@@ -1,0 +1,24 @@
+name: fuzz
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1" # weekly (Mon 04:00 UTC)
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build
+      - name: Fuzz the reader (smoke — extend in OSS-Fuzz / longer jobs)
+        run: cargo +nightly fuzz run parse -- -max_total_time=120 -rss_limit_mb=2048
+      - name: Fuzz the authoring path (smoke)
+        run: cargo +nightly fuzz run author -- -max_total_time=120 -rss_limit_mb=2048

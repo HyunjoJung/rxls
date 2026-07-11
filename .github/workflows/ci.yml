@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt · clippy · test · doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install openpyxl (strict-consumer gate)
+        run: python3 -m pip install openpyxl
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (.xls-only, no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --features full --all-targets -- -D warnings
+      # RXLS_REQUIRE_OPENPYXL turns the openpyxl strict-consumer gate from a
+      # graceful skip into a hard failure, so the .xlsx authoring conformance is
+      # genuinely enforced in CI and can never be silently bypassed.
+      - name: Test (default features + enforced openpyxl gate)
+        env:
+          RXLS_REQUIRE_OPENPYXL: "1"
+        run: cargo test --all-targets
+      - name: Test (.xls-only build)
+        run: cargo test --no-default-features
+      - name: Test (all features — incl. .xlsb)
+        run: cargo test --features full
+      - name: Doctests
+        run: cargo test --doc
+      - name: Doc
+        run: cargo doc --no-deps
+
+  msrv:
+    name: MSRV (1.74)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.74.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+
+  public-parity:
+    name: public .xls/.xlsb parity (xlrd + pyxlsb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install oracles
+        run: python3 -m pip install "xlrd>=2.0" pyxlsb odfpy pandas
+      # Fetch the calamine project's MIT-licensed test suite (genuine BIFF5/7 +
+      # date/1904 + SST-CONTINUE .xls, plus a real .xlsb) so the readers are
+      # validated on REAL files, reproducibly, on every run — not author-asserted.
+      - name: Fetch calamine reference corpus (MIT)
+        run: bash scripts/fetch-xls-reference.sh
+      - name: Build extract example (+ xlsb + ods)
+        run: cargo build --features full --example extract
+      - name: Parity vs xlrd (.xls — BIFF5/7 + date + SST-CONTINUE)
+        run: python3 scripts/xls-xlrd-parity.py --corpus local/xls-poc/cal --bin target/debug/examples/extract --min 0.95
+      - name: Parity vs pyxlsb (.xlsb — BIFF12)
+        run: python3 scripts/xlsb-pyxlsb-parity.py --corpus local/xlsb --bin target/debug/examples/extract --min 0.95
+      - name: Parity vs odfpy (.ods — ODF)
+        run: python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.90

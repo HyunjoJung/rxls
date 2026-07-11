@@ -1,0 +1,92 @@
+[package]
+name = "rxls"
+version = "0.1.0"
+edition = "2021"
+# Core deps (`cfb`→`uuid`, `zip`→`indexmap`/`hashbrown`) require Rust 1.85 —
+# the same chain that sets the floor for the sibling `rwml` crate.
+rust-version = "1.85"
+license = "MIT"
+description = "Native Rust spreadsheet library: reads .xls (BIFF8/5/7), .xlsx, .xlsb, .ods and writes .xlsx. Typed cells, formulas, panic-free, no JVM/POI."
+repository = "https://github.com/HyunjoJung/rxls"
+homepage = "https://github.com/HyunjoJung/rxls"
+documentation = "https://docs.rs/rxls"
+readme = "README.md"
+authors = ["Hyunjo Jung <j96263732@gmail.com>"]
+keywords = ["xls", "xlsx", "excel", "spreadsheet", "ole2"]
+categories = ["parser-implementations", "text-processing", "localization"]
+exclude = [".github/", "docs/", "fuzz/", "oss-fuzz/", "scripts/"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# The CLI binary shares the package name "rxls" with the `cdylib` library
+# target above. On native targets that's harmless (a bin has no extension,
+# a cdylib gets .so/.dylib/.dll — different filenames), but
+# wasm32-unknown-unknown emits *both* as a bare "rxls.wasm", so an
+# unfiltered `cargo build --target wasm32-unknown-unknown` writes two
+# different artifacts to the same path (cargo warns: "output filename
+# collision"). Gating the bin behind a feature that's part of `default`
+# means nothing changes for today's native consumers, while a wasm32/
+# cdylib-only build that opts out of `default` (`--no-default-features`,
+# the same convention this crate already uses for its dependency-light
+# .xls-only build — see docs/regressions/0156-wasm-adapter.md) naturally
+# only builds the library, so the collision no longer arises.
+[[bin]]
+name = "rxls"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+cfb = "0.10"
+encoding_rs = "0.8"
+thiserror = "2.0"
+# .xlsx (OOXML) support — on by default; disable for the dependency-light
+# .xls-only build (`default-features = false`).
+zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.36", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+chrono = { version = "0.4.45", default-features = false, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.126"
+
+[features]
+default = ["xlsx", "cli"]
+# Builds the `rxls` CLI binary (src/main.rs). On by default so existing
+# native workflows (`cargo build`, `cargo run -p rxls --bin rxls`) are
+# unaffected; disable it (via `--no-default-features`) for a library-only
+# build, e.g. a cdylib intended for wasm32-unknown-unknown — see the [lib]
+# comment above.
+cli = []
+xlsx = ["dep:zip", "dep:quick-xml"]
+# .xlsb (BIFF12 binary) reader — reuses the xlsx ZIP plumbing + rels parser.
+xlsb = ["xlsx"]
+# .ods (OpenDocument Spreadsheet) reader — ZIP + content.xml.
+ods = ["dep:zip", "dep:quick-xml"]
+# Optional typed row deserialization from a worksheet Range.
+serde = ["dep:serde"]
+# Optional conversions from Excel serial dates to chrono's NaiveDateTime.
+chrono = ["dep:chrono"]
+# Everything: .xls + .xlsx (read/write) + .xlsb (read) + .ods (read).
+full = ["xlsx", "xlsb", "ods", "serde", "chrono"]
+
+[[example]]
+name = "extract"
+path = "examples/extract.rs"
+
+[[example]]
+name = "metadata"
+
+# Authoring examples need the `xlsx` writer; skipped in the `.xls`-only build
+# (`cargo build --no-default-features`).
+[[example]]
+name = "to_xlsx"
+required-features = ["xlsx"]
+
+[[example]]
+name = "roundtrip"
+required-features = ["xlsx"]
+
+[[example]]
+name = "author_report"
+required-features = ["xlsx"]
