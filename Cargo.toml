@@ -42,7 +42,7 @@ encoding_rs = "0.8"
 thiserror = "2.0"
 # .xlsx (OOXML) support — on by default; disable for the dependency-light
 # .xls-only build (`default-features = false`).
-zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "8.6", default-features = false, features = ["deflate"], optional = true }
 quick-xml = { version = "0.36", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 chrono = { version = "0.4.45", default-features = false, optional = true }
