@@ -1,0 +1,7 @@
+# Normalize line endings to LF in the repository (cross-platform OSS hygiene).
+* text=auto eol=lf
+*.rs text eol=lf
+*.ods binary
+*.xls binary
+*.xlsb binary
+*.xlsx binary

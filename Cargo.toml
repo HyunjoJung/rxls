@@ -1,0 +1,80 @@
+[package]
+name = "rxls"
+version = "0.1.0"
+edition = "2021"
+# The resolved dependency graph supports Rust 1.85; CI enforces this floor.
+rust-version = "1.85"
+license = "MIT"
+description = "Native Rust spreadsheet library: reads .xls (BIFF8/5/7), .xlsx, .xlsb, .ods and writes .xlsx. Typed cells, formulas, panic-free, no JVM/POI."
+repository = "https://github.com/HyunjoJung/rxls"
+homepage = "https://github.com/HyunjoJung/rxls"
+documentation = "https://docs.rs/rxls"
+readme = "README.md"
+authors = ["Hyunjo Jung <j96263732@gmail.com>"]
+keywords = ["xls", "xlsx", "excel", "spreadsheet", "ole2"]
+categories = ["parser-implementations", "text-processing", "localization"]
+exclude = [".github/", "bindings/", "fuzz/", "oss-fuzz/"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+crate-type = ["rlib"]
+
+# The JavaScript-facing cdylib lives in bindings/wasm so the native library and
+# CLI can both retain the public name `rxls` without colliding on Windows PDBs.
+[[bin]]
+name = "rxls"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+cfb = "0.14"
+encoding_rs = "0.8"
+thiserror = "2.0"
+# .xlsx (OOXML) support — on by default; disable for the dependency-light
+# .xls-only build (`default-features = false`).
+zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.41", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+chrono = { version = "0.4.45", default-features = false, optional = true }
+
+[features]
+default = ["xlsx", "cli"]
+# Builds the `rxls` CLI binary (src/main.rs). On by default so existing
+# native workflows (`cargo build`, `cargo run -p rxls --bin rxls`) are
+# unaffected; disable it (via `--no-default-features`) for a library-only
+# build.
+cli = []
+xlsx = ["dep:zip", "dep:quick-xml"]
+# .xlsb (BIFF12 binary) reader — reuses the xlsx ZIP plumbing + rels parser.
+xlsb = ["xlsx"]
+# .ods (OpenDocument Spreadsheet) reader — ZIP + content.xml.
+ods = ["dep:zip", "dep:quick-xml"]
+# Optional typed row deserialization from a worksheet Range.
+serde = ["dep:serde"]
+# Optional conversions from Excel serial dates to chrono's NaiveDateTime.
+chrono = ["dep:chrono"]
+# Everything: .xls + .xlsx (read/write) + .xlsb (read) + .ods (read).
+full = ["xlsx", "xlsb", "ods", "serde", "chrono"]
+
+[[example]]
+name = "extract"
+path = "examples/extract.rs"
+
+[[example]]
+name = "metadata"
+
+# Authoring examples need the `xlsx` writer; skipped in the `.xls`-only build
+# (`cargo build --no-default-features`).
+[[example]]
+name = "to_xlsx"
+required-features = ["xlsx"]
+
+[[example]]
+name = "roundtrip"
+required-features = ["xlsx"]
+
+[[example]]
+name = "author_report"
+required-features = ["xlsx"]

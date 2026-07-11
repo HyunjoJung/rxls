@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install public reference readers
+        run: python3 -m pip install "xlrd==2.0.2" "openpyxl==3.1.5" "pyxlsb==1.0.10"
+
+      - name: Validate release identity
+        id: release
+        shell: bash
+        run: |
+          version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || {
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+              exit 1
+            }
+            git fetch origin main --no-tags
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "release tag must point to a commit on origin/main" >&2
+              exit 1
+            }
+          else
+            echo "workflow_dispatch is verification-only; no publish will run"
+          fi
+
+      - name: Run canonical release gate
+        env:
+          RXLS_REQUIRE_OPENPYXL: "1"
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          python3 scripts/public_hygiene_audit.py
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+          cargo test --all-targets --no-default-features --locked
+          cargo test --doc --all-features --locked
+          cargo doc --no-deps --all-features --locked
+          cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+          python3 -m unittest discover -s scripts -p "test_*.py"
+          cargo package --locked
+
+      - name: Run full pinned public-corpus gate
+        run: |
+          python3 scripts/fetch-public-corpus.py
+          cargo build --all-features --example extract --locked
+          cargo run --bin rxls --all-features --locked -- corpus-report local/public-corpus/manifest.json | tee target/release-corpus-report.txt
+          grep -Fx "manifest_files: 916" target/release-corpus-report.txt
+          grep -Fx "opened: 876" target/release-corpus-report.txt
+          grep -Fx "failed: 40" target/release-corpus-report.txt
+          grep -Fx "expected_rejections: 40" target/release-corpus-report.txt
+          grep -Fx "unexpected_failures: 0" target/release-corpus-report.txt
+          grep -Fx "by_ext: .xlsm files=18 opened=18 failed=0" target/release-corpus-report.txt
+
+          python3 scripts/xls-xlrd-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99 | tee target/release-xls-parity-full.txt
+          grep -F "files: 448   rxls extracted: 426" target/release-xls-parity-full.txt
+          grep -F "comparable: 417" target/release-xls-parity-full.txt
+          grep -F ">=99%: 415/417" target/release-xls-parity-full.txt
+          grep -E "^(manifest:|files:|rxls vs)" target/release-xls-parity-full.txt > target/release-xls-parity-summary.txt
+
+          python3 scripts/xlsx-openpyxl-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99 | tee target/release-ooxml-parity-full.txt
+          grep -F "files: 431   rxls extracted: 412" target/release-ooxml-parity-full.txt
+          grep -F "comparable: 388" target/release-ooxml-parity-full.txt
+          grep -F ">=99%: 387/388" target/release-ooxml-parity-full.txt
+          grep -E "^(manifest:|files:|rxls vs)" target/release-ooxml-parity-full.txt > target/release-ooxml-parity-summary.txt
+
+          python3 scripts/xlsb-pyxlsb-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --min 0.99 | tee target/release-xlsb-parity-full.txt
+          grep -F "files: 21   rxls extracted: 18" target/release-xlsb-parity-full.txt
+          grep -F "comparable: 18" target/release-xlsb-parity-full.txt
+          grep -F "mean parity 100.000%" target/release-xlsb-parity-full.txt
+          grep -E "^(manifest:|files:|rxls vs)" target/release-xlsb-parity-full.txt > target/release-xlsb-parity-summary.txt
+
+          python3 scripts/ods-odfpy-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99 | tee target/release-ods-parity-full.txt
+          grep -F "files: 16   rxls extracted: 14" target/release-ods-parity-full.txt
+          grep -F "comparable: 14" target/release-ods-parity-full.txt
+          grep -F "mean recall 100.000%" target/release-ods-parity-full.txt
+          grep -E "^(manifest:|files:|rxls vs)" target/release-ods-parity-full.txt > target/release-ods-parity-summary.txt
+
+      - name: Generate release evidence
+        shell: bash
+        run: |
+          python3 scripts/public_hygiene_audit.py --json > target/release-public-hygiene.json
+          mkdir -p dist
+          version="${{ steps.release.outputs.version }}"
+          cp "target/package/rxls-${version}.crate" dist/
+          cp target/release-corpus-report.txt target/release-*-parity-summary.txt dist/
+          cp target/release-public-hygiene.json dist/public-hygiene.json
+          (cd dist && sha256sum "rxls-${version}.crate" > "rxls-${version}.crate.sha256")
+          python3 scripts/release_manifest.py \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA" \
+            --hygiene-report dist/public-hygiene.json \
+            --output dist/rxls-release-manifest.json \
+            "dist/rxls-${version}.crate" \
+            "dist/rxls-${version}.crate.sha256" \
+            dist/release-corpus-report.txt \
+            dist/release-xls-parity-summary.txt \
+            dist/release-ooxml-parity-summary.txt \
+            dist/release-xlsb-parity-summary.txt \
+            dist/release-ods-parity-summary.txt
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: rxls-${{ steps.release.outputs.version }}-release
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          url="https://crates.io/api/v1/crates/rxls/${version}"
+          local_checksum=$(sha256sum "dist/rxls-${version}.crate" | cut -d ' ' -f 1)
+          status=$(curl --retry 3 --retry-all-errors -sS -o /tmp/crates-response.json \
+            -w "%{http_code}" -A "rxls-release-ci (GitHub Actions)" "$url")
+          case "$status" in
+            200)
+              echo "rxls ${version} is already published; skipping"
+              ;;
+            404)
+              cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+              ;;
+            *)
+              echo "crates.io version check failed with HTTP $status" >&2
+              cat /tmp/crates-response.json >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$status" == "404" ]]; then
+            for attempt in $(seq 1 12); do
+              sleep 5
+              status=$(curl --retry 3 --retry-all-errors -sS \
+                -o /tmp/crates-response.json -w "%{http_code}" \
+                -A "rxls-release-ci (GitHub Actions)" "$url")
+              [[ "$status" == "200" ]] && break
+              [[ "$status" == "404" ]] || {
+                echo "crates.io checksum lookup failed with HTTP $status" >&2
+                exit 1
+              }
+            done
+          fi
+          [[ "$status" == "200" ]] || {
+            echo "published version did not appear in the crates.io API" >&2
+            exit 1
+          }
+          remote_checksum=$(python3 -c "import json; print(json.load(open('/tmp/crates-response.json', encoding='utf-8'))['version']['checksum'])")
+          [[ "$remote_checksum" == "$local_checksum" ]] || {
+            echo "crates.io checksum does not match release evidence" >&2
+            echo "local=$local_checksum remote=$remote_checksum" >&2
+            exit 1
+          }
+
+      - name: Create or update GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --verify-tag --generate-notes --title "$tag"
+          fi

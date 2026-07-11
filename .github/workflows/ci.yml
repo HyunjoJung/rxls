@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt / clippy / test / doc / package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install public reference readers
+        run: python3 -m pip install "xlrd==2.0.2" "openpyxl==3.1.5" "pyxlsb==1.0.10"
+      - name: Public hygiene audit
+        run: python3 scripts/public_hygiene_audit.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy (.xls-only)
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test (all features and strict openpyxl gate)
+        env:
+          RXLS_REQUIRE_OPENPYXL: "1"
+        run: cargo test --all-targets --all-features --locked
+      - name: Test (.xls-only)
+        run: cargo test --all-targets --no-default-features --locked
+      - name: Doctests (all features)
+        run: cargo test --doc --all-features --locked
+      - name: Documentation (all features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features --locked
+      - name: Python harness tests
+        run: python3 -m unittest discover -s scripts -p "test_*.py"
+      - name: Package dry run
+        run: cargo package --locked
+
+  msrv:
+    name: MSRV 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (.xls-only)
+        run: cargo build --no-default-features --locked
+      - name: Build (default features)
+        run: cargo build --locked
+      - name: Build (all features)
+        run: cargo build --all-features --locked
+      - name: Build WebAssembly binding
+        run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+
+  wasm:
+    name: wasm32 binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+
+  public-parity:
+    name: Public .xls/.xlsb/.ods parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install public reference readers
+        run: python3 -m pip install "xlrd==2.0.2" "pyxlsb==1.0.10"
+      - name: Fetch pinned calamine reference corpus
+        run: bash scripts/fetch-xls-reference.sh
+      - name: Build extract example
+        run: cargo build --all-features --example extract --locked
+      - name: Parity vs xlrd (.xls)
+        run: python3 scripts/xls-xlrd-parity.py --corpus local/xls-poc/cal --bin target/debug/examples/extract --min 0.99
+      - name: Parity vs pyxlsb (.xlsb)
+        run: python3 scripts/xlsb-pyxlsb-parity.py --corpus local/xlsb --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --min 0.99
+      - name: Parity vs bounded ODF XML oracle (.ods)
+        run: python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.99
