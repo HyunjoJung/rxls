@@ -1,0 +1,15 @@
+/target
+bindings/wasm/target
+fuzz/target
+fuzz/Cargo.lock
+__pycache__/
+.pytest_cache/
+*.py[cod]
+# Generated fuzz corpora / crash artifacts — grown locally by `cargo fuzz`,
+# never committed (size; the targets seed from tests/fixtures on demand).
+fuzz/corpus/
+fuzz/artifacts/
+# Fetched reference corpora (calamine/GovDocs1/POI) — pulled on demand by
+# scripts/fetch-xls-reference.sh; never committed (size + upstream licensing).
+/local
+.worktrees/

@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    ignore:
+      # zip 8.x raises the dependency MSRV to 1.88. Keep accepting compatible
+      # 2.x updates while rxls promises Rust 1.85; revisit with an explicit MSRV
+      # migration and corpus run.
+      - dependency-name: "zip"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    ignore:
+      # This action's ref is the Rust compiler version, not an action runtime
+      # version. MSRV changes are deliberate and validated separately.
+      - dependency-name: "dtolnay/rust-toolchain"
