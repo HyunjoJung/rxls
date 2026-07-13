@@ -351,6 +351,9 @@ impl Workbook {
     pub fn open_with_codepage(bytes: &[u8], force_codepage: Option<u16>) -> Result<Self> {
         let mut wb = crate::ole::read_workbook_stream(bytes)?;
         let default_xor_decrypted = maybe_decrypt_default_xor(&mut wb)?;
+        if wb.is_empty() {
+            return Err(Error::Biff("empty BIFF stream"));
+        }
         let mut sst_strings: Vec<String> = Vec::new();
         let mut sheets: Vec<Sheet> = Vec::new();
         let mut frozen_views: Vec<bool> = Vec::new();
@@ -383,16 +386,30 @@ impl Workbook {
         };
 
         let mut pos = 0usize;
-        while pos + 4 <= wb.len() {
-            let typ = u16le(&wb, pos).unwrap_or(0);
-            let len = u16le(&wb, pos + 2).unwrap_or(0) as usize;
-            let start = pos + 4;
-            let end = start.saturating_add(len);
-            if end > wb.len() {
-                break; // truncated trailing record
-            }
-            let data = &wb[start..end];
+        let mut saw_global_header = false;
+        while pos < wb.len() {
+            let header_end = pos
+                .checked_add(4)
+                .filter(|end| *end <= wb.len())
+                .ok_or(Error::Biff("truncated BIFF record header"))?;
+            let typ = u16le(&wb, pos).ok_or(Error::Biff("truncated BIFF record header"))?;
+            let len =
+                u16le(&wb, pos + 2).ok_or(Error::Biff("truncated BIFF record header"))? as usize;
+            let end = header_end
+                .checked_add(len)
+                .filter(|end| *end <= wb.len())
+                .ok_or(Error::Biff("truncated BIFF record"))?;
+            let data = &wb[header_end..end];
             pos = end;
+
+            if !saw_global_header && typ != BOF {
+                return Err(Error::Biff(
+                    "malformed BIFF stream: missing leading BOF record",
+                ));
+            }
+            if !saw_global_header {
+                saw_global_header = true;
+            }
 
             // Any non-CONTINUE record terminates an in-progress SST.
             if typ != CONTINUE {
@@ -403,6 +420,10 @@ impl Workbook {
 
             match typ {
                 BOF => {
+                    let version = u16le(data, 0).ok_or(Error::Biff("malformed BIFF BOF record"))?;
+                    if !matches!(version, 0x0500 | 0x0600) {
+                        return Err(Error::Biff("unsupported BIFF version"));
+                    }
                     // Only a *top-level* (depth-0) BOF starts a new substream:
                     // the workbook globals, then one per sheet in BOUNDSHEET
                     // order. BOFs nested inside a worksheet (embedded charts,
@@ -415,7 +436,12 @@ impl Workbook {
                         cur_sheet = if top_count == 1 {
                             // First top-level substream = workbook globals; pin
                             // the BIFF generation. BOF.vers: 0x0600 = BIFF8.
-                            ctx.biff8 = u16le(data, 0) == Some(0x0600);
+                            if u16le(data, 2) != Some(0x0005) {
+                                return Err(Error::Biff(
+                                    "malformed BIFF stream: first BOF is not workbook globals",
+                                ));
+                            }
+                            ctx.biff8 = version == 0x0600;
                             None
                         } else {
                             Some(top_count - 2)
@@ -483,7 +509,12 @@ impl Workbook {
                         chunks.push(data);
                     }
                 }
-                EOF => depth = depth.saturating_sub(1),
+                EOF => {
+                    if depth == 0 {
+                        return Err(Error::Biff("unexpected BIFF EOF record"));
+                    }
+                    depth -= 1;
+                }
                 WINDOW1 if cur_sheet.is_none() && active_sheet.is_none() => {
                     active_sheet = parse_window1_active_sheet(data);
                 }
@@ -727,6 +758,15 @@ impl Workbook {
                     }
                 }
             }
+        }
+        if !saw_global_header {
+            return Err(Error::Biff("missing BIFF stream header"));
+        }
+        if depth != 0 {
+            return Err(Error::Biff("unterminated BIFF stream"));
+        }
+        if pos != wb.len() {
+            return Err(Error::Biff("truncated BIFF record header"));
         }
         apply_sheet_page_setups(&mut sheets, sheet_page_setups);
         apply_sheet_builtin_names(&mut sheets, sheet_builtin_names);
@@ -3699,5 +3739,97 @@ mod tests {
     #[test]
     fn rejects_non_ole2() {
         assert!(matches!(extract_text(b"not an xls"), Err(Error::NotOle2)));
+    }
+
+    #[test]
+    fn rejects_empty_workbook_stream() {
+        let bytes = wrap_xls(&[], "/Workbook");
+        assert!(matches!(Workbook::open(&bytes), Err(Error::Biff(_))));
+        assert!(matches!(extract_text(&bytes), Err(Error::Biff(_))));
+    }
+
+    #[test]
+    fn rejects_random_workbook_stream() {
+        let bytes = wrap_xls(b"random stream payload", "/Workbook");
+        assert!(matches!(Workbook::open(&bytes), Err(Error::Biff(_))));
+        assert!(matches!(extract_text(&bytes), Err(Error::Biff(_))));
+    }
+
+    #[test]
+    fn rejects_unsupported_biff_version() {
+        let mut g_bof = vec![0x34, 0x12, 0x05, 0x00];
+        g_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &g_bof);
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let bytes = wrap_xls(&stream, "/Workbook");
+        assert!(matches!(Workbook::open(&bytes), Err(Error::Biff(_))));
+    }
+
+    #[test]
+    fn rejects_non_workbook_global_bof() {
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &sheet_bof);
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let bytes = wrap_xls(&stream, "/Workbook");
+        assert!(matches!(Workbook::open(&bytes), Err(Error::Biff(_))));
+    }
+
+    #[test]
+    fn rejects_truncated_biff_header_and_body() {
+        let mut g_bof = vec![0x00, 0x06, 0x05, 0x00];
+        g_bof.extend_from_slice(&[0u8; 12]);
+
+        let mut truncated_header = rec(BOF, &g_bof);
+        truncated_header.extend_from_slice(&rec(EOF, &[]));
+        truncated_header.extend_from_slice(&[0x09, 0x08, 0x01]);
+        assert!(matches!(
+            Workbook::open(&wrap_xls(&truncated_header, "/Workbook")),
+            Err(Error::Biff(_))
+        ));
+
+        let mut truncated_body = rec(BOF, &g_bof);
+        truncated_body.extend_from_slice(&LABEL.to_le_bytes());
+        truncated_body.extend_from_slice(&8u16.to_le_bytes());
+        truncated_body.extend_from_slice(&[0x00, 0x00]);
+        assert!(matches!(
+            Workbook::open(&wrap_xls(&truncated_body, "/Workbook")),
+            Err(Error::Biff(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unbalanced_biff_substreams() {
+        let mut g_bof = vec![0x00, 0x06, 0x05, 0x00];
+        g_bof.extend_from_slice(&[0u8; 12]);
+
+        let unterminated = rec(BOF, &g_bof);
+        assert!(matches!(
+            Workbook::open(&wrap_xls(&unterminated, "/Workbook")),
+            Err(Error::Biff(_))
+        ));
+
+        let mut extra_eof = rec(BOF, &g_bof);
+        extra_eof.extend_from_slice(&rec(EOF, &[]));
+        extra_eof.extend_from_slice(&rec(EOF, &[]));
+        assert!(matches!(
+            Workbook::open(&wrap_xls(&extra_eof, "/Workbook")),
+            Err(Error::Biff(_))
+        ));
+    }
+
+    #[test]
+    fn preserves_empty_biff_semantics_with_valid_headers() {
+        let mut g_bof = vec![0x00, 0x06, 0x05, 0x00];
+        g_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &g_bof);
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let bytes = wrap_xls(&stream, "/Workbook");
+        let wb = Workbook::open(&bytes).unwrap();
+        assert!(wb.sheets.is_empty());
+        assert!(matches!(extract_text(&bytes), Err(Error::NoText)));
     }
 }

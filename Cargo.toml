@@ -1,6 +1,6 @@
 [package]
 name = "rxls"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # The resolved dependency graph supports Rust 1.85; CI enforces this floor.
 rust-version = "1.85"

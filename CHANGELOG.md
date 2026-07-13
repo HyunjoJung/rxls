@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-13
+
+### Fixed
+
+- Hardened `.xls` BIFF parsing for OLE2 `Workbook`/`Book` streams that are malformed
+  or semantically empty by introducing explicit header/truncation checks.
+  Arbitrary bytes no longer parse as a successful (empty) workbook; they now
+  return `Error::Biff`, while still allowing valid header-only BIFF payloads to
+  round-trip as an empty but typed `Workbook` (and `extract_text` still reports
+  `NoText`).
+- Added regression tests for malformed `Workbook` streams (empty stream and random
+  bytes), unsupported or misplaced `BOF` records, truncated records, unbalanced
+  substreams, and valid-header, no-cell BIFF payloads.
+
 ## [0.1.0] - 2026-07-11
 
 First public release. `rxls` is a native Rust spreadsheet toolkit with no JVM,
@@ -77,5 +91,6 @@ Apache POI, or runtime subprocess dependency.
   comments, metadata, charts, drawings, and editable package parts after the
   `quick-xml` migration.
 
-[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.1
 [0.1.0]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.0
