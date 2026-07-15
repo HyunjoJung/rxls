@@ -357,6 +357,25 @@ pub(super) fn workbook_xml_with_budget(wb: &Workbook, budget: &mut usize) -> Str
             ),
         );
     }
+    for local in &wb.local_defined_names {
+        let Some(sheet_index) = wb
+            .sheets
+            .iter()
+            .position(|sheet| sheet.name.eq_ignore_ascii_case(&local.sheet))
+        else {
+            continue;
+        };
+        push_defined_name(
+            &mut s,
+            budget,
+            &mut defs_open,
+            format!(
+                r#"<definedName name="{}" localSheetId="{sheet_index}">{}</definedName>"#,
+                esc_attr(&local.name),
+                esc_text(&local.refers_to)
+            ),
+        );
+    }
     if defs_open {
         s.push_str("</definedNames>");
     }

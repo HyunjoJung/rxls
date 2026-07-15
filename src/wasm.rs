@@ -7,11 +7,20 @@
 use crate::{Error, Result, Workbook, WorkbookReport};
 
 /// Extract workbook text from spreadsheet bytes.
+///
+/// # Errors
+///
+/// Returns the same typed parse and empty-text errors as [`crate::extract_text`].
 pub fn extract_text_bytes(bytes: &[u8]) -> Result<String> {
     crate::extract_text(bytes)
 }
 
 /// Export one worksheet as CSV from spreadsheet bytes.
+///
+/// # Errors
+///
+/// Returns a typed parse error for invalid input or [`Error::SheetOutOfRange`]
+/// when `sheet_index` does not identify a grid worksheet.
 pub fn to_csv_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
     Workbook::open(bytes)?
         .to_csv(sheet_index)
@@ -19,6 +28,11 @@ pub fn to_csv_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
 }
 
 /// Export one worksheet as an HTML table fragment from spreadsheet bytes.
+///
+/// # Errors
+///
+/// Returns a typed parse error for invalid input or [`Error::SheetOutOfRange`]
+/// when `sheet_index` does not identify a grid worksheet.
 pub fn to_html_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
     Workbook::open(bytes)?
         .to_html(sheet_index)
@@ -26,6 +40,11 @@ pub fn to_html_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
 }
 
 /// Build the machine-readable diagnose JSON report from spreadsheet bytes.
+///
+/// # Errors
+///
+/// Returns a typed parse error when the bytes are malformed, encrypted,
+/// unsupported by the enabled format features, or exceed a resource bound.
 pub fn report_json_bytes(bytes: &[u8]) -> Result<String> {
     let workbook = Workbook::open(bytes)?;
     #[cfg(feature = "xlsx")]
@@ -138,13 +157,15 @@ mod tests {
     fn report_json_bytes_happy_path_exact_value() {
         assert_eq!(
             report_json_bytes(&tiny_fixture_bytes()).unwrap(),
-            "{\"format\":\"xlsx\",\"stats\":{\"sheets\":1,\"cells\":1,\"formulas\":0,\"text_truncated\":false},\
+            "{\"schema_version\":1,\"format\":\"xlsx\",\"stats\":{\"sheets\":1,\"cells\":1,\"formulas\":0,\"text_truncated\":false},\
              \"properties\":{\"title\":null,\"subject\":null,\"creator\":null,\"keywords\":null,\"description\":null,\
              \"last_modified_by\":null,\"company\":null,\"created\":null},\"defined_names_count\":0,\
+             \"local_defined_names_count\":0,\
              \"features\":{\"comments\":0,\"data_validations\":0,\"tables\":0,\"merged_ranges\":0,\"hyperlinks\":0,\
              \"images\":0,\"charts\":0,\"sparklines\":0,\"conditional_formatting\":0,\"hidden_sheets\":0,\
              \"frozen_panes\":0,\"page_setup\":0,\"protection\":0,\"pivot_tables\":0,\"vba_project\":false,\
-             \"threaded_comments\":0,\"external_links\":0,\"custom_xml\":0},\"warnings\":[]}"
+             \"threaded_comments\":0,\"external_links\":0,\"custom_xml\":0},\"evaluation\":{\"computed\":0,\"errors\":0,\
+             \"cached\":0,\"unsupported\":0,\"truncated\":false,\"by_reason\":{}},\"warnings\":[]}"
         );
     }
 

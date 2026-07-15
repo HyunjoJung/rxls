@@ -4,19 +4,20 @@ use std::fmt::Write as _;
 use std::fs;
 #[cfg(any(feature = "xlsx", feature = "ods"))]
 use std::io::Read;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rxls::{
-    Cell, DocProperties, Error, SheetType, SheetView, SheetVisible, Workbook, WorkbookReport,
+    export_csv, Cell, CsvFormulaPolicy, CsvNewline, CsvOptions, DocProperties, Error, SheetType,
+    SheetView, SheetVisible, Workbook, WorkbookReport,
 };
 
 fn main() -> ExitCode {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "rxls".to_string());
     let Some(command) = args.next() else {
-        print_usage(&program);
-        return ExitCode::from(64);
+        return ExitCode::from(usage_status(std::io::stderr().lock(), &program, 64));
     };
 
     match command.as_str() {
@@ -36,7 +37,7 @@ fn main() -> ExitCode {
             Err(code) => code,
         },
         "csv" => match parse_csv_args(&program, &mut args) {
-            Ok((path, sheet, delimiter)) => csv(&path, sheet, delimiter),
+            Ok(args) => csv(&args.path, args.sheet, args.options),
             Err(code) => code,
         },
         "sheet" => match parse_sheet_args(&program, "sheet", &mut args) {
@@ -98,13 +99,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "-h" | "--help" | "help" => {
-            print_usage(&program);
-            ExitCode::SUCCESS
+            ExitCode::from(usage_status(std::io::stdout().lock(), &program, 0))
         }
         other => {
-            eprintln!("{program}: unknown command {other:?}");
-            print_usage(&program);
-            ExitCode::from(64)
+            let mut stderr = std::io::stderr().lock();
+            if writeln!(stderr, "{program}: unknown command {other:?}").is_err() {
+                return ExitCode::from(74);
+            }
+            ExitCode::from(usage_status(stderr, &program, 64))
         }
     }
 }
@@ -200,7 +202,7 @@ fn dump(path: &str, sheet_index: usize, limit: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn csv(path: &str, sheet_index: usize, delimiter: char) -> ExitCode {
+fn csv(path: &str, sheet_index: usize, options: CsvOptions) -> ExitCode {
     let (_bytes, workbook) = match read_workbook(path) {
         Ok(parsed) => parsed,
         Err(code) => return code,
@@ -213,14 +215,48 @@ fn csv(path: &str, sheet_index: usize, delimiter: char) -> ExitCode {
         );
         return ExitCode::from(65);
     }
-    let Some(csv) = workbook.to_csv_with_delimiter(sheet_index, delimiter) else {
+    let Some(sheet) = workbook
+        .sheets
+        .get(sheet_index)
+        .filter(|sheet| sheet.sheet_type() == SheetType::WorkSheet)
+    else {
         eprintln!("sheet index {sheet_index} is not a worksheet");
         return ExitCode::from(65);
     };
+    let csv = match export_csv(sheet, options) {
+        Ok(csv) => csv,
+        Err(error) => {
+            eprintln!("rxls csv: {error}");
+            return ExitCode::from(65);
+        }
+    };
 
-    print!("{csv}");
-    if !csv.is_empty() {
-        println!();
+    let newline = match options.newline {
+        CsvNewline::Lf => b"\n".as_slice(),
+        CsvNewline::CrLf => b"\r\n".as_slice(),
+        _ => {
+            eprintln!("rxls csv: unsupported newline policy");
+            return ExitCode::from(65);
+        }
+    };
+    if !csv.is_empty() && csv.len().saturating_add(newline.len()) > options.max_output_bytes {
+        eprintln!(
+            "rxls csv: CSV output exceeds the configured {}-byte limit",
+            options.max_output_bytes
+        );
+        return ExitCode::from(65);
+    }
+    let mut stdout = std::io::stdout().lock();
+    let write_result = stdout.write_all(csv.as_bytes()).and_then(|()| {
+        if csv.is_empty() {
+            Ok(())
+        } else {
+            stdout.write_all(newline)
+        }
+    });
+    if let Err(error) = write_result {
+        eprintln!("rxls csv: failed to write stdout: {error}");
+        return ExitCode::from(74);
     }
     ExitCode::SUCCESS
 }
@@ -611,12 +647,21 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
     let mut by_failure_decision = BTreeMap::<String, usize>::new();
     let mut by_failure_evidence = BTreeMap::<String, usize>::new();
     let mut failures = Vec::<CorpusFailure>::new();
+    let mut unexpected_accepts = Vec::<CorpusUnexpectedAccept>::new();
     let mut eligible_files = 0usize;
     let mut opened = 0usize;
     let mut failed = 0usize;
     let mut expected_rejections = 0usize;
     let mut unexpected_failures = 0usize;
     let mut skipped = 0usize;
+    let mut formula_files = 0usize;
+    let mut formula_cells = 0usize;
+    let mut evaluation_computed = 0usize;
+    let mut evaluation_errors = 0usize;
+    let mut evaluation_cached = 0usize;
+    let mut evaluation_unsupported = 0usize;
+    let mut evaluation_truncated_files = 0usize;
+    let mut evaluation_by_reason = BTreeMap::<String, usize>::new();
 
     for entry in &entries {
         if entry.status.as_deref() == Some("failed") {
@@ -641,23 +686,56 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
         let label = corpus_label(entry, local_path);
         match fs::read(&workbook_path) {
             Ok(bytes) => match Workbook::open(&bytes) {
-                Ok(_) => {
+                Ok(workbook) => {
                     opened += 1;
                     stats.opened += 1;
+                    let report =
+                        WorkbookReport::from_workbook(ext.trim_start_matches('.'), &workbook);
+                    if report.stats.formulas > 0 {
+                        formula_files += 1;
+                    }
+                    formula_cells += report.stats.formulas;
+                    evaluation_computed += report.evaluation.computed;
+                    evaluation_errors += report.evaluation.errors;
+                    evaluation_cached += report.evaluation.cached;
+                    evaluation_unsupported += report.evaluation.unsupported;
+                    evaluation_truncated_files += usize::from(report.evaluation.truncated);
+                    for (reason, count) in report.evaluation.by_reason {
+                        *evaluation_by_reason.entry(reason).or_default() += count;
+                    }
+                    if let Some(CorpusExpectation::Reject {
+                        kind,
+                        decision,
+                        evidence,
+                    }) = entry.expected.as_ref()
+                    {
+                        unexpected_accepts.push(CorpusUnexpectedAccept {
+                            ext,
+                            label,
+                            kind: kind.clone(),
+                            decision: decision.clone(),
+                            evidence: evidence.clone(),
+                        });
+                    }
                 }
                 Err(err) => {
                     failed += 1;
                     stats.failed += 1;
                     let kind = corpus_failure_kind(&err);
                     let decision = corpus_failure_decision(kind);
-                    if corpus_failure_is_expected(decision) {
+                    let container = corpus_container_kind(&bytes);
+                    let extension_mismatch = corpus_extension_mismatch(&ext, container);
+                    let evidence = corpus_failure_evidence(kind, container, extension_mismatch);
+                    if corpus_failure_matches_expectation(
+                        entry.expected.as_ref(),
+                        kind,
+                        decision,
+                        evidence,
+                    ) {
                         expected_rejections += 1;
                     } else {
                         unexpected_failures += 1;
                     }
-                    let container = corpus_container_kind(&bytes);
-                    let extension_mismatch = corpus_extension_mismatch(&ext, container);
-                    let evidence = corpus_failure_evidence(kind, container, extension_mismatch);
                     *by_failure_kind.entry(kind.to_string()).or_default() += 1;
                     *by_failure_decision.entry(decision.to_string()).or_default() += 1;
                     *by_failure_evidence.entry(evidence.to_string()).or_default() += 1;
@@ -670,6 +748,10 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
                         container: container.to_string(),
                         extension_mismatch,
                         error: format!("parse: {err}"),
+                        expectation: entry
+                            .expected
+                            .as_ref()
+                            .map_or_else(|| "classification".to_string(), |value| value.summary()),
                     });
                 }
             },
@@ -678,12 +760,17 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
                 stats.failed += 1;
                 let kind = "read_error";
                 let decision = corpus_failure_decision(kind);
-                if corpus_failure_is_expected(decision) {
+                let evidence = corpus_failure_evidence(kind, "unreadable", false);
+                if corpus_failure_matches_expectation(
+                    entry.expected.as_ref(),
+                    kind,
+                    decision,
+                    evidence,
+                ) {
                     expected_rejections += 1;
                 } else {
                     unexpected_failures += 1;
                 }
-                let evidence = corpus_failure_evidence(kind, "unreadable", false);
                 *by_failure_kind.entry("read_error".to_string()).or_default() += 1;
                 *by_failure_decision.entry(decision.to_string()).or_default() += 1;
                 *by_failure_evidence.entry(evidence.to_string()).or_default() += 1;
@@ -696,6 +783,10 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
                     container: "unreadable".to_string(),
                     extension_mismatch: false,
                     error: format!("read: {err}"),
+                    expectation: entry
+                        .expected
+                        .as_ref()
+                        .map_or_else(|| "classification".to_string(), |value| value.summary()),
                 });
             }
         }
@@ -709,7 +800,18 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
     println!("failed: {failed}");
     println!("expected_rejections: {expected_rejections}");
     println!("unexpected_failures: {unexpected_failures}");
+    println!("unexpected_accepts: {}", unexpected_accepts.len());
     println!("skipped: {skipped}");
+    println!("formula_files: {formula_files}");
+    println!("formula_cells: {formula_cells}");
+    println!("evaluation_computed: {evaluation_computed}");
+    println!("evaluation_errors: {evaluation_errors}");
+    println!("evaluation_cached: {evaluation_cached}");
+    println!("evaluation_unsupported: {evaluation_unsupported}");
+    println!("evaluation_truncated_files: {evaluation_truncated_files}");
+    for (reason, count) in evaluation_by_reason {
+        println!("evaluation_by_reason: {reason} formulas={count}");
+    }
     println!("limit: {limit} failures");
     for (ext, stats) in by_ext {
         println!(
@@ -728,7 +830,7 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
     }
     for failure in failures.iter().take(limit) {
         println!(
-            "failure: {} {} kind={} decision={} evidence={} container={} extension_mismatch={} {}",
+            "failure: {} {} kind={} decision={} evidence={} container={} extension_mismatch={} {} expected={}",
             failure.ext,
             escape_dump_text(&failure.label),
             failure.kind,
@@ -736,12 +838,26 @@ fn corpus_report(manifest_path: &str, limit: usize) -> ExitCode {
             failure.evidence,
             failure.container,
             failure.extension_mismatch,
-            escape_dump_text(&failure.error)
+            escape_dump_text(&failure.error),
+            escape_dump_text(&failure.expectation)
         );
     }
-    println!("truncated: {}", failures.len() > limit);
+    for accepted in unexpected_accepts.iter().take(limit) {
+        println!(
+            "unexpected_accept: {} {} expected_kind={} expected_decision={} expected_evidence={}",
+            accepted.ext,
+            escape_dump_text(&accepted.label),
+            accepted.kind,
+            accepted.decision,
+            accepted.evidence
+        );
+    }
+    println!(
+        "truncated: {}",
+        failures.len() > limit || unexpected_accepts.len() > limit
+    );
 
-    if unexpected_failures == 0 {
+    if unexpected_failures == 0 && unexpected_accepts.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -929,19 +1045,23 @@ fn corpus_failure_kind(err: &Error) -> &'static str {
         Error::MissingWorkbook => "missing_workbook",
         Error::Biff(_) => "malformed_biff",
         Error::Zip(_) => "invalid_zip",
+        Error::UnsupportedCompression { .. } => "unsupported_zip_compression",
         Error::Xml(_) => "malformed_xml",
         Error::Encrypted => "unsupported_encrypted_workbook",
         Error::EncryptedPackage => "unsupported_encrypted_ooxml",
         Error::EncryptedOpenDocument => "unsupported_encrypted_opendocument",
         Error::NoText => "no_text",
         Error::SheetOutOfRange => "sheet_out_of_range",
+        _ => "other",
     }
 }
 
 fn corpus_failure_decision(kind: &str) -> &'static str {
     match kind {
         "invalid_cfb" | "invalid_zip" | "not_ole2" => "excluded_malformed_container",
+        "malformed_biff" | "malformed_xml" => "excluded_malformed_workbook",
         "legacy_biff" => "unsupported_legacy_biff",
+        "unsupported_zip_compression" => "unsupported_package_compression",
         "unsupported_encrypted_workbook"
         | "unsupported_encrypted_ooxml"
         | "unsupported_encrypted_opendocument" => "unsupported_encrypted",
@@ -953,8 +1073,31 @@ fn corpus_failure_decision(kind: &str) -> &'static str {
 fn corpus_failure_is_expected(decision: &str) -> bool {
     matches!(
         decision,
-        "excluded_malformed_container" | "unsupported_legacy_biff" | "unsupported_encrypted"
+        "excluded_malformed_container"
+            | "excluded_malformed_workbook"
+            | "unsupported_legacy_biff"
+            | "unsupported_package_compression"
+            | "unsupported_encrypted"
     )
+}
+
+fn corpus_failure_matches_expectation(
+    expectation: Option<&CorpusExpectation>,
+    kind: &str,
+    decision: &str,
+    evidence: &str,
+) -> bool {
+    match expectation {
+        None => corpus_failure_is_expected(decision),
+        Some(CorpusExpectation::Open) => false,
+        Some(CorpusExpectation::Reject {
+            kind: expected_kind,
+            decision: expected_decision,
+            evidence: expected_evidence,
+        }) => {
+            kind == expected_kind && decision == expected_decision && evidence == expected_evidence
+        }
+    }
 }
 
 fn corpus_container_kind(bytes: &[u8]) -> &'static str {
@@ -982,12 +1125,15 @@ fn corpus_failure_evidence(kind: &str, container: &str, extension_mismatch: bool
         ("invalid_zip", "zip", true) => "zip_signature_misleading_extension",
         ("invalid_zip", "zip", false) => "zip_signature_corrupt_container",
         ("invalid_cfb", "ole2", _) => "ole2_signature_corrupt_container",
+        ("malformed_biff", "ole2", _) => "biff_structure_invalid",
+        ("malformed_xml", "zip", _) => "spreadsheet_xml_invalid_or_over_budget",
         ("not_ole2", _, _) => "signature_mismatch_or_unknown_container",
         ("read_error", _, _) => "read_error",
         ("legacy_biff", "ole2", _) => "ole2_legacy_biff_stream",
         ("unsupported_encrypted_workbook", "ole2", _) => "ole2_encrypted_workbook",
         ("unsupported_encrypted_ooxml", _, _) => "encrypted_ooxml_package",
         ("unsupported_encrypted_opendocument", "zip", _) => "encrypted_opendocument_package",
+        ("unsupported_zip_compression", "zip", _) => "zip_compression_method_not_enabled",
         _ => "parser_or_support_classification",
     }
 }
@@ -2398,14 +2544,14 @@ fn parse_sheet_args(
 fn parse_csv_args(
     program: &str,
     args: &mut impl Iterator<Item = String>,
-) -> Result<(String, usize, char), ExitCode> {
+) -> Result<CsvCliArgs, ExitCode> {
     let Some(path) = args.next() else {
-        eprintln!("usage: {program} csv <file> [--sheet N] [--delimiter C]");
+        print_csv_usage(program);
         return Err(ExitCode::from(64));
     };
 
     let mut sheet = 0usize;
-    let mut delimiter = ',';
+    let mut options = CsvOptions::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--sheet" => {
@@ -2426,10 +2572,52 @@ fn parse_csv_args(
                     eprintln!("{program} csv: --delimiter requires one character");
                     return Err(ExitCode::from(64));
                 };
-                delimiter = match parse_csv_delimiter(&value) {
+                options.delimiter = match parse_csv_delimiter(&value) {
                     Some(delimiter) => delimiter,
                     None => {
                         eprintln!("{program} csv: invalid --delimiter value {value:?}");
+                        return Err(ExitCode::from(64));
+                    }
+                };
+            }
+            "--bom" => options.bom = true,
+            "--newline" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{program} csv: --newline requires lf or crlf");
+                    return Err(ExitCode::from(64));
+                };
+                options.newline = match value.as_str() {
+                    "lf" => CsvNewline::Lf,
+                    "crlf" => CsvNewline::CrLf,
+                    _ => {
+                        eprintln!("{program} csv: invalid --newline value {value:?}");
+                        return Err(ExitCode::from(64));
+                    }
+                };
+            }
+            "--formula-injection" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{program} csv: --formula-injection requires preserve or escape");
+                    return Err(ExitCode::from(64));
+                };
+                options.formula_policy = match value.as_str() {
+                    "preserve" => CsvFormulaPolicy::Preserve,
+                    "escape" => CsvFormulaPolicy::Escape,
+                    _ => {
+                        eprintln!("{program} csv: invalid --formula-injection value {value:?}");
+                        return Err(ExitCode::from(64));
+                    }
+                };
+            }
+            "--max-output-bytes" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{program} csv: --max-output-bytes requires a byte count");
+                    return Err(ExitCode::from(64));
+                };
+                options.max_output_bytes = match value.parse() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        eprintln!("{program} csv: invalid --max-output-bytes value {value:?}");
                         return Err(ExitCode::from(64));
                     }
                 };
@@ -2441,7 +2629,23 @@ fn parse_csv_args(
         }
     }
 
-    Ok((path, sheet, delimiter))
+    Ok(CsvCliArgs {
+        path,
+        sheet,
+        options,
+    })
+}
+
+struct CsvCliArgs {
+    path: String,
+    sheet: usize,
+    options: CsvOptions,
+}
+
+fn print_csv_usage(program: &str) {
+    eprintln!(
+        "usage: {program} csv <file> [--sheet N] [--delimiter C] [--newline lf|crlf] [--bom] [--formula-injection preserve|escape] [--max-output-bytes N]"
+    );
 }
 
 fn parse_csv_delimiter(value: &str) -> Option<char> {
@@ -2456,7 +2660,7 @@ fn parse_csv_delimiter(value: &str) -> Option<char> {
             delimiter
         }
     };
-    if matches!(delimiter, '\n' | '\r') {
+    if matches!(delimiter, '"' | '\n' | '\r') {
         None
     } else {
         Some(delimiter)
@@ -2538,22 +2742,58 @@ fn parse_compare_args(
     Ok((left, right, limit))
 }
 
-fn print_usage(program: &str) {
-    eprintln!("usage: {program} <command> <file>");
-    eprintln!("commands:");
-    eprintln!("  --version              print binary version");
-    eprintln!("  info <file>            summarize workbook sheets and metadata");
-    eprintln!("  dump <file>            print bounded sheet cells");
-    eprintln!("  csv <file>             export one sheet as CSV");
-    eprintln!("  sheet <file>           summarize one sheet metadata surface");
-    eprintln!("  formula <file>         print bounded formula cells");
-    eprintln!("  diagnose <file>        print JSON workbook diagnostics");
-    eprintln!("  metadata <file>        print workbook metadata");
-    eprintln!("  inspect-package <file> inspect ZIP package parts");
-    eprintln!("  inspect-output <file>  inspect generated writer .xlsx parts");
-    eprintln!("  compare <left> <right> compare workbook structure and cells");
-    eprintln!("  corpus-report <file>   summarize a public corpus manifest");
-    eprintln!("  fixture-report <file>  validate a committed fixture manifest");
+fn print_usage(mut output: impl IoWrite, program: &str) -> std::io::Result<()> {
+    writeln!(output, "usage: {program} <command> <file>")?;
+    writeln!(output, "commands:")?;
+    writeln!(output, "  --version              print binary version")?;
+    writeln!(
+        output,
+        "  info <file>            summarize workbook sheets and metadata"
+    )?;
+    writeln!(output, "  dump <file>            print bounded sheet cells")?;
+    writeln!(
+        output,
+        "  csv <file>             export one sheet as bounded CSV"
+    )?;
+    writeln!(
+        output,
+        "  sheet <file>           summarize one sheet metadata surface"
+    )?;
+    writeln!(
+        output,
+        "  formula <file>         print bounded formula cells"
+    )?;
+    writeln!(
+        output,
+        "  diagnose <file>        print JSON workbook diagnostics"
+    )?;
+    writeln!(output, "  metadata <file>        print workbook metadata")?;
+    writeln!(output, "  inspect-package <file> inspect ZIP package parts")?;
+    writeln!(
+        output,
+        "  inspect-output <file>  inspect generated writer .xlsx parts"
+    )?;
+    writeln!(
+        output,
+        "  compare <left> <right> compare workbook structure and cells"
+    )?;
+    writeln!(
+        output,
+        "  corpus-report <file>   summarize a public corpus manifest"
+    )?;
+    writeln!(
+        output,
+        "  fixture-report <file>  validate a committed fixture manifest"
+    )?;
+    Ok(())
+}
+
+fn usage_status(output: impl IoWrite, program: &str, normal_status: u8) -> u8 {
+    if print_usage(output, program).is_ok() {
+        normal_status
+    } else {
+        74
+    }
 }
 
 #[derive(Default)]
@@ -2572,12 +2812,44 @@ struct CorpusFailure {
     container: String,
     extension_mismatch: bool,
     error: String,
+    expectation: String,
+}
+
+struct CorpusUnexpectedAccept {
+    ext: String,
+    label: String,
+    kind: String,
+    decision: String,
+    evidence: String,
 }
 
 struct CorpusEntry {
     path: String,
     local_path: Option<String>,
     status: Option<String>,
+    expected: Option<CorpusExpectation>,
+}
+
+enum CorpusExpectation {
+    Open,
+    Reject {
+        kind: String,
+        decision: String,
+        evidence: String,
+    },
+}
+
+impl CorpusExpectation {
+    fn summary(&self) -> String {
+        match self {
+            Self::Open => "open".to_string(),
+            Self::Reject {
+                kind,
+                decision,
+                evidence,
+            } => format!("reject:{kind}:{decision}:{evidence}"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2679,15 +2951,44 @@ fn parse_corpus_manifest(manifest: &str) -> Result<Vec<CorpusEntry>, String> {
     let files = json_array_for_key(manifest, "files")
         .ok_or_else(|| "manifest missing top-level files array".to_string())?;
     let objects = json_objects_in_array(files)?;
-    let entries = objects
-        .into_iter()
-        .map(|object| CorpusEntry {
+    let mut entries = Vec::with_capacity(objects.len());
+    for (index, object) in objects.into_iter().enumerate() {
+        entries.push(CorpusEntry {
             path: json_string_field(object, "path").unwrap_or_default(),
             local_path: json_string_field(object, "local_path"),
             status: json_string_field(object, "status"),
-        })
-        .collect();
+            expected: parse_corpus_expectation(object, index)?,
+        });
+    }
     Ok(entries)
+}
+
+fn parse_corpus_expectation(
+    object: &str,
+    index: usize,
+) -> Result<Option<CorpusExpectation>, String> {
+    let Some(expected) = json_object_field(object, "expected") else {
+        if object.contains("\"expected\"") {
+            return Err(format!("file[{index}] expected must be an object"));
+        }
+        return Ok(None);
+    };
+    let outcome = json_string_field(expected, "outcome")
+        .ok_or_else(|| format!("file[{index}] expected missing outcome"))?;
+    match outcome.as_str() {
+        "open" => Ok(Some(CorpusExpectation::Open)),
+        "reject" => Ok(Some(CorpusExpectation::Reject {
+            kind: json_string_field(expected, "kind")
+                .ok_or_else(|| format!("file[{index}] reject expectation missing kind"))?,
+            decision: json_string_field(expected, "decision")
+                .ok_or_else(|| format!("file[{index}] reject expectation missing decision"))?,
+            evidence: json_string_field(expected, "evidence")
+                .ok_or_else(|| format!("file[{index}] reject expectation missing evidence"))?,
+        })),
+        _ => Err(format!(
+            "file[{index}] expected outcome must be open or reject, found {outcome:?}"
+        )),
+    }
 }
 
 fn parse_fixture_manifest(manifest: &str) -> Result<Vec<FixtureEntry>, String> {
@@ -3444,5 +3745,54 @@ impl Comparison {
         } else {
             self.truncated = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        corpus_failure_decision, corpus_failure_evidence, corpus_failure_is_expected, usage_status,
+    };
+    use std::io;
+
+    struct FailingWriter;
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed stdout"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn usage_status_maps_output_failure_to_exit_74_without_changing_normal_status() {
+        let mut output = Vec::new();
+        assert_eq!(usage_status(&mut output, "rxls", 0), 0);
+        assert!(output.starts_with(b"usage: rxls <command> <file>\n"));
+        output.clear();
+        assert_eq!(usage_status(&mut output, "rxls", 64), 64);
+        assert!(output.starts_with(b"usage: rxls <command> <file>\n"));
+        assert_eq!(usage_status(FailingWriter, "rxls", 0), 74);
+        assert_eq!(usage_status(FailingWriter, "rxls", 64), 74);
+    }
+
+    #[test]
+    fn malformed_workbook_structures_are_expected_rejections() {
+        for kind in ["malformed_biff", "malformed_xml"] {
+            let decision = corpus_failure_decision(kind);
+            assert_eq!(decision, "excluded_malformed_workbook");
+            assert!(corpus_failure_is_expected(decision));
+        }
+        assert_eq!(
+            corpus_failure_evidence("malformed_biff", "ole2", false),
+            "biff_structure_invalid"
+        );
+        assert_eq!(
+            corpus_failure_evidence("malformed_xml", "zip", false),
+            "spreadsheet_xml_invalid_or_over_budget"
+        );
     }
 }

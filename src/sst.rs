@@ -160,6 +160,14 @@ pub(crate) fn read_continued_plain(chunks: &[&[u8]], skip: usize) -> Option<Stri
     cur.read_plain()
 }
 
+/// Read one `XLUnicodeRichExtendedString` outside the SST (for BIFF8
+/// `RSTRING`), including its optional rich/phonetic headers and trailing data.
+pub(crate) fn read_continued_rich(chunks: &[&[u8]], skip: usize) -> Option<String> {
+    let mut cur = Cursor::new(chunks);
+    cur.skip(skip);
+    cur.read_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,9 +16,10 @@ use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
 use crate::{
-    format, Cell, CellEntry, CfRule, Chart, ChartKind, Color, Comment, CondFormat, DataValidation,
-    DocProperties, DvKind, DvOp, Image, ImageFmt, PageSetup, ProtectionOptions, Series, Sheet,
-    SheetType, Sparkline, SparklineKind, Table, Workbook,
+    format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
+    Chart, ChartKind, Color, Comment, CondFormat, DataValidation, DocProperties, DvKind, DvOp,
+    Fill, Font, FormatPattern, FormatScript, HAlign, Image, ImageFmt, PageSetup, ProtectionOptions,
+    Series, Sheet, SheetType, Sparkline, SparklineKind, Table, VAlign, Workbook,
 };
 
 /// Detect the ZIP/OOXML magic (`PK\x03\x04`).
@@ -29,6 +30,7 @@ pub(crate) fn is_xlsx(bytes: &[u8]) -> bool {
 pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| Error::Zip("not a valid spreadsheet ZIP container"))?;
+    crate::ziputil::validate_compression(&mut zip)?;
 
     let mut workbook_path =
         office_document_path(&mut zip).unwrap_or_else(|| "xl/workbook.xml".to_string());
@@ -43,7 +45,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let workbook_rels_xml = part(&mut zip, &sheet_rels_path(&workbook_path)).unwrap_or_default();
     let rels = parse_rels(&workbook_rels_xml);
     let rel_types = parse_rel_types(&workbook_rels_xml);
-    let shared =
+    let shared_xml =
         workbook_related_part(&mut zip, &workbook_path, &rels, &rel_types, "sharedStrings")
             .or_else(|| {
                 part(
@@ -51,7 +53,6 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
                     &normalize_part_target(&workbook_path, "sharedStrings.xml"),
                 )
             })
-            .map(|s| parse_shared_strings(&s))
             .unwrap_or_default();
     let theme = workbook_related_part(&mut zip, &workbook_path, &rels, &rel_types, "theme")
         .or_else(|| {
@@ -71,6 +72,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         })
         .map(|s| parse_styles(&s, &theme))
         .unwrap_or_default();
+    let shared = parse_shared_strings(&shared_xml, &theme, &styles.indexed_colors);
     let parsed = parse_workbook(&workbook_xml);
     let ParsedWorkbook {
         sheets: sheet_refs,
@@ -78,6 +80,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         structure_protected,
         active_sheet,
         defined_names,
+        local_defined_names,
         sheet_defined_names,
     } = parsed;
     let properties = parse_doc_properties(
@@ -125,6 +128,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         };
         let ParsedSheet {
             cells,
+            rich,
             merges,
             hyperlink_refs,
             freeze,
@@ -138,6 +142,12 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             print_headings,
             row_outline,
             col_outline,
+            col_widths,
+            row_heights,
+            hidden_cols,
+            hidden_rows,
+            default_row_height,
+            default_col_width,
             collapsed_rows,
             outline_summary_below,
             outline_summary_right,
@@ -209,6 +219,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             is_worksheet,
             sheet_type: Some(sheet_type),
             cells,
+            rich,
             read_merges: merges,
             read_hyperlinks,
             comments,
@@ -226,6 +237,12 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             print_headings,
             row_outline,
             col_outline,
+            col_widths,
+            row_heights,
+            hidden_cols,
+            hidden_rows,
+            default_row_height,
+            default_col_width,
             collapsed_rows,
             outline_summary_below: outline_summary_below.unwrap_or(true),
             outline_summary_right: outline_summary_right.unwrap_or(true),
@@ -248,6 +265,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         text_truncated: budget == 0,
         properties,
         defined_names,
+        local_defined_names,
         ..Default::default()
     })
 }
@@ -350,6 +368,8 @@ struct Styles {
     indexed_colors: Vec<Color>,
     /// Solid fill color per `dxfs` index, used by conditional formatting rules.
     dxf_fills: Vec<Option<Color>>,
+    /// Common public style subset per `cellXfs` index.
+    cell_styles: Vec<CellStyle>,
 }
 
 impl Styles {
@@ -360,6 +380,10 @@ impl Styles {
 
     fn dxf_fill(&self, dxf_id: usize) -> Option<Color> {
         self.dxf_fills.get(dxf_id).copied().flatten()
+    }
+
+    fn cell_style(&self, style_idx: usize) -> Option<&CellStyle> {
+        self.cell_styles.get(style_idx)
     }
 }
 
@@ -715,13 +739,20 @@ pub(crate) fn parse_doc_properties(core_xml: Option<&str>, app_xml: Option<&str>
     props
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SharedString {
+    text: String,
+    runs: Vec<crate::TextRun>,
+}
+
 /// `<sst><si>…<t>text</t>…</si>` — concatenate `<t>` runs within each `<si>`,
 /// but skip `<rPh>` (East Asian phonetic / ruby guide) text, which is not part of
 /// the displayed string.
-fn parse_shared_strings(xml: &str) -> Vec<String> {
+fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<SharedString> {
     let mut r = Reader::from_str(xml);
     let mut out = Vec::new();
-    let mut cur = String::new();
+    let mut cur = SharedString::default();
+    let mut run: Option<crate::TextRun> = None;
     let mut in_si = false;
     let mut in_t = false;
     let mut in_rph = false;
@@ -730,32 +761,103 @@ fn parse_shared_strings(xml: &str) -> Vec<String> {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
                 b"si" => {
                     in_si = true;
-                    cur.clear();
+                    cur = SharedString::default();
                 }
+                b"r" if in_si && !in_rph => run = Some(crate::TextRun::default()),
                 b"rPh" => in_rph = true,
                 b"t" => in_t = true,
+                b"rFont" if run.is_some() => {
+                    run.as_mut().expect("run").font.name = attr(&e, b"val");
+                }
+                b"sz" if run.is_some() => {
+                    run.as_mut().expect("run").font.size_pt = attr(&e, b"val")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                }
+                b"color" if run.is_some() => {
+                    run.as_mut().expect("run").font.color = color_attr(&e, theme, indexed);
+                }
+                b"b" if run.is_some() => run.as_mut().expect("run").font.bold = true,
+                b"i" if run.is_some() => run.as_mut().expect("run").font.italic = true,
+                b"u" if run.is_some() => run.as_mut().expect("run").font.underline = true,
+                b"strike" if run.is_some() => {
+                    run.as_mut().expect("run").font.strikethrough = true;
+                }
+                b"vertAlign" if run.is_some() => {
+                    run.as_mut().expect("run").font.script = match attr(&e, b"val").as_deref() {
+                        Some("superscript") => FormatScript::Superscript,
+                        Some("subscript") => FormatScript::Subscript,
+                        _ => FormatScript::None,
+                    };
+                }
                 _ => {}
             },
             // A self-closing `<si/>` is an empty string — it must still occupy an
             // index slot, or every later shared-string reference shifts.
             Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"si" => {
-                out.push(String::new());
+                out.push(SharedString::default());
+            }
+            Ok(Event::Empty(e)) if in_si && run.is_some() => {
+                let font = &mut run.as_mut().expect("run").font;
+                match local(e.name().as_ref()) {
+                    b"rFont" => font.name = attr(&e, b"val"),
+                    b"sz" => {
+                        font.size_pt = attr(&e, b"val")
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                    }
+                    b"color" => font.color = color_attr(&e, theme, indexed),
+                    b"b" => font.bold = true,
+                    b"i" => font.italic = true,
+                    b"u" => font.underline = true,
+                    b"strike" => font.strikethrough = true,
+                    b"vertAlign" => {
+                        font.script = match attr(&e, b"val").as_deref() {
+                            Some("superscript") => FormatScript::Superscript,
+                            Some("subscript") => FormatScript::Subscript,
+                            _ => FormatScript::None,
+                        };
+                    }
+                    _ => {}
+                }
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
                 b"si" => {
                     in_si = false;
                     out.push(std::mem::take(&mut cur));
                 }
+                b"r" if run.is_some() => {
+                    let completed = run.take().expect("run");
+                    if !completed.text.is_empty() {
+                        cur.runs.push(completed);
+                    }
+                }
                 b"rPh" => in_rph = false,
                 b"t" => in_t = false,
                 _ => {}
             },
-            Ok(Event::Text(t)) if in_si && in_t && !in_rph => cur.push_str(&text_of(&t)),
+            Ok(Event::Text(t)) if in_si && in_t && !in_rph => {
+                let text = text_of(&t);
+                cur.text.push_str(&text);
+                if let Some(run) = run.as_mut() {
+                    run.text.push_str(&text);
+                }
+            }
             Ok(Event::GeneralRef(reference)) if in_si && in_t && !in_rph => {
-                append_general_ref(&mut cur, &reference);
+                with_general_ref_text(&reference, |text| {
+                    cur.text.push_str(text);
+                    if let Some(run) = run.as_mut() {
+                        run.text.push_str(text);
+                    }
+                });
             }
             Ok(Event::CData(t)) if in_si && in_t && !in_rph => {
-                cur.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                let bytes = t.into_inner();
+                let text = String::from_utf8_lossy(bytes.as_ref());
+                cur.text.push_str(&text);
+                if let Some(run) = run.as_mut() {
+                    run.text.push_str(&text);
+                }
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -830,6 +932,357 @@ fn parse_styles(xml: &str, theme: &ThemeColors) -> Styles {
             _ => {}
         }
     }
+    styles.cell_styles = parse_cell_styles(xml, theme, &styles.indexed_colors, &styles.custom);
+    styles
+}
+
+fn parse_font_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Font> {
+    let mut reader = Reader::from_str(xml);
+    let mut in_fonts = false;
+    let mut current: Option<Font> = None;
+    let mut fonts = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"fonts" => in_fonts = true,
+                b"font" if in_fonts => {
+                    if current.is_some() {
+                        fonts.push(current.take().unwrap_or_default());
+                    }
+                    current = Some(Font::default());
+                    if e.is_empty() {
+                        fonts.push(current.take().unwrap_or_default());
+                    }
+                }
+                b"name" if current.is_some() => {
+                    current.as_mut().expect("font").name = attr(&e, b"val");
+                }
+                b"sz" if current.is_some() => {
+                    current.as_mut().expect("font").size_pt = attr(&e, b"val")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                }
+                b"color" if current.is_some() => {
+                    current.as_mut().expect("font").color = color_attr(&e, theme, indexed);
+                }
+                b"b" if current.is_some() => current.as_mut().expect("font").bold = true,
+                b"i" if current.is_some() => current.as_mut().expect("font").italic = true,
+                b"u" if current.is_some() => current.as_mut().expect("font").underline = true,
+                b"strike" if current.is_some() => {
+                    current.as_mut().expect("font").strikethrough = true;
+                }
+                b"vertAlign" if current.is_some() => {
+                    current.as_mut().expect("font").script = match attr(&e, b"val").as_deref() {
+                        Some("superscript") => FormatScript::Superscript,
+                        Some("subscript") => FormatScript::Subscript,
+                        _ => FormatScript::None,
+                    };
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"font" && current.is_some() => {
+                fonts.push(current.take().unwrap_or_default());
+            }
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"fonts" => in_fonts = false,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    fonts
+}
+
+fn format_pattern(value: Option<&str>) -> FormatPattern {
+    match value.unwrap_or("none") {
+        "solid" => FormatPattern::Solid,
+        "mediumGray" => FormatPattern::MediumGray,
+        "darkGray" => FormatPattern::DarkGray,
+        "lightGray" => FormatPattern::LightGray,
+        "darkHorizontal" => FormatPattern::DarkHorizontal,
+        "darkVertical" => FormatPattern::DarkVertical,
+        "darkDown" => FormatPattern::DarkDown,
+        "darkUp" => FormatPattern::DarkUp,
+        "darkGrid" => FormatPattern::DarkGrid,
+        "darkTrellis" => FormatPattern::DarkTrellis,
+        "lightHorizontal" => FormatPattern::LightHorizontal,
+        "lightVertical" => FormatPattern::LightVertical,
+        "lightDown" => FormatPattern::LightDown,
+        "lightUp" => FormatPattern::LightUp,
+        "lightGrid" => FormatPattern::LightGrid,
+        "lightTrellis" => FormatPattern::LightTrellis,
+        "gray125" => FormatPattern::Gray125,
+        "gray0625" => FormatPattern::Gray0625,
+        _ => FormatPattern::None,
+    }
+}
+
+fn parse_fill_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fill> {
+    let mut reader = Reader::from_str(xml);
+    let mut in_fills = false;
+    let mut current: Option<Fill> = None;
+    let mut fills = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"fills" => in_fills = true,
+                b"fill" if in_fills => {
+                    current = Some(Fill::default());
+                    if e.is_empty() {
+                        fills.push(current.take().unwrap_or_default());
+                    }
+                }
+                b"patternFill" if current.is_some() => {
+                    current.as_mut().expect("fill").pattern =
+                        format_pattern(attr(&e, b"patternType").as_deref());
+                }
+                b"fgColor" if current.is_some() => {
+                    current.as_mut().expect("fill").foreground = color_attr(&e, theme, indexed);
+                }
+                b"bgColor" if current.is_some() => {
+                    current.as_mut().expect("fill").background = color_attr(&e, theme, indexed);
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"fill" && current.is_some() => {
+                fills.push(current.take().unwrap_or_default());
+            }
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"fills" => in_fills = false,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    fills
+}
+
+#[derive(Clone, Copy)]
+enum BorderEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn border_style(value: Option<&str>) -> BorderStyle {
+    match value.unwrap_or("none") {
+        "thin" | "hair" | "dotted" | "dashed" | "dashDot" | "dashDotDot" => BorderStyle::Thin,
+        "medium" | "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" => BorderStyle::Medium,
+        "thick" | "slantDashDot" => BorderStyle::Thick,
+        "double" => BorderStyle::Double,
+        _ => BorderStyle::None,
+    }
+}
+
+fn set_border_edge(border: &mut Border, edge: BorderEdge, style: BorderStyle) {
+    match edge {
+        BorderEdge::Left => border.left = style,
+        BorderEdge::Right => border.right = style,
+        BorderEdge::Top => border.top = style,
+        BorderEdge::Bottom => border.bottom = style,
+    }
+}
+
+fn set_border_color(border: &mut Border, edge: BorderEdge, color: Color) {
+    match edge {
+        BorderEdge::Left => border.left_color = Some(color),
+        BorderEdge::Right => border.right_color = Some(color),
+        BorderEdge::Top => border.top_color = Some(color),
+        BorderEdge::Bottom => border.bottom_color = Some(color),
+    }
+}
+
+fn parse_border_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Border> {
+    let mut reader = Reader::from_str(xml);
+    let mut in_borders = false;
+    let mut current: Option<Border> = None;
+    let mut edge = None;
+    let mut borders = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"borders" => in_borders = true,
+                b"border" if in_borders => {
+                    current = Some(Border::default());
+                    if e.is_empty() {
+                        borders.push(current.take().unwrap_or_default());
+                    }
+                }
+                b"left" | b"right" | b"top" | b"bottom" if current.is_some() => {
+                    let selected = match local(e.name().as_ref()) {
+                        b"left" => BorderEdge::Left,
+                        b"right" => BorderEdge::Right,
+                        b"top" => BorderEdge::Top,
+                        _ => BorderEdge::Bottom,
+                    };
+                    set_border_edge(
+                        current.as_mut().expect("border"),
+                        selected,
+                        border_style(attr(&e, b"style").as_deref()),
+                    );
+                    edge = (!e.is_empty()).then_some(selected);
+                }
+                b"color" if current.is_some() && edge.is_some() => {
+                    if let Some(color) = color_attr(&e, theme, indexed) {
+                        set_border_color(
+                            current.as_mut().expect("border"),
+                            edge.expect("edge"),
+                            color,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e))
+                if matches!(
+                    local(e.name().as_ref()),
+                    b"left" | b"right" | b"top" | b"bottom"
+                ) =>
+            {
+                edge = None
+            }
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"border" && current.is_some() => {
+                borders.push(current.take().unwrap_or_default());
+            }
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"borders" => in_borders = false,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    borders
+}
+
+fn built_in_num_fmt(id: u16) -> Option<&'static str> {
+    match id {
+        1 => Some("0"),
+        2 => Some("0.00"),
+        3 => Some("#,##0"),
+        4 => Some("#,##0.00"),
+        9 => Some("0%"),
+        10 => Some("0.00%"),
+        11 => Some("0.00E+00"),
+        14 => Some("mm-dd-yy"),
+        20 => Some("h:mm"),
+        21 => Some("h:mm:ss"),
+        22 => Some("m/d/yy h:mm"),
+        49 => Some("@"),
+        _ => None,
+    }
+}
+
+fn parse_alignment(e: &quick_xml::events::BytesStart<'_>) -> Alignment {
+    let horizontal = match attr(e, b"horizontal").as_deref() {
+        Some("left") => Some(HAlign::Left),
+        Some("center" | "centerContinuous" | "distributed") => Some(HAlign::Center),
+        Some("right") => Some(HAlign::Right),
+        _ => None,
+    };
+    let vertical = match attr(e, b"vertical").as_deref() {
+        Some("top") => Some(VAlign::Top),
+        Some("center" | "distributed" | "justify") => Some(VAlign::Middle),
+        Some("bottom") => Some(VAlign::Bottom),
+        _ => None,
+    };
+    let raw_rotation = attr(e, b"textRotation")
+        .and_then(|value| value.parse::<i16>().ok())
+        .unwrap_or(0);
+    let rotation = if (91..=180).contains(&raw_rotation) {
+        90 - raw_rotation
+    } else if raw_rotation <= 90 {
+        raw_rotation
+    } else {
+        0
+    };
+    Alignment {
+        horizontal,
+        vertical,
+        wrap: attr(e, b"wrapText").as_deref().is_some_and(attr_true),
+        rotation,
+        indent: attr(e, b"indent")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0),
+        shrink_to_fit: attr(e, b"shrinkToFit").as_deref().is_some_and(attr_true),
+    }
+}
+
+fn cell_style_from_xf(
+    e: &quick_xml::events::BytesStart<'_>,
+    fonts: &[Font],
+    fills: &[Fill],
+    borders: &[Border],
+    custom: &HashMap<u16, String>,
+) -> CellStyle {
+    let num_fmt_id = attr(e, b"numFmtId")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let font_id = attr(e, b"fontId").and_then(|value| value.parse::<usize>().ok());
+    let fill_id = attr(e, b"fillId").and_then(|value| value.parse::<usize>().ok());
+    let border_id = attr(e, b"borderId").and_then(|value| value.parse::<usize>().ok());
+    CellStyle {
+        font: font_id.and_then(|id| fonts.get(id).cloned()),
+        fill: None,
+        pattern_fill: fill_id.and_then(|id| fills.get(id).copied()),
+        border: border_id.and_then(|id| borders.get(id).cloned()),
+        num_fmt: custom
+            .get(&num_fmt_id)
+            .cloned()
+            .or_else(|| built_in_num_fmt(num_fmt_id).map(str::to_string)),
+        align: None,
+        protection: None,
+    }
+}
+
+fn parse_cell_styles(
+    xml: &str,
+    theme: &ThemeColors,
+    indexed: &[Color],
+    custom: &HashMap<u16, String>,
+) -> Vec<CellStyle> {
+    let fonts = parse_font_table(xml, theme, indexed);
+    let fills = parse_fill_table(xml, theme, indexed);
+    let borders = parse_border_table(xml, theme, indexed);
+    let mut reader = Reader::from_str(xml);
+    let mut in_cell_xfs = false;
+    let mut current: Option<CellStyle> = None;
+    let mut styles = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match local(e.name().as_ref()) {
+                b"cellXfs" => in_cell_xfs = true,
+                b"xf" if in_cell_xfs => {
+                    current = Some(cell_style_from_xf(&e, &fonts, &fills, &borders, custom));
+                }
+                b"alignment" if current.is_some() => {
+                    current.as_mut().expect("xf").align = Some(parse_alignment(&e));
+                }
+                b"protection" if current.is_some() => {
+                    current.as_mut().expect("xf").protection = Some(CellProtection {
+                        locked: attr(&e, b"locked").as_deref().and_then(parse_bool_attr),
+                        hidden: attr(&e, b"hidden").as_deref().is_some_and(attr_true),
+                    });
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"xf" if in_cell_xfs => {
+                    styles.push(cell_style_from_xf(&e, &fonts, &fills, &borders, custom));
+                }
+                b"alignment" if current.is_some() => {
+                    current.as_mut().expect("xf").align = Some(parse_alignment(&e));
+                }
+                b"protection" if current.is_some() => {
+                    current.as_mut().expect("xf").protection = Some(CellProtection {
+                        locked: attr(&e, b"locked").as_deref().and_then(parse_bool_attr),
+                        hidden: attr(&e, b"hidden").as_deref().is_some_and(attr_true),
+                    });
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"xf" && current.is_some() => {
+                styles.push(current.take().unwrap_or_default());
+            }
+            Ok(Event::End(e)) if local(e.name().as_ref()) == b"cellXfs" => in_cell_xfs = false,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
     styles
 }
 
@@ -868,11 +1321,13 @@ struct ParsedWorkbook {
     structure_protected: bool,
     active_sheet: Option<usize>,
     defined_names: Vec<(String, String)>,
+    local_defined_names: Vec<crate::LocalDefinedName>,
     sheet_defined_names: Vec<SheetDefinedName>,
 }
 
 enum DefinedNameCapture {
     GlobalUser(String),
+    LocalUser { local_sheet_id: usize, name: String },
     LocalBuiltin { local_sheet_id: usize, name: String },
 }
 
@@ -888,6 +1343,7 @@ fn parse_workbook(xml: &str) -> ParsedWorkbook {
     let mut structure_protected = false;
     let mut active_sheet = None;
     let mut defined_names = Vec::new();
+    let mut raw_local_defined_names = Vec::new();
     let mut sheet_defined_names = Vec::new();
     // Open `<definedName>` capture: (name, accumulated refers-to text).
     let mut cur_name: Option<DefinedNameCapture> = None;
@@ -943,6 +1399,12 @@ fn parse_workbook(xml: &str) -> ParsedWorkbook {
                                 name: n,
                             })
                         }
+                        (Some(n), Some(local_sheet_id)) if !n.starts_with("_xlnm.") => {
+                            Some(DefinedNameCapture::LocalUser {
+                                local_sheet_id,
+                                name: n,
+                            })
+                        }
                         _ => None,
                     };
                     cur_refers.clear();
@@ -959,6 +1421,14 @@ fn parse_workbook(xml: &str) -> ParsedWorkbook {
                         DefinedNameCapture::GlobalUser(name) => {
                             defined_names.push((name, std::mem::take(&mut cur_refers)));
                         }
+                        DefinedNameCapture::LocalUser {
+                            local_sheet_id,
+                            name,
+                        } => raw_local_defined_names.push((
+                            local_sheet_id,
+                            name,
+                            std::mem::take(&mut cur_refers),
+                        )),
                         DefinedNameCapture::LocalBuiltin {
                             local_sheet_id,
                             name,
@@ -976,12 +1446,25 @@ fn parse_workbook(xml: &str) -> ParsedWorkbook {
             _ => {}
         }
     }
+    let local_defined_names = raw_local_defined_names
+        .into_iter()
+        .filter_map(|(sheet_index, name, refers_to)| {
+            sheets
+                .get(sheet_index)
+                .map(|sheet| crate::LocalDefinedName {
+                    sheet: sheet.name.clone(),
+                    name,
+                    refers_to,
+                })
+        })
+        .collect();
     ParsedWorkbook {
         sheets,
         date1904,
         structure_protected,
         active_sheet,
         defined_names,
+        local_defined_names,
         sheet_defined_names,
     }
 }
@@ -2048,6 +2531,7 @@ fn shift_formula(f: &str, drow: i64, dcol: i64) -> String {
 #[derive(Debug, Default)]
 struct ParsedSheet {
     cells: Vec<CellEntry>,
+    rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
     merges: Vec<(u32, u16, u32, u16)>,
     hyperlink_refs: Vec<(u32, u16, String)>,
     freeze: Option<(u32, u16)>,
@@ -2061,6 +2545,12 @@ struct ParsedSheet {
     print_headings: bool,
     row_outline: BTreeMap<u32, u8>,
     col_outline: BTreeMap<u16, u8>,
+    col_widths: BTreeMap<u16, f32>,
+    row_heights: BTreeMap<u32, f32>,
+    hidden_cols: BTreeSet<u16>,
+    hidden_rows: BTreeSet<u32>,
+    default_row_height: Option<f32>,
+    default_col_width: Option<f32>,
     collapsed_rows: BTreeSet<u32>,
     outline_summary_below: Option<bool>,
     outline_summary_right: Option<bool>,
@@ -2172,7 +2662,7 @@ impl PendingCfRule {
 
 fn parse_sheet(
     xml: &str,
-    shared: &[String],
+    shared: &[SharedString],
     styles: &Styles,
     theme: &ThemeColors,
     date1904: bool,
@@ -2191,6 +2681,8 @@ fn parse_sheet(
     let mut value = String::new();
     let mut inline_value = String::new();
     let mut inline_text_seen = false;
+    let mut inline_run: Option<crate::TextRun> = None;
+    let mut inline_runs = Vec::<crate::TextRun>::new();
     let mut formula = String::new();
     // Shared-formula state: si → (master formula text, base row, base col).
     let mut shared_masters: HashMap<u32, (String, u32, u16)> = HashMap::new();
@@ -2282,6 +2774,18 @@ fn parse_sheet(
                     if attr(&e, b"collapsed").as_deref().is_some_and(attr_true) {
                         parsed.collapsed_rows.insert(cur_row);
                     }
+                    if let Some(height) = attr(&e, b"ht").and_then(|s| s.parse::<f32>().ok()) {
+                        parsed.row_heights.insert(cur_row, height);
+                    }
+                    if attr(&e, b"hidden").as_deref().is_some_and(attr_true) {
+                        parsed.hidden_rows.insert(cur_row);
+                    }
+                }
+                b"sheetFormatPr" => {
+                    parsed.default_row_height =
+                        attr(&e, b"defaultRowHeight").and_then(|s| s.parse::<f32>().ok());
+                    parsed.default_col_width =
+                        attr(&e, b"defaultColWidth").and_then(|s| s.parse::<f32>().ok());
                 }
                 b"outlinePr" => {
                     if let Some(value) = attr(&e, b"summaryBelow")
@@ -2298,18 +2802,32 @@ fn parse_sheet(
                     }
                 }
                 b"col" => {
+                    let first = attr(&e, b"min")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    let last = attr(&e, b"max")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(first)
+                        .min(16_384);
+                    if first <= last {
+                        let width = attr(&e, b"width").and_then(|s| s.parse::<f32>().ok());
+                        let hidden = attr(&e, b"hidden").as_deref().is_some_and(attr_true);
+                        for col in first..=last {
+                            if let Ok(col) = u16::try_from(col - 1) {
+                                if let Some(width) = width {
+                                    parsed.col_widths.insert(col, width);
+                                }
+                                if hidden {
+                                    parsed.hidden_cols.insert(col);
+                                }
+                            }
+                        }
+                    }
                     if let Some(level) = attr(&e, b"outlineLevel")
                         .and_then(|s| s.parse::<u8>().ok())
                         .filter(|level| *level > 0)
                     {
-                        let first = attr(&e, b"min")
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(1)
-                            .max(1);
-                        let last = attr(&e, b"max")
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(first)
-                            .min(16_384);
                         if first <= last {
                             for col in first..=last {
                                 if let Ok(col) = u16::try_from(col - 1) {
@@ -2395,6 +2913,8 @@ fn parse_sheet(
                     value.clear();
                     inline_value.clear();
                     inline_text_seen = false;
+                    inline_run = None;
+                    inline_runs.clear();
                     formula.clear();
                     f_si = None;
                     f_array_ref = None;
@@ -2424,6 +2944,39 @@ fn parse_sheet(
                     };
                 }
                 b"rPh" => in_rph = true, // phonetic/ruby guide in an inline string
+                b"r" if ctype == "inlineStr" && rc.is_some() && !in_rph => {
+                    inline_run = Some(crate::TextRun::default());
+                }
+                b"rFont" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.name = attr(&e, b"val");
+                }
+                b"sz" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.size_pt = attr(&e, b"val")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                }
+                b"color" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.color =
+                        color_attr(&e, theme, &styles.indexed_colors);
+                }
+                b"b" if inline_run.is_some() => inline_run.as_mut().expect("run").font.bold = true,
+                b"i" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.italic = true;
+                }
+                b"u" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.underline = true;
+                }
+                b"strike" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.strikethrough = true;
+                }
+                b"vertAlign" if inline_run.is_some() => {
+                    inline_run.as_mut().expect("run").font.script =
+                        match attr(&e, b"val").as_deref() {
+                            Some("superscript") => FormatScript::Superscript,
+                            Some("subscript") => FormatScript::Subscript,
+                            _ => FormatScript::None,
+                        };
+                }
                 b"t" => {
                     in_is_t = true; // inline-string text (within <is>)
                     if !in_rph {
@@ -2616,7 +3169,13 @@ fn parse_sheet(
             }
             Ok(Event::Text(t)) if in_f => formula.push_str(&text_of(&t)),
             Ok(Event::Text(t)) if in_v => value.push_str(&text_of(&t)),
-            Ok(Event::Text(t)) if in_is_t && !in_rph => inline_value.push_str(&text_of(&t)),
+            Ok(Event::Text(t)) if in_is_t && !in_rph => {
+                let text = text_of(&t);
+                inline_value.push_str(&text);
+                if let Some(run) = inline_run.as_mut() {
+                    run.text.push_str(&text);
+                }
+            }
             Ok(Event::GeneralRef(reference)) => {
                 with_general_ref_text(&reference, |text| {
                     if let Some(field) = header_footer_capture {
@@ -2647,6 +3206,9 @@ fn parse_sheet(
                         value.push_str(text);
                     } else if in_is_t && !in_rph {
                         inline_value.push_str(text);
+                        if let Some(run) = inline_run.as_mut() {
+                            run.text.push_str(text);
+                        }
                     }
                 });
             }
@@ -2686,7 +3248,12 @@ fn parse_sheet(
                 value.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
             }
             Ok(Event::CData(t)) if in_is_t && !in_rph => {
-                inline_value.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                let bytes = t.into_inner();
+                let text = String::from_utf8_lossy(bytes.as_ref());
+                inline_value.push_str(&text);
+                if let Some(run) = inline_run.as_mut() {
+                    run.text.push_str(&text);
+                }
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
                 b"v" => in_v = false,
@@ -2694,6 +3261,12 @@ fn parse_sheet(
                 b"f" => in_f = false,
                 b"rPh" => in_rph = false,
                 b"t" => in_is_t = false,
+                b"r" if inline_run.is_some() => {
+                    let completed = inline_run.take().expect("run");
+                    if !completed.text.is_empty() {
+                        inline_runs.push(completed);
+                    }
+                }
                 b"sheetView" => in_selected_sheet_view = false,
                 b"oddHeader" | b"firstHeader" | b"evenHeader" | b"oddFooter" | b"firstFooter"
                 | b"evenFooter" => header_footer_capture = None,
@@ -2784,6 +3357,20 @@ fn parse_sheet(
                                 break;
                             }
                             *budget -= entry.text.len();
+                            if ctype == "s" {
+                                if let Some(runs) = value
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                                    .and_then(|index| shared.get(index))
+                                    .map(|shared| shared.runs.clone())
+                                    .filter(|runs| !runs.is_empty())
+                                {
+                                    parsed.rich.insert((row, col), runs);
+                                }
+                            } else if ctype == "inlineStr" && !inline_runs.is_empty() {
+                                parsed.rich.insert((row, col), inline_runs.clone());
+                            }
                             parsed.cells.push(entry);
                         }
                     }
@@ -3005,7 +3592,10 @@ fn parse_repeat_rows(value: &str) -> Option<(u32, u32)> {
 
 fn parse_one_based_row(value: &str) -> Option<u32> {
     let row = value.trim().trim_start_matches('$').parse::<u32>().ok()?;
-    (1..=1_048_576).contains(&row).then_some(row - 1)
+    if !(1..=1_048_576).contains(&row) {
+        return None;
+    }
+    Some(row - 1)
 }
 
 fn parse_repeat_cols(value: &str) -> Option<(u16, u16)> {
@@ -3239,7 +3829,7 @@ fn build_cell(
     style_idx: usize,
     value: &str,
     formula: &str,
-    shared: &[String],
+    shared: &[SharedString],
     styles: &Styles,
     date1904: bool,
 ) -> Option<CellEntry> {
@@ -3249,8 +3839,8 @@ fn build_cell(
             .trim()
             .parse::<usize>()
             .ok()
-            .and_then(|idx| shared.get(idx).cloned())
-            .map(|s| (Cell::Text(s.clone()), s)),
+            .and_then(|idx| shared.get(idx))
+            .map(|shared| (Cell::Text(shared.text.clone()), shared.text.clone())),
         "str" | "inlineStr" if !value.is_empty() => {
             Some((Cell::Text(value.to_string()), value.to_string()))
         }
@@ -3314,7 +3904,7 @@ fn build_cell(
         col,
         value,
         text,
-        style: None,
+        style: styles.cell_style(style_idx).cloned(),
         hyperlink: None,
     })
 }
@@ -3322,6 +3912,13 @@ fn build_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_texts(xml: &str) -> Vec<String> {
+        parse_shared_strings(xml, &ThemeColors::default(), &[])
+            .into_iter()
+            .map(|shared| shared.text)
+            .collect()
+    }
 
     #[test]
     fn cell_ref_parsing() {
@@ -3337,14 +3934,22 @@ mod tests {
 
     #[test]
     fn shared_strings_concatenate_runs() {
-        let xml = r#"<sst><si><t>Hello</t></si><si><r><t>가</t></r><r><t>나</t></r></si></sst>"#;
-        assert_eq!(parse_shared_strings(xml), vec!["Hello", "가나"]);
+        let xml = r#"<sst><si><t>Hello</t></si><si><r><rPr><b/><color rgb="FF112233"/></rPr><t>가</t></r><r><rPr><i/></rPr><t>나</t></r></si></sst>"#;
+        assert_eq!(shared_texts(xml), vec!["Hello", "가나"]);
+        let parsed = parse_shared_strings(xml, &ThemeColors::default(), &[]);
+        assert_eq!(parsed[1].runs.len(), 2);
+        assert!(parsed[1].runs[0].font.bold);
+        assert_eq!(
+            parsed[1].runs[0].font.color,
+            Some(Color::rgb(0x11, 0x22, 0x33))
+        );
+        assert!(parsed[1].runs[1].font.italic);
     }
 
     #[test]
     fn general_refs_are_reassembled_across_xlsx_text_surfaces() {
         assert_eq!(
-            parse_shared_strings("<sst><si><t>A&amp;B&#33;</t></si></sst>"),
+            shared_texts("<sst><si><t>A&amp;B&#33;</t></si></sst>"),
             vec!["A&B!"]
         );
 
@@ -3384,7 +3989,7 @@ mod tests {
     #[test]
     fn unknown_and_illegal_general_refs_are_preserved_lexically_on_read() {
         assert_eq!(
-            parse_shared_strings("<sst><si><t>A&bogus;&#x1;</t></si></sst>"),
+            shared_texts("<sst><si><t>A&bogus;&#x1;</t></si></sst>"),
             vec!["A&bogus;&#x1;"]
         );
     }
@@ -3426,7 +4031,7 @@ mod tests {
         // A self-closing <si/> and an empty <si></si> must each occupy an index,
         // so later references don't shift.
         let xml = r#"<sst><si><t>품목</t></si><si/><si></si><si><t>가격</t></si></sst>"#;
-        assert_eq!(parse_shared_strings(xml), vec!["품목", "", "", "가격"]);
+        assert_eq!(shared_texts(xml), vec!["품목", "", "", "가격"]);
     }
 
     #[test]
@@ -3503,7 +4108,10 @@ mod tests {
     fn text_budget_caps_shared_string_amplification() {
         // The shared-string DoS: one large pooled string referenced by very many
         // cells. Accumulated text must stay within the budget (here, a small one).
-        let shared = vec!["X".repeat(100)];
+        let shared = vec![SharedString {
+            text: "X".repeat(100),
+            runs: Vec::new(),
+        }];
         let mut xml = String::from("<worksheet><sheetData><row>");
         for _ in 0..1000 {
             xml.push_str("<c t=\"s\"><v>0</v></c>");
@@ -3529,7 +4137,10 @@ mod tests {
 
     #[test]
     fn text_budget_exhaustion_leaves_zero_budget_signal() {
-        let shared = vec!["X".repeat(100)];
+        let shared = vec![SharedString {
+            text: "X".repeat(100),
+            runs: Vec::new(),
+        }];
         let xml =
             "<worksheet><sheetData><row><c t=\"s\"><v>0</v></c></row></sheetData></worksheet>";
         let mut budget = 50usize;
@@ -3692,11 +4303,19 @@ mod tests {
         assert_eq!(parsed.sheets[0].visibility, Visibility::Visible);
         assert_eq!(parsed.sheets[1].visibility, Visibility::Hidden);
         assert_eq!(parsed.sheets[2].visibility, Visibility::VeryHidden);
-        // Only the workbook-global user name `TaxRate` remains: the built-in
-        // `_xlnm.Print_Area` and the sheet-local `LocalOnly` are both filtered out.
+        // Global and local user names remain distinct; the built-in print area
+        // stays in the sheet-metadata path.
         assert_eq!(
             parsed.defined_names,
             vec![("TaxRate".to_string(), "Sheet1!$B$1".to_string())]
+        );
+        assert_eq!(
+            parsed.local_defined_names,
+            vec![crate::LocalDefinedName {
+                sheet: "Hid".to_string(),
+                name: "LocalOnly".to_string(),
+                refers_to: "Sheet2!$A$1".to_string(),
+            }]
         );
     }
 
@@ -4446,7 +5065,7 @@ mod tests {
         // `<rPh>` carries East Asian ruby (furigana) guide text, not part of the
         // displayed string — it must not be concatenated into the value.
         let xml = r#"<sst><si><t>東京</t><rPh sb="0" eb="2"><t>とうきょう</t></rPh></si></sst>"#;
-        assert_eq!(parse_shared_strings(xml), vec!["東京"]);
+        assert_eq!(shared_texts(xml), vec!["東京"]);
     }
 
     #[test]
@@ -4651,4 +5270,10 @@ mod tests {
         }
         assert_eq!(a1.text, "30"); // display text is the cached value
     }
+}
+#[test]
+fn zero_print_title_rows_are_rejected_without_panicking() {
+    assert_eq!(parse_repeat_rows("0:1"), None);
+    assert_eq!(parse_repeat_rows("$0:$1"), None);
+    assert_eq!(parse_repeat_rows("1:1048577"), None);
 }

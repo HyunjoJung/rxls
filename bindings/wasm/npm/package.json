@@ -1,0 +1,43 @@
+{
+  "name": "rxls-wasm",
+  "version": "0.1.2",
+  "description": "Read and diagnose spreadsheet files in WebAssembly with rxls",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HyunjoJung/rxls.git",
+    "directory": "bindings/wasm"
+  },
+  "type": "commonjs",
+  "main": "./node/rxls_wasm.js",
+  "types": "./node/rxls_wasm.d.ts",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./web/rxls_wasm.d.ts",
+        "default": "./web/rxls_wasm.js"
+      },
+      "node": {
+        "types": "./node/rxls_wasm.d.ts",
+        "default": "./node/rxls_wasm.js"
+      },
+      "types": "./node/rxls_wasm.d.ts",
+      "default": "./node/rxls_wasm.js"
+    }
+  },
+  "files": [
+    "node",
+    "web",
+    "demo",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

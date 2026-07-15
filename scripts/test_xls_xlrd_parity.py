@@ -234,14 +234,15 @@ class XlsXlrdParityTests(unittest.TestCase):
             "1904-01-01",
         )
 
-    def test_cli_skips_corpus_reported_unsupported_legacy_biff(self) -> None:
+    def test_cli_skips_corpus_reported_expected_rejections(self) -> None:
         module = load_xls_xlrd_parity_module()
 
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             legacy = base / "test-data" / "spreadsheet" / "legacy.xls"
+            malformed = base / "test-data" / "spreadsheet" / "malformed.xls"
             perfect = base / "test-data" / "spreadsheet" / "perfect.xls"
-            for path in [legacy, perfect]:
+            for path in [legacy, malformed, perfect]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"placeholder")
 
@@ -250,15 +251,21 @@ class XlsXlrdParityTests(unittest.TestCase):
                 "failure: .xls test-data/spreadsheet/legacy.xls "
                 "kind=legacy_biff decision=unsupported_legacy_biff "
                 "evidence=parser_or_support_classification container=unknown "
-                "extension_mismatch=true parse: legacy BIFF2-4 unsupported\n",
+                "extension_mismatch=true parse: legacy BIFF2-4 unsupported\n"
+                "failure: .xls test-data/spreadsheet/malformed.xls "
+                "kind=malformed_biff decision=excluded_malformed_workbook "
+                "evidence=biff_structure_invalid container=ole2 "
+                "extension_mismatch=false parse: malformed BIFF stream\n",
                 encoding="utf-8",
             )
 
             def fake_xlrd_text(path):
-                return "legacy gold" if Path(path).name == "legacy.xls" else "ok"
+                if Path(path).name in {"legacy.xls", "malformed.xls"}:
+                    return "unsupported gold"
+                return "ok"
 
             def fake_run(args, **_kwargs):
-                stdout = b"" if Path(args[-1]).name == "legacy.xls" else b"ok"
+                stdout = b"" if Path(args[-1]).name != "perfect.xls" else b"ok"
                 return SimpleNamespace(stdout=stdout)
 
             argv = [
@@ -276,7 +283,7 @@ class XlsXlrdParityTests(unittest.TestCase):
                 "--min",
                 "0.0",
             ]
-            files = [str(legacy), str(perfect)]
+            files = [str(legacy), str(malformed), str(perfect)]
 
             with (
                 mock.patch.object(sys, "argv", argv),
@@ -292,14 +299,21 @@ class XlsXlrdParityTests(unittest.TestCase):
 
             self.assertEqual(exit_context.exception.code, 0)
             stdout = output.getvalue()
-            self.assertIn("files: 2", stdout)
+            self.assertIn("files: 3", stdout)
             self.assertIn("comparable: 1", stdout)
+            self.assertIn("by_skip_decision: excluded_malformed_workbook skipped=1", stdout)
             self.assertIn("by_skip_decision: unsupported_legacy_biff skipped=1", stdout)
+            self.assertIn("by_skip_evidence: biff_structure_invalid skipped=1", stdout)
             self.assertIn("by_skip_evidence: parser_or_support_classification skipped=1", stdout)
             self.assertIn("by_skip_corpus_kind: legacy_biff skipped=1", stdout)
             self.assertIn(
                 "skip: kind=corpus-report-excluded decision=unsupported_legacy_biff "
                 "evidence=parser_or_support_classification corpus_kind=legacy_biff",
+                stdout,
+            )
+            self.assertIn(
+                "skip: kind=corpus-report-excluded decision=excluded_malformed_workbook "
+                "evidence=biff_structure_invalid corpus_kind=malformed_biff",
                 stdout,
             )
             self.assertNotIn("low-parity: ratio=0.000", stdout)
@@ -380,16 +394,16 @@ class XlsXlrdParityTests(unittest.TestCase):
             self.assertEqual(exit_context.exception.code, 0)
             stdout = output.getvalue()
             self.assertIn("files: 4", stdout)
-            self.assertIn("xlrd-unreadable: 1", stdout)
+            self.assertIn("xlrd-unreadable: 0", stdout)
             self.assertIn("oversized-comparisons: 1", stdout)
-            self.assertIn("xlrd-unreadable with rxls output: 1/1", stdout)
+            self.assertIn("xlrd-unreadable with rxls output: 0/0", stdout)
             self.assertIn("by_skip_decision: needs_bounded_oracle skipped=1", stdout)
             self.assertIn("by_skip_decision: unsupported_encrypted skipped=1", stdout)
             self.assertIn("by_skip_evidence: comparison_budget_exceeded skipped=1", stdout)
             self.assertIn("by_skip_evidence: ole2_encrypted_workbook skipped=1", stdout)
             self.assertIn("by_skip_corpus_kind: unsupported_encrypted_workbook skipped=1", stdout)
             self.assertIn(
-                "skip: kind=xlrd-unreadable decision=unsupported_encrypted "
+                "skip: kind=corpus-report-excluded decision=unsupported_encrypted "
                 "evidence=ole2_encrypted_workbook corpus_kind=unsupported_encrypted_workbook",
                 stdout,
             )

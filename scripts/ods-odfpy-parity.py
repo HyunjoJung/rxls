@@ -25,7 +25,15 @@ from zipfile import ZipFile
 from collections import Counter
 
 from oracle_timeout import run_with_timeout
-from public_corpus_manifest import corpus_files, manifest_files, resolve_binary
+from public_corpus_manifest import (
+    corpus_files,
+    emit_parity_provenance,
+    manifest_files,
+    report_path,
+    report_reason,
+    report_source_root,
+    resolve_binary,
+)
 
 MAX_ORACLE_VALUES = 100_000
 ORACLE_LIMIT_ERROR = "ODS oracle value limit exceeded"
@@ -247,11 +255,16 @@ def main() -> None:
     ap.add_argument("--min", type=float, default=0.90)
     args = ap.parse_args()
 
+    emit_parity_provenance(
+        args.manifest, oracle_reader="xml.etree.ElementTree"
+    )
+
     binary = resolve_binary(args.bin)
+    source_root = report_source_root(args.manifest, args.corpus)
     corpus_failures = parse_corpus_report(args.corpus_report) if args.corpus_report else []
     if args.manifest:
         files = manifest_files(args.manifest, {".ods"}, args.limit)
-        print(f"manifest: {args.manifest}")
+        print(f"manifest: {report_path(args.manifest)}")
     else:
         files = corpus_files(args.corpus, {".ods"}, args.limit)
     if not files:
@@ -271,12 +284,18 @@ def main() -> None:
             oracle_failed += 1
             reason = f"oracle timeout after {args.oracle_timeout_seconds:g}s"
             skips.append(("oracle-timeout", f, reason))
-            print(f"  oracle-skip {f}: {reason}")
+            print(
+                f"  oracle-skip {report_path(f, source_root)}: "
+                f"{report_reason(reason, f, source_root)}"
+            )
             continue
         if oracle_result.status == "error":
             oracle_failed += 1
             skips.append(("oracle-error", f, oracle_result.error))
-            print(f"  oracle-skip {f}: {oracle_result.error}")
+            print(
+                f"  oracle-skip {report_path(f, source_root)}: "
+                f"{report_reason(oracle_result.error, f, source_root)}"
+            )
             continue
         orc = oracle_result.value
         got = subprocess.run(
@@ -286,7 +305,7 @@ def main() -> None:
             rxls_ok += 1
         r = recall(orc, rxls_tokens(got))
         ratios.append(r)
-        print(f"  {f}: {r:.3f} ({len(orc)} values)")
+        print(f"  {report_path(f, source_root)}: {r:.3f} ({len(orc)} values)")
     if not ratios:
         sys.exit("no comparable files")
     mean = sum(ratios) / len(ratios)
@@ -317,7 +336,8 @@ def main() -> None:
         corpus_part = f" corpus_kind={corpus_kind}" if corpus_kind else ""
         print(
             f"skip: kind={kind} decision={decision} evidence={evidence}{corpus_part} "
-            f"path={path} reason={reason}"
+            f"path={report_path(path, source_root)} "
+            f"reason={report_reason(reason, path, source_root)}"
         )
     sys.exit(0 if mean >= args.min else 1)
 

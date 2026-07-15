@@ -17,18 +17,29 @@ jobs:
     name: fmt / clippy / test / doc / package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
+      - name: Validate native/WASM release identity
+        run: python3 scripts/check_release_identity.py
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
       - name: Install public reference readers
         run: python3 -m pip install "xlrd==2.0.2" "openpyxl==3.1.5" "pyxlsb==1.0.10"
       - name: Public hygiene audit
         run: python3 scripts/public_hygiene_audit.py
+      - name: Dependency security, license, and source policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.85.0"
+          command: check
+          arguments: --locked --all-features
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (default features)
@@ -37,6 +48,17 @@ jobs:
         run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Check additive feature matrix and examples
+        run: |
+          cargo check --no-default-features --locked
+          cargo check --no-default-features --features xlsx --locked
+          cargo check --no-default-features --features xlsb --locked
+          cargo check --no-default-features --features ods --locked
+          cargo check --no-default-features --features serde --locked
+          cargo check --no-default-features --features chrono --locked
+          cargo check --no-default-features --features cli --locked
+          cargo check --no-default-features --features full --locked
+          cargo check --all-features --examples --locked
       - name: Test (all features and strict openpyxl gate)
         env:
           RXLS_REQUIRE_OPENPYXL: "1"
@@ -51,6 +73,13 @@ jobs:
         run: cargo doc --no-deps --all-features --locked
       - name: Python harness tests
         run: python3 -m unittest discover -s scripts -p "test_*.py"
+      - name: Reproducible CycloneDX dependency manifest
+        run: |
+          python3 scripts/generate-sbom.py \
+            --manifest-path Cargo.toml \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --output target/rxls-sbom.cdx.json
+          git diff --exit-code -- Cargo.lock bindings/wasm/Cargo.lock
       - name: Package dry run
         run: cargo package --locked
 
@@ -58,11 +87,14 @@ jobs:
     name: MSRV 1.85
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Validate native/WASM release identity
+        run: python3 scripts/check_release_identity.py
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
+          toolchain: 1.85.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build (.xls-only)
         run: cargo build --no-default-features --locked
       - name: Build (default features)
@@ -71,37 +103,153 @@ jobs:
         run: cargo build --all-features --locked
       - name: Build WebAssembly binding
         run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+      - name: Verify frozen public API and rustdoc contracts
+        run: python3 scripts/check_public_api.py
+
+  installed-product:
+    name: Installed product (${{ matrix.os_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_name: Linux
+            executable: rxls
+          - os: macos-latest
+            os_name: macOS
+            executable: rxls
+          - os: windows-latest
+            os_name: Windows
+            executable: rxls.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: 1.85.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Build installed product
+        run: cargo build --locked
+      - name: Test installed-product CLI surface
+        env:
+          CARGO_BIN_EXE_rxls: target/debug/${{ matrix.executable }}
+        run: cargo test --test cli --locked
+      - name: Package crate
+        run: cargo package --locked
+      - name: Install CLI from the exact packaged crate contents
+        run: cargo install --path target/package/rxls-0.1.2 --locked --root target/installed-product
+      - name: Smoke installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="target/installed-product/bin/${{ matrix.executable }}"
+          test -x "$installed"
+          "$installed" --version | grep -E '^rxls [0-9]+\.[0-9]+\.[0-9]+$'
+          "$installed" diagnose tests/fixtures/xlsx/reader-structural.xlsx \
+            > target/installed-product-smoke.json
+          python3 -c 'import json; report=json.load(open("target/installed-product-smoke.json", encoding="utf-8")); assert report["format"] == "xlsx" and report["warnings"] == []'
 
   wasm:
     name: wasm32 binding
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Validate native/WASM release identity
+        run: python3 scripts/check_release_identity.py
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "20"
+      - name: Install locked wasm-bindgen CLI
+        shell: bash
+        run: |
+          version=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - name: Build and validate npm package
+        run: bash scripts/build-wasm-package.sh
+      - name: Native/WASM report parity and Node smoke
+        run: |
+          cargo run --bin rxls --all-features --locked -- diagnose tests/fixtures/xlsx/reader-structural.xlsx > target/wasm-native-report.json
+          node bindings/wasm/tests/node-smoke.cjs target/wasm-package target/wasm-native-report.json
+      - name: Install Chromium smoke runtime
+        run: |
+          npm install --prefix target/playwright --no-save --ignore-scripts playwright@1.54.1
+          npm exec --prefix target/playwright -- playwright install --with-deps chromium
+      - name: Browser smoke
+        run: node bindings/wasm/tests/browser-smoke.mjs target/wasm-package target/wasm-native-report.json
+      - name: Pack and enforce compressed bundle budget
+        shell: bash
+        run: |
+          mkdir -p target/wasm-dist
+          archive=$(npm pack ./target/wasm-package --pack-destination target/wasm-dist --silent)
+          python3 scripts/check_wasm_package.py target/wasm-package \
+            --archive "target/wasm-dist/$archive" \
+            --write-report target/wasm-package/wasm-size-report.json
+          sha256sum "target/wasm-dist/$archive" > "target/wasm-dist/$archive.sha256"
+      - name: Upload WASM release candidates
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-wasm-${{ github.run_attempt }}
+          path: |
+            target/wasm-dist/*
+            target/wasm-package/wasm-size-report.json
+          if-no-files-found: error
+          retention-days: 14
 
   public-parity:
     name: Public .xls/.xlsb/.ods parity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
       - name: Install public reference readers
         run: python3 -m pip install "xlrd==2.0.2" "pyxlsb==1.0.10"
       - name: Fetch pinned calamine reference corpus
-        run: bash scripts/fetch-xls-reference.sh
+        id: reference
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target
+          bash scripts/fetch-xls-reference.sh | tee target/ci-reference-fetch.txt
       - name: Build extract example
+        id: extract
         run: cargo build --all-features --example extract --locked
       - name: Parity vs xlrd (.xls)
-        run: python3 scripts/xls-xlrd-parity.py --corpus local/xls-poc/cal --bin target/debug/examples/extract --min 0.99
+        if: ${{ always() && steps.reference.outcome == 'success' && steps.extract.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/xls-xlrd-parity.py --corpus local/xls-poc/cal --bin target/debug/examples/extract --min 0.99 --show-worst 13 --show-skips 20 | tee target/ci-xls-parity.txt
       - name: Parity vs pyxlsb (.xlsb)
-        run: python3 scripts/xlsb-pyxlsb-parity.py --corpus local/xlsb --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --min 0.99
+        if: ${{ always() && steps.reference.outcome == 'success' && steps.extract.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/xlsb-pyxlsb-parity.py --corpus local/xlsb --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --min 0.99 --show-skips 20 | tee target/ci-xlsb-parity.txt
       - name: Parity vs bounded ODF XML oracle (.ods)
-        run: python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.99
+        if: ${{ always() && steps.reference.outcome == 'success' && steps.extract.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.99 --show-skips 20 | tee target/ci-ods-parity.txt
+      - name: Upload parity diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-parity-diagnostics-${{ github.run_attempt }}
+          path: target/ci-*.txt
+          if-no-files-found: warn
+          retention-days: 14

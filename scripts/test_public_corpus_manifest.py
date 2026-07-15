@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,16 +15,89 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from public_corpus_manifest import corpus_files, manifest_files, resolve_binary
+from public_corpus_manifest import (
+    corpus_files,
+    emit_parity_provenance,
+    manifest_sha256,
+    manifest_files,
+    report_path,
+    report_reason,
+    resolve_binary,
+)
 from oracle_timeout import _read_result, run_with_timeout
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PublicCorpusManifestTests(unittest.TestCase):
+    def test_parity_provenance_emits_reader_version_and_exact_manifest_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+            payload = b'{"schema":"fixture","files":[]}\n'
+            manifest_path.write_bytes(payload)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                emit_parity_provenance(
+                    manifest_path,
+                    oracle_reader="fixture-reader",
+                )
+            expected_digest = hashlib.sha256(payload).hexdigest()
+            self.assertEqual(manifest_sha256(manifest_path), expected_digest)
+
+        self.assertIn(
+            "provenance: oracle_reader=fixture-reader oracle_version=python-",
+            output.getvalue(),
+        )
+        self.assertIn(
+            f"provenance: input_manifest_sha256={expected_digest}",
+            output.getvalue(),
+        )
+
+    def test_parity_provenance_marks_non_manifest_corpus_runs(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            emit_parity_provenance(None, oracle_reader="fixture-reader")
+        self.assertIn("provenance: input_manifest_sha256=none", output.getvalue())
+
+    def test_parity_provenance_reads_installed_oracle_distribution_version(self) -> None:
+        output = io.StringIO()
+        with mock.patch(
+            "public_corpus_manifest.importlib.metadata.version",
+            return_value="1.2.3",
+        ), redirect_stdout(output):
+            emit_parity_provenance(
+                None,
+                oracle_reader="fixture-reader",
+                package_distribution="fixture-distribution",
+            )
+        self.assertIn(
+            "provenance: oracle_reader=fixture-reader oracle_version=1.2.3",
+            output.getvalue(),
+        )
+
+    def test_report_paths_and_oracle_reasons_are_machine_independent(self) -> None:
+        runner_home = "/" + "home" + "/runner"
+        selected = f"{runner_home}/work/rxls/rxls/local/public-corpus/source/book.xls"
+        root = f"{runner_home}/work/rxls/rxls/local/public-corpus"
+
+        self.assertEqual(report_path(selected, root), "corpus/source/book.xls")
+        self.assertEqual(
+            report_reason(f"failed to open {selected}", selected, root),
+            "failed to open corpus/source/book.xls",
+        )
+        self.assertNotIn(runner_home, report_path(selected, root))
+
+        checkout_root = ROOT / "local" / "public-corpus"
+        checkout_selected = checkout_root / "source" / "book.xls"
+        self.assertEqual(
+            report_path(checkout_selected, checkout_root), "corpus/source/book.xls"
+        )
+
     def test_manifest_files_selects_ready_entries_by_extension_and_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -114,6 +189,74 @@ class PublicCorpusManifestTests(unittest.TestCase):
         module = _load_fetch_public_corpus()
 
         self.assertIn(".xlsm", module.SUPPORTED_EXTS)
+
+    def test_fetch_expectations_annotate_open_and_reject_entries(self) -> None:
+        module = _load_fetch_public_corpus()
+        with tempfile.TemporaryDirectory() as tmp:
+            expectations = Path(tmp) / "expectations.json"
+            expectations.write_text(
+                json.dumps(
+                    {
+                        "schema": "rxls.public-corpus-expectations.v1",
+                        "default_outcome": "open",
+                        "rejects": [
+                            {
+                                "source": "fixture",
+                                "path": "bad.xls",
+                                "kind": "malformed_biff",
+                                "decision": "excluded_malformed_workbook",
+                                "evidence": "biff_structure_invalid",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            annotated = module.apply_expectations(
+                [
+                    {"source": "fixture", "path": "good.xls"},
+                    {"source": "fixture", "path": "bad.xls"},
+                ],
+                expectations,
+            )
+
+        self.assertEqual(annotated[0]["expected"], {"outcome": "open"})
+        self.assertEqual(
+            annotated[1]["expected"],
+            {
+                "outcome": "reject",
+                "kind": "malformed_biff",
+                "decision": "excluded_malformed_workbook",
+                "evidence": "biff_structure_invalid",
+            },
+        )
+
+    def test_fetch_expectations_reject_stale_entries(self) -> None:
+        module = _load_fetch_public_corpus()
+        with tempfile.TemporaryDirectory() as tmp:
+            expectations = Path(tmp) / "expectations.json"
+            expectations.write_text(
+                json.dumps(
+                    {
+                        "schema": "rxls.public-corpus-expectations.v1",
+                        "default_outcome": "open",
+                        "rejects": [
+                            {
+                                "source": "fixture",
+                                "path": "missing.xls",
+                                "kind": "malformed_biff",
+                                "decision": "excluded_malformed_workbook",
+                                "evidence": "biff_structure_invalid",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "not present in pinned sources"):
+                module.apply_expectations([], expectations)
 
     def test_fetch_download_one_accepts_relative_repo_destinations(self) -> None:
         module = _load_fetch_public_corpus()

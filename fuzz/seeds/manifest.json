@@ -1,0 +1,109 @@
+{
+  "schema": "rxls.fuzz-seeds.v1",
+  "seeds": [
+    {
+      "hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "id": "bounded-authoring",
+      "name": "bounded-authoring.bin",
+      "sha256": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"
+    },
+    {
+      "hex": "53554d2841313a4234292b49462841313e302c414253284131292c3029",
+      "id": "formula-expression",
+      "name": "formula-expression.bin",
+      "sha256": "7c102166a85c86bde653d106a1e6570aff55f7ac8418bf1b20db47083e01f006"
+    },
+    {
+      "id": "formula-xls",
+      "name": "formula-source.xls",
+      "sha256": "ce94a1f8165cb4d1d3d6158008e8ab0af468720834068d68c2897fda5bb5e3d2",
+      "source": "tests/fixtures/formula/biff8/formula-source.xls"
+    },
+    {
+      "id": "formula-xlsx",
+      "name": "formula-source.xlsx",
+      "sha256": "945dc6eab3aea076f6115a3b6c71a9464adaa3c0d5b21ec32ba16458f3e4764b",
+      "source": "tests/fixtures/formula/formula-source.xlsx"
+    },
+    {
+      "id": "reader-ods",
+      "name": "repeated-hidden.ods",
+      "sha256": "ec3b4833ff35505a08ca84cc6945c8145f0dc665497b2d238c16c5a243a5da2b",
+      "source": "tests/fixtures/ods/repeated-hidden.ods"
+    },
+    {
+      "id": "reader-xls-biff5",
+      "name": "korean-cp949-biff5.xls",
+      "sha256": "74e587a499c8d4ac044dd2424bb144cc454a66396e98c89adf9dd06800d0c375",
+      "source": "tests/fixtures/xls/korean-cp949-biff5.xls"
+    },
+    {
+      "id": "reader-xls-biff8",
+      "name": "reader-basic.xls",
+      "sha256": "85c305746d22d202744b7c26e5a0218f739a152dbe3f4fa8e909c095d9915dda",
+      "source": "tests/fixtures/xls/reader-basic.xls"
+    },
+    {
+      "id": "reader-xlsb",
+      "name": "reader-basic.xlsb",
+      "sha256": "919164434e5f3b96319f8c1dbfd9e35000739d170e0c5a41cb51450fb929984e",
+      "source": "tests/fixtures/xlsb/reader-basic.xlsb"
+    },
+    {
+      "id": "reader-xlsm",
+      "name": "reader-structural.xlsm",
+      "sha256": "25d91030bf0e416ce5a0bc3fe7d219e2358d70340b7732120cb031e2e09cdece",
+      "source": "tests/fixtures/xlsx/reader-structural.xlsx",
+      "transform": "xlsx-to-xlsm"
+    },
+    {
+      "id": "reader-xlsx",
+      "name": "reader-structural.xlsx",
+      "sha256": "d4fe4e707529d60a1f9ca15079f516e77494a3398aab79c5ab8eee36ea9959e2",
+      "source": "tests/fixtures/xlsx/reader-structural.xlsx"
+    },
+    {
+      "hex": "504b030414000000",
+      "id": "truncated-zip",
+      "name": "truncated-zip.bin",
+      "sha256": "4bc961e8ca5ed1566ca76e0986ba99290b4fe8fbc177eaa9c99761dc2bb74cc1"
+    }
+  ],
+  "targets": [
+    {
+      "seeds": [
+        "reader-xls-biff8",
+        "reader-xls-biff5",
+        "reader-xlsx",
+        "reader-xlsb",
+        "reader-ods",
+        "formula-xls",
+        "formula-xlsx",
+        "reader-xlsm",
+        "truncated-zip"
+      ],
+      "target": "parse"
+    },
+    {
+      "seeds": [
+        "bounded-authoring"
+      ],
+      "target": "author"
+    },
+    {
+      "seeds": [
+        "reader-xlsx",
+        "reader-xlsm"
+      ],
+      "target": "edit"
+    },
+    {
+      "seeds": [
+        "formula-expression",
+        "formula-xls",
+        "formula-xlsx"
+      ],
+      "target": "formula"
+    }
+  ]
+}

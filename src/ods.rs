@@ -164,6 +164,7 @@ fn read_image_parts_with_limits(
 pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| Error::Zip("not a valid .ods ZIP container"))?;
+    crate::ziputil::validate_compression(&mut zip)?;
     if has_encrypted_manifest(&mut zip) {
         return Err(Error::EncryptedOpenDocument);
     }
@@ -1145,6 +1146,18 @@ fn read_draw_image(
     })
 }
 
+fn flush_ods_run(text: &str, start: &mut usize, runs: &mut Vec<crate::TextRun>) {
+    let end = text.len();
+    if *start < end {
+        if let Some(fragment) = text.get(*start..end) {
+            if !fragment.is_empty() {
+                runs.push(crate::TextRun::new(fragment, crate::Font::default()));
+            }
+        }
+    }
+    *start = end;
+}
+
 fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts) -> Workbook {
     let mut r = Reader::from_str(xml);
     let mut sheets: Vec<Sheet> = Vec::new();
@@ -1163,6 +1176,7 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
     let mut read_images: Images = Vec::new();
     let mut row_outline: BTreeMap<u32, u8> = BTreeMap::new();
     let mut col_outline: BTreeMap<u16, u8> = BTreeMap::new();
+    let mut rich: BTreeMap<(u32, u16), Vec<crate::TextRun>> = BTreeMap::new();
     let mut page_setup: Option<PageSetup> = None;
     let mut name = String::new();
     let mut tab_color: Option<Color> = None;
@@ -1199,6 +1213,10 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
     let mut in_annotation = false;
     let mut in_annotation_p = false;
     let mut in_annotation_creator = false;
+    let mut cell_runs: Vec<crate::TextRun> = Vec::new();
+    let mut cell_run_start = 0usize;
+    let mut cell_saw_span = false;
+    let mut span_depth = 0u8;
 
     loop {
         match r.read_event() {
@@ -1238,6 +1256,7 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                     read_images = Vec::new();
                     row_outline = BTreeMap::new();
                     col_outline = BTreeMap::new();
+                    rich = BTreeMap::new();
                     row = 0;
                     table_column = 0;
                     in_table = true;
@@ -1293,6 +1312,10 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                     cell_comment_author = None;
                     cell_comment_author_text.clear();
                     cell_images.clear();
+                    cell_runs.clear();
+                    cell_run_start = 0;
+                    cell_saw_span = false;
+                    span_depth = 0;
                     in_annotation = false;
                     in_annotation_p = false;
                     in_annotation_creator = false;
@@ -1314,6 +1337,13 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                     in_annotation_p = true;
                 }
                 b"p" if cur.is_some() => in_p = true,
+                b"span" if cur.is_some() && in_p && !in_annotation => {
+                    if span_depth == 0 {
+                        flush_ods_run(&text, &mut cell_run_start, &mut cell_runs);
+                    }
+                    span_depth = span_depth.saturating_add(1);
+                    cell_saw_span = true;
+                }
                 b"a" if cur.is_some() && in_p && !in_annotation && cell_hyperlink.is_none() => {
                     cell_hyperlink = attr(&e, b"href");
                 }
@@ -1449,6 +1479,12 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                 }
                 b"p" if in_annotation_p => in_annotation_p = false,
                 b"p" => in_p = false,
+                b"span" if span_depth > 0 => {
+                    span_depth = span_depth.saturating_sub(1);
+                    if span_depth == 0 {
+                        flush_ods_run(&text, &mut cell_run_start, &mut cell_runs);
+                    }
+                }
                 b"annotation" if in_annotation => {
                     in_annotation = false;
                     in_annotation_p = false;
@@ -1456,6 +1492,8 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                 }
                 b"table-cell" | b"covered-table-cell" => {
                     if let Some(a) = cur.take() {
+                        flush_ods_run(&text, &mut cell_run_start, &mut cell_runs);
+                        let rich_start_col = col;
                         let pending_comment =
                             (!cell_comment_text.trim().is_empty()).then(|| PendingComment {
                                 text: cell_comment_text.trim().to_string(),
@@ -1487,11 +1525,20 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                                 images: &cell_images,
                             },
                         );
+                        if cell_saw_span && !cell_runs.is_empty() {
+                            for rich_col in rich_start_col..col {
+                                rich.insert((row, rich_col), cell_runs.clone());
+                            }
+                        }
                         cell_hyperlink = None;
                         cell_comment_text.clear();
                         cell_comment_author = None;
                         cell_comment_author_text.clear();
                         cell_images.clear();
+                        cell_runs.clear();
+                        cell_run_start = 0;
+                        cell_saw_span = false;
+                        span_depth = 0;
                         in_annotation = false;
                         in_annotation_p = false;
                         in_annotation_creator = false;
@@ -1523,6 +1570,10 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                         let validation_template: Vec<DataValidation> =
                             read_data_validations[row_validation_start..].to_vec();
                         let image_template: Vec<Image> = read_images[row_image_start..].to_vec();
+                        let rich_template: Vec<(u16, Vec<crate::TextRun>)> = rich
+                            .range((row, 0)..=(row, u16::MAX))
+                            .map(|((_, col), runs)| (*col, runs.clone()))
+                            .collect();
                         'rep: for r in 1..row_rep {
                             for c in &template {
                                 // Per-clone budget charge (text + per-cell cost) so
@@ -1595,6 +1646,9 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                                 }
                                 read_images.push(cloned);
                             }
+                            for (col, runs) in &rich_template {
+                                rich.insert((row.saturating_add(r), *col), runs.clone());
+                            }
                         }
                     }
                     row = row.saturating_add(row_rep.max(1));
@@ -1637,6 +1691,7 @@ fn parse_content(xml: &str, table_styles: &TableStyles, image_parts: &ImageParts
                         images: std::mem::take(&mut read_images),
                         row_outline: std::mem::take(&mut row_outline),
                         col_outline: std::mem::take(&mut col_outline),
+                        rich: std::mem::take(&mut rich),
                         page_setup: page_setup.take(),
                         tab_color,
                         hidden,
@@ -2056,6 +2111,24 @@ mod tests {
         assert_eq!(s.cell(0, 1), Some(&Cell::Number(42.0)));
         assert_eq!(s.cell(1, 0), Some(&Cell::Bool(true)));
         assert_eq!(s.cell(1, 1), Some(&Cell::Date(45366.0))); // 2024-03-15
+    }
+
+    #[test]
+    fn ods_rich_spans_preserve_text_boundaries_and_unicode() {
+        let content = r#"<?xml version="1.0"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="RTL"><table:table-row><table:table-cell office:value-type="string"><text:p>한글 <text:span text:style-name="em">مرحباً 👩‍💻</text:span> e&#x301;</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let wb = Workbook::open(&ods_bytes(content)).unwrap();
+        let sheet = &wb.sheets[0];
+        let expected = "한글 مرحباً 👩‍💻 e\u{301}";
+        assert_eq!(sheet.cell(0, 0), Some(&Cell::Text(expected.to_string())));
+        let runs = sheet.rich_text_runs(0, 0).expect("ODF span boundaries");
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            ["한글 ", "مرحباً 👩‍💻", " e\u{301}"]
+        );
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            expected
+        );
     }
 
     #[test]

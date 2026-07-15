@@ -40,7 +40,7 @@ pub(super) fn comments_xml(sheet: &Sheet) -> String {
     comments_xml_for_comments(&sheet.comments)
 }
 
-pub(super) fn comments_xml_for_comments(comments: &[Comment]) -> String {
+pub(crate) fn comments_xml_for_comments(comments: &[Comment]) -> String {
     let (names, ids) = authors(comments);
     let mut s = String::new();
     s.push_str(XML_DECL);
@@ -71,7 +71,7 @@ pub(super) fn vml_drawing_xml(sheet: &Sheet) -> String {
     vml_drawing_xml_for_comments(&sheet.comments)
 }
 
-pub(super) fn vml_drawing_xml_for_comments(comments: &[Comment]) -> String {
+pub(crate) fn vml_drawing_xml_for_comments(comments: &[Comment]) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         r#"<xml xmlns:v="{NS_V}" xmlns:o="{NS_O}" xmlns:x="{NS_X}">"#

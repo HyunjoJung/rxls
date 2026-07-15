@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz the `.xls` / `.xlsx` reader on arbitrary bytes: the panic-free,
+//! Fuzz the `.xls` / `.xlsx` / `.xlsb` / `.ods` readers on arbitrary bytes: the panic-free,
 //! bounds-checked contract means no input may panic, abort, OOM, or hang — only
 //! return an `Err` or a bounded workbook.
 //!

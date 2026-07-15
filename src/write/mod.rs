@@ -18,7 +18,9 @@ mod worksheet;
 pub(crate) mod xml;
 
 pub(crate) use validate::validate;
+pub(crate) use validate::validate_data_validation_rule;
 pub use validate::WriteError;
+pub(crate) use validate::{is_valid_defined_name, MAX_CELL_STRING_UTF16_UNITS};
 pub(crate) use workbook::is_w3cdtf;
 
 use std::collections::HashMap;
@@ -29,6 +31,10 @@ use zip::ZipWriter;
 
 use crate::write::cell::shared_strings_xml;
 use crate::write::comment::{comments_xml_for_comments, vml_drawing_xml_for_comments};
+pub(crate) use crate::write::comment::{
+    comments_xml_for_comments as editable_comments_xml,
+    vml_drawing_xml_for_comments as editable_vml_drawing_xml,
+};
 use crate::write::drawing::build_drawings_with_budget;
 use crate::write::styles::StyleTable;
 use crate::write::table::{table_name, table_xml};
@@ -36,6 +42,7 @@ use crate::write::workbook::{
     app_xml_with_budget, content_types, core_xml_with_budget, root_rels, workbook_rels,
     workbook_xml_with_budget,
 };
+pub(crate) use crate::write::worksheet::data_validation_xml as editable_data_validation_xml;
 use crate::write::worksheet::{
     worksheet_xml, WorksheetXmlContext, WorksheetXmlOptions, WorksheetXmlRelationships,
 };
@@ -380,6 +387,20 @@ mod tests {
             style: None,
             hyperlink: None,
         }
+    }
+
+    #[test]
+    fn repeated_xlsx_serialization_is_byte_identical() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(8, 3, "later coordinate");
+        sheet.write(0, 0, "header");
+        sheet.write_formula(2, 1, "A1", "header");
+        workbook.define_name("Header", "Data!$A$1");
+
+        let first = workbook.to_xlsx();
+        let second = workbook.to_xlsx();
+        assert_eq!(first, second);
     }
 
     fn worksheet_xml_with_budget<'a>(

@@ -1,7 +1,8 @@
 //! Error type for `.xls` parsing.
 
-/// Errors produced while opening or decoding a `.xls` workbook.
+/// Errors produced while opening, decoding, exporting, or editing a spreadsheet.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The input is not an OLE2 / CFB compound file (`.xls` is OLE2-based).
     #[error("not an OLE2/CFB file (.xls must start with the D0CF11E0 magic)")]
@@ -33,6 +34,15 @@ pub enum Error {
     /// A ZIP-based spreadsheet container could not be opened as a ZIP package.
     #[error("invalid ZIP package: {0}")]
     Zip(&'static str),
+
+    /// A ZIP package entry uses a compression method not enabled by rxls.
+    #[error("unsupported ZIP compression method {method} in part {part}")]
+    UnsupportedCompression {
+        /// Package part whose central-directory entry declares the method.
+        part: String,
+        /// ZIP compression method identifier.
+        method: u16,
+    },
 
     /// An OOXML part's XML tree (`xmltree::XmlTree`) could not be parsed or
     /// edited: malformed markup (mismatched/unclosed tags, invalid UTF-8, a

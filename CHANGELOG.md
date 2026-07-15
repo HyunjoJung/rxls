@@ -6,6 +6,83 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The `0.1.2` entry below is the prepared release candidate. It is not tagged or
+published until both clean hosted candidates and the final Go/No-Go gate pass.
+
+## [0.1.2] - Unreleased candidate
+
+This release is the near-1.0 compatibility candidate described in
+[`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md). It deliberately combines the remaining
+correctness, editing, runtime, security, and release-engineering work into one
+large release.
+
+### Added
+
+- Completed BIFF/XLSB formula-source recovery, including the audited official
+  function table, reference flags, 3D/name/shared/array expressions, and
+  explicit `_xlfn.RXLS_PARTIAL(...)` markers for unsupported token sequences.
+- Expanded deterministic formula evaluation with range/name/date/coercion
+  semantics, shared operation and formula-dependency depth budgets, and
+  explicit calculated, cached, unsupported, and error outcomes.
+- Added cross-format rich-text, layout, style, Unicode/code-page, and negative
+  corpus coverage, including a licensed Korean CP949 BIFF5 fixture.
+- Added atomic package-preserving worksheet rename/add/delete, transactions,
+  merge and layout editing, legacy-note and hyperlink CRUD, exact-range data
+  validations, safe existing-table bottom-row resizing, and atomic filesystem
+  save support.
+- Added bounded configurable CSV export, stable diagnostic JSON schema and CLI
+  exit contracts, plus independent-consumer and LibreOffice smoke gates.
+- Added a frozen Rust API inventory, compile-time contract tests, and complete
+  read/inspect/evaluate/edit/create/export/diagnose examples.
+- Added a publishable WASM/npm package with typed errors, Node and real-browser
+  parity smokes, a demo, input limits, and bundle-size budgets.
+- Added all-reader and formula fuzzing, ZIP resource limits, dependency/license
+  policy, deterministic CycloneDX SBOM generation, and reproducible diagnose
+  plus package-edit/save performance evidence with enforced resource budgets.
+- Added deterministic release manifests, archive-aware public-hygiene checks,
+  a fail-closed two-candidate bundle comparator with same-SHA performance
+  reproducibility limits, exact-SHA publication attestations, and
+  post-publication crate plus downloaded-WASM Node/browser install/execute,
+  docs.rs, asset, and checksum verification.
+- Added independent LibreOffice smokes for authored/edited XLSX and
+  package-edited XLSM, including exact VBA/content-type preservation and an
+  assertion that only the expected `MacrosPresentNotExecuted` warning appears.
+- Added immutable GitHub Actions policy enforcement, fixed release and fuzz
+  toolchains, and retained exact tool-version evidence.
+- Added deterministic, hashed seed corpora and pre-campaign replay for every
+  fuzz target, including valid XLSX/XLSM editing seeds.
+- Expanded the packed WASM/npm contract across XLS, XLSX, XLSM, XLSB, and ODS
+  with native parity, condition-correct Node/browser typings, executed
+  TypeScript consumers, and real-browser coverage of the shipped demo.
+
+### Changed
+
+- Synchronized native, WASM, npm, and lockfile identities at 0.1.2 and made
+  drift a CI/release failure.
+- Consolidated the pinned 916-file corpus baseline at 869 successful opens and
+  47 classified rejections, with zero unexpected failures or accepts; parity
+  reports now bind the exact manifest digest and installed oracle versions.
+- Made output, feature, MSRV, unsupported-input, and 0.1.2-to-1.0 compatibility
+  policies explicit and regression-tested.
+- Made successful CLI help stdout-only while invalid usage remains stderr-only,
+  and added an isolated exact-crate consumer plus `cargo install` smoke for
+  pre-publication archives and published registry versions.
+- Preserved retained BIFF and XLSB external-name tables and rendered original
+  `NameX` names with explicit external-workbook provenance.
+- Rejected non-finite or nested formula cell values, oversized/illegal XML
+  text, invalid or colliding defined names, and invalid W3CDTF property updates
+  before package mutation.
+
+### Security
+
+- Reject unsupported ZIP compression and over-budget entry counts, part sizes,
+  aggregate expansion, and names before package parsing.
+- Preserve fuzz crash artifacts and add short pull-request and extended
+  scheduled fuzz gates for every reader and the formula path.
+- Enforce dependency advisory, license, and source policy during CI and release.
+- Reject zero-based whole-row references without arithmetic underflow; the
+  regression was discovered by the formula decompilation/evaluation fuzzer.
+
 ## [0.1.1] - 2026-07-13
 
 ### Fixed
@@ -91,6 +168,7 @@ Apache POI, or runtime subprocess dependency.
   comments, metadata, charts, drawings, and editable package parts after the
   `quick-xml` migration.
 
-[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2
 [0.1.1]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.1
 [0.1.0]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.0

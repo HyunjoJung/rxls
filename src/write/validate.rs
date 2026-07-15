@@ -19,6 +19,10 @@ use super::workbook::is_w3cdtf;
 use crate::write::{MAX_COL, MAX_ROW, MAX_SHEETS};
 use crate::{Cell, CellStyle, CfRule, DataValidation, DvKind, DvOp, Font, Sheet, Workbook};
 
+// Excel stores cell strings in an `XLWideString`; the application limit is
+// 32,767 UTF-16 code units, including the combined text of rich-string runs.
+pub(crate) const MAX_CELL_STRING_UTF16_UNITS: usize = 32_767;
+
 /// A problem found by the checked validator *before* any `.xlsx` bytes are emitted.
 ///
 /// Returned by [`Workbook::to_xlsx_checked`]. The infallible
@@ -38,6 +42,13 @@ pub enum WriteError {
     /// starts with an invalid character, contains an invalid character, or looks
     /// like an A1/R1C1 cell reference. Carries the offending name.
     InvalidDefinedName(String),
+    /// A sheet-scoped defined name references a worksheet that is not present.
+    UnknownDefinedNameSheet {
+        /// Local defined name.
+        name: String,
+        /// Missing scope sheet.
+        sheet: String,
+    },
     /// A table name is not a valid Excel defined name (starts with a digit,
     /// contains whitespace, or looks like a cell reference such as `A1` or
     /// `R1C1`). Carries the offending name.
@@ -96,6 +107,24 @@ pub enum WriteError {
         field: String,
         /// Original authored value.
         value: String,
+    },
+    /// A plain, rich, or formula-cached text cell exceeds Excel's 32,767
+    /// UTF-16-code-unit cell string limit.
+    CellTextTooLong {
+        /// 0-based row index of the authored cell.
+        row: u32,
+        /// 0-based column index of the authored cell.
+        col: u16,
+        /// Authored UTF-16 code-unit count.
+        length: usize,
+    },
+    /// The authored workbook is conservatively estimated to exceed the
+    /// writer's bounded in-memory payload limit.
+    OutputTooLarge {
+        /// Conservative estimated uncompressed payload size in bytes.
+        estimated_bytes: usize,
+        /// Writer payload limit in bytes.
+        limit: usize,
     },
     /// A checked range or drawing anchor extends past the Excel grid, or is
     /// reversed (last row/col before first — e.g. `F1:D3`).
@@ -161,6 +190,10 @@ impl fmt::Display for WriteError {
             WriteError::InvalidDefinedName(name) => {
                 write!(f, "invalid Excel defined name: {name:?}")
             }
+            WriteError::UnknownDefinedNameSheet { name, sheet } => write!(
+                f,
+                "sheet-scoped defined name {name:?} references unknown sheet {sheet:?}"
+            ),
             WriteError::InvalidTableName(name) => {
                 write!(f, "invalid Excel table name: {name:?}")
             }
@@ -193,6 +226,17 @@ impl fmt::Display for WriteError {
             WriteError::InvalidXmlText { field, value } => {
                 write!(f, "{field} contains XML-forbidden characters: {value:?}")
             }
+            WriteError::CellTextTooLong { row, col, length } => write!(
+                f,
+                "cell text at row {row}, col {col} is {length} UTF-16 code units; Excel allows at most {MAX_CELL_STRING_UTF16_UNITS}"
+            ),
+            WriteError::OutputTooLarge {
+                estimated_bytes,
+                limit,
+            } => write!(
+                f,
+                "estimated XLSX payload is {estimated_bytes} bytes; writer limit is {limit} bytes"
+            ),
             WriteError::MergeOutOfGrid => {
                 write!(
                     f,
@@ -258,11 +302,13 @@ impl std::error::Error for WriteError {}
 /// Validate `wb` against Excel's structural rules **before** emission, returning
 /// the first problem the infallible [`to_xlsx`](super::to_xlsx) would otherwise
 /// have silently sanitized away — sheet/table names, grid bounds (cells, comments,
-/// finite numeric cell values, authored cell/formula XML text, row/column layout
+/// finite numeric cell values, authored cell/formula XML text and Excel's cell
+/// string length limit, row/column layout
 /// metadata, merges, autofilter, hyperlink targets, table ranges/header-format
 /// targets, drawing anchors, conditional formats, data validations, chart series
 /// references, sparkline source ranges, print setup ranges, sheet-view zoom,
-/// page setup scale/margins, document-property text/timestamps, and
+/// page setup scale/margins, document-property text/timestamps, bounded output
+/// size, and
 /// active-sheet index), range ordering, and table
 /// width-vs-columns.
 /// The name/grid checks are kept in lock-step with the writer's sanitizers, so for
@@ -313,9 +359,9 @@ pub(crate) fn validate(wb: &Workbook) -> Result<(), WriteError> {
                 });
             }
             if let Some(runs) = sheet.rich.get(&(cell.row, cell.col)) {
-                validate_rich_text_runs(runs)?;
+                validate_rich_text_runs(runs, cell.row, cell.col)?;
             } else {
-                validate_cell_xml_text(&cell.value)?;
+                validate_cell_xml_text(&cell.value, cell.row, cell.col)?;
             }
             if let Some(style) = &cell.style {
                 validate_style_xml_text(style)?;
@@ -353,8 +399,8 @@ pub(crate) fn validate(wb: &Workbook) -> Result<(), WriteError> {
         if let Some(style) = &sheet.default_format {
             validate_style_xml_text(style)?;
         }
-        for runs in sheet.rich.values() {
-            validate_rich_text_runs(runs)?;
+        for (&(row, col), runs) in &sheet.rich {
+            validate_rich_text_runs(runs, row, col)?;
         }
         for &(r0, c0, r1, c1) in &sheet.merges {
             if !range_in_grid_ordered(r0, c0, r1, c1) {
@@ -526,7 +572,220 @@ pub(crate) fn validate(wb: &Workbook) -> Result<(), WriteError> {
         }
     }
 
+    validate_output_size_with_limit(wb, super::MAX_OUTPUT_BYTES)?;
+
     Ok(())
+}
+
+fn validate_output_size_with_limit(wb: &Workbook, limit: usize) -> Result<(), WriteError> {
+    let estimated_bytes = estimated_output_size(wb);
+    if estimated_bytes > limit {
+        Err(WriteError::OutputTooLarge {
+            estimated_bytes,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Conservative upper estimate for authored variable payload plus generous
+/// per-record XML/relationship overhead. This intentionally costs only O(number
+/// of authored records) and allocates no proportional buffer before the checked
+/// writer decides whether emission is safe.
+fn estimated_output_size(wb: &Workbook) -> usize {
+    let mut bytes = 64 << 10; // fixed package parts, ZIP directory, XML wrappers
+    bytes = add_strings(
+        bytes,
+        wb.defined_names
+            .iter()
+            .flat_map(|(name, refers_to)| [name.as_str(), refers_to.as_str()]),
+    );
+    bytes = add_strings(
+        bytes,
+        wb.local_defined_names.iter().flat_map(|name| {
+            [
+                name.sheet.as_str(),
+                name.name.as_str(),
+                name.refers_to.as_str(),
+            ]
+        }),
+    );
+    bytes = add_strings(
+        bytes,
+        [
+            wb.properties.title.as_deref(),
+            wb.properties.subject.as_deref(),
+            wb.properties.creator.as_deref(),
+            wb.properties.keywords.as_deref(),
+            wb.properties.description.as_deref(),
+            wb.properties.last_modified_by.as_deref(),
+            wb.properties.company.as_deref(),
+            wb.properties.created.as_deref(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+
+    for sheet in &wb.sheets {
+        bytes = bytes.saturating_add(16 << 10);
+        bytes = add_escaped_string(bytes, &sheet.name);
+        bytes = bytes.saturating_add(sheet.cells.len().saturating_mul(512));
+        bytes = bytes.saturating_add(sheet.blank_styles.len().saturating_mul(1 << 10));
+        bytes = bytes.saturating_add(
+            sheet
+                .row_formats
+                .len()
+                .saturating_add(sheet.col_formats.len())
+                .saturating_mul(1 << 10),
+        );
+        bytes = bytes.saturating_add(sheet.merges.len().saturating_mul(128));
+
+        for cell in &sheet.cells {
+            bytes = add_cell_payload(bytes, &cell.value);
+            if let Some(target) = &cell.hyperlink {
+                bytes = add_escaped_string(bytes, target);
+            }
+            if let Some(style) = &cell.style {
+                bytes = add_style_payload(bytes, style);
+            }
+        }
+        for runs in sheet.rich.values() {
+            bytes = bytes.saturating_add(runs.len().saturating_mul(2 << 10));
+            for run in runs {
+                bytes = add_escaped_string(bytes, &run.text);
+                bytes = add_font_payload(bytes, &run.font);
+            }
+        }
+        for comment in &sheet.comments {
+            bytes = bytes.saturating_add(2 << 10);
+            bytes = add_escaped_string(bytes, &comment.text);
+            if let Some(author) = &comment.author {
+                bytes = add_escaped_string(bytes, author);
+            }
+        }
+        for image in &sheet.images {
+            bytes = bytes
+                .saturating_add(16 << 10)
+                .saturating_add(image.data.len());
+        }
+        for table in &sheet.tables {
+            bytes = bytes.saturating_add(4 << 10);
+            bytes = add_escaped_string(bytes, &table.name);
+            bytes = add_strings(bytes, table.columns.iter().map(String::as_str));
+            if let Some(style) = &table.style {
+                bytes = add_escaped_string(bytes, style);
+            }
+        }
+        for validation in &sheet.data_validations {
+            bytes = bytes.saturating_add(4 << 10);
+            bytes = add_escaped_string(bytes, &validation.formula1);
+            if let Some(formula) = &validation.formula2 {
+                bytes = add_escaped_string(bytes, formula);
+            }
+            if let Some((title, message)) = &validation.prompt {
+                bytes = add_strings(bytes, [title.as_str(), message.as_str()]);
+            }
+            if let Some((title, message)) = &validation.error {
+                bytes = add_strings(bytes, [title.as_str(), message.as_str()]);
+            }
+        }
+        for format in &sheet.cond_formats {
+            bytes = bytes.saturating_add(4 << 10);
+            match &format.rule {
+                CfRule::CellIs {
+                    formula1, formula2, ..
+                } => {
+                    bytes = add_escaped_string(bytes, formula1);
+                    if let Some(formula) = formula2 {
+                        bytes = add_escaped_string(bytes, formula);
+                    }
+                }
+                CfRule::Expression { formula, .. } => {
+                    bytes = add_escaped_string(bytes, formula);
+                }
+                _ => {}
+            }
+        }
+        for chart in &sheet.charts {
+            bytes = bytes.saturating_add(16 << 10);
+            bytes = add_strings(
+                bytes,
+                [
+                    chart.title.as_deref(),
+                    chart.x_axis_title.as_deref(),
+                    chart.y_axis_title.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+            for series in &chart.series {
+                bytes = bytes.saturating_add(4 << 10);
+                bytes = add_strings(
+                    bytes,
+                    [
+                        series.name.as_deref(),
+                        series.categories.as_deref(),
+                        Some(series.values.as_str()),
+                        series.bubble_sizes.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+            }
+        }
+        for sparkline in &sheet.sparklines {
+            bytes = bytes.saturating_add(2 << 10);
+            bytes = add_escaped_string(bytes, &sparkline.range);
+        }
+        if let Some(page_setup) = &sheet.page_setup {
+            bytes = bytes.saturating_add(4 << 10);
+            if let Some(header) = &page_setup.header {
+                bytes = add_escaped_string(bytes, header);
+            }
+            if let Some(footer) = &page_setup.footer {
+                bytes = add_escaped_string(bytes, footer);
+            }
+        }
+    }
+    bytes
+}
+
+fn add_cell_payload(bytes: usize, cell: &Cell) -> usize {
+    match cell {
+        Cell::Text(text) | Cell::Error(text) => add_escaped_string(bytes, text),
+        Cell::Formula { formula, cached } => {
+            add_cell_payload(add_escaped_string(bytes, formula), cached)
+        }
+        Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => bytes,
+    }
+}
+
+fn add_style_payload(bytes: usize, style: &CellStyle) -> usize {
+    let mut bytes = bytes.saturating_add(1 << 10);
+    if let Some(font) = &style.font {
+        bytes = add_font_payload(bytes, font);
+    }
+    if let Some(format) = &style.num_fmt {
+        bytes = add_escaped_string(bytes, format);
+    }
+    bytes
+}
+
+fn add_font_payload(bytes: usize, font: &Font) -> usize {
+    font.name
+        .as_deref()
+        .map_or(bytes, |name| add_escaped_string(bytes, name))
+}
+
+fn add_strings<'a>(bytes: usize, values: impl IntoIterator<Item = &'a str>) -> usize {
+    values.into_iter().fold(bytes, add_escaped_string)
+}
+
+fn add_escaped_string(bytes: usize, value: &str) -> usize {
+    // XML entity escaping expands one UTF-8 byte by at most six bytes; this is
+    // deliberately conservative for both text and attribute contexts.
+    bytes.saturating_add(value.len().saturating_mul(6))
 }
 
 fn validate_defined_names(wb: &Workbook) -> Result<(), WriteError> {
@@ -538,6 +797,31 @@ fn validate_defined_names(wb: &Workbook) -> Result<(), WriteError> {
         validate_xml_text("defined name formula", refers_to)?;
         if !seen_names.insert(name.to_lowercase()) {
             return Err(WriteError::DuplicateDefinedName(name.clone()));
+        }
+    }
+    let mut seen_local = HashSet::with_capacity(wb.local_defined_names.len());
+    for local in &wb.local_defined_names {
+        if !is_valid_defined_name(&local.name) {
+            return Err(WriteError::InvalidDefinedName(local.name.clone()));
+        }
+        validate_xml_text("sheet-scoped defined name formula", &local.refers_to)?;
+        let Some(sheet) = wb
+            .sheets
+            .iter()
+            .find(|sheet| sheet.name.eq_ignore_ascii_case(&local.sheet))
+        else {
+            return Err(WriteError::UnknownDefinedNameSheet {
+                name: local.name.clone(),
+                sheet: local.sheet.clone(),
+            });
+        };
+        let key = format!(
+            "{}\0{}",
+            sheet.name.to_lowercase(),
+            local.name.to_lowercase()
+        );
+        if !seen_local.insert(key) {
+            return Err(WriteError::DuplicateDefinedName(local.name.clone()));
         }
     }
     Ok(())
@@ -649,21 +933,27 @@ fn cell_number_is_finite(cell: &Cell) -> bool {
     }
 }
 
-fn validate_cell_xml_text(cell: &Cell) -> Result<(), WriteError> {
+fn validate_cell_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(), WriteError> {
     match cell {
-        Cell::Text(value) => validate_xml_text("cell text", value),
+        Cell::Text(value) => {
+            validate_cell_text_length(row, col, value.encode_utf16().count())?;
+            validate_xml_text("cell text", value)
+        }
         Cell::Error(value) => validate_xml_text("cell error", value),
         Cell::Formula { formula, cached } => {
             validate_xml_text("formula", formula)?;
-            validate_formula_cached_xml_text(cached)
+            validate_formula_cached_xml_text(cached, row, col)
         }
         Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => Ok(()),
     }
 }
 
-fn validate_formula_cached_xml_text(cell: &Cell) -> Result<(), WriteError> {
+fn validate_formula_cached_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(), WriteError> {
     match cell {
-        Cell::Text(value) => validate_xml_text("formula cached text", value),
+        Cell::Text(value) => {
+            validate_cell_text_length(row, col, value.encode_utf16().count())?;
+            validate_xml_text("formula cached text", value)
+        }
         Cell::Error(value) => validate_xml_text("formula cached error", value),
         Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) | Cell::Formula { .. } => Ok(()),
     }
@@ -686,12 +976,24 @@ fn validate_font_xml_text(font: &Font) -> Result<(), WriteError> {
     Ok(())
 }
 
-fn validate_rich_text_runs(runs: &[crate::TextRun]) -> Result<(), WriteError> {
+fn validate_rich_text_runs(runs: &[crate::TextRun], row: u32, col: u16) -> Result<(), WriteError> {
+    let length = runs.iter().fold(0usize, |length, run| {
+        length.saturating_add(run.text.encode_utf16().count())
+    });
+    validate_cell_text_length(row, col, length)?;
     for run in runs {
         validate_xml_text("rich string text", &run.text)?;
         validate_font_xml_text(&run.font)?;
     }
     Ok(())
+}
+
+fn validate_cell_text_length(row: u32, col: u16, length: usize) -> Result<(), WriteError> {
+    if length > MAX_CELL_STRING_UTF16_UNITS {
+        Err(WriteError::CellTextTooLong { row, col, length })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_doc_properties(properties: &crate::DocProperties) -> Result<(), WriteError> {
@@ -831,7 +1133,7 @@ fn validate_conditional_format_rule(rule: &CfRule) -> Result<(), WriteError> {
     Ok(())
 }
 
-fn validate_data_validation_rule(rule: &DataValidation) -> Result<(), WriteError> {
+pub(crate) fn validate_data_validation_rule(rule: &DataValidation) -> Result<(), WriteError> {
     if rule.formula1.trim().is_empty() {
         return Err(WriteError::InvalidDataValidationRule(
             "formula1 must not be empty".to_string(),
@@ -994,7 +1296,7 @@ fn is_valid_table_name(name: &str) -> bool {
     !super::table::looks_like_cell_ref(name) && !super::table::looks_like_r1c1_ref(name)
 }
 
-fn is_valid_defined_name(name: &str) -> bool {
+pub(crate) fn is_valid_defined_name(name: &str) -> bool {
     let Some(first) = name.chars().next() else {
         return false;
     };
@@ -1012,9 +1314,12 @@ fn is_valid_defined_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Sheet, Table, Workbook};
+    use crate::{Cell, Sheet, Table, Workbook};
 
-    use super::WriteError;
+    use super::{
+        estimated_output_size, validate_output_size_with_limit, WriteError,
+        MAX_CELL_STRING_UTF16_UNITS,
+    };
 
     type DocPropertySetter = fn(&mut crate::DocProperties, &str);
 
@@ -1166,6 +1471,35 @@ mod tests {
             wb.to_xlsx_checked(),
             Err(WriteError::DuplicateDefinedName(name)) if name == "rate"
         ));
+    }
+
+    #[test]
+    fn sheet_local_defined_name_scope_and_duplicates_are_validated() {
+        let mut missing = Workbook::new();
+        missing.add_sheet("S");
+        missing.define_local_name("Missing", "Rate", "S!$A$1");
+        assert!(matches!(
+            missing.to_xlsx_checked(),
+            Err(WriteError::UnknownDefinedNameSheet { name, sheet })
+                if name == "Rate" && sheet == "Missing"
+        ));
+
+        let mut duplicate = Workbook::new();
+        duplicate.add_sheet("S1");
+        duplicate.add_sheet("S2");
+        duplicate.define_local_name("S1", "Rate", "S1!$A$1");
+        duplicate.define_local_name("s1", "rate", "S1!$A$2");
+        assert!(matches!(
+            duplicate.to_xlsx_checked(),
+            Err(WriteError::DuplicateDefinedName(name)) if name == "rate"
+        ));
+
+        let mut separate_scopes = Workbook::new();
+        separate_scopes.add_sheet("S1");
+        separate_scopes.add_sheet("S2");
+        separate_scopes.define_local_name("S1", "Rate", "S1!$A$1");
+        separate_scopes.define_local_name("S2", "Rate", "S2!$A$1");
+        assert!(separate_scopes.to_xlsx_checked().is_ok());
     }
 
     #[test]
@@ -1412,6 +1746,83 @@ mod tests {
         );
 
         assert_invalid_xml_text(wb, "rich string text", "bad\u{1f}run");
+    }
+
+    #[test]
+    fn checked_writer_enforces_excel_cell_string_limit_in_utf16_units() {
+        let mut accepted = Workbook::new();
+        accepted
+            .add_sheet("S")
+            .write(0, 0, "a".repeat(MAX_CELL_STRING_UTF16_UNITS));
+        assert!(accepted.to_xlsx_checked().is_ok());
+
+        let mut rejected = Workbook::new();
+        rejected.add_sheet("S").write(4, 2, "😀".repeat(16_384));
+        assert!(matches!(
+            rejected.to_xlsx_checked(),
+            Err(WriteError::CellTextTooLong {
+                row: 4,
+                col: 2,
+                length: 32_768
+            })
+        ));
+    }
+
+    #[test]
+    fn checked_writer_applies_cell_string_limit_to_rich_and_cached_text() {
+        let mut rich = Workbook::new();
+        rich.add_sheet("S").write_rich(
+            1,
+            3,
+            vec![
+                crate::TextRun::new("a".repeat(20_000), crate::Font::default()),
+                crate::TextRun::new("b".repeat(12_768), crate::Font::default()),
+            ],
+        );
+        assert!(matches!(
+            rich.to_xlsx_checked(),
+            Err(WriteError::CellTextTooLong {
+                row: 1,
+                col: 3,
+                length: 32_768
+            })
+        ));
+
+        let mut cached = Workbook::new();
+        cached.add_sheet("S").write(
+            2,
+            1,
+            Cell::Formula {
+                formula: "A1".to_string(),
+                cached: Box::new(Cell::Text("x".repeat(32_768))),
+            },
+        );
+        assert!(matches!(
+            cached.to_xlsx_checked(),
+            Err(WriteError::CellTextTooLong {
+                row: 2,
+                col: 1,
+                length: 32_768
+            })
+        ));
+    }
+
+    #[test]
+    fn checked_output_limit_returns_a_typed_error_before_emission() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "bounded");
+        sheet.write(0, 1, 42.0);
+
+        let estimate = estimated_output_size(&workbook);
+        assert_eq!(
+            validate_output_size_with_limit(&workbook, estimate.saturating_sub(1)),
+            Err(WriteError::OutputTooLarge {
+                estimated_bytes: estimate,
+                limit: estimate - 1,
+            })
+        );
+        assert_eq!(validate_output_size_with_limit(&workbook, estimate), Ok(()));
     }
 
     #[test]

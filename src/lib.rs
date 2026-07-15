@@ -49,7 +49,9 @@
 
 mod error;
 mod eval;
+mod export;
 mod format;
+mod ftab;
 mod model;
 #[cfg(feature = "ods")]
 mod ods;
@@ -71,9 +73,14 @@ mod xlsb;
 mod xlsx;
 #[cfg(feature = "xlsx")]
 mod xmltree;
+#[cfg(any(feature = "xlsx", feature = "ods"))]
+mod ziputil;
 
 pub use error::{Error, Result};
 pub use eval::{FormulaEvaluation, FormulaUnsupportedReason};
+pub use export::{
+    export_csv, CsvExportError, CsvFormulaPolicy, CsvNewline, CsvOptions, DEFAULT_EXPORT_MAX_BYTES,
+};
 #[cfg(all(feature = "serde", feature = "chrono"))]
 pub use model::{
     deserialize_as_date_1900_or_none, deserialize_as_date_1900_or_string,
@@ -91,17 +98,21 @@ pub use model::{
 };
 pub use model::{
     excel_serial_to_datetime, Alignment, Border, BorderStyle, Cell, CellErrorType, CellProtection,
-    CellStyle, CfRule, Chart, ChartKind, Color, Comment, CondFormat, Data, DataRef, DataType,
-    DataValidation, Dimensions, DocProperties, DvKind, DvOp, ExcelDateTime, Fill, Font, Format,
-    FormatAlign, FormatBorder, FormatPattern, FormatScript, FormulaRange, FormulaRangeRow,
-    FormulaRangeRowCells, FormulaRangeRows, HAlign, HeaderRow, Image, ImageFmt, PageSetup, Picture,
-    ProtectionOptions, Range, RangeRow, RangeRowCells, RangeRows, Reader, Series, Sheet,
-    SheetMetadata, SheetType, SheetView, SheetVisible, Sparkline, SparklineKind, Table, TextRun,
-    VAlign, Workbook, WorkbookMetadata,
+    CellStyle, CfRule, Chart, ChartKind, Color, Comment, CommentAuthor, CondFormat, Data, DataRef,
+    DataType, DataValidation, Dimensions, DocProperties, DvKind, DvOp, ExcelDateTime, Fill, Font,
+    Format, FormatAlign, FormatBorder, FormatPattern, FormatScript, FormulaRange, FormulaRangeRow,
+    FormulaRangeRowCells, FormulaRangeRowUsedCells, FormulaRangeRows, HAlign, HeaderRow, Image,
+    ImageFmt, LocalDefinedName, PageSetup, Picture, ProtectionOptions, Range, RangeRow,
+    RangeRowCells, RangeRowUsedCells, RangeRows, Reader, Series, Sheet, SheetMetadata, SheetType,
+    SheetView, SheetVisible, Sparkline, SparklineKind, Table, TextRun, VAlign, Workbook,
+    WorkbookMetadata,
 };
 #[cfg(feature = "chrono")]
 pub use model::{excel_serial_to_duration, excel_serial_to_naive_datetime};
-pub use report::WorkbookReport;
+pub use report::{
+    ReportEvaluation, ReportFeatures, ReportProperties, ReportStats, WorkbookReport,
+    REPORT_SCHEMA_VERSION,
+};
 #[cfg(feature = "xlsx")]
 pub use spreadsheet::{EditCapability, EditReadOnlyReason, Spreadsheet};
 /// The error type returned by [`Workbook::to_xlsx_checked`].
@@ -156,6 +167,29 @@ fn xml_reference_work_within_limit(xml: &[u8], limit: usize) -> bool {
 impl Workbook {
     /// Parse an Excel workbook from its raw bytes. Detects the format: legacy
     /// `.xls` (OLE2/BIFF) or, with the `xlsx` feature, modern `.xlsx` (OOXML).
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`Error`] for malformed, encrypted, unsupported, or
+    /// over-budget input. Enabled format features determine which ZIP-based
+    /// workbook kinds are recognized.
+    ///
+    /// # Panics
+    ///
+    /// This function does not intentionally panic for malformed input. Resource
+    /// exhaustion remains outside Rust's recoverable error model.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn workbook_bytes() -> Vec<u8> { todo!() }
+    /// # fn main() -> Result<(), rxls::Error> {
+    /// let bytes = workbook_bytes();
+    /// let workbook = rxls::Workbook::open(&bytes)?;
+    /// println!("{} worksheets", workbook.sheets.len());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open(bytes: &[u8]) -> Result<Self> {
         // `.xlsb` and `.xlsx` are both ZIP packages, so probe `.xlsb` (binary
         // `workbook.bin`) before the generic OOXML magic.
@@ -179,6 +213,9 @@ impl Workbook {
     /// preserves the typed cells (text, number, date serial, bool, error), so a
     /// legacy `.xls` can be converted to a clean, Office-openable `.xlsx`.
     /// Available with the default `xlsx` feature.
+    ///
+    /// For authored workbooks, prefer `to_xlsx_checked` when invalid or
+    /// over-budget data must be reported instead of sanitized.
     #[cfg(feature = "xlsx")]
     pub fn to_xlsx(&self) -> Vec<u8> {
         write::to_xlsx(self)
@@ -187,6 +224,11 @@ impl Workbook {
 
 /// Convenience: decode `.xls` bytes into normalized plain text. Errors with
 /// [`Error::NoText`] if nothing indexable was found.
+///
+/// # Errors
+///
+/// Propagates [`Workbook::open`] failures and returns [`Error::NoText`] when
+/// parsing succeeds but no indexable text is present.
 pub fn extract_text(bytes: &[u8]) -> Result<String> {
     let text = Workbook::open(bytes)?.text();
     if has_indexable(&text) {

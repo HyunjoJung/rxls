@@ -234,7 +234,7 @@ fn merge_cells_wrapper_len(count: usize) -> usize {
     format!(r#"<mergeCells count="{count}">"#).len() + "</mergeCells>".len()
 }
 
-fn data_validation_xml(dv: &DataValidation) -> String {
+pub(crate) fn data_validation_xml(dv: &DataValidation) -> String {
     let (r0, c0, r1, c1) = dv.sqref;
     let sq = format!(
         "{}:{}",
@@ -584,6 +584,7 @@ pub(super) fn worksheet_xml(
     // Columns needing a <col>: those with a width, outline level, or default style.
     let mut col_keys: BTreeSet<u16> = widths.keys().copied().collect();
     col_keys.extend(sheet.col_outline.keys().copied().filter(|c| *c <= MAX_COL));
+    col_keys.extend(sheet.hidden_cols.iter().copied().filter(|c| *c <= MAX_COL));
     col_keys.extend(col_style_xfs.keys().copied());
     if default_style_xf.is_some() || !col_keys.is_empty() {
         let mut cols_body = String::new();
@@ -608,6 +609,9 @@ pub(super) fn worksheet_xml(
             }
             if let Some(&lvl) = sheet.col_outline.get(&col) {
                 attrs.push_str(&format!(r#" outlineLevel="{lvl}""#));
+            }
+            if sheet.hidden_cols.contains(&col) {
+                attrs.push_str(r#" hidden="1""#);
             }
             if let Some(xf) = col_style_xfs.get(&col).copied().or(default_style_xf) {
                 attrs.push_str(&format!(r#" style="{xf}""#));
@@ -644,6 +648,7 @@ pub(super) fn worksheet_xml(
     rows.extend(sheet.row_heights.keys().copied().filter(|r| *r <= MAX_ROW));
     rows.extend(sheet.row_outline.keys().copied().filter(|r| *r <= MAX_ROW));
     rows.extend(sheet.row_formats.keys().copied().filter(|r| *r <= MAX_ROW));
+    rows.extend(sheet.hidden_rows.iter().copied().filter(|r| *r <= MAX_ROW));
     rows.extend(
         sheet
             .collapsed_rows
@@ -678,6 +683,8 @@ pub(super) fn worksheet_xml(
         }
         if sheet.collapsed_rows.contains(&row) {
             row_attrs.push_str(r#" collapsed="1" hidden="1""#);
+        } else if sheet.hidden_rows.contains(&row) {
+            row_attrs.push_str(r#" hidden="1""#);
         }
         let row_open = format!("<row{row_attrs}>");
         let row_close = "</row>";

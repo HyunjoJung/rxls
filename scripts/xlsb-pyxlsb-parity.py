@@ -27,7 +27,15 @@ from collections import Counter
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from public_corpus_manifest import corpus_files, manifest_files, resolve_binary
+from public_corpus_manifest import (
+    corpus_files,
+    emit_parity_provenance,
+    manifest_files,
+    report_path,
+    report_reason,
+    report_source_root,
+    resolve_binary,
+)
 
 
 def scientific_decimal_token(text: str) -> str | None:
@@ -221,12 +229,17 @@ def main() -> None:
     ap.add_argument("--min", type=float, default=0.95)
     args = ap.parse_args()
 
+    emit_parity_provenance(
+        args.manifest, oracle_reader="pyxlsb", package_distribution="pyxlsb"
+    )
+
     binary = resolve_binary(args.bin)
+    source_root = report_source_root(args.manifest, args.corpus)
     expected = load_expected_values(args.expected_values) if args.expected_values else {}
     corpus_failures = parse_corpus_report(args.corpus_report) if args.corpus_report else []
     if args.manifest:
         files = manifest_files(args.manifest, {".xlsb"}, args.limit)
-        print(f"manifest: {args.manifest}")
+        print(f"manifest: {report_path(args.manifest)}")
     else:
         files = corpus_files(args.corpus, {".xlsb"}, args.limit)
     if not files:
@@ -245,7 +258,10 @@ def main() -> None:
             oracle_failed += 1
             reason = f"{type(e).__name__}: {e}"
             skips.append(("pyxlsb-unreadable", f, reason))
-            print(f"  oracle-skip {f}: {reason}")
+            print(
+                f"  oracle-skip {report_path(f, source_root)}: "
+                f"{report_reason(reason, f, source_root)}"
+            )
             continue
         if oracle_source == "expected":
             expected_used += 1
@@ -256,7 +272,10 @@ def main() -> None:
             rxls_ok += 1
         r = recall(orc, rxls_tokens(got))
         ratios.append(r)
-        print(f"  {f}: {r:.3f} ({len(orc)} values, oracle={oracle_source})")
+        print(
+            f"  {report_path(f, source_root)}: {r:.3f} "
+            f"({len(orc)} values, oracle={oracle_source})"
+        )
 
     if not ratios:
         sys.exit("no comparable files")
@@ -289,7 +308,8 @@ def main() -> None:
         corpus_part = f" corpus_kind={corpus_kind}" if corpus_kind else ""
         print(
             f"skip: kind={kind} decision={decision} evidence={evidence}{corpus_part} "
-            f"path={path} reason={reason}"
+            f"path={report_path(path, source_root)} "
+            f"reason={report_reason(reason, path, source_root)}"
         )
     sys.exit(0 if mean >= args.min else 1)
 

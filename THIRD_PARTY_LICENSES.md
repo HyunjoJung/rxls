@@ -16,7 +16,11 @@ MIT.
 | [`serde`](https://crates.io/crates/serde) *(optional)* | MIT OR Apache-2.0 | serde-rs/serde |
 | [`chrono`](https://crates.io/crates/chrono) *(optional)* | MIT OR Apache-2.0 | chronotope/chrono |
 
-No third-party source is vendored into this crate.
+No third-party source code is vendored into this crate. The tracked reader
+fixture `tests/fixtures/xls/korean-cp949-biff5.xls` is a reduced data derivative
+of Apache POI's Apache-2.0-licensed `15556.xls`; its immutable source revision,
+source hash, transformation, and output hash are recorded in
+`tests/fixtures/README.md` and `tests/fixtures/MANIFEST.json`.
 
 The repository-only `bindings/wasm` package additionally depends directly on
 [`wasm-bindgen`](https://crates.io/crates/wasm-bindgen), licensed under MIT OR

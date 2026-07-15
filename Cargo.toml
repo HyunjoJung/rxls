@@ -1,6 +1,6 @@
 [package]
 name = "rxls"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # The resolved dependency graph supports Rust 1.85; CI enforces this floor.
 rust-version = "1.85"
@@ -77,4 +77,12 @@ required-features = ["xlsx"]
 
 [[example]]
 name = "author_report"
+required-features = ["xlsx"]
+
+[[example]]
+name = "api_journeys"
+required-features = ["xlsx"]
+
+[[example]]
+name = "edit_save_benchmark"
 required-features = ["xlsx"]

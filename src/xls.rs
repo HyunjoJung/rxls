@@ -19,7 +19,7 @@ use encoding_rs::{
     Encoding, BIG5, EUC_KR, GBK, SHIFT_JIS, UTF_8, WINDOWS_1251, WINDOWS_1252, WINDOWS_1253,
     WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1258, WINDOWS_874,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 // --- BIFF record type ids ([MS-XLS] 2.3) ---
 const BOF: u16 = 0x0809;
@@ -27,6 +27,9 @@ const EOF: u16 = 0x000A;
 const SST: u16 = 0x00FC;
 const CONTINUE: u16 = 0x003C;
 const LBL: u16 = 0x0018;
+const EXTERNSHEET: u16 = 0x0017;
+const EXTERNNAME: u16 = 0x0023;
+const SUPBOOK: u16 = 0x01AE;
 const BOUNDSHEET: u16 = 0x0085;
 const CODEPAGE: u16 = 0x0042;
 const FILEPASS: u16 = 0x002F;
@@ -57,6 +60,8 @@ const NUMBER: u16 = 0x0203;
 const BOOLERR: u16 = 0x0205;
 const FORMULA: u16 = 0x0006;
 const FORMULA_ALT: u16 = 0x0406;
+const ARRAY: u16 = 0x0221;
+const SHRFMLA: u16 = 0x04BC;
 const STRING: u16 = 0x0207;
 const ROW: u16 = 0x0208;
 const COLINFO: u16 = 0x007D;
@@ -140,6 +145,17 @@ const BIFF_DEFAULT_PALETTE: [Color; 56] = [
 type SheetRange = (u32, u16, u32, u16);
 type SheetRanges = Vec<SheetRange>;
 
+#[derive(Clone, Debug)]
+struct FormulaDefinition {
+    anchor: (u32, u16),
+    range: SheetRange,
+    rgce: Vec<u8>,
+    rgb_extra: Vec<u8>,
+    is_array: bool,
+}
+
+type FormulaDefinitions = HashMap<(usize, u32, u16), FormulaDefinition>;
+
 /// Decode context: the BIFF generation and the codepage for 8-bit strings.
 #[derive(Clone, Copy)]
 struct Ctx {
@@ -150,12 +166,22 @@ struct Ctx {
     enc: &'static Encoding,
 }
 
-/// Resolve a Windows codepage number to its `encoding_rs` codec.
+/// Resolve a BIFF `CODEPAGE` value to its `encoding_rs` codec.
+///
+/// Compatibility policy for BIFF5/7 is intentionally deterministic:
+///
+/// - missing and unknown declarations fall back to Windows-1252, Excel's
+///   historical Western default;
+/// - codepages 949 (Windows/UHC) and 51949 (EUC-KR) use `encoding_rs`'s
+///   Windows-949-compatible `EUC_KR` decoder;
+/// - malformed byte sequences are decoded lossily as U+FFFD by `encoding_rs`;
+/// - callers with a missing or incorrect declaration can use
+///   [`Workbook::open_with_codepage`] to force the intended codepage.
 fn resolve_encoding(cp: u16) -> &'static Encoding {
     match cp {
         932 => SHIFT_JIS,
         936 => GBK,
-        949 | 1361 => EUC_KR, // 1361 (Johab) unsupported by encoding_rs → UHC best-effort
+        949 | 51949 | 1361 => EUC_KR, // 1361 (Johab) unsupported → UHC best-effort
         950 => BIG5,
         1251 => WINDOWS_1251,
         1253 => WINDOWS_1253,
@@ -358,6 +384,13 @@ impl Workbook {
         let mut sheets: Vec<Sheet> = Vec::new();
         let mut frozen_views: Vec<bool> = Vec::new();
         let mut defined_names: Vec<(String, String)> = Vec::new();
+        let mut raw_defined_names = Vec::new();
+        let mut raw_local_defined_names = Vec::new();
+        let mut formula_names: Vec<String> = Vec::new();
+        let mut formula_sheet_names: Vec<String> = Vec::new();
+        let mut extern_sheets: Vec<crate::ptg::ExternSheet> = Vec::new();
+        let mut external_names: Vec<Vec<String>> = Vec::new();
+        let mut current_supbook = None;
         let mut sheet_builtin_names: Vec<SheetBuiltinName> = Vec::new();
         let mut sheet_page_setups: Vec<XlsPageSetup> = Vec::new();
         let mut sheet_note_texts: Vec<HashMap<u16, String>> = Vec::new();
@@ -372,6 +405,7 @@ impl Workbook {
         let mut top_count = 0usize;
         let mut cur_sheet: Option<usize> = None;
         let mut last_formula: Option<(usize, u32, u16, Option<String>)> = None;
+        let mut formula_definitions = FormulaDefinitions::new();
         let mut formats = Formats::default();
         let mut palette = BIFF_DEFAULT_PALETTE;
         // Per-workbook text budget (shared across sheets) — see MAX_TEXT_BYTES.
@@ -388,6 +422,21 @@ impl Workbook {
         let mut pos = 0usize;
         let mut saw_global_header = false;
         while pos < wb.len() {
+            // Some producers declare the Workbook stream at the containing CFB
+            // allocation size and leave an all-zero tail after the final EOF.
+            // A zero-length BIFF record is valid, so parsing that tail as records
+            // eventually leaves one to three bytes and incorrectly reports a
+            // truncated header.  Only accept padding after a balanced top-level
+            // substream; non-zero trailing bytes remain a hard error below.
+            if saw_global_header
+                && depth == 0
+                && wb
+                    .get(pos..)
+                    .is_some_and(|tail| tail.iter().all(|byte| *byte == 0))
+            {
+                pos = wb.len();
+                break;
+            }
             let header_end = pos
                 .checked_add(4)
                 .filter(|end| *end <= wb.len())
@@ -480,15 +529,42 @@ impl Workbook {
                 }
                 LBL => {
                     if cur_sheet.is_none() {
+                        if let Some(name) = parse_lbl_formula_name(data, ctx) {
+                            formula_names.push(name);
+                        }
                         match parse_lbl(data, ctx) {
-                            Some(ParsedLbl::GlobalUser(name)) => defined_names.push(name),
+                            Some(ParsedLbl::GlobalUser(name)) => raw_defined_names.push(name),
+                            Some(ParsedLbl::LocalUser { sheet_index, name }) => {
+                                raw_local_defined_names.push((sheet_index, name));
+                            }
                             Some(ParsedLbl::SheetBuiltin(name)) => sheet_builtin_names.push(name),
                             None => {}
                         }
                     }
                 }
+                EXTERNSHEET => {
+                    if cur_sheet.is_none() {
+                        extern_sheets.extend(parse_extern_sheets(data));
+                    }
+                }
+                SUPBOOK => {
+                    if cur_sheet.is_none() {
+                        external_names.push(Vec::new());
+                        current_supbook = Some(external_names.len() - 1);
+                    }
+                }
+                EXTERNNAME => {
+                    if cur_sheet.is_none() {
+                        if let (Some(supbook), Some(name)) =
+                            (current_supbook, parse_extern_name(data, ctx))
+                        {
+                            external_names[supbook].push(name);
+                        }
+                    }
+                }
                 BOUNDSHEET => {
                     let (name, sheet_type, hidden, very_hidden) = parse_boundsheet(data, ctx);
+                    formula_sheet_names.push(name.clone());
                     sheets.push(Sheet {
                         name,
                         is_worksheet: sheet_type == SheetType::WorkSheet,
@@ -698,6 +774,27 @@ impl Workbook {
                         }
                     }
                 }
+                ARRAY | SHRFMLA => {
+                    if depth == 1 {
+                        if let Some(si) = cur_sheet.filter(|si| *si < sheets.len()) {
+                            if let Some(definition) = parse_formula_definition(typ, data) {
+                                let key = (si, definition.anchor.0, definition.anchor.1);
+                                formula_definitions.insert(key, definition.clone());
+                                apply_formula_definition(
+                                    si,
+                                    &definition,
+                                    &mut sheets[si].cells,
+                                    &mut last_formula,
+                                    ctx,
+                                    &formula_sheet_names,
+                                    &extern_sheets,
+                                    &external_names,
+                                    &formula_names,
+                                );
+                            }
+                        }
+                    }
+                }
                 LABEL | RSTRING | STRING => {
                     // The text payload of these cell records can overflow into
                     // CONTINUE records (exactly like the SST). Gather the record
@@ -721,11 +818,13 @@ impl Workbook {
                     if depth == 1 {
                         if let Some(si) = cur_sheet {
                             if si < sheets.len() {
+                                let sheet = &mut sheets[si];
                                 decode_string_cell(
                                     typ,
                                     &chunks,
                                     si,
-                                    &mut sheets[si].cells,
+                                    &mut sheet.cells,
+                                    &mut sheet.rich,
                                     &mut last_formula,
                                     ctx,
                                     &mut budget,
@@ -752,6 +851,12 @@ impl Workbook {
                                     &mut last_formula,
                                     &formats,
                                     &mut budget,
+                                    &formula_sheet_names,
+                                    &extern_sheets,
+                                    &external_names,
+                                    &formula_names,
+                                    ctx,
+                                    &formula_definitions,
                                 );
                             }
                         }
@@ -770,10 +875,58 @@ impl Workbook {
         }
         apply_sheet_page_setups(&mut sheets, sheet_page_setups);
         apply_sheet_builtin_names(&mut sheets, sheet_builtin_names);
+        defined_names.extend(raw_defined_names.into_iter().map(|name| {
+            let context = formula_context(
+                ctx,
+                0,
+                0,
+                &formula_sheet_names,
+                &extern_sheets,
+                &external_names,
+                &formula_names,
+            );
+            let context = crate::ptg::Context {
+                name_formula: true,
+                ..context
+            };
+            let refers_to =
+                crate::ptg::decompile_parsed_with_context(&name.rgce, &name.rgb_extra, &context);
+            (name.name, refers_to)
+        }));
+        let local_defined_names = raw_local_defined_names
+            .into_iter()
+            .filter_map(|(sheet_index, name)| {
+                let sheet = formula_sheet_names.get(sheet_index)?.clone();
+                let context = formula_context(
+                    ctx,
+                    0,
+                    0,
+                    &formula_sheet_names,
+                    &extern_sheets,
+                    &external_names,
+                    &formula_names,
+                );
+                let context = crate::ptg::Context {
+                    name_formula: true,
+                    ..context
+                };
+                let refers_to = crate::ptg::decompile_parsed_with_context(
+                    &name.rgce,
+                    &name.rgb_extra,
+                    &context,
+                );
+                Some(crate::LocalDefinedName {
+                    sheet,
+                    name: name.name,
+                    refers_to,
+                })
+            })
+            .collect();
         Ok(Workbook {
             sheets,
             properties: parse_ole_doc_properties(bytes),
             defined_names,
+            local_defined_names,
             date1904: formats.date1904(),
             active_sheet: active_sheet.or(selected_sheet_fallback).unwrap_or_default(),
             protect_structure,
@@ -1346,8 +1499,18 @@ fn parse_ref8u(data: &[u8]) -> Option<SheetRange> {
 }
 
 enum ParsedLbl {
-    GlobalUser((String, String)),
+    GlobalUser(RawDefinedName),
+    LocalUser {
+        sheet_index: usize,
+        name: RawDefinedName,
+    },
     SheetBuiltin(SheetBuiltinName),
+}
+
+struct RawDefinedName {
+    name: String,
+    rgce: Vec<u8>,
+    rgb_extra: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -1361,6 +1524,63 @@ struct SheetBuiltinName {
     sheet_index: usize,
     kind: SheetBuiltinKind,
     ranges: Vec<(u32, u16, u32, u16)>,
+}
+
+fn parse_extern_sheets(data: &[u8]) -> Vec<crate::ptg::ExternSheet> {
+    let count = usize::from(u16le(data, 0).unwrap_or(0));
+    data.get(2..)
+        .unwrap_or_default()
+        .chunks_exact(6)
+        .take(count)
+        .filter_map(|xti| {
+            Some(crate::ptg::ExternSheet {
+                supbook_index: usize::from(u16le(xti, 0)?),
+                first_sheet: i32::from(i16le(xti, 2)?),
+                last_sheet: i32::from(i16le(xti, 4)?),
+            })
+        })
+        .collect()
+}
+
+/// Parse the name payload of a BIFF5/8 `EXTERNNAME` record. The six-byte
+/// prefix contains option/automatic-link metadata; the trailing value is the
+/// same short string dialect used by `BOUNDSHEET` (a compressed-or-wide
+/// `ShortXLUnicodeString` in BIFF8, codepage bytes in BIFF5/7).
+fn parse_extern_name(data: &[u8], ctx: Ctx) -> Option<String> {
+    let name = read_short_string(data, 6, ctx)?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn parse_lbl_formula_name(data: &[u8], ctx: Ctx) -> Option<String> {
+    let flags = u16le(data, 0)?;
+    let cch = usize::from(*data.get(3)?);
+    if flags & 0x0020 != 0 {
+        if cch != 1 {
+            return None;
+        }
+        let id = *data.get(14)?;
+        return Some(
+            match id {
+                0x00 => "Consolidate_Area",
+                0x01 => "Auto_Open",
+                0x02 => "Auto_Close",
+                0x03 => "Extract",
+                0x04 => "Database",
+                0x05 => "Criteria",
+                0x06 => "Print_Area",
+                0x07 => "Print_Titles",
+                0x08 => "Recorder",
+                0x09 => "Data_Form",
+                0x0A => "Auto_Activate",
+                0x0B => "Auto_Deactivate",
+                0x0C => "Sheet_Title",
+                0x0D => "_FilterDatabase",
+                _ => return Some(format!("BuiltinName{id:02X}")),
+            }
+            .to_string(),
+        );
+    }
+    read_name_no_cch(data, 14, cch, ctx).map(|(name, _)| name)
 }
 
 /// Parse a workbook-global `Lbl` record. Workbook-global user names are surfaced
@@ -1388,11 +1608,19 @@ fn parse_lbl(data: &[u8], ctx: Ctx) -> Option<ParsedLbl> {
     let rgce = data.get(rgce_start..rgce_start.checked_add(cce)?)?;
     match name {
         NameKind::User(name) => {
+            let rgce_end = rgce_start.checked_add(cce)?;
+            let raw = RawDefinedName {
+                name,
+                rgce: rgce.to_vec(),
+                rgb_extra: data.get(rgce_end..).unwrap_or_default().to_vec(),
+            };
             if itab == 0 {
-                let refers_to = crate::ptg::decompile(rgce, false);
-                Some(ParsedLbl::GlobalUser((name, refers_to)))
+                Some(ParsedLbl::GlobalUser(raw))
             } else {
-                None
+                Some(ParsedLbl::LocalUser {
+                    sheet_index: usize::from(itab - 1),
+                    name: raw,
+                })
             }
         }
         NameKind::Builtin(kind) => {
@@ -1582,6 +1810,155 @@ fn decode_chars(data: &[u8], off: usize, cch: usize, grbit: u8) -> Option<String
     }
 }
 
+fn parse_formula_definition(typ: u16, data: &[u8]) -> Option<FormulaDefinition> {
+    let row_first = u32::from(u16le(data, 0)?);
+    let row_last = u32::from(u16le(data, 2)?);
+    let col_first = u16::from(*data.get(4)?);
+    let col_last = u16::from(*data.get(5)?);
+    if row_first > row_last || col_first > col_last {
+        return None;
+    }
+    let formula_start = match typ {
+        SHRFMLA => 8,
+        ARRAY => 12,
+        _ => return None,
+    };
+    let cce = usize::from(u16le(data, formula_start)?);
+    let rgce_start = formula_start.checked_add(2)?;
+    let rgce_end = rgce_start.checked_add(cce)?;
+    let rgce = data.get(rgce_start..rgce_end)?.to_vec();
+    Some(FormulaDefinition {
+        anchor: (row_first, col_first),
+        range: (row_first, col_first, row_last, col_last),
+        rgce,
+        rgb_extra: data.get(rgce_end..).unwrap_or_default().to_vec(),
+        is_array: typ == ARRAY,
+    })
+}
+
+fn formula_context<'a>(
+    ctx: Ctx,
+    row: u32,
+    col: u16,
+    sheet_names: &'a [String],
+    extern_sheets: &'a [crate::ptg::ExternSheet],
+    external_names: &'a [Vec<String>],
+    defined_names: &'a [String],
+) -> crate::ptg::Context<'a> {
+    crate::ptg::Context {
+        biff12: false,
+        biff5: !ctx.biff8,
+        name_formula: false,
+        base_row: row,
+        base_col: col,
+        sheet_names,
+        extern_sheets,
+        external_names,
+        defined_names,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompile_formula_source(
+    rgce: &[u8],
+    rgb_extra: &[u8],
+    sheet_idx: usize,
+    row: u32,
+    col: u16,
+    ctx: Ctx,
+    definitions: &FormulaDefinitions,
+    sheet_names: &[String],
+    extern_sheets: &[crate::ptg::ExternSheet],
+    external_names: &[Vec<String>],
+    defined_names: &[String],
+) -> Option<String> {
+    let (tokens, extra, base_row, base_col) =
+        if let Some((anchor_row, anchor_col)) = crate::ptg::exp_anchor(rgce, rgb_extra, false) {
+            let definition = definitions.get(&(sheet_idx, anchor_row, anchor_col))?;
+            let (row_first, col_first, row_last, col_last) = definition.range;
+            if row < row_first || row > row_last || col < col_first || col > col_last {
+                return None;
+            }
+            let (base_row, base_col) = if definition.is_array {
+                definition.anchor
+            } else {
+                (row, col)
+            };
+            (
+                definition.rgce.as_slice(),
+                definition.rgb_extra.as_slice(),
+                base_row,
+                base_col,
+            )
+        } else {
+            (rgce, rgb_extra, row, col)
+        };
+    let context = formula_context(
+        ctx,
+        base_row,
+        base_col,
+        sheet_names,
+        extern_sheets,
+        external_names,
+        defined_names,
+    );
+    let formula = crate::ptg::decompile_parsed_with_context(tokens, extra, &context);
+    (!formula.is_empty()).then_some(formula)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_formula_definition(
+    sheet_idx: usize,
+    definition: &FormulaDefinition,
+    cells: &mut [CellEntry],
+    last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
+    ctx: Ctx,
+    sheet_names: &[String],
+    extern_sheets: &[crate::ptg::ExternSheet],
+    external_names: &[Vec<String>],
+    defined_names: &[String],
+) {
+    let context = formula_context(
+        ctx,
+        definition.anchor.0,
+        definition.anchor.1,
+        sheet_names,
+        extern_sheets,
+        external_names,
+        defined_names,
+    );
+    let formula = crate::ptg::decompile_parsed_with_context(
+        &definition.rgce,
+        &definition.rgb_extra,
+        &context,
+    );
+    if formula.is_empty() {
+        return;
+    }
+    if let Some((si, row, col, source)) = last_formula.as_mut() {
+        if (*si, *row, *col) == (sheet_idx, definition.anchor.0, definition.anchor.1) {
+            *source = Some(formula.clone());
+        }
+    }
+    if let Some(cell) = cells
+        .iter_mut()
+        .rev()
+        .find(|cell| cell.row == definition.anchor.0 && cell.col == definition.anchor.1)
+    {
+        match &mut cell.value {
+            Cell::Formula {
+                formula: source, ..
+            } => *source = formula,
+            cached => {
+                cell.value = Cell::Formula {
+                    formula,
+                    cached: Box::new(cached.clone()),
+                };
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_cell(
     typ: u16,
@@ -1592,6 +1969,12 @@ fn decode_cell(
     last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
     formats: &Formats,
     budget: &mut usize,
+    sheet_names: &[String],
+    extern_sheets: &[crate::ptg::ExternSheet],
+    external_names: &[Vec<String>],
+    defined_names: &[String],
+    ctx: Ctx,
+    formula_definitions: &FormulaDefinitions,
 ) {
     if *budget == 0 {
         return; // text budget exhausted — stop accumulating
@@ -1667,8 +2050,19 @@ fn decode_cell(
             // `Cell::Formula { formula, cached }`, else just the cached value.
             let formula = u16le(data, 20).and_then(|cce| {
                 let end = 22usize.saturating_add(cce as usize).min(data.len());
-                let f = crate::ptg::decompile(data.get(22..end).unwrap_or(&[]), false);
-                (!f.is_empty()).then_some(f)
+                decompile_formula_source(
+                    data.get(22..end).unwrap_or_default(),
+                    data.get(end..).unwrap_or_default(),
+                    sheet_idx,
+                    row,
+                    col,
+                    ctx,
+                    formula_definitions,
+                    sheet_names,
+                    extern_sheets,
+                    external_names,
+                    defined_names,
+                )
             });
             if let Some(res) = data.get(6..14) {
                 if res[6] == 0xFF && res[7] == 0xFF {
@@ -1755,11 +2149,13 @@ fn wrap_formula(formula: &Option<String>, cached: Cell) -> Cell {
 /// records. `chunks[0]` is the record body; `chunks[1..]` are the CONTINUE
 /// bodies. This replaces the single-record arms once in `decode_cell`: the
 /// payload is reassembled across the record boundary before decoding.
+#[allow(clippy::too_many_arguments)]
 fn decode_string_cell(
     typ: u16,
     chunks: &[&[u8]],
     sheet_idx: usize,
     cells: &mut Vec<CellEntry>,
+    rich: &mut BTreeMap<(u32, u16), Vec<crate::TextRun>>,
     last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
     ctx: Ctx,
     budget: &mut usize,
@@ -1777,7 +2173,18 @@ fn decode_string_cell(
             let (Some(row), Some(col)) = (u16le(first, 0), u16le(first, 2)) else {
                 return;
             };
-            if let Some(s) = read_continued_xl_string(chunks, 6, ctx) {
+            let decoded = if typ == RSTRING && ctx.biff8 {
+                crate::sst::read_continued_rich(chunks, 6)
+            } else {
+                read_continued_xl_string(chunks, 6, ctx)
+            };
+            if let Some(s) = decoded {
+                if typ == RSTRING {
+                    let runs = parse_rstring_runs(first, 6, ctx, &s);
+                    if !runs.is_empty() {
+                        rich.insert((u32::from(row), col), runs);
+                    }
+                }
                 push_text(cells, u32::from(row), col, s, budget);
             }
         }
@@ -1804,6 +2211,65 @@ fn decode_string_cell(
         }
         _ => {}
     }
+}
+
+fn parse_rstring_runs(data: &[u8], off: usize, ctx: Ctx, text: &str) -> Vec<crate::TextRun> {
+    if !ctx.biff8 {
+        return Vec::new();
+    }
+    let Some(cch) = u16le(data, off).map(usize::from) else {
+        return Vec::new();
+    };
+    let Some(flags) = data.get(off + 2).copied() else {
+        return Vec::new();
+    };
+    if flags & 0x08 == 0 {
+        return Vec::new();
+    }
+    let mut pos = off + 3;
+    let Some(run_count) = u16le(data, pos).map(usize::from) else {
+        return Vec::new();
+    };
+    pos += 2;
+    if flags & 0x04 != 0 {
+        pos = pos.saturating_add(4);
+    }
+    pos = pos.saturating_add(cch.saturating_mul(if flags & 0x01 != 0 { 2 } else { 1 }));
+    let available = data.len().saturating_sub(pos) / 4;
+    let mut starts = Vec::with_capacity(run_count.min(available));
+    for index in 0..run_count.min(available) {
+        if let Some(start) = u16le(data, pos + index * 4) {
+            starts.push(usize::from(start));
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+
+    let text_units = text.encode_utf16().count();
+    let mut runs = Vec::with_capacity(starts.len());
+    for (index, start) in starts.iter().copied().enumerate() {
+        if start >= text_units {
+            continue;
+        }
+        let end = starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(text_units)
+            .min(text_units);
+        let mut unit = 0usize;
+        let fragment = text
+            .chars()
+            .filter(|ch| {
+                let position = unit;
+                unit += ch.len_utf16();
+                position >= start && position < end
+            })
+            .collect::<String>();
+        if !fragment.is_empty() {
+            runs.push(crate::TextRun::new(fragment, crate::Font::default()));
+        }
+    }
+    runs
 }
 
 /// Read an `XLUnicodeString` (BIFF8) or codepage byte string (BIFF5/7) that may
@@ -1890,11 +2356,21 @@ fn parse_pane_freeze(data: &[u8]) -> Option<(u32, u16)> {
 }
 
 fn apply_row_outline(data: &[u8], sheet: &mut Sheet) {
-    let (Some(row), Some(options)) = (u16le(data, 0), u32le(data, 12)) else {
+    let (Some(row), Some(height_twips), Some(options)) =
+        (u16le(data, 0), u16le(data, 6), u32le(data, 12))
+    else {
         return;
     };
     let level = (options & 0x07) as u8;
     let row = u32::from(row);
+    if height_twips > 0 {
+        sheet
+            .row_heights
+            .insert(row, f32::from(height_twips) / 20.0);
+    }
+    if options & 0x20 != 0 {
+        sheet.hidden_rows.insert(row);
+    }
     if level > 0 {
         sheet.row_outline.insert(row, level);
     }
@@ -1904,16 +2380,28 @@ fn apply_row_outline(data: &[u8], sheet: &mut Sheet) {
 }
 
 fn apply_col_outline(data: &[u8], sheet: &mut Sheet) {
-    let (Some(first), Some(last), Some(options)) = (u16le(data, 0), u16le(data, 2), u16le(data, 8))
-    else {
+    let (Some(first), Some(last), Some(width_256), Some(options)) = (
+        u16le(data, 0),
+        u16le(data, 2),
+        u16le(data, 4),
+        u16le(data, 8),
+    ) else {
         return;
     };
-    let level = ((options >> 8) & 0x07) as u8;
-    if level == 0 || first > last {
+    if first > last {
         return;
     }
+    let level = ((options >> 8) & 0x07) as u8;
     for col in first..=last {
-        sheet.col_outline.insert(col, level);
+        if width_256 > 0 {
+            sheet.col_widths.insert(col, f32::from(width_256) / 256.0);
+        }
+        if options & 0x01 != 0 {
+            sheet.hidden_cols.insert(col);
+        }
+        if level > 0 {
+            sheet.col_outline.insert(col, level);
+        }
     }
 }
 
@@ -2095,6 +2583,51 @@ mod tests {
 
     fn wrap_xls(stream: &[u8], name: &str) -> Vec<u8> {
         wrap_xls_with_extra_streams(stream, name, &[])
+    }
+
+    fn encode_legacy_text(encoding: &'static Encoding, value: &str) -> Vec<u8> {
+        let (bytes, _, had_errors) = encoding.encode(value);
+        assert!(
+            !had_errors,
+            "{value:?} is not representable in {}",
+            encoding.name()
+        );
+        bytes.into_owned()
+    }
+
+    /// Build one complete BIFF5 `Book` stream so codepage tests exercise the
+    /// global declaration, sheet-name path, and cell-string path together.
+    fn biff5_single_label(
+        declared_codepage: Option<u16>,
+        encoding: &'static Encoding,
+        sheet_name: &str,
+        label: &str,
+    ) -> Vec<u8> {
+        let sheet_name = encode_legacy_text(encoding, sheet_name);
+        let label = encode_legacy_text(encoding, label);
+
+        let mut global_bof = vec![0x00, 0x05, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 4]);
+        let mut stream = rec(BOF, &global_bof);
+        if let Some(codepage) = declared_codepage {
+            stream.extend_from_slice(&rec(CODEPAGE, &codepage.to_le_bytes()));
+        }
+
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, sheet_name.len() as u8];
+        boundsheet.extend_from_slice(&sheet_name);
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x05, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 4]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let mut label_record = vec![0, 0, 0, 0, 0, 0];
+        label_record.extend_from_slice(&(label.len() as u16).to_le_bytes());
+        label_record.extend_from_slice(&label);
+        stream.extend_from_slice(&rec(LABEL, &label_record));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        wrap_xls(&stream, "/Book")
     }
 
     fn wrap_xls_with_extra_streams(
@@ -2457,6 +2990,19 @@ mod tests {
         lbl.extend_from_slice(&[0x1E, 42, 0]); // PtgInt(42)
         stream.extend_from_slice(&rec(0x0018, &lbl));
 
+        let mut local_lbl = Vec::new();
+        local_lbl.extend_from_slice(&0u16.to_le_bytes());
+        local_lbl.push(0);
+        local_lbl.push(4);
+        local_lbl.extend_from_slice(&3u16.to_le_bytes());
+        local_lbl.extend_from_slice(&0u16.to_le_bytes());
+        local_lbl.extend_from_slice(&1u16.to_le_bytes()); // one-based sheet scope
+        local_lbl.extend_from_slice(&[0, 0, 0, 0]);
+        local_lbl.push(0x00);
+        local_lbl.extend_from_slice(b"Rate");
+        local_lbl.extend_from_slice(&[0x1E, 7, 0]);
+        stream.extend_from_slice(&rec(0x0018, &local_lbl));
+
         let mut bs = vec![0, 0, 0, 0, 0, 0, 2, 0x00];
         bs.extend_from_slice(b"S1");
         stream.extend_from_slice(&rec(BOUNDSHEET, &bs));
@@ -2465,12 +3011,35 @@ mod tests {
         let mut s_bof = vec![0x00, 0x06, 0x10, 0x00];
         s_bof.extend_from_slice(&[0u8; 12]);
         stream.extend_from_slice(&rec(BOF, &s_bof));
+        let mut formula = vec![0, 0, 0, 0, 0, 0];
+        formula.extend_from_slice(&42.0f64.to_le_bytes());
+        formula.extend_from_slice(&[0, 0]);
+        formula.extend_from_slice(&[0, 0, 0, 0]);
+        let rgce = [0x23, 1, 0, 0, 0]; // PtgName, one-based Lbl index 1
+        formula.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
+        formula.extend_from_slice(&rgce);
+        stream.extend_from_slice(&rec(FORMULA, &formula));
         stream.extend_from_slice(&rec(EOF, &[]));
 
         let wb = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
         assert_eq!(
             wb.defined_names(),
             &[("Answer".to_string(), "42".to_string())]
+        );
+        assert_eq!(
+            wb.local_defined_names(),
+            &[crate::LocalDefinedName {
+                sheet: "S1".into(),
+                name: "Rate".into(),
+                refers_to: "7".into(),
+            }]
+        );
+        assert_eq!(
+            wb.sheets[0].cell(0, 0),
+            Some(&Cell::Formula {
+                formula: "Answer".to_string(),
+                cached: Box::new(Cell::Number(42.0))
+            })
         );
     }
 
@@ -2681,9 +3250,9 @@ mod tests {
         s_bof.extend_from_slice(&[0u8; 12]);
         stream.extend_from_slice(&rec(BOF, &s_bof));
         stream.extend_from_slice(&rec(0x0081, &0u16.to_le_bytes())); // summaries above/left
-        stream.extend_from_slice(&rec(0x0208, &row_record(2, 2 | (1 << 4))));
+        stream.extend_from_slice(&rec(0x0208, &row_record(2, 2 | (1 << 4) | (1 << 5))));
         stream.extend_from_slice(&rec(0x0208, &row_record(3, 2)));
-        stream.extend_from_slice(&rec(0x007D, &col_info(1, 3, 3 << 8)));
+        stream.extend_from_slice(&rec(0x007D, &col_info(1, 3, (3 << 8) | 1)));
         stream.extend_from_slice(&rec(EOF, &[]));
 
         let wb = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
@@ -2694,6 +3263,13 @@ mod tests {
         assert!(sheet.collapsed_rows().contains(&2));
         assert_eq!(sheet.col_outline_levels().get(&1), Some(&3));
         assert_eq!(sheet.col_outline_levels().get(&3), Some(&3));
+        assert_eq!(sheet.row_heights().get(&2), Some(&(0x8000 as f32 / 20.0)));
+        assert!(sheet.hidden_rows().contains(&2));
+        assert_eq!(
+            sheet.column_widths().get(&1),
+            Some(&(0x08FF as f32 / 256.0))
+        );
+        assert!(sheet.hidden_columns().contains(&1));
         assert!(!sheet.outline_summary_below());
         assert!(!sheet.outline_summary_right());
 
@@ -3103,10 +3679,15 @@ mod tests {
         // RSTRING: row,col,ixfe, XLUnicodeString "Hi" (compressed), + run table.
         let mut data = vec![0u8; 6]; // row=0,col=0,ixfe=0
         data.extend_from_slice(&2u16.to_le_bytes()); // cch
-        data.push(0x00); // grbit compressed
+        data.push(0x08); // grbit compressed + rich runs
+        data.extend_from_slice(&2u16.to_le_bytes()); // cRun
         data.extend_from_slice(b"Hi");
-        data.extend_from_slice(&[0xFF; 4]); // trailing rich-run bytes (ignored)
+        data.extend_from_slice(&0u16.to_le_bytes()); // ich
+        data.extend_from_slice(&1u16.to_le_bytes()); // ifnt
+        data.extend_from_slice(&1u16.to_le_bytes()); // ich
+        data.extend_from_slice(&2u16.to_le_bytes()); // ifnt
         let mut cells = Vec::new();
+        let mut rich = BTreeMap::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
         decode_string_cell(
@@ -3114,6 +3695,7 @@ mod tests {
             &[&data],
             0,
             &mut cells,
+            &mut rich,
             &mut lf,
             ctx8(),
             &mut budget,
@@ -3121,6 +3703,13 @@ mod tests {
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].value, Cell::Text("Hi".to_string()));
         assert_eq!(cells[0].text, "Hi");
+        assert_eq!(
+            rich[&(0, 0)]
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["H", "i"]
+        );
     }
 
     #[test]
@@ -3371,6 +3960,12 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
         );
         // BOOLERR bool FALSE at row 1.
         decode_cell(
@@ -3382,11 +3977,32 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
         );
         // FORMULA cached error: res[0]=0x02, res[2]=0x2A (#N/A), tail 0xFFFF.
         let mut fmla = vec![2, 0, 0, 0, 0, 0]; // row 2, col 0, ixfe 0
         fmla.extend_from_slice(&[0x02, 0x00, 0x2A, 0x00, 0x00, 0x00, 0xFF, 0xFF]);
-        decode_cell(FORMULA, &fmla, &[], 0, &mut cells, &mut lf, f, &mut budget);
+        decode_cell(
+            FORMULA,
+            &fmla,
+            &[],
+            0,
+            &mut cells,
+            &mut lf,
+            f,
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
+        );
         assert_eq!(cells[0].value, Cell::Error("#DIV/0!".to_string()));
         assert_eq!(cells[1].value, Cell::Bool(false));
         assert_eq!(cells[2].value, Cell::Error("#N/A".to_string()));
@@ -3407,15 +4023,77 @@ mod tests {
         let rgce: Vec<u8> = vec![0x25, 0, 0, 1, 0, 0, 0, 0, 0, 0x22, 1, 4, 0];
         p.extend_from_slice(&(rgce.len() as u16).to_le_bytes()); // cce
         p.extend_from_slice(&rgce);
-        decode_cell(FORMULA, &p, &[], 0, &mut cells, &mut lf, f, &mut budget);
+        decode_cell(
+            FORMULA,
+            &p,
+            &[],
+            0,
+            &mut cells,
+            &mut lf,
+            f,
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
+        );
         assert_eq!(cells.len(), 1);
         match &cells[0].value {
             Cell::Formula { formula, cached } => {
-                assert_eq!(formula, "SUM(A1:A2)");
+                assert_eq!(formula, "SUM($A$1:$A$2)");
                 assert_eq!(**cached, Cell::Number(30.0));
             }
             other => panic!("expected a formula cell, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xls_formula_resolves_namex_from_supbook_externname_table() {
+        let mut globals_bof = vec![0x00, 0x06, 0x05, 0x00];
+        globals_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &globals_bof);
+        stream.extend_from_slice(&rec(SUPBOOK, &[1, 0, 1, 4]));
+
+        let mut extern_name = vec![0, 0, 0, 0, 0, 0, 12, 0];
+        extern_name.extend_from_slice(b"ExternalRate");
+        stream.extend_from_slice(&rec(EXTERNNAME, &extern_name));
+        stream.extend_from_slice(&rec(EXTERNSHEET, &[1, 0, 0, 0, 0, 0, 0, 0]));
+
+        let mut bound = vec![0, 0, 0, 0, 0, 0, 4, 0];
+        bound.extend_from_slice(b"Data");
+        stream.extend_from_slice(&rec(BOUNDSHEET, &bound));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let mut formula = vec![0, 0, 0, 0, 0, 0];
+        formula.extend_from_slice(&1.0f64.to_le_bytes());
+        formula.extend_from_slice(&[0, 0]);
+        formula.extend_from_slice(&[0, 0, 0, 0]);
+        let namex = [0x39, 0, 0, 1, 0, 0, 0];
+        formula.extend_from_slice(&(namex.len() as u16).to_le_bytes());
+        formula.extend_from_slice(&namex);
+        stream.extend_from_slice(&rec(FORMULA, &formula));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        match workbook.sheets[0].cell(0, 0).unwrap() {
+            Cell::Formula { formula, cached } => {
+                assert_eq!(formula, "[ixti:0]!ExternalRate");
+                assert_eq!(cached.as_ref(), &Cell::Number(1.0));
+            }
+            other => panic!("expected resolved NameX formula, got {other:?}"),
+        }
+        assert_eq!(
+            workbook.evaluate_cell("Data", 0, 0),
+            crate::FormulaEvaluation::Fallback {
+                cached: Cell::Number(1.0),
+                reason: crate::FormulaUnsupportedReason::ExternalRef,
+            }
+        );
     }
 
     #[test]
@@ -3434,16 +4112,171 @@ mod tests {
         p.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
         p.extend_from_slice(&rgce);
 
-        decode_cell(0x0406, &p, &[], 0, &mut cells, &mut lf, f, &mut budget);
+        decode_cell(
+            0x0406,
+            &p,
+            &[],
+            0,
+            &mut cells,
+            &mut lf,
+            f,
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
+        );
 
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].text, "3");
         match &cells[0].value {
             Cell::Formula { formula, cached } => {
-                assert_eq!(formula, "SUM(A1:A2)");
+                assert_eq!(formula, "SUM($A$1:$A$2)");
                 assert_eq!(**cached, Cell::Number(3.0));
             }
             other => panic!("expected a formula cell, got {other:?}"),
+        }
+    }
+
+    fn numeric_formula_body(row: u16, col: u16, cached: f64, rgce: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&row.to_le_bytes());
+        body.extend_from_slice(&col.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&cached.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
+        body.extend_from_slice(rgce);
+        body
+    }
+
+    #[test]
+    fn xls_shared_formula_is_reconstructed_for_each_cell() {
+        let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &global_bof);
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, 4, 0];
+        boundsheet.extend_from_slice(b"Data");
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let exp = [0x01, 0, 0, 1, 0]; // shared anchor B1
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(0, 1, 10.0, &exp)));
+
+        let shared_rgce = [0x2C, 0, 0, 0xFF, 0xFF]; // PtgRefN: one column left
+        let mut shared = Vec::new();
+        shared.extend_from_slice(&0u16.to_le_bytes());
+        shared.extend_from_slice(&1u16.to_le_bytes());
+        shared.extend_from_slice(&[1, 1, 0, 2]);
+        shared.extend_from_slice(&(shared_rgce.len() as u16).to_le_bytes());
+        shared.extend_from_slice(&shared_rgce);
+        stream.extend_from_slice(&rec(SHRFMLA, &shared));
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(1, 1, 20.0, &exp)));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        for (row, expected) in [(0, "A1"), (1, "A2")] {
+            match workbook.sheets[0].cell(row, 1).unwrap() {
+                Cell::Formula { formula, .. } => assert_eq!(formula, expected),
+                other => panic!("expected shared formula at row {row}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn xls_array_formula_and_array_constant_are_reconstructed() {
+        let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &global_bof);
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, 4, 0];
+        boundsheet.extend_from_slice(b"Data");
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let exp = [0x01, 0, 0, 0, 0];
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(0, 0, 1.0, &exp)));
+
+        let array_rgce = [0x20, 0, 0, 0, 0, 0, 0, 0];
+        let mut array = Vec::new();
+        array.extend_from_slice(&0u16.to_le_bytes());
+        array.extend_from_slice(&0u16.to_le_bytes());
+        array.extend_from_slice(&[0, 1]); // A1:B1
+        array.extend_from_slice(&0u16.to_le_bytes());
+        array.extend_from_slice(&0u32.to_le_bytes());
+        array.extend_from_slice(&(array_rgce.len() as u16).to_le_bytes());
+        array.extend_from_slice(&array_rgce);
+        array.extend_from_slice(&[1, 0, 0]); // two columns, one row
+        array.push(0x01);
+        array.extend_from_slice(&1.0f64.to_le_bytes());
+        array.push(0x01);
+        array.extend_from_slice(&2.0f64.to_le_bytes());
+        stream.extend_from_slice(&rec(ARRAY, &array));
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(0, 1, 2.0, &exp)));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        for col in 0..=1 {
+            match workbook.sheets[0].cell(0, col).unwrap() {
+                Cell::Formula { formula, .. } => assert_eq!(formula, "{1,2}"),
+                other => panic!("expected array formula at col {col}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn xls_formula_resolves_3d_sheet_names_and_absolute_markers() {
+        let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &global_bof);
+        for name in ["Calc", "Input Data"] {
+            let mut boundsheet = vec![0, 0, 0, 0, 0, 0, name.len() as u8, 0];
+            boundsheet.extend_from_slice(name.as_bytes());
+            stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        }
+        let extern_sheet = [
+            1, 0, // cXTI
+            0, 0, // iSupBook
+            1, 0, // itabFirst
+            1, 0, // itabLast
+        ];
+        stream.extend_from_slice(&rec(EXTERNSHEET, &extern_sheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let mut formula = vec![0, 0, 0, 0, 0, 0];
+        formula.extend_from_slice(&7.0f64.to_le_bytes());
+        formula.extend_from_slice(&[0, 0]);
+        formula.extend_from_slice(&[0, 0, 0, 0]);
+        let rgce = [
+            0x3A, 0, 0, // PtgRef3d, ixti 0
+            2, 0, // absolute row 2
+            1, 0, // absolute column 1
+        ];
+        formula.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
+        formula.extend_from_slice(&rgce);
+        stream.extend_from_slice(&rec(FORMULA, &formula));
+        stream.extend_from_slice(&rec(EOF, &[]));
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        match workbook.sheets[0].cell(0, 0).unwrap() {
+            Cell::Formula { formula, cached } => {
+                assert_eq!(formula, "'Input Data'!$B$3");
+                assert_eq!(cached.as_ref(), &Cell::Number(7.0));
+            }
+            other => panic!("expected 3D formula, got {other:?}"),
         }
     }
 
@@ -3462,11 +4295,26 @@ mod tests {
         let rgce: Vec<u8> = vec![0x25, 0, 0, 1, 0, 0, 0, 0, 0, 0x22, 1, 4, 0]; // SUM(A1:A2)
         p.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
         p.extend_from_slice(&rgce);
-        decode_cell(FORMULA, &p, &[], 0, &mut cells, &mut lf, f, &mut budget);
+        decode_cell(
+            FORMULA,
+            &p,
+            &[],
+            0,
+            &mut cells,
+            &mut lf,
+            f,
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+            ctx8(),
+            &FormulaDefinitions::new(),
+        );
         assert_eq!(cells.len(), 1, "blank-result formula must still surface");
         match &cells[0].value {
             Cell::Formula { formula, cached } => {
-                assert_eq!(formula, "SUM(A1:A2)");
+                assert_eq!(formula, "SUM($A$1:$A$2)");
                 assert_eq!(**cached, Cell::Text(String::new()));
             }
             other => panic!("expected a formula cell, got {other:?}"),
@@ -3585,35 +4433,60 @@ mod tests {
     }
 
     #[test]
-    fn biff5_cp949_end_to_end() {
-        // A real BIFF5 (`Book` stream, BOF vers 0x0500) workbook with Korean
-        // text in cp949: no SST, strings are raw codepage bytes with no grbit.
-        let kr_sheet = EUC_KR.encode("내역서").0.into_owned();
-        let kr_label = EUC_KR.encode("조달청 입찰공고").0.into_owned();
-        // globals: BOF(BIFF5), CODEPAGE(949), BOUNDSHEET, EOF
-        let mut g_bof = vec![0x00, 0x05, 0x05, 0x00];
-        g_bof.extend_from_slice(&[0u8; 4]);
-        let mut stream = rec(BOF, &g_bof);
-        stream.extend_from_slice(&rec(CODEPAGE, &949u16.to_le_bytes()));
-        // BOUNDSHEET: lbPlyPos(4), hidden(1)=0, dt(1)=0, cch(1) + cp949 bytes
-        let mut bs = vec![0, 0, 0, 0, 0, 0, kr_sheet.len() as u8];
-        bs.extend_from_slice(&kr_sheet);
-        stream.extend_from_slice(&rec(BOUNDSHEET, &bs));
-        stream.extend_from_slice(&rec(EOF, &[]));
-        // sheet: BOF(BIFF5), LABEL(row,col,ixfe, cch + cp949 bytes), EOF
-        let mut s_bof = vec![0x00, 0x05, 0x10, 0x00];
-        s_bof.extend_from_slice(&[0u8; 4]);
-        stream.extend_from_slice(&rec(BOF, &s_bof));
-        let mut lbl = vec![0, 0, 0, 0, 0, 0]; // row, col, ixfe
-        lbl.extend_from_slice(&(kr_label.len() as u16).to_le_bytes()); // cch = byte count
-        lbl.extend_from_slice(&kr_label);
-        stream.extend_from_slice(&rec(LABEL, &lbl));
-        stream.extend_from_slice(&rec(EOF, &[]));
+    fn biff5_supported_codepages_have_golden_text_end_to_end() {
+        let cases = [
+            // 949 is Windows Korean/UHC (a superset of KS X 1001).
+            (949, EUC_KR, "내역서", "뷁 테스트"),
+            // 51949 is the BIFF declaration used for EUC-KR.
+            (51949, EUC_KR, "한국어", "조달청 입찰공고"),
+            (932, SHIFT_JIS, "集計", "日本語テスト"),
+            (1252, WINDOWS_1252, "Résumé", "Café € – naïve"),
+        ];
 
-        let bytes = wrap_xls(&stream, "/Book");
-        let text = extract_text(&bytes).unwrap();
-        assert!(text.contains("내역서"), "{text:?}");
-        assert!(text.contains("조달청 입찰공고"), "{text:?}");
+        for (codepage, encoding, sheet_name, expected) in cases {
+            let bytes = biff5_single_label(Some(codepage), encoding, sheet_name, expected);
+            let workbook = Workbook::open(&bytes).expect("open BIFF5 codepage fixture");
+            assert_eq!(workbook.sheets[0].name, sheet_name, "codepage {codepage}");
+            assert_eq!(
+                workbook.sheets[0].cell(0, 0),
+                Some(&Cell::Text(expected.to_string())),
+                "codepage {codepage}"
+            );
+        }
+    }
+
+    #[test]
+    fn biff5_codepage_fallback_and_override_policy_is_stable() {
+        // Missing and unknown declarations use the documented cp1252 fallback.
+        for declared in [None, Some(65_000)] {
+            let bytes = biff5_single_label(declared, WINDOWS_1252, "Western", "Café €");
+            let workbook = Workbook::open(&bytes).expect("open fallback fixture");
+            assert_eq!(
+                workbook.sheets[0].cell(0, 0),
+                Some(&Cell::Text("Café €".to_string()))
+            );
+        }
+
+        // A caller can correct a wrong declaration without changing the file.
+        let wrongly_declared = biff5_single_label(Some(1252), EUC_KR, "Sheet", "한글");
+        assert_ne!(
+            Workbook::open(&wrongly_declared).unwrap().sheets[0].cell(0, 0),
+            Some(&Cell::Text("한글".to_string()))
+        );
+        let forced = Workbook::open_with_codepage(&wrongly_declared, Some(949)).unwrap();
+        assert_eq!(
+            forced.sheets[0].cell(0, 0),
+            Some(&Cell::Text("한글".to_string()))
+        );
+
+        // Malformed byte sequences are replaced with U+FFFD, never panicked or
+        // silently dropped. 0x81 is an incomplete Shift-JIS lead byte.
+        let malformed = [1, 0, 0x81];
+        let context = Ctx {
+            biff8: false,
+            enc: SHIFT_JIS,
+        };
+        assert_eq!(read_xl_string(&malformed, 0, context).as_deref(), Some("�"));
     }
 
     #[test]
@@ -3831,5 +4704,18 @@ mod tests {
         let wb = Workbook::open(&bytes).unwrap();
         assert!(wb.sheets.is_empty());
         assert!(matches!(extract_text(&bytes), Err(Error::NoText)));
+    }
+
+    #[test]
+    fn accepts_cfb_allocation_padding_after_balanced_stream() {
+        let mut g_bof = vec![0x00, 0x06, 0x05, 0x00];
+        g_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &g_bof);
+        stream.extend_from_slice(&rec(EOF, &[]));
+        stream.extend_from_slice(&[0u8; 17]);
+
+        let bytes = wrap_xls(&stream, "/Workbook");
+        let wb = Workbook::open(&bytes).unwrap();
+        assert!(wb.sheets.is_empty());
     }
 }

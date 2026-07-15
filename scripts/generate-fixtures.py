@@ -70,8 +70,8 @@ def cfb_directory_entry(
     return bytes(entry)
 
 
-def write_cfb(path: Path, workbook_stream: bytes) -> None:
-    """Write a minimal deterministic CFB v3 file with one Workbook stream."""
+def write_cfb(path: Path, workbook_stream: bytes, stream_name: str = "Workbook") -> None:
+    """Write a minimal deterministic CFB v3 file with one BIFF workbook stream."""
 
     # Streams below the mini-stream cutoff are normally stored through MiniFAT.
     # Padding the logical Workbook stream to the cutoff keeps the file simpler:
@@ -98,7 +98,7 @@ def write_cfb(path: Path, workbook_stream: bytes) -> None:
     directory_payload = b"".join(
         [
             cfb_directory_entry("Root Entry", 5, 1, CFB_END, 0),
-            cfb_directory_entry("Workbook", 2, CFB_FREE, workbook_start_sector, stream_size),
+            cfb_directory_entry(stream_name, 2, CFB_FREE, workbook_start_sector, stream_size),
             bytes(128),
             bytes(128),
         ]
@@ -308,6 +308,58 @@ def generate_xls() -> None:
     workbook.extend(biff_record(0x000A, b""))
 
     write_cfb(FIXTURES / "xls" / "reader-basic.xls", bytes(workbook))
+
+
+def biff5_bof(stream_type: int) -> bytes:
+    return biff_record(0x0809, u16(0x0500) + u16(stream_type) + bytes(4))
+
+
+def biff5_short_string(value: str, encoding: str = "cp949") -> bytes:
+    encoded = value.encode(encoding)
+    if len(encoded) > 255:
+        raise ValueError("BIFF5 short string too long")
+    return bytes([len(encoded)]) + encoded
+
+
+def biff5_label(row: int, col: int, value: str, encoding: str = "cp949") -> bytes:
+    encoded = value.encode(encoding)
+    return biff_record(
+        0x0204,
+        u16(row) + u16(col) + u16(0) + u16(len(encoded)) + encoded,
+    )
+
+
+def generate_korean_biff5() -> None:
+    """Generate a BIFF5 CP949 derivative of Apache POI's Korean 15556.xls.
+
+    The source workbook is Apache-2.0 licensed. Keeping a tiny deterministic
+    derivative in-tree exercises the legacy `Book` stream and CP949 byte-string
+    paths without making the test suite depend on the optional public corpus.
+    """
+
+    workbook = bytearray()
+    workbook.extend(biff5_bof(0x0005))
+    workbook.extend(biff_record(0x0042, u16(949)))
+    workbook.extend(
+        biff_record(
+            0x0085,
+            bytes(6) + biff5_short_string("작업표"),
+        )
+    )
+    workbook.extend(biff_record(0x000A, b""))
+
+    workbook.extend(biff5_bof(0x0010))
+    workbook.extend(biff5_label(0, 0, "조립 작업 표준서"))
+    workbook.extend(biff5_label(1, 0, "체결(TIGHTENING)"))
+    workbook.extend(biff5_label(2, 0, "클램핑(CLAMPING)"))
+    workbook.extend(biff5_label(3, 0, "확인(CONFIRMATION)"))
+    workbook.extend(biff_record(0x000A, b""))
+
+    write_cfb(
+        FIXTURES / "xls" / "korean-cp949-biff5.xls",
+        bytes(workbook),
+        stream_name="Book",
+    )
 
 
 def biff12_var_uint(value: int) -> bytes:
@@ -659,6 +711,89 @@ def generate_xlsx() -> None:
     )
 
 
+def generate_formula_source() -> None:
+    """Create the independent OOXML source converted into the BIFF8 oracle."""
+    write_zip(
+        FIXTURES / "formula" / "formula-source.xlsx",
+        [
+            (
+                "[Content_Types].xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+            (
+                "_rels/.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+            (
+                "xl/workbook.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Calc" sheetId="1" r:id="rId1"/>
+    <sheet name="Input Data" sheetId="2" r:id="rId2"/>
+  </sheets>
+  <definedNames><definedName name="Answer">'Input Data'!$B$3</definedName></definedNames>
+</workbook>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+</Relationships>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+  <row r="1">
+    <c r="A1"><v>5</v></c>
+    <c r="B1"><f>ABS($A$1)</f><v>5</v></c>
+    <c r="C1" t="b"><f>TRUE()</f><v>1</v></c>
+    <c r="D1" t="b"><f>FALSE()</f><v>0</v></c>
+    <c r="E1"><f>NOW()</f><v>45000</v></c>
+  </row>
+  <row r="2"><c r="A2"><v>2</v></c><c r="B2"><f>$A$1+A$1+$A1+A1</f><v>20</v></c></row>
+  <row r="3"><c r="B3"><f>'Input Data'!$B$3</f><v>7</v></c></row>
+  <row r="4"><c r="B4"><f>Answer</f><v>7</v></c></row>
+  <row r="5"><c r="A5"><v>3</v></c><c r="B5"><f>A5*2</f><v>6</v></c></row>
+  <row r="6"><c r="A6"><v>4</v></c><c r="B6"><f>A6*2</f><v>8</v></c></row>
+</sheetData></worksheet>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+            (
+                "xl/worksheets/sheet2.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+  <row r="3"><c r="B3"><v>7</v></c></row>
+</sheetData></worksheet>
+""",
+                FIXTURE_COMPRESSION,
+            ),
+        ],
+    )
+
+
 def generate_xlsb() -> None:
     workbook = b"".join(
         [
@@ -849,9 +984,11 @@ def generate_ods() -> None:
 
 def main() -> None:
     generate_xls()
+    generate_korean_biff5()
     generate_xlsx()
-    generate_xlsb()
     generate_ods()
+    generate_formula_source()
+    generate_xlsb()
 
 
 if __name__ == "__main__":

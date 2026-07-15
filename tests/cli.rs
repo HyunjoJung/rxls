@@ -35,6 +35,50 @@ fn cli_version_reports_crate_identity() {
     assert_eq!(stdout.trim(), format!("rxls {}", env!("CARGO_PKG_VERSION")));
 }
 
+#[test]
+fn cli_help_is_successful_stdout_contract() {
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "target\\debug\\rxls.exe".to_string()
+        } else {
+            "target/debug/rxls".to_string()
+        }
+    });
+    let output = Command::new(bin)
+        .arg("--help")
+        .output()
+        .expect("run rxls --help");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.starts_with("usage: "));
+    assert!(stdout.contains("commands:\n"));
+    assert!(stdout.contains("  diagnose <file>        print JSON workbook diagnostics\n"));
+}
+
+#[test]
+fn cli_invalid_usage_remains_stderr_only() {
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "target\\debug\\rxls.exe".to_string()
+        } else {
+            "target/debug/rxls".to_string()
+        }
+    });
+    let output = Command::new(bin)
+        .arg("not-a-command")
+        .output()
+        .expect("run invalid rxls command");
+
+    assert_eq!(output.status.code(), Some(64));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf8");
+    assert!(stderr.contains("unknown command \"not-a-command\"\n"));
+    assert!(stderr.contains("usage: "));
+    assert!(stderr.contains("commands:\n"));
+}
+
 #[cfg(feature = "xlsx")]
 #[test]
 fn cli_info_reports_workbook_and_sheet_structure() {
@@ -209,6 +253,84 @@ fn cli_csv_exports_sheet_with_delimiter() {
 
 #[cfg(feature = "xlsx")]
 #[test]
+fn cli_csv_applies_bom_crlf_and_formula_injection_policy() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("CSV");
+    sheet.write(0, 0, "name");
+    sheet.write(0, 1, "danger");
+    sheet.write(1, 0, "Alice");
+    sheet.write(1, 1, "=2+2");
+
+    let path = std::env::temp_dir().join(format!(
+        "rxls_cli_csv_policy_{}_{}.xlsx",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, workbook.to_xlsx()).expect("write csv fixture");
+
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let output = Command::new(bin)
+        .args([
+            "csv",
+            path.to_str().expect("utf8 fixture path"),
+            "--newline",
+            "crlf",
+            "--bom",
+            "--formula-injection",
+            "escape",
+        ])
+        .output()
+        .expect("run rxls csv");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "rxls csv failed: status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"\xEF\xBB\xBFname,danger\r\nAlice,\"'=2+2\"\r\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn cli_csv_output_limit_fails_without_partial_stdout() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("CSV").write(0, 0, "value");
+
+    let path = std::env::temp_dir().join(format!(
+        "rxls_cli_csv_limit_{}_{}.xlsx",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, workbook.to_xlsx()).expect("write csv fixture");
+
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let output = Command::new(bin)
+        .args([
+            "csv",
+            path.to_str().expect("utf8 fixture path"),
+            "--max-output-bytes",
+            "5",
+        ])
+        .output()
+        .expect("run rxls csv");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(output.status.code(), Some(65));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr is utf8"),
+        "rxls csv: CSV output exceeds the configured 5-byte limit\n"
+    );
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
 fn cli_formula_reports_bounded_formula_cells() {
     let mut workbook = Workbook::new();
     {
@@ -318,13 +440,48 @@ fn cli_diagnose_reports_machine_readable_counts() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains(r#""schema_version":1"#));
     assert!(stdout.contains(r#""format":"xlsx""#));
     assert!(
         stdout.contains(r#""stats":{"sheets":2,"cells":3,"formulas":1,"text_truncated":false}"#)
     );
     assert!(stdout.contains(r#""defined_names_count":1"#));
     assert!(stdout.contains(r#""features":{"comments":0,"data_validations":0,"tables":0,"merged_ranges":0,"hyperlinks":0,"images":0,"charts":0,"sparklines":0,"conditional_formatting":0,"hidden_sheets":1,"frozen_panes":1,"page_setup":0,"protection":0,"pivot_tables":0,"vba_project":false,"threaded_comments":0,"external_links":0,"custom_xml":0}"#));
-    assert!(stdout.contains(r#""warnings":["FormulaCacheOnly"]"#));
+    assert!(stdout.contains(r#""evaluation":{"computed":1,"errors":0,"cached":0,"unsupported":0,"truncated":false,"by_reason":{}}"#));
+    assert!(stdout.contains(r#""warnings":[]"#));
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn cli_diagnose_schema_v1_matches_exact_golden() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("Data").write(0, 0, "value");
+
+    let path = std::env::temp_dir().join(format!(
+        "rxls_cli_diagnose_golden_{}_{}.xlsx",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, workbook.to_xlsx()).expect("write diagnose fixture");
+
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let output = Command::new(bin)
+        .args(["diagnose", path.to_str().expect("utf8 fixture path")])
+        .output()
+        .expect("run rxls diagnose");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "rxls diagnose failed: status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is utf8"),
+        include_str!("golden/diagnose-v1.json")
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[cfg(feature = "xlsx")]
@@ -1846,9 +2003,9 @@ fn cli_corpus_report_summarizes_manifest_parse_results() {
         format!(
             r#"{{
   "files": [
-    {{"source": "test", "path": "valid.xlsx", "local_path": "{}"}},
-    {{"source": "test", "path": "bad.xlsx", "local_path": "{}"}},
-    {{"source": "test", "path": "bad-zip.xlsx", "local_path": "{}"}}
+    {{"source": "test", "path": "valid.xlsx", "local_path": "{}", "expected": {{"outcome": "open"}}}},
+    {{"source": "test", "path": "bad.xlsx", "local_path": "{}", "expected": {{"outcome": "reject", "kind": "not_ole2", "decision": "excluded_malformed_container", "evidence": "signature_mismatch_or_unknown_container"}}}},
+    {{"source": "test", "path": "bad-zip.xlsx", "local_path": "{}", "expected": {{"outcome": "reject", "kind": "invalid_zip", "decision": "excluded_malformed_container", "evidence": "zip_signature_corrupt_container"}}}}
   ]
 }}"#,
             json_path(&valid_path),
@@ -1885,6 +2042,14 @@ fn cli_corpus_report_summarizes_manifest_parse_results() {
     assert!(stdout.contains("failed: 2"));
     assert!(stdout.contains("expected_rejections: 2"));
     assert!(stdout.contains("unexpected_failures: 0"));
+    assert!(stdout.contains("unexpected_accepts: 0"));
+    assert!(stdout.contains("formula_files: 0"));
+    assert!(stdout.contains("formula_cells: 0"));
+    assert!(stdout.contains("evaluation_computed: 0"));
+    assert!(stdout.contains("evaluation_errors: 0"));
+    assert!(stdout.contains("evaluation_cached: 0"));
+    assert!(stdout.contains("evaluation_unsupported: 0"));
+    assert!(stdout.contains("evaluation_truncated_files: 0"));
     assert!(stdout.contains("by_ext: .xlsx files=3 opened=1 failed=2"));
     assert!(stdout.contains("by_failure_kind: invalid_zip failed=1"));
     assert!(stdout.contains("by_failure_kind: not_ole2 failed=1"));
@@ -1892,6 +2057,56 @@ fn cli_corpus_report_summarizes_manifest_parse_results() {
     assert!(stdout
         .contains("failure: .xlsx bad.xlsx kind=not_ole2 decision=excluded_malformed_container"));
     assert!(stdout.contains("truncated: true"));
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn cli_corpus_report_fails_when_an_expected_rejection_opens() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("Data").write(0, 0, "ok");
+
+    let base = std::env::temp_dir().join(format!(
+        "rxls_cli_corpus_report_unexpected_accept_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::create_dir_all(&base).expect("create temp corpus dir");
+    let workbook_path = base.join("accepted.xlsx");
+    let manifest_path = base.join("manifest.json");
+    std::fs::write(&workbook_path, workbook.to_xlsx()).expect("write valid workbook");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            r#"{{
+  "files": [
+    {{"source": "test", "path": "accepted.xlsx", "local_path": "{}", "expected": {{"outcome": "reject", "kind": "invalid_zip", "decision": "excluded_malformed_container", "evidence": "zip_signature_corrupt_container"}}}}
+  ]
+}}"#,
+            json_path(&workbook_path)
+        ),
+    )
+    .expect("write manifest");
+
+    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let output = Command::new(bin)
+        .args([
+            "corpus-report",
+            manifest_path.to_str().expect("utf8 manifest path"),
+            "--limit",
+            "5",
+        ])
+        .output()
+        .expect("run rxls corpus-report");
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
+    assert!(stdout.contains("opened: 1"));
+    assert!(stdout.contains("failed: 0"));
+    assert!(stdout.contains("expected_rejections: 0"));
+    assert!(stdout.contains("unexpected_failures: 0"));
+    assert!(stdout.contains("unexpected_accepts: 1"));
+    assert!(stdout.contains("unexpected_accept: .xlsx accepted.xlsx expected_kind=invalid_zip expected_decision=excluded_malformed_container expected_evidence=zip_signature_corrupt_container"));
 }
 
 #[cfg(feature = "xlsx")]
@@ -2135,7 +2350,7 @@ fn cli_fixture_report_validates_committed_fixture_manifest() {
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/MANIFEST.json");
     let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
     let output = Command::new(bin)
-        .args(["fixture-report", manifest, "--limit", "4"])
+        .args(["fixture-report", manifest, "--limit", "5"])
         .output()
         .expect("run rxls fixture-report");
 
@@ -2148,16 +2363,16 @@ fn cli_fixture_report_validates_committed_fixture_manifest() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("rxls fixture-report"));
-    assert!(stdout.contains("manifest_entries: 4"));
-    assert!(stdout.contains("opened: 4"));
-    assert!(stdout.contains("hash_ok: 4"));
-    assert!(stdout.contains("oracle_entries: 4"));
-    assert!(stdout.contains("oracle_ok: 4"));
+    assert!(stdout.contains("manifest_entries: 5"));
+    assert!(stdout.contains("opened: 5"));
+    assert!(stdout.contains("hash_ok: 5"));
+    assert!(stdout.contains("oracle_entries: 5"));
+    assert!(stdout.contains("oracle_ok: 5"));
     assert!(stdout.contains("oracle_failed: 0"));
     assert!(stdout.contains("failed: 0"));
     assert!(stdout.contains("coverage_tags: "));
     assert!(stdout.contains("by_format: ods files=1 opened=1 hash_ok=1"));
-    assert!(stdout.contains("by_format: xls files=1 opened=1 hash_ok=1"));
+    assert!(stdout.contains("by_format: xls files=2 opened=2 hash_ok=2"));
     assert!(stdout.contains("by_format: xlsb files=1 opened=1 hash_ok=1"));
     assert!(stdout.contains("by_format: xlsx files=1 opened=1 hash_ok=1"));
     assert!(stdout.contains(
@@ -2167,6 +2382,7 @@ fn cli_fixture_report_validates_committed_fixture_manifest() {
         "fixture: ods tests/fixtures/ods/repeated-hidden.ods hash=ok open=ok oracle=ok covers="
     ));
     assert!(stdout.contains("oracle: xls tests/fixtures/xls/reader-basic.xls sheets=2 cells=7 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=0 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
+    assert!(stdout.contains("oracle: xls tests/fixtures/xls/korean-cp949-biff5.xls sheets=1 cells=4 defined_names=0 hidden_sheets=0 merged_ranges=0 hyperlinks=0 comments=0 tables=0 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
     assert!(stdout.contains("oracle: xlsx tests/fixtures/xlsx/reader-structural.xlsx sheets=2 cells=12 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=0 autofilters=1 page_setups=1 images=0 sheet_views=1 tab_colors=1 print_options=1 sparklines=0"));
     assert!(stdout.contains("oracle: xlsb tests/fixtures/xlsb/reader-basic.xlsb sheets=2 cells=8 defined_names=0 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
     assert!(stdout.contains("oracle: ods tests/fixtures/ods/repeated-hidden.ods sheets=2 cells=10 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=2 autofilters=1 page_setups=1 images=1 sheet_views=1 tab_colors=0 print_options=0 sparklines=0"));

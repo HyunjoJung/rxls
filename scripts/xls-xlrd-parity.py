@@ -35,7 +35,15 @@ import re
 import subprocess
 import sys
 
-from public_corpus_manifest import corpus_files, manifest_files, resolve_binary
+from public_corpus_manifest import (
+    corpus_files,
+    emit_parity_provenance,
+    manifest_files,
+    report_path,
+    report_reason,
+    report_source_root,
+    resolve_binary,
+)
 
 _CORPUS_FAILURE_RE = re.compile(
     r"^failure:\s+(?P<ext>\S+)\s+(?P<label>.*?)\s+"
@@ -43,7 +51,12 @@ _CORPUS_FAILURE_RE = re.compile(
     r"evidence=(?P<evidence>\S+)\s+container=(?P<container>\S+)\s+"
     r"extension_mismatch=(?P<extension_mismatch>\S+)\s+(?P<error>.*)$"
 )
-_CORPUS_COMPARISON_EXCLUDE_DECISIONS = {"unsupported_legacy_biff"}
+_CORPUS_COMPARISON_EXCLUDE_DECISIONS = {
+    "excluded_malformed_container",
+    "excluded_malformed_workbook",
+    "unsupported_encrypted",
+    "unsupported_legacy_biff",
+}
 
 
 def _fnum(f):
@@ -312,11 +325,16 @@ def main():
     ap.add_argument("--min", type=float, default=0.95)
     args = ap.parse_args()
 
+    emit_parity_provenance(
+        args.manifest, oracle_reader="xlrd", package_distribution="xlrd"
+    )
+
     binary = resolve_binary(args.bin)
+    source_root = report_source_root(args.manifest, args.corpus)
     corpus_failures = parse_corpus_report(args.corpus_report) if args.corpus_report else []
     if args.manifest:
         files = manifest_files(args.manifest, {".xls"}, args.limit)
-        print(f"manifest: {args.manifest}")
+        print(f"manifest: {report_path(args.manifest)}")
     else:
         files = corpus_files(args.corpus, {".xls"}, args.limit)
     if not files:
@@ -438,7 +456,8 @@ def main():
         corpus_part = f" corpus_kind={corpus_kind}" if corpus_kind else ""
         print(
             f"skip: kind={kind} decision={decision} evidence={evidence}{corpus_part} "
-            f"path={path} reason={reason}"
+            f"path={report_path(path, source_root)} "
+            f"reason={report_reason(reason, path, source_root)}"
         )
     for ratio, path, gold_chars, rxls_chars in worst_records(records, args.show_worst):
         failure = corpus_failure_for_path(path, corpus_failures)
@@ -450,7 +469,8 @@ def main():
             )
         print(
             f"low-parity: ratio={ratio:.3f} gold_chars={gold_chars} "
-            f"rxls_chars={rxls_chars}{corpus_part} path={path}"
+            f"rxls_chars={rxls_chars}{corpus_part} "
+            f"path={report_path(path, source_root)}"
         )
     sys.exit(0 if mean >= args.min else 1)
 

@@ -4,8 +4,8 @@
 use crate::Color;
 
 pub(super) const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
-pub(super) const NS_MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-pub(super) const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(crate) const NS_MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub(crate) const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 pub(super) const NS_CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 pub(super) const NS_PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 
@@ -31,13 +31,13 @@ pub(super) const REL_EXT_PROPS: &str =
 pub(crate) const CT_CORE_PROPS: &str = "application/vnd.openxmlformats-package.core-properties+xml";
 pub(crate) const CT_EXT_PROPS: &str =
     "application/vnd.openxmlformats-officedocument.extended-properties+xml";
-pub(super) const REL_WORKSHEET: &str =
+pub(crate) const REL_WORKSHEET: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
 pub(super) const REL_STYLES: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
 pub(super) const REL_SST: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
-pub(super) const REL_HYPERLINK: &str =
+pub(crate) const REL_HYPERLINK: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 pub(super) const REL_DRAWING: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing";
@@ -47,18 +47,18 @@ pub(super) const REL_CHART: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
 pub(super) const REL_TABLE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
-pub(super) const REL_COMMENTS: &str =
+pub(crate) const REL_COMMENTS: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
-pub(super) const REL_VML_DRAWING: &str =
+pub(crate) const REL_VML_DRAWING: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
 pub(super) const CT_DRAWING: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
 pub(super) const CT_CHART: &str =
     "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 pub(super) const CT_TABLE: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
-pub(super) const CT_COMMENTS: &str =
+pub(crate) const CT_COMMENTS: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
-pub(super) const CT_VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+pub(crate) const CT_VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
 pub(super) const NS_XDR: &str =
     "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
 pub(super) const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";

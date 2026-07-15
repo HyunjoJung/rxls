@@ -1,10 +1,24 @@
 //! Deterministic formula evaluation for the safe MVP subset.
 
+use std::cell::Cell as CounterCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::{Cell, CellErrorType, Workbook};
 
 const MAX_RANGE_CELLS: u64 = 10_000;
+
+/// Maximum semantic parser/evaluator work units for one top-level evaluation,
+/// shared by all formulas reached through references. Operands, operators,
+/// postfix operations, and function dispatch each consume one unit. Range
+/// traversal has its own independent `MAX_RANGE_CELLS` limit.
+const MAX_EVALUATION_OPERATIONS: usize = 10_000;
+
+/// Maximum number of formula bodies entered through one top-level evaluation.
+/// This is independent of expression nesting: each referenced formula starts a
+/// fresh parser, so a shared dependency-depth guard is required to keep long
+/// acyclic reference/name chains from exhausting the process stack.
+pub(crate) const MAX_FORMULA_DEPENDENCY_DEPTH: usize = 64;
 
 /// Canonical Excel error literal strings recognized when parsing a `#...`
 /// token in formula text (e.g. the `#N/A` inside `ISNA(#N/A)`). The first
@@ -42,6 +56,8 @@ const MAX_EXPR_DEPTH: usize = 128;
 
 /// Result of evaluating a formula cell.
 #[derive(Debug, Clone, PartialEq)]
+#[must_use = "formula evaluation returns either a computed value or a typed fallback"]
+#[non_exhaustive]
 pub enum FormulaEvaluation {
     /// The formula was evaluated deterministically.
     Computed(Cell),
@@ -56,6 +72,7 @@ pub enum FormulaEvaluation {
 
 /// Why a formula could not be evaluated deterministically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FormulaUnsupportedReason {
     /// Function is not implemented by the deterministic evaluator.
     UnsupportedFunction,
@@ -78,13 +95,52 @@ pub enum FormulaUnsupportedReason {
     /// Formula nesting (parentheses, function calls, or unary operators)
     /// exceeded the evaluator's bounded recursion depth.
     ExpressionTooComplex,
+    /// Formula evaluation exceeded the bounded semantic-operation budget.
+    OperationLimitExceeded,
+    /// Formula evaluation exceeded the bounded dependency-chain depth.
+    DependencyDepthExceeded,
+}
+
+impl FormulaUnsupportedReason {
+    /// Stable machine-readable reason code shared by library and reports.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedFunction => "unsupported_function",
+            Self::Volatile => "volatile",
+            Self::ExternalRef => "external_reference",
+            Self::CircularReference => "circular_reference",
+            Self::UnresolvedName => "unresolved_name",
+            Self::UnparsableExpression => "unparsable_expression",
+            Self::ArraySemantics => "array_semantics",
+            Self::RangeTooLarge => "range_too_large",
+            Self::SheetNotFound => "sheet_not_found",
+            Self::ExpressionTooComplex => "expression_too_complex",
+            Self::OperationLimitExceeded => "operation_limit_exceeded",
+            Self::DependencyDepthExceeded => "dependency_depth_exceeded",
+        }
+    }
 }
 
 impl Workbook {
     /// Evaluate one worksheet cell.
     ///
-    /// The MVP evaluates deterministic literal formulas only. Unsupported
-    /// formulas return their cached value with a typed reason.
+    /// Evaluates the documented deterministic subset, including literals,
+    /// references, bounded ranges, defined names, and supported functions.
+    /// Unsupported semantics return a typed reason and preserve any cached
+    /// fallback value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut workbook = rxls::Workbook::new();
+    /// workbook.add_sheet("Data").write_formula(0, 0, "1+1", 2.0);
+    /// match workbook.evaluate_cell("Data", 0, 0) {
+    ///     rxls::FormulaEvaluation::Computed(rxls::Cell::Number(value)) => {
+    ///         assert_eq!(value, 2.0);
+    ///     }
+    ///     other => panic!("unexpected evaluation: {other:?}"),
+    /// }
+    /// ```
     pub fn evaluate_cell(&self, sheet: &str, row: u32, col: u16) -> FormulaEvaluation {
         let Some(sheet) = self.sheet_by_name(sheet) else {
             return FormulaEvaluation::Fallback {
@@ -112,7 +168,26 @@ impl Workbook {
 #[derive(Debug, Default)]
 struct EvalState {
     visiting: HashSet<(String, u32, u16)>,
+    visiting_names: HashSet<String>,
     memo: HashMap<(String, u32, u16), Cell>,
+    operation_budget: OperationBudget,
+    formula_dependency_depth: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OperationBudget {
+    used: Rc<CounterCell<usize>>,
+}
+
+impl OperationBudget {
+    fn charge(&self) -> std::result::Result<(), FormulaUnsupportedReason> {
+        let used = self.used.get() + 1;
+        self.used.set(used);
+        if used > MAX_EVALUATION_OPERATIONS {
+            return Err(FormulaUnsupportedReason::OperationLimitExceeded);
+        }
+        Ok(())
+    }
 }
 
 fn evaluate_cell_inner(
@@ -138,67 +213,7 @@ fn evaluate_cell_inner(
         };
         match cell {
             Cell::Formula { formula, .. } => {
-                evaluate_formula_with_refs(formula, |request| match request {
-                    RefRequest::Cell { sheet, reference } => {
-                        let target_sheet_name = sheet.as_deref().unwrap_or(sheet_name);
-                        let target_sheet = workbook
-                            .sheet_by_name(target_sheet_name)
-                            .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
-                        let (ref_row, ref_col) = parse_a1_ref(&reference)
-                            .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
-                        if target_sheet.cell(ref_row, ref_col).is_none() {
-                            Ok(Value::Blank)
-                        } else {
-                            let cell = evaluate_cell_inner(
-                                workbook,
-                                target_sheet_name,
-                                ref_row,
-                                ref_col,
-                                state,
-                            )?;
-                            Ok(cell_to_value(&cell))
-                        }
-                    }
-                    RefRequest::Range { sheet, start, end } => {
-                        let target_sheet_name = sheet.as_deref().unwrap_or(sheet_name);
-                        let target_sheet = workbook
-                            .sheet_by_name(target_sheet_name)
-                            .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
-                        let (raw_start_row, raw_start_col) = parse_a1_ref(&start)
-                            .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
-                        let (raw_end_row, raw_end_col) = parse_a1_ref(&end)
-                            .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
-                        let start_row = raw_start_row.min(raw_end_row);
-                        let end_row = raw_start_row.max(raw_end_row);
-                        let start_col = raw_start_col.min(raw_end_col);
-                        let end_col = raw_start_col.max(raw_end_col);
-                        let row_count = end_row.saturating_sub(start_row).saturating_add(1) as u64;
-                        let col_count = end_col.saturating_sub(start_col).saturating_add(1) as u64;
-                        let total_cells = row_count.saturating_mul(col_count);
-                        if total_cells > MAX_RANGE_CELLS {
-                            return Err(FormulaUnsupportedReason::RangeTooLarge);
-                        }
-                        let mut values = Vec::with_capacity(total_cells as usize);
-                        for r in start_row..=end_row {
-                            for c in start_col..=end_col {
-                                let value = if target_sheet.cell(r, c).is_some() {
-                                    let cell = evaluate_cell_inner(
-                                        workbook,
-                                        target_sheet_name,
-                                        r,
-                                        c,
-                                        state,
-                                    )?;
-                                    cell_to_value(&cell)
-                                } else {
-                                    Value::Blank
-                                };
-                                values.push(value);
-                            }
-                        }
-                        Ok(Value::Range(values))
-                    }
-                })
+                evaluate_formula_in_context(workbook, sheet_name, formula, state)
             }
             _ => Ok(cell.clone()),
         }
@@ -210,15 +225,236 @@ fn evaluate_cell_inner(
     result
 }
 
+fn evaluate_formula_in_context(
+    workbook: &Workbook,
+    sheet_name: &str,
+    formula: &str,
+    state: &mut EvalState,
+) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    if state.formula_dependency_depth >= MAX_FORMULA_DEPENDENCY_DEPTH {
+        return Err(FormulaUnsupportedReason::DependencyDepthExceeded);
+    }
+    state.formula_dependency_depth += 1;
+    let operation_budget = state.operation_budget.clone();
+    let result = evaluate_formula_with_refs(formula, operation_budget, |request| {
+        resolve_reference(workbook, sheet_name, state, request)
+    });
+    state.formula_dependency_depth -= 1;
+    result
+}
+
+fn resolve_reference(
+    workbook: &Workbook,
+    current_sheet: &str,
+    state: &mut EvalState,
+    request: RefRequest,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    match request {
+        RefRequest::Name { name } => {
+            let local = workbook.local_defined_names.iter().find(|candidate| {
+                candidate.sheet.eq_ignore_ascii_case(current_sheet)
+                    && candidate.name.eq_ignore_ascii_case(&name)
+            });
+            let global = workbook
+                .defined_names
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&name));
+            let (canonical, refers_to, local_scope) = if let Some(local) = local {
+                (local.name.as_str(), local.refers_to.as_str(), true)
+            } else if let Some((global, refers_to)) = global {
+                (global.as_str(), refers_to.as_str(), false)
+            } else {
+                return Err(FormulaUnsupportedReason::UnresolvedName);
+            };
+            let key = if local_scope {
+                format!(
+                    "{}!{}",
+                    current_sheet.to_ascii_uppercase(),
+                    canonical.to_ascii_uppercase()
+                )
+            } else {
+                format!("!{}", canonical.to_ascii_uppercase())
+            };
+            if !state.visiting_names.insert(key.clone()) {
+                return Err(FormulaUnsupportedReason::CircularReference);
+            }
+            let result = evaluate_formula_in_context(workbook, current_sheet, refers_to, state)
+                .map(|cell| cell_to_value(&cell));
+            state.visiting_names.remove(&key);
+            result
+        }
+        RefRequest::Cell { sheet, reference } => {
+            let target_names = target_sheet_names(workbook, current_sheet, sheet.as_deref())?;
+            let (row, col) =
+                parse_a1_ref(&reference).ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+            let mut values = Vec::with_capacity(target_names.len());
+            for target_name in target_names {
+                let target = workbook
+                    .sheet_by_name(target_name)
+                    .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
+                let value = if target.cell(row, col).is_some() {
+                    cell_to_value(&evaluate_cell_inner(
+                        workbook,
+                        target_name,
+                        row,
+                        col,
+                        state,
+                    )?)
+                } else {
+                    Value::Blank
+                };
+                values.push(value);
+            }
+            if values.len() == 1 {
+                Ok(values.pop().unwrap_or(Value::Blank))
+            } else {
+                Ok(Value::Range(values))
+            }
+        }
+        RefRequest::Range { sheet, start, end } => {
+            let target_names = target_sheet_names(workbook, current_sheet, sheet.as_deref())?;
+            let range = parse_reference_range(&start, &end)
+                .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+            let mut values = Vec::new();
+            for target_name in target_names {
+                let target = workbook
+                    .sheet_by_name(target_name)
+                    .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
+                match range {
+                    ReferenceRange::Cells {
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                    } => {
+                        let row_count = u64::from(end_row - start_row + 1);
+                        let col_count = u64::from(end_col - start_col + 1);
+                        if (values.len() as u64).saturating_add(row_count.saturating_mul(col_count))
+                            > MAX_RANGE_CELLS
+                        {
+                            return Err(FormulaUnsupportedReason::RangeTooLarge);
+                        }
+                        for row in start_row..=end_row {
+                            for col in start_col..=end_col {
+                                let value = if target.cell(row, col).is_some() {
+                                    cell_to_value(&evaluate_cell_inner(
+                                        workbook,
+                                        target_name,
+                                        row,
+                                        col,
+                                        state,
+                                    )?)
+                                } else {
+                                    Value::Blank
+                                };
+                                values.push(value);
+                            }
+                        }
+                    }
+                    ReferenceRange::Rows { start, end } => {
+                        append_sparse_range_values(
+                            workbook,
+                            target_name,
+                            state,
+                            &mut values,
+                            |row, _| (start..=end).contains(&row),
+                        )?;
+                    }
+                    ReferenceRange::Columns { start, end } => {
+                        append_sparse_range_values(
+                            workbook,
+                            target_name,
+                            state,
+                            &mut values,
+                            |_, col| (start..=end).contains(&col),
+                        )?;
+                    }
+                }
+            }
+            Ok(Value::Range(values))
+        }
+    }
+}
+
+fn append_sparse_range_values(
+    workbook: &Workbook,
+    sheet_name: &str,
+    state: &mut EvalState,
+    values: &mut Vec<Value>,
+    includes: impl Fn(u32, u16) -> bool,
+) -> std::result::Result<(), FormulaUnsupportedReason> {
+    let sheet = workbook
+        .sheet_by_name(sheet_name)
+        .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
+    let mut effective = std::collections::BTreeSet::new();
+    for entry in sheet.cells.iter().rev() {
+        if includes(entry.row, entry.col) {
+            effective.insert((entry.row, entry.col));
+        }
+    }
+    if (values.len() as u64).saturating_add(effective.len() as u64) > MAX_RANGE_CELLS {
+        return Err(FormulaUnsupportedReason::RangeTooLarge);
+    }
+    for (row, col) in effective {
+        let cell = evaluate_cell_inner(workbook, sheet_name, row, col, state)?;
+        values.push(cell_to_value(&cell));
+    }
+    Ok(())
+}
+
+fn target_sheet_names<'a>(
+    workbook: &'a Workbook,
+    current_sheet: &str,
+    selector: Option<&str>,
+) -> std::result::Result<Vec<&'a str>, FormulaUnsupportedReason> {
+    let Some(selector) = selector else {
+        return workbook
+            .sheet_by_name(current_sheet)
+            .map(|sheet| vec![sheet.name.as_str()])
+            .ok_or(FormulaUnsupportedReason::SheetNotFound);
+    };
+    let Some((first, last)) = selector.split_once(':') else {
+        return workbook
+            .sheet_by_name(selector)
+            .map(|sheet| vec![sheet.name.as_str()])
+            .ok_or(FormulaUnsupportedReason::SheetNotFound);
+    };
+    let first_index = workbook
+        .sheets
+        .iter()
+        .position(|sheet| sheet.name.eq_ignore_ascii_case(first))
+        .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
+    let last_index = workbook
+        .sheets
+        .iter()
+        .position(|sheet| sheet.name.eq_ignore_ascii_case(last))
+        .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
+    let (start, end) = if first_index <= last_index {
+        (first_index, last_index)
+    } else {
+        (last_index, first_index)
+    };
+    Ok(workbook.sheets[start..=end]
+        .iter()
+        .map(|sheet| sheet.name.as_str())
+        .collect())
+}
+
 fn evaluate_formula_with_refs(
     formula: &str,
+    operation_budget: OperationBudget,
     mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
     let formula = formula.trim().strip_prefix('=').unwrap_or(formula.trim());
+    let normalized = normalize_formula_syntax(formula)?;
+    let formula = normalized.as_str();
     if formula.contains('[') {
         return Err(FormulaUnsupportedReason::ExternalRef);
     }
-    let mut parser = Parser::new(formula, &mut resolve_ref);
+    if formula.contains('{') || formula.contains('}') || formula.contains('@') {
+        return Err(FormulaUnsupportedReason::ArraySemantics);
+    }
+    let mut parser = Parser::new(formula, operation_budget, &mut resolve_ref);
     let value = parser.parse_comparison()?;
     parser.skip_ws();
     if parser.eof() {
@@ -326,12 +562,34 @@ enum RefRequest {
         start: String,
         end: String,
     },
+    Name {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceRange {
+    Cells {
+        start_row: u32,
+        start_col: u16,
+        end_row: u32,
+        end_col: u16,
+    },
+    Rows {
+        start: u32,
+        end: u32,
+    },
+    Columns {
+        start: u16,
+        end: u16,
+    },
 }
 
 struct Parser<'a, 'r> {
     input: &'a str,
     pos: usize,
     depth: usize,
+    operation_budget: OperationBudget,
     resolve_ref:
         &'r mut dyn FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
 }
@@ -339,6 +597,7 @@ struct Parser<'a, 'r> {
 impl<'a, 'r> Parser<'a, 'r> {
     fn new(
         input: &'a str,
+        operation_budget: OperationBudget,
         resolve_ref: &'r mut dyn FnMut(
             RefRequest,
         )
@@ -348,6 +607,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             input,
             pos: 0,
             depth: 0,
+            operation_budget,
             resolve_ref,
         }
     }
@@ -373,6 +633,10 @@ impl<'a, 'r> Parser<'a, 'r> {
         self.depth -= 1;
     }
 
+    fn charge_operation(&mut self) -> std::result::Result<(), FormulaUnsupportedReason> {
+        self.operation_budget.charge()
+    }
+
     fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(c) if c.is_whitespace()) {
             self.bump();
@@ -386,6 +650,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             let Some(op) = self.consume_comparison_op() else {
                 return Ok(left);
             };
+            self.charge_operation()?;
             let right = self.parse_concat()?;
             left = compare_values(left, right, op);
         }
@@ -398,6 +663,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             if !self.consume_char('&') {
                 return Ok(left);
             }
+            self.charge_operation()?;
             let right = self.parse_add()?;
             left = binary_text(left, right);
         }
@@ -408,8 +674,10 @@ impl<'a, 'r> Parser<'a, 'r> {
         loop {
             self.skip_ws();
             if self.consume_char('+') {
+                self.charge_operation()?;
                 left = binary_number(left, self.parse_mul()?, |a, b| a + b);
             } else if self.consume_char('-') {
+                self.charge_operation()?;
                 left = binary_number(left, self.parse_mul()?, |a, b| a - b);
             } else {
                 return Ok(left);
@@ -422,8 +690,10 @@ impl<'a, 'r> Parser<'a, 'r> {
         loop {
             self.skip_ws();
             if self.consume_char('*') {
+                self.charge_operation()?;
                 left = binary_number(left, self.parse_power()?, |a, b| a * b);
             } else if self.consume_char('/') {
+                self.charge_operation()?;
                 let right = self.parse_power()?;
                 left = match right.as_number() {
                     Ok(0.0) => Value::Error("#DIV/0!".to_string()),
@@ -447,6 +717,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             if !self.consume_char('^') {
                 return Ok(left);
             }
+            self.charge_operation()?;
             let right = self.parse_unary()?;
             left = binary_power(left, right);
         }
@@ -462,9 +733,11 @@ impl<'a, 'r> Parser<'a, 'r> {
     fn parse_unary_inner(&mut self) -> std::result::Result<Value, FormulaUnsupportedReason> {
         self.skip_ws();
         if self.consume_char('+') {
+            self.charge_operation()?;
             return self.parse_unary();
         }
         if self.consume_char('-') {
+            self.charge_operation()?;
             return Ok(match self.parse_unary()?.as_number() {
                 Ok(n) => Value::Number(-n),
                 Err(e) => e,
@@ -478,10 +751,13 @@ impl<'a, 'r> Parser<'a, 'r> {
         loop {
             self.skip_ws();
             if self.consume_char('%') {
+                self.charge_operation()?;
                 value = match value.as_number() {
                     Ok(n) => Value::Number(n / 100.0),
                     Err(e) => e,
                 };
+            } else if self.consume_char('#') {
+                return Err(FormulaUnsupportedReason::ArraySemantics);
             } else {
                 return Ok(value);
             }
@@ -494,7 +770,9 @@ impl<'a, 'r> Parser<'a, 'r> {
         // arguments (parsed via parse_comparison in parse_identifier), so
         // guarding it catches adversarial nesting from either path.
         self.enter_depth()?;
-        let result = self.parse_primary_inner();
+        let result = self
+            .charge_operation()
+            .and_then(|()| self.parse_primary_inner());
         self.exit_depth();
         result
     }
@@ -505,6 +783,8 @@ impl<'a, 'r> Parser<'a, 'r> {
             Some('"') => self.parse_string().map(Value::Text),
             Some('\'') => self.parse_quoted_sheet_reference(),
             Some('#') => Ok(Value::Error(self.parse_error())),
+            Some('$') => self.parse_unqualified_reference(),
+            Some('0'..='9') if self.starts_whole_row_range() => self.parse_unqualified_reference(),
             Some('0'..='9') | Some('.') => self.parse_number().map(Value::Number),
             Some('(') => {
                 self.bump();
@@ -523,7 +803,8 @@ impl<'a, 'r> Parser<'a, 'r> {
 
     fn parse_identifier(&mut self) -> std::result::Result<Value, FormulaUnsupportedReason> {
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        {
             self.bump();
         }
         let ident = self.input[start..self.pos].to_string();
@@ -536,18 +817,23 @@ impl<'a, 'r> Parser<'a, 'r> {
             if is_volatile(&ident_upper) {
                 return Err(FormulaUnsupportedReason::Volatile);
             }
+            if is_dynamic_array_function(&ident_upper) {
+                return Err(FormulaUnsupportedReason::ArraySemantics);
+            }
             if !is_deterministic_function(&ident_upper) {
                 return Err(FormulaUnsupportedReason::UnsupportedFunction);
             };
             let mut args = Vec::new();
             self.skip_ws();
             if self.consume_char(')') {
+                self.charge_operation()?;
                 return evaluate_function(&ident_upper, &args);
             }
             loop {
                 args.push(self.parse_comparison()?);
                 self.skip_ws();
                 if self.consume_char(')') {
+                    self.charge_operation()?;
                     return evaluate_function(&ident_upper, &args);
                 }
                 if self.consume_char(',') {
@@ -557,8 +843,24 @@ impl<'a, 'r> Parser<'a, 'r> {
             }
         }
         if self.consume_char(':') {
+            let after_colon = self.pos;
             self.skip_ws();
-            let end = self.parse_a1_reference()?;
+            let second_start = self.pos;
+            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                self.bump();
+            }
+            let second_sheet = self.input[second_start..self.pos].to_string();
+            self.skip_ws();
+            if !second_sheet.is_empty() && self.consume_char('!') {
+                return self.parse_sheet_reference(format!("{ident}:{second_sheet}"));
+            }
+            self.pos = after_colon;
+            self.skip_ws();
+            let end = self.parse_reference_endpoint()?;
+            if parse_reference_range(&ident, &end).is_none() {
+                return Err(FormulaUnsupportedReason::UnparsableExpression);
+            }
             return (self.resolve_ref)(RefRequest::Range {
                 sheet: None,
                 start: ident.clone(),
@@ -574,7 +876,7 @@ impl<'a, 'r> Parser<'a, 'r> {
         match ident_upper.as_str() {
             "TRUE" => Ok(Value::Bool(true)),
             "FALSE" => Ok(Value::Bool(false)),
-            _ => Err(FormulaUnsupportedReason::UnresolvedName),
+            _ => (self.resolve_ref)(RefRequest::Name { name: ident }),
         }
     }
 
@@ -605,16 +907,22 @@ impl<'a, 'r> Parser<'a, 'r> {
         sheet: String,
     ) -> std::result::Result<Value, FormulaUnsupportedReason> {
         self.skip_ws();
-        let start = self.parse_a1_reference()?;
+        let start = self.parse_reference_endpoint()?;
         self.skip_ws();
         if self.consume_char(':') {
             self.skip_ws();
-            let end = self.parse_a1_reference()?;
+            let end = self.parse_reference_endpoint()?;
+            if parse_reference_range(&start, &end).is_none() {
+                return Err(FormulaUnsupportedReason::UnparsableExpression);
+            }
             return (self.resolve_ref)(RefRequest::Range {
                 sheet: Some(sheet),
                 start,
                 end,
             });
+        }
+        if parse_a1_ref(&start).is_none() {
+            return Err(FormulaUnsupportedReason::UnparsableExpression);
         }
         (self.resolve_ref)(RefRequest::Cell {
             sheet: Some(sheet),
@@ -622,7 +930,35 @@ impl<'a, 'r> Parser<'a, 'r> {
         })
     }
 
-    fn parse_a1_reference(&mut self) -> std::result::Result<String, FormulaUnsupportedReason> {
+    fn parse_unqualified_reference(
+        &mut self,
+    ) -> std::result::Result<Value, FormulaUnsupportedReason> {
+        let start = self.parse_reference_endpoint()?;
+        self.skip_ws();
+        if self.consume_char(':') {
+            self.skip_ws();
+            let end = self.parse_reference_endpoint()?;
+            if parse_reference_range(&start, &end).is_none() {
+                return Err(FormulaUnsupportedReason::UnparsableExpression);
+            }
+            return (self.resolve_ref)(RefRequest::Range {
+                sheet: None,
+                start,
+                end,
+            });
+        }
+        if parse_a1_ref(&start).is_none() {
+            return Err(FormulaUnsupportedReason::UnparsableExpression);
+        }
+        (self.resolve_ref)(RefRequest::Cell {
+            sheet: None,
+            reference: start,
+        })
+    }
+
+    fn parse_reference_endpoint(
+        &mut self,
+    ) -> std::result::Result<String, FormulaUnsupportedReason> {
         let start = self.pos;
         while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '$') {
             self.bump();
@@ -631,11 +967,30 @@ impl<'a, 'r> Parser<'a, 'r> {
             return Err(FormulaUnsupportedReason::UnparsableExpression);
         }
         let reference = self.input[start..self.pos].to_string();
-        if parse_a1_ref(&reference).is_none() {
-            Err(FormulaUnsupportedReason::UnparsableExpression)
-        } else {
+        if parse_a1_ref(&reference).is_some()
+            || parse_whole_row_ref(&reference).is_some()
+            || parse_whole_col_ref(&reference).is_some()
+        {
             Ok(reference)
+        } else {
+            Err(FormulaUnsupportedReason::UnparsableExpression)
         }
+    }
+
+    fn starts_whole_row_range(&self) -> bool {
+        let mut chars = self.input[self.pos..].chars().peekable();
+        if chars.peek() == Some(&'$') {
+            chars.next();
+        }
+        let mut digits = 0usize;
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            chars.next();
+            digits += 1;
+        }
+        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+            chars.next();
+        }
+        digits > 0 && chars.next() == Some(':')
     }
 
     fn parse_string(&mut self) -> std::result::Result<String, FormulaUnsupportedReason> {
@@ -751,6 +1106,8 @@ fn is_deterministic_function(ident: &str) -> bool {
             | "COUNT"
             | "COUNTA"
             | "IF"
+            | "IFERROR"
+            | "IFNA"
             | "ROUND"
             | "ROUNDUP"
             | "ROUNDDOWN"
@@ -787,6 +1144,9 @@ fn evaluate_function(
     ident: &str,
     args: &[Value],
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    if !valid_function_arity(ident, args.len()) {
+        return Ok(Value::Error("#VALUE!".to_string()));
+    }
     match ident {
         "SUM" => Ok(eval_sum(args)),
         "MIN" => Ok(eval_number_fold(args, f64::INFINITY, f64::min)),
@@ -795,11 +1155,13 @@ fn evaluate_function(
         "COUNT" => Ok(eval_count(args)),
         "COUNTA" => Ok(eval_counta(args)),
         "IF" => eval_if(args),
+        "IFERROR" => eval_iferror(args, false),
+        "IFNA" => eval_iferror(args, true),
         "ROUND" => eval_round(args, RoundKind::Standard),
         "ROUNDUP" => eval_round(args, RoundKind::AwayFromZero),
         "ROUNDDOWN" => eval_round(args, RoundKind::TowardZero),
         "ABS" => eval_unary_numeric(args, f64::abs),
-        "INT" => eval_unary_numeric(args, f64::trunc),
+        "INT" => eval_unary_numeric(args, f64::floor),
         "TRUNC" => eval_trunc(args),
         "SIGN" => eval_sign(args),
         "SQRT" => eval_sqrt(args),
@@ -858,6 +1220,22 @@ fn evaluate_function(
     }
 }
 
+fn valid_function_arity(ident: &str, count: usize) -> bool {
+    match ident {
+        "SUM" | "MIN" | "MAX" | "AVERAGE" | "COUNT" | "COUNTA" | "PRODUCT" => count <= 255,
+        "IF" => (2..=3).contains(&count),
+        "ROUND" | "ROUNDUP" | "ROUNDDOWN" | "MOD" | "POWER" | "EXACT" | "IFERROR" | "IFNA" => {
+            count == 2
+        }
+        "ABS" | "INT" | "LEN" | "TRIM" | "UPPER" | "LOWER" | "NOT" | "ISNA" | "ISERROR"
+        | "ISNUMBER" | "ISTEXT" | "ISBLANK" | "VALUE" | "SIGN" | "SQRT" => count == 1,
+        "LEFT" | "RIGHT" | "TRUNC" => (1..=2).contains(&count),
+        "MID" => count == 3,
+        "CONCATENATE" | "AND" | "OR" => (1..=255).contains(&count),
+        _ => true,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RoundKind {
     Standard,
@@ -867,22 +1245,27 @@ enum RoundKind {
 
 fn for_each_value<'a>(
     values: &'a [Value],
-    visit: &mut impl FnMut(&'a Value) -> std::result::Result<(), Value>,
+    in_range: bool,
+    visit: &mut impl FnMut(&'a Value, bool) -> std::result::Result<(), Value>,
 ) -> std::result::Result<(), Value> {
     for value in values {
         match value {
-            Value::Range(values) => for_each_value(values, visit)?,
-            value => visit(value)?,
+            Value::Range(values) => for_each_value(values, true, visit)?,
+            value => visit(value, in_range)?,
         }
     }
     Ok(())
 }
 
-fn aggregate_number(value: &Value) -> std::result::Result<Option<f64>, Value> {
+fn aggregate_number(value: &Value, in_range: bool) -> std::result::Result<Option<f64>, Value> {
     match value {
         Value::Number(number) => Ok(Some(*number)),
-        Value::Bool(number) => Ok(Some(if *number { 1.0 } else { 0.0 })),
+        Value::Bool(number) if !in_range => Ok(Some(if *number { 1.0 } else { 0.0 })),
+        Value::Bool(_) => Ok(None),
         Value::Text(text) => {
+            if in_range {
+                return Ok(None);
+            }
             let text = text.trim();
             if text.is_empty() {
                 Ok(None)
@@ -896,27 +1279,30 @@ fn aggregate_number(value: &Value) -> std::result::Result<Option<f64>, Value> {
     }
 }
 
-fn count_if_number_like(value: &Value) -> std::result::Result<bool, Value> {
+fn count_if_number_like(value: &Value, in_range: bool) -> std::result::Result<bool, Value> {
     match value {
         Value::Number(_) => Ok(true),
-        Value::Text(text) => Ok(!text.trim().is_empty() && text.parse::<f64>().is_ok()),
+        Value::Text(text) if !in_range => {
+            Ok(!text.trim().is_empty() && text.parse::<f64>().is_ok())
+        }
+        Value::Bool(_) if !in_range => Ok(true),
         Value::Blank => Ok(false),
-        Value::Error(error) => Err(Value::Error(error.clone())),
-        Value::Bool(_) | Value::Range(_) => Ok(false),
+        Value::Error(error) if !in_range => Err(Value::Error(error.clone())),
+        Value::Text(_) | Value::Bool(_) | Value::Error(_) | Value::Range(_) => Ok(false),
     }
 }
 
 fn eval_sum(args: &[Value]) -> Value {
     let mut total = 0.0;
     let mut have_any = false;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        if let Some(number) = aggregate_number(value)? {
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        if let Some(number) = aggregate_number(value, in_range)? {
             total += number;
             have_any = true;
         }
         Ok(())
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
     if have_any {
@@ -929,34 +1315,34 @@ fn eval_sum(args: &[Value]) -> Value {
 fn eval_number_fold(args: &[Value], init: f64, f: fn(f64, f64) -> f64) -> Value {
     let mut acc = init;
     let mut seen = false;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        if let Some(number) = aggregate_number(value)? {
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        if let Some(number) = aggregate_number(value, in_range)? {
             acc = f(acc, number);
             seen = true;
         }
         Ok(())
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
     if seen {
         Value::Number(acc)
     } else {
-        Value::Error("#NUM!".to_string())
+        Value::Number(0.0)
     }
 }
 
 fn eval_average(args: &[Value]) -> Value {
     let mut total = 0.0;
     let mut count = 0;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        if let Some(number) = aggregate_number(value)? {
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        if let Some(number) = aggregate_number(value, in_range)? {
             total += number;
             count += 1;
         }
         Ok(())
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
     if count == 0 {
@@ -968,13 +1354,13 @@ fn eval_average(args: &[Value]) -> Value {
 
 fn eval_count(args: &[Value]) -> Value {
     let mut count = 0;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        if count_if_number_like(value)? {
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        if count_if_number_like(value, in_range)? {
             count += 1;
         }
         Ok(())
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
 
@@ -983,17 +1369,16 @@ fn eval_count(args: &[Value]) -> Value {
 
 fn eval_counta(args: &[Value]) -> Value {
     let mut count = 0;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
+    let mut visit = |value: &Value, _in_range: bool| -> std::result::Result<(), Value> {
         match value {
             Value::Blank => Ok(()),
-            Value::Error(error) => Err(Value::Error(error.clone())),
             _ => {
                 count += 1;
                 Ok(())
             }
         }
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
     Value::Number(count as f64)
@@ -1010,6 +1395,18 @@ fn eval_if(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReaso
     let true_value = args.get(1).cloned().unwrap_or(Value::Bool(false));
     let false_value = args.get(2).cloned().unwrap_or(Value::Bool(false));
     Ok(if condition { true_value } else { false_value })
+}
+
+fn eval_iferror(
+    args: &[Value],
+    only_na: bool,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    let replace = matches!(&args[0], Value::Error(error) if !only_na || error == "#N/A");
+    Ok(if replace {
+        args[1].clone()
+    } else {
+        args[0].clone()
+    })
 }
 
 fn eval_round(
@@ -1149,14 +1546,14 @@ fn eval_mod(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReas
 fn eval_product(args: &[Value]) -> Value {
     let mut product = 1.0;
     let mut have_any = false;
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        if let Some(number) = aggregate_number(value)? {
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        if let Some(number) = aggregate_number(value, in_range)? {
             product *= number;
             have_any = true;
         }
         Ok(())
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return error;
     }
     if have_any {
@@ -1180,7 +1577,10 @@ fn eval_trim(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedRea
         Err(error) => return Ok(error),
     };
     Ok(Value::Text(
-        text.split_ascii_whitespace().collect::<Vec<_>>().join(" "),
+        text.split(' ')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
     ))
 }
 
@@ -1217,7 +1617,10 @@ fn eval_left_or_right(
             return Ok(Value::Error("#VALUE!".to_string()));
         }
         let rounded = raw_count.trunc();
-        if rounded <= 0.0 {
+        if rounded < 0.0 {
+            return Ok(Value::Error("#VALUE!".to_string()));
+        }
+        if rounded == 0.0 {
             return Ok(Value::Text(String::new()));
         }
         let chars = text.chars().count() as f64;
@@ -1249,7 +1652,7 @@ fn eval_mid(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReas
         Ok(len) => len,
         Err(error) => return Ok(error),
     };
-    if start <= 0.0 || !start.is_finite() || !len.is_finite() {
+    if start <= 0.0 || len < 0.0 || !start.is_finite() || !len.is_finite() {
         return Ok(Value::Error("#VALUE!".to_string()));
     }
     let start = start.trunc() as usize;
@@ -1286,15 +1689,22 @@ fn eval_and_or_or(
         return Ok(Value::Error("#VALUE!".to_string()));
     }
     let mut truth_values = Vec::new();
-    let mut visit = |value: &Value| -> std::result::Result<(), Value> {
-        let value = value.as_bool()?;
-        truth_values.push(value);
-        Ok(())
+    let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
+        match (value, in_range) {
+            (Value::Text(_) | Value::Blank, true) => Ok(()),
+            (Value::Error(error), _) => Err(Value::Error(error.clone())),
+            _ => {
+                truth_values.push(value.as_bool()?);
+                Ok(())
+            }
+        }
     };
-    if let Err(error) = for_each_value(args, &mut visit) {
+    if let Err(error) = for_each_value(args, false, &mut visit) {
         return Ok(error);
     }
-    if any_true {
+    if truth_values.is_empty() {
+        Ok(Value::Error("#VALUE!".to_string()))
+    } else if any_true {
         Ok(Value::Bool(truth_values.into_iter().any(|value| value)))
     } else {
         Ok(Value::Bool(truth_values.into_iter().all(|value| value)))
@@ -1515,6 +1925,158 @@ fn is_volatile(ident: &str) -> bool {
     )
 }
 
+fn is_dynamic_array_function(ident: &str) -> bool {
+    matches!(
+        ident,
+        "FILTER"
+            | "UNIQUE"
+            | "SORT"
+            | "SORTBY"
+            | "SEQUENCE"
+            | "RANDARRAY"
+            | "TOCOL"
+            | "TOROW"
+            | "WRAPCOLS"
+            | "WRAPROWS"
+            | "TAKE"
+            | "DROP"
+            | "EXPAND"
+            | "CHOOSECOLS"
+            | "CHOOSEROWS"
+            | "VSTACK"
+            | "HSTACK"
+    )
+}
+
+fn parse_reference_range(start: &str, end: &str) -> Option<ReferenceRange> {
+    if let (Some((start_row, start_col)), Some((end_row, end_col))) =
+        (parse_a1_ref(start), parse_a1_ref(end))
+    {
+        return Some(ReferenceRange::Cells {
+            start_row: start_row.min(end_row),
+            start_col: start_col.min(end_col),
+            end_row: start_row.max(end_row),
+            end_col: start_col.max(end_col),
+        });
+    }
+    if let (Some(start), Some(end)) = (parse_whole_row_ref(start), parse_whole_row_ref(end)) {
+        return Some(ReferenceRange::Rows {
+            start: start.min(end),
+            end: start.max(end),
+        });
+    }
+    if let (Some(start), Some(end)) = (parse_whole_col_ref(start), parse_whole_col_ref(end)) {
+        return Some(ReferenceRange::Columns {
+            start: start.min(end),
+            end: start.max(end),
+        });
+    }
+    None
+}
+
+fn parse_whole_row_ref(reference: &str) -> Option<u32> {
+    let digits = reference.strip_prefix('$').unwrap_or(reference);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let row = digits.parse::<u32>().ok()?;
+    if !(1..=1_048_576).contains(&row) {
+        return None;
+    }
+    Some(row - 1)
+}
+
+fn parse_whole_col_ref(reference: &str) -> Option<u16> {
+    let letters = reference.strip_prefix('$').unwrap_or(reference);
+    if letters.is_empty()
+        || letters.len() > 3
+        || !letters.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let mut col = 0u32;
+    for byte in letters.bytes() {
+        col = col * 26 + u32::from(byte.to_ascii_uppercase() - b'A' + 1);
+    }
+    (1..=16_384).contains(&col).then(|| (col - 1) as u16)
+}
+
+/// Convert the bounded OpenFormula reference spelling surfaced by the ODS
+/// reader to the evaluator's Excel-like reference grammar. External workbook
+/// and array syntax remain typed fallbacks rather than being guessed.
+fn normalize_formula_syntax(
+    formula: &str,
+) -> std::result::Result<String, FormulaUnsupportedReason> {
+    if !formula.contains('[') && !formula.contains(';') {
+        return Ok(formula.to_string());
+    }
+    let mut out = String::with_capacity(formula.len());
+    let mut chars = formula.char_indices().peekable();
+    let mut in_string = false;
+    while let Some((index, ch)) = chars.next() {
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            continue;
+        }
+        if ch != '[' || in_string {
+            out.push(if ch == ';' && !in_string { ',' } else { ch });
+            continue;
+        }
+        let content_start = index + ch.len_utf8();
+        let mut content_end = None;
+        for (candidate, candidate_ch) in chars.by_ref() {
+            if candidate_ch == ']' {
+                content_end = Some(candidate);
+                break;
+            }
+        }
+        let Some(content_end) = content_end else {
+            return Err(FormulaUnsupportedReason::UnparsableExpression);
+        };
+        let content = &formula[content_start..content_end];
+        out.push_str(&normalize_odf_reference(content)?);
+    }
+    Ok(out)
+}
+
+fn normalize_odf_reference(
+    reference: &str,
+) -> std::result::Result<String, FormulaUnsupportedReason> {
+    let mut normalized = String::new();
+    for (index, endpoint) in reference.split(':').enumerate() {
+        if index > 0 {
+            normalized.push(':');
+        }
+        normalized.push_str(&normalize_odf_endpoint(endpoint)?);
+    }
+    Ok(normalized)
+}
+
+fn normalize_odf_endpoint(endpoint: &str) -> std::result::Result<String, FormulaUnsupportedReason> {
+    let endpoint = endpoint.trim();
+    if let Some(cell) = endpoint.strip_prefix('.') {
+        return parse_a1_ref(cell)
+            .is_some()
+            .then(|| cell.to_string())
+            .ok_or(FormulaUnsupportedReason::UnparsableExpression);
+    }
+    let endpoint = endpoint.strip_prefix('$').unwrap_or(endpoint);
+    if parse_a1_ref(endpoint).is_some() {
+        return Ok(endpoint.to_string());
+    }
+    let Some(dot) = endpoint.rfind('.') else {
+        return Err(FormulaUnsupportedReason::ExternalRef);
+    };
+    let (sheet, cell_with_dot) = endpoint.split_at(dot);
+    let cell = cell_with_dot.strip_prefix('.').unwrap_or(cell_with_dot);
+    if parse_a1_ref(cell).is_none() || sheet.is_empty() {
+        return Err(FormulaUnsupportedReason::ExternalRef);
+    }
+    let sheet = sheet.strip_prefix('$').unwrap_or(sheet);
+    Ok(format!("{sheet}!{cell}"))
+}
+
 fn parse_a1_ref(reference: &str) -> Option<(u32, u16)> {
     let normalized = reference.replace('$', "");
     let reference = normalized.as_str();
@@ -1542,7 +2104,10 @@ fn parse_a1_ref(reference: &str) -> Option<(u32, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FormulaEvaluation, FormulaUnsupportedReason, MAX_EXPR_DEPTH};
+    use super::{
+        parse_whole_row_ref, FormulaEvaluation, FormulaUnsupportedReason,
+        MAX_EVALUATION_OPERATIONS, MAX_EXPR_DEPTH, MAX_FORMULA_DEPENDENCY_DEPTH,
+    };
     use crate::{Cell, Workbook};
 
     #[test]
@@ -1606,15 +2171,15 @@ mod tests {
 
         assert_eq!(
             wb.evaluate_cell("Data", 0, 1),
-            FormulaEvaluation::Computed(Cell::Number(6.0))
+            FormulaEvaluation::Computed(Cell::Number(3.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 2),
-            FormulaEvaluation::Computed(Cell::Number(2.0))
+            FormulaEvaluation::Computed(Cell::Number(1.5))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 3),
-            FormulaEvaluation::Computed(Cell::Number(3.0))
+            FormulaEvaluation::Computed(Cell::Number(2.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 4),
@@ -1638,7 +2203,7 @@ mod tests {
 
         assert_eq!(
             wb.evaluate_cell("Data", 0, 4),
-            FormulaEvaluation::Computed(Cell::Number(3.0))
+            FormulaEvaluation::Computed(Cell::Number(1.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 5),
@@ -1646,15 +2211,15 @@ mod tests {
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 6),
-            FormulaEvaluation::Computed(Cell::Number(2.0))
+            FormulaEvaluation::Computed(Cell::Number(1.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 7),
-            FormulaEvaluation::Computed(Cell::Number(1.5))
+            FormulaEvaluation::Computed(Cell::Number(1.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 8),
-            FormulaEvaluation::Computed(Cell::Number(2.0))
+            FormulaEvaluation::Computed(Cell::Number(1.0))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 0, 9),
@@ -1719,6 +2284,37 @@ mod tests {
         assert_eq!(
             wb.evaluate_cell("Data", 1, 9),
             FormulaEvaluation::Computed(Cell::Bool(true))
+        );
+    }
+
+    #[test]
+    fn iferror_ifna_and_logical_range_semantics_are_deterministic() {
+        assert_eq!(
+            eval("IFERROR(1/0,7)"),
+            FormulaEvaluation::Computed(Cell::Number(7.0))
+        );
+        assert_eq!(
+            eval("IFNA(#N/A,8)"),
+            FormulaEvaluation::Computed(Cell::Number(8.0))
+        );
+        assert_eq!(
+            eval("IFNA(1/0,8)"),
+            FormulaEvaluation::Computed(Cell::Error("#DIV/0!".into()))
+        );
+
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("Data");
+        sheet.write(0, 0, "ignored");
+        sheet.write(1, 0, true);
+        sheet.write_formula(0, 1, "AND(A1:A2)", false);
+        sheet.write_formula(1, 1, "OR(A1:A1)", false);
+        assert_eq!(
+            wb.evaluate_cell("Data", 0, 1),
+            FormulaEvaluation::Computed(Cell::Bool(true))
+        );
+        assert_eq!(
+            wb.evaluate_cell("Data", 1, 1),
+            FormulaEvaluation::Computed(Cell::Error("#VALUE!".into()))
         );
     }
 
@@ -2291,11 +2887,15 @@ mod tests {
             "MAX(1/0)",
             "AVERAGE(1/0)",
             "COUNT(1/0)",
-            "COUNTA(1/0)",
             "PRODUCT(1/0)",
         ] {
             assert_div0(formula);
         }
+        assert_eq!(
+            eval("COUNTA(1/0)"),
+            FormulaEvaluation::Computed(Cell::Number(1.0)),
+            "COUNTA counts error values as non-empty"
+        );
     }
 
     #[test]
@@ -2621,36 +3221,13 @@ mod tests {
 
     #[test]
     fn reference_forms_bare_a1_dollar_variants() {
-        // Only a bare, undecorated "A1" is recognized as a top-level
-        // reference by the identifier scanner (it doesn't include '$' in
-        // its character class). A leading '$' isn't a valid primary-token
-        // start at all, and a mid-token '$' truncates the identifier before
-        // the digits, so "A$1" is read as bare identifier "A" instead.
-        assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "A1"),
-            FormulaEvaluation::Computed(Cell::Number(1.0))
-        );
-        assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "$A$1"),
-            FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnparsableExpression,
-            }
-        );
-        assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "$A1"),
-            FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnparsableExpression,
-            }
-        );
-        assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "A$1"),
-            FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnresolvedName,
-            }
-        );
+        for formula in ["A1", "$A$1", "$A1", "A$1"] {
+            assert_eq!(
+                eval_ref_against((1.0, 2.0), (3.0, 4.0), formula),
+                FormulaEvaluation::Computed(Cell::Number(1.0)),
+                "formula {formula:?}"
+            );
+        }
     }
 
     #[test]
@@ -2669,47 +3246,206 @@ mod tests {
 
     #[test]
     fn reference_range_dollar_variants() {
-        // A bare (non-sheet-qualified) range's END operand goes through the
-        // dollar-aware scanner even though the START does not (it's read as
-        // a plain identifier first), so a '$' on the end alone still works.
+        for formula in ["SUM(A1:$B$2)", "SUM($A$1:$B$2)", "SUM(Data!$A$1:$B$2)"] {
+            assert_eq!(
+                eval_ref_against((1.0, 2.0), (3.0, 4.0), formula),
+                FormulaEvaluation::Computed(Cell::Number(10.0)),
+                "formula {formula:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_whole_row_and_whole_column_ranges_are_bounded_and_evaluated() {
+        for (formula, expected) in [
+            ("SUM(1:2)", 10.0),
+            ("SUM($1:$2)", 10.0),
+            ("SUM(B:D)", 6.0),
+            ("SUM($B:$D)", 6.0),
+            ("SUM(Data!B:D)", 6.0),
+        ] {
+            assert_eq!(
+                eval_ref_against((1.0, 2.0), (3.0, 4.0), formula),
+                FormulaEvaluation::Computed(Cell::Number(expected)),
+                "formula {formula:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_based_whole_row_ranges_are_rejected_without_panicking() {
+        for formula in ["SUM(0:1)", "SUM($0:$1)", "SUM(0:0)"] {
+            assert!(matches!(
+                eval_ref_against((1.0, 2.0), (3.0, 4.0), formula),
+                FormulaEvaluation::Fallback { .. }
+            ));
+        }
+        assert_eq!(parse_whole_row_ref("0"), None);
+        assert_eq!(parse_whole_row_ref("$0"), None);
+    }
+
+    #[test]
+    fn evaluates_workbook_defined_names_and_detects_name_cycles() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Inputs").write(0, 0, 3.0);
+        wb.add_sheet("Data").write_formula(0, 0, "Rate*2", 0.0);
+        wb.defined_names.push(("Rate".into(), "Inputs!$A$1".into()));
         assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "SUM(A1:$B$2)"),
-            FormulaEvaluation::Computed(Cell::Number(10.0))
+            wb.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Computed(Cell::Number(6.0))
         );
-        // Sheet-qualified ranges are dollar-aware on both operands.
+
+        wb.defined_names.push(("LoopA".into(), "LoopB".into()));
+        wb.defined_names.push(("LoopB".into(), "LoopA".into()));
+        wb.sheets
+            .iter_mut()
+            .find(|sheet| sheet.name == "Data")
+            .expect("Data")
+            .write_formula(0, 1, "LoopA", 99.0);
         assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "SUM(Data!$A$1:$B$2)"),
-            FormulaEvaluation::Computed(Cell::Number(10.0))
-        );
-        // A '$' on the bare START of a range is not recognized at all.
-        assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "SUM($A$1:$B$2)"),
+            wb.evaluate_cell("Data", 0, 1),
             FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnparsableExpression,
+                cached: Cell::Number(99.0),
+                reason: FormulaUnsupportedReason::CircularReference,
             }
         );
     }
 
     #[test]
-    fn reference_whole_row_and_whole_column_are_rejected() {
-        // Whole-row/whole-column references are not part of this MVP
-        // grammar (tracked separately on the roadmap); they must fail
-        // gracefully, never miscompute or panic.
+    fn sheet_local_defined_names_shadow_globals_only_in_their_scope() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Inputs").write(0, 0, 2.0);
+        wb.add_sheet("Local Inputs").write(0, 0, 3.0);
+        wb.add_sheet("Data").write_formula(0, 0, "Rate", 0.0);
+        wb.add_sheet("Other").write_formula(0, 0, "Rate", 0.0);
+        wb.define_name("Rate", "Inputs!$A$1");
+        wb.define_local_name("Data", "Rate", "'Local Inputs'!$A$1");
+
         assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "3:5"),
-            FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnparsableExpression,
-            }
+            wb.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Computed(Cell::Number(3.0))
         );
         assert_eq!(
-            eval_ref_against((1.0, 2.0), (3.0, 4.0), "B:D"),
-            FormulaEvaluation::Fallback {
-                cached: Cell::Number(0.0),
-                reason: FormulaUnsupportedReason::UnparsableExpression,
-            }
+            wb.evaluate_cell("Other", 0, 0),
+            FormulaEvaluation::Computed(Cell::Number(2.0))
         );
+    }
+
+    #[test]
+    fn evaluates_three_dimensional_sheet_ranges() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S1").write(0, 0, 1.0);
+        wb.add_sheet("S2").write(0, 0, 2.0);
+        wb.add_sheet("S3").write(0, 0, 3.0);
+        let calc = wb.add_sheet("Calc");
+        calc.write_formula(0, 0, "SUM(S1:S3!A1)", 0.0);
+        calc.write_formula(0, 1, "SUM(S3:S1!$A$1)", 0.0);
+        for col in 0..=1 {
+            assert_eq!(
+                wb.evaluate_cell("Calc", 0, col),
+                FormulaEvaluation::Computed(Cell::Number(6.0))
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_openformula_references_into_the_common_evaluator() {
+        let mut wb = Workbook::new();
+        let data = wb.add_sheet("Data");
+        data.write(0, 0, 1.0);
+        data.write(0, 1, 2.0);
+        data.write(1, 0, 3.0);
+        data.write(1, 1, 4.0);
+        data.write_formula(2, 0, "SUM([.A1:.B2])", 0.0);
+        data.write_formula(2, 1, "SUM([.A1];[.B1])", 0.0);
+        wb.add_sheet("Input Data").write(0, 0, 5.0);
+        wb.sheets
+            .iter_mut()
+            .find(|sheet| sheet.name == "Data")
+            .expect("Data")
+            .write_formula(2, 2, "SUM(['Input Data'.A1];[.A1])", 0.0);
+        assert_eq!(
+            wb.evaluate_cell("Data", 2, 0),
+            FormulaEvaluation::Computed(Cell::Number(10.0))
+        );
+        assert_eq!(
+            wb.evaluate_cell("Data", 2, 1),
+            FormulaEvaluation::Computed(Cell::Number(3.0))
+        );
+        assert_eq!(
+            wb.evaluate_cell("Data", 2, 2),
+            FormulaEvaluation::Computed(Cell::Number(6.0))
+        );
+    }
+
+    #[test]
+    fn date_cells_use_the_stored_serial_in_both_epoch_systems() {
+        for date1904 in [false, true] {
+            let mut wb = Workbook::new();
+            wb.date1904 = date1904;
+            let sheet = wb.add_sheet("Data");
+            sheet.write(0, 0, Cell::Date(45_000.25));
+            sheet.write_formula(0, 1, "A1+1", 0.0);
+            assert_eq!(
+                wb.evaluate_cell("Data", 0, 1),
+                FormulaEvaluation::Computed(Cell::Number(45_001.25))
+            );
+        }
+    }
+
+    #[test]
+    fn array_and_external_semantics_have_typed_fallbacks() {
+        for (formula, reason) in [
+            (
+                "FILTER(A1:A2,A1:A2>0)",
+                FormulaUnsupportedReason::ArraySemantics,
+            ),
+            ("A1#", FormulaUnsupportedReason::ArraySemantics),
+            ("@A1", FormulaUnsupportedReason::ArraySemantics),
+            (
+                "[Book.xlsx]Sheet1!A1",
+                FormulaUnsupportedReason::ExternalRef,
+            ),
+        ] {
+            let mut wb = Workbook::new();
+            wb.add_sheet("Data").write_formula(0, 1, formula, 7.0);
+            assert_eq!(
+                wb.evaluate_cell("Data", 0, 1),
+                FormulaEvaluation::Fallback {
+                    cached: Cell::Number(7.0),
+                    reason,
+                },
+                "formula {formula:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_external_name_marker_is_an_external_reference() {
+        let mut wb = Workbook::new();
+        let formulas = [
+            "[ixti:7]!External.Rate_β",
+            "UNSUPPORTED([ixti:7]!External.Rate_β)",
+        ];
+        let sheet = wb.add_sheet("Data");
+        for (col, formula) in formulas.iter().enumerate() {
+            sheet.write_formula(0, col as u16, *formula, 9.5);
+        }
+
+        for (col, formula) in formulas.iter().enumerate() {
+            assert_eq!(
+                wb.evaluate_cell("Data", 0, col as u16),
+                FormulaEvaluation::Fallback {
+                    cached: Cell::Number(9.5),
+                    reason: FormulaUnsupportedReason::ExternalRef,
+                }
+            );
+            assert!(matches!(
+                wb.sheet_by_name("Data")
+                    .and_then(|sheet| sheet.cell(0, col as u16)),
+                Some(Cell::Formula { formula: source, .. }) if source == *formula
+            ));
+        }
     }
 
     #[test]
@@ -2886,6 +3622,110 @@ mod tests {
                 cached: Cell::Number(0.0),
                 reason: FormulaUnsupportedReason::ExpressionTooComplex,
             }
+        );
+    }
+
+    #[test]
+    fn expression_at_exact_operation_limit_computes() {
+        // 5,000 primary operands + 4,999 additions + one postfix operation
+        // consume exactly the 10,000-unit semantic-operation budget.
+        assert_eq!(
+            MAX_EVALUATION_OPERATIONS, 10_000,
+            "boundary math below assumes this constant"
+        );
+        let operand_count = MAX_EVALUATION_OPERATIONS / 2;
+        let formula = format!("{}1%", "1+".repeat(operand_count - 1));
+
+        assert!(matches!(
+            eval(&formula),
+            FormulaEvaluation::Computed(Cell::Number(_))
+        ));
+    }
+
+    #[test]
+    fn expression_one_past_operation_limit_returns_typed_fallback() {
+        let operand_count = MAX_EVALUATION_OPERATIONS / 2;
+        let formula = format!("{}1%%", "1+".repeat(operand_count - 1));
+
+        assert_eq!(
+            eval(&formula),
+            FormulaEvaluation::Fallback {
+                cached: Cell::Number(0.0),
+                reason: FormulaUnsupportedReason::OperationLimitExceeded,
+            }
+        );
+        assert_eq!(
+            FormulaUnsupportedReason::OperationLimitExceeded.code(),
+            "operation_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn operation_budget_is_shared_across_referenced_formulas() {
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("Data");
+        let referenced = format!("{}1", "1+".repeat(2_999));
+        let root = format!("A2+{}1", "1+".repeat(2_998));
+        sheet.write_formula(0, 0, root, 123.0);
+        sheet.write_formula(1, 0, referenced, 456.0);
+
+        assert!(matches!(
+            wb.evaluate_cell("Data", 1, 0),
+            FormulaEvaluation::Computed(Cell::Number(_))
+        ));
+        assert_eq!(
+            wb.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Fallback {
+                cached: Cell::Number(123.0),
+                reason: FormulaUnsupportedReason::OperationLimitExceeded,
+            }
+        );
+    }
+
+    fn linear_formula_dependency_chain(length: usize) -> Workbook {
+        assert!(length > 0);
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for index in 0..length {
+            let formula = if index + 1 == length {
+                "1".to_string()
+            } else {
+                format!("A{}", index + 2)
+            };
+            let cached = if index == 0 { 123.0 } else { 0.0 };
+            sheet.write_formula(index as u32, 0, formula, cached);
+        }
+        workbook
+    }
+
+    #[test]
+    fn formula_dependency_chain_at_exact_depth_limit_computes() {
+        assert_eq!(
+            MAX_FORMULA_DEPENDENCY_DEPTH, 64,
+            "boundary fixture below assumes this constant"
+        );
+        let workbook = linear_formula_dependency_chain(MAX_FORMULA_DEPENDENCY_DEPTH);
+
+        assert_eq!(
+            workbook.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Computed(Cell::Number(1.0))
+        );
+    }
+
+    #[test]
+    fn formula_dependency_chain_one_past_limit_returns_typed_fallback() {
+        let workbook = linear_formula_dependency_chain(MAX_FORMULA_DEPENDENCY_DEPTH + 1);
+
+        assert_eq!(
+            workbook.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Fallback {
+                cached: Cell::Number(123.0),
+                reason: FormulaUnsupportedReason::DependencyDepthExceeded,
+            }
+        );
+        assert_eq!(
+            FormulaUnsupportedReason::DependencyDepthExceeded.code(),
+            "dependency_depth_exceeded"
         );
     }
 
@@ -3115,14 +3955,88 @@ mod tests {
     }
 
     #[test]
-    fn min_and_max_of_no_numeric_input_is_num_error() {
+    fn min_and_max_of_no_numeric_input_are_zero() {
         assert_eq!(
             eval("MIN()"),
-            FormulaEvaluation::Computed(Cell::Error("#NUM!".into()))
+            FormulaEvaluation::Computed(Cell::Number(0.0))
         );
         assert_eq!(
             eval("MAX()"),
-            FormulaEvaluation::Computed(Cell::Error("#NUM!".into()))
+            FormulaEvaluation::Computed(Cell::Number(0.0))
+        );
+    }
+
+    #[test]
+    fn aggregate_direct_values_and_reference_values_use_excel_coercion_rules() {
+        assert_eq!(
+            eval("SUM(1,\"2\",TRUE)"),
+            FormulaEvaluation::Computed(Cell::Number(4.0))
+        );
+        assert_eq!(
+            eval("AVERAGE(1,\"2\",TRUE)"),
+            FormulaEvaluation::Computed(Cell::Number(4.0 / 3.0))
+        );
+        assert_eq!(
+            eval("COUNT(1,\"2\",TRUE)"),
+            FormulaEvaluation::Computed(Cell::Number(3.0))
+        );
+
+        let mut wb = Workbook::new();
+        let sheet = wb.add_sheet("Data");
+        sheet.write(0, 0, 1.0);
+        sheet.write(1, 0, "2");
+        sheet.write(2, 0, true);
+        sheet.write(3, 0, Cell::Error("#N/A".into()));
+        sheet.write_formula(0, 1, "COUNT(A1:A4)", 0.0);
+        sheet.write_formula(1, 1, "COUNTA(A1:A4)", 0.0);
+        assert_eq!(
+            wb.evaluate_cell("Data", 0, 1),
+            FormulaEvaluation::Computed(Cell::Number(1.0))
+        );
+        assert_eq!(
+            wb.evaluate_cell("Data", 1, 1),
+            FormulaEvaluation::Computed(Cell::Number(4.0))
+        );
+    }
+
+    #[test]
+    fn int_floors_negative_values_and_supported_functions_reject_extra_arguments() {
+        assert_eq!(
+            eval("INT(-1.2)"),
+            FormulaEvaluation::Computed(Cell::Number(-2.0))
+        );
+        for formula in [
+            "ABS(1,2)",
+            "ROUND(1,2,3)",
+            "LEFT(\"abc\",1,2)",
+            "MID(\"abc\",1)",
+            "NOT(TRUE,FALSE)",
+            "POWER(2,3,4)",
+        ] {
+            assert_eq!(
+                eval(formula),
+                FormulaEvaluation::Computed(Cell::Error("#VALUE!".into())),
+                "formula {formula:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_function_boundaries_match_excel_error_rules() {
+        for formula in ["LEFT(\"abc\",-1)", "RIGHT(\"abc\",-1)", "MID(\"abc\",1,-1)"] {
+            assert_eq!(
+                eval(formula),
+                FormulaEvaluation::Computed(Cell::Error("#VALUE!".into())),
+                "formula {formula:?}"
+            );
+        }
+        assert_eq!(
+            eval("TRIM(\"  a   b  \")"),
+            FormulaEvaluation::Computed(Cell::Text("a b".into()))
+        );
+        assert_eq!(
+            eval("TRIM(\"a\tb\")"),
+            FormulaEvaluation::Computed(Cell::Text("a\tb".into()))
         );
     }
 

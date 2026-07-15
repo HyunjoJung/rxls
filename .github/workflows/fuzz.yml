@@ -1,6 +1,7 @@
 name: fuzz
 
 on:
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * 1"
@@ -8,19 +9,79 @@ on:
 permissions:
   contents: read
 
+env:
+  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
+  CARGO_FUZZ_VERSION: "0.13.2"
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    env:
+      # PRs receive a bounded smoke gate; scheduled/manual runs retain the
+      # longer pre-existing campaign duration.
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '20' || '120' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY_VERSION }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Materialize deterministic fuzz seeds
+        run: |
+          python3 scripts/fuzz_seeds.py materialize \
+            --corpus-root target/fuzz-seeds \
+            --report target/fuzz-seed-manifest.json
       - name: Build fuzz targets
-        run: cargo +nightly fuzz build
+        id: build
+        shell: bash
+        run: |
+          mkdir -p target
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build 2>&1 | tee target/fuzz-build.log
+      - name: Replay deterministic fuzz seeds
+        id: replay
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/fuzz_seeds.py replay \
+            --corpus-root target/fuzz-seeds \
+            --toolchain "$FUZZ_NIGHTLY_VERSION" \
+            --cargo-fuzz-version "$CARGO_FUZZ_VERSION" \
+            --report target/fuzz-seed-replay.json
       - name: Fuzz the reader
-        run: cargo +nightly fuzz run parse -- -max_total_time=120 -rss_limit_mb=2048
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run parse target/fuzz-seeds/parse -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-parse.log
       - name: Fuzz the authoring path
-        run: cargo +nightly fuzz run author -- -max_total_time=120 -rss_limit_mb=2048
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run author target/fuzz-seeds/author -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-author.log
       - name: Fuzz package-preserving edits
-        run: cargo +nightly fuzz run edit -- -max_total_time=120 -rss_limit_mb=2048
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run edit target/fuzz-seeds/edit -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-edit.log
+      - name: Fuzz formula decompilation and evaluation
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run formula target/fuzz-seeds/formula -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-formula.log
+      - name: Upload fuzz diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/fuzz-*.log
+            target/fuzz-*.json
+            fuzz/artifacts/**
+          if-no-files-found: warn
+          retention-days: 14

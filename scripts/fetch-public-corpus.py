@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DEST = ROOT / "local" / "public-corpus"
+DEFAULT_EXPECTATIONS = ROOT / "tests" / "oracles" / "public-corpus-expectations.json"
 USER_AGENT = "rxls-public-corpus-fetcher"
 SUPPORTED_EXTS = (".xls", ".xlsx", ".xlsm", ".xlsb", ".ods")
 
@@ -99,6 +100,44 @@ def discover(source_name: str, max_bytes: int | None) -> list[dict]:
             }
         )
     return sorted(files, key=lambda f: f["path"])
+
+
+def apply_expectations(files: list[dict], path: Path = DEFAULT_EXPECTATIONS) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema") != "rxls.public-corpus-expectations.v1":
+        raise RuntimeError("unexpected public corpus expectations schema")
+    if payload.get("default_outcome") != "open":
+        raise RuntimeError("public corpus default outcome must be open")
+
+    rejects: dict[tuple[str, str], dict] = {}
+    for row in payload.get("rejects", []):
+        key = (row.get("source", ""), row.get("path", ""))
+        if not all(row.get(field) for field in ["source", "path", "kind", "decision", "evidence"]):
+            raise RuntimeError(f"incomplete public corpus expectation: {row!r}")
+        if key in rejects:
+            raise RuntimeError(f"duplicate public corpus expectation: {key!r}")
+        rejects[key] = row
+
+    discovered = {(file["source"], file["path"]) for file in files}
+    stale = sorted(set(rejects) - discovered)
+    if stale:
+        raise RuntimeError(f"public corpus expectations not present in pinned sources: {stale!r}")
+
+    annotated: list[dict] = []
+    for file in files:
+        item = dict(file)
+        reject = rejects.get((file["source"], file["path"]))
+        if reject is None:
+            item["expected"] = {"outcome": "open"}
+        else:
+            item["expected"] = {
+                "outcome": "reject",
+                "kind": reject["kind"],
+                "decision": reject["decision"],
+                "evidence": reject["evidence"],
+            }
+        annotated.append(item)
+    return annotated
 
 
 def sha256(path: Path) -> str:
@@ -233,6 +272,7 @@ def main(argv: list[str]) -> int:
         print(f"{source_name}: discovered {summarize(discovered)}")
         files.extend(discovered)
     files = sorted(files, key=lambda f: (f["source"], f["path"]))
+    files = apply_expectations(files)
     if args.limit is not None:
         files = files[: args.limit]
 

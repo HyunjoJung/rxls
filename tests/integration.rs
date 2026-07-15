@@ -97,6 +97,16 @@ fn committed_xlsx_fixture_exposes_structural_reader_surface() {
 
 #[cfg(feature = "xlsx")]
 fn synthetic_xlsm_with_vba() -> Vec<u8> {
+    synthetic_xlsm(false)
+}
+
+#[cfg(feature = "xlsx")]
+fn synthetic_xlsm_with_multisurface_parts() -> Vec<u8> {
+    synthetic_xlsm(true)
+}
+
+#[cfg(feature = "xlsx")]
+fn synthetic_xlsm(include_multisurface_parts: bool) -> Vec<u8> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -112,37 +122,133 @@ fn synthetic_xlsm_with_vba() -> Vec<u8> {
 
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opt = SimpleFileOptions::default();
-    add(
-        &mut zip,
-        opt,
-        "[Content_Types].xml",
-        br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
-    );
-    add(
-        &mut zip,
-        opt,
-        "_rels/.rels",
-        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
-    );
+    let content_types: &[u8] = if include_multisurface_parts {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Default Extension="png" ContentType="image/png"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/><Override PartName="/customXml/item1.xml" ContentType="application/xml"/><Override PartName="/_xmlsignatures/origin.sigs" ContentType="application/vnd.openxmlformats-package.digital-signature-origin"/><Override PartName="/_xmlsignatures/sig1.xml" ContentType="application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml"/><Override PartName="/xl/unknown/opaque.bin" ContentType="application/vnd.example.rxls-opaque"/></Types>"#
+    } else {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/></Types>"#
+    };
+    add(&mut zip, opt, "[Content_Types].xml", content_types);
+    let root_relationships: &[u8] = if include_multisurface_parts {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rIdSig" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin" Target="_xmlsignatures/origin.sigs"/></Relationships>"#
+    } else {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+    };
+    add(&mut zip, opt, "_rels/.rels", root_relationships);
     add(
         &mut zip,
         opt,
         "xl/workbook.xml",
         br#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
     );
+    let workbook_relationships: &[u8] = if include_multisurface_parts {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/><Relationship Id="rId3" Type="https://example.invalid/relationships/opaque-feature" Target="unknown/opaque.bin"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item1.xml"/></Relationships>"#
+    } else {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#
+    };
     add(
         &mut zip,
         opt,
         "xl/_rels/workbook.xml.rels",
-        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+        workbook_relationships,
     );
     add(
         &mut zip,
         opt,
         "xl/worksheets/sheet1.xml",
-        br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>macro book</t></is></c></row></sheetData></worksheet>"#,
+        br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>macro book</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#,
+    );
+    let sheet_relationships: &[u8] = if include_multisurface_parts {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#
+    } else {
+        br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#
+    };
+    add(
+        &mut zip,
+        opt,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        sheet_relationships,
+    );
+    add(
+        &mut zip,
+        opt,
+        "xl/tables/table1.xml",
+        br#"<?xml version="1.0" encoding="UTF-8"?><table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="MacroTable" displayName="MacroTable" ref="A1:A1" totalsRowShown="0"><autoFilter ref="A1:A1"/><tableColumns count="1"><tableColumn id="1" name="macro book"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/></table>"#,
     );
     add(&mut zip, opt, "xl/vbaProject.bin", b"rxls macro payload");
+    if include_multisurface_parts {
+        add(
+        &mut zip,
+        opt,
+        "xl/drawings/drawing1.xml",
+        br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" opaque="drawing"><xdr:oneCellAnchor><xdr:graphicFrame/><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#,
+    );
+        add(
+        &mut zip,
+        opt,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#,
+    );
+        add(
+        &mut zip,
+        opt,
+        "xl/charts/chart1.xml",
+        br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" opaque="chart"/>"#,
+    );
+        add(
+            &mut zip,
+            opt,
+            "xl/media/image1.png",
+            b"\x89PNG\r\n\x1a\nrxls-image",
+        );
+        add(
+        &mut zip,
+        opt,
+        "xl/pivotTables/pivotTable1.xml",
+        br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="OpaquePivot"/>"#,
+    );
+        add(
+            &mut zip,
+            opt,
+            "customXml/item1.xml",
+            br#"<rxls:opaque xmlns:rxls="urn:rxls:test">custom XML</rxls:opaque>"#,
+        );
+        add(
+        &mut zip,
+        opt,
+        "customXml/_rels/item1.xml.rels",
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="opaqueRel" Type="https://example.invalid/relationships/custom-opaque" Target="../itemProps1.xml"/></Relationships>"#,
+    );
+        add(
+        &mut zip,
+        opt,
+        "customXml/itemProps1.xml",
+        br#"<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml" ds:itemID="{00000000-0000-0000-0000-000000000001}"/>"#,
+    );
+        add(
+            &mut zip,
+            opt,
+            "_xmlsignatures/origin.sigs",
+            b"rxls-signature-origin",
+        );
+        add(
+        &mut zip,
+        opt,
+        "_xmlsignatures/_rels/origin.sigs.rels",
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/signature" Target="sig1.xml"/></Relationships>"#,
+    );
+        add(
+        &mut zip,
+        opt,
+        "_xmlsignatures/sig1.xml",
+        br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><Object>signature-adjacent sentinel</Object></Signature>"#,
+    );
+        add(
+            &mut zip,
+            opt,
+            "xl/unknown/opaque.bin",
+            b"\x00opaque relationship payload\xff",
+        );
+    }
     zip.finish().unwrap().into_inner()
 }
 
@@ -377,6 +483,221 @@ fn editable_xlsm_set_cell_value_touches_only_sheet_part() {
         reopened.sheet_by_name("Data").and_then(|s| s.cell(0, 0)),
         Some(&Cell::Text("edited <&>".into()))
     );
+}
+
+/// A single unrelated edit must leave a representative multi-surface OOXML
+/// package byte-for-byte intact outside the declared worksheet part. Keeping
+/// these sentinels together catches broad ZIP rebuild or relationship-pruning
+/// regressions that isolated VBA-only tests cannot detect.
+#[cfg(feature = "xlsx")]
+#[test]
+fn editable_unrelated_cell_edit_byte_preserves_multisurface_package() {
+    use rxls::{Cell, Spreadsheet};
+
+    let input = synthetic_xlsm_with_multisurface_parts();
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open multisurface xlsm");
+    spreadsheet
+        .set_cell_value("Data", 0, 0, Cell::Text("unrelated edit".into()))
+        .expect("edit worksheet cell");
+    assert_eq!(spreadsheet.edited_parts(), &["xl/worksheets/sheet1.xml"]);
+
+    let saved = spreadsheet.save().expect("save multisurface xlsm");
+    let untouched = [
+        "[Content_Types].xml",
+        "_rels/.rels",
+        "xl/_rels/workbook.xml.rels",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/vbaProject.bin",
+        "xl/drawings/drawing1.xml",
+        "xl/drawings/_rels/drawing1.xml.rels",
+        "xl/charts/chart1.xml",
+        "xl/media/image1.png",
+        "xl/pivotTables/pivotTable1.xml",
+        "customXml/item1.xml",
+        "customXml/_rels/item1.xml.rels",
+        "customXml/itemProps1.xml",
+        "_xmlsignatures/origin.sigs",
+        "_xmlsignatures/_rels/origin.sigs.rels",
+        "_xmlsignatures/sig1.xml",
+        "xl/unknown/opaque.bin",
+    ];
+    for part in untouched {
+        assert_eq!(
+            zip_part(&saved, part),
+            zip_part(&input, part),
+            "unrelated edit changed retained part {part}"
+        );
+    }
+
+    let reopened = Workbook::open(&saved).expect("reopen multisurface xlsm");
+    assert_eq!(
+        reopened
+            .sheet_by_name("Data")
+            .and_then(|sheet| sheet.cell(0, 0)),
+        Some(&Cell::Text("unrelated edit".into()))
+    );
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn editable_xlsm_comment_and_hyperlink_crud_preserves_vba() {
+    use rxls::{Comment, Spreadsheet};
+
+    let input = synthetic_xlsm_with_vba();
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsm");
+    spreadsheet
+        .set_comment("Data", 0, 0, "created note", Some("Alice"))
+        .expect("create legacy note");
+    spreadsheet
+        .set_external_hyperlink("Data", 0, 0, "https://example.com/created")
+        .expect("create external hyperlink");
+    let created = spreadsheet.save().expect("save created metadata");
+    assert_eq!(
+        zip_part(&created, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    let reopened = Workbook::open(&created).expect("reopen created xlsm");
+    let sheet = reopened.sheet_by_name("Data").expect("Data");
+    assert_eq!(
+        sheet.comments(),
+        &[Comment {
+            row: 0,
+            col: 0,
+            text: "created note".into(),
+            author: Some("Alice".into()),
+        }]
+    );
+    assert_eq!(
+        sheet.hyperlinks(),
+        &[(0, 0, "https://example.com/created".into())]
+    );
+
+    let mut spreadsheet = Spreadsheet::open(&created).expect("reopen xlsm for update");
+    spreadsheet
+        .set_comment("Data", 0, 0, "updated note", Some("Bob"))
+        .expect("update legacy note");
+    spreadsheet
+        .set_internal_hyperlink("Data", 0, 0, "Data!A1")
+        .expect("replace external hyperlink with internal hyperlink");
+    let updated = spreadsheet.save().expect("save updated metadata");
+    assert_eq!(
+        zip_part(&updated, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    let reopened = Workbook::open(&updated).expect("reopen updated xlsm");
+    let sheet = reopened.sheet_by_name("Data").expect("Data");
+    assert_eq!(sheet.comments()[0].text, "updated note");
+    assert_eq!(sheet.comments()[0].author.as_deref(), Some("Bob"));
+    assert!(sheet.hyperlinks().is_empty());
+
+    let mut spreadsheet = Spreadsheet::open(&updated).expect("reopen xlsm for delete");
+    spreadsheet
+        .delete_comment("Data", 0, 0)
+        .expect("delete legacy note");
+    spreadsheet
+        .delete_hyperlink("Data", 0, 0)
+        .expect("delete internal hyperlink");
+    let deleted = spreadsheet.save().expect("save deleted metadata");
+    assert_eq!(
+        zip_part(&deleted, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    assert!(!zip_has_part(&deleted, "xl/comments1.xml"));
+    assert!(!zip_has_part(&deleted, "xl/drawings/vmlDrawing1.vml"));
+    let reopened = Workbook::open(&deleted).expect("reopen deleted xlsm");
+    let sheet = reopened.sheet_by_name("Data").expect("Data");
+    assert!(sheet.comments().is_empty());
+    assert!(sheet.hyperlinks().is_empty());
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn editable_xlsm_delete_sheet_preserves_vba_and_reopens() {
+    use rxls::{Cell, Spreadsheet};
+
+    let input = synthetic_xlsm_with_vba();
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsm");
+    spreadsheet.add_sheet("Keep").expect("add surviving sheet");
+    spreadsheet
+        .set_cell_value("Keep", 0, 0, Cell::Text("survives".into()))
+        .expect("write surviving sheet");
+    let two_sheet = spreadsheet.save().expect("save two-sheet xlsm");
+
+    let mut spreadsheet = Spreadsheet::open(&two_sheet).expect("reopen two-sheet xlsm");
+    spreadsheet
+        .delete_sheet("Data")
+        .expect("delete first sheet");
+    let saved = spreadsheet.save().expect("save deleted-sheet xlsm");
+
+    assert_eq!(zip_part(&saved, "xl/vbaProject.bin"), b"rxls macro payload");
+    let reopened = Workbook::open(&saved).expect("reopen deleted-sheet xlsm");
+    assert_eq!(reopened.sheet_names(), vec!["Keep"]);
+    assert_eq!(
+        reopened
+            .sheet_by_name("Keep")
+            .and_then(|sheet| sheet.cell(0, 0)),
+        Some(&Cell::Text("survives".into()))
+    );
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn editable_xlsm_validation_and_existing_table_range_edits_preserve_vba() {
+    use rxls::{DataValidation, DvKind, DvOp, Spreadsheet};
+
+    let input = synthetic_xlsm_with_vba();
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsm");
+    spreadsheet
+        .set_data_validation("Data", DataValidation::list((1, 0, 3, 0), "\"A,B\""))
+        .expect("create validation");
+    spreadsheet
+        .set_table_range("Data", "MacroTable", (0, 0, 3, 0))
+        .expect("expand existing table");
+    let created = spreadsheet.save().expect("save created xlsm metadata");
+    assert_eq!(
+        zip_part(&created, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    let reopened = Workbook::open(&created).expect("reopen created xlsm metadata");
+    let sheet = reopened.sheet_by_name("Data").expect("Data");
+    assert_eq!(sheet.data_validations().len(), 1);
+    assert_eq!(sheet.tables()[0].range, (0, 0, 3, 0));
+
+    let mut spreadsheet = Spreadsheet::open(&created).expect("reopen xlsm for update");
+    spreadsheet
+        .set_data_validation(
+            "Data",
+            DataValidation::new((1, 0, 3, 0), DvKind::Whole, DvOp::Between, "1").with_formula2("9"),
+        )
+        .expect("update validation");
+    spreadsheet
+        .set_table_range("Data", "MacroTable", (0, 0, 1, 0))
+        .expect("shrink existing table");
+    let updated = spreadsheet.save().expect("save updated xlsm metadata");
+    assert_eq!(
+        zip_part(&updated, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    let reopened = Workbook::open(&updated).expect("reopen updated xlsm metadata");
+    let sheet = reopened.sheet_by_name("Data").expect("Data");
+    assert_eq!(sheet.data_validations()[0].kind, DvKind::Whole);
+    assert_eq!(sheet.tables()[0].range, (0, 0, 1, 0));
+
+    let mut spreadsheet = Spreadsheet::open(&updated).expect("reopen xlsm for delete");
+    spreadsheet
+        .delete_data_validation("Data", (1, 0, 3, 0))
+        .expect("delete validation");
+    let deleted = spreadsheet.save().expect("save deleted validation");
+    assert_eq!(
+        zip_part(&deleted, "xl/vbaProject.bin"),
+        b"rxls macro payload"
+    );
+    assert!(Workbook::open(&deleted)
+        .expect("reopen deleted validation xlsm")
+        .sheet_by_name("Data")
+        .expect("Data")
+        .data_validations()
+        .is_empty());
 }
 
 #[cfg(feature = "xlsx")]
@@ -1312,6 +1633,98 @@ fn committed_xls_fixture_exposes_legacy_reader_surface() {
         .sheet_by_name("Hidden")
         .expect("Hidden sheet")
         .is_hidden());
+}
+
+/// The tracked legacy fixture is a licensed, deterministic derivative of a
+/// real Korean workbook and exercises BIFF5's byte-oriented `Book` stream.
+#[test]
+fn committed_korean_biff5_fixture_decodes_cp949_exactly() {
+    use rxls::Cell;
+
+    let wb = Workbook::open(include_bytes!("fixtures/xls/korean-cp949-biff5.xls"))
+        .expect("Korean BIFF5 fixture");
+    let sheet = wb.sheet_by_name("작업표").expect("Korean sheet name");
+
+    assert_eq!(
+        sheet.cell(0, 0),
+        Some(&Cell::Text("조립 작업 표준서".into()))
+    );
+    assert_eq!(
+        sheet.cell(1, 0),
+        Some(&Cell::Text("체결(TIGHTENING)".into()))
+    );
+    assert_eq!(
+        sheet.cell(2, 0),
+        Some(&Cell::Text("클램핑(CLAMPING)".into()))
+    );
+    assert_eq!(
+        sheet.cell(3, 0),
+        Some(&Cell::Text("확인(CONFIRMATION)".into()))
+    );
+}
+
+/// Formula text is reconstructed from BIFF tokens, not from cached results.
+/// This workbook was saved as BIFF8 by LibreOffice from the committed OOXML
+/// source, so these expectations are independent of rxls' token writer/tests.
+#[test]
+fn libreoffice_biff8_fixture_preserves_exact_formula_sources() {
+    use rxls::Cell;
+
+    fn formula_source(cell: Option<&Cell>) -> &str {
+        match cell {
+            Some(Cell::Formula { formula, .. }) => formula,
+            other => panic!("expected formula cell, got {other:?}"),
+        }
+    }
+
+    let wb = Workbook::open(include_bytes!("fixtures/formula/biff8/formula-source.xls"))
+        .expect("LibreOffice BIFF8 formula fixture");
+    let sheet = wb.sheet_by_name("Calc").expect("Calc sheet");
+    let expected = [
+        ((0, 1), "ABS($A$1)"),
+        ((0, 2), "TRUE"),
+        ((0, 3), "FALSE"),
+        ((0, 4), "NOW()"),
+        ((1, 1), "$A$1+A$1+$A1+A1"),
+        ((2, 1), "'Input Data'!$B$3"),
+        ((3, 1), "Answer"),
+        ((4, 1), "A5*2"),
+        ((5, 1), "A6*2"),
+    ];
+    for ((row, col), source) in expected {
+        assert_eq!(formula_source(sheet.cell(row, col)), source, "R{row}C{col}");
+    }
+}
+
+#[test]
+fn libreoffice_biff8_formula_sources_feed_deterministic_evaluation() {
+    use rxls::{Cell, FormulaEvaluation, FormulaUnsupportedReason};
+
+    let wb = Workbook::open(include_bytes!("fixtures/formula/biff8/formula-source.xls"))
+        .expect("LibreOffice BIFF8 formula fixture");
+    for ((row, col), expected) in [
+        ((0, 1), Cell::Number(5.0)),
+        ((0, 2), Cell::Bool(true)),
+        ((0, 3), Cell::Bool(false)),
+        ((1, 1), Cell::Number(20.0)),
+        ((2, 1), Cell::Number(7.0)),
+        ((3, 1), Cell::Number(7.0)),
+        ((4, 1), Cell::Number(6.0)),
+        ((5, 1), Cell::Number(8.0)),
+    ] {
+        assert_eq!(
+            wb.evaluate_cell("Calc", row, col),
+            FormulaEvaluation::Computed(expected),
+            "R{row}C{col}"
+        );
+    }
+    assert!(matches!(
+        wb.evaluate_cell("Calc", 0, 4),
+        FormulaEvaluation::Fallback {
+            reason: FormulaUnsupportedReason::Volatile,
+            ..
+        }
+    ));
 }
 
 /// Keep a committed `.xlsb` fixture so the binary workbook reader has real ZIP
@@ -2294,6 +2707,9 @@ fn authoring_roundtrips_through_the_public_api() {
         s.merge(3, 0, 3, 2);
         s.write_styled(3, 0, "합계", &CellStyle::new().bold().align(HAlign::Center));
         s.set_col_width(0, 30.0);
+        s.set_row_height(1, 24.0);
+        s.hide_column(2);
+        s.hide_row(2);
         s.freeze_panes(1, 0);
         s.autofilter(0, 0, 1, 2);
     }
@@ -2322,6 +2738,19 @@ fn authoring_roundtrips_through_the_public_api() {
     assert_eq!(reread.sheets[1].cell(0, 0), Some(&Cell::Number(42.0)));
     // Merged ranges round-trip: authored merge → <mergeCells> → read back.
     assert_eq!(s0.merged_ranges(), &[(3, 0, 3, 2)]);
+    assert_eq!(s0.column_widths().get(&0), Some(&30.0));
+    assert_eq!(s0.row_heights().get(&1), Some(&24.0));
+    assert!(s0.hidden_columns().contains(&2));
+    assert!(s0.hidden_rows().contains(&2));
+    assert!(s0
+        .cell_style(0, 1)
+        .and_then(|style| style.font.as_ref())
+        .is_some_and(|font| font.bold));
+    assert_eq!(
+        s0.cell_style(1, 1)
+            .and_then(|style| style.num_fmt.as_deref()),
+        Some("₩#,##0")
+    );
 }
 
 /// The calamine-style range facade: by-name sheet lookup + grouped row iteration.
@@ -2539,6 +2968,7 @@ fn workbook_metadata_facade_groups_public_reader_metadata() {
     wb.properties.title = Some("Quarterly Report".into());
     wb.properties.creator = Some("rxls author".into());
     wb.define_name("NamedTotal", "Data!$B$2");
+    wb.define_local_name("Data", "LocalTotal", "Data!$B$2");
     wb.protect_structure();
     wb.add_sheet("Data").write(0, 0, "item");
     wb.add_sheet("Summary").write(0, 0, "total");
@@ -2569,6 +2999,15 @@ fn workbook_metadata_facade_groups_public_reader_metadata() {
         [("NamedTotal".to_string(), "Data!$B$2".to_string())].as_slice()
     );
     assert_eq!(
+        metadata.local_defined_names,
+        [rxls::LocalDefinedName {
+            sheet: "Data".into(),
+            name: "LocalTotal".into(),
+            refers_to: "Data!$B$2".into(),
+        }]
+        .as_slice()
+    );
+    assert_eq!(
         metadata.properties.title.as_deref(),
         Some("Quarterly Report")
     );
@@ -2597,6 +3036,37 @@ fn workbook_metadata_facade_groups_public_reader_metadata() {
                 visible: SheetVisible::VeryHidden,
             },
         ]
+    );
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn sheet_local_defined_names_round_trip_and_evaluate_after_reopen() {
+    use rxls::{Cell, FormulaEvaluation, LocalDefinedName, Reader};
+
+    let mut wb = Workbook::new();
+    let data = wb.add_sheet("Data");
+    data.write(0, 0, 7.0);
+    data.write_formula(0, 1, "Rate*2", 0.0);
+    wb.add_sheet("Other");
+    wb.define_local_name("Data", "Rate", "Data!$A$1");
+
+    let back = Workbook::open(&wb.to_xlsx_checked().expect("valid local name")).expect("reopen");
+    assert_eq!(
+        back.local_defined_names(),
+        &[LocalDefinedName {
+            sheet: "Data".into(),
+            name: "Rate".into(),
+            refers_to: "Data!$A$1".into(),
+        }]
+    );
+    assert_eq!(
+        Reader::local_defined_names(&back),
+        back.local_defined_names()
+    );
+    assert_eq!(
+        back.evaluate_cell("Data", 0, 1),
+        FormulaEvaluation::Computed(Cell::Number(14.0))
     );
 }
 
@@ -5519,6 +5989,18 @@ fn rich_string_accepts_format_facade() {
         back.sheets[0].cell(0, 0),
         Some(&Cell::Text("Hello World".into()))
     );
+    let runs = back.sheets[0]
+        .rich_text_runs(0, 0)
+        .expect("rich runs retained");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].text, "Hello ");
+    assert!(runs[0].font.bold);
+    assert_eq!(runs[1].text, "World");
+    assert!(runs[1].font.italic);
+    assert!(back.sheets[0]
+        .cell_style(0, 0)
+        .and_then(|style| style.align.as_ref())
+        .is_some_and(|align| align.horizontal == Some(rxls::HAlign::Center)));
 }
 
 /// W1: rich-string helpers should accept common run collections directly,

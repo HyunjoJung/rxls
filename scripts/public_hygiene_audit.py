@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -17,7 +18,10 @@ REPO = Path(__file__).resolve().parents[1]
 SCHEMA = "rxls.public-hygiene-audit.v1"
 MAX_TEXT_BYTES = 8 * 1024 * 1024
 MAX_OFFICE_TEXT_BYTES = 4 * 1024 * 1024
+MAX_ARCHIVE_TEXT_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10_000
 OFFICE_SUFFIXES = {".ods", ".xlsb", ".xlsm", ".xlsx"}
+TAR_GZIP_SUFFIXES = {".crate", ".tgz"}
 BINARY_SUFFIXES = {
     ".bin",
     ".gif",
@@ -156,6 +160,139 @@ def scan_office_package(path: Path, display_path: str) -> list[Finding]:
     return findings
 
 
+def _unsafe_archive_path(name: str) -> bool:
+    normalized_name = name.replace("\\", "/")
+    member = PurePosixPath(normalized_name)
+    return (
+        member.is_absolute()
+        or ".." in member.parts
+        or re.match(r"^[A-Za-z]:/", normalized_name) is not None
+    )
+
+
+def scan_tar_package(path: Path, display_path: str) -> list[Finding]:
+    """Scan text members and paths inside a published .crate or npm .tgz."""
+    findings: list[Finding] = []
+    text_bytes = 0
+    try:
+        with tarfile.open(path, mode="r:gz") as archive:
+            for index, info in enumerate(archive, start=1):
+                member_path = f"{display_path}::{info.name}"
+                findings.extend(scan_text(member_path, info.name))
+                if index > MAX_ARCHIVE_MEMBERS:
+                    findings.append(
+                        Finding(
+                            display_path,
+                            None,
+                            "archive_member_limit",
+                            "release archive exceeds member audit limit",
+                        )
+                    )
+                    break
+                if _unsafe_archive_path(info.name):
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "unsafe_archive_member",
+                            "unsafe release archive member path",
+                        )
+                    )
+                if info.issym() or info.islnk():
+                    findings.extend(scan_text(member_path, info.linkname))
+                    if _unsafe_archive_path(info.linkname):
+                        findings.append(
+                            Finding(
+                                member_path,
+                                None,
+                                "unsafe_archive_link",
+                                "unsafe release archive link target",
+                            )
+                        )
+                    continue
+                if info.isdir():
+                    continue
+                if not info.isfile():
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "unsupported_archive_member",
+                            "release archive contains a special member",
+                        )
+                    )
+                    continue
+                suffix = PurePosixPath(info.name).suffix.lower()
+                if suffix in OFFICE_SUFFIXES or suffix in BINARY_SUFFIXES:
+                    continue
+                if info.size > MAX_TEXT_BYTES:
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "archive_text_too_large",
+                            "archive text member exceeds audit limit",
+                        )
+                    )
+                    continue
+                text_bytes += info.size
+                if text_bytes > MAX_ARCHIVE_TEXT_BYTES:
+                    findings.append(
+                        Finding(
+                            display_path,
+                            None,
+                            "archive_text_total_too_large",
+                            "release archive text exceeds total audit limit",
+                        )
+                    )
+                    break
+                member = archive.extractfile(info)
+                if member is None:
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "unreadable_archive_member",
+                            "release archive member could not be read",
+                        )
+                    )
+                    continue
+                data = member.read(MAX_TEXT_BYTES + 1)
+                if len(data) > MAX_TEXT_BYTES:
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "archive_text_too_large",
+                            "archive text member exceeds audit limit",
+                        )
+                    )
+                    continue
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    findings.append(
+                        Finding(
+                            member_path,
+                            None,
+                            "non_utf8_archive_text",
+                            "non-binary archive member is not UTF-8",
+                        )
+                    )
+                else:
+                    findings.extend(scan_text(member_path, text))
+    except (OSError, tarfile.TarError):
+        findings.append(
+            Finding(
+                display_path,
+                None,
+                "invalid_release_archive",
+                "release archive is not a valid gzip-compressed tar archive",
+            )
+        )
+    return findings
+
+
 def audit_file(path: Path, repo: Path = REPO) -> list[Finding]:
     relative = path.relative_to(repo).as_posix()
     findings = scan_text(relative, relative)
@@ -164,6 +301,8 @@ def audit_file(path: Path, repo: Path = REPO) -> list[Finding]:
     suffix = path.suffix.lower()
     if suffix in OFFICE_SUFFIXES:
         return findings + scan_office_package(path, relative)
+    if suffix in TAR_GZIP_SUFFIXES:
+        return findings + scan_tar_package(path, relative)
     if suffix in BINARY_SUFFIXES:
         return findings
     if path.stat().st_size > MAX_TEXT_BYTES:
@@ -184,11 +323,37 @@ def audit(repo: Path = REPO) -> list[Finding]:
     return sorted(findings, key=lambda item: (item.path, item.line or 0, item.kind))
 
 
+def audit_paths(raw_paths: list[str], repo: Path = REPO) -> list[Finding]:
+    files: set[Path] = set()
+    for raw in raw_paths:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = repo / path
+        path = path.resolve()
+        try:
+            path.relative_to(repo.resolve())
+        except ValueError as error:
+            raise ValueError(f"audit path is outside the repository: {path}") from error
+        if path.is_dir():
+            files.update(candidate for candidate in path.rglob("*") if candidate.is_file())
+        elif path.is_file():
+            files.add(path)
+        else:
+            raise FileNotFoundError(path)
+    findings = [finding for path in sorted(files) for finding in audit_file(path, repo)]
+    return sorted(findings, key=lambda item: (item.path, item.line or 0, item.kind))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("paths", nargs="*", help="optional repository-relative files/directories")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
-    findings = audit()
+    try:
+        findings = audit_paths(args.paths) if args.paths else audit()
+    except (FileNotFoundError, ValueError) as error:
+        print(f"public hygiene: {error}", file=sys.stderr)
+        return 2
     if args.json:
         print(
             json.dumps(

@@ -1,14 +1,22 @@
 //! Deterministic machine-readable diagnostics for workbook feature inventory.
 
+use std::collections::BTreeMap;
+
 use crate::model::Workbook;
-use crate::{Cell, DocProperties, SheetVisible};
+use crate::{Cell, DocProperties, FormulaEvaluation, SheetVisible};
+
+/// Current public diagnose JSON contract version.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 /// A compact, deterministic diagnose report for a workbook.
 ///
 /// The report is intentionally small and stable; consumers can rely on the
 /// JSON field order and keys for smoke checks.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WorkbookReport {
+    /// Version of the stable diagnose JSON schema.
+    pub schema_version: u32,
     /// Source format detected from the CLI argument path or caller-provided hint.
     pub format: String,
     /// Workbook-level numeric stats.
@@ -17,14 +25,37 @@ pub struct WorkbookReport {
     pub properties: ReportProperties,
     /// Count of workbook-defined names.
     pub defined_names_count: usize,
+    /// Count of worksheet-scoped defined names.
+    pub local_defined_names_count: usize,
     /// Aggregate feature counters from workbook and worksheet metadata.
     pub features: ReportFeatures,
+    /// Deterministic formula evaluation/cache fallback distribution.
+    pub evaluation: ReportEvaluation,
     /// Human-readable warnings derived from the parse results.
     pub warnings: Vec<String>,
 }
 
+/// Bounded formula evaluation distribution used by library and CLI reports.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ReportEvaluation {
+    /// Formulas that produced a deterministic non-error value.
+    pub computed: usize,
+    /// Formulas that deterministically produced a spreadsheet error value.
+    pub errors: usize,
+    /// Formulas for which the stored cached value was used.
+    pub cached: usize,
+    /// Formulas outside the deterministic evaluator's declared support set.
+    pub unsupported: usize,
+    /// Stable typed fallback reason counts.
+    pub by_reason: BTreeMap<String, usize>,
+    /// Whether evaluation stopped at its reporting budget.
+    pub truncated: bool,
+}
+
 /// Stable workbook stats used by the diagnose report.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ReportStats {
     /// Number of worksheets (including non-grid sheets).
     pub sheets: usize,
@@ -38,6 +69,7 @@ pub struct ReportStats {
 
 /// Document properties surfaced in the diagnose report.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ReportProperties {
     /// `dc:title` value.
     pub title: Option<String>,
@@ -59,6 +91,7 @@ pub struct ReportProperties {
 
 /// Worksheet feature totals from metadata and surface APIs.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ReportFeatures {
     /// Legacy comment/notes count.
     pub comments: usize,
@@ -100,20 +133,34 @@ pub struct ReportFeatures {
 
 impl WorkbookReport {
     /// Build a deterministic report for a parsed workbook.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut workbook = rxls::Workbook::new();
+    /// workbook.add_sheet("Data").write(0, 0, "value");
+    /// let report = rxls::WorkbookReport::from_workbook("xlsx", &workbook);
+    /// assert_eq!(report.schema_version, rxls::REPORT_SCHEMA_VERSION);
+    /// assert!(report.to_json().contains(r#""format":"xlsx""#));
+    /// ```
     pub fn from_workbook(format: impl Into<String>, workbook: &Workbook) -> Self {
         let format = format.into();
         let metadata = workbook.metadata();
         let stats = ReportStats::from_workbook(workbook);
         let properties = ReportProperties::from_doc_properties(metadata.properties);
         let features = ReportFeatures::from_workbook(&metadata, workbook);
-        let warnings = derived_warnings(&stats, &features);
+        let evaluation = ReportEvaluation::from_workbook(workbook);
+        let warnings = derived_warnings(&stats, &features, &evaluation);
 
         Self {
+            schema_version: REPORT_SCHEMA_VERSION,
             format,
             stats,
             properties,
             defined_names_count: metadata.defined_names.len(),
+            local_defined_names_count: workbook.local_defined_names.len(),
             features,
+            evaluation,
             warnings,
         }
     }
@@ -128,7 +175,7 @@ impl WorkbookReport {
         let mut report = Self::from_workbook(format, workbook);
         if let Ok(package) = crate::package::Package::from_bytes(bytes) {
             report.features.add_package_part_names(package.part_names());
-            report.warnings = derived_warnings(&report.stats, &report.features);
+            report.warnings = derived_warnings(&report.stats, &report.features, &report.evaluation);
         }
         report
     }
@@ -140,6 +187,8 @@ impl WorkbookReport {
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         out.push('{');
+        out.push_str(&format!("\"schema_version\":{}", self.schema_version));
+        out.push(',');
         push_json_string_field(&mut out, "format", &self.format);
         out.push(',');
 
@@ -156,9 +205,18 @@ impl WorkbookReport {
             self.defined_names_count
         ));
         out.push(',');
+        out.push_str(&format!(
+            "\"local_defined_names_count\":{}",
+            self.local_defined_names_count
+        ));
+        out.push(',');
 
         out.push_str(r#""features":"#);
         self.features.write_json(&mut out);
+        out.push(',');
+
+        out.push_str(r#""evaluation":"#);
+        self.evaluation.write_json(&mut out);
         out.push(',');
 
         out.push_str(r#""warnings":"#);
@@ -166,6 +224,61 @@ impl WorkbookReport {
 
         out.push('}');
         out
+    }
+}
+
+impl ReportEvaluation {
+    fn from_workbook(workbook: &Workbook) -> Self {
+        const MAX_EVALUATED_FORMULAS: usize = 10_000;
+        let mut report = Self::default();
+        let mut visited = 0usize;
+        for sheet in &workbook.sheets {
+            for (row, cells) in sheet.rows() {
+                for (col, cell) in cells {
+                    if !matches!(cell, Cell::Formula { .. }) {
+                        continue;
+                    }
+                    if visited == MAX_EVALUATED_FORMULAS {
+                        report.truncated = true;
+                        return report;
+                    }
+                    visited += 1;
+                    match workbook.evaluate_cell(&sheet.name, row, col) {
+                        FormulaEvaluation::Computed(Cell::Error(_)) => report.errors += 1,
+                        FormulaEvaluation::Computed(_) => report.computed += 1,
+                        FormulaEvaluation::Fallback { reason, .. } => {
+                            report.cached += 1;
+                            report.unsupported += 1;
+                            *report
+                                .by_reason
+                                .entry(reason.code().to_string())
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    fn write_json(&self, out: &mut String) {
+        out.push('{');
+        out.push_str(&format!(
+            "\"computed\":{},\"errors\":{},\"cached\":{},\"unsupported\":{},\"truncated\":{}",
+            self.computed, self.errors, self.cached, self.unsupported, self.truncated
+        ));
+        out.push_str(r#","by_reason":"#);
+        out.push('{');
+        for (index, (reason, count)) in self.by_reason.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_json_string(out, reason);
+            out.push(':');
+            out.push_str(&count.to_string());
+        }
+        out.push('}');
+        out.push('}');
     }
 }
 
@@ -376,10 +489,17 @@ impl ReportFeatures {
     }
 }
 
-fn derived_warnings(stats: &ReportStats, features: &ReportFeatures) -> Vec<String> {
+fn derived_warnings(
+    stats: &ReportStats,
+    features: &ReportFeatures,
+    evaluation: &ReportEvaluation,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    if stats.formulas > 0 {
-        warnings.push("FormulaCacheOnly".to_string());
+    if evaluation.cached > 0 {
+        warnings.push("FormulaFallbackPresent".to_string());
+    }
+    if evaluation.truncated {
+        warnings.push("FormulaEvaluationTruncated".to_string());
     }
     if stats.text_truncated {
         warnings.push("TextTruncated".to_string());
@@ -483,10 +603,58 @@ mod tests {
         assert_eq!(report.stats.sheets, 1);
         assert_eq!(report.stats.formulas, 1);
         assert_eq!(report.defined_names_count, 1);
+        assert_eq!(report.local_defined_names_count, 0);
         assert!(json.contains(r#""format":"xlsx""#));
         assert!(json.contains(r#""stats":{""#));
-        assert!(json.contains(r#""FormulaCacheOnly""#));
+        assert!(
+            json.contains(r#""evaluation":{"computed":1,"errors":0,"cached":0,"unsupported":0"#)
+        );
         assert!(json.contains(r#""features":{"comments":0"#));
+    }
+
+    #[test]
+    fn report_distinguishes_computed_errors_and_typed_cached_fallbacks() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_formula(0, 0, "1+1", 2.0);
+        sheet.write_formula(0, 1, "1/0", 0.0);
+        sheet.write_formula(0, 2, "MISSING(1)", 9.0);
+
+        let report = WorkbookReport::from_workbook("xlsx", &workbook);
+        assert_eq!(report.evaluation.computed, 1);
+        assert_eq!(report.evaluation.errors, 1);
+        assert_eq!(report.evaluation.cached, 1);
+        assert_eq!(report.evaluation.unsupported, 1);
+        assert_eq!(
+            report.evaluation.by_reason.get("unsupported_function"),
+            Some(&1)
+        );
+        assert!(report.to_json().contains(
+            r#""evaluation":{"computed":1,"errors":1,"cached":1,"unsupported":1,"truncated":false,"by_reason":{"unsupported_function":1}}"#
+        ));
+    }
+
+    #[test]
+    fn report_counts_dependency_depth_fallback_reason() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for index in 0..=crate::eval::MAX_FORMULA_DEPENDENCY_DEPTH {
+            let formula = if index == crate::eval::MAX_FORMULA_DEPENDENCY_DEPTH {
+                "1".to_string()
+            } else {
+                format!("A{}", index + 2)
+            };
+            sheet.write_formula(index as u32, 0, formula, 0.0);
+        }
+
+        let report = WorkbookReport::from_workbook("xlsx", &workbook);
+
+        assert_eq!(report.evaluation.cached, 1);
+        assert_eq!(report.evaluation.unsupported, 1);
+        assert_eq!(
+            report.evaluation.by_reason.get("dependency_depth_exceeded"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -518,6 +686,7 @@ mod tests {
                     text_truncated: false,
                 },
                 &features,
+                &ReportEvaluation::default(),
             ),
             [
                 "MacrosPresentNotExecuted".to_string(),
@@ -1106,18 +1275,20 @@ mod tests {
     // -- WS2: warnings derivation ----------------------------------------------
 
     #[test]
-    fn warning_formula_cache_only_present_iff_formulas_present() {
+    fn warning_formula_fallback_present_only_when_cached_value_is_used() {
         let mut with_formula = Workbook::new();
         with_formula
             .add_sheet("Data")
-            .write_formula(0, 0, "1+1", 2.0);
+            .write_formula(0, 0, "UNSUPPORTED(1)", 2.0);
         let with_json = WorkbookReport::from_workbook("xlsx", &with_formula).to_json();
-        assert!(with_json.contains(r#""FormulaCacheOnly""#));
+        assert!(with_json.contains(r#""FormulaFallbackPresent""#));
 
         let mut without_formula = Workbook::new();
-        without_formula.add_sheet("Data").write(0, 0, 1.0);
+        without_formula
+            .add_sheet("Data")
+            .write_formula(0, 0, "1+1", 2.0);
         let without_json = WorkbookReport::from_workbook("xlsx", &without_formula).to_json();
-        assert!(!without_json.contains("FormulaCacheOnly"));
+        assert!(!without_json.contains("FormulaFallbackPresent"));
     }
 
     #[test]
@@ -1146,7 +1317,10 @@ mod tests {
             formulas: 0,
             text_truncated: false,
         };
-        assert_eq!(derived_warnings(&stats, &features), Vec::<String>::new());
+        assert_eq!(
+            derived_warnings(&stats, &features, &ReportEvaluation::default()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

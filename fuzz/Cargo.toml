@@ -17,7 +17,9 @@ arbitrary = "1"
 
 [dependencies.rxls]
 path = ".."
-features = ["xlsx"]
+default-features = false
+# Exercise every reader dispatch path without pulling the CLI into the fuzz crate.
+features = ["xlsx", "xlsb", "ods"]
 
 [[bin]]
 name = "parse"
@@ -36,6 +38,13 @@ bench = false
 [[bin]]
 name = "edit"
 path = "fuzz_targets/edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "formula"
+path = "fuzz_targets/formula.rs"
 test = false
 doc = false
 bench = false

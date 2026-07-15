@@ -17,3 +17,25 @@ tags, and oracle counts together.
 The larger reference corpora stay under `local/` and are fetched on demand via
 the parity scripts. Those files are not committed because of size and upstream
 licensing constraints.
+
+`xls/korean-cp949-biff5.xls` is the one deliberately small licensed derivative.
+It reduces the Korean workbook `15556.xls` from Apache POI test-data commit
+`aa268199243921dd0d9e1dc8d96cc06331280c94` (Apache-2.0, source SHA-256
+`d2c03941f912abf003a50df4f39a6bfa8ec4cb017759a9a1f3717e01859257d8`) to four
+representative cells and encodes them as a BIFF5 `Book` stream with `CODEPAGE`
+949. The deterministic derivative is regenerated in-repository; its provenance
+and oracle are fixed in `MANIFEST.json`.
+
+Formula-source oracles live separately under `formula/` so cached calculation
+results cannot become the expected formula text. `formula/formula-source.xlsx`
+is generated deterministically by `scripts/generate-fixtures.py`; it was opened
+and saved as `formula/biff8/formula-source.xls` with LibreOfficeDev 26.8.0.0
+alpha0 (`2c87e51eeaa2b413ff4ae097b2705eea1995d8e5`). The integration suite compares
+the BIFF8 token reconstruction against an exact source list while deliberately
+ignoring its recalculated cached values. Their SHA-256 hashes are:
+
+- `formula-source.xlsx`: `945dc6eab3aea076f6115a3b6c71a9464adaa3c0d5b21ec32ba16458f3e4764b`
+- `biff8/formula-source.xls`: `ce94a1f8165cb4d1d3d6158008e8ab0af468720834068d68c2897fda5bb5e3d2`
+
+BIFF5 and BIFF12 token-layout cases that LibreOffice cannot export directly are
+covered by the spec-derived table in `tests/oracles/formula-source-fixtures.tsv`.

@@ -126,8 +126,8 @@ pub enum Cell {
     /// Error cell (`#DIV/0!`, `#N/A`, …).
     Error(String),
     /// A formula cell — the formula text (without the leading `=`) plus its last
-    /// cached value. The reader produces the cached value directly; this variant
-    /// is for authoring a formula via [`Sheet::write`].
+    /// cached value. Supported readers use this variant when formula source can
+    /// be recovered, and authoring APIs use it for newly written formulas.
     Formula {
         /// Formula text, e.g. `SUM(A1:A9)`.
         formula: String,
@@ -1273,8 +1273,8 @@ impl Font {
 }
 
 /// One run of a rich (mixed-format) string: a text fragment plus the font applied
-/// to it. Author a multi-format cell with [`Sheet::write_rich`]; on read a rich
-/// string surfaces as its concatenated text.
+/// to it. Author a multi-format cell with [`Sheet::write_rich`]; readers retain
+/// supported run metadata through [`Sheet::rich_text_runs`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct TextRun {
     /// The run's text.
@@ -5003,6 +5003,8 @@ pub struct WorkbookMetadata<'a> {
     pub properties: &'a DocProperties,
     /// Workbook-global defined names as `(name, refers_to)`.
     pub defined_names: &'a [(String, String)],
+    /// Worksheet-scoped defined names.
+    pub local_defined_names: &'a [LocalDefinedName],
     /// Sheet metadata in workbook order.
     pub sheets: Vec<SheetMetadata>,
 }
@@ -5268,10 +5270,14 @@ pub struct Sheet {
     /// Parsed sheet type for metadata when the source format exposes it.
     pub(crate) sheet_type: Option<SheetType>,
     pub(crate) cells: Vec<CellEntry>,
-    /// Per-column widths in character units (authoring).
+    /// Per-column widths in character units, populated by readers and authoring.
     pub(crate) col_widths: BTreeMap<u16, f32>,
-    /// Per-row heights in points (authoring).
+    /// Per-row heights in points, populated by readers and authoring.
     pub(crate) row_heights: BTreeMap<u32, f32>,
+    /// Explicitly hidden columns.
+    pub(crate) hidden_cols: BTreeSet<u16>,
+    /// Explicitly hidden rows.
+    pub(crate) hidden_rows: BTreeSet<u32>,
     /// Per-column default formats (authoring).
     pub(crate) col_formats: BTreeMap<u16, CellStyle>,
     /// Per-row default formats (authoring).
@@ -5385,6 +5391,8 @@ impl Default for Sheet {
             cells: Vec::default(),
             col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
+            hidden_cols: BTreeSet::default(),
+            hidden_rows: BTreeSet::default(),
             col_formats: BTreeMap::default(),
             row_formats: BTreeMap::default(),
             default_format: None,
@@ -6580,6 +6588,43 @@ impl Sheet {
             .map(|c| c.text.as_str())
     }
 
+    /// Effective cell style at `(row, col)`, when retained by the reader or set
+    /// explicitly for authoring. A format-only blank cell is also surfaced.
+    pub fn cell_style(&self, row: u32, col: u16) -> Option<&CellStyle> {
+        self.cells
+            .iter()
+            .rev()
+            .find(|cell| cell.row == row && cell.col == col)
+            .and_then(|cell| cell.style.as_ref())
+            .or_else(|| self.blank_styles.get(&(row, col)))
+    }
+
+    /// Rich-text runs retained for a cell. Plain strings return `None`; the
+    /// concatenated value remains available through [`Sheet::cell`].
+    pub fn rich_text_runs(&self, row: u32, col: u16) -> Option<&[TextRun]> {
+        self.rich.get(&(row, col)).map(Vec::as_slice)
+    }
+
+    /// Explicit column widths in character units, keyed by 0-based column.
+    pub fn column_widths(&self) -> &BTreeMap<u16, f32> {
+        &self.col_widths
+    }
+
+    /// Explicit row heights in points, keyed by 0-based row.
+    pub fn row_heights(&self) -> &BTreeMap<u32, f32> {
+        &self.row_heights
+    }
+
+    /// Explicitly hidden columns, as 0-based indexes.
+    pub fn hidden_columns(&self) -> &BTreeSet<u16> {
+        &self.hidden_cols
+    }
+
+    /// Explicitly hidden rows, as 0-based indexes.
+    pub fn hidden_rows(&self) -> &BTreeSet<u32> {
+        &self.hidden_rows
+    }
+
     /// Worksheet tab color, when the source workbook or authoring model set one.
     ///
     /// Currently read from OOXML `<sheetPr><tabColor .../>` RGB, theme/tint, and
@@ -6810,6 +6855,17 @@ impl Sheet {
     }
 }
 
+/// A worksheet-scoped defined name retained independently from global names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDefinedName {
+    /// Worksheet name that owns this local name.
+    pub sheet: String,
+    /// Name visible within `sheet`.
+    pub name: String,
+    /// Formula or reference text represented by the name.
+    pub refers_to: String,
+}
+
 /// A workbook — parsed from `.xls`/`.xlsx`, or built for authoring via
 /// [`Workbook::new`].
 #[derive(Debug, Clone, Default)]
@@ -6831,6 +6887,8 @@ pub struct Workbook {
     /// Workbook-global defined names as `(name, refers_to)` (authoring), e.g.
     /// `("TaxRate", "Sheet1!$B$1")`. Set via [`Workbook::define_name`].
     pub defined_names: Vec<(String, String)>,
+    /// Sheet-scoped defined names retained from readers and authoring.
+    pub local_defined_names: Vec<LocalDefinedName>,
     /// 0-based index of the active/selected sheet (authoring), emitted as
     /// `<workbookView activeTab="N"/>` plus `tabSelected="1"` on that sheet's
     /// view. Defaults to `0`; set via [`Workbook::set_active_sheet`].
@@ -6855,6 +6913,8 @@ pub trait Reader {
     fn sheets_metadata(&self) -> Vec<SheetMetadata>;
     /// Workbook-global defined names as `(name, refers_to)`.
     fn defined_names(&self) -> &[(String, String)];
+    /// Worksheet-scoped defined names in workbook order.
+    fn local_defined_names(&self) -> &[LocalDefinedName];
     /// Set the row used as the top of workbook-level worksheet ranges.
     fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self
     where
@@ -7253,6 +7313,7 @@ impl Workbook {
             active_sheet_name: self.active_sheet_name(),
             properties: &self.properties,
             defined_names: &self.defined_names,
+            local_defined_names: &self.local_defined_names,
             sheets: self.sheets_metadata(),
         }
     }
@@ -7707,6 +7768,23 @@ impl Workbook {
     /// series references, or consumer-specific rendering details.
     ///
     /// Available with the default `xlsx` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first typed [`WriteError`](crate::WriteError) found during
+    /// structural, text, range, or output-budget validation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), rxls::WriteError> {
+    /// let mut workbook = rxls::Workbook::new();
+    /// workbook.add_sheet("Data").write(0, 0, "ready");
+    /// let bytes = workbook.to_xlsx_checked()?;
+    /// assert!(bytes.starts_with(b"PK"));
+    /// # Ok(())
+    /// # }
+    /// ```
     #[cfg(feature = "xlsx")]
     pub fn to_xlsx_checked(&self) -> Result<Vec<u8>, crate::WriteError> {
         crate::write::validate(self)?;
@@ -7725,6 +7803,20 @@ impl Workbook {
     pub fn define_name(&mut self, name: impl AsRef<str>, refers_to: impl AsRef<str>) {
         self.defined_names
             .push((name.as_ref().to_string(), refers_to.as_ref().to_string()));
+    }
+    /// Define a name scoped to one worksheet. The checked writer rejects an
+    /// unknown sheet; the infallible writer omits such an invalid entry.
+    pub fn define_local_name(
+        &mut self,
+        sheet: impl AsRef<str>,
+        name: impl AsRef<str>,
+        refers_to: impl AsRef<str>,
+    ) {
+        self.local_defined_names.push(LocalDefinedName {
+            sheet: sheet.as_ref().to_string(),
+            name: name.as_ref().to_string(),
+            refers_to: refers_to.as_ref().to_string(),
+        });
     }
     /// Set workbook document properties for `.xlsx` authoring.
     pub fn set_properties(&mut self, properties: DocProperties) {
@@ -7749,9 +7841,14 @@ impl Workbook {
     /// over [`Self::defined_names`], populated by the `.xlsx` reader,
     /// workbook-global `.xls` `Lbl` / `.xlsb` `BrtName` records, and `.ods`
     /// named ranges, then round-tripped by the writer. Built-in `_xlnm.*` names
-    /// and sheet-local names are skipped on read.
+    /// Sheet-local user names are exposed separately through
+    /// [`Self::local_defined_names`].
     pub fn defined_names(&self) -> &[(String, String)] {
         &self.defined_names
+    }
+    /// Sheet-scoped defined names retained by readers or added for authoring.
+    pub fn local_defined_names(&self) -> &[LocalDefinedName] {
+        &self.local_defined_names
     }
     /// Find a worksheet by name (case-sensitive) — the calamine-style by-name
     /// accessor over [`Self::sheets`].
@@ -7925,6 +8022,10 @@ impl Reader for Workbook {
 
     fn defined_names(&self) -> &[(String, String)] {
         Workbook::defined_names(self)
+    }
+
+    fn local_defined_names(&self) -> &[LocalDefinedName] {
+        Workbook::local_defined_names(self)
     }
 
     fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self {
@@ -8365,6 +8466,14 @@ impl Sheet {
     /// Set a row height in points.
     pub fn set_row_height(&mut self, row: u32, points: f32) {
         self.row_heights.insert(row, points);
+    }
+    /// Hide a column by 0-based index.
+    pub fn hide_column(&mut self, col: u16) {
+        self.hidden_cols.insert(col);
+    }
+    /// Hide a row by 0-based index.
+    pub fn hide_row(&mut self, row: u32) {
+        self.hidden_rows.insert(row);
     }
     /// Set the default format for cells in a row.
     pub fn set_row_format(&mut self, row: u32, format: &Format) {

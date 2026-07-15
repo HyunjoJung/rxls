@@ -38,6 +38,7 @@ cargo test --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 python3 -m unittest discover -s scripts -p "test_*.py"
 cargo package --locked
+cargo publish --dry-run --locked
 ```
 
 ## Tests
@@ -52,8 +53,38 @@ cargo package --locked
 - The trickiest edit-path invariant is byte preservation: a no-op
   open → save must reproduce every untouched part byte-for-byte, and an edit
   may only rewrite the parts it actually touched.
-- Fuzz targets (`fuzz/`) cover parsing, authoring, and the package-preserving
-  edit surface: `cargo +nightly fuzz run parse|author|edit`.
+- Fuzz targets (`fuzz/`) cover parsing, authoring, package-preserving edits,
+  and formula decompilation/evaluation. Run all four locally with:
+
+  ```sh
+  for target in parse author edit formula; do
+    cargo +nightly fuzz run "$target" -- -max_total_time=20
+  done
+  ```
+
+  Pull requests run a bounded smoke; scheduled, manual, and release-candidate
+  campaigns retain per-target diagnostics.
+
+## Release candidates
+
+Run the `Release` workflow twice with `workflow_dispatch` against the exact
+same commit. Run the first candidate without inputs, then give its run ID as
+`baseline_run_id` on the second candidate. The second run downloads the first
+bundle and `scripts/compare_release_bundles.py` rejects missing artifacts,
+manifest inconsistencies, deterministic checksum changes, failed evidence, or
+unexplained differences. Successful test duration and successful 120-second fuzz
+diagnostics may vary freely. Timing, RSS, and edit/save output size may vary only
+within the documented same-SHA reproducibility/noise limits; the absolute
+performance budgets are the regression guard. Create `v0.1.2` only after
+the reproducibility comparison artifact and exact-SHA push runs for both `CI`
+and `CodeQL` pass. The second run emits an immutable attestation bound to the
+repository, version, exact commit, both run IDs, comparison digest, and candidate
+release-manifest digest. The tag-triggered publication path downloads that
+candidate, verifies the exact 47-file bundle contract, and compares the tag-run
+bundle against it before crates.io or GitHub Release writes. After publication,
+the workflow downloads every GitHub Release asset and re-verifies full manifest
+coverage, byte sizes, SHA-256 digests, package checksums, and the Node/browser
+installation smokes.
 
 ## Scope
 

@@ -27,12 +27,14 @@ fn err_kind(e: &Error) -> &'static str {
         Error::MissingWorkbook => "MissingWorkbook",
         Error::Biff(_) => "Biff",
         Error::Zip(_) => "Zip",
+        Error::UnsupportedCompression { .. } => "UnsupportedCompression",
         Error::Xml(_) => "Xml",
         Error::Encrypted => "Encrypted",
         Error::EncryptedPackage => "EncryptedPackage",
         Error::EncryptedOpenDocument => "EncryptedOpenDocument",
         Error::NoText => "NoText",
         Error::SheetOutOfRange => "SheetOutOfRange",
+        _ => "Other",
     }
 }
 

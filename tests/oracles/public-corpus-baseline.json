@@ -1,0 +1,69 @@
+{
+  "as_of": "2026-07-15",
+  "corpus": {
+    "by_ext": {
+      ".ods": {
+        "failed": 1,
+        "files": 16,
+        "opened": 15
+      },
+      ".xls": {
+        "failed": 26,
+        "files": 448,
+        "opened": 422
+      },
+      ".xlsb": {
+        "failed": 2,
+        "files": 21,
+        "opened": 19
+      },
+      ".xlsm": {
+        "failed": 0,
+        "files": 18,
+        "opened": 18
+      },
+      ".xlsx": {
+        "failed": 18,
+        "files": 413,
+        "opened": 395
+      }
+    },
+    "eligible_files": 916,
+    "expected_rejections": 47,
+    "failed": 47,
+    "manifest_files": 916,
+    "opened": 869,
+    "skipped": 0,
+    "unexpected_accepts": 0,
+    "unexpected_failures": 0
+  },
+  "parity": {
+    "ods": {
+      "comparable": 14,
+      "files": 16,
+      "mean_percent": 100.0,
+      "rxls_extracted": 14
+    },
+    "ooxml": {
+      "at_least_99": 387,
+      "comparable": 388,
+      "files": 431,
+      "mean_percent": 99.889,
+      "rxls_extracted": 412
+    },
+    "xls": {
+      "at_least_99": 414,
+      "comparable": 414,
+      "files": 448,
+      "mean_percent": 100.0,
+      "rxls_extracted": 422
+    },
+    "xlsb": {
+      "comparable": 18,
+      "files": 21,
+      "mean_percent": 100.0,
+      "rxls_extracted": 18
+    }
+  },
+  "schema": "rxls.public-corpus-baseline.v1"
+}

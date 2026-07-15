@@ -6,11 +6,37 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
+> **Release status:** this source tree targets the `0.1.2` compatibility
+> candidate. Until `v0.1.2` is tagged and published, the crates.io badge
+> continues to describe the latest public release. Remaining hosted and
+> publication gates are tracked in
+> [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
 **`.xlsb`**, and **`.ods`** into one typed cell model; writes styled **`.xlsx`**;
 and package-preservingly edits **`.xlsx`/`.xlsm`**. No JVM, Apache POI, or
 subprocess is required. Malformed input returns a typed error instead of
 panicking when bounded recovery is not possible.
+
+## Install
+
+Add the library after `0.1.2` is published:
+
+```sh
+cargo add rxls@0.1.2
+```
+
+Install the CLI from the same exact release:
+
+```sh
+cargo install rxls --version =0.1.2 --locked
+rxls --help
+```
+
+The minimum supported Rust version is 1.85. Core library use does not invoke
+Java, Excel, LibreOffice, Python, or any other subprocess.
+
+## Library quick start
 
 ```rust
 // Plain text (search/indexing):
@@ -29,7 +55,39 @@ for sheet in &wb.sheets {
 }
 ```
 
-Examples:
+## CLI
+
+The installed CLI exposes bounded human-readable inspection, stable diagnose
+JSON, CSV export, package inspection, and comparison commands:
+
+```sh
+rxls info book.xlsx
+rxls diagnose book.xlsx
+rxls csv book.xlsx --sheet 0 --max-output-bytes 1048576
+rxls compare before.xlsx after.xlsx --limit 50
+```
+
+Successful `--help` and command output go to stdout. Usage and operational
+errors go to stderr with the stable exit classes documented in
+[`OUTPUT-CONTRACTS.md`](OUTPUT-CONTRACTS.md).
+
+## Cargo features
+
+| Feature | Default | Surface |
+|---|:---:|---|
+| `cli` | Yes | Builds the `rxls` binary |
+| `xlsx` | Yes | XLSX/XLSM reading, XLSX writing, and package-preserving editing |
+| `xlsb` | No | XLSB reader; enables `xlsx` package support |
+| `ods` | No | ODS reader |
+| `serde` | No | Typed row deserialization |
+| `chrono` | No | Date/time and duration conversions |
+| `full` | No | All library format/data features; intentionally excludes `cli` |
+
+The legacy XLS reader is always available. Features are additive. For example,
+use `default-features = false` for an XLS-only library build, or
+`features = ["full"]` for every reader and typed-data helper.
+
+## Examples
 
 ```text
 cargo run -p rxls --bin rxls -- --version
@@ -59,6 +117,12 @@ records. `rxls`:
    (`Sheet::cell`/`cells`/`dimensions`) and flattened to tab-joined rows by
    `to_text`.
 
+For BIFF5/7, declarations `949` (Windows Korean/UHC) and `51949` (EUC-KR)
+share `encoding_rs`'s Windows-949-compatible decoder. Missing or unknown
+codepages fall back to Windows-1252, malformed byte sequences become U+FFFD,
+and [`Workbook::open_with_codepage`] can override a missing or incorrect
+declaration. BIFF8 strings are Unicode and do not use this fallback.
+
 Modern **`.xlsx`** (OOXML) is read too (default `xlsx` feature): `Workbook::open`
 auto-detects OLE2 `.xls` vs ZIP `.xlsx` and produces the same typed cells / text.
 `xlsx` cell data, shared strings, and number formats (for dates) are parsed via
@@ -80,6 +144,12 @@ applications that also need styled `.xlsx` generation, package-preserving
 diagnostic surfaces. The public corpus results below describe `rxls`; they are
 not presented as a current head-to-head benchmark against another crate.
 
+Security/resource limits, absolute performance ceilings, and same-SHA
+reproducibility thresholds are defined in
+[`PERFORMANCE.md`](PERFORMANCE.md); release dependency policy is enforced by
+`deny.toml`, CodeQL, fuzz smoke/scheduled jobs, and a deterministic CycloneDX
+dependency manifest.
+
 ## Scope & parity
 
 Targets plain-text extraction for search/indexing. Date/time serials and
@@ -92,17 +162,16 @@ external reference, circular reference, unresolved name, oversized range,
 missing sheet, …) instead of guessing when a formula falls outside that MVP;
 full custom number-format rendering and styling are out of scope.
 
-**Editing existing files** (`Spreadsheet::open`/`set_cell_value`/
-`set_cell_formula`/`append_row`/`clear_range`/document- and sheet-metadata
-setters/`save`) is package-preserving and `.xlsx`/`.xlsm`-only: edits rewrite
-worksheet/workbook XML in place through an arena-based `XmlTree` engine, so
-every untouched part round-trips byte-for-byte, and new/changed text is
-written as inline `<is>` strings rather than growing the shared string table.
-`.xls`, `.xlsb`, and `.ods` are read-only through this API — `Spreadsheet`
-reports a typed `EditCapability::ReadOnly(EditReadOnlyReason)` (`LegacyBiff`,
-`BinaryPackage`, `OpenDocument`, or `PackageMetadataLoss` for an `.xlsx`
-package that can't be round-tripped losslessly enough to edit) rather than
-attempting a lossy write.
+**Editing existing files** is package-preserving and `.xlsx`/`.xlsm`-only.
+`Spreadsheet` supports atomic batches; cell/formula and range edits; document,
+name, sheet, layout, pane, and print-area metadata; sheet add/rename/delete;
+merges; legacy notes; hyperlinks; exact-range validations; and safe bottom-row
+resizing of existing tables. Untouched declared parts round-trip byte-for-byte,
+including retained VBA content. `.xls`, `.xlsb`, `.ods`, and metadata-lossy
+OOXML packages are read-only through this API. The complete method-by-method
+atomicity, preservation, rejection, and explicit non-goal boundary is frozen in
+[`EDITING-CONTRACT.md`](EDITING-CONTRACT.md); notably, rxls does not insert or
+delete rows or columns or guess how to repair unsafe structural dependencies.
 
 A worksheet can also be exported directly to **CSV**, **HTML**, or
 **Markdown** (`Sheet`/`Workbook::to_csv`/`to_html`/`to_markdown`), and a whole
@@ -112,21 +181,37 @@ surfaced on the CLI as `rxls diagnose <file>` (and `rxls csv <file>` for
 direct CSV export). The portable adapter in `src/wasm.rs` is exposed to
 JavaScript by the isolated `bindings/wasm` `cdylib`; the native `rxls` CLI
 binary itself lives behind the `cli` feature (on by default, so existing
-native workflows are unaffected).
+native workflows are unaffected). Determinism, CSV safety options, diagnose JSON
+schema compatibility, CLI exit codes, and bounded-output guidance are defined in
+[`OUTPUT-CONTRACTS.md`](OUTPUT-CONTRACTS.md). The Rust API inventory, coordinate
+rules, feature guarantees, and 0.1.2-to-1.0 compatibility policy are in
+[`API-COMPATIBILITY.md`](API-COMPATIBILITY.md); the expected no-source-change
+upgrade is summarized in [`MIGRATION-1.0.md`](MIGRATION-1.0.md).
 
-**Current public-corpus gate (2026-07-11).** The pinned fetch recipe selects 916
+The WASM distribution provides generated Node and browser entry points,
+TypeScript declarations, a minimal file-picker demo, structured `RxlsError`
+objects, and a synchronous 32 MiB input limit. Build it with
+`bash scripts/build-wasm-package.sh`; the CI release gate executes Node and
+Chromium smoke tests, compares `reportJson` with `rxls diagnose`, and enforces
+raw WASM, JavaScript glue, and compressed npm bundle budgets. See the
+[WASM package guide](https://github.com/HyunjoJung/rxls/blob/main/bindings/wasm/npm/README.md)
+for initialization and memory guidance.
+
+<!-- public-corpus-baseline:start -->
+**Current public-corpus gate (2026-07-15).** The pinned fetch recipe selects 916
 files from Apache POI and calamine at immutable upstream commits: 448 `.xls`,
 413 `.xlsx`, 18 `.xlsm`, 21 `.xlsb`, and 16 `.ods`. `rxls corpus-report` opens
-876; the remaining 40 are expected rejections for encrypted input, unsupported
-legacy BIFF, or malformed containers. The report records zero unexpected
-failures. Public visible-value checks report:
+869; the remaining 47 are explicit expected rejections for encrypted input,
+unsupported legacy BIFF, malformed containers, or structurally invalid BIFF streams.
+The report records 0 unexpected failures and 0 unexpected accepts. Public visible-value checks report:
 
 | Format | Comparable files | Result |
 |---|---:|---:|
-| `.xls` vs `xlrd` | 417 | 99.520% mean parity; 415/417 at least 99% |
-| `.xlsx`/`.xlsm` vs `openpyxl` | 389 | 99.889% mean parity; 388/389 at least 99% |
+| `.xls` vs `xlrd` | 414 | 100.000% mean parity; 414/414 at least 99% |
+| `.xlsx`/`.xlsm` vs `openpyxl` | 388 | 99.889% mean parity; 387/388 at least 99% |
 | `.xlsb` vs `pyxlsb` plus committed residual oracles | 18 | 100.000% mean parity |
 | `.ods` vs bounded ODF XML visible-text oracle | 14 | 100.000% mean recall |
+<!-- public-corpus-baseline:end -->
 
 The release claim depends only on public, reproducible fixtures and corpora.
 GitHub Actions runs formatting, clippy, the feature/MSRV matrix, Rust and Python
@@ -138,7 +223,7 @@ The broader 916-file run is reproducible on demand with the commands below.
 Everything below runs from a clean checkout — no private data.
 
 ```bash
-python3 -m pip install "xlrd>=2.0" openpyxl pyxlsb
+python3 -m pip install "xlrd==2.0.2" "openpyxl==3.1.5" "pyxlsb==1.0.10" "odfpy==1.4.1"
 python3 scripts/public_hygiene_audit.py
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -151,18 +236,58 @@ cargo package --locked
 cargo publish --dry-run --locked
 ```
 
+To test the exact packaged crate as both an external Rust dependency and a
+`cargo install` CLI—entirely outside the checkout—run:
+
+```sh
+cargo package --locked
+python3 scripts/smoke_crate_distribution.py \
+  --crate target/package/rxls-0.1.2.crate \
+  --fixture tests/fixtures/xlsx/reader-structural.xlsx
+```
+
+After publication, exercise the same consumer, install, version, help,
+diagnose, and invalid-usage contracts through crates.io with:
+
+```sh
+python3 scripts/smoke_crate_distribution.py \
+  --registry-version 0.1.2 \
+  --fixture tests/fixtures/xlsx/reader-structural.xlsx
+```
+
+Maintainers create two clean `Release` workflow-dispatch candidates from the
+same commit. The second receives the first run's `baseline_run_id`; the
+fail-closed bundle comparator requires deterministic artifacts to be identical
+and explains permitted test-duration and successful fuzz-log differences.
+Timing, RSS, and edit-output variation must remain inside the documented
+same-SHA reproducibility/noise limits; the absolute budgets remain the
+performance regression guard. Tag publication is allowed only after that report
+and every hosted gate pass. The second candidate emits an immutable
+exact-SHA attestation that also binds the candidate release-manifest digest.
+The tag-triggered job requires successful exact-SHA CI and CodeQL push runs,
+downloads the attested candidate, and fails before publishing unless its own
+47-file bundle compares cleanly. Post-publication verification downloads every
+release asset and validates full manifest coverage and checksums. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the exact sequence.
+
 Pinned public spreadsheet corpus for parity work:
 
 ```bash
 python3 scripts/fetch-public-corpus.py --dry-run
 python3 scripts/fetch-public-corpus.py
 cargo build --all-features --example extract --locked
-cargo run --all-features --locked -- corpus-report local/public-corpus/manifest.json
-python3 scripts/xls-xlrd-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99
-python3 scripts/xlsx-openpyxl-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99
-python3 scripts/xlsb-pyxlsb-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --min 0.99
-python3 scripts/ods-odfpy-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --min 0.99
+cargo run --bin rxls --all-features --locked -- corpus-report local/public-corpus/manifest.json | tee target/release-corpus-report.txt
+python3 scripts/xls-xlrd-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-worst 20 --show-skips 200 | tee target/release-xls-parity-full.txt
+python3 scripts/xlsx-openpyxl-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-worst 20 --show-skips 200 | tee target/release-ooxml-parity-full.txt
+python3 scripts/xlsb-pyxlsb-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --corpus-report target/release-corpus-report.txt --min 0.99 --show-skips 200 | tee target/release-xlsb-parity-full.txt
+python3 scripts/ods-odfpy-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-skips 200 | tee target/release-ods-parity-full.txt
+python3 scripts/verify_public_baseline.py --corpus-report target/release-corpus-report.txt --xls target/release-xls-parity-full.txt --ooxml target/release-ooxml-parity-full.txt --xlsb target/release-xlsb-parity-full.txt --ods target/release-ods-parity-full.txt --readme README.md
 ```
+
+Each parity report records the oracle reader and installed version plus the
+SHA-256 of the exact input manifest bytes. Directory-only development runs
+explicitly report `input_manifest_sha256=none`; release evidence always uses
+the pinned manifest.
 
 The dry run should report 916 files (`.xls` 448, `.xlsx` 413, `.xlsm` 18,
 `.xlsb` 21, `.ods` 16). Files download into gitignored `local/public-corpus`; this repo
@@ -209,11 +334,16 @@ of scope.)
 
 ## Stability
 
-Pre-1.0: the API may change in minor releases until it settles; pin a version if
-that matters to you. One deliberate design choice to be aware of: a single model
-serves **both reading and authoring**. Most layout setters (`freeze_panes`,
-`set_col_width`, styles) are *authoring inputs* the reader does not populate.
-The reader does surface **merged ranges** (`Sheet::merged_ranges()`),
+Version 0.1.2 is the 1.0 compatibility candidate. Its public API and documented
+semantics target a zero-breaking-change transition to 1.0; additive APIs and
+`#[non_exhaustive]` variants may still be introduced. Pin 0.1.2 during the
+observation period if an application requires an exact dependency graph. One
+deliberate design choice to be aware of: a single model serves **both reading
+and authoring**. Readers populate the documented cross-format subset of layout,
+style, and view metadata, but this is not a promise that every authoring setter
+is reconstructed as a complete writer template; see the
+[reader-fidelity matrix](docs/READER_FIDELITY.md). The reader also surfaces
+**merged ranges** (`Sheet::merged_ranges()`),
 from `.xls MERGECELLS` / `.xlsx <mergeCells>`) and best-effort formula text for
 `.xlsx`, `.xls`, `.xlsb`, and `.ods` (`Cell::Formula`, with the cached value
 retained). Read-discovered merges are tracked separately from authoring merges
@@ -276,36 +406,31 @@ serials can be converted to `chrono::Duration` via
 callers want calamine-style typed access without choosing the workbook date
 system yet.
 
-## Roadmap
+## 0.1.2 candidate status
 
-- [x] BIFF5/7 (`Book` stream) codepage strings (cp949 etc.) via `CODEPAGE`
-- [x] `RSTRING` rich-text cells; `FILEPASS` encryption detection
-- [x] Number-format aware rendering (dates `yyyy-mm-dd`, percentages) via
-      `XF` + `FORMAT` + `DATEMODE`
-- [x] ODS percentage/time fallback display text when no `<text:p>` display text
-      is present
-- [x] BIFF5/7 record path validated on real reference files (xlrd as oracle)
-- [x] Embedded chart/pivot substreams handled by BOF/EOF depth (no sheet desync)
-- [x] Tolerant CFB fallback for non-spec OLE2 directories the `cfb` crate rejects
-- [x] `.xlsx` implicit cell positions (`r`-less cells/rows); shared-string OOM cap
-- [x] Mutation and libFuzzer targets for parsing, authoring, and editing
-- [x] `LABEL`/`RSTRING`/`STRING` records that span `CONTINUE` (no truncation)
-- [x] Merged-range read (`.xls MERGECELLS` / `.xlsx <mergeCells>`) via
-      `Sheet::merged_ranges()`; `.xlsx` formula text via `Cell::Formula`
-- [ ] A real Korean (cp949) BIFF5 corpus file to validate that path directly
-- [x] Elapsed-time formats (`[h]:mm`) rendered as total hours; `BOOLERR` cells
-- [x] XOR (Method 1) decryption for default-password workbooks
-- [x] `.xlsb` (BIFF12 binary) reader via the `xlsb` feature (validated vs `pyxlsb`)
-- [x] `.ods` (OpenDocument) reader via the `ods` feature (validated with a
-      bounded ODF XML visible-text oracle)
-- [x] `.xls` formula-token (Ptg) decompilation → `Cell::Formula` source text
-- [x] `.xlsb` 1904 date-system detection via `BrtWbProp`
-- [x] Writer rich strings / comments; `.xls` formula-string follower records
-- [x] `.xlsb` `BrtFmlaString` cached string formula records
-- [x] Signal partial extraction via `Workbook::is_partial()` /
-      `Workbook::text_truncated` when the `MAX_TEXT_BYTES` cap is hit
-- [x] Optional `serde` helpers for typed row deserialization from worksheet ranges
-- [x] Optional `chrono` helpers for Excel date serials and date cells
+The local implementation and evidence scope is complete:
+
+- BIFF/XLSB formula source, external-name provenance, shared/array formulas,
+  and deterministic evaluation have independent source and cached-value tests.
+- Reader fidelity, codepage, metadata, and explicit loss boundaries are frozen
+  in [`docs/READER_FIDELITY.md`](docs/READER_FIDELITY.md).
+- Package-preserving XLSX/XLSM editing covers the declared cell, sheet,
+  transaction, merge, layout, note, hyperlink, validation, table-resize, and
+  atomic-save surface in [`EDITING-CONTRACT.md`](EDITING-CONTRACT.md).
+- Output, CLI/JSON, API/SemVer, MSRV, WASM packaging, security, fuzz,
+  performance, package, SBOM, and public-corpus evidence gates are implemented
+  and have local evidence.
+- Strict invalid-edit rejection, authored/edited XLSX and edited XLSM
+  LibreOffice smokes, same-SHA performance reproducibility comparison, and
+  exact-SHA tag attestation enforcement are covered locally.
+
+Publication is operationally gated on one immutable candidate commit, two clean
+hosted candidates, `v0.1.2`, crate publication, the npm-compatible WASM archive
+as a GitHub asset, and verification of crates.io, docs.rs, assets, and
+checksums, including install-and-execute verification of the downloaded WASM
+archive through Node package resolution and a real browser. The authoritative
+checklist and local-versus-external evidence rules are in
+[`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
 
 ## Contributing
 

@@ -268,6 +268,7 @@ impl Package {
 
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
             .map_err(|_| Error::Zip("not a valid spreadsheet ZIP container"))?;
+        crate::ziputil::validate_compression(&mut zip)?;
         if zip.len() > max_entries() {
             return Err(Error::Zip("OOXML package has too many entries"));
         }
@@ -560,7 +561,11 @@ impl Package {
     /// the `order` field doc); [`Package::to_bytes`] skips it there.
     pub(crate) fn remove_part(&mut self, name: &str) -> Option<String> {
         let key = self.find_part_key(name)?.clone();
+        self.touched.insert(key.clone());
         self.parts.remove(&key);
+        if is_rels_part(&key) {
+            self.rels.remove(&key);
+        }
         Some(key)
     }
 
@@ -663,6 +668,54 @@ impl Package {
         self.regen_content_types();
     }
 
+    /// Remove the exact part-name override for `part`, if present, from both
+    /// the parsed content-type view and the retained XML part. Defaults are
+    /// deliberately preserved because they may type unrelated package parts.
+    pub(crate) fn remove_content_type(&mut self, part: &str) -> Result<bool> {
+        let part_name = override_part_name(part);
+        let old_len = self.ctypes.overrides.len();
+        self.ctypes
+            .overrides
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(&part_name));
+        let removed_cached = self.ctypes.overrides.len() != old_len;
+
+        let Some(key) = self.find_part_key(CONTENT_TYPES).cloned() else {
+            return Ok(removed_cached);
+        };
+        if !matches!(self.parts.get(&key), Some(Part::Xml(_))) {
+            if removed_cached {
+                self.regen_content_types();
+            }
+            return Ok(removed_cached);
+        }
+
+        let mut removed_live = false;
+        if let Some(Part::Xml(tree)) = self.parts.get_mut(&key) {
+            if let Some(root) = tree.root_element() {
+                let matches: Vec<NodeId> = tree
+                    .children_of(root)
+                    .iter()
+                    .copied()
+                    .filter(|&node| {
+                        tree.element_name(node)
+                            .is_some_and(|name| local_name(name).eq_ignore_ascii_case(b"Override"))
+                            && tree.attr_value(node, b"PartName").is_some_and(|value| {
+                                String::from_utf8_lossy(value).eq_ignore_ascii_case(&part_name)
+                            })
+                    })
+                    .collect();
+                for node in matches {
+                    tree.remove_child(root, node)?;
+                    removed_live = true;
+                }
+            }
+        }
+        if removed_live {
+            self.touched.insert(key);
+        }
+        Ok(removed_cached || removed_live)
+    }
+
     /// Resolve an internal relationship target against `src_part`'s directory
     /// and normalize dot segments to a canonical package part name (no
     /// leading slash) suitable for [`Package::has_part`] lookup.
@@ -727,6 +780,34 @@ impl Package {
             .unwrap_or(&[])
     }
 
+    /// Snapshot every parsed relationship together with its source part.
+    /// The package root is represented by an empty source string. Entries are
+    /// sorted so dependency planning remains deterministic even though the
+    /// internal maps are hash-based.
+    pub(crate) fn relationship_entries(&self) -> Vec<(String, Rel)> {
+        let mut entries = Vec::new();
+        for (rels_path, relationships) in &self.rels {
+            let Some(source) = source_part_of_rels_path(rels_path) else {
+                continue;
+            };
+            entries.extend(
+                relationships
+                    .iter()
+                    .cloned()
+                    .map(|relationship| (source.clone(), relationship)),
+            );
+        }
+        entries.sort_by(|left, right| {
+            (&left.0, &left.1.id, &left.1.rel_type, &left.1.target).cmp(&(
+                &right.0,
+                &right.1.id,
+                &right.1.rel_type,
+                &right.1.target,
+            ))
+        });
+        entries
+    }
+
     /// Add a new relationship from `src_part` to `target` (an internal
     /// package part name, or an external URI when `external` is `true`),
     /// allocating a fresh `rId`. Regenerates `src_part`'s `.rels` XML and
@@ -752,6 +833,108 @@ impl Package {
         });
         self.regen_rels(&rels_path);
         rid
+    }
+
+    /// Remove every relationship with the exact opaque `id` from
+    /// `src_part`'s relationship part, keeping the parsed cache and a
+    /// previously promoted live XML tree synchronized.
+    pub(crate) fn remove_relationship(&mut self, src_part: &str, id: &str) -> Result<bool> {
+        let rels_path = Self::rels_path_of(src_part);
+        let removed_cached = self.rels.get_mut(&rels_path).is_some_and(|rels| {
+            let old_len = rels.len();
+            rels.retain(|rel| rel.id != id);
+            rels.len() != old_len
+        });
+
+        let Some(key) = self.find_part_key(&rels_path).cloned() else {
+            return Ok(removed_cached);
+        };
+        if !matches!(self.parts.get(&key), Some(Part::Xml(_))) {
+            if removed_cached {
+                self.regen_rels(&rels_path);
+            }
+            return Ok(removed_cached);
+        }
+
+        let mut removed_live = false;
+        if let Some(Part::Xml(tree)) = self.parts.get_mut(&key) {
+            if let Some(root) = tree.root_element() {
+                let matches: Vec<NodeId> = tree
+                    .children_of(root)
+                    .iter()
+                    .copied()
+                    .filter(|&node| {
+                        tree.element_name(node).is_some_and(|name| {
+                            local_name(name).eq_ignore_ascii_case(b"Relationship")
+                        }) && tree.attr_value(node, b"Id") == Some(id.as_bytes())
+                    })
+                    .collect();
+                for node in matches {
+                    tree.remove_child(root, node)?;
+                    removed_live = true;
+                }
+            }
+        }
+        if removed_live {
+            self.touched.insert(key);
+            if self.ct_rels_injected {
+                self.regen_content_types();
+            }
+        }
+        Ok(removed_cached || removed_live)
+    }
+
+    /// Update an existing relationship's target and external mode without
+    /// reallocating its opaque id. Keeps the parsed cache and any promoted
+    /// live `.rels` tree synchronized.
+    pub(crate) fn update_relationship_target(
+        &mut self,
+        src_part: &str,
+        id: &str,
+        target: &str,
+        external: bool,
+    ) -> Result<bool> {
+        let rels_path = Self::rels_path_of(src_part);
+        let Some(relationship) = self
+            .rels
+            .get_mut(&rels_path)
+            .and_then(|relationships| relationships.iter_mut().find(|rel| rel.id == id))
+        else {
+            return Ok(false);
+        };
+        if relationship.target == target && relationship.external == external {
+            return Ok(true);
+        }
+        relationship.target = target.to_string();
+        relationship.external = external;
+
+        let Some(key) = self.find_part_key(&rels_path).cloned() else {
+            return Ok(false);
+        };
+        if !matches!(self.parts.get(&key), Some(Part::Xml(_))) {
+            self.regen_rels(&rels_path);
+            return Ok(true);
+        }
+        if let Some(Part::Xml(tree)) = self.parts.get_mut(&key) {
+            let Some(root) = tree.root_element() else {
+                return Ok(false);
+            };
+            let Some(node) = tree.children_of(root).iter().copied().find(|&node| {
+                tree.element_name(node)
+                    .is_some_and(|name| local_name(name).eq_ignore_ascii_case(b"Relationship"))
+                    && tree.attr_value(node, b"Id") == Some(id.as_bytes())
+            }) else {
+                return Ok(false);
+            };
+            tree.set_attr(node, b"Target", target.as_bytes())?;
+            if external {
+                tree.set_attr(node, b"TargetMode", b"External")?;
+            } else {
+                tree.remove_attr(node, b"TargetMode");
+            }
+        }
+        self.touched.insert(key);
+        Ok(true)
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
@@ -1938,6 +2121,37 @@ mod tests {
             rels.iter().any(|r| r.id == rid),
             "the add_relationship-added relationship must also be present, got {rels:?}"
         );
+    }
+
+    #[test]
+    fn update_relationship_target_keeps_promoted_tree_and_cache_in_sync() {
+        let mut package = Package::from_bytes(&minimal_xlsx()).unwrap();
+        let tree = package.part_tree_mut("_rels/.rels").unwrap();
+        let root = tree.root_element().unwrap();
+        let relationship = tree
+            .children_of(root)
+            .iter()
+            .copied()
+            .find(|&node| tree.attr_value(node, b"Id") == Some(b"rId1"))
+            .unwrap();
+        tree.set_attr(relationship, b"Custom", b"preserved")
+            .unwrap();
+
+        assert!(package
+            .update_relationship_target("", "rId1", "https://example.com/book", true)
+            .unwrap());
+        let live = package.part_tree_ref("_rels/.rels").unwrap().serialize();
+        let live = String::from_utf8(live).unwrap();
+        assert!(live.contains(r#"Custom="preserved""#));
+        assert!(live.contains(r#"Target="https://example.com/book""#));
+        assert!(live.contains(r#"TargetMode="External""#));
+
+        let bytes = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&bytes).unwrap();
+        let relationship = &reread.relationships_of("")[0];
+        assert_eq!(relationship.id, "rId1");
+        assert_eq!(relationship.target, "https://example.com/book");
+        assert!(relationship.external);
     }
 
     #[test]

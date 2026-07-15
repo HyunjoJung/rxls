@@ -1,0 +1,335 @@
+{
+  "default_outcome": "open",
+  "rejects": [
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/35897-type4.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/50833.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/51832.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "test-data/spreadsheet/58616.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/60284.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/61300.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/64130.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/cf9f845e73447b092477d0472402a5baea4b8c9f.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIFuzzer-5040805309710336.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-4651309315719168.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-4657005060816896.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-4734163573080064.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-4819588401201152.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-5175219985448960.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-5786329142919168.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-5816431116615680.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-5889658057523200.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-6137883240824832.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-6322470200934400.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-6483562584932352.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "ole2_signature_corrupt_container",
+      "kind": "invalid_cfb",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIHSSFFuzzer-6537773940867072.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-4828727001088000.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-5089447305609216.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-5185049589579776.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-6123461607817216.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-6419366255919104.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-POIXSSFFuzzer-6448258963341312.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-XLSX2CSVFuzzer-5025401116950528.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-XLSX2CSVFuzzer-5542865479270400.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-XLSX2CSVFuzzer-5636439151607808.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-XLSX2CSVFuzzer-6504225896792064.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/clusterfuzz-testcase-minimized-XLSX2CSVFuzzer-6594557414080512.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/crash-274d6342e4842d61be0fb48eaadad6208ae767ae.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "test-data/spreadsheet/crash-9bf3cd4bd6f50a8a9339d363c2c7af14b536865c.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_corrupt_container",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/deep-data.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/password.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "test-data/spreadsheet/protected_passtika.xlsb",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "test-data/spreadsheet/protected_passtika.xlsx",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_container",
+      "evidence": "zip_signature_misleading_extension",
+      "kind": "invalid_zip",
+      "path": "test-data/spreadsheet/rde.imf.ru_sites_default_files_rde_documents_vodootvedenie_2020.xlsb.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_legacy_biff",
+      "evidence": "parser_or_support_classification",
+      "kind": "legacy_biff",
+      "path": "test-data/spreadsheet/testEXCEL_3.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_legacy_biff",
+      "evidence": "parser_or_support_classification",
+      "kind": "legacy_biff",
+      "path": "test-data/spreadsheet/testEXCEL_4.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "test-data/spreadsheet/xor-encryption-abc.xls",
+      "source": "apache-poi"
+    },
+    {
+      "decision": "excluded_malformed_workbook",
+      "evidence": "biff_structure_invalid",
+      "kind": "malformed_biff",
+      "path": "tests/OOM_alloc3.xls",
+      "source": "calamine"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "ole2_encrypted_workbook",
+      "kind": "unsupported_encrypted_workbook",
+      "path": "tests/issue_385.xls",
+      "source": "calamine"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_opendocument_package",
+      "kind": "unsupported_encrypted_opendocument",
+      "path": "tests/pass_protected.ods",
+      "source": "calamine"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "tests/pass_protected.xlsb",
+      "source": "calamine"
+    },
+    {
+      "decision": "unsupported_encrypted",
+      "evidence": "encrypted_ooxml_package",
+      "kind": "unsupported_encrypted_ooxml",
+      "path": "tests/pass_protected.xlsx",
+      "source": "calamine"
+    }
+  ],
+  "schema": "rxls.public-corpus-expectations.v1"
+}

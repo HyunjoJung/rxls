@@ -705,7 +705,8 @@ class XlsxOpenpyxlParityTests(unittest.TestCase):
                 text=True,
             )
 
-            self.assertIn(f"manifest: {manifest_path}", output.stdout)
+            self.assertIn("manifest: manifest.json", output.stdout)
+            self.assertNotIn(str(base), output.stdout)
             self.assertIn("files: 1", output.stdout)
             self.assertIn("rxls extracted: 1", output.stdout)
             self.assertIn("openpyxl-unreadable: 0", output.stdout)

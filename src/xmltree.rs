@@ -448,6 +448,16 @@ impl XmlTree {
         }
     }
 
+    /// An element's ordered decoded attribute pairs, or `None` for a
+    /// non-element node. Structural editors use this to split a range-shaped
+    /// element while retaining attributes they do not interpret.
+    pub(crate) fn attributes(&self, id: NodeId) -> Option<&[(Vec<u8>, Vec<u8>)]> {
+        match &self.nodes[id.0 as usize].node {
+            Node::Element { attrs, .. } => Some(attrs.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Concatenated text of every `Text`/CDATA descendant of `id` (lossy UTF-8).
     pub(crate) fn text_of(&self, id: NodeId) -> String {
         let mut out = String::new();

@@ -3,13 +3,49 @@
 from __future__ import annotations
 
 import glob
+import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 from pathlib import Path
 from typing import Iterable
 
 
 READY_STATUSES = {"cached", "downloaded"}
+
+
+def manifest_sha256(manifest_path: str | os.PathLike[str]) -> str:
+    """Return the SHA-256 of the exact manifest bytes consumed by a run."""
+    digest = hashlib.sha256()
+    with open(manifest_path, "rb") as manifest:
+        for chunk in iter(lambda: manifest.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def emit_parity_provenance(
+    manifest_path: str | os.PathLike[str] | None,
+    *,
+    oracle_reader: str,
+    package_distribution: str | None = None,
+) -> None:
+    """Print deterministic input identity and the installed oracle version."""
+    if package_distribution is None:
+        oracle_version = f"python-{platform.python_version()}"
+    else:
+        try:
+            oracle_version = importlib.metadata.version(package_distribution)
+        except importlib.metadata.PackageNotFoundError:
+            oracle_version = "unavailable"
+    if manifest_path and os.path.isfile(manifest_path):
+        manifest_digest = manifest_sha256(manifest_path)
+    elif manifest_path:
+        manifest_digest = "unavailable"
+    else:
+        manifest_digest = "none"
+    print(f"provenance: oracle_reader={oracle_reader} oracle_version={oracle_version}")
+    print(f"provenance: input_manifest_sha256={manifest_digest}")
 
 
 def resolve_binary(binary: str) -> str:
@@ -18,6 +54,58 @@ def resolve_binary(binary: str) -> str:
     if not os.path.exists(path) and os.path.exists(path + ".exe"):
         return path + ".exe"
     return path
+
+
+def report_source_root(
+    manifest_path: str | os.PathLike[str] | None,
+    corpus_path: str | os.PathLike[str] | None,
+) -> str | None:
+    """Return the source root used to make report paths machine-independent."""
+    if manifest_path:
+        return os.path.dirname(os.path.abspath(os.fspath(manifest_path)))
+    if corpus_path:
+        return os.path.abspath(os.fspath(corpus_path))
+    return None
+
+
+def report_path(
+    path: str | os.PathLike[str], source_root: str | os.PathLike[str] | None = None
+) -> str:
+    """Render a path without serializing a checkout or runner home directory."""
+    resolved = Path(path).resolve()
+    for root, prefix in ((source_root, "corpus"), (Path.cwd().resolve(), None)):
+        if root is None:
+            continue
+        try:
+            relative = resolved.relative_to(Path(root).resolve())
+        except ValueError:
+            continue
+        if prefix is not None:
+            relative = Path(prefix) / relative
+        return relative.as_posix()
+    return resolved.name
+
+
+def report_reason(
+    reason: str,
+    path: str | os.PathLike[str],
+    source_root: str | os.PathLike[str] | None = None,
+) -> str:
+    """Replace a selected file's machine path if an oracle repeats it in an error."""
+    replacement = report_path(path, source_root)
+    raw = os.fspath(path)
+    variants = {
+        raw,
+        os.path.abspath(raw),
+        raw.replace("\\", "/"),
+        raw.replace("/", "\\"),
+        os.path.abspath(raw).replace("\\", "/"),
+        os.path.abspath(raw).replace("/", "\\"),
+    }
+    for variant in sorted(variants, key=len, reverse=True):
+        if variant:
+            reason = reason.replace(variant, replacement)
+    return reason
 
 
 def entry_path(manifest_path: str | os.PathLike[str], entry: dict) -> str | None:

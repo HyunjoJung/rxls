@@ -37,6 +37,38 @@
     }
   },
   {
+    "path": "tests/fixtures/xls/korean-cp949-biff5.xls",
+    "format": "xls",
+    "source": "Apache POI 15556.xls, reduced and converted in-repository",
+    "license": "Apache-2.0",
+    "sha256": "74e587a499c8d4ac044dd2424bb144cc454a66396e98c89adf9dd06800d0c375",
+    "covers": [
+      "cfb_package",
+      "biff5",
+      "book_stream",
+      "codepage_949",
+      "korean_text"
+    ],
+    "oracle": {
+      "sheets": 1,
+      "cells": 4,
+      "defined_names": 0,
+      "hidden_sheets": 0,
+      "merged_ranges": 0,
+      "hyperlinks": 0,
+      "comments": 0,
+      "tables": 0,
+      "data_validations": 0,
+      "autofilters": 0,
+      "page_setups": 0,
+      "images": 0,
+      "sheet_views": 0,
+      "tab_colors": 0,
+      "print_options": 0,
+      "sparklines": 0
+    }
+  },
+  {
     "path": "tests/fixtures/xlsx/reader-structural.xlsx",
     "format": "xlsx",
     "source": "generated in-repository",

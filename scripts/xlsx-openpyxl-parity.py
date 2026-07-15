@@ -50,7 +50,15 @@ import sys
 import zipfile
 from xml.etree import ElementTree as ET
 
-from public_corpus_manifest import corpus_files, manifest_files, resolve_binary
+from public_corpus_manifest import (
+    corpus_files,
+    emit_parity_provenance,
+    manifest_files,
+    report_path,
+    report_reason,
+    report_source_root,
+    resolve_binary,
+)
 
 
 class OversizedWorksheet(Exception):
@@ -652,12 +660,17 @@ def main():
     ap.add_argument("--min", type=float, default=0.95)
     args = ap.parse_args()
 
+    emit_parity_provenance(
+        args.manifest, oracle_reader="openpyxl", package_distribution="openpyxl"
+    )
+
     binary = resolve_binary(args.bin)
+    source_root = report_source_root(args.manifest, args.corpus)
     corpus_failures = parse_corpus_report(args.corpus_report) if args.corpus_report else []
 
     if args.manifest:
         files = manifest_files(args.manifest, {".xlsx", ".xlsm"}, args.limit)
-        print(f"manifest: {args.manifest}")
+        print(f"manifest: {report_path(args.manifest)}")
     else:
         files = corpus_files(args.corpus, {".xlsx", ".xlsm"}, args.limit)
 
@@ -785,7 +798,7 @@ def main():
     for corpus_kind, count in sorted(by_skip_corpus_kind.items()):
         print(f"by_skip_corpus_kind: {corpus_kind} skipped={count}")
     for ratio, path in sorted(comparisons)[: max(0, args.show_worst)]:
-        print(f"low-parity: {ratio:.3f} {path}")
+        print(f"low-parity: {ratio:.3f} {report_path(path, source_root)}")
     for kind, path, reason in skips[: max(0, args.show_skips)]:
         decision, evidence, corpus_kind = skip_classification(
             kind, reason, path=path, corpus_failures=corpus_failures
@@ -793,7 +806,8 @@ def main():
         corpus_part = f" corpus_kind={corpus_kind}" if corpus_kind else ""
         print(
             f"skip: kind={kind} decision={decision} evidence={evidence}{corpus_part} "
-            f"path={path} reason={_one_line(reason)}"
+            f"path={report_path(path, source_root)} "
+            f"reason={_one_line(report_reason(reason, path, source_root))}"
         )
     print(f"(note: {opx_failed} files openpyxl could not read were extracted by rxls - robustness edge)")
     sys.exit(0 if mean >= args.min else 1)
