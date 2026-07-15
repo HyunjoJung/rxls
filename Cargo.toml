@@ -13,7 +13,14 @@ readme = "README.md"
 authors = ["Hyunjo Jung <j96263732@gmail.com>"]
 keywords = ["xls", "xlsx", "excel", "spreadsheet", "ole2"]
 categories = ["parser-implementations", "text-processing", "localization"]
-exclude = [".github/", "bindings/", "fuzz/", "oss-fuzz/"]
+exclude = [
+    ".github/",
+    "bindings/",
+    "fuzz/",
+    "oss-fuzz/",
+    "MIGRATION-*.md",
+    "ROADMAP-*.md",
+]
 
 [package.metadata.docs.rs]
 all-features = true

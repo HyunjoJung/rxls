@@ -216,6 +216,5 @@ that save, and accepts only the expected macro warning. The hosted runner's
 captured version is authoritative for hosted evidence; no fixed hosted
 LibreOffice version is claimed.
 
-Microsoft Excel desktop validation has not been claimed. Hosted and publication
-gates remain tracked in
-[`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+Microsoft Excel desktop validation has not been claimed. The completed hosted
+and publication gates are recorded in [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).

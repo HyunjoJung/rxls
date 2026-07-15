@@ -1,22 +1,24 @@
 # Rust public API inventory and compatibility policy
 
-This is the rxls 0.1.2 API-freeze baseline and the compatibility policy for the
-path to 1.0.0. The target breaking delta is **zero**. Any exception requires an
-explicit release note, migration path, and approval before 1.0.
+This is the rxls 0.1.2 API-freeze baseline and SemVer compatibility policy.
+No current public item is planned for breaking removal or rename. Any breaking
+change requires an explicit release note, migration path, and major-version
+review.
 
 ## Classification
 
-- **Frozen**: retained through 1.x with the same path and compatible semantics.
+- **Frozen**: retained across compatible releases with the same path and
+  compatible semantics.
 - **Extensible**: retained, but marked `#[non_exhaustive]`; callers must include
   a wildcard when matching or use constructors instead of struct literals.
-- **Compatibility alias**: retained through 1.x, but new code should prefer the
-  canonical type named below.
+- **Compatibility alias**: retained across compatible releases, but new code
+  should prefer the canonical type named below.
 - **Feature-gated**: frozen whenever its documented Cargo feature is enabled.
 
 Every publicly reachable inherent method, trait method, associated function,
 and public field on a type listed below inherits that type's classification
 unless a row says otherwise. No current public item is classified for removal
-or privatization, and there are no planned 1.0 renames or deprecations.
+or privatization, and there are no planned renames or deprecations.
 
 ## Root inventory
 
@@ -140,7 +142,7 @@ features deliberately expose their respective types and therefore pin those
 major-version compatibility boundaries. ZIP, XML, CFB, encoding, and error
 implementation crates are not exposed in public signatures.
 
-For 1.x:
+For compatible releases:
 
 1. Additive methods, trait implementations, and non-exhaustive variants are
    permitted in minor releases.
@@ -150,7 +152,7 @@ For 1.x:
    least one minor release; removal waits for the next major release.
 4. Feature removal, MSRV increases, coordinate changes, alias removal, and
    dependency major changes visible in signatures are breaking changes.
-5. The planned 1.0.0 breaking-change list is currently **empty**.
+5. No current public item is planned for breaking removal or rename.
 
 ## API-diff automation status
 

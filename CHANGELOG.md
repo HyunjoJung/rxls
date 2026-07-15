@@ -6,15 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The `0.1.2` entry below is the prepared release candidate. It is not tagged or
-published until both clean hosted candidates and the final Go/No-Go gate pass.
+No unreleased changes are recorded yet.
 
-## [0.1.2] - Unreleased candidate
+## [0.1.2] - 2026-07-16
 
-This release is the near-1.0 compatibility candidate described in
-[`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md). It deliberately combines the remaining
-correctness, editing, runtime, security, and release-engineering work into one
-large release.
+This release combines the remaining correctness, editing, runtime, security,
+and release-engineering work into one large release. Its completed evidence
+checklist is recorded in [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
 
 ### Added
 
@@ -62,7 +60,7 @@ large release.
 - Consolidated the pinned 916-file corpus baseline at 869 successful opens and
   47 classified rejections, with zero unexpected failures or accepts; parity
   reports now bind the exact manifest digest and installed oracle versions.
-- Made output, feature, MSRV, unsupported-input, and 0.1.2-to-1.0 compatibility
+- Made output, feature, MSRV, unsupported-input, and SemVer compatibility
   policies explicit and regression-tested.
 - Made successful CLI help stdout-only while invalid usage remains stderr-only,
   and added an isolated exact-crate consumer plus `cargo install` smoke for

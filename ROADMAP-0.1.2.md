@@ -1,16 +1,15 @@
-# rxls 0.1.2 → 1.0 Candidate Roadmap
+# rxls 0.1.2 Release Roadmap
 
-> Ship `0.1.2` as one unusually large release whose behavior, compatibility,
-> evidence, and operational safety are already close to a `1.0.0` candidate.
+> Ship `0.1.2` as one unusually large release with documented behavior,
+> compatibility, evidence, and operational safety.
 
 | Field | Value |
 | --- | --- |
-| Status | `0.1.2` published; `1.0.0` observation active |
+| Status | Completed and published |
 | Target | `0.1.2` |
 | Baseline date | 2026-07-15 |
 | Original estimate | 30–45 solo development days, about eight weeks |
 | Public-release policy | No intermediate crates.io release; integrate once into `0.1.2` |
-| Next public version | A low-change `1.0.0` after a 2–4 week observation period |
 
 ## 1. Goal
 
@@ -20,18 +19,20 @@
 - Formula source recovery and deterministic evaluation are tested independently from cached values.
 - `.xlsx`/`.xlsm` editing preserves untouched package content and safely supports declared structural edits.
 - XLSX authoring, CSV/HTML/Markdown export, CLI diagnostics, JSON, and WASM share the same semantics.
-- Public Rust APIs, features, errors, CLI behavior, and JSON contracts are stable enough to carry into `1.0`.
+- Public Rust APIs, features, errors, CLI behavior, and JSON contracts have an
+  explicit compatibility policy.
 - Corpus parity, fuzzing, security, resource, performance, package, and release evidence are reproducible.
 - `0.1.3` is reserved for security, data-loss, broad compatibility, or release-asset defects.
 
-“Nearly 1.0” means documented boundaries, explicit failure instead of silent wrong results, a credible compatibility promise, and reviewable evidence—not merely a large feature count.
+“Release-grade” means documented boundaries, explicit failure instead of silent
+wrong results, a credible compatibility policy, and reviewable evidence—not
+merely a large feature count.
 
 ## 2. Status and evidence rules
 
 - `[x]` means the requirement is proven by current local, hosted, registry, or
   external-consumer evidence as appropriate to its scope.
-- `[ ]` means either an implementation or evidence gap remains, or a stated
-  observation interval has not elapsed.
+- `[ ]` means an implementation or evidence gap remains.
 - A configured workflow is local evidence that the gate exists; it is not evidence that the hosted gate passed.
 - Checked-in corpus summaries are frozen metadata, not a substitute for rerunning the live 916-file corpus on the release commit.
 - No milestone is release-complete while one of its completion criteria remains unchecked.
@@ -51,8 +52,7 @@
 - The canonical local gate passes 651 library, 2 binary, 3 API-contract, 45 CLI, 149 integration, 6 rustdoc, and 150 Python tests.
 - Exact-SHA CI and CodeQL, two clean release-candidate runs, the tag publication
   workflow, the 47-file GitHub Release, crates.io publication, docs.rs, and
-  post-publication native/WASM consumer smokes passed for `0.1.2`. Only the
-  explicitly listed 2–4 week `1.0.0` observation criteria remain open.
+  post-publication native/WASM consumer smokes passed for `0.1.2`.
 
 ## 3. Release strategy and change control
 
@@ -61,8 +61,6 @@
 - Do not publish alpha, beta, or RC crates.
 - Produce numbered internal candidates only as CI artifacts.
 - Tag one fully qualified commit as `v0.1.2`.
-- Observe `0.1.2` for at least two weeks, preferably four.
-- Prepare `1.0.0` without feature churn if no unresolved P0/P1 issue appears.
 - Permit `0.1.3` only for security, data loss, broad open failures, or defective release assets.
 
 ### 3.2 Merge rules
@@ -260,11 +258,12 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] `OUTPUT-CONTRACTS.md` defines future change rules.
 - [x] The available local LibreOffice runtime smoke passes; the release workflow repeats it on the hosted runner.
 
-### M6. Rust API freeze and 1.0 compatibility design
+### M6. Rust API freeze and compatibility design
 
 **Original estimate:** 4–6 days. **Depends on:** public model decisions from M1–M5.
 
-**Purpose:** make the expected `0.1.2 → 1.0.0` breaking delta zero.
+**Purpose:** make the `0.1.2` public contract explicit and keep compatible
+updates additive.
 
 #### Work
 
@@ -281,14 +280,14 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] Audit public dependency exposure and visible major-version boundaries.
 - [x] Add a compile-checked create/read/inspect/evaluate/export/diagnose/edit/reopen journey.
 - [x] Finish a machine-enforced `Errors`/`Panics`/`Examples` rustdoc audit for the declared ten-entry principal API inventory; cover every other public signature with warning-free rustdoc and the API snapshot.
-- [x] Record the planned `1.0.0` breaking-change list as empty.
+- [x] Record that no current public item is planned for removal or breaking rename.
 
 #### Completion criteria
 
 - [x] The checked-in public API inventory has no unclassified listed area.
 - [x] Generate and check a machine-readable semver/API-diff baseline.
 - [x] Compile every documented journey and supported feature combination in hosted CI. **External**
-- [x] The current compatibility design lists zero expected `1.0.0` breaking changes.
+- [x] The current compatibility design lists no planned removal or breaking rename.
 
 ### M7. WASM runtime and distribution
 
@@ -319,7 +318,7 @@ Unsupported content should remain readable or preservable where safe, with an ex
 
 **Original estimate:** 3–5 days. **Depends on:** stable input paths from M1–M7.
 
-**Purpose:** bound operational risk for a 1.0 candidate.
+**Purpose:** bound operational risk for the release candidate.
 
 #### Work
 
@@ -376,13 +375,11 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] GitHub Release contains every promised artifact and checksum. **External**
 - [x] README, changelog, support matrix, and generated evidence agree on the final tag. **External**
 
-### Release-candidate hardening — RHWP-grade product spine
+### Release-candidate product hardening
 
-This bounded pre-publication pass adopts the product qualities demonstrated by
-`rhwp` v0.7.18 without importing HWP-specific rendering, app, extension,
-binding, or internal-log scope. The current public roadmap and its API,
-editing, output, fidelity, performance, and migration contracts are
-authoritative; obsolete internal June/early-July planning assertions are not.
+This bounded pre-publication pass strengthens automation, fuzzing,
+distribution, browser verification, and installed-product evidence without
+expanding the declared spreadsheet semantics or product boundary.
 
 - [x] Pin every third-party workflow dependency to an immutable commit and
   enforce that rule with a repository policy test.
@@ -428,8 +425,8 @@ flowchart LR
     M4 --> M8
     M5 --> M8
     M7 --> M8
-    M6 --> RC["RHWP-grade RC hardening"]
-    M8 --> RC["RHWP-grade RC hardening"]
+    M6 --> RC["RC product hardening"]
+    M8 --> RC["RC product hardening"]
     M7 --> RC
     RC --> M9["M9 Release evidence"]
 ```
@@ -441,7 +438,7 @@ flowchart LR
 | 3 | M2 + M4 | Evaluation semantics and safe structural editing |
 | 4 | M5 + M6 + M7 | Frozen outputs/API and distributable WASM |
 | 5 | M8 | Fuzz, security, performance, and resource evidence |
-| 6 | RHWP-grade RC hardening | Immutable automation, seeded fuzz, real package/browser, and installed-product proof |
+| 6 | RC product hardening | Immutable automation, seeded fuzz, real package/browser, and installed-product proof |
 | 7 | M9 | Two clean candidates, final Go/No-Go, and `v0.1.2` |
 
 ## 7. Progress tracking
@@ -457,7 +454,7 @@ flowchart LR
 | M6 API freeze | Done | 100% | None |
 | M7 WASM | Done | 100% | None |
 | M8 Safety/performance | Done | 100% | None |
-| RHWP-grade RC hardening | Done | 100% | None |
+| RC product hardening | Done | 100% | None |
 | M9 Release evidence | Done | 100% | None |
 
 Status values are `Pending`, `Next`, `In progress`, `Blocked`, and `Done`. Completion criteria, not checkbox count, determine status.
@@ -483,7 +480,7 @@ Any unchecked item is a release No-Go.
 
 ### API and documentation
 
-- [x] The public API inventory targets zero `1.0` breaking changes.
+- [x] The public API inventory lists no planned removal or breaking rename.
 - [x] Local MSRV/default/no-default/all-feature gates pass.
 - [x] The principal API journey compiles and runs locally.
 - [x] Support, loss, fallback, output, and resource boundaries are documented.
@@ -516,15 +513,7 @@ Any unchecked item is a release No-Go.
 
 During RC, accept only P0/P1 fixes and their direct regressions. A P2 fix must be narrow and must not disturb the API freeze.
 
-## 10. Transition from `0.1.2` to `1.0.0`
-
-### Observation period
-
-- Duration: minimum two weeks, preferably four.
-- Collect: real-file failures, panic/timeout, wrong formulas, edit preservation, WASM installation, and API confusion.
-- Triage repeated reports by root cause, severity, and whether they fall inside the declared support boundary.
-
-### Allowed follow-up changes
+## 10. Post-release maintenance
 
 - Documentation and examples.
 - Clearer errors without contract changes.
@@ -532,20 +521,12 @@ During RC, accept only P0/P1 fixes and their direct regressions. A P2 fix must b
 - Internal refactoring and regression tests.
 - Emergency security, data-loss, or compatibility fixes.
 
-### `1.0.0` criteria
-
-- [ ] No unresolved P0/P1 remains after the observation period.
-- [ ] No `0.1.2` public API is removed or breaking-renamed.
-- [ ] Support, SemVer, and MSRV policies are final.
-- [ ] The `0.1.2` release gates pass again at equal or stronger thresholds.
-- [ ] Migration documentation can state that no required code change is expected.
-
 ## 11. Decision record
 
 | Date | Decision | Reason |
 | --- | --- | --- |
 | 2026-07-15 | Integrate without intermediate public releases | Minimize user update burden and release fragmentation |
-| 2026-07-15 | Treat `0.1.2` as a practical 1.0 candidate | Minimize later feature/API delta |
+| 2026-07-15 | Treat `0.1.2` as the compatibility baseline | Minimize later API and behavior churn |
 | 2026-07-15 | Test formula source independently from cached results | Cached values can hide decompiler defects |
 | 2026-07-15 | Require untouched-part preservation for editing | Prevent XLSX/XLSM collateral data loss |
 | 2026-07-15 | Keep writer scope at XLSX | Avoid unbounded schedule and validation growth |
@@ -553,8 +534,7 @@ During RC, accept only P0/P1 fixes and their direct regressions. A P2 fix must b
 | 2026-07-15 | Separate local evidence from hosted/publish evidence | Prevent configured workflows or frozen metadata from being mistaken for completed release gates |
 | 2026-07-15 | Exclude row/column insertion and deletion from `0.1.2` | Safe general dependency repair is not yet a supportable contract |
 | 2026-07-15 | Bundle a 120-second campaign for every fuzz target in the release workflow | Make tag-candidate fuzz evidence attributable and publishable with the other release evidence |
-| 2026-07-15 | Complete the bounded RHWP-grade product spine before publishing 0.1.2 | Close automation, fuzz, package/browser, and installed-product evidence without copying format-specific product sprawl |
-| 2026-07-15 | Treat this roadmap and the current public contracts as authoritative | The older internal PRD/TRD/ledger describe superseded MSRV, workflow, WASM, and capability states |
+| 2026-07-15 | Complete bounded product hardening before publishing 0.1.2 | Close automation, fuzz, package/browser, and installed-product evidence without expanding format scope |
 
 Record any scope change here with its alternative and schedule impact.
 
@@ -562,12 +542,12 @@ Record any scope change here with its alternative and schedule impact.
 
 The roadmap is complete only when all are true:
 
-- [x] Every M0–M9 task, completion criterion, and RHWP-grade RC-hardening item is closed.
+- [x] Every M0–M9 task, completion criterion, and RC-hardening item is closed.
 - [x] Every Go/No-Go item is checked.
 - [x] Corpus, formula, evaluation, editing, WASM, security, performance, and package evidence are assembled locally and wired into one hosted release bundle.
 - [x] Two clean candidates for the same tag commit succeed consecutively.
 - [x] `v0.1.2`, the crate, GitHub Release, documentation, SBOM, and checksums are public and consistent.
 - [x] Post-publication crate and downloaded-WASM Node/browser install/core smokes pass.
-- [x] Only observation/stabilization remains before `1.0.0`, with no required breaking change.
+- [x] The published release and its documented compatibility boundary are fully verified.
 
 Test volume, a few successful samples, or a local-only pass never substitutes for this definition.

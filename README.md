@@ -6,11 +6,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-> **Release status:** `v0.1.2` is published as the compatibility candidate for
-> `1.0.0`. The crate, tagged source, 47-file GitHub Release bundle, SBOM, and
-> checksums are bound to commit `33b4db17f2047febf9e6550299c3dde572afd6e5`.
-> The remaining observation criteria before `1.0.0` are tracked in
-> [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+> **Release status:** `v0.1.2` is published. The crate, tagged source, 47-file
+> GitHub Release bundle, SBOM, and checksums are bound to commit
+> `33b4db17f2047febf9e6550299c3dde572afd6e5`.
 
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
 **`.xlsb`**, and **`.ods`** into one typed cell model; writes styled **`.xlsx`**;
@@ -184,9 +182,8 @@ binary itself lives behind the `cli` feature (on by default, so existing
 native workflows are unaffected). Determinism, CSV safety options, diagnose JSON
 schema compatibility, CLI exit codes, and bounded-output guidance are defined in
 [`OUTPUT-CONTRACTS.md`](OUTPUT-CONTRACTS.md). The Rust API inventory, coordinate
-rules, feature guarantees, and 0.1.2-to-1.0 compatibility policy are in
-[`API-COMPATIBILITY.md`](API-COMPATIBILITY.md); the expected no-source-change
-upgrade is summarized in [`MIGRATION-1.0.md`](MIGRATION-1.0.md).
+rules, feature guarantees, and SemVer compatibility policy are in
+[`API-COMPATIBILITY.md`](API-COMPATIBILITY.md).
 
 The WASM distribution provides generated Node and browser entry points,
 TypeScript declarations, a minimal file-picker demo, structured `RxlsError`
@@ -334,12 +331,11 @@ of scope.)
 
 ## Stability
 
-Version 0.1.2 is the 1.0 compatibility candidate. Its public API and documented
-semantics target a zero-breaking-change transition to 1.0; additive APIs and
-`#[non_exhaustive]` variants may still be introduced. Pin 0.1.2 during the
-observation period if an application requires an exact dependency graph. One
-deliberate design choice to be aware of: a single model serves **both reading
-and authoring**. Readers populate the documented cross-format subset of layout,
+Version 0.1.2 defines the current public API and documented semantics. Compatible
+updates may add APIs and `#[non_exhaustive]` variants under the published SemVer
+policy; applications that require an exact dependency graph should pin an exact
+version. One deliberate design choice to be aware of: a single model serves
+**both reading and authoring**. Readers populate the documented cross-format subset of layout,
 style, and view metadata, but this is not a promise that every authoring setter
 is reconstructed as a complete writer template; see the
 [reader-fidelity matrix](docs/READER_FIDELITY.md). The reader also surfaces
@@ -428,9 +424,8 @@ Publication passed one immutable candidate commit, two clean hosted candidates,
 the attested `v0.1.2` tag, crates.io and docs.rs publication, and a verified
 47-file GitHub Release bundle containing the npm-compatible WASM archive.
 Post-publication checks installed the exact crate and downloaded WASM package,
-then executed the native, Node, and real-browser consumers. The authoritative
-checklist and remaining observation rules are in
-[`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+then executed the native, Node, and real-browser consumers. The completed
+release checklist is in [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
 
 ## Contributing
 
