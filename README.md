@@ -66,8 +66,8 @@ rxls compare before.xlsx after.xlsx --limit 50
 ```
 
 Successful `--help` and command output go to stdout. Usage and operational
-errors go to stderr with the stable exit classes documented in
-[`OUTPUT-CONTRACTS.md`](OUTPUT-CONTRACTS.md).
+errors go to stderr. Exit classifications and diagnose JSON schema evolution
+are compatibility-controlled public behavior.
 
 ## Cargo features
 
@@ -142,9 +142,9 @@ applications that also need styled `.xlsx` generation, package-preserving
 diagnostic surfaces. The public corpus results below describe `rxls`; they are
 not presented as a current head-to-head benchmark against another crate.
 
-Security/resource limits, absolute performance ceilings, and same-SHA
-reproducibility thresholds are defined in
-[`PERFORMANCE.md`](PERFORMANCE.md); release dependency policy is enforced by
+Parsing, export, editing, and WASM paths enforce bounded input, allocation, and
+output limits. Release gates enforce absolute performance ceilings and
+same-SHA reproducibility thresholds; dependency policy is enforced by
 `deny.toml`, CodeQL, fuzz smoke/scheduled jobs, and a deterministic CycloneDX
 dependency manifest.
 
@@ -167,9 +167,9 @@ merges; legacy notes; hyperlinks; exact-range validations; and safe bottom-row
 resizing of existing tables. Untouched declared parts round-trip byte-for-byte,
 including retained VBA content. `.xls`, `.xlsb`, `.ods`, and metadata-lossy
 OOXML packages are read-only through this API. The complete method-by-method
-atomicity, preservation, rejection, and explicit non-goal boundary is frozen in
-[`EDITING-CONTRACT.md`](EDITING-CONTRACT.md); notably, rxls does not insert or
-delete rows or columns or guess how to repair unsafe structural dependencies.
+atomicity, preservation, rejection, and explicit non-goal boundary is treated
+as compatibility-controlled behavior. Notably, rxls does not insert or delete
+rows or columns or guess how to repair unsafe structural dependencies.
 
 A worksheet can also be exported directly to **CSV**, **HTML**, or
 **Markdown** (`Sheet`/`Workbook::to_csv`/`to_html`/`to_markdown`), and a whole
@@ -180,10 +180,8 @@ direct CSV export). The portable adapter in `src/wasm.rs` is exposed to
 JavaScript by the isolated `bindings/wasm` `cdylib`; the native `rxls` CLI
 binary itself lives behind the `cli` feature (on by default, so existing
 native workflows are unaffected). Determinism, CSV safety options, diagnose JSON
-schema compatibility, CLI exit codes, and bounded-output guidance are defined in
-[`OUTPUT-CONTRACTS.md`](OUTPUT-CONTRACTS.md). The Rust API inventory, coordinate
-rules, feature guarantees, and SemVer compatibility policy are in
-[`API-COMPATIBILITY.md`](API-COMPATIBILITY.md).
+schema compatibility, CLI exit codes, public Rust APIs, coordinate rules,
+feature guarantees, and error semantics follow the crate's SemVer policy.
 
 The WASM distribution provides generated Node and browser entry points,
 TypeScript declarations, a minimal file-picker demo, structured `RxlsError`
@@ -337,8 +335,7 @@ policy; applications that require an exact dependency graph should pin an exact
 version. One deliberate design choice to be aware of: a single model serves
 **both reading and authoring**. Readers populate the documented cross-format subset of layout,
 style, and view metadata, but this is not a promise that every authoring setter
-is reconstructed as a complete writer template; see the
-[reader-fidelity matrix](docs/READER_FIDELITY.md). The reader also surfaces
+is reconstructed as a complete writer template. The reader also surfaces
 **merged ranges** (`Sheet::merged_ranges()`),
 from `.xls MERGECELLS` / `.xlsx <mergeCells>`) and best-effort formula text for
 `.xlsx`, `.xls`, `.xlsb`, and `.ods` (`Cell::Formula`, with the cached value
@@ -404,28 +401,11 @@ system yet.
 
 ## 0.1.2 release status
 
-The implementation and release-evidence scope is complete:
-
-- BIFF/XLSB formula source, external-name provenance, shared/array formulas,
-  and deterministic evaluation have independent source and cached-value tests.
-- Reader fidelity, codepage, metadata, and explicit loss boundaries are frozen
-  in [`docs/READER_FIDELITY.md`](docs/READER_FIDELITY.md).
-- Package-preserving XLSX/XLSM editing covers the declared cell, sheet,
-  transaction, merge, layout, note, hyperlink, validation, table-resize, and
-  atomic-save surface in [`EDITING-CONTRACT.md`](EDITING-CONTRACT.md).
-- Output, CLI/JSON, API/SemVer, MSRV, WASM packaging, security, fuzz,
-  performance, package, SBOM, and public-corpus evidence gates passed locally
-  and on the tagged hosted release.
-- Strict invalid-edit rejection, authored/edited XLSX and edited XLSM
-  LibreOffice smokes, same-SHA performance reproducibility comparison, and
-  exact-SHA tag attestation enforcement passed in the hosted release gates.
-
-Publication passed one immutable candidate commit, two clean hosted candidates,
-the attested `v0.1.2` tag, crates.io and docs.rs publication, and a verified
-47-file GitHub Release bundle containing the npm-compatible WASM archive.
-Post-publication checks installed the exact crate and downloaded WASM package,
-then executed the native, Node, and real-browser consumers. The completed
-release checklist is in [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+Version 0.1.2 is published on crates.io, docs.rs, and GitHub. Its release gates
+cover reader and formula correctness, package-preserving XLSX/XLSM editing,
+CLI and JSON contracts, WASM/npm and browser consumers, public-corpus parity,
+security analysis, fuzzing, performance budgets, SBOM/provenance, independent
+LibreOffice checks, and exact-package installation.
 
 ## Contributing
 

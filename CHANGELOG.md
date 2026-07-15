@@ -11,8 +11,7 @@ No unreleased changes are recorded yet.
 ## [0.1.2] - 2026-07-16
 
 This release combines the remaining correctness, editing, runtime, security,
-and release-engineering work into one large release. Its completed evidence
-checklist is recorded in [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
+and release-engineering work into one large release.
 
 ### Added
 

@@ -67,24 +67,10 @@ cargo publish --dry-run --locked
 
 ## Release candidates
 
-Run the `Release` workflow twice with `workflow_dispatch` against the exact
-same commit. Run the first candidate without inputs, then give its run ID as
-`baseline_run_id` on the second candidate. The second run downloads the first
-bundle and `scripts/compare_release_bundles.py` rejects missing artifacts,
-manifest inconsistencies, deterministic checksum changes, failed evidence, or
-unexplained differences. Successful test duration and successful 120-second fuzz
-diagnostics may vary freely. Timing, RSS, and edit/save output size may vary only
-within the documented same-SHA reproducibility/noise limits; the absolute
-performance budgets are the regression guard. Create `v0.1.2` only after
-the reproducibility comparison artifact and exact-SHA push runs for both `CI`
-and `CodeQL` pass. The second run emits an immutable attestation bound to the
-repository, version, exact commit, both run IDs, comparison digest, and candidate
-release-manifest digest. The tag-triggered publication path downloads that
-candidate, verifies the exact 47-file bundle contract, and compares the tag-run
-bundle against it before crates.io or GitHub Release writes. After publication,
-the workflow downloads every GitHub Release asset and re-verifies full manifest
-coverage, byte sizes, SHA-256 digests, package checksums, and the Node/browser
-installation smokes.
+Release publication is maintainer-controlled. Do not create a release tag or
+publish a package from a contributor branch. Maintainers run the hosted
+reproducibility, exact-commit CI and CodeQL, artifact-integrity, and installed
+consumer gates before publishing.
 
 ## Scope
 
