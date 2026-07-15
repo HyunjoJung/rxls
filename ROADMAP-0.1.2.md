@@ -5,7 +5,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Local candidate complete; hosted release gates pending |
+| Status | `0.1.2` published; `1.0.0` observation active |
 | Target | `0.1.2` |
 | Baseline date | 2026-07-15 |
 | Original estimate | 30–45 solo development days, about eight weeks |
@@ -28,13 +28,15 @@
 
 ## 2. Status and evidence rules
 
-- `[x]` means the implementation and focused local verification exist in the shared workspace.
-- `[ ]` means either an implementation gap remains or the result requires GitHub-hosted CI, a clean release runner, a registry, or an external application.
+- `[x]` means the requirement is proven by current local, hosted, registry, or
+  external-consumer evidence as appropriate to its scope.
+- `[ ]` means either an implementation or evidence gap remains, or a stated
+  observation interval has not elapsed.
 - A configured workflow is local evidence that the gate exists; it is not evidence that the hosted gate passed.
 - Checked-in corpus summaries are frozen metadata, not a substitute for rerunning the live 916-file corpus on the release commit.
 - No milestone is release-complete while one of its completion criteria remains unchecked.
 
-### Current local baseline
+### Current release baseline
 
 - Native and WASM release identities and lockfiles are synchronized and guarded by tests.
 - Stable and Rust 1.85 native/WASM locked builds have local evidence.
@@ -43,10 +45,14 @@
 - The latest local run reproduces that complete 916-file baseline and all four parity thresholds.
 - Node and a real Chromium-family browser pass WASM smoke tests and normalized native-report parity locally.
 - LibreOffice independently opens/saves authored and package-edited `.xlsx` candidates without repair or rxls diagnostic warnings. The package-edited `.xlsm` candidate retains VBA and emits only the expected `MacrosPresentNotExecuted` warning. The deterministic medium/edit/large performance budgets pass locally.
-- All four local release-style fuzz campaigns complete for 121 seconds without a crash, hang, timeout, OOM, or sanitizer finding; hosted tag-candidate campaigns remain a separate external gate.
+- All four local and hosted tag-candidate release-style fuzz campaigns complete
+  for 121 seconds without a crash, hang, timeout, OOM, or sanitizer finding.
 - The crate is byte-reproducible across two clean package invocations, its registry dry-run passes, and the assembled local evidence bundle passes public-hygiene and checksum verification.
 - The canonical local gate passes 651 library, 2 binary, 3 API-contract, 45 CLI, 149 integration, 6 rustdoc, and 150 Python tests.
-- GitHub-hosted workflows, two clean release-candidate runs, tag assets, crates.io publication, and post-publication smoke remain external work.
+- Exact-SHA CI and CodeQL, two clean release-candidate runs, the tag publication
+  workflow, the 47-file GitHub Release, crates.io publication, docs.rs, and
+  post-publication native/WASM consumer smokes passed for `0.1.2`. Only the
+  explicitly listed 2–4 week `1.0.0` observation criteria remain open.
 
 ## 3. Release strategy and change control
 
