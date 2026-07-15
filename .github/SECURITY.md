@@ -8,8 +8,8 @@ goals, so security reports are taken seriously.
 
 | Version | Supported |
 |---------|-----------|
-| `main` and 0.1.x | Yes |
-| Older releases | No |
+| `main` and the latest published release | Yes |
+| All earlier releases | No |
 
 Security fixes are applied to the latest release only.
 
