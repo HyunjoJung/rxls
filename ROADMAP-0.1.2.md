@@ -104,14 +104,14 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] Record corpus sources, licenses, expectations, and hashes in deterministic metadata.
 - [x] Define release-asset names, checksums, diagnostics, and evidence-bundle structure.
 - [x] Upload diagnostics even when parity/fuzz/release stages fail.
-- [ ] Commit and reproduce identical small-parity results for the candidate SHA in GitHub Actions. **External**
+- [x] Commit and reproduce identical small-parity results for the candidate SHA in GitHub Actions. **External**
 
 #### Completion criteria
 
 - [x] Stable/MSRV native and WASM locked builds pass locally.
 - [x] Local tests validate generated README/baseline consistency.
-- [ ] The same commit produces identical small-parity results locally and in GitHub Actions. **External**
-- [ ] The hosted release workflow reaches the full-corpus stage and retains failure evidence. **External**
+- [x] The same commit produces identical small-parity results locally and in GitHub Actions. **External**
+- [x] The hosted release workflow reaches the full-corpus stage and retains failure evidence. **External**
 
 ### M1. BIFF/XLSB formula-source fidelity
 
@@ -281,7 +281,7 @@ Unsupported content should remain readable or preservable where safe, with an ex
 
 - [x] The checked-in public API inventory has no unclassified listed area.
 - [x] Generate and check a machine-readable semver/API-diff baseline.
-- [ ] Compile every documented journey and supported feature combination in hosted CI. **External**
+- [x] Compile every documented journey and supported feature combination in hosted CI. **External**
 - [x] The current compatibility design lists zero expected `1.0.0` breaking changes.
 
 ### M7. WASM runtime and distribution
@@ -306,7 +306,7 @@ Unsupported content should remain readable or preservable where safe, with an ex
 
 - [x] Local Node/browser smoke and native parity pass.
 - [x] Local stable/MSRV locked WASM builds pass.
-- [ ] The tagged GitHub Release contains the npm/WASM archive, size report, and checksum, and the downloaded archive installs through Node package resolution and executes in Node and a real browser. **External**
+- [x] The tagged GitHub Release contains the npm/WASM archive, size report, and checksum, and the downloaded archive installs through Node package resolution and executes in Node and a real browser. **External**
 - [x] Exact-limit and over-limit Node probes terminate without OOM, hang, or panic.
 
 ### M8. Security, fuzzing, performance, and resource limits
@@ -325,18 +325,18 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] Configure CodeQL plus Rust security/license/source policy in release gates.
 - [x] Add deterministic performance evidence tooling and a locally verified small-fixture budget.
 - [x] Generate a deterministic medium OOXML fixture and measure release-mode diagnose and package-edit/save workloads.
-- [ ] Record release-runner medium/large corpus and package-edit peak RSS/time/output baselines. **External**
+- [x] Record release-runner medium/large corpus and package-edit peak RSS/time/output baselines. **External**
 - [x] Define separate native and WASM memory/bundle budgets.
 - [x] Document absolute performance regression budgets and separate same-SHA reproducibility/noise limits in `PERFORMANCE.md`.
 - [x] Enforce same-SHA performance/RSS/output reproducibility comparisons against the first candidate run and fail closed on missing or malformed evidence.
 
 #### Completion criteria
 
-- [ ] Every fuzz target completes the 120-second tag-candidate campaign with zero unclassified crash. **External**
+- [x] Every fuzz target completes the 120-second tag-candidate campaign with zero unclassified crash. **External**
 - [x] Focused hostile fixtures terminate inside declared local budgets.
-- [ ] Hosted CodeQL/cargo-deny reports zero high/critical security and blocking license issues. **External**
-- [ ] Release-runner measurements pass every absolute performance and memory budget. **External**
-- [ ] Hosted same-SHA performance/RSS/output reproducibility evidence is present and passes for the tag candidate. **External**
+- [x] Hosted CodeQL/cargo-deny reports zero high/critical security and blocking license issues. **External**
+- [x] Release-runner measurements pass every absolute performance and memory budget. **External**
+- [x] Hosted same-SHA performance/RSS/output reproducibility evidence is present and passes for the tag candidate. **External**
 
 ### M9. Full corpus, documentation, and release evidence
 
@@ -358,17 +358,17 @@ Unsupported content should remain readable or preservable where safe, with an ex
 - [x] Generate a deterministic CycloneDX SBOM and wire it into release evidence.
 - [x] Add a fail-closed two-candidate comparator that verifies manifest coverage and explains every permitted timing/RSS/edit-output/fuzz checksum difference.
 - [x] Make the tag-publication path require a successful exact-SHA comparison artifact and immutable candidate attestation.
-- [ ] Run the clean release workflow twice against the same commit and explain every checksum difference. **External**
-- [ ] Create the `v0.1.2` tag and GitHub Release draft and perform Go/No-Go. **External**
-- [ ] Publish to crates.io, attach the WASM archive to GitHub Releases, then smoke crate installation, downloaded-WASM Node package resolution and real-browser execution, docs.rs, assets, and checksums. **External**
+- [x] Run the clean release workflow twice against the same commit and explain every checksum difference. **External**
+- [x] Create the `v0.1.2` tag and GitHub Release and perform Go/No-Go. **External**
+- [x] Publish to crates.io, attach the WASM archive to GitHub Releases, then smoke crate installation, downloaded-WASM Node package resolution and real-browser execution, docs.rs, assets, and checksums. **External**
 
 #### Completion criteria
 
 - [x] The local full-corpus run has zero unexpected open failure and zero unexpected accept; the tag workflow repeats it.
-- [ ] Every release gate is green for the tag commit. **External**
-- [ ] Two clean release-candidate runs are reproducible. **External**
-- [ ] GitHub Release contains every promised artifact and checksum. **External**
-- [ ] README, changelog, support matrix, and generated evidence agree on the final tag. **External**
+- [x] Every release gate is green for the tag commit. **External**
+- [x] Two clean release-candidate runs are reproducible. **External**
+- [x] GitHub Release contains every promised artifact and checksum. **External**
+- [x] README, changelog, support matrix, and generated evidence agree on the final tag. **External**
 
 ### Release-candidate hardening — RHWP-grade product spine
 
@@ -387,7 +387,7 @@ authoritative; obsolete internal June/early-July planning assertions are not.
   parity, and the shipped browser demo.
 - [x] Verify the exact packaged crate as an external library and installed CLI;
   smoke version, stdout help, diagnostics, and failure behavior.
-- [ ] Run lightweight Linux, macOS, and Windows installed-product coverage in
+- [x] Run lightweight Linux, macOS, and Windows installed-product coverage in
   hosted CI while retaining the complete Linux release gate.
 - [x] Keep capability regressions anchored in committed tests, including
   `committed_xls_fixture_exposes_legacy_reader_surface`,
@@ -442,17 +442,17 @@ flowchart LR
 
 | Milestone | Status | Approx. completion | Remaining blocker |
 | --- | --- | ---: | --- |
-| M0 Baseline | In progress | 95% | Candidate SHA must be pushed and pass hosted CI/full-corpus entry |
+| M0 Baseline | Done | 100% | None |
 | M1 Formula source | Done | 100% | None |
 | M2 Evaluator | Done | 100% | Release evidence is collected in M9 |
 | M3 Reader fidelity | Done | 100% | None |
 | M4 Editing | Done | 100% | None |
 | M5 Output contracts | Done | 100% | None |
-| M6 API freeze | In progress | 95% | Hosted feature/journey gate on the release commit |
-| M7 WASM | In progress | 90% | Tagged hosted release asset publication |
-| M8 Safety/performance | In progress | 90% | Hosted 120-second-per-target campaign, CodeQL, and runner baselines |
-| RHWP-grade RC hardening | In progress | 80% | Hosted Linux, macOS, and Windows installed-product coverage |
-| M9 Release evidence | In progress | 75% | Two clean hosted runs, tag, publish, and post-publish smoke |
+| M6 API freeze | Done | 100% | None |
+| M7 WASM | Done | 100% | None |
+| M8 Safety/performance | Done | 100% | None |
+| RHWP-grade RC hardening | Done | 100% | None |
+| M9 Release evidence | Done | 100% | None |
 
 Status values are `Pending`, `Next`, `In progress`, `Blocked`, and `Done`. Completion criteria, not checkbox count, determine status.
 
@@ -485,19 +485,19 @@ Any unchecked item is a release No-Go.
 
 ### Security and operations
 
-- [ ] Required hosted fuzz duration completes with no unclassified crash/hang/OOM. **External**
-- [ ] Hosted security/license gates report no blocker. **External**
-- [ ] Release-runner performance/memory evidence passes every absolute budget. **External**
-- [ ] Hosted same-SHA performance/RSS/output reproducibility evidence passes for the candidate. **External**
+- [x] Required hosted fuzz duration completes with no unclassified crash/hang/OOM. **External**
+- [x] Hosted security/license gates report no blocker. **External**
+- [x] Release-runner performance/memory evidence passes every absolute budget. **External**
+- [x] Hosted same-SHA performance/RSS/output reproducibility evidence passes for the candidate. **External**
 - [x] Focused hostile and boundary tests terminate within local budgets.
-- [ ] The clean release workflow succeeds twice. **External**
+- [x] The clean release workflow succeeds twice. **External**
 
 ### Distribution
 
 - [x] Local crate/package and npm/WASM candidate inspections pass.
-- [ ] GitHub Release assets, evidence, SBOM, npm-compatible WASM archive, and checksums exist. **External**
-- [ ] Tag, crate, docs.rs, and assets point to the same commit. **External**
-- [ ] Post-publication crate install plus downloaded-WASM Node and browser install/execute smokes pass. **External**
+- [x] GitHub Release assets, evidence, SBOM, npm-compatible WASM archive, and checksums exist. **External**
+- [x] Tag, crate, docs.rs, and assets point to the same commit. **External**
+- [x] Post-publication crate install plus downloaded-WASM Node and browser install/execute smokes pass. **External**
 
 ## 9. Defect priority and release blocking
 
@@ -556,12 +556,12 @@ Record any scope change here with its alternative and schedule impact.
 
 The roadmap is complete only when all are true:
 
-- [ ] Every M0–M9 task, completion criterion, and RHWP-grade RC-hardening item is closed.
-- [ ] Every Go/No-Go item is checked.
+- [x] Every M0–M9 task, completion criterion, and RHWP-grade RC-hardening item is closed.
+- [x] Every Go/No-Go item is checked.
 - [x] Corpus, formula, evaluation, editing, WASM, security, performance, and package evidence are assembled locally and wired into one hosted release bundle.
-- [ ] Two clean candidates for the same tag commit succeed consecutively.
-- [ ] `v0.1.2`, the crate, GitHub Release, documentation, SBOM, and checksums are public and consistent.
-- [ ] Post-publication crate and downloaded-WASM Node/browser install/core smokes pass.
-- [ ] Only observation/stabilization remains before `1.0.0`, with no required breaking change.
+- [x] Two clean candidates for the same tag commit succeed consecutively.
+- [x] `v0.1.2`, the crate, GitHub Release, documentation, SBOM, and checksums are public and consistent.
+- [x] Post-publication crate and downloaded-WASM Node/browser install/core smokes pass.
+- [x] Only observation/stabilization remains before `1.0.0`, with no required breaking change.
 
 Test volume, a few successful samples, or a local-only pass never substitutes for this definition.

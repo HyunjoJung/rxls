@@ -6,10 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-> **Release status:** this source tree targets the `0.1.2` compatibility
-> candidate. Until `v0.1.2` is tagged and published, the crates.io badge
-> continues to describe the latest public release. Remaining hosted and
-> publication gates are tracked in
+> **Release status:** `v0.1.2` is published as the compatibility candidate for
+> `1.0.0`. The crate, tagged source, 47-file GitHub Release bundle, SBOM, and
+> checksums are bound to commit `33b4db17f2047febf9e6550299c3dde572afd6e5`.
+> The remaining observation criteria before `1.0.0` are tracked in
 > [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
 
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
@@ -20,7 +20,7 @@ panicking when bounded recovery is not possible.
 
 ## Install
 
-Add the library after `0.1.2` is published:
+Add the `0.1.2` library:
 
 ```sh
 cargo add rxls@0.1.2
@@ -406,9 +406,9 @@ serials can be converted to `chrono::Duration` via
 callers want calamine-style typed access without choosing the workbook date
 system yet.
 
-## 0.1.2 candidate status
+## 0.1.2 release status
 
-The local implementation and evidence scope is complete:
+The implementation and release-evidence scope is complete:
 
 - BIFF/XLSB formula source, external-name provenance, shared/array formulas,
   and deterministic evaluation have independent source and cached-value tests.
@@ -418,18 +418,18 @@ The local implementation and evidence scope is complete:
   transaction, merge, layout, note, hyperlink, validation, table-resize, and
   atomic-save surface in [`EDITING-CONTRACT.md`](EDITING-CONTRACT.md).
 - Output, CLI/JSON, API/SemVer, MSRV, WASM packaging, security, fuzz,
-  performance, package, SBOM, and public-corpus evidence gates are implemented
-  and have local evidence.
+  performance, package, SBOM, and public-corpus evidence gates passed locally
+  and on the tagged hosted release.
 - Strict invalid-edit rejection, authored/edited XLSX and edited XLSM
   LibreOffice smokes, same-SHA performance reproducibility comparison, and
-  exact-SHA tag attestation enforcement are covered locally.
+  exact-SHA tag attestation enforcement passed in the hosted release gates.
 
-Publication is operationally gated on one immutable candidate commit, two clean
-hosted candidates, `v0.1.2`, crate publication, the npm-compatible WASM archive
-as a GitHub asset, and verification of crates.io, docs.rs, assets, and
-checksums, including install-and-execute verification of the downloaded WASM
-archive through Node package resolution and a real browser. The authoritative
-checklist and local-versus-external evidence rules are in
+Publication passed one immutable candidate commit, two clean hosted candidates,
+the attested `v0.1.2` tag, crates.io and docs.rs publication, and a verified
+47-file GitHub Release bundle containing the npm-compatible WASM archive.
+Post-publication checks installed the exact crate and downloaded WASM package,
+then executed the native, Node, and real-browser consumers. The authoritative
+checklist and remaining observation rules are in
 [`ROADMAP-0.1.2.md`](ROADMAP-0.1.2.md).
 
 ## Contributing
