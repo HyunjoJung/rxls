@@ -69,7 +69,17 @@ INTERNAL_TRACE_PATTERNS = (
     ),
     ("claude_project_trace", re.compile(r"[.]claude[/\\]projects", re.IGNORECASE)),
     ("private_workspace_trace", re.compile("cong" + "mo", re.IGNORECASE)),
+    (
+        "internal_release_promotion_trace",
+        re.compile(
+            r"\b(?:nearly|almost|de facto|effectively)\s+"
+            r"(?:a\s+)?1[.]0\b|\b1[.]0\s+(?:release\s+)?"
+            r"candidate\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
+INTERNAL_PLANNING_PREFIXES = ("ROADMAP-", "MIGRATION-")
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,22 @@ def scan_text(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def scan_internal_planning_name(path: str, display_path: str | None = None) -> list[Finding]:
+    """Reject internal planning documents from public trees and archives."""
+    normalized = path.replace("\\", "/")
+    basename = PurePosixPath(normalized).name.upper()
+    if basename.startswith(INTERNAL_PLANNING_PREFIXES):
+        return [
+            Finding(
+                display_path or path,
+                None,
+                "internal_planning_document",
+                "internal planning documents must not enter public release inputs",
+            )
+        ]
+    return []
+
+
 def decode_office_text(data: bytes) -> str | None:
     for encoding in ("utf-8-sig", "utf-16"):
         try:
@@ -129,6 +155,9 @@ def scan_office_package(path: Path, display_path: str) -> list[Finding]:
                 normalized_name = info.filename.replace("\\", "/")
                 member = PurePosixPath(normalized_name)
                 member_path = f"{display_path}::{info.filename}"
+                findings.extend(
+                    scan_internal_planning_name(info.filename, member_path)
+                )
                 findings.extend(scan_text(member_path, info.filename))
                 if (
                     member.is_absolute()
@@ -178,6 +207,7 @@ def scan_tar_package(path: Path, display_path: str) -> list[Finding]:
         with tarfile.open(path, mode="r:gz") as archive:
             for index, info in enumerate(archive, start=1):
                 member_path = f"{display_path}::{info.name}"
+                findings.extend(scan_internal_planning_name(info.name, member_path))
                 findings.extend(scan_text(member_path, info.name))
                 if index > MAX_ARCHIVE_MEMBERS:
                     findings.append(
@@ -295,7 +325,7 @@ def scan_tar_package(path: Path, display_path: str) -> list[Finding]:
 
 def audit_file(path: Path, repo: Path = REPO) -> list[Finding]:
     relative = path.relative_to(repo).as_posix()
-    findings = scan_text(relative, relative)
+    findings = scan_internal_planning_name(relative) + scan_text(relative, relative)
     if any(part in SKIP_DIRS for part in path.relative_to(repo).parts) or not path.is_file():
         return findings
     suffix = path.suffix.lower()

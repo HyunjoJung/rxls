@@ -557,6 +557,37 @@ class ReleaseToolTests(unittest.TestCase):
             kinds, {"openai_api_key", "windows_home_path", "internal_docs_trace"}
         )
 
+    def test_hygiene_rejects_internal_promotion_language(self) -> None:
+        module = _load("public_hygiene_audit_promotion", HYGIENE)
+        text = "\n".join(
+            [
+                "status=" + "1.0 " + "candidate",
+                "goal=" + "effectively " + "1.0",
+            ]
+        )
+
+        findings = module.scan_text("README.md", text)
+
+        self.assertEqual(
+            [finding.kind for finding in findings],
+            [
+                "internal_release_promotion_trace",
+                "internal_release_promotion_trace",
+            ],
+        )
+
+    def test_hygiene_rejects_internal_planning_document_names(self) -> None:
+        module = _load("public_hygiene_audit_planning", HYGIENE)
+
+        findings = module.scan_internal_planning_name(
+            "docs/" + "ROADMAP-" + "private.md"
+        )
+
+        self.assertEqual(
+            [finding.kind for finding in findings],
+            ["internal_planning_document"],
+        )
+
     def test_hygiene_scans_office_member_text(self) -> None:
         module = _load("public_hygiene_audit", HYGIENE)
         with tempfile.TemporaryDirectory() as tmp:

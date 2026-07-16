@@ -58,6 +58,7 @@ mod ods;
 mod ole;
 #[cfg(feature = "xlsx")]
 mod package;
+mod provenance;
 mod ptg;
 mod report;
 #[cfg(feature = "xlsx")]
@@ -98,17 +99,22 @@ pub use model::{
 };
 pub use model::{
     excel_serial_to_datetime, Alignment, Border, BorderStyle, Cell, CellErrorType, CellProtection,
-    CellStyle, CfRule, Chart, ChartKind, Color, Comment, CommentAuthor, CondFormat, Data, DataRef,
-    DataType, DataValidation, Dimensions, DocProperties, DvKind, DvOp, ExcelDateTime, Fill, Font,
-    Format, FormatAlign, FormatBorder, FormatPattern, FormatScript, FormulaRange, FormulaRangeRow,
-    FormulaRangeRowCells, FormulaRangeRowUsedCells, FormulaRangeRows, HAlign, HeaderRow, Image,
-    ImageFmt, LocalDefinedName, PageSetup, Picture, ProtectionOptions, Range, RangeRow,
-    RangeRowCells, RangeRowUsedCells, RangeRows, Reader, Series, Sheet, SheetMetadata, SheetType,
-    SheetView, SheetVisible, Sparkline, SparklineKind, Table, TextRun, VAlign, Workbook,
-    WorkbookMetadata,
+    CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint, ChartKind, ChartMarkerSymbol,
+    ChartSeriesCache, ChartSeriesStyle, ChartSeriesStyleLossKind, ChartUnsupportedReason, Color,
+    Comment, CommentAuthor, CondFormat, ConditionalFormatMetadata, Data, DataRef, DataType,
+    DataValidation, Dimensions, DisplayCell, DocProperties, DrawingAnchorBehavior, DrawingCrop,
+    DrawingMetadata, DrawingObjectKind, DvKind, DvOp, ExcelDateTime, Fill, Font, Format,
+    FormatAlign, FormatBorder, FormatPattern, FormatScript, FormulaRange, FormulaRangeRow,
+    FormulaRangeRowCells, FormulaRangeRowUsedCells, FormulaRangeRows, HAlign, HeaderFooterKind,
+    HeaderFooterMetadata, HeaderRow, Image, ImageFmt, LocalDefinedName, PageSetup, Picture,
+    PrintFidelity, PrintLoss, PrintLossKind, PrintMetadata, PrintPageOrder, ProtectionOptions,
+    Range, RangeRow, RangeRowCells, RangeRowUsedCells, RangeRows, Reader, Series, Sheet,
+    SheetMetadata, SheetType, SheetView, SheetVisible, Sparkline, SparklineKind, StyleFidelity,
+    StyleLoss, StyleLossKind, Table, TextRun, VAlign, Workbook, WorkbookMetadata,
 };
 #[cfg(feature = "chrono")]
 pub use model::{excel_serial_to_duration, excel_serial_to_naive_datetime};
+pub use provenance::{ContainerParseMode, ParseProvenance, RecoveryCode, MAX_PARSE_RECOVERY_CODES};
 pub use report::{
     ReportEvaluation, ReportFeatures, ReportProperties, ReportStats, WorkbookReport,
     REPORT_SCHEMA_VERSION,

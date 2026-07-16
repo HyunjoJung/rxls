@@ -149,8 +149,13 @@ def biff8_short_string(value: str) -> bytes:
     return bytes([len(value), 0x01]) + value.encode("utf-16le")
 
 
-def biff_boundsheet(name: str, hidden_state: int = 0, sheet_type: int = 0) -> bytes:
-    payload = bytearray(4)
+def biff_boundsheet(
+    name: str,
+    hidden_state: int = 0,
+    sheet_type: int = 0,
+    stream_offset: int = 0,
+) -> bytes:
+    payload = bytearray(u32(stream_offset))
     payload.extend(bytes([hidden_state, sheet_type]))
     payload.extend(biff8_short_string(name))
     return biff_record(0x0085, bytes(payload))
@@ -359,6 +364,66 @@ def generate_korean_biff5() -> None:
         FIXTURES / "xls" / "korean-cp949-biff5.xls",
         bytes(workbook),
         stream_name="Book",
+    )
+
+
+def generate_korean_biff8() -> None:
+    """Generate a Korean BIFF8 Unicode/SST/formula compatibility fixture.
+
+    The SST deliberately crosses a CONTINUE boundary and changes from compressed
+    single-byte text (``K-``) to UTF-16LE Hangul. The adjacent NUMBER and cached
+    string FORMULA records catch record-boundary regressions that a text-only
+    fixture cannot expose. DIMENSION and the exact BoundSheet8 stream offset keep
+    the file valid in both LibreOffice Calc and independent BIFF readers.
+    """
+
+    sheet = bytearray()
+    sheet.extend(biff_bof(0x0010))
+    sheet.extend(
+        biff_record(
+            0x0200,
+            u32(0) + u32(2) + u16(0) + u16(2) + u16(0),
+        )
+    )
+    sheet.extend(biff_labelsst(0, 0, 0))
+    sheet.extend(biff_number(0, 1, 949.0))
+
+    # PtgStr("확인") as the formula source, with BIFF's cached-string marker.
+    formula_text = "확인".encode("utf-16le")
+    formula_tokens = bytes([0x17, 0x02, 0x01]) + formula_text
+    formula = bytearray()
+    formula.extend(u16(1) + u16(0) + u16(0))
+    formula.extend(bytes(6) + b"\xff\xff")
+    formula.extend(u16(0))
+    formula.extend(u32(0))
+    formula.extend(u16(len(formula_tokens)))
+    formula.extend(formula_tokens)
+    sheet.extend(biff_record(0x0006, bytes(formula)))
+    sheet.extend(biff_record(0x0207, u16(2) + b"\x01" + formula_text))
+    sheet.extend(biff_record(0x000A, b""))
+
+    # XLUnicodeRichExtendedString cch=4, compressed "K-", then CONTINUE's
+    # required option byte switches the remaining two characters to UTF-16LE.
+    sst_head = u32(1) + u32(1) + u16(4) + b"\x00K-"
+    sst_records = biff_record(0x00FC, sst_head) + biff_record(
+        0x003C, b"\x01" + "한글".encode("utf-16le")
+    )
+
+    prefix = biff_bof(0x0005) + biff_record(0x0042, u16(1200))
+    placeholder = biff_boundsheet("한글표")
+    sheet_offset = len(prefix) + len(placeholder) + len(sst_records) + len(
+        biff_record(0x000A, b"")
+    )
+    workbook = bytearray(prefix)
+    workbook.extend(biff_boundsheet("한글표", stream_offset=sheet_offset))
+    workbook.extend(sst_records)
+    workbook.extend(biff_record(0x000A, b""))
+    workbook.extend(sheet)
+
+    write_cfb(
+        FIXTURES / "xls" / "korean-unicode-biff8.xls",
+        bytes(workbook),
+        stream_name="Workbook",
     )
 
 
@@ -985,6 +1050,7 @@ def generate_ods() -> None:
 def main() -> None:
     generate_xls()
     generate_korean_biff5()
+    generate_korean_biff8()
     generate_xlsx()
     generate_ods()
     generate_formula_source()

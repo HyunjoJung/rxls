@@ -38,7 +38,11 @@ jobs:
           languages: rust
 
       - name: Build
-        run: cargo build --all-targets --all-features --locked
+        run: |
+          cargo build --all-targets --all-features --locked
+          cargo build --manifest-path render/Cargo.toml --all-targets --locked
+          cargo build --manifest-path bindings/render-wasm/Cargo.toml \
+            --all-targets --locked
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0

@@ -10,6 +10,11 @@
 > GitHub Release bundle, SBOM, and checksums are bound to commit
 > `33b4db17f2047febf9e6550299c3dde572afd6e5`.
 
+> **Development status:** `main` contains additive, unreleased work that is not
+> part of the crates.io `v0.1.2` package. The installation commands below
+> describe the published package; build from source to evaluate development
+> APIs and behavior.
+
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
 **`.xlsb`**, and **`.ods`** into one typed cell model; writes styled **`.xlsx`**;
 and package-preservingly edits **`.xlsx`/`.xlsm`**. No JVM, Apache POI, or
@@ -132,6 +137,11 @@ Unsupported password-protected workbooks (`FILEPASS`) are reported as
 workbooks using Excel's default `VelvetSweatshop` password are deobfuscated.
 Every read is bounds-checked. Malformed structures are either handled by an
 explicit bounded recovery path or return an [`Error`], never a panic.
+After a successful read, [`Workbook::parse_provenance`] distinguishes the
+format's primary container path from rxls's bounded tolerant CFB directory
+walk and exposes stable typed recovery codes. Recovery is an audit signal, not
+a guarantee that the original container was valid or complete, and it never
+bypasses the existing strict edit/save safeguards.
 
 ## Choosing a crate
 
@@ -151,14 +161,17 @@ dependency manifest.
 ## Scope & parity
 
 Targets plain-text extraction for search/indexing. Date/time serials and
-percentages are rendered as Excel displays them (via `XF`/`FORMAT`/`DATEMODE`
-for Excel files and ODS value-type fallbacks when no display paragraph is
-present); other cached cell values are emitted as text. Formula re-evaluation is
-limited to the deterministic MVP exposed by `Workbook::evaluate_cell`, which
+percentages are rendered through the retained format metadata. Excel custom
+formats support positive/negative/zero/text sections, conditions and colors,
+locale/currency markers, grouping and scaling, fractions, scientific notation,
+date/time and elapsed tokens, literals, escapes, and text placeholders. ODS
+continues to prefer its source display paragraph, with typed-value fallbacks
+when none is present. Formula re-evaluation is limited to the deterministic MVP
+exposed by `Workbook::evaluate_cell`, which
 returns a typed `FormulaUnsupportedReason` (unsupported/volatile function,
 external reference, circular reference, unresolved name, oversized range,
 missing sheet, …) instead of guessing when a formula falls outside that MVP;
-full custom number-format rendering and styling are out of scope.
+locale-specific calendars and digit substitution remain explicit boundaries.
 
 **Editing existing files** is package-preserving and `.xlsx`/`.xlsm`-only.
 `Spreadsheet` supports atomic batches; cell/formula and range edits; document,
@@ -182,6 +195,8 @@ binary itself lives behind the `cli` feature (on by default, so existing
 native workflows are unaffected). Determinism, CSV safety options, diagnose JSON
 schema compatibility, CLI exit codes, public Rust APIs, coordinate rules,
 feature guarantees, and error semantics follow the crate's SemVer policy.
+Diagnose schema v2 adds the bounded `provenance` object; schema v1 remains a
+historical frozen contract and is not extended with new keys.
 
 The WASM distribution provides generated Node and browser entry points,
 TypeScript declarations, a minimal file-picker demo, structured `RxlsError`
@@ -191,6 +206,17 @@ Chromium smoke tests, compares `reportJson` with `rxls diagnose`, and enforces
 raw WASM, JavaScript glue, and compressed npm bundle budgets. See the
 [WASM package guide](https://github.com/HyunjoJung/rxls/blob/main/bindings/wasm/npm/README.md)
 for initialization and memory guidance.
+
+## Rendering workspace
+
+Development `main` also contains a separate `rxls-render` crate and
+`@rxls/render-worker` browser/WASM package. They are not part of the published
+core crate `v0.1.2`: the renderer builds one bounded fixed-point scene and
+replays it to deterministic SVG, PDF, and PNG, while the browser surface keeps
+parsing and virtual sheet/tile/page rendering inside a CSP-safe worker. See the
+[renderer guide](render/README.md) and
+[worker package guide](bindings/render-wasm/README.md) for source builds,
+limits, font isolation, pagination, and distribution gates.
 
 <!-- public-corpus-baseline:start -->
 **Current public-corpus gate (2026-07-15).** The pinned fetch recipe selects 916

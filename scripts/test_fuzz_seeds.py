@@ -40,7 +40,12 @@ class FuzzSeedTests(unittest.TestCase):
         }
 
         self.assertTrue(
-            {"reader-basic.xls", "korean-cp949-biff5.xls", "formula-source.xls"}
+            {
+                "reader-basic.xls",
+                "korean-cp949-biff5.xls",
+                "korean-unicode-biff8.xls",
+                "formula-source.xls",
+            }
             <= by_target["parse"]
         )
         self.assertTrue(

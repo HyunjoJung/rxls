@@ -14,10 +14,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 
+use quick_xml::events::{BytesRef, Event};
+use quick_xml::{Reader, XmlVersion};
+
 use crate::error::{Error, Result};
+use crate::model::OoxmlImplicitColumnWidth;
 use crate::{
-    format, rk_to_f64, Cell, CellEntry, Color, Comment, DataValidation, DvKind, DvOp, PageSetup,
-    ProtectionOptions, Sheet, SheetType, Table, Workbook,
+    format, rk_to_f64, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle,
+    Chart, Color, Comment, DataValidation, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata,
+    DrawingObjectKind, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript, HAlign,
+    HeaderFooterKind, Image, ImageFmt, PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder,
+    ProtectionOptions, Sheet, SheetType, StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign,
+    Workbook,
 };
 
 #[derive(Clone, Default)]
@@ -28,6 +36,7 @@ struct SharedString {
 
 // BIFF12 record type ids ([MS-XLSB] 2.4).
 const BRT_ROW_HDR: u32 = 0;
+const BRT_CELL_BLANK: u32 = 1;
 const BRT_CELL_RK: u32 = 2;
 const BRT_CELL_ERROR: u32 = 3;
 const BRT_CELL_BOOL: u32 = 4;
@@ -51,6 +60,9 @@ const BRT_ARR_FMLA: u32 = 0x01AA;
 const BRT_SHR_FMLA: u32 = 0x01AB;
 const BRT_EXTERN_SHEET: u32 = 0x016A;
 const BRT_FMT: u32 = 44;
+const BRT_FONT: u32 = 43;
+const BRT_FILL: u32 = 45;
+const BRT_BORDER: u32 = 46;
 const BRT_XF: u32 = 47;
 const BRT_COL_INFO: u32 = 60;
 const BRT_DVAL: u32 = 64;
@@ -65,10 +77,16 @@ const BRT_WB_PROP: u32 = 153; // 0x99 — workbook properties, carries the 1904 
 const BRT_MERGE_CELL: u32 = 176;
 const BRT_BEGIN_LIST: u32 = 288;
 const BRT_BEGIN_LIST_COL: u32 = 291;
-const BRT_MARGINS: u32 = 475;
-const BRT_PRINT_OPTIONS: u32 = 476;
-const BRT_PAGE_SETUP: u32 = 477;
-const BRT_BEGIN_HEADER_FOOTER: u32 = 478;
+const BRT_MARGINS: u32 = 476;
+const BRT_PRINT_OPTIONS: u32 = 477;
+const BRT_PAGE_SETUP: u32 = 478;
+const BRT_BEGIN_HEADER_FOOTER: u32 = 479;
+const BRT_WS_FMT_INFO: u32 = 0x01E5;
+const BRT_BEGIN_RW_BRK: u32 = 392;
+const BRT_END_RW_BRK: u32 = 393;
+const BRT_BEGIN_COL_BRK: u32 = 394;
+const BRT_END_COL_BRK: u32 = 395;
+const BRT_BRK: u32 = 396;
 const BRT_HLINK: u32 = 0x01EE;
 const BRT_BOOK_PROTECTION: u32 = 534;
 const BRT_SHEET_PROTECTION: u32 = 535;
@@ -81,12 +99,18 @@ const BRT_TABLE_STYLE_CLIENT: u32 = 649;
 const BRT_DVAL_LIST: u32 = 681;
 const BRT_BEGIN_CELL_XFS: u32 = 0x0269;
 const BRT_END_CELL_XFS: u32 = 0x026A;
+const BRT_BEGIN_CELL_STYLE_XFS: u32 = 0x0272;
+const BRT_END_CELL_STYLE_XFS: u32 = 0x0273;
 const MAX_DVAL_RANGES: usize = 8192;
 const MAX_TABLE_COLUMNS: usize = 16_384;
 const MAX_XLSB_COL_INDEX: u32 = 16_383;
 const MAX_XLSB_ROW_INDEX: u32 = 1_048_575;
 const MAX_XLSB_SUPPORTING_LINKS: usize = 1 << 20;
 const MAX_XLSB_EXTERNAL_NAMES: usize = 1 << 20;
+const MAX_XLSB_STYLE_RECORDS: usize = 65_536;
+const MAX_XLSB_DRAWINGS: usize = 16_384;
+const MAX_XLSB_DRAWING_TEXT: usize = 4_096;
+const MAX_XLSB_BLANK_STYLES: usize = 1 << 20;
 
 /// A cursor over one BIFF12 record stream that yields `(record_type, payload)`,
 /// bounded by the buffer — a hostile size never reads past the end.
@@ -204,8 +228,11 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let shared = part(&mut zip, "xl/sharedStrings.bin")
         .map(|b| parse_shared_strings(&b))
         .unwrap_or_default();
+    let theme = crate::xlsx::part_str(&mut zip, "xl/theme/theme1.xml")
+        .map(|xml| parse_xlsb_theme(&xml))
+        .unwrap_or_default();
     let styles = part(&mut zip, "xl/styles.bin")
-        .map(|b| parse_styles(&b))
+        .map(|b| parse_styles(&b, &theme))
         .unwrap_or_default();
     let properties = crate::xlsx::parse_doc_properties(
         crate::xlsx::part_str(&mut zip, "docProps/core.xml").as_deref(),
@@ -292,19 +319,55 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         } else {
             Vec::new()
         };
+        let (images, charts, drawing_metadata, drawing_losses) = if is_worksheet {
+            read_sheet_drawings(&mut zip, &path, &sheet_rels_xml, &theme)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        let mut style_losses = styles.losses.clone();
+        for loss in &metadata.style_losses {
+            add_style_loss(&mut style_losses, loss.kind, loss.occurrences);
+        }
+        for loss in drawing_losses {
+            add_style_loss(&mut style_losses, loss.kind, loss.occurrences);
+        }
+        let style_fidelity = if !styles.has_source_styles {
+            StyleFidelity::Unavailable
+        } else if style_losses.is_empty() {
+            StyleFidelity::Retained
+        } else {
+            StyleFidelity::Partial
+        };
+        let ooxml_implicit_col_width = if !is_worksheet || metadata.default_col_width.is_some() {
+            OoxmlImplicitColumnWidth::None
+        } else if let Some(chars) = metadata.ooxml_base_col_width {
+            OoxmlImplicitColumnWidth::BaseCharacters(chars)
+        } else {
+            OoxmlImplicitColumnWidth::ApplicationDefault
+        };
         sheets.push(Sheet {
             name,
             is_worksheet,
+            style_fidelity,
             sheet_type: Some(sheet_type),
             cells,
+            default_format: styles.cell_styles.first().cloned(),
+            col_formats: metadata.col_formats,
+            row_formats: metadata.row_formats,
+            blank_styles: metadata.blank_styles,
             read_merges: merges,
             read_hyperlinks,
             comments,
             tables,
+            images,
+            charts,
+            drawing_metadata,
+            style_losses,
             freeze: metadata.freeze,
             autofilter: metadata.autofilter,
             data_validations: metadata.data_validations,
             page_setup: metadata.page_setup,
+            print_metadata: metadata.print_metadata,
             tab_color: metadata.tab_color,
             print_gridlines: metadata.print_gridlines,
             print_headings: metadata.print_headings,
@@ -318,6 +381,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline: metadata.col_outline,
             row_heights: metadata.row_heights,
             col_widths: metadata.col_widths,
+            default_col_width: metadata.default_col_width,
+            ooxml_implicit_col_width,
             hidden_rows: metadata.hidden_rows,
             hidden_cols: metadata.hidden_cols,
             rich: metadata.rich,
@@ -339,6 +404,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         date1904,
         active_sheet: active_sheet.or(selected_sheet_fallback).unwrap_or_default(),
         text_truncated: budget == 0,
+        container_parse_mode: crate::ContainerParseMode::Primary,
         protect_structure,
         ..Default::default()
     })
@@ -469,46 +535,638 @@ fn parse_external_defined_names(b: &[u8]) -> Vec<String> {
     names
 }
 
-/// Number formats from `styles.bin` (for date detection), shared with `.xlsx`.
-#[derive(Default)]
-struct Styles {
-    xf_numfmt: Vec<u16>,
-    custom: HashMap<u16, String>,
+#[derive(Clone, Copy, Default)]
+struct XlsbTheme {
+    colors: [Option<Color>; 12],
 }
 
-impl Styles {
-    fn kind(&self, style_idx: usize) -> format::Kind {
-        let id = self.xf_numfmt.get(style_idx).copied().unwrap_or(0);
-        format::classify(id, self.custom.get(&id).map(String::as_str))
+impl XlsbTheme {
+    fn chart_palette(&self) -> Vec<Color> {
+        const OFFICE_ACCENTS: [Color; 6] = [
+            Color::rgb(68, 114, 196),
+            Color::rgb(237, 125, 49),
+            Color::rgb(165, 165, 165),
+            Color::rgb(255, 192, 0),
+            Color::rgb(91, 155, 213),
+            Color::rgb(112, 173, 71),
+        ];
+        (0..OFFICE_ACCENTS.len())
+            .map(|index| self.colors[index + 4].unwrap_or(OFFICE_ACCENTS[index]))
+            .collect()
     }
 }
 
-fn parse_styles(b: &[u8]) -> Styles {
+fn xml_local(name: &[u8]) -> &[u8] {
+    name.iter()
+        .rposition(|byte| *byte == b':')
+        .map_or(name, |index| &name[index + 1..])
+}
+
+fn xml_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+    e.attributes().flatten().find_map(|attribute| {
+        (xml_local(attribute.key.as_ref()) == key)
+            .then(|| {
+                attribute
+                    .decoded_and_normalized_value_with(
+                        XmlVersion::Implicit1_0,
+                        e.decoder(),
+                        1,
+                        quick_xml::escape::resolve_xml_entity,
+                    )
+                    .ok()
+                    .map(|value| value.into_owned())
+            })
+            .flatten()
+    })
+}
+
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let value = value.trim().trim_start_matches('#');
+    let value = match value.len() {
+        8 => &value[2..],
+        6 => value,
+        _ => return None,
+    };
+    let red = u8::from_str_radix(value.get(0..2)?, 16).ok()?;
+    let green = u8::from_str_radix(value.get(2..4)?, 16).ok()?;
+    let blue = u8::from_str_radix(value.get(4..6)?, 16).ok()?;
+    Some(Color::rgb(red, green, blue))
+}
+
+fn theme_slot(name: &[u8]) -> Option<usize> {
+    match name {
+        b"dk1" => Some(0),
+        b"lt1" => Some(1),
+        b"dk2" => Some(2),
+        b"lt2" => Some(3),
+        b"accent1" => Some(4),
+        b"accent2" => Some(5),
+        b"accent3" => Some(6),
+        b"accent4" => Some(7),
+        b"accent5" => Some(8),
+        b"accent6" => Some(9),
+        b"hlink" => Some(10),
+        b"folHlink" => Some(11),
+        _ => None,
+    }
+}
+
+fn parse_xlsb_theme(xml: &str) -> XlsbTheme {
+    let mut reader = Reader::from_str(xml);
+    let mut theme = XlsbTheme::default();
+    let mut slot = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let local = xml_local(name.as_ref());
+                if let Some(next) = theme_slot(local) {
+                    slot = Some(next);
+                } else if local == b"srgbClr" {
+                    if let (Some(index), Some(color)) = (
+                        slot,
+                        xml_attr(&e, b"val").as_deref().and_then(parse_hex_color),
+                    ) {
+                        theme.colors[index] = Some(color);
+                    }
+                } else if local == b"sysClr" {
+                    if let (Some(index), Some(color)) = (
+                        slot,
+                        xml_attr(&e, b"lastClr")
+                            .as_deref()
+                            .and_then(parse_hex_color),
+                    ) {
+                        theme.colors[index] = Some(color);
+                    }
+                }
+            }
+            Ok(Event::End(e)) if theme_slot(xml_local(e.name().as_ref())).is_some() => slot = None,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    theme
+}
+
+fn add_style_loss(losses: &mut Vec<StyleLoss>, kind: StyleLossKind, occurrences: u32) {
+    if occurrences == 0 {
+        return;
+    }
+    if let Some(loss) = losses.iter_mut().find(|loss| loss.kind == kind) {
+        loss.occurrences = loss.occurrences.saturating_add(occurrences);
+    } else {
+        losses.push(StyleLoss { kind, occurrences });
+    }
+}
+
+#[derive(Clone, Default)]
+struct Styles {
+    xf_numfmt: Vec<u16>,
+    custom: HashMap<u16, String>,
+    fonts: Vec<Font>,
+    fills: Vec<Fill>,
+    borders: Vec<Border>,
+    cell_styles: Vec<CellStyle>,
+    losses: Vec<StyleLoss>,
+    has_source_styles: bool,
+}
+
+impl Styles {
+    fn format_id(&self, style_idx: usize) -> u16 {
+        self.xf_numfmt.get(style_idx).copied().unwrap_or(0)
+    }
+
+    fn kind(&self, style_idx: usize) -> format::Kind {
+        let id = self.format_id(style_idx);
+        format::classify(id, self.custom.get(&id).map(String::as_str))
+    }
+
+    fn custom_format(&self, style_idx: usize) -> Option<&str> {
+        let id = self.xf_numfmt.get(style_idx).copied()?;
+        self.custom.get(&id).map(String::as_str)
+    }
+
+    fn render_text(&self, style_idx: usize, value: &str) -> String {
+        self.custom_format(style_idx).map_or_else(
+            || value.to_string(),
+            |code| format::render_text_format(value, code),
+        )
+    }
+
+    fn cell_style(&self, style_idx: usize) -> Option<&CellStyle> {
+        self.cell_styles.get(style_idx)
+    }
+}
+
+#[derive(Clone, Default)]
+struct RawXf {
+    parent: Option<usize>,
+    num_fmt: u16,
+    font: usize,
+    fill: usize,
+    border: usize,
+    alignment: Alignment,
+    protection: CellProtection,
+    changed_groups: u8,
+}
+
+fn bounded_wide_string(b: &[u8], offset: usize, max_chars: usize) -> Option<(String, usize)> {
+    let chars = usize::try_from(u32le(b, offset)?).ok()?;
+    (chars <= max_chars)
+        .then(|| wide_string(b, offset))
+        .flatten()
+}
+
+fn tint_color(color: Color, tint: i16) -> Color {
+    let factor = f64::from(tint) / if tint < 0 { 32_768.0 } else { 32_767.0 };
+    let tint_channel = |channel: u8| {
+        let channel = f64::from(channel);
+        let result = if factor < 0.0 {
+            channel * (1.0 + factor)
+        } else {
+            channel + (255.0 - channel) * factor
+        };
+        result.round().clamp(0.0, 255.0) as u8
+    };
+    let [red, green, blue] = color.as_rgb();
+    Color::rgb(tint_channel(red), tint_channel(green), tint_channel(blue))
+}
+
+fn indexed_xlsb_color(index: u8) -> Option<Color> {
+    Some(match index {
+        0 | 8 => Color::rgb(0, 0, 0),
+        1 | 9 => Color::rgb(255, 255, 255),
+        2 | 10 => Color::rgb(255, 0, 0),
+        3 | 11 => Color::rgb(0, 255, 0),
+        4 | 12 => Color::rgb(0, 0, 255),
+        5 | 13 => Color::rgb(255, 255, 0),
+        6 | 14 => Color::rgb(255, 0, 255),
+        7 | 15 => Color::rgb(0, 255, 255),
+        16 => Color::rgb(128, 0, 0),
+        17 => Color::rgb(0, 128, 0),
+        18 => Color::rgb(0, 0, 128),
+        19 => Color::rgb(128, 128, 0),
+        20 => Color::rgb(128, 0, 128),
+        21 => Color::rgb(0, 128, 128),
+        22 => Color::rgb(192, 192, 192),
+        23 => Color::rgb(128, 128, 128),
+        _ => return None,
+    })
+}
+
+fn parse_style_color(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -> Option<Color> {
+    let flags = *p.first()?;
+    let valid_rgb = flags & 1 != 0;
+    let color_type = flags >> 1;
+    let index = *p.get(1)?;
+    let tint = i16::from_le_bytes([*p.get(2)?, *p.get(3)?]);
+    let base = match color_type {
+        0 => return None,
+        1 => indexed_xlsb_color(index),
+        2 if valid_rgb => Some(Color::rgb(*p.get(4)?, *p.get(5)?, *p.get(6)?)),
+        3 => theme.colors.get(usize::from(index)).copied().flatten(),
+        _ => None,
+    };
+    if base.is_none() {
+        add_style_loss(losses, StyleLossKind::UnresolvedColor, 1);
+    }
+    base.map(|color| tint_color(color, tint))
+}
+
+fn parse_xlsb_font(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -> Font {
+    let height_twips = u16le(p, 0).unwrap_or(220);
+    if height_twips % 20 != 0 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    let flags = u16le(p, 2).unwrap_or_default();
+    let weight = u16le(p, 4).unwrap_or(400);
+    if !matches!(weight, 400 | 700) {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    let script = match u16le(p, 6).unwrap_or_default() {
+        1 => FormatScript::Superscript,
+        2 => FormatScript::Subscript,
+        _ => FormatScript::None,
+    };
+    let name = bounded_wide_string(p, 21, 1_024).map(|(name, _)| name);
+    if name.is_none() && u32le(p, 21).is_some_and(|length| length > 0) {
+        add_style_loss(losses, StyleLossKind::LimitExceeded, 1);
+    }
+    let underline = p.get(8).copied().unwrap_or_default();
+    if !matches!(underline, 0 | 1) {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    // Outline, shadow, condensed, and extended font flags have no public
+    // model equivalent. Italic and strikethrough are retained below.
+    if flags & !0x000A != 0 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    Font {
+        name,
+        size_pt: Some(((u32::from(height_twips) + 10) / 20).clamp(1, u32::from(u16::MAX)) as u16),
+        color: p
+            .get(12..20)
+            .and_then(|color| parse_style_color(color, theme, losses)),
+        bold: weight >= 700,
+        italic: flags & 0x0002 != 0,
+        underline: underline != 0,
+        strikethrough: flags & 0x0008 != 0,
+        script,
+    }
+}
+
+fn xlsb_fill_pattern(value: u32) -> FormatPattern {
+    match value {
+        1 => FormatPattern::Solid,
+        2 => FormatPattern::MediumGray,
+        3 => FormatPattern::DarkGray,
+        4 => FormatPattern::LightGray,
+        5 => FormatPattern::DarkHorizontal,
+        6 => FormatPattern::DarkVertical,
+        7 => FormatPattern::DarkDown,
+        8 => FormatPattern::DarkUp,
+        9 => FormatPattern::DarkGrid,
+        10 => FormatPattern::DarkTrellis,
+        11 => FormatPattern::LightHorizontal,
+        12 => FormatPattern::LightVertical,
+        13 => FormatPattern::LightDown,
+        14 => FormatPattern::LightUp,
+        15 => FormatPattern::LightGrid,
+        16 => FormatPattern::LightTrellis,
+        17 => FormatPattern::Gray125,
+        18 => FormatPattern::Gray0625,
+        _ => FormatPattern::None,
+    }
+}
+
+fn parse_xlsb_fill(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -> Fill {
+    let raw_pattern = u32le(p, 0).unwrap_or_default();
+    if raw_pattern == 0x28 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+        return Fill::default();
+    }
+    if raw_pattern > 18 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    Fill {
+        pattern: xlsb_fill_pattern(raw_pattern),
+        foreground: p
+            .get(4..12)
+            .and_then(|color| parse_style_color(color, theme, losses)),
+        background: p
+            .get(12..20)
+            .and_then(|color| parse_style_color(color, theme, losses)),
+    }
+}
+
+fn xlsb_border_style(value: u8, losses: &mut Vec<StyleLoss>) -> BorderStyle {
+    let style = match value {
+        0 => BorderStyle::None,
+        1 => BorderStyle::Thin,
+        2 => BorderStyle::Medium,
+        3 | 4 | 7 | 9 | 11 => BorderStyle::Thin,
+        8 | 10 | 12 => BorderStyle::Medium,
+        5 | 13 => BorderStyle::Thick,
+        6 => BorderStyle::Double,
+        _ => BorderStyle::None,
+    };
+    if !matches!(value, 0 | 1 | 2 | 5 | 6) {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    style
+}
+
+fn parse_xlsb_border(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -> Border {
+    let mut border = Border::default();
+    for (offset, edge) in [(1usize, 0u8), (11, 1), (21, 2), (31, 3)] {
+        let style = xlsb_border_style(p.get(offset).copied().unwrap_or_default(), losses);
+        let color = p
+            .get(offset + 2..offset + 10)
+            .and_then(|value| parse_style_color(value, theme, losses));
+        match edge {
+            0 => {
+                border.top = style;
+                border.top_color = color;
+            }
+            1 => {
+                border.bottom = style;
+                border.bottom_color = color;
+            }
+            2 => {
+                border.left = style;
+                border.left_color = color;
+            }
+            _ => {
+                border.right = style;
+                border.right_color = color;
+            }
+        }
+    }
+    if p.first().is_some_and(|flags| flags & 0x03 != 0) {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    border
+}
+
+fn parse_xlsb_xf(p: &[u8], losses: &mut Vec<StyleLoss>) -> Option<RawXf> {
+    let parent = u16le(p, 0)?;
+    let alignment_bits = u16le(p, 12).unwrap_or_default();
+    let horizontal_code = alignment_bits & 0x07;
+    let horizontal = match horizontal_code {
+        1 => Some(HAlign::Left),
+        2 | 6 | 7 => Some(HAlign::Center),
+        3 => Some(HAlign::Right),
+        _ => None,
+    };
+    if matches!(horizontal_code, 4..=7) {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    let vertical_code = (alignment_bits >> 3) & 0x07;
+    let vertical = match vertical_code {
+        0 => Some(VAlign::Top),
+        1 | 3 | 4 => Some(VAlign::Middle),
+        2 => Some(VAlign::Bottom),
+        _ => None,
+    };
+    if vertical_code >= 3 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    // The first four bytes carry the parent and number-format identifiers.
+    // Preserve that valid prefix when an XF's trailing style-component fields
+    // are absent; losing the whole record here also loses date typing.
+    let raw_rotation = i16::from(p.get(10).copied().unwrap_or_default());
+    let rotation = match raw_rotation {
+        0..=90 => raw_rotation,
+        91..=180 => 90 - raw_rotation,
+        _ => 0,
+    };
+    if p.get(10).is_some() && raw_rotation > 180 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    let raw_indent = p.get(11).copied().unwrap_or_default();
+    if raw_indent > 250 {
+        add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+    }
+    if p.get(12..14).is_some() {
+        // Justify-last-line, merge-cell, reading order, PivotTable button, and
+        // quote-prefix bits are not represented by `Alignment`.
+        for mask in [1 << 7, 1 << 9, 0b11 << 10, 1 << 14, 1 << 15] {
+            if alignment_bits & mask != 0 {
+                add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+            }
+        }
+    }
+    Some(RawXf {
+        parent: (parent != u16::MAX).then_some(usize::from(parent)),
+        num_fmt: u16le(p, 2)?,
+        font: usize::from(u16le(p, 4).unwrap_or_default()),
+        fill: usize::from(u16le(p, 6).unwrap_or_default()),
+        border: usize::from(u16le(p, 8).unwrap_or_default()),
+        alignment: Alignment {
+            horizontal,
+            vertical,
+            wrap: alignment_bits & (1 << 6) != 0,
+            rotation,
+            indent: raw_indent.min(250),
+            shrink_to_fit: alignment_bits & (1 << 8) != 0,
+        },
+        protection: CellProtection {
+            locked: Some(alignment_bits & (1 << 12) != 0),
+            hidden: alignment_bits & (1 << 13) != 0,
+        },
+        changed_groups: (u16le(p, 14).unwrap_or_default() & 0x3f) as u8,
+    })
+}
+
+fn built_in_xlsb_num_fmt(id: u16) -> Option<&'static str> {
+    match id {
+        1 => Some("0"),
+        2 => Some("0.00"),
+        3 => Some("#,##0"),
+        4 => Some("#,##0.00"),
+        9 => Some("0%"),
+        10 => Some("0.00%"),
+        11 => Some("0.00E+00"),
+        12 => Some("# ?/?"),
+        13 => Some("# ??/??"),
+        14 => Some("mm-dd-yy"),
+        15 => Some("d-mmm-yy"),
+        16 => Some("d-mmm"),
+        17 => Some("mmm-yy"),
+        18 => Some("h:mm AM/PM"),
+        19 => Some("h:mm:ss AM/PM"),
+        20 => Some("h:mm"),
+        21 => Some("h:mm:ss"),
+        22 => Some("m/d/yy h:mm"),
+        45 => Some("mm:ss"),
+        46 => Some("[h]:mm:ss"),
+        47 => Some("mm:ss.0"),
+        48 => Some("##0.0E+0"),
+        49 => Some("@"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_xf_style(
+    xf: &RawXf,
+    custom: &HashMap<u16, String>,
+    fonts: &[Font],
+    fills: &[Fill],
+    borders: &[Border],
+    parent: Option<&CellStyle>,
+    style_xf: bool,
+    losses: &mut Vec<StyleLoss>,
+) -> CellStyle {
+    let mut result = parent.cloned().unwrap_or_default();
+    let uses = |group: u8| {
+        if style_xf {
+            xf.changed_groups & (1 << group) == 0
+        } else {
+            parent.is_none() || xf.changed_groups & (1 << group) != 0
+        }
+    };
+    if uses(0) {
+        result.num_fmt = custom
+            .get(&xf.num_fmt)
+            .cloned()
+            .or_else(|| built_in_xlsb_num_fmt(xf.num_fmt).map(str::to_string));
+        if result.num_fmt.is_none() && xf.num_fmt >= 164 {
+            add_style_loss(losses, StyleLossKind::MissingReference, 1);
+        } else if result.num_fmt.is_none() && xf.num_fmt != 0 {
+            // Locale-dependent built-ins cannot be converted to a truthful,
+            // locale-neutral format code without workbook locale metadata.
+            add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+        }
+    }
+    if uses(1) {
+        result.font = fonts.get(xf.font).cloned();
+        if result.font.is_none() && xf.font != 0 {
+            add_style_loss(losses, StyleLossKind::MissingReference, 1);
+        }
+    }
+    if uses(2) {
+        result.align = Some(xf.alignment.clone());
+    }
+    if uses(3) {
+        result.border = borders.get(xf.border).cloned();
+        if result.border.is_none() && xf.border != 0 {
+            add_style_loss(losses, StyleLossKind::MissingReference, 1);
+        }
+    }
+    if uses(4) {
+        result.pattern_fill = fills.get(xf.fill).copied();
+        result.fill = result.pattern_fill.and_then(|fill| {
+            (fill.pattern == FormatPattern::Solid)
+                .then_some(fill.foreground.or(fill.background))
+                .flatten()
+        });
+        if result.pattern_fill.is_none() && xf.fill != 0 {
+            add_style_loss(losses, StyleLossKind::MissingReference, 1);
+        }
+    }
+    if uses(5) {
+        result.protection = Some(xf.protection.clone());
+    }
+    result
+}
+
+fn parse_styles(b: &[u8], theme: &XlsbTheme) -> Styles {
     let mut s = Styles::default();
     let mut r = RecReader::new(b);
     let mut in_cell_xfs = false;
+    let mut in_style_xfs = false;
+    let mut raw_cell_xfs = Vec::new();
+    let mut raw_style_xfs = Vec::new();
     while let Some((rt, p)) = r.next() {
         match rt {
+            BRT_FONT if s.fonts.len() < MAX_XLSB_STYLE_RECORDS => {
+                s.has_source_styles = true;
+                s.fonts.push(parse_xlsb_font(p, theme, &mut s.losses));
+            }
+            BRT_FILL if s.fills.len() < MAX_XLSB_STYLE_RECORDS => {
+                s.has_source_styles = true;
+                s.fills.push(parse_xlsb_fill(p, theme, &mut s.losses));
+            }
+            BRT_BORDER if s.borders.len() < MAX_XLSB_STYLE_RECORDS => {
+                s.has_source_styles = true;
+                s.borders.push(parse_xlsb_border(p, theme, &mut s.losses));
+            }
             BRT_FMT => {
                 // ifmt:u16, stFmtCode: XLWideString.
-                if let (Some(ifmt), Some((code, _))) = (u16le(p, 0), wide_string(p, 2)) {
+                s.has_source_styles = true;
+                if let (Some(ifmt), Some((code, _))) =
+                    (u16le(p, 0), bounded_wide_string(p, 2, 4_096))
+                {
                     s.custom.insert(ifmt, code);
+                } else {
+                    add_style_loss(&mut s.losses, StyleLossKind::LimitExceeded, 1);
                 }
             }
+            BRT_BEGIN_CELL_STYLE_XFS => in_style_xfs = true,
+            BRT_END_CELL_STYLE_XFS => in_style_xfs = false,
             BRT_BEGIN_CELL_XFS => {
                 in_cell_xfs = true;
+                s.has_source_styles = true;
             }
             BRT_END_CELL_XFS => {
                 in_cell_xfs = false;
             }
             BRT_XF if in_cell_xfs => {
-                // BrtXF: ixfeParent:u16, iFmt:u16, ...
-                if let Some(ifmt) = u16le(p, 2) {
-                    s.xf_numfmt.push(ifmt);
+                if raw_cell_xfs.len() < MAX_XLSB_STYLE_RECORDS {
+                    if let Some(xf) = parse_xlsb_xf(p, &mut s.losses) {
+                        s.xf_numfmt.push(xf.num_fmt);
+                        raw_cell_xfs.push(xf);
+                    }
+                } else {
+                    add_style_loss(&mut s.losses, StyleLossKind::LimitExceeded, 1);
                 }
+            }
+            BRT_XF if in_style_xfs => {
+                if raw_style_xfs.len() < MAX_XLSB_STYLE_RECORDS {
+                    if let Some(xf) = parse_xlsb_xf(p, &mut s.losses) {
+                        raw_style_xfs.push(xf);
+                    }
+                } else {
+                    add_style_loss(&mut s.losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
+            BRT_FONT | BRT_FILL | BRT_BORDER => {
+                add_style_loss(&mut s.losses, StyleLossKind::LimitExceeded, 1);
             }
             _ => {}
         }
+    }
+    let mut resolved_style_xfs = Vec::with_capacity(raw_style_xfs.len());
+    for xf in &raw_style_xfs {
+        let style = raw_xf_style(
+            xf,
+            &s.custom,
+            &s.fonts,
+            &s.fills,
+            &s.borders,
+            None,
+            true,
+            &mut s.losses,
+        );
+        resolved_style_xfs.push(style);
+    }
+    for xf in &raw_cell_xfs {
+        let parent = xf.parent.and_then(|index| resolved_style_xfs.get(index));
+        if xf.parent.is_some() && parent.is_none() {
+            add_style_loss(&mut s.losses, StyleLossKind::MissingReference, 1);
+        }
+        let style = raw_xf_style(
+            xf,
+            &s.custom,
+            &s.fonts,
+            &s.fills,
+            &s.borders,
+            parent,
+            false,
+            &mut s.losses,
+        );
+        s.cell_styles.push(style);
     }
     s
 }
@@ -801,7 +1459,12 @@ fn apply_xlsb_sheet_builtin_names(sheets: &mut [Sheet], names: Vec<SheetBuiltinN
         };
         match name.kind {
             SheetBuiltinKind::PrintArea => {
-                if let Some(range) = name.ranges.into_iter().next() {
+                let mut first = None;
+                for range in name.ranges {
+                    first.get_or_insert(range);
+                    sheet.print_metadata.push_print_area(range);
+                }
+                if let Some(range) = first {
                     sheet
                         .page_setup
                         .get_or_insert_with(PageSetup::default)
@@ -902,6 +1565,7 @@ struct SheetReadMetadata {
     autofilter: AutoFilter,
     data_validations: Vec<DataValidation>,
     page_setup: Option<PageSetup>,
+    print_metadata: PrintMetadata,
     tab_color: Option<Color>,
     table_rel_ids: Vec<String>,
     print_gridlines: bool,
@@ -920,9 +1584,21 @@ struct SheetReadMetadata {
     collapsed_rows: BTreeSet<u32>,
     row_heights: BTreeMap<u32, f32>,
     col_widths: BTreeMap<u16, f32>,
+    default_col_width: Option<f32>,
+    ooxml_base_col_width: Option<f32>,
+    row_formats: BTreeMap<u32, CellStyle>,
+    col_formats: BTreeMap<u16, CellStyle>,
+    blank_styles: BTreeMap<(u32, u16), CellStyle>,
+    style_losses: Vec<StyleLoss>,
     hidden_rows: BTreeSet<u32>,
     hidden_cols: BTreeSet<u16>,
     rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
+}
+
+#[derive(Clone, Copy)]
+enum XlsbPageBreakAxis {
+    Row,
+    Column,
 }
 
 fn parse_sheet_comments(
@@ -1043,6 +1719,7 @@ fn parse_sheet(
     let mut formula_definitions = BrtFormulaDefinitions::new();
     let mut last_formula_cell: Option<(u32, u16)> = None;
     let mut row: u32 = 0;
+    let mut page_break_axis: Option<XlsbPageBreakAxis> = None;
     let mut r = RecReader::new(b);
     while let Some((rt, p)) = r.next() {
         match rt {
@@ -1061,8 +1738,13 @@ fn parse_sheet(
                 apply_ws_prop_metadata(p, &mut metadata);
             }
             BRT_MARGINS => {
+                metadata.print_metadata.mark_source();
                 if let Some(margins) = parse_page_margins(p) {
                     page_setup_mut(&mut metadata).margins = Some(margins);
+                } else {
+                    metadata
+                        .print_metadata
+                        .add_loss(PrintLossKind::UnsupportedProperty);
                 }
             }
             BRT_PRINT_OPTIONS => {
@@ -1074,6 +1756,17 @@ fn parse_sheet(
             BRT_BEGIN_HEADER_FOOTER => {
                 parse_header_footer(p, &mut metadata);
             }
+            BRT_BEGIN_RW_BRK => {
+                metadata.print_metadata.mark_source();
+                page_break_axis = Some(XlsbPageBreakAxis::Row);
+            }
+            BRT_END_RW_BRK => page_break_axis = None,
+            BRT_BEGIN_COL_BRK => {
+                metadata.print_metadata.mark_source();
+                page_break_axis = Some(XlsbPageBreakAxis::Column);
+            }
+            BRT_END_COL_BRK => page_break_axis = None,
+            BRT_BRK => parse_xlsb_page_break(p, page_break_axis, &mut metadata.print_metadata),
             BRT_BEGIN_WS_VIEW => {
                 let Some(rank) = parse_sheet_view(p, &mut metadata, selected_view_rank) else {
                     in_selected_view = false;
@@ -1093,14 +1786,17 @@ fn parse_sheet(
             BRT_BEGIN_AFILTER => {
                 metadata.autofilter = parse_unchecked_rfx(p);
             }
+            BRT_WS_FMT_INFO => {
+                apply_ws_fmt_info(p, &mut metadata);
+            }
             BRT_COL_INFO => {
-                apply_col_outline(p, &mut metadata);
+                apply_col_outline(p, &mut metadata, styles);
             }
             BRT_ROW_HDR => {
                 if let Some(rr) = u32le(p, 0) {
                     row = rr;
                 }
-                apply_row_outline(p, &mut metadata);
+                apply_row_outline(p, &mut metadata, styles);
             }
             BRT_ARR_FMLA | BRT_SHR_FMLA => {
                 if let Some(definition) = parse_brt_formula_definition(rt, p, last_formula_cell) {
@@ -1136,6 +1832,29 @@ fn parse_sheet(
                     metadata.table_rel_ids.push(rel_id);
                 }
             }
+            BRT_CELL_BLANK => {
+                let Some(col_u) = u32le(p, 0) else { continue };
+                let col = col_u.min(MAX_XLSB_COL_INDEX) as u16;
+                let style_idx = (u32::from(*p.get(4).unwrap_or(&0))
+                    | (u32::from(*p.get(5).unwrap_or(&0)) << 8)
+                    | (u32::from(*p.get(6).unwrap_or(&0)) << 16))
+                    as usize;
+                if metadata.blank_styles.len() < MAX_XLSB_BLANK_STYLES {
+                    if let Some(style) = styles.cell_style(style_idx) {
+                        if style != &CellStyle::default() {
+                            metadata.blank_styles.insert((row, col), style.clone());
+                        }
+                    } else if styles.has_source_styles || style_idx != 0 {
+                        add_style_loss(
+                            &mut metadata.style_losses,
+                            StyleLossKind::MissingReference,
+                            1,
+                        );
+                    }
+                } else {
+                    add_style_loss(&mut metadata.style_losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
             BRT_CELL_RK | BRT_CELL_REAL | BRT_CELL_ISST | BRT_CELL_ST | BRT_CELL_BOOL
             | BRT_CELL_ERROR | BRT_FMLA_NUM | BRT_FMLA_STRING | BRT_FMLA_BOOL | BRT_FMLA_ERROR => {
                 if *budget == 0 {
@@ -1151,9 +1870,18 @@ fn parse_sheet(
                     last_formula_cell = Some((row, col));
                 }
                 let style_idx = (u32::from(*p.get(4).unwrap_or(&0))
-                    | u32::from(*p.get(5).unwrap_or(&0)) << 8
-                    | u32::from(*p.get(6).unwrap_or(&0)) << 16)
+                    | (u32::from(*p.get(5).unwrap_or(&0)) << 8)
+                    | (u32::from(*p.get(6).unwrap_or(&0)) << 16))
                     as usize;
+                if styles.cell_style(style_idx).is_none()
+                    && (styles.has_source_styles || style_idx != 0)
+                {
+                    add_style_loss(
+                        &mut metadata.style_losses,
+                        StyleLossKind::MissingReference,
+                        1,
+                    );
+                }
                 decode_cell(
                     rt,
                     p,
@@ -1224,17 +1952,17 @@ fn apply_ws_prop_metadata(p: &[u8], metadata: &mut SheetReadMetadata) {
     }
 }
 
-fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata) {
+fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles) {
     let (Some(row), Some(height_twips), Some(flags)) = (u32le(p, 0), u16le(p, 8), u16le(p, 10))
     else {
         return;
     };
-    if height_twips > 0 {
+    if height_twips > 0 && flags & (1 << 13) != 0 {
         metadata
             .row_heights
             .insert(row, f32::from(height_twips) / 20.0);
     }
-    if flags & (1 << 5) != 0 {
+    if flags & (1 << 12) != 0 {
         metadata.hidden_rows.insert(row);
     }
     let level = ((flags >> 8) & 0x07) as u8;
@@ -1244,17 +1972,42 @@ fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata) {
     if flags & (1 << 11) != 0 {
         metadata.collapsed_rows.insert(row);
     }
+    if flags & (1 << 14) != 0 {
+        if let Some(style_index) = u32le(p, 4).and_then(|value| usize::try_from(value).ok()) {
+            if let Some(style) = styles.cell_style(style_index) {
+                metadata.row_formats.insert(row, style.clone());
+            } else if styles.has_source_styles || style_index != 0 {
+                add_style_loss(
+                    &mut metadata.style_losses,
+                    StyleLossKind::MissingReference,
+                    1,
+                );
+            }
+        }
+    }
 }
 
-fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata) {
-    let (Some(first), Some(last), Some(width_256), Some(flags)) =
-        (u32le(p, 0), u32le(p, 4), u32le(p, 8), u16le(p, 16))
-    else {
+fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles) {
+    let (Some(first), Some(last), Some(width_256), Some(style_index), Some(flags)) = (
+        u32le(p, 0),
+        u32le(p, 4),
+        u32le(p, 8),
+        u32le(p, 12).and_then(|value| usize::try_from(value).ok()),
+        u16le(p, 16),
+    ) else {
         return;
     };
     let level = ((flags >> 8) & 0x07) as u8;
     if first > last || first > MAX_XLSB_COL_INDEX {
         return;
+    }
+    let column_style = styles.cell_style(style_index).cloned();
+    if column_style.is_none() && (styles.has_source_styles || style_index != 0) {
+        add_style_loss(
+            &mut metadata.style_losses,
+            StyleLossKind::MissingReference,
+            1,
+        );
     }
     for col in first..=last.min(MAX_XLSB_COL_INDEX) {
         let col = col as u16;
@@ -1267,6 +2020,24 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata) {
         if level > 0 {
             metadata.col_outline.insert(col, level);
         }
+        if let Some(style) = column_style.as_ref() {
+            metadata.col_formats.insert(col, style.clone());
+        }
+    }
+}
+
+fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
+    let (Some(default_width_256), Some(base_characters)) = (u32le(p, 0), u16le(p, 4)) else {
+        return;
+    };
+    metadata.default_col_width = None;
+    metadata.ooxml_base_col_width = None;
+    if default_width_256 == u32::MAX {
+        if base_characters <= 255 {
+            metadata.ooxml_base_col_width = Some(f32::from(base_characters));
+        }
+    } else if default_width_256 <= 65_535 {
+        metadata.default_col_width = Some(default_width_256 as f32 / 256.0);
     }
 }
 
@@ -1278,6 +2049,536 @@ fn parse_brt_color(p: &[u8]) -> Option<Color> {
         return None;
     }
     Some(Color::rgb(*p.get(4)?, *p.get(5)?, *p.get(6)?))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XlsbDrawingKind {
+    Image,
+    Chart,
+    Shape,
+}
+
+#[derive(Clone)]
+struct XlsbDrawingRef {
+    kind: XlsbDrawingKind,
+    rid: Option<String>,
+    from: (u32, u16),
+    to: Option<(u32, u16)>,
+    metadata: DrawingMetadata,
+}
+
+#[derive(Clone, Copy)]
+enum DrawingMarker {
+    From,
+    To,
+}
+
+#[derive(Clone, Copy)]
+enum DrawingMarkerField {
+    Row,
+    Col,
+    RowOffset,
+    ColOffset,
+}
+
+fn drawing_relationship_target(xml: &str) -> Option<String> {
+    let rels = crate::xlsx::parse_rels(xml);
+    let types = crate::xlsx::parse_rel_types(xml);
+    types.into_iter().find_map(|(id, ty)| {
+        (ty.rsplit('/').next() == Some("drawing"))
+            .then(|| rels.get(&id).cloned())
+            .flatten()
+    })
+}
+
+fn drawing_text(e: &quick_xml::events::BytesText<'_>) -> String {
+    e.decode().map(|text| text.into_owned()).unwrap_or_default()
+}
+
+fn truncate_drawing_text(value: &mut String) {
+    if value.len() <= MAX_XLSB_DRAWING_TEXT {
+        return;
+    }
+    let mut end = MAX_XLSB_DRAWING_TEXT;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn append_drawing_ref(out: &mut String, reference: &BytesRef<'_>) {
+    if out.len() >= MAX_XLSB_DRAWING_TEXT {
+        return;
+    }
+    match reference.resolve_char_ref() {
+        Ok(Some(ch)) => out.push(ch),
+        Ok(None) => {
+            if let Ok(name) = reference.decode() {
+                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
+                    out.push_str(value);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    truncate_drawing_text(out);
+}
+
+fn parse_anchor_behavior(
+    element: &[u8],
+    e: &quick_xml::events::BytesStart<'_>,
+) -> DrawingAnchorBehavior {
+    match element {
+        b"absoluteAnchor" => DrawingAnchorBehavior::Absolute,
+        b"oneCellAnchor" => DrawingAnchorBehavior::MoveOnly,
+        b"twoCellAnchor" => match xml_attr(e, b"editAs").as_deref() {
+            Some("absolute") => DrawingAnchorBehavior::Absolute,
+            Some("oneCell") => DrawingAnchorBehavior::MoveOnly,
+            _ => DrawingAnchorBehavior::MoveAndSize,
+        },
+        _ => DrawingAnchorBehavior::MoveAndSize,
+    }
+}
+
+fn parse_xlsb_drawing_refs(xml: &str) -> Vec<XlsbDrawingRef> {
+    const MAX_ROW: u32 = 1_048_575;
+    const MAX_COL: u16 = 16_383;
+    let mut reader = Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut current: Option<XlsbDrawingRef> = None;
+    let mut marker = None;
+    let mut field = None;
+    let mut field_text = String::new();
+    let mut from_offset = (0i64, 0i64);
+    let mut to_offset = (0i64, 0i64);
+    let mut from_offset_seen = false;
+    let mut to_offset_seen = false;
+    let mut from_row_seen = false;
+    let mut from_col_seen = false;
+    let mut to_row_seen = false;
+    let mut to_col_seen = false;
+    let mut desc_depth = 0usize;
+    let mut desc_text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = xml_local(name.as_ref());
+                match local {
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
+                        if out.len() >= MAX_XLSB_DRAWINGS {
+                            break;
+                        }
+                        current = Some(XlsbDrawingRef {
+                            kind: XlsbDrawingKind::Shape,
+                            rid: None,
+                            from: (0, 0),
+                            to: None,
+                            metadata: DrawingMetadata {
+                                behavior: parse_anchor_behavior(local, &e),
+                                z_order: Some(out.len().min(i32::MAX as usize) as i32),
+                                ..Default::default()
+                            },
+                        });
+                        from_offset = (0, 0);
+                        to_offset = (0, 0);
+                        from_offset_seen = false;
+                        to_offset_seen = false;
+                        from_row_seen = false;
+                        from_col_seen = false;
+                        to_row_seen = false;
+                        to_col_seen = false;
+                    }
+                    b"from" if current.is_some() => marker = Some(DrawingMarker::From),
+                    b"to" if current.is_some() => marker = Some(DrawingMarker::To),
+                    b"row" if current.is_some() => field = Some(DrawingMarkerField::Row),
+                    b"col" if current.is_some() => field = Some(DrawingMarkerField::Col),
+                    b"rowOff" if current.is_some() => field = Some(DrawingMarkerField::RowOffset),
+                    b"colOff" if current.is_some() => field = Some(DrawingMarkerField::ColOffset),
+                    b"blip" if current.is_some() => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.rid.is_none() {
+                            item.rid = xml_attr(&e, b"embed");
+                            item.kind = XlsbDrawingKind::Image;
+                        }
+                    }
+                    b"chart" if current.is_some() => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.rid.is_none() {
+                            item.rid = xml_attr(&e, b"id");
+                            item.kind = XlsbDrawingKind::Chart;
+                        }
+                    }
+                    b"cNvPr" if current.is_some() => {
+                        let item = current.as_mut().expect("drawing");
+                        item.metadata.name = xml_attr(&e, b"name")
+                            .filter(|value| value.len() <= MAX_XLSB_DRAWING_TEXT);
+                        item.metadata.alt_text = xml_attr(&e, b"descr")
+                            .filter(|value| value.len() <= MAX_XLSB_DRAWING_TEXT);
+                    }
+                    b"xfrm" if current.is_some() => {
+                        current.as_mut().expect("drawing").metadata.rotation_mdeg =
+                            xml_attr(&e, b"rot")
+                                .and_then(|value| value.parse::<i32>().ok())
+                                .map(|value| value / 60);
+                    }
+                    b"ext"
+                        if current.as_ref().is_some_and(|item| {
+                            item.metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+                        }) =>
+                    {
+                        let width = xml_attr(&e, b"cx").and_then(|value| value.parse::<u64>().ok());
+                        let height =
+                            xml_attr(&e, b"cy").and_then(|value| value.parse::<u64>().ok());
+                        let item = current.as_mut().expect("drawing");
+                        if item.metadata.absolute_size_emu.is_none() {
+                            item.metadata.absolute_size_emu = width.zip(height);
+                        }
+                    }
+                    b"pos" if current.is_some() => {
+                        let x = xml_attr(&e, b"x").and_then(|value| value.parse::<i64>().ok());
+                        let y = xml_attr(&e, b"y").and_then(|value| value.parse::<i64>().ok());
+                        current.as_mut().expect("drawing").metadata.from_offset_emu = x.zip(y);
+                    }
+                    b"srcRect" if current.is_some() => {
+                        let edge = |name| {
+                            xml_attr(&e, name)
+                                .and_then(|value| value.parse::<u32>().ok())
+                                .map(|value| value.saturating_mul(10).min(1_000_000))
+                                .unwrap_or(0)
+                        };
+                        current.as_mut().expect("drawing").metadata.crop = Some(DrawingCrop {
+                            left_ppm: edge(b"l"),
+                            top_ppm: edge(b"t"),
+                            right_ppm: edge(b"r"),
+                            bottom_ppm: edge(b"b"),
+                        });
+                    }
+                    b"desc" if current.is_some() => {
+                        desc_depth = 1;
+                        desc_text.clear();
+                    }
+                    _ if desc_depth > 0 => desc_depth += 1,
+                    _ => {}
+                }
+                if field.is_some() {
+                    field_text.clear();
+                }
+            }
+            Ok(Event::Empty(e)) if current.is_some() => match xml_local(e.name().as_ref()) {
+                b"blip" => {
+                    let item = current.as_mut().expect("drawing");
+                    if item.rid.is_none() {
+                        item.rid = xml_attr(&e, b"embed");
+                        item.kind = XlsbDrawingKind::Image;
+                    }
+                }
+                b"chart" => {
+                    let item = current.as_mut().expect("drawing");
+                    if item.rid.is_none() {
+                        item.rid = xml_attr(&e, b"id");
+                        item.kind = XlsbDrawingKind::Chart;
+                    }
+                }
+                b"cNvPr" => {
+                    let item = current.as_mut().expect("drawing");
+                    item.metadata.name =
+                        xml_attr(&e, b"name").filter(|value| value.len() <= MAX_XLSB_DRAWING_TEXT);
+                    item.metadata.alt_text =
+                        xml_attr(&e, b"descr").filter(|value| value.len() <= MAX_XLSB_DRAWING_TEXT);
+                }
+                b"ext"
+                    if current.as_ref().is_some_and(|item| {
+                        item.metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+                    }) =>
+                {
+                    let width = xml_attr(&e, b"cx").and_then(|value| value.parse::<u64>().ok());
+                    let height = xml_attr(&e, b"cy").and_then(|value| value.parse::<u64>().ok());
+                    let item = current.as_mut().expect("drawing");
+                    if item.metadata.absolute_size_emu.is_none() {
+                        item.metadata.absolute_size_emu = width.zip(height);
+                    }
+                }
+                b"pos" => {
+                    let x = xml_attr(&e, b"x").and_then(|value| value.parse::<i64>().ok());
+                    let y = xml_attr(&e, b"y").and_then(|value| value.parse::<i64>().ok());
+                    current.as_mut().expect("drawing").metadata.from_offset_emu = x.zip(y);
+                }
+                b"srcRect" => {
+                    let edge = |name| {
+                        xml_attr(&e, name)
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .map(|value| value.saturating_mul(10).min(1_000_000))
+                            .unwrap_or(0)
+                    };
+                    current.as_mut().expect("drawing").metadata.crop = Some(DrawingCrop {
+                        left_ppm: edge(b"l"),
+                        top_ppm: edge(b"t"),
+                        right_ppm: edge(b"r"),
+                        bottom_ppm: edge(b"b"),
+                    });
+                }
+                _ => {}
+            },
+            Ok(Event::Text(text)) if field.is_some() => {
+                field_text.push_str(&drawing_text(&text));
+            }
+            Ok(Event::Text(text)) if desc_depth > 0 => {
+                if desc_text.len() < MAX_XLSB_DRAWING_TEXT {
+                    desc_text.push_str(&drawing_text(&text));
+                    truncate_drawing_text(&mut desc_text);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) if field.is_some() => {
+                append_drawing_ref(&mut field_text, &reference);
+            }
+            Ok(Event::GeneralRef(reference)) if desc_depth > 0 => {
+                append_drawing_ref(&mut desc_text, &reference);
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = xml_local(name.as_ref());
+                match local {
+                    b"row" | b"col" | b"rowOff" | b"colOff" if current.is_some() => {
+                        if let (Some(marker), Some(field), Ok(value)) =
+                            (marker, field, field_text.trim().parse::<i64>())
+                        {
+                            let item = current.as_mut().expect("drawing");
+                            match (marker, field) {
+                                (DrawingMarker::From, DrawingMarkerField::Row) => {
+                                    item.from.0 = value.max(0).min(i64::from(MAX_ROW)) as u32;
+                                    from_row_seen = true;
+                                }
+                                (DrawingMarker::From, DrawingMarkerField::Col) => {
+                                    item.from.1 = value.max(0).min(i64::from(MAX_COL)) as u16;
+                                    from_col_seen = true;
+                                }
+                                (DrawingMarker::To, DrawingMarkerField::Row) => {
+                                    item.to.get_or_insert((0, 0)).0 =
+                                        value.max(0).min(i64::from(MAX_ROW)) as u32;
+                                    to_row_seen = true;
+                                }
+                                (DrawingMarker::To, DrawingMarkerField::Col) => {
+                                    item.to.get_or_insert((0, 0)).1 =
+                                        value.max(0).min(i64::from(MAX_COL)) as u16;
+                                    to_col_seen = true;
+                                }
+                                (DrawingMarker::From, DrawingMarkerField::RowOffset) => {
+                                    from_offset.1 = value;
+                                    from_offset_seen = true;
+                                }
+                                (DrawingMarker::From, DrawingMarkerField::ColOffset) => {
+                                    from_offset.0 = value;
+                                    from_offset_seen = true;
+                                }
+                                (DrawingMarker::To, DrawingMarkerField::RowOffset) => {
+                                    to_offset.1 = value;
+                                    to_offset_seen = true;
+                                }
+                                (DrawingMarker::To, DrawingMarkerField::ColOffset) => {
+                                    to_offset.0 = value;
+                                    to_offset_seen = true;
+                                }
+                            }
+                        }
+                        field = None;
+                        field_text.clear();
+                    }
+                    b"from" | b"to" => marker = None,
+                    b"desc" if desc_depth > 0 => {
+                        if !desc_text.trim().is_empty() {
+                            current.as_mut().expect("drawing").metadata.alt_text =
+                                Some(desc_text.trim().to_string());
+                        }
+                        desc_depth = 0;
+                    }
+                    _ if desc_depth > 0 => desc_depth -= 1,
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
+                        if let Some(mut item) = current.take() {
+                            if item.metadata.from_offset_emu.is_none() && from_offset_seen {
+                                item.metadata.from_offset_emu = Some(from_offset);
+                            }
+                            if to_offset_seen {
+                                item.metadata.to_offset_emu = Some(to_offset);
+                            }
+                            if from_row_seen && from_col_seen {
+                                item.metadata.from_cell = Some(item.from);
+                            }
+                            if to_row_seen && to_col_seen {
+                                item.metadata.to_cell = item.to;
+                            }
+                            out.push(item);
+                        }
+                        marker = None;
+                        field = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+fn xlsb_image_format(path: &str) -> Option<ImageFmt> {
+    match path.rsplit('.').next()?.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageFmt::Png),
+        "jpg" | "jpeg" => Some(ImageFmt::Jpeg),
+        _ => None,
+    }
+}
+
+fn part_bytes_limited(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+    max: u64,
+) -> Option<Vec<u8>> {
+    let index = part_index(zip, name)?;
+    let file = zip.by_index(index).ok()?;
+    if file.size() > max {
+        return None;
+    }
+    let mut out = Vec::with_capacity(usize::try_from(file.size()).ok()?);
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut out)
+        .ok()?;
+    (u64::try_from(out.len()).ok()? <= max).then_some(out)
+}
+
+type DrawingReadResult = (Vec<Image>, Vec<Chart>, Vec<DrawingMetadata>, Vec<StyleLoss>);
+
+fn retain_xlsb_unrepresented_drawing(
+    mut sidecar: DrawingMetadata,
+    metadata: &mut Vec<DrawingMetadata>,
+) {
+    sidecar.kind = DrawingObjectKind::Shape;
+    sidecar.object_index = 0;
+    metadata.push(sidecar);
+}
+
+fn read_sheet_drawings(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    sheet_path: &str,
+    sheet_rels_xml: &str,
+    theme: &XlsbTheme,
+) -> DrawingReadResult {
+    const MAX_IMAGE_PART: u64 = 64 << 20;
+    const MAX_IMAGE_TOTAL: usize = 256 << 20;
+    let Some(target) = drawing_relationship_target(sheet_rels_xml) else {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    };
+    let drawing_path = normalize_part_target(sheet_path, &target);
+    let Some(drawing_xml) = crate::xlsx::part_str(zip, &drawing_path) else {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![StyleLoss {
+                kind: StyleLossKind::DrawingMetadataPartial,
+                occurrences: 1,
+            }],
+        );
+    };
+    let refs = parse_xlsb_drawing_refs(&drawing_xml);
+    let rels_xml = crate::xlsx::part_str(zip, &sheet_rels_path(&drawing_path)).unwrap_or_default();
+    let rels = crate::xlsx::parse_rels(&rels_xml);
+    let mut images = Vec::new();
+    let mut charts = Vec::new();
+    let mut metadata = Vec::new();
+    let mut losses = Vec::new();
+    let mut image_bytes = 0usize;
+    let mut chart_cache_points_remaining = 1_000_000;
+    let mut chart_series_remaining = 4_096;
+    for drawing in refs {
+        match drawing.kind {
+            XlsbDrawingKind::Image => {
+                let Some(target) = drawing.rid.as_ref().and_then(|rid| rels.get(rid)) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let path = normalize_part_target(&drawing_path, target);
+                let Some(format) = xlsb_image_format(&path) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                let Some(data) = part_bytes_limited(zip, &path, MAX_IMAGE_PART) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                };
+                if image_bytes.saturating_add(data.len()) > MAX_IMAGE_TOTAL {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                image_bytes += data.len();
+                let index = images.len();
+                images.push(Image {
+                    data,
+                    format,
+                    from: drawing.from,
+                    to: drawing.to,
+                });
+                let mut sidecar = drawing.metadata;
+                sidecar.kind = DrawingObjectKind::Image;
+                sidecar.object_index = index;
+                metadata.push(sidecar);
+            }
+            XlsbDrawingKind::Chart => {
+                let Some(target) = drawing.rid.as_ref().and_then(|rid| rels.get(rid)) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let path = normalize_part_target(&drawing_path, target);
+                let Some(chart_xml) = crate::xlsx::part_str(zip, &path) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let Some(parsed) = crate::xlsx::parse_chart(
+                    &chart_xml,
+                    drawing.from,
+                    drawing.to.unwrap_or(drawing.from),
+                    &mut chart_cache_points_remaining,
+                    &mut chart_series_remaining,
+                ) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                let has_unsupported_chart_content = !parsed.unsupported_reasons.is_empty();
+                let index = charts.len();
+                charts.push(parsed.chart);
+                let mut sidecar = drawing.metadata;
+                sidecar.kind = DrawingObjectKind::Chart;
+                sidecar.object_index = index;
+                sidecar.chart_palette = theme.chart_palette();
+                sidecar.chart_series_caches = parsed.series_caches;
+                sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
+                sidecar.chart_bar_direction = parsed.bar_direction;
+                metadata.push(sidecar);
+                if parsed.limit_exceeded {
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                }
+                if has_unsupported_chart_content {
+                    add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                }
+            }
+            XlsbDrawingKind::Shape => {
+                let mut sidecar = drawing.metadata;
+                sidecar.kind = DrawingObjectKind::Shape;
+                sidecar.object_index = 0;
+                metadata.push(sidecar);
+                add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+            }
+        }
+    }
+    (images, charts, metadata, losses)
 }
 
 fn parse_sheet_tables(
@@ -1408,7 +2709,24 @@ fn xlsb_margin_at(p: &[u8], offset: usize) -> Option<f64> {
 }
 
 fn parse_print_options(p: &[u8], metadata: &mut SheetReadMetadata) {
-    let Some(flags) = u16le(p, 0) else { return };
+    let Some(flags) = u16le(p, 0) else {
+        metadata
+            .print_metadata
+            .add_loss(PrintLossKind::UnsupportedProperty);
+        return;
+    };
+    metadata
+        .print_metadata
+        .set_center_horizontally(flags & 0x0001 != 0);
+    metadata
+        .print_metadata
+        .set_center_vertically(flags & 0x0002 != 0);
+    metadata
+        .print_metadata
+        .set_print_headings(flags & 0x0004 != 0);
+    metadata
+        .print_metadata
+        .set_print_gridlines(flags & 0x0008 != 0);
     if flags & 0x0001 != 0 {
         page_setup_mut(metadata).center_horizontally = true;
     }
@@ -1421,8 +2739,19 @@ fn parse_print_options(p: &[u8], metadata: &mut SheetReadMetadata) {
 
 fn parse_page_setup(p: &[u8], metadata: &mut SheetReadMetadata) {
     let (Some(page_start), Some(flags)) = (i32le(p, 20), u16le(p, 32)) else {
+        metadata
+            .print_metadata
+            .add_loss(PrintLossKind::UnsupportedProperty);
         return;
     };
+
+    metadata
+        .print_metadata
+        .set_page_order(if flags & 0x0001 != 0 {
+            PrintPageOrder::OverThenDown
+        } else {
+            PrintPageOrder::DownThenOver
+        });
 
     let ps = page_setup_mut(metadata);
     ps.paper_size = nonzero_u32_as_u16(p, 0);
@@ -1446,23 +2775,81 @@ fn nonzero_u32_as_u16(p: &[u8], offset: usize) -> Option<u16> {
 }
 
 fn parse_header_footer(p: &[u8], metadata: &mut SheetReadMetadata) {
-    let Some((header, footer)) = parse_header_footer_pair(p) else {
+    let Some(flags) = u16le(p, 0) else {
+        metadata
+            .print_metadata
+            .add_loss(PrintLossKind::MalformedHeaderFooter);
         return;
     };
-    if !header.is_empty() {
-        page_setup_mut(metadata).header = Some(header);
+    metadata.print_metadata.set_header_footer_flag(
+        Some(flags & 0x0001 != 0),
+        Some(flags & 0x0002 != 0),
+        Some(flags & 0x0004 != 0),
+        Some(flags & 0x0008 != 0),
+    );
+    let mut offset = 2usize;
+    let mut fields = Vec::with_capacity(6);
+    for kind in [
+        HeaderFooterKind::OddHeader,
+        HeaderFooterKind::OddFooter,
+        HeaderFooterKind::EvenHeader,
+        HeaderFooterKind::EvenFooter,
+        HeaderFooterKind::FirstHeader,
+        HeaderFooterKind::FirstFooter,
+    ] {
+        let Some((value, used)) = nullable_wide_opt(p, offset) else {
+            metadata
+                .print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+            return;
+        };
+        if let Some(value) = value.as_ref() {
+            metadata
+                .print_metadata
+                .set_header_footer(kind, value.clone());
+        }
+        fields.push(value);
+        let Some(next) = offset.checked_add(used) else {
+            metadata
+                .print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+            return;
+        };
+        offset = next;
     }
-    if !footer.is_empty() {
-        page_setup_mut(metadata).footer = Some(footer);
+    if let Some(header) = fields.first().and_then(|value| value.as_ref()) {
+        if !header.is_empty() {
+            page_setup_mut(metadata).header = Some(header.clone());
+        }
+    }
+    if let Some(footer) = fields.get(1).and_then(|value| value.as_ref()) {
+        if !footer.is_empty() {
+            page_setup_mut(metadata).footer = Some(footer.clone());
+        }
     }
 }
 
-fn parse_header_footer_pair(p: &[u8]) -> Option<(String, String)> {
-    let mut offset = 2usize;
-    let (header, used) = nullable_wide(p, offset)?;
-    offset = offset.checked_add(used)?;
-    let (footer, _) = nullable_wide(p, offset)?;
-    Some((header, footer))
+fn parse_xlsb_page_break(p: &[u8], axis: Option<XlsbPageBreakAxis>, metadata: &mut PrintMetadata) {
+    let (Some(index), Some(manual)) = (u32le(p, 0), u32le(p, 12)) else {
+        metadata.add_loss(PrintLossKind::InvalidPageBreak);
+        return;
+    };
+    match manual {
+        0 => return,
+        1 => {}
+        _ => {
+            metadata.add_loss(PrintLossKind::InvalidPageBreak);
+            return;
+        }
+    }
+    match axis {
+        Some(XlsbPageBreakAxis::Row) => metadata.push_manual_row_break(index),
+        Some(XlsbPageBreakAxis::Column) => match u16::try_from(index) {
+            Ok(col) => metadata.push_manual_col_break(col),
+            Err(_) => metadata.add_loss(PrintLossKind::InvalidPageBreak),
+        },
+        None => metadata.add_loss(PrintLossKind::InvalidPageBreak),
+    }
 }
 
 fn parse_dval(p: &[u8], list_formula: Option<String>) -> Vec<DataValidation> {
@@ -1872,13 +3259,18 @@ fn decode_cell(
             col,
             value,
             text,
-            style: None,
+            style: (style_idx != 0)
+                .then(|| styles.cell_style(style_idx).cloned())
+                .flatten(),
             hyperlink: None,
         });
     };
     let number = |f: f64, cells: &mut Vec<CellEntry>, budget: &mut usize| {
         let kind = styles.kind(style_idx);
-        let display = format::render_value(f, kind, date1904);
+        let display = styles.custom_format(style_idx).map_or_else(
+            || format::render_indexed(f, styles.format_id(style_idx), date1904),
+            |code| format::render_format(f, code, date1904),
+        );
         let cell = if kind.is_datetime() {
             Cell::Date(f)
         } else {
@@ -1900,7 +3292,10 @@ fn decode_cell(
             if let Some(s) = p.get(8..16) {
                 let f = f64::from_le_bytes(s.try_into().unwrap_or([0; 8]));
                 let kind = styles.kind(style_idx);
-                let display = format::render_value(f, kind, date1904);
+                let display = styles.custom_format(style_idx).map_or_else(
+                    || format::render_indexed(f, styles.format_id(style_idx), date1904),
+                    |code| format::render_format(f, code, date1904),
+                );
                 let cached = if kind.is_datetime() {
                     Cell::Date(f)
                 } else {
@@ -1922,7 +3317,8 @@ fn decode_cell(
         BRT_CELL_ISST => {
             if let Some(isst) = u32le(p, 8) {
                 if let Some(s) = shared.get(isst as usize) {
-                    push(cells, budget, Cell::Text(s.text.clone()), s.text.clone());
+                    let display = styles.render_text(style_idx, &s.text);
+                    push(cells, budget, Cell::Text(s.text.clone()), display);
                     if !s.runs.is_empty() {
                         rich.insert((row, col), s.runs.clone());
                     }
@@ -1931,11 +3327,13 @@ fn decode_cell(
         }
         BRT_CELL_ST => {
             if let Some((s, _)) = wide_string(p, 8) {
-                push(cells, budget, Cell::Text(s.clone()), s);
+                let display = styles.render_text(style_idx, &s);
+                push(cells, budget, Cell::Text(s), display);
             }
         }
         BRT_FMLA_STRING => {
             if let Some((s, used)) = wide_string(p, 8) {
+                let display = styles.render_text(style_idx, &s);
                 push(
                     cells,
                     budget,
@@ -1946,7 +3344,7 @@ fn decode_cell(
                         &formula_context,
                         formula_definitions,
                     ),
-                    s,
+                    display,
                 );
             }
         }
@@ -2264,6 +3662,8 @@ mod tests {
             Some(&Cell::Text("품목".to_string()))
         );
         assert_eq!(wb.sheets[0].cell(0, 1), Some(&Cell::Number(42.0)));
+        assert_eq!(wb.sheets[0].default_column_width(), None);
+        assert_eq!(wb.sheets[0].implicit_ooxml_column_width(), Some(None));
         assert_eq!(
             wb.sheets[0]
                 .rich_text_runs(0, 0)
@@ -2433,7 +3833,7 @@ mod tests {
         let wb_bin = rec(BRT_BUNDLE_SH, &wb_bin);
 
         let mut fmt = 164u16.to_le_bytes().to_vec();
-        fmt.extend_from_slice(&wstr("yyyy-mm-dd"));
+        fmt.extend_from_slice(&wstr("yyyy\"년\" m\"월\" d\"일\""));
         let mut styles = rec(BRT_FMT, &fmt);
         styles.extend_from_slice(&rec(0x0272, &1u32.to_le_bytes()));
         styles.extend_from_slice(&rec(BRT_XF, &xf(0)));
@@ -2468,7 +3868,479 @@ mod tests {
 
         let wb = Workbook::open(&bytes).unwrap();
         assert_eq!(wb.sheets[0].cell(0, 0), Some(&Cell::Date(44_197.0)));
+        assert_eq!(wb.sheets[0].formatted(0, 0), Some("2021년 1월 1일"));
         assert_eq!(wb.sheets[0].cell(0, 1), Some(&Cell::Number(15.0)));
+    }
+
+    #[test]
+    fn xlsb_compact_xf_prefix_retains_date_numfmt_mapping() {
+        let compact_xf = |num_fmt: u16| {
+            let mut payload = 0u16.to_le_bytes().to_vec();
+            payload.extend_from_slice(&num_fmt.to_le_bytes());
+            rec(BRT_XF, &payload)
+        };
+        let mut style_stream = rec(BRT_BEGIN_CELL_XFS, &2u32.to_le_bytes());
+        style_stream.extend_from_slice(&compact_xf(0));
+        style_stream.extend_from_slice(&compact_xf(14));
+        style_stream.extend_from_slice(&rec(BRT_END_CELL_XFS, &[]));
+
+        let styles = parse_styles(&style_stream, &XlsbTheme::default());
+
+        assert_eq!(styles.format_id(1), 14);
+        assert_eq!(styles.kind(1), format::Kind::Date);
+        assert_eq!(
+            styles
+                .cell_style(1)
+                .and_then(|style| style.num_fmt.as_deref()),
+            Some("mm-dd-yy")
+        );
+        assert_eq!(
+            format::render_indexed(45_366.0, styles.format_id(1), false),
+            "2024-03-15"
+        );
+    }
+
+    #[test]
+    fn xlsb_standard_builtin_number_formats_are_retained_as_style_codes() {
+        for (id, expected) in [
+            (12, "# ?/?"),
+            (13, "# ??/??"),
+            (15, "d-mmm-yy"),
+            (18, "h:mm AM/PM"),
+            (45, "mm:ss"),
+            (46, "[h]:mm:ss"),
+            (48, "##0.0E+0"),
+        ] {
+            assert_eq!(built_in_xlsb_num_fmt(id), Some(expected), "format {id}");
+        }
+    }
+
+    #[test]
+    fn xlsb_sheet_style_references_report_missing_xfs_once_per_record() {
+        let styles = Styles {
+            cell_styles: vec![CellStyle::default()],
+            has_source_styles: true,
+            ..Default::default()
+        };
+
+        let mut col_info = Vec::new();
+        col_info.extend_from_slice(&0u32.to_le_bytes());
+        col_info.extend_from_slice(&1u32.to_le_bytes());
+        col_info.extend_from_slice(&256u32.to_le_bytes());
+        col_info.extend_from_slice(&9u32.to_le_bytes());
+        col_info.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut row_header = Vec::new();
+        row_header.extend_from_slice(&0u32.to_le_bytes());
+        row_header.extend_from_slice(&8u32.to_le_bytes());
+        row_header.extend_from_slice(&0u16.to_le_bytes());
+        row_header.extend_from_slice(&(1u16 << 14).to_le_bytes());
+
+        let mut blank = vec![0u8; 8];
+        blank[4..7].copy_from_slice(&7u32.to_le_bytes()[..3]);
+        let mut number = vec![0u8; 8];
+        number[0..4].copy_from_slice(&1u32.to_le_bytes());
+        number[4..7].copy_from_slice(&6u32.to_le_bytes()[..3]);
+        number.extend_from_slice(&1.0f64.to_le_bytes());
+
+        let mut stream = rec(BRT_COL_INFO, &col_info);
+        stream.extend_from_slice(&rec(BRT_ROW_HDR, &row_header));
+        stream.extend_from_slice(&rec(BRT_CELL_BLANK, &blank));
+        stream.extend_from_slice(&rec(BRT_CELL_REAL, &number));
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let (_, _, _, metadata) = parse_sheet(
+            &stream,
+            &[],
+            &styles,
+            false,
+            &HashMap::new(),
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            metadata
+                .style_losses
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::MissingReference)
+                .map(|loss| loss.occurrences),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn xlsb_ws_format_info_distinguishes_default_and_base_column_widths() {
+        let parse = |default_width_256: u32, base_characters: u16| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&default_width_256.to_le_bytes());
+            payload.extend_from_slice(&base_characters.to_le_bytes());
+            payload.extend_from_slice(&300u16.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            let mut budget = crate::MAX_TEXT_BYTES;
+            parse_sheet(
+                &rec(BRT_WS_FMT_INFO, &payload),
+                &[],
+                &Styles::default(),
+                false,
+                &HashMap::new(),
+                &mut budget,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .3
+        };
+
+        let explicit = parse(2_158, 42);
+        assert_eq!(explicit.default_col_width, Some(2_158.0 / 256.0));
+        assert_eq!(explicit.ooxml_base_col_width, None);
+
+        let base = parse(u32::MAX, 8);
+        assert_eq!(base.default_col_width, None);
+        assert_eq!(base.ooxml_base_col_width, Some(8.0));
+
+        let invalid_base = parse(u32::MAX, 256);
+        assert_eq!(invalid_base.default_col_width, None);
+        assert_eq!(invalid_base.ooxml_base_col_width, None);
+    }
+
+    #[test]
+    fn xlsb_unrepresentable_xf_and_border_variants_are_typed_losses() {
+        let mut dashed_border = vec![0u8; 51];
+        dashed_border[1] = 3;
+        let mut raw = xf(0);
+        raw[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        raw[8..10].copy_from_slice(&0u16.to_le_bytes());
+        raw[12..14].copy_from_slice(&(7u16 | (1 << 7) | (1 << 10)).to_le_bytes());
+
+        let mut stream = rec(BRT_BORDER, &dashed_border);
+        stream.extend_from_slice(&rec(BRT_BEGIN_CELL_XFS, &1u32.to_le_bytes()));
+        stream.extend_from_slice(&rec(BRT_XF, &raw));
+        stream.extend_from_slice(&rec(BRT_END_CELL_XFS, &[]));
+        let styles = parse_styles(&stream, &XlsbTheme::default());
+
+        assert!(styles
+            .losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::UnsupportedProperty && loss.occurrences >= 3));
+    }
+
+    #[test]
+    fn xlsb_style_tables_retain_inherited_components() {
+        fn rgb(red: u8, green: u8, blue: u8) -> [u8; 8] {
+            [5, 0, 0, 0, red, green, blue, 0xFF]
+        }
+
+        fn font(
+            name: &str,
+            height_twips: u16,
+            flags: u16,
+            weight: u16,
+            script: u16,
+            underline: u8,
+            color: [u8; 8],
+        ) -> Vec<u8> {
+            let mut out = vec![0u8; 21];
+            out[0..2].copy_from_slice(&height_twips.to_le_bytes());
+            out[2..4].copy_from_slice(&flags.to_le_bytes());
+            out[4..6].copy_from_slice(&weight.to_le_bytes());
+            out[6..8].copy_from_slice(&script.to_le_bytes());
+            out[8] = underline;
+            out[12..20].copy_from_slice(&color);
+            out.extend_from_slice(&wstr(name));
+            out
+        }
+
+        fn raw_xf(
+            parent: u16,
+            num_fmt: u16,
+            font: u16,
+            fill: u16,
+            border: u16,
+            changed_groups: u16,
+        ) -> Vec<u8> {
+            let mut out = vec![0u8; 16];
+            out[0..2].copy_from_slice(&parent.to_le_bytes());
+            out[2..4].copy_from_slice(&num_fmt.to_le_bytes());
+            out[4..6].copy_from_slice(&font.to_le_bytes());
+            out[6..8].copy_from_slice(&fill.to_le_bytes());
+            out[8..10].copy_from_slice(&border.to_le_bytes());
+            out[14..16].copy_from_slice(&changed_groups.to_le_bytes());
+            out
+        }
+
+        let default_font = font("Aptos", 220, 0, 400, 0, 0, [0; 8]);
+        let custom_font = font(
+            "Noto Sans KR",
+            240,
+            0x000A,
+            700,
+            2,
+            1,
+            rgb(0x11, 0x22, 0x33),
+        );
+
+        let default_fill = vec![0u8; 20];
+        let mut custom_fill = vec![0u8; 20];
+        custom_fill[0..4].copy_from_slice(&1u32.to_le_bytes());
+        custom_fill[4..12].copy_from_slice(&rgb(0xFF, 0xEE, 0xCC));
+
+        let default_border = vec![0u8; 41];
+        let mut custom_border = vec![0u8; 41];
+        custom_border[1] = 6;
+        custom_border[3..11].copy_from_slice(&rgb(0x44, 0x55, 0x66));
+
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&wstr("₩#,##0.00"));
+
+        let mut styles = rec(BRT_FONT, &default_font);
+        styles.extend_from_slice(&rec(BRT_FONT, &custom_font));
+        styles.extend_from_slice(&rec(BRT_FILL, &default_fill));
+        styles.extend_from_slice(&rec(BRT_FILL, &custom_fill));
+        styles.extend_from_slice(&rec(BRT_BORDER, &default_border));
+        styles.extend_from_slice(&rec(BRT_BORDER, &custom_border));
+        styles.extend_from_slice(&rec(BRT_FMT, &format));
+        styles.extend_from_slice(&rec(BRT_BEGIN_CELL_STYLE_XFS, &1u32.to_le_bytes()));
+        styles.extend_from_slice(&rec(BRT_XF, &raw_xf(u16::MAX, 0, 0, 0, 0, 0)));
+        styles.extend_from_slice(&rec(BRT_END_CELL_STYLE_XFS, &[]));
+        styles.extend_from_slice(&rec(BRT_BEGIN_CELL_XFS, &1u32.to_le_bytes()));
+        let mut cell_xf = raw_xf(0, 164, 1, 1, 1, 0x3F);
+        cell_xf[10] = 135; // -45 degrees.
+        cell_xf[11] = 3;
+        let alignment = 2u16 | (2 << 3) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13);
+        cell_xf[12..14].copy_from_slice(&alignment.to_le_bytes());
+        styles.extend_from_slice(&rec(BRT_XF, &cell_xf));
+        styles.extend_from_slice(&rec(BRT_END_CELL_XFS, &[]));
+
+        let parsed = parse_styles(&styles, &XlsbTheme::default());
+        assert!(
+            parsed.losses.is_empty(),
+            "unexpected losses: {:?}",
+            parsed.losses
+        );
+        let style = &parsed.cell_styles[0];
+
+        assert_eq!(style.num_fmt.as_deref(), Some("₩#,##0.00"));
+        assert_eq!(style.fill, Some(Color::rgb(0xFF, 0xEE, 0xCC)));
+        assert_eq!(
+            style.pattern_fill.as_ref().unwrap().pattern,
+            FormatPattern::Solid
+        );
+
+        let font = style.font.as_ref().unwrap();
+        assert_eq!(font.name.as_deref(), Some("Noto Sans KR"));
+        assert_eq!(font.size_pt, Some(12));
+        assert_eq!(font.color, Some(Color::rgb(0x11, 0x22, 0x33)));
+        assert!(font.bold && font.italic && font.underline && font.strikethrough);
+        assert_eq!(font.script, FormatScript::Subscript);
+
+        let border = style.border.as_ref().unwrap();
+        assert_eq!(border.top, BorderStyle::Double);
+        assert_eq!(border.top_color, Some(Color::rgb(0x44, 0x55, 0x66)));
+
+        assert_eq!(
+            style.align,
+            Some(Alignment {
+                horizontal: Some(HAlign::Center),
+                vertical: Some(VAlign::Bottom),
+                wrap: true,
+                rotation: -45,
+                indent: 3,
+                shrink_to_fit: true,
+            })
+        );
+        assert_eq!(
+            style.protection,
+            Some(CellProtection {
+                locked: Some(true),
+                hidden: true,
+            })
+        );
+    }
+
+    #[test]
+    fn xlsb_style_table_limit_is_bounded_and_typed() {
+        let mut no_parent = xf(0);
+        no_parent[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        let record = rec(BRT_XF, &no_parent);
+        let mut styles = rec(
+            BRT_BEGIN_CELL_XFS,
+            &(MAX_XLSB_STYLE_RECORDS as u32 + 1).to_le_bytes(),
+        );
+        styles.reserve(record.len() * (MAX_XLSB_STYLE_RECORDS + 1));
+        for _ in 0..=MAX_XLSB_STYLE_RECORDS {
+            styles.extend_from_slice(&record);
+        }
+        styles.extend_from_slice(&rec(BRT_END_CELL_XFS, &[]));
+
+        let parsed = parse_styles(&styles, &XlsbTheme::default());
+        assert_eq!(parsed.cell_styles.len(), MAX_XLSB_STYLE_RECORDS);
+        assert_eq!(
+            parsed
+                .losses
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::LimitExceeded)
+                .map(|loss| loss.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn xlsb_drawing_anchor_retains_offsets_crop_rotation_and_accessibility() {
+        let xml = r#"
+            <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+                      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <xdr:twoCellAnchor editAs="oneCell">
+                <xdr:from><xdr:col>1</xdr:col><xdr:colOff>123</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>456</xdr:rowOff></xdr:from>
+                <xdr:to><xdr:col>4</xdr:col><xdr:colOff>789</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>1011</xdr:rowOff></xdr:to>
+                <xdr:pic>
+                  <xdr:nvPicPr><xdr:cNvPr id="2" name="Logo" descr="Accessible logo"/></xdr:nvPicPr>
+                  <xdr:blipFill><a:blip r:embed="rId5"/><a:srcRect l="1000" t="2000" r="3000" b="4000"/></xdr:blipFill>
+                  <xdr:spPr><a:xfrm rot="60000"><a:ext cx="914400" cy="457200"/></a:xfrm></xdr:spPr>
+                </xdr:pic>
+              </xdr:twoCellAnchor>
+            </xdr:wsDr>
+        "#;
+
+        let refs = parse_xlsb_drawing_refs(xml);
+        assert_eq!(refs.len(), 1);
+        let drawing = &refs[0];
+        assert!(matches!(drawing.kind, XlsbDrawingKind::Image));
+        assert_eq!(drawing.rid.as_deref(), Some("rId5"));
+        assert_eq!(drawing.from, (2, 1));
+        assert_eq!(drawing.to, Some((5, 4)));
+        assert_eq!(drawing.metadata.from_cell, Some((2, 1)));
+        assert_eq!(drawing.metadata.to_cell, Some((5, 4)));
+        assert_eq!(drawing.metadata.from_offset_emu, Some((123, 456)));
+        assert_eq!(drawing.metadata.to_offset_emu, Some((789, 1011)));
+        assert_eq!(drawing.metadata.absolute_size_emu, Some((914_400, 457_200)));
+        assert_eq!(drawing.metadata.rotation_mdeg, Some(1_000));
+        assert_eq!(drawing.metadata.name.as_deref(), Some("Logo"));
+        assert_eq!(
+            drawing.metadata.alt_text.as_deref(),
+            Some("Accessible logo")
+        );
+        assert_eq!(drawing.metadata.behavior, DrawingAnchorBehavior::MoveOnly);
+        assert_eq!(
+            drawing.metadata.crop,
+            Some(DrawingCrop {
+                left_ppm: 10_000,
+                top_ppm: 20_000,
+                right_ppm: 30_000,
+                bottom_ppm: 40_000,
+            })
+        );
+    }
+
+    #[test]
+    fn xlsb_drawing_anchor_preserves_explicit_zero_offsets() {
+        let xml = r#"
+            <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing">
+              <xdr:twoCellAnchor>
+                <xdr:from><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+                <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+                <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="Zero offsets"/></xdr:nvSpPr></xdr:sp>
+              </xdr:twoCellAnchor>
+            </xdr:wsDr>
+        "#;
+
+        let refs = parse_xlsb_drawing_refs(xml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].metadata.from_offset_emu, Some((0, 0)));
+        assert_eq!(refs[0].metadata.to_offset_emu, Some((0, 0)));
+        assert_eq!(refs[0].metadata.from_cell, Some((2, 1)));
+        assert_eq!(refs[0].metadata.to_cell, Some((5, 4)));
+    }
+
+    #[test]
+    fn xlsb_chart_sidecar_retains_horizontal_bar_direction() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer
+            .start_file("xl/drawings/drawing1.xml", options)
+            .unwrap();
+        writer
+            .write_all(br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:to><xdr:col>7</xdr:col><xdr:row>14</xdr:row></xdr:to><xdr:graphicFrame><c:chart r:id="rIdChart"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>"#)
+            .unwrap();
+        writer
+            .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
+            .unwrap();
+        writer
+            .write_all(br#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#)
+            .unwrap();
+        writer.start_file("xl/charts/chart1.xml", options).unwrap();
+        writer
+            .write_all(br#"<chartSpace><chart><plotArea><barChart><barDir val="bar"/><ser><val><numRef><f>Sheet1!$A$1:$A$2</f></numRef></val></ser></barChart></plotArea></chart></chartSpace>"#)
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let sheet_rels = r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let (_, charts, metadata, losses) = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.bin",
+            sheet_rels,
+            &XlsbTheme::default(),
+        );
+        assert_eq!(charts.len(), 1);
+        assert!(losses.is_empty(), "unexpected losses: {losses:?}");
+        let sidecar = metadata
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("chart sidecar");
+        assert_eq!(
+            sidecar.chart_bar_direction,
+            crate::ChartBarDirection::Horizontal
+        );
+        assert_eq!(sidecar.from_cell, Some((2, 1)));
+        assert_eq!(sidecar.to_cell, Some((14, 7)));
+    }
+
+    #[test]
+    fn xlsb_missing_drawing_target_retains_anchor_sidecar() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("xl/drawings/drawing1.xml", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(
+                br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:row>5</xdr:row></xdr:to><xdr:pic><xdr:blipFill><a:blip r:embed="rIdMissing"/></xdr:blipFill></xdr:pic></xdr:twoCellAnchor></xdr:wsDr>"#,
+            )
+            .unwrap();
+        writer
+            .start_file(
+                "xl/drawings/_rels/drawing1.xml.rels",
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"<Relationships/>").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let sheet_rels = r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let (images, charts, metadata, losses) = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.bin",
+            sheet_rels,
+            &XlsbTheme::default(),
+        );
+        assert!(images.is_empty());
+        assert!(charts.is_empty());
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].kind, DrawingObjectKind::Shape);
+        assert_eq!(metadata[0].from_offset_emu, None);
+        assert!(losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::DrawingMetadataPartial));
     }
 
     #[test]
@@ -2957,10 +4829,10 @@ mod tests {
             out.extend_from_slice(&row.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes()); // ixfe
             out.extend_from_slice(&400u16.to_le_bytes()); // miyRw: 20 pt
-            let mut flags = u16::from(level) << 8;
+            let mut flags = (u16::from(level) << 8) | (1 << 13); // fUnsynced
             if collapsed {
                 flags |= 1 << 11;
-                flags |= 1 << 5; // hidden
+                flags |= 1 << 12; // hidden
             }
             out.extend_from_slice(&flags.to_le_bytes());
             out
@@ -3035,11 +4907,10 @@ mod tests {
 
     #[test]
     fn xlsb_page_setup_records_surface_public_metadata() {
-        const BRT_MARGINS: u32 = 475;
-        const BRT_PRINT_OPTIONS: u32 = 476;
-        const BRT_PAGE_SETUP: u32 = 477;
-        const BRT_BEGIN_HEADER_FOOTER: u32 = 478;
-        const BRT_END_HEADER_FOOTER: u32 = 479;
+        // [MS-XLSB] 2.3 record numbering; these exact ids also occur in
+        // Excel-authored Apache POI fixtures.  A former off-by-one synthetic
+        // sequence (475..479) must not define the reader contract.
+        const BRT_END_HEADER_FOOTER: u32 = 480;
 
         let mut wb_bin = vec![0u8; 8]; // hsState + iTabID
         wb_bin.extend_from_slice(&wstr("rId1"));
@@ -3060,15 +4931,30 @@ mod tests {
         page_setup.extend_from_slice(&3i32.to_le_bytes()); // iPageStart
         page_setup.extend_from_slice(&2u32.to_le_bytes()); // iFitWidth
         page_setup.extend_from_slice(&1u32.to_le_bytes()); // iFitHeight
-        page_setup.extend_from_slice(&((1u16 << 1) | (1u16 << 7)).to_le_bytes());
+        page_setup.extend_from_slice(&((1u16 << 0) | (1u16 << 1) | (1u16 << 7)).to_le_bytes());
         page_setup.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // szRelID null
 
         let mut header_footer = Vec::new();
-        header_footer.extend_from_slice(&0u16.to_le_bytes());
-        header_footer.extend_from_slice(&wstr("&CQuarterly"));
-        header_footer.extend_from_slice(&wstr("&RPage &P"));
-        for _ in 0..4 {
-            header_footer.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        header_footer.extend_from_slice(&0x000Fu16.to_le_bytes());
+        for text in [
+            "&CQuarterly",
+            "&RPage &P",
+            "&LEven",
+            "&REvenF",
+            "&LFirst",
+            "&RFirstF",
+        ] {
+            header_footer.extend_from_slice(&wstr(text));
+        }
+
+        fn page_break(index: u32, manual: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&u32::MAX.to_le_bytes());
+            out.extend_from_slice(&manual.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out
         }
 
         let mut sheet = rec(BRT_MARGINS, &margins);
@@ -3076,6 +4962,15 @@ mod tests {
         sheet.extend_from_slice(&rec(BRT_PAGE_SETUP, &page_setup));
         sheet.extend_from_slice(&rec(BRT_BEGIN_HEADER_FOOTER, &header_footer));
         sheet.extend_from_slice(&rec(BRT_END_HEADER_FOOTER, &[]));
+        sheet.extend_from_slice(&rec(BRT_BEGIN_RW_BRK, &[]));
+        sheet.extend_from_slice(&rec(BRT_BRK, &page_break(20, 1)));
+        sheet.extend_from_slice(&rec(BRT_BRK, &page_break(5, 1)));
+        sheet.extend_from_slice(&rec(BRT_BRK, &page_break(8, 0)));
+        sheet.extend_from_slice(&rec(BRT_END_RW_BRK, &[]));
+        sheet.extend_from_slice(&rec(BRT_BEGIN_COL_BRK, &[]));
+        sheet.extend_from_slice(&rec(BRT_BRK, &page_break(7, 1)));
+        sheet.extend_from_slice(&rec(BRT_BRK, &page_break(3, 1)));
+        sheet.extend_from_slice(&rec(BRT_END_COL_BRK, &[]));
 
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
 
@@ -3106,6 +5001,54 @@ mod tests {
         assert!(wb.sheets[0].print_gridlines());
         assert_eq!(ps.header.as_deref(), Some("&CQuarterly"));
         assert_eq!(ps.footer.as_deref(), Some("&RPage &P"));
+        let metadata = wb.sheets[0].print_metadata();
+        assert_eq!(metadata.fidelity(), crate::PrintFidelity::Retained);
+        assert_eq!(metadata.manual_row_breaks(), &[5, 20]);
+        assert_eq!(metadata.manual_col_breaks(), &[3, 7]);
+        assert_eq!(metadata.page_order(), Some(PrintPageOrder::OverThenDown));
+        assert_eq!(metadata.print_headings(), Some(true));
+        assert_eq!(metadata.print_gridlines(), Some(true));
+        assert_eq!(metadata.center_horizontally(), Some(true));
+        assert_eq!(metadata.center_vertically(), Some(true));
+        assert_eq!(metadata.header_footer().odd_header(), Some("&CQuarterly"));
+        assert_eq!(metadata.header_footer().odd_footer(), Some("&RPage &P"));
+        assert_eq!(metadata.header_footer().even_header(), Some("&LEven"));
+        assert_eq!(metadata.header_footer().even_footer(), Some("&REvenF"));
+        assert_eq!(metadata.header_footer().first_header(), Some("&LFirst"));
+        assert_eq!(metadata.header_footer().first_footer(), Some("&RFirstF"));
+        assert_eq!(metadata.header_footer().different_odd_even(), Some(true));
+        assert_eq!(metadata.header_footer().different_first(), Some(true));
+    }
+
+    #[test]
+    fn malformed_xlsb_print_records_report_typed_losses() {
+        let mut metadata = SheetReadMetadata::default();
+        parse_header_footer(&[0x01], &mut metadata);
+        parse_xlsb_page_break(
+            &[0; 8],
+            Some(XlsbPageBreakAxis::Row),
+            &mut metadata.print_metadata,
+        );
+        parse_xlsb_page_break(
+            &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+            Some(XlsbPageBreakAxis::Row),
+            &mut metadata.print_metadata,
+        );
+
+        assert_eq!(
+            metadata.print_metadata.fidelity(),
+            crate::PrintFidelity::Partial
+        );
+        assert!(metadata
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::MalformedHeaderFooter));
+        assert!(metadata
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::InvalidPageBreak));
     }
 
     #[test]
@@ -3300,7 +5243,9 @@ mod tests {
             rgce
         }
 
-        let print_area = ptg_area(1, 1, 5, 3);
+        let mut print_area = ptg_area(1, 1, 5, 3);
+        print_area.extend_from_slice(&ptg_area(9, 4, 11, 6));
+        print_area.push(0x10); // PtgUnion
         let mut print_titles = ptg_area(0, 0, 1, MAX_XLSB_COL_INDEX as u16);
         print_titles.extend_from_slice(&ptg_area(0, 0, 1_048_575, 2));
         print_titles.push(0x10); // PtgUnion
@@ -3334,6 +5279,10 @@ mod tests {
         assert_eq!(ps.print_area, Some((1, 1, 5, 3)));
         assert_eq!(ps.repeat_rows, Some((0, 1)));
         assert_eq!(ps.repeat_cols, Some((0, 2)));
+        assert_eq!(
+            wb.sheets[0].print_metadata().print_areas(),
+            &[(1, 1, 5, 3), (9, 4, 11, 6)]
+        );
     }
 
     #[test]

@@ -1,0 +1,119 @@
+{
+  "cairo": {
+    "soname": "libcairo.so.2"
+  },
+  "expected_identity": null,
+  "platform": {
+    "machine": "x86_64",
+    "system": "linux"
+  },
+  "poppler": {
+    "executables": [
+      "pdffonts",
+      "pdfinfo",
+      "pdftoppm",
+      "pdftotext"
+    ]
+  },
+  "python": {
+    "distributions": [
+      {
+        "name": "cairocffi",
+        "version": "1.7.1",
+        "wheel": {
+          "bytes": 75611,
+          "filename": "cairocffi-1.7.1-py3-none-any.whl",
+          "sha256": "9803a0e11f6c962f3b0ae2ec8ba6ae45e957a146a004697a1ac1bbf16b073b3f"
+        }
+      },
+      {
+        "name": "cairosvg",
+        "version": "2.9.0",
+        "wheel": {
+          "bytes": 45962,
+          "filename": "cairosvg-2.9.0-py3-none-any.whl",
+          "sha256": "4b82d07d145377dffdfc19d9791bd5fb65539bb4da0adecf0bdbd9cd4ffd7c68"
+        }
+      },
+      {
+        "name": "cffi",
+        "version": "2.1.0",
+        "wheel": {
+          "bytes": 221808,
+          "filename": "cffi-2.1.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "799416bae98336e400981ff6e532d67d5c709cfb30afb79865a1315f94b0e224"
+        }
+      },
+      {
+        "name": "cssselect2",
+        "version": "0.9.0",
+        "wheel": {
+          "bytes": 15453,
+          "filename": "cssselect2-0.9.0-py3-none-any.whl",
+          "sha256": "6a99e5f91f9a016a304dd929b0966ca464bcfda15177b6fb4a118fc0fb5d9563"
+        }
+      },
+      {
+        "name": "defusedxml",
+        "version": "0.7.1",
+        "wheel": {
+          "bytes": 25604,
+          "filename": "defusedxml-0.7.1-py2.py3-none-any.whl",
+          "sha256": "a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61"
+        }
+      },
+      {
+        "name": "numpy",
+        "version": "2.4.4",
+        "wheel": {
+          "bytes": 16632682,
+          "filename": "numpy-2.4.4-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "c901b15172510173f5cb310eae652908340f8dede90fff9e3bf6c0d8dfd92f83"
+        }
+      },
+      {
+        "name": "pillow",
+        "version": "12.2.0",
+        "wheel": {
+          "bytes": 7082423,
+          "filename": "pillow-12.2.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "eedf4b74eda2b5a4b2b2fb4c006d6295df3bf29e459e198c90ea48e130dc75c3"
+        }
+      },
+      {
+        "name": "pycparser",
+        "version": "3.0",
+        "wheel": {
+          "bytes": 48172,
+          "filename": "pycparser-3.0-py3-none-any.whl",
+          "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
+        }
+      },
+      {
+        "name": "tinycss2",
+        "version": "1.5.1",
+        "wheel": {
+          "bytes": 28404,
+          "filename": "tinycss2-1.5.1-py3-none-any.whl",
+          "sha256": "3415ba0f5839c062696996998176c4a3751d18b7edaaeeb658c9ce21ec150661"
+        }
+      },
+      {
+        "name": "webencodings",
+        "version": "0.5.1",
+        "wheel": {
+          "bytes": 11774,
+          "filename": "webencodings-0.5.1-py2.py3-none-any.whl",
+          "sha256": "a0af1213f3c2226497a97e2b3aa01a7e4bee4f403f95be16fc9acd2947514a78"
+        }
+      }
+    ],
+    "implementation": "cpython",
+    "requirements": {
+      "bytes": 950,
+      "sha256": "fbcbbc4cd7d7ec83f97ab407e9468bf87e9407f627415a8118b2cfdc97a65cb0"
+    },
+    "version": "3.13.14"
+  },
+  "schema": "rxls.render-oracle-host-tools-lock.v1"
+}

@@ -1,0 +1,67 @@
+# cargo-fuzz harness for the standalone renderer. Run from `render/` with
+# `cargo +nightly fuzz build`.
+[package]
+name = "rxls-render-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = "=1.4.2"
+libfuzzer-sys = "=0.4.10"
+
+[dependencies.rxls]
+path = "../.."
+default-features = false
+features = ["xlsx", "xlsb", "ods"]
+
+[dependencies.rxls-render]
+path = ".."
+
+[[bin]]
+name = "snapshot_construction"
+path = "fuzz_targets/snapshot_construction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pagination"
+path = "fuzz_targets/pagination.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svg_emission"
+path = "fuzz_targets/svg_emission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chart_range_resolution"
+path = "fuzz_targets/chart_range_resolution.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_headers"
+path = "fuzz_targets/image_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backend_command_replay"
+path = "fuzz_targets/backend_command_replay.rs"
+test = false
+doc = false
+bench = false

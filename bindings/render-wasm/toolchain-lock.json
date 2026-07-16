@@ -1,0 +1,25 @@
+{
+  "schema": "rxls.render-browser-toolchain.v1",
+  "rust": "1.85.0",
+  "wasmPack": {
+    "version": "0.13.1"
+  },
+  "wasmBindgen": {
+    "version": "0.2.126"
+  },
+  "chromium": {
+    "product": "Google Chrome",
+    "testingProduct": "Google Chrome for Testing",
+    "version": "150.0.7871.115",
+    "archive": {
+      "platform": "linux64",
+      "file": "chrome-linux64.zip",
+      "sizeBytes": 187332810,
+      "sha256": "1be2db033133c5e2dd1a4e8664bf67b19a61bcf6ed28d2b00f433b3f0b4f9585"
+    },
+    "heapGate": {
+      "maxAccountedBytes": 268435456,
+      "maxRetainedGrowthBytes": 67108864
+    }
+  }
+}

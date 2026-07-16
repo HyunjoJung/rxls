@@ -97,7 +97,7 @@ pub(crate) struct Context<'a> {
     pub(crate) defined_names: &'a [String],
 }
 
-impl<'a> Context<'a> {
+impl Context<'_> {
     pub(crate) fn new(biff12: bool) -> Self {
         Self {
             biff12,

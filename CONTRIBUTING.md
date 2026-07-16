@@ -36,8 +36,19 @@ RXLS_REQUIRE_OPENPYXL=1 cargo test --all-targets --all-features --locked
 cargo test --no-default-features --all-targets --locked
 cargo test --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+cargo fmt --manifest-path render/Cargo.toml -- --check
+cargo clippy --manifest-path render/Cargo.toml --all-targets --locked -- -D warnings
+cargo test --manifest-path render/Cargo.toml --all-targets --locked
+cargo fmt --manifest-path bindings/render-wasm/Cargo.toml -- --check
+cargo clippy --manifest-path bindings/render-wasm/Cargo.toml --all-targets --locked -- -D warnings
+cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked
+npm --prefix bindings/render-wasm test
 python3 -m unittest discover -s scripts -p "test_*.py"
+python3 scripts/libreoffice-render-parity.py --corpus tests/fixtures \
+  --dry-run --max-files 8 \
+  --report target/libreoffice-render-parity-dry-run.json
 cargo package --locked
+python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate
 cargo publish --dry-run --locked
 ```
 
@@ -64,6 +75,17 @@ cargo publish --dry-run --locked
 
   Pull requests run a bounded smoke; scheduled, manual, and release-candidate
   campaigns retain per-target diagnostics.
+- The standalone renderer lives under `render/`. Its tests cover one
+  backend-neutral fixed-point scene, deterministic SVG/PDF/PNG replay,
+  authored pagination, typography and style resolution, drawings/charts,
+  bounded failures, and atomic bundles. The separate browser package under
+  `bindings/render-wasm/` exercises the same engine through a CSP-safe worker.
+  Primary CI runs the LibreOffice parity harness in dependency-free preflight
+  mode. The render-oracle workflow builds and exercises the pinned,
+  network-isolated LibreOffice container, exact OFL font pack, and locked
+  Poppler tools. Full campaigns compare visual, semantic, text-box, edge, page,
+  and authored-print geometry metrics without retaining workbook text or raw
+  rendered pages in uploaded evidence.
 
 ## Release candidates
 
@@ -78,9 +100,10 @@ Reading targets faithful typed-cell extraction with display-formatted text;
 formula evaluation is limited to the deterministic subset exposed by
 `Workbook::evaluate_cell` (everything else falls back to the cached value
 with a typed reason). Editing is `.xlsx`/`.xlsm`-only and package-preserving.
-Full custom number-format rendering, styling semantics, macro execution, and
-pivot-table semantics are out of scope; unmodeled parts are preserved, not
-interpreted. Larger features are welcome — open an issue first.
+Excel custom number-format sections are rendered within explicit locale and
+output bounds. Complete cross-format styling semantics, macro execution, and
+pivot-table semantics are not promised; unmodeled parts are preserved rather
+than interpreted. Larger features are welcome — open an issue first.
 
 [MS-XLS]: https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/
 [MS-XLSB]: https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xlsb/

@@ -1,0 +1,2449 @@
+{
+  "crate": "rxls",
+  "generator": {
+    "rust_toolchain": "1.85.0",
+    "script": "scripts/check_public_api.py",
+    "surface": "all-features rustdoc public module indexes"
+  },
+  "items": [
+    {
+      "declaration": "pub struct Alignment { pub horizontal: Option<HAlign>, pub vertical: Option<VAlign>, pub wrap: bool, pub rotation: i16, pub indent: u8, pub shrink_to_fit: bool, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn with_horizontal(self, horizontal: HAlign) -> Self",
+        "pub fn with_indent(self, level: u8) -> Self",
+        "pub fn with_rotation(self, degrees: i16) -> Self",
+        "pub fn with_shrink_to_fit(self) -> Self",
+        "pub fn with_vertical(self, vertical: VAlign) -> Self",
+        "pub fn with_wrap(self, wrap: bool) -> Self",
+        "pub fn wrapped(self) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Alignment",
+      "trait_implementations": [
+        "impl Clone for Alignment",
+        "impl Debug for Alignment",
+        "impl Default for Alignment",
+        "impl Eq for Alignment",
+        "impl Hash for Alignment",
+        "impl PartialEq for Alignment",
+        "impl StructuralPartialEq for Alignment"
+      ]
+    },
+    {
+      "declaration": "pub struct Border { pub left: BorderStyle, pub right: BorderStyle, pub top: BorderStyle, pub bottom: BorderStyle, pub color: Option<Color>, pub left_color: Option<Color>, pub right_color: Option<Color>, pub top_color: Option<Color>, pub bottom_color: Option<Color>, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn with_all(self, style: BorderStyle) -> Self",
+        "pub fn with_bottom(self, style: BorderStyle) -> Self",
+        "pub fn with_bottom_color(self, color: impl Into<Color>) -> Self",
+        "pub fn with_color(self, color: impl Into<Color>) -> Self",
+        "pub fn with_left(self, style: BorderStyle) -> Self",
+        "pub fn with_left_color(self, color: impl Into<Color>) -> Self",
+        "pub fn with_right(self, style: BorderStyle) -> Self",
+        "pub fn with_right_color(self, color: impl Into<Color>) -> Self",
+        "pub fn with_top(self, style: BorderStyle) -> Self",
+        "pub fn with_top_color(self, color: impl Into<Color>) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Border",
+      "trait_implementations": [
+        "impl Clone for Border",
+        "impl Debug for Border",
+        "impl Default for Border",
+        "impl Eq for Border",
+        "impl Hash for Border",
+        "impl PartialEq for Border",
+        "impl StructuralPartialEq for Border"
+      ]
+    },
+    {
+      "declaration": "pub enum BorderStyle { None, Thin, Medium, Thick, Double, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::BorderStyle",
+      "trait_implementations": [
+        "impl Clone for BorderStyle",
+        "impl Copy for BorderStyle",
+        "impl Debug for BorderStyle",
+        "impl Default for BorderStyle",
+        "impl Eq for BorderStyle",
+        "impl Hash for BorderStyle",
+        "impl PartialEq for BorderStyle",
+        "impl StructuralPartialEq for BorderStyle"
+      ]
+    },
+    {
+      "declaration": "pub enum Cell { Text(String), Number(f64), Date(f64), Bool(bool), Error(String), Formula { formula: String, cached: Box<Cell>, }, }",
+      "inherent_items": [
+        "pub fn as_date(&self, date1904: bool) -> Option<NaiveDate>",
+        "pub fn as_datetime(&self, date1904: bool) -> Option<ExcelDateTime>",
+        "pub fn as_duration(&self) -> Option<Duration>",
+        "pub fn as_f64(&self) -> Option<f64>",
+        "pub fn as_i64(&self) -> Option<i64>",
+        "pub fn as_naive_date(&self, date1904: bool) -> Option<NaiveDate>",
+        "pub fn as_naive_datetime(&self, date1904: bool) -> Option<NaiveDateTime>",
+        "pub fn as_naive_time(&self, date1904: bool) -> Option<NaiveTime>",
+        "pub fn as_string(&self) -> Option<String>",
+        "pub fn as_time(&self, date1904: bool) -> Option<NaiveTime>",
+        "pub fn boolean(value: bool) -> Self",
+        "pub fn cached_value(&self) -> Option<&Cell>",
+        "pub fn date(serial: f64) -> Self",
+        "pub fn date_time(serial: f64) -> Self",
+        "pub fn error(error: CellErrorType) -> Self",
+        "pub fn float(value: impl Into<f64>) -> Self",
+        "pub fn formula(formula: impl Into<String>, cached: impl Into<Cell>) -> Self",
+        "pub fn get_bool(&self) -> Option<bool>",
+        "pub fn get_datetime(&self) -> Option<f64>",
+        "pub fn get_datetime_iso(&self) -> Option<&str>",
+        "pub fn get_duration_iso(&self) -> Option<&str>",
+        "pub fn get_error(&self) -> Option<&str>",
+        "pub fn get_error_type(&self) -> Option<CellErrorType>",
+        "pub fn get_float(&self) -> Option<f64>",
+        "pub fn get_formula(&self) -> Option<&str>",
+        "pub fn get_int(&self) -> Option<i64>",
+        "pub fn get_string(&self) -> Option<&str>",
+        "pub fn int(value: impl Into<i64>) -> Self",
+        "pub fn is_bool(&self) -> bool",
+        "pub fn is_datetime(&self) -> bool",
+        "pub fn is_datetime_iso(&self) -> bool",
+        "pub fn is_duration_iso(&self) -> bool",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn is_error(&self) -> bool",
+        "pub fn is_float(&self) -> bool",
+        "pub fn is_formula(&self) -> bool",
+        "pub fn is_int(&self) -> bool",
+        "pub fn is_string(&self) -> bool",
+        "pub fn string(value: impl Into<String>) -> Self",
+        "pub fn text(value: impl Into<String>) -> Self"
+      ],
+      "kind": "enum",
+      "path": "rxls::Cell",
+      "trait_implementations": [
+        "impl Clone for Cell",
+        "impl DataType for Cell",
+        "impl Debug for Cell",
+        "impl Display for Cell",
+        "impl From<&Cell> for Cell",
+        "impl From<&str> for Cell",
+        "impl From<CellErrorType> for Cell",
+        "impl From<String> for Cell",
+        "impl From<bool> for Cell",
+        "impl From<f32> for Cell",
+        "impl From<f64> for Cell",
+        "impl From<i128> for Cell",
+        "impl From<i16> for Cell",
+        "impl From<i32> for Cell",
+        "impl From<i64> for Cell",
+        "impl From<i8> for Cell",
+        "impl From<isize> for Cell",
+        "impl From<u128> for Cell",
+        "impl From<u16> for Cell",
+        "impl From<u32> for Cell",
+        "impl From<u64> for Cell",
+        "impl From<u8> for Cell",
+        "impl From<usize> for Cell",
+        "impl PartialEq for Cell",
+        "impl PartialEq<&String> for Cell",
+        "impl PartialEq<&str> for Cell",
+        "impl PartialEq<Cell> for &String",
+        "impl PartialEq<Cell> for &str",
+        "impl PartialEq<Cell> for String",
+        "impl PartialEq<Cell> for bool",
+        "impl PartialEq<Cell> for f32",
+        "impl PartialEq<Cell> for f64",
+        "impl PartialEq<Cell> for i128",
+        "impl PartialEq<Cell> for i16",
+        "impl PartialEq<Cell> for i32",
+        "impl PartialEq<Cell> for i64",
+        "impl PartialEq<Cell> for i8",
+        "impl PartialEq<Cell> for isize",
+        "impl PartialEq<Cell> for u128",
+        "impl PartialEq<Cell> for u16",
+        "impl PartialEq<Cell> for u32",
+        "impl PartialEq<Cell> for u64",
+        "impl PartialEq<Cell> for u8",
+        "impl PartialEq<Cell> for usize",
+        "impl PartialEq<String> for Cell",
+        "impl PartialEq<bool> for Cell",
+        "impl PartialEq<f32> for Cell",
+        "impl PartialEq<f64> for Cell",
+        "impl PartialEq<i128> for Cell",
+        "impl PartialEq<i16> for Cell",
+        "impl PartialEq<i32> for Cell",
+        "impl PartialEq<i64> for Cell",
+        "impl PartialEq<i8> for Cell",
+        "impl PartialEq<isize> for Cell",
+        "impl PartialEq<str> for Cell",
+        "impl PartialEq<u128> for Cell",
+        "impl PartialEq<u16> for Cell",
+        "impl PartialEq<u32> for Cell",
+        "impl PartialEq<u64> for Cell",
+        "impl PartialEq<u8> for Cell",
+        "impl PartialEq<usize> for Cell",
+        "impl StructuralPartialEq for Cell",
+        "impl<'de> Deserialize<'de> for Cell"
+      ]
+    },
+    {
+      "declaration": "pub enum CellErrorType { Div0, NA, Name, Null, Num, Ref, Value, GettingData, }",
+      "inherent_items": [
+        "pub fn as_str(self) -> &'static str",
+        "pub fn from_excel_error(error: &str) -> Option<Self>"
+      ],
+      "kind": "enum",
+      "path": "rxls::CellErrorType",
+      "trait_implementations": [
+        "impl Clone for CellErrorType",
+        "impl Copy for CellErrorType",
+        "impl Debug for CellErrorType",
+        "impl Display for CellErrorType",
+        "impl Eq for CellErrorType",
+        "impl From<CellErrorType> for Cell",
+        "impl Hash for CellErrorType",
+        "impl PartialEq for CellErrorType",
+        "impl StructuralPartialEq for CellErrorType"
+      ]
+    },
+    {
+      "declaration": "pub struct CellProtection { pub locked: Option<bool>, pub hidden: bool, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::CellProtection",
+      "trait_implementations": [
+        "impl Clone for CellProtection",
+        "impl Debug for CellProtection",
+        "impl Default for CellProtection",
+        "impl Eq for CellProtection",
+        "impl Hash for CellProtection",
+        "impl PartialEq for CellProtection",
+        "impl StructuralPartialEq for CellProtection"
+      ]
+    },
+    {
+      "declaration": "pub struct CellStyle { pub font: Option<Font>, pub fill: Option<Color>, pub pattern_fill: Option<Fill>, pub border: Option<Border>, pub num_fmt: Option<String>, pub align: Option<Alignment>, pub protection: Option<CellProtection>, }",
+      "inherent_items": [
+        "pub fn align(self, h: HAlign) -> Self",
+        "pub fn alignment(self, alignment: Alignment) -> Self",
+        "pub fn background_color(self, color: impl Into<Color>) -> Self",
+        "pub fn bold(self) -> Self",
+        "pub fn border(self, b: Border) -> Self",
+        "pub fn border_bottom(self, style: FormatBorder) -> Self",
+        "pub fn border_bottom_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_left(self, style: FormatBorder) -> Self",
+        "pub fn border_left_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_right(self, style: FormatBorder) -> Self",
+        "pub fn border_right_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_top(self, style: FormatBorder) -> Self",
+        "pub fn border_top_color(self, color: impl Into<Color>) -> Self",
+        "pub fn color(self, color: impl Into<Color>) -> Self",
+        "pub fn fill(self, color: impl Into<Color>) -> Self",
+        "pub fn font_name(self, name: impl AsRef<str>) -> Self",
+        "pub fn font_script(self, script: FormatScript) -> Self",
+        "pub fn foreground_color(self, color: impl Into<Color>) -> Self",
+        "pub fn hidden(self) -> Self",
+        "pub fn indent(self, level: u8) -> Self",
+        "pub fn italic(self) -> Self",
+        "pub fn locked(self) -> Self",
+        "pub fn merge(&self, overlay: &CellStyle) -> Self",
+        "pub fn new() -> Self",
+        "pub fn num_fmt(self, code: impl AsRef<str>) -> Self",
+        "pub fn pattern(self, pattern: FormatPattern) -> Self",
+        "pub fn pattern_fill(self, fill: Fill) -> Self",
+        "pub fn set_align(self, h: FormatAlign) -> Self",
+        "pub fn set_alignment(self, alignment: Alignment) -> Self",
+        "pub fn set_background_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_bg_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_bold(self) -> Self",
+        "pub fn set_border(self, style: FormatBorder) -> Self",
+        "pub fn set_border_bottom(self, style: FormatBorder) -> Self",
+        "pub fn set_border_bottom_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_left(self, style: FormatBorder) -> Self",
+        "pub fn set_border_left_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_right(self, style: FormatBorder) -> Self",
+        "pub fn set_border_right_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_top(self, style: FormatBorder) -> Self",
+        "pub fn set_border_top_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_font_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_font_name(self, name: impl AsRef<str>) -> Self",
+        "pub fn set_font_script(self, script: FormatScript) -> Self",
+        "pub fn set_font_size(self, points: u16) -> Self",
+        "pub fn set_font_strikethrough(self) -> Self",
+        "pub fn set_foreground_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_hidden(self) -> Self",
+        "pub fn set_indent(self, level: u8) -> Self",
+        "pub fn set_italic(self) -> Self",
+        "pub fn set_locked(self) -> Self",
+        "pub fn set_num_format(self, code: impl AsRef<str>) -> Self",
+        "pub fn set_pattern(self, pattern: FormatPattern) -> Self",
+        "pub fn set_pattern_fill(self, fill: Fill) -> Self",
+        "pub fn set_shrink_to_fit(self) -> Self",
+        "pub fn set_strikethrough(self) -> Self",
+        "pub fn set_text_rotation(self, degrees: i16) -> Self",
+        "pub fn set_text_wrap(self) -> Self",
+        "pub fn set_underline(self) -> Self",
+        "pub fn set_unlocked(self) -> Self",
+        "pub fn set_valign(self, v: VAlign) -> Self",
+        "pub fn shrink_to_fit(self) -> Self",
+        "pub fn size(self, points: u16) -> Self",
+        "pub fn strikethrough(self) -> Self",
+        "pub fn text_rotation(self, degrees: i16) -> Self",
+        "pub fn underline(self) -> Self",
+        "pub fn unlocked(self) -> Self",
+        "pub fn valign(self, v: VAlign) -> Self",
+        "pub fn wrap(self) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::CellStyle",
+      "trait_implementations": [
+        "impl Clone for CellStyle",
+        "impl Debug for CellStyle",
+        "impl Default for CellStyle",
+        "impl Eq for CellStyle",
+        "impl From<CellStyle> for Format",
+        "impl From<Format> for CellStyle",
+        "impl Hash for CellStyle",
+        "impl PartialEq for CellStyle",
+        "impl StructuralPartialEq for CellStyle"
+      ]
+    },
+    {
+      "declaration": "pub enum CfRule { CellIs { op: DvOp, formula1: String, formula2: Option<String>, fill: Color, }, ColorScale2 { min: Color, max: Color, }, ColorScale3 { min: Color, mid: Color, max: Color, }, DataBar { color: Color, }, TopBottom { rank: u32, bottom: bool, percent: bool, fill: Color, }, AboveAverage { below: bool, fill: Color, }, DuplicateValues { unique: bool, fill: Color, }, Expression { formula: String, fill: Color, }, }",
+      "inherent_items": [
+        "pub fn above_average(below: bool, fill: impl Into<Color>) -> Self",
+        "pub fn cell_is( op: DvOp, formula1: impl AsRef<str>, formula2: Option<impl AsRef<str>>, fill: impl Into<Color>, ) -> Self",
+        "pub fn color_scale2(min: impl Into<Color>, max: impl Into<Color>) -> Self",
+        "pub fn color_scale3( min: impl Into<Color>, mid: impl Into<Color>, max: impl Into<Color>, ) -> Self",
+        "pub fn data_bar(color: impl Into<Color>) -> Self",
+        "pub fn duplicate_values(unique: bool, fill: impl Into<Color>) -> Self",
+        "pub fn expression(formula: impl AsRef<str>, fill: impl Into<Color>) -> Self",
+        "pub fn top_bottom( rank: u32, bottom: bool, percent: bool, fill: impl Into<Color>, ) -> Self"
+      ],
+      "kind": "enum",
+      "path": "rxls::CfRule",
+      "trait_implementations": [
+        "impl Clone for CfRule",
+        "impl Debug for CfRule",
+        "impl Eq for CfRule",
+        "impl PartialEq for CfRule",
+        "impl StructuralPartialEq for CfRule"
+      ]
+    },
+    {
+      "declaration": "pub struct Chart { pub kind: ChartKind, pub title: Option<String>, pub series: Vec<Series>, pub legend: bool, pub data_labels: bool, pub x_axis_title: Option<String>, pub y_axis_title: Option<String>, pub from: (u32, u16), pub to: (u32, u16), }",
+      "inherent_items": [
+        "pub fn add_series(self, series: Series) -> Self",
+        "pub fn new(kind: ChartKind, from: (u32, u16), to: (u32, u16)) -> Self",
+        "pub fn with_data_labels(self, show: bool) -> Self",
+        "pub fn with_legend(self, show: bool) -> Self",
+        "pub fn with_series<I>(self, series: I) -> Selfwhere I: IntoIterator<Item = Series>,",
+        "pub fn with_title(self, title: impl AsRef<str>) -> Self",
+        "pub fn with_x_axis_title(self, title: impl AsRef<str>) -> Self",
+        "pub fn with_y_axis_title(self, title: impl AsRef<str>) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Chart",
+      "trait_implementations": [
+        "impl Clone for Chart",
+        "impl Debug for Chart",
+        "impl Eq for Chart",
+        "impl PartialEq for Chart",
+        "impl StructuralPartialEq for Chart"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartBarDirection { Column, Horizontal, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartBarDirection",
+      "trait_implementations": [
+        "impl Clone for ChartBarDirection",
+        "impl Copy for ChartBarDirection",
+        "impl Debug for ChartBarDirection",
+        "impl Default for ChartBarDirection",
+        "impl Eq for ChartBarDirection",
+        "impl Hash for ChartBarDirection",
+        "impl PartialEq for ChartBarDirection",
+        "impl StructuralPartialEq for ChartBarDirection"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ChartCachedPoint { pub index: u32, pub value: String, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ChartCachedPoint",
+      "trait_implementations": [
+        "impl Clone for ChartCachedPoint",
+        "impl Debug for ChartCachedPoint",
+        "impl Default for ChartCachedPoint",
+        "impl Eq for ChartCachedPoint",
+        "impl PartialEq for ChartCachedPoint",
+        "impl StructuralPartialEq for ChartCachedPoint"
+      ]
+    },
+    {
+      "declaration": "pub enum ChartKind { Bar, Line, Pie, Scatter, Area, Doughnut, Radar, Bubble, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartKind",
+      "trait_implementations": [
+        "impl Clone for ChartKind",
+        "impl Copy for ChartKind",
+        "impl Debug for ChartKind",
+        "impl Eq for ChartKind",
+        "impl PartialEq for ChartKind",
+        "impl StructuralPartialEq for ChartKind"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartMarkerSymbol { Automatic, None, Circle, Square, Diamond, Triangle, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartMarkerSymbol",
+      "trait_implementations": [
+        "impl Clone for ChartMarkerSymbol",
+        "impl Copy for ChartMarkerSymbol",
+        "impl Debug for ChartMarkerSymbol",
+        "impl Default for ChartMarkerSymbol",
+        "impl Eq for ChartMarkerSymbol",
+        "impl Hash for ChartMarkerSymbol",
+        "impl PartialEq for ChartMarkerSymbol",
+        "impl StructuralPartialEq for ChartMarkerSymbol"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ChartSeriesCache { pub name: Vec<ChartCachedPoint>, pub categories: Vec<ChartCachedPoint>, pub values: Vec<ChartCachedPoint>, pub bubble_sizes: Vec<ChartCachedPoint>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ChartSeriesCache",
+      "trait_implementations": [
+        "impl Clone for ChartSeriesCache",
+        "impl Debug for ChartSeriesCache",
+        "impl Default for ChartSeriesCache",
+        "impl Eq for ChartSeriesCache",
+        "impl PartialEq for ChartSeriesCache",
+        "impl StructuralPartialEq for ChartSeriesCache"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ChartSeriesStyle { pub marker: ChartMarkerSymbol, pub marker_size: Option<u8>, pub line_visible: bool, pub line_color: Option<Color>, pub losses: Vec<ChartSeriesStyleLossKind>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ChartSeriesStyle",
+      "trait_implementations": [
+        "impl Clone for ChartSeriesStyle",
+        "impl Debug for ChartSeriesStyle",
+        "impl Default for ChartSeriesStyle",
+        "impl Eq for ChartSeriesStyle",
+        "impl PartialEq for ChartSeriesStyle",
+        "impl StructuralPartialEq for ChartSeriesStyle"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartSeriesStyleLossKind { UnsupportedMarkerSymbol, InvalidMarkerSize, UnsupportedLinePaint, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartSeriesStyleLossKind",
+      "trait_implementations": [
+        "impl Clone for ChartSeriesStyleLossKind",
+        "impl Copy for ChartSeriesStyleLossKind",
+        "impl Debug for ChartSeriesStyleLossKind",
+        "impl Eq for ChartSeriesStyleLossKind",
+        "impl Hash for ChartSeriesStyleLossKind",
+        "impl PartialEq for ChartSeriesStyleLossKind",
+        "impl StructuralPartialEq for ChartSeriesStyleLossKind"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartUnsupportedReason { Combo, ThreeDimensional, Pivot, ExternalData, UnsupportedKind, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartUnsupportedReason",
+      "trait_implementations": [
+        "impl Clone for ChartUnsupportedReason",
+        "impl Copy for ChartUnsupportedReason",
+        "impl Debug for ChartUnsupportedReason",
+        "impl Eq for ChartUnsupportedReason",
+        "impl Hash for ChartUnsupportedReason",
+        "impl PartialEq for ChartUnsupportedReason",
+        "impl StructuralPartialEq for ChartUnsupportedReason"
+      ]
+    },
+    {
+      "declaration": "pub struct Color(pub [u8; 3]);",
+      "inherent_items": [
+        "pub const fn as_rgb(self) -> [u8; 3]",
+        "pub const fn rgb(red: u8, green: u8, blue: u8) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Color",
+      "trait_implementations": [
+        "impl Clone for Color",
+        "impl Copy for Color",
+        "impl Debug for Color",
+        "impl Default for Color",
+        "impl Eq for Color",
+        "impl From<[u8; 3]> for Color",
+        "impl Hash for Color",
+        "impl PartialEq for Color",
+        "impl StructuralPartialEq for Color"
+      ]
+    },
+    {
+      "declaration": "pub struct Comment { pub row: u32, pub col: u16, pub text: String, pub author: Option<String>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::Comment",
+      "trait_implementations": [
+        "impl Clone for Comment",
+        "impl Debug for Comment",
+        "impl Eq for Comment",
+        "impl PartialEq for Comment",
+        "impl StructuralPartialEq for Comment"
+      ]
+    },
+    {
+      "declaration": "pub struct CommentAuthor(/* private fields */);",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::CommentAuthor",
+      "trait_implementations": [
+        "impl Clone for CommentAuthor",
+        "impl Debug for CommentAuthor",
+        "impl Eq for CommentAuthor",
+        "impl From<&String> for CommentAuthor",
+        "impl From<&str> for CommentAuthor",
+        "impl From<Option<&str>> for CommentAuthor",
+        "impl From<String> for CommentAuthor",
+        "impl PartialEq for CommentAuthor",
+        "impl StructuralPartialEq for CommentAuthor"
+      ]
+    },
+    {
+      "declaration": "pub struct CondFormat { pub sqref: (u32, u16, u32, u16), pub rule: CfRule, }",
+      "inherent_items": [
+        "pub fn new(sqref: (u32, u16, u32, u16), rule: CfRule) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::CondFormat",
+      "trait_implementations": [
+        "impl Clone for CondFormat",
+        "impl Debug for CondFormat",
+        "impl Eq for CondFormat",
+        "impl PartialEq for CondFormat",
+        "impl StructuralPartialEq for CondFormat"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ConditionalFormatMetadata { pub priority: Option<u32>, pub stop_if_true: bool, pub differential_style: Option<CellStyle>, pub style_losses: Vec<StyleLoss>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ConditionalFormatMetadata",
+      "trait_implementations": [
+        "impl Clone for ConditionalFormatMetadata",
+        "impl Debug for ConditionalFormatMetadata",
+        "impl Default for ConditionalFormatMetadata",
+        "impl Eq for ConditionalFormatMetadata",
+        "impl PartialEq for ConditionalFormatMetadata",
+        "impl StructuralPartialEq for ConditionalFormatMetadata"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ContainerParseMode { NotApplicable, Primary, TolerantCfbDirectoryWalk, }",
+      "inherent_items": [
+        "pub const fn code(self) -> &'static str"
+      ],
+      "kind": "enum",
+      "path": "rxls::ContainerParseMode",
+      "trait_implementations": [
+        "impl Clone for ContainerParseMode",
+        "impl Copy for ContainerParseMode",
+        "impl Debug for ContainerParseMode",
+        "impl Default for ContainerParseMode",
+        "impl Eq for ContainerParseMode",
+        "impl PartialEq for ContainerParseMode",
+        "impl StructuralPartialEq for ContainerParseMode"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum CsvExportError { InvalidDelimiter(char), OutputTooLarge { limit: usize, }, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::CsvExportError",
+      "trait_implementations": [
+        "impl Clone for CsvExportError",
+        "impl Debug for CsvExportError",
+        "impl Display for CsvExportError",
+        "impl Eq for CsvExportError",
+        "impl Error for CsvExportError",
+        "impl PartialEq for CsvExportError",
+        "impl StructuralPartialEq for CsvExportError"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum CsvFormulaPolicy { Preserve, Escape, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::CsvFormulaPolicy",
+      "trait_implementations": [
+        "impl Clone for CsvFormulaPolicy",
+        "impl Copy for CsvFormulaPolicy",
+        "impl Debug for CsvFormulaPolicy",
+        "impl Eq for CsvFormulaPolicy",
+        "impl PartialEq for CsvFormulaPolicy",
+        "impl StructuralPartialEq for CsvFormulaPolicy"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum CsvNewline { Lf, CrLf, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::CsvNewline",
+      "trait_implementations": [
+        "impl Clone for CsvNewline",
+        "impl Copy for CsvNewline",
+        "impl Debug for CsvNewline",
+        "impl Eq for CsvNewline",
+        "impl PartialEq for CsvNewline",
+        "impl StructuralPartialEq for CsvNewline"
+      ]
+    },
+    {
+      "declaration": "pub struct CsvOptions { pub delimiter: char, pub newline: CsvNewline, pub bom: bool, pub formula_policy: CsvFormulaPolicy, pub max_output_bytes: usize, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::CsvOptions",
+      "trait_implementations": [
+        "impl Clone for CsvOptions",
+        "impl Copy for CsvOptions",
+        "impl Debug for CsvOptions",
+        "impl Default for CsvOptions",
+        "impl Eq for CsvOptions",
+        "impl PartialEq for CsvOptions",
+        "impl StructuralPartialEq for CsvOptions"
+      ]
+    },
+    {
+      "declaration": "pub const DEFAULT_EXPORT_MAX_BYTES: usize = _; // 268_435_456usize",
+      "inherent_items": [],
+      "kind": "constant",
+      "path": "rxls::DEFAULT_EXPORT_MAX_BYTES",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub type Data = Cell;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::Data",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub type DataRef<'a> = &'a Cell;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::DataRef",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub trait DataType { // Required methods fn is_empty(&self) -> bool; fn is_int(&self) -> bool; fn is_float(&self) -> bool; fn is_bool(&self) -> bool; fn is_string(&self) -> bool; fn is_error(&self) -> bool; fn is_datetime(&self) -> bool; fn is_datetime_iso(&self) -> bool; fn is_duration_iso(&self) -> bool; fn is_formula(&self) -> bool; fn get_int(&self) -> Option<i64>; fn get_float(&self) -> Option<f64>; fn get_bool(&self) -> Option<bool>; fn get_string(&self) -> Option<&str>; fn get_error(&self) -> Option<&str>; fn get_error_type(&self) -> Option<CellErrorType>; fn get_datetime(&self) -> Option<f64>; fn get_formula(&self) -> Option<&str>; fn get_datetime_iso(&self) -> Option<&str>; fn get_duration_iso(&self) -> Option<&str>; fn cached_value(&self) -> Option<&Cell>; fn as_string(&self) -> Option<String>; fn as_i64(&self) -> Option<i64>; fn as_f64(&self) -> Option<f64>; fn as_datetime(&self, date1904: bool) -> Option<ExcelDateTime>; fn as_naive_datetime(&self, date1904: bool) -> Option<NaiveDateTime>; fn as_naive_date(&self, date1904: bool) -> Option<NaiveDate>; fn as_date(&self, date1904: bool) -> Option<NaiveDate>; fn as_naive_time(&self, date1904: bool) -> Option<NaiveTime>; fn as_time(&self, date1904: bool) -> Option<NaiveTime>; fn as_duration(&self) -> Option<Duration>; }",
+      "inherent_items": [],
+      "kind": "trait",
+      "path": "rxls::DataType",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub struct DataValidation { pub sqref: (u32, u16, u32, u16), pub kind: DvKind, pub operator: DvOp, pub formula1: String, pub formula2: Option<String>, pub allow_blank: bool, pub show_input_message: bool, pub show_error_message: bool, pub prompt: Option<(String, String)>, pub error: Option<(String, String)>, }",
+      "inherent_items": [
+        "pub fn list(sqref: (u32, u16, u32, u16), source: impl AsRef<str>) -> Self",
+        "pub fn new( sqref: (u32, u16, u32, u16), kind: DvKind, operator: DvOp, formula1: impl AsRef<str>, ) -> Self",
+        "pub fn with_allow_blank(self, allow_blank: bool) -> Self",
+        "pub fn with_error( self, title: impl AsRef<str>, message: impl AsRef<str>, ) -> Self",
+        "pub fn with_formula2(self, formula2: impl AsRef<str>) -> Self",
+        "pub fn with_prompt( self, title: impl AsRef<str>, message: impl AsRef<str>, ) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::DataValidation",
+      "trait_implementations": [
+        "impl Clone for DataValidation",
+        "impl Debug for DataValidation",
+        "impl Eq for DataValidation",
+        "impl PartialEq for DataValidation",
+        "impl StructuralPartialEq for DataValidation"
+      ]
+    },
+    {
+      "declaration": "pub type DeError = Error;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::DeError",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub struct Dimensions { pub start: (u32, u32), pub end: (u32, u32), }",
+      "inherent_items": [
+        "pub fn contains(&self, row: u32, col: u32) -> bool",
+        "pub fn from_range_tuple(range: (u32, u16, u32, u16)) -> Self",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn len(&self) -> u64",
+        "pub fn new(start: (u32, u32), end: (u32, u32)) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Dimensions",
+      "trait_implementations": [
+        "impl Clone for Dimensions",
+        "impl Copy for Dimensions",
+        "impl Debug for Dimensions",
+        "impl Default for Dimensions",
+        "impl Eq for Dimensions",
+        "impl From<(u32, u16, u32, u16)> for Dimensions",
+        "impl Hash for Dimensions",
+        "impl Ord for Dimensions",
+        "impl PartialEq for Dimensions",
+        "impl PartialOrd for Dimensions",
+        "impl StructuralPartialEq for Dimensions"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct DisplayCell<'a> { pub row: u32, pub col: u16, pub value: &'a Cell, pub formatted: &'a str, pub explicit_style: Option<&'a CellStyle>, pub rich_text: Option<&'a [TextRun]>, pub hyperlink: Option<&'a str>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::DisplayCell",
+      "trait_implementations": [
+        "impl<'a> Clone for DisplayCell<'a>",
+        "impl<'a> Copy for DisplayCell<'a>",
+        "impl<'a> Debug for DisplayCell<'a>"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct DocProperties { pub title: Option<String>, pub subject: Option<String>, pub creator: Option<String>, pub keywords: Option<String>, pub description: Option<String>, pub last_modified_by: Option<String>, pub company: Option<String>, pub created: Option<String>, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn with_company(self, company: impl AsRef<str>) -> Self",
+        "pub fn with_created(self, created: impl AsRef<str>) -> Self",
+        "pub fn with_creator(self, creator: impl AsRef<str>) -> Self",
+        "pub fn with_description(self, description: impl AsRef<str>) -> Self",
+        "pub fn with_keywords(self, keywords: impl AsRef<str>) -> Self",
+        "pub fn with_last_modified_by(self, last_modified_by: impl AsRef<str>) -> Self",
+        "pub fn with_subject(self, subject: impl AsRef<str>) -> Self",
+        "pub fn with_title(self, title: impl AsRef<str>) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::DocProperties",
+      "trait_implementations": [
+        "impl Clone for DocProperties",
+        "impl Debug for DocProperties",
+        "impl Default for DocProperties",
+        "impl Eq for DocProperties",
+        "impl PartialEq for DocProperties",
+        "impl StructuralPartialEq for DocProperties"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum DrawingAnchorBehavior { MoveAndSize, MoveOnly, Absolute, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::DrawingAnchorBehavior",
+      "trait_implementations": [
+        "impl Clone for DrawingAnchorBehavior",
+        "impl Copy for DrawingAnchorBehavior",
+        "impl Debug for DrawingAnchorBehavior",
+        "impl Default for DrawingAnchorBehavior",
+        "impl Eq for DrawingAnchorBehavior",
+        "impl Hash for DrawingAnchorBehavior",
+        "impl PartialEq for DrawingAnchorBehavior",
+        "impl StructuralPartialEq for DrawingAnchorBehavior"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct DrawingCrop { pub left_ppm: u32, pub top_ppm: u32, pub right_ppm: u32, pub bottom_ppm: u32, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::DrawingCrop",
+      "trait_implementations": [
+        "impl Clone for DrawingCrop",
+        "impl Copy for DrawingCrop",
+        "impl Debug for DrawingCrop",
+        "impl Default for DrawingCrop",
+        "impl Eq for DrawingCrop",
+        "impl Hash for DrawingCrop",
+        "impl PartialEq for DrawingCrop",
+        "impl StructuralPartialEq for DrawingCrop"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct DrawingMetadata { pub kind: DrawingObjectKind, pub object_index: usize, pub from_cell: Option<(u32, u16)>, pub to_cell: Option<(u32, u16)>, pub from_offset_emu: Option<(i64, i64)>, pub to_offset_emu: Option<(i64, i64)>, pub absolute_size_emu: Option<(u64, u64)>, pub crop: Option<DrawingCrop>, pub rotation_mdeg: Option<i32>, pub z_order: Option<i32>, pub alt_text: Option<String>, pub name: Option<String>, pub behavior: DrawingAnchorBehavior, pub chart_palette: Vec<Color>, pub chart_series_caches: Vec<ChartSeriesCache>, pub chart_series_styles: Vec<ChartSeriesStyle>, pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>, pub chart_bar_direction: ChartBarDirection, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::DrawingMetadata",
+      "trait_implementations": [
+        "impl Clone for DrawingMetadata",
+        "impl Debug for DrawingMetadata",
+        "impl Default for DrawingMetadata",
+        "impl Eq for DrawingMetadata",
+        "impl PartialEq for DrawingMetadata",
+        "impl StructuralPartialEq for DrawingMetadata"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum DrawingObjectKind { Image, Chart, Shape, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::DrawingObjectKind",
+      "trait_implementations": [
+        "impl Clone for DrawingObjectKind",
+        "impl Copy for DrawingObjectKind",
+        "impl Debug for DrawingObjectKind",
+        "impl Default for DrawingObjectKind",
+        "impl Eq for DrawingObjectKind",
+        "impl Hash for DrawingObjectKind",
+        "impl PartialEq for DrawingObjectKind",
+        "impl StructuralPartialEq for DrawingObjectKind"
+      ]
+    },
+    {
+      "declaration": "pub enum DvKind { List, Whole, Decimal, Date, Time, TextLength, Custom, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::DvKind",
+      "trait_implementations": [
+        "impl Clone for DvKind",
+        "impl Copy for DvKind",
+        "impl Debug for DvKind",
+        "impl Eq for DvKind",
+        "impl PartialEq for DvKind",
+        "impl StructuralPartialEq for DvKind"
+      ]
+    },
+    {
+      "declaration": "pub enum DvOp { Between, NotBetween, Equal, NotEqual, GreaterThan, LessThan, GreaterThanOrEqual, LessThanOrEqual, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::DvOp",
+      "trait_implementations": [
+        "impl Clone for DvOp",
+        "impl Copy for DvOp",
+        "impl Debug for DvOp",
+        "impl Eq for DvOp",
+        "impl PartialEq for DvOp",
+        "impl StructuralPartialEq for DvOp"
+      ]
+    },
+    {
+      "declaration": "pub enum EditCapability { ReadWrite, ReadOnly(EditReadOnlyReason), }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::EditCapability",
+      "trait_implementations": [
+        "impl Clone for EditCapability",
+        "impl Debug for EditCapability",
+        "impl Eq for EditCapability",
+        "impl PartialEq for EditCapability",
+        "impl StructuralPartialEq for EditCapability"
+      ]
+    },
+    {
+      "declaration": "pub enum EditReadOnlyReason { LegacyBiff, BinaryPackage, OpenDocument, PackageMetadataLoss, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::EditReadOnlyReason",
+      "trait_implementations": [
+        "impl Clone for EditReadOnlyReason",
+        "impl Debug for EditReadOnlyReason",
+        "impl Eq for EditReadOnlyReason",
+        "impl PartialEq for EditReadOnlyReason",
+        "impl StructuralPartialEq for EditReadOnlyReason"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum Error { NotOle2, LegacyBiff, Cfb(Error), InvalidCfb(&'static str), MissingWorkbook, Biff(&'static str), Zip(&'static str), UnsupportedCompression { part: String, method: u16, }, Xml(&'static str), Encrypted, EncryptedPackage, EncryptedOpenDocument, NoText, SheetOutOfRange, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::Error",
+      "trait_implementations": [
+        "impl Debug for Error",
+        "impl Display for Error",
+        "impl Error for Error",
+        "impl From<Error> for Error"
+      ]
+    },
+    {
+      "declaration": "pub struct ExcelDateTime { pub year: i64, pub month: u32, pub day: u32, pub hour: u32, pub minute: u32, pub second: u32, }",
+      "inherent_items": [
+        "pub fn date_string(&self) -> String",
+        "pub fn time_string(&self) -> String",
+        "pub fn to_naive_datetime(self) -> Option<NaiveDateTime>"
+      ],
+      "kind": "struct",
+      "path": "rxls::ExcelDateTime",
+      "trait_implementations": [
+        "impl Clone for ExcelDateTime",
+        "impl Copy for ExcelDateTime",
+        "impl Debug for ExcelDateTime",
+        "impl Display for ExcelDateTime",
+        "impl Eq for ExcelDateTime",
+        "impl Hash for ExcelDateTime",
+        "impl PartialEq for ExcelDateTime",
+        "impl StructuralPartialEq for ExcelDateTime"
+      ]
+    },
+    {
+      "declaration": "pub struct Fill { pub pattern: FormatPattern, pub background: Option<Color>, pub foreground: Option<Color>, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn solid(color: impl Into<Color>) -> Self",
+        "pub fn with_background(self, color: impl Into<Color>) -> Self",
+        "pub fn with_foreground(self, color: impl Into<Color>) -> Self",
+        "pub fn with_pattern(self, pattern: FormatPattern) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Fill",
+      "trait_implementations": [
+        "impl Clone for Fill",
+        "impl Copy for Fill",
+        "impl Debug for Fill",
+        "impl Default for Fill",
+        "impl Eq for Fill",
+        "impl Hash for Fill",
+        "impl PartialEq for Fill",
+        "impl StructuralPartialEq for Fill"
+      ]
+    },
+    {
+      "declaration": "pub struct Font { pub name: Option<String>, pub size_pt: Option<u16>, pub color: Option<Color>, pub bold: bool, pub italic: bool, pub underline: bool, pub strikethrough: bool, pub script: FormatScript, }",
+      "inherent_items": [
+        "pub fn bold(self) -> Self",
+        "pub fn italic(self) -> Self",
+        "pub fn new() -> Self",
+        "pub fn strikethrough(self) -> Self",
+        "pub fn underline(self) -> Self",
+        "pub fn with_color(self, color: impl Into<Color>) -> Self",
+        "pub fn with_name(self, name: impl AsRef<str>) -> Self",
+        "pub fn with_script(self, script: FormatScript) -> Self",
+        "pub fn with_size(self, points: u16) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Font",
+      "trait_implementations": [
+        "impl Clone for Font",
+        "impl Debug for Font",
+        "impl Default for Font",
+        "impl Eq for Font",
+        "impl Hash for Font",
+        "impl PartialEq for Font",
+        "impl StructuralPartialEq for Font"
+      ]
+    },
+    {
+      "declaration": "pub struct Format { /* private fields */ }",
+      "inherent_items": [
+        "pub fn align(self, h: HAlign) -> Self",
+        "pub fn alignment(self, alignment: Alignment) -> Self",
+        "pub fn as_cell_style(&self) -> &CellStyle",
+        "pub fn background_color(self, color: impl Into<Color>) -> Self",
+        "pub fn bold(self) -> Self",
+        "pub fn border(self, border: Border) -> Self",
+        "pub fn border_bottom(self, style: FormatBorder) -> Self",
+        "pub fn border_bottom_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_left(self, style: FormatBorder) -> Self",
+        "pub fn border_left_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_right(self, style: FormatBorder) -> Self",
+        "pub fn border_right_color(self, color: impl Into<Color>) -> Self",
+        "pub fn border_top(self, style: FormatBorder) -> Self",
+        "pub fn border_top_color(self, color: impl Into<Color>) -> Self",
+        "pub fn color(self, color: impl Into<Color>) -> Self",
+        "pub fn fill(self, color: impl Into<Color>) -> Self",
+        "pub fn font_name(self, name: impl AsRef<str>) -> Self",
+        "pub fn font_script(self, script: FormatScript) -> Self",
+        "pub fn foreground_color(self, color: impl Into<Color>) -> Self",
+        "pub fn from_cell_style(style: CellStyle) -> Self",
+        "pub fn hidden(self) -> Self",
+        "pub fn indent(self, level: u8) -> Self",
+        "pub fn into_cell_style(self) -> CellStyle",
+        "pub fn italic(self) -> Self",
+        "pub fn locked(self) -> Self",
+        "pub fn merge(&self, overlay: &CellStyle) -> Self",
+        "pub fn merge(&self, overlay: &Format) -> Self",
+        "pub fn new() -> Self",
+        "pub fn num_fmt(self, code: impl AsRef<str>) -> Self",
+        "pub fn pattern(self, pattern: FormatPattern) -> Self",
+        "pub fn pattern_fill(self, fill: Fill) -> Self",
+        "pub fn set_align(self, h: FormatAlign) -> Self",
+        "pub fn set_alignment(self, alignment: Alignment) -> Self",
+        "pub fn set_background_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_bg_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_bold(self) -> Self",
+        "pub fn set_border(self, style: FormatBorder) -> Self",
+        "pub fn set_border_bottom(self, style: FormatBorder) -> Self",
+        "pub fn set_border_bottom_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_left(self, style: FormatBorder) -> Self",
+        "pub fn set_border_left_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_right(self, style: FormatBorder) -> Self",
+        "pub fn set_border_right_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_border_top(self, style: FormatBorder) -> Self",
+        "pub fn set_border_top_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_font_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_font_name(self, name: impl AsRef<str>) -> Self",
+        "pub fn set_font_script(self, script: FormatScript) -> Self",
+        "pub fn set_font_size(self, points: u16) -> Self",
+        "pub fn set_font_strikethrough(self) -> Self",
+        "pub fn set_foreground_color(self, color: impl Into<Color>) -> Self",
+        "pub fn set_hidden(self) -> Self",
+        "pub fn set_indent(self, level: u8) -> Self",
+        "pub fn set_italic(self) -> Self",
+        "pub fn set_locked(self) -> Self",
+        "pub fn set_num_format(self, code: impl AsRef<str>) -> Self",
+        "pub fn set_pattern(self, pattern: FormatPattern) -> Self",
+        "pub fn set_pattern_fill(self, fill: Fill) -> Self",
+        "pub fn set_shrink_to_fit(self) -> Self",
+        "pub fn set_strikethrough(self) -> Self",
+        "pub fn set_text_rotation(self, degrees: i16) -> Self",
+        "pub fn set_text_wrap(self) -> Self",
+        "pub fn set_underline(self) -> Self",
+        "pub fn set_unlocked(self) -> Self",
+        "pub fn set_valign(self, v: VAlign) -> Self",
+        "pub fn shrink_to_fit(self) -> Self",
+        "pub fn size(self, points: u16) -> Self",
+        "pub fn strikethrough(self) -> Self",
+        "pub fn text_rotation(self, degrees: i16) -> Self",
+        "pub fn underline(self) -> Self",
+        "pub fn unlocked(self) -> Self",
+        "pub fn valign(self, v: VAlign) -> Self",
+        "pub fn wrap(self) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Format",
+      "trait_implementations": [
+        "impl Clone for Format",
+        "impl Debug for Format",
+        "impl Default for Format",
+        "impl Deref for Format",
+        "impl DerefMut for Format",
+        "impl Eq for Format",
+        "impl From<CellStyle> for Format",
+        "impl From<Format> for CellStyle",
+        "impl Hash for Format",
+        "impl PartialEq for Format",
+        "impl StructuralPartialEq for Format"
+      ]
+    },
+    {
+      "declaration": "pub type FormatAlign = HAlign;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::FormatAlign",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub type FormatBorder = BorderStyle;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::FormatBorder",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub enum FormatPattern { None, Solid, MediumGray, DarkGray, LightGray, DarkHorizontal, DarkVertical, DarkDown, DarkUp, DarkGrid, DarkTrellis, LightHorizontal, LightVertical, LightDown, LightUp, LightGrid, LightTrellis, Gray125, Gray0625, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::FormatPattern",
+      "trait_implementations": [
+        "impl Clone for FormatPattern",
+        "impl Copy for FormatPattern",
+        "impl Debug for FormatPattern",
+        "impl Default for FormatPattern",
+        "impl Eq for FormatPattern",
+        "impl Hash for FormatPattern",
+        "impl PartialEq for FormatPattern",
+        "impl StructuralPartialEq for FormatPattern"
+      ]
+    },
+    {
+      "declaration": "pub enum FormatScript { None, Superscript, Subscript, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::FormatScript",
+      "trait_implementations": [
+        "impl Clone for FormatScript",
+        "impl Copy for FormatScript",
+        "impl Debug for FormatScript",
+        "impl Default for FormatScript",
+        "impl Eq for FormatScript",
+        "impl Hash for FormatScript",
+        "impl PartialEq for FormatScript",
+        "impl StructuralPartialEq for FormatScript"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum FormulaEvaluation { Computed(Cell), Fallback { cached: Cell, reason: FormulaUnsupportedReason, }, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::FormulaEvaluation",
+      "trait_implementations": [
+        "impl Clone for FormulaEvaluation",
+        "impl Debug for FormulaEvaluation",
+        "impl PartialEq for FormulaEvaluation",
+        "impl StructuralPartialEq for FormulaEvaluation"
+      ]
+    },
+    {
+      "declaration": "pub struct FormulaRange<'a> { /* private fields */ }",
+      "inherent_items": [
+        "pub fn cells( &self, ) -> impl DoubleEndedIterator<Item = (usize, usize, Option<&str>)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn dimensions_info(&self) -> Option<Dimensions>",
+        "pub fn empty() -> Self",
+        "pub fn end(&self) -> Option<(u32, u32)>",
+        "pub fn from_sparse<I, S>(formulas: I) -> Selfwhere I: IntoIterator<Item = ((u32, u32), S)>, S: Into<String>,",
+        "pub fn get(&self, pos: (usize, usize)) -> Option<&str>",
+        "pub fn get_abs(&self, row: u32, col: u16) -> Option<&str>",
+        "pub fn get_size(&self) -> (usize, usize)",
+        "pub fn get_value(&self, pos: (u32, u32)) -> Option<&str>",
+        "pub fn headers(&self) -> Option<Vec<String>>",
+        "pub fn height(&self) -> usize",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn new(start: (u32, u32), end: (u32, u32)) -> Self",
+        "pub fn range(&self, start: (u32, u32), end: (u32, u32)) -> Self",
+        "pub fn row_views(&self) -> FormulaRangeRows<'_, 'a> \u24d8",
+        "pub fn rows( &self, ) -> impl DoubleEndedIterator<Item = Vec<Option<&str>>> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn set_value(&mut self, pos: (u32, u32), formula: impl Into<String>)",
+        "pub fn size(&self) -> (usize, usize)",
+        "pub fn start(&self) -> Option<(u32, u32)>",
+        "pub fn used_cells( &self, ) -> impl DoubleEndedIterator<Item = (u32, u16, &str)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn used_cells_abs( &self, ) -> impl DoubleEndedIterator<Item = (u32, u16, &str)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn width(&self) -> usize"
+      ],
+      "kind": "struct",
+      "path": "rxls::FormulaRange",
+      "trait_implementations": [
+        "impl Eq for FormulaRange<'_>",
+        "impl<'a> Clone for FormulaRange<'a>",
+        "impl<'a> Debug for FormulaRange<'a>",
+        "impl<'a> Default for FormulaRange<'a>",
+        "impl<'right> PartialEq<FormulaRange<'right>> for FormulaRange<'_>"
+      ]
+    },
+    {
+      "declaration": "pub struct FormulaRangeRow<'range, 'formula> { /* private fields */ }",
+      "inherent_items": [
+        "pub fn cells( &self, ) -> impl DoubleEndedIterator<Item = (usize, Option<&'range str>)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn end_col(&self) -> u16",
+        "pub fn get(&self, col: usize) -> Option<&str>",
+        "pub fn get_abs(&self, col: u16) -> Option<&str>",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn iter(&self) -> FormulaRangeRowCells<'range, 'formula> \u24d8",
+        "pub fn len(&self) -> usize",
+        "pub fn row(&self) -> u32",
+        "pub fn start_col(&self) -> u16",
+        "pub fn used_cells(&self) -> FormulaRangeRowUsedCells<'range, 'formula> \u24d8"
+      ],
+      "kind": "struct",
+      "path": "rxls::FormulaRangeRow",
+      "trait_implementations": [
+        "impl<'range, 'formula> Clone for FormulaRangeRow<'range, 'formula>",
+        "impl<'range, 'formula> Copy for FormulaRangeRow<'range, 'formula>",
+        "impl<'range, 'formula> Debug for FormulaRangeRow<'range, 'formula>"
+      ]
+    },
+    {
+      "declaration": "pub struct FormulaRangeRowCells<'range, 'formula> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::FormulaRangeRowCells",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for FormulaRangeRowCells<'_, '_>",
+        "impl ExactSizeIterator for FormulaRangeRowCells<'_, '_>",
+        "impl FusedIterator for FormulaRangeRowCells<'_, '_>",
+        "impl<'range, 'formula> Clone for FormulaRangeRowCells<'range, 'formula>",
+        "impl<'range, 'formula> Debug for FormulaRangeRowCells<'range, 'formula>",
+        "impl<'range> Iterator for FormulaRangeRowCells<'range, '_>"
+      ]
+    },
+    {
+      "declaration": "pub struct FormulaRangeRowUsedCells<'range, 'formula> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::FormulaRangeRowUsedCells",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for FormulaRangeRowUsedCells<'_, '_>",
+        "impl ExactSizeIterator for FormulaRangeRowUsedCells<'_, '_>",
+        "impl FusedIterator for FormulaRangeRowUsedCells<'_, '_>",
+        "impl<'range, 'formula> Clone for FormulaRangeRowUsedCells<'range, 'formula>",
+        "impl<'range, 'formula> Debug for FormulaRangeRowUsedCells<'range, 'formula>",
+        "impl<'range> Iterator for FormulaRangeRowUsedCells<'range, '_>"
+      ]
+    },
+    {
+      "declaration": "pub struct FormulaRangeRows<'range, 'formula> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::FormulaRangeRows",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for FormulaRangeRows<'_, '_>",
+        "impl ExactSizeIterator for FormulaRangeRows<'_, '_>",
+        "impl FusedIterator for FormulaRangeRows<'_, '_>",
+        "impl<'range, 'formula> Clone for FormulaRangeRows<'range, 'formula>",
+        "impl<'range, 'formula> Debug for FormulaRangeRows<'range, 'formula>",
+        "impl<'range, 'formula> Iterator for FormulaRangeRows<'range, 'formula>"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum FormulaUnsupportedReason { UnsupportedFunction, Volatile, ExternalRef, CircularReference, UnresolvedName, UnparsableExpression, ArraySemantics, RangeTooLarge, SheetNotFound, ExpressionTooComplex, OperationLimitExceeded, DependencyDepthExceeded, }",
+      "inherent_items": [
+        "pub fn code(self) -> &'static str"
+      ],
+      "kind": "enum",
+      "path": "rxls::FormulaUnsupportedReason",
+      "trait_implementations": [
+        "impl Clone for FormulaUnsupportedReason",
+        "impl Copy for FormulaUnsupportedReason",
+        "impl Debug for FormulaUnsupportedReason",
+        "impl Eq for FormulaUnsupportedReason",
+        "impl PartialEq for FormulaUnsupportedReason",
+        "impl StructuralPartialEq for FormulaUnsupportedReason"
+      ]
+    },
+    {
+      "declaration": "pub enum HAlign { Left, Center, Right, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::HAlign",
+      "trait_implementations": [
+        "impl Clone for HAlign",
+        "impl Copy for HAlign",
+        "impl Debug for HAlign",
+        "impl Eq for HAlign",
+        "impl Hash for HAlign",
+        "impl PartialEq for HAlign",
+        "impl StructuralPartialEq for HAlign"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum HeaderFooterKind { OddHeader, OddFooter, EvenHeader, EvenFooter, FirstHeader, FirstFooter, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::HeaderFooterKind",
+      "trait_implementations": [
+        "impl Clone for HeaderFooterKind",
+        "impl Copy for HeaderFooterKind",
+        "impl Debug for HeaderFooterKind",
+        "impl Eq for HeaderFooterKind",
+        "impl Hash for HeaderFooterKind",
+        "impl PartialEq for HeaderFooterKind",
+        "impl StructuralPartialEq for HeaderFooterKind"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct HeaderFooterMetadata { /* private fields */ }",
+      "inherent_items": [
+        "pub fn align_with_margins(&self) -> Option<bool>",
+        "pub fn different_first(&self) -> Option<bool>",
+        "pub fn different_odd_even(&self) -> Option<bool>",
+        "pub fn even_footer(&self) -> Option<&str>",
+        "pub fn even_header(&self) -> Option<&str>",
+        "pub fn first_footer(&self) -> Option<&str>",
+        "pub fn first_header(&self) -> Option<&str>",
+        "pub fn get(&self, kind: HeaderFooterKind) -> Option<&str>",
+        "pub fn odd_footer(&self) -> Option<&str>",
+        "pub fn odd_header(&self) -> Option<&str>",
+        "pub fn scale_with_document(&self) -> Option<bool>"
+      ],
+      "kind": "struct",
+      "path": "rxls::HeaderFooterMetadata",
+      "trait_implementations": [
+        "impl Clone for HeaderFooterMetadata",
+        "impl Debug for HeaderFooterMetadata",
+        "impl Default for HeaderFooterMetadata",
+        "impl Eq for HeaderFooterMetadata",
+        "impl PartialEq for HeaderFooterMetadata",
+        "impl StructuralPartialEq for HeaderFooterMetadata"
+      ]
+    },
+    {
+      "declaration": "pub enum HeaderRow { FirstNonEmptyRow, Row(u32), }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::HeaderRow",
+      "trait_implementations": [
+        "impl Clone for HeaderRow",
+        "impl Copy for HeaderRow",
+        "impl Debug for HeaderRow",
+        "impl Default for HeaderRow",
+        "impl Eq for HeaderRow",
+        "impl From<u32> for HeaderRow",
+        "impl Hash for HeaderRow",
+        "impl PartialEq for HeaderRow",
+        "impl StructuralPartialEq for HeaderRow"
+      ]
+    },
+    {
+      "declaration": "pub struct Image { pub data: Vec<u8>, pub format: ImageFmt, pub from: (u32, u16), pub to: Option<(u32, u16)>, }",
+      "inherent_items": [
+        "pub fn new(data: impl Into<Vec<u8>>, format: ImageFmt, from: (u32, u16)) -> Self",
+        "pub fn with_to(self, to: (u32, u16)) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Image",
+      "trait_implementations": [
+        "impl Clone for Image",
+        "impl Debug for Image",
+        "impl Eq for Image",
+        "impl PartialEq for Image",
+        "impl StructuralPartialEq for Image"
+      ]
+    },
+    {
+      "declaration": "pub enum ImageFmt { Png, Jpeg, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ImageFmt",
+      "trait_implementations": [
+        "impl Clone for ImageFmt",
+        "impl Copy for ImageFmt",
+        "impl Debug for ImageFmt",
+        "impl Eq for ImageFmt",
+        "impl PartialEq for ImageFmt",
+        "impl StructuralPartialEq for ImageFmt"
+      ]
+    },
+    {
+      "declaration": "pub struct LocalDefinedName { pub sheet: String, pub name: String, pub refers_to: String, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::LocalDefinedName",
+      "trait_implementations": [
+        "impl Clone for LocalDefinedName",
+        "impl Debug for LocalDefinedName",
+        "impl Eq for LocalDefinedName",
+        "impl PartialEq for LocalDefinedName",
+        "impl StructuralPartialEq for LocalDefinedName"
+      ]
+    },
+    {
+      "declaration": "pub const MAX_PARSE_RECOVERY_CODES: usize = 16;",
+      "inherent_items": [],
+      "kind": "constant",
+      "path": "rxls::MAX_PARSE_RECOVERY_CODES",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub struct PageSetup { pub landscape: bool, pub margins: Option<(f64, f64, f64, f64, f64, f64)>, pub print_area: Option<(u32, u16, u32, u16)>, pub repeat_rows: Option<(u32, u32)>, pub repeat_cols: Option<(u16, u16)>, pub fit_to_width: Option<u16>, pub fit_to_height: Option<u16>, pub header: Option<String>, pub footer: Option<String>, pub paper_size: Option<u16>, pub scale: Option<u16>, pub center_horizontally: bool, pub center_vertically: bool, pub first_page_number: Option<u16>, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn with_center_horizontally(self, center: bool) -> Self",
+        "pub fn with_center_vertically(self, center: bool) -> Self",
+        "pub fn with_first_page_number(self, first_page_number: u16) -> Self",
+        "pub fn with_fit_to_pages(self, width: u16, height: u16) -> Self",
+        "pub fn with_footer(self, footer: impl AsRef<str>) -> Self",
+        "pub fn with_header(self, header: impl AsRef<str>) -> Self",
+        "pub fn with_landscape(self) -> Self",
+        "pub fn with_margins( self, left: f64, right: f64, top: f64, bottom: f64, header: f64, footer: f64, ) -> Self",
+        "pub fn with_paper_size(self, paper_size: u16) -> Self",
+        "pub fn with_print_area(self, range: (u32, u16, u32, u16)) -> Self",
+        "pub fn with_repeat_cols(self, first: u16, last: u16) -> Self",
+        "pub fn with_repeat_rows(self, first: u32, last: u32) -> Self",
+        "pub fn with_scale(self, scale: u16) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::PageSetup",
+      "trait_implementations": [
+        "impl Clone for PageSetup",
+        "impl Debug for PageSetup",
+        "impl Default for PageSetup",
+        "impl PartialEq for PageSetup",
+        "impl StructuralPartialEq for PageSetup"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ParseProvenance { pub container: ContainerParseMode, pub partial: bool, /* private fields */ }",
+      "inherent_items": [
+        "pub fn is_recovered(&self) -> bool",
+        "pub fn recoveries(&self) -> &[RecoveryCode]",
+        "pub fn recoveries_truncated(&self) -> bool"
+      ],
+      "kind": "struct",
+      "path": "rxls::ParseProvenance",
+      "trait_implementations": [
+        "impl Clone for ParseProvenance",
+        "impl Debug for ParseProvenance",
+        "impl Default for ParseProvenance",
+        "impl Eq for ParseProvenance",
+        "impl PartialEq for ParseProvenance",
+        "impl StructuralPartialEq for ParseProvenance"
+      ]
+    },
+    {
+      "declaration": "pub struct Picture { pub row: u32, pub col: u32, pub sheet_name: String, pub extension: String, pub data: Vec<u8>, pub name: String, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::Picture",
+      "trait_implementations": [
+        "impl Clone for Picture",
+        "impl Debug for Picture",
+        "impl Eq for Picture",
+        "impl PartialEq for Picture",
+        "impl StructuralPartialEq for Picture"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum PrintFidelity { Unavailable, Partial, Retained, Authored, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::PrintFidelity",
+      "trait_implementations": [
+        "impl Clone for PrintFidelity",
+        "impl Copy for PrintFidelity",
+        "impl Debug for PrintFidelity",
+        "impl Default for PrintFidelity",
+        "impl Eq for PrintFidelity",
+        "impl Hash for PrintFidelity",
+        "impl PartialEq for PrintFidelity",
+        "impl StructuralPartialEq for PrintFidelity"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct PrintLoss { pub kind: PrintLossKind, pub occurrences: u32, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::PrintLoss",
+      "trait_implementations": [
+        "impl Clone for PrintLoss",
+        "impl Copy for PrintLoss",
+        "impl Debug for PrintLoss",
+        "impl Eq for PrintLoss",
+        "impl Hash for PrintLoss",
+        "impl PartialEq for PrintLoss",
+        "impl StructuralPartialEq for PrintLoss"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum PrintLossKind { InvalidPrintArea, InvalidPageBreak, MissingReference, UnsupportedProperty, MalformedHeaderFooter, LimitExceeded, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::PrintLossKind",
+      "trait_implementations": [
+        "impl Clone for PrintLossKind",
+        "impl Copy for PrintLossKind",
+        "impl Debug for PrintLossKind",
+        "impl Eq for PrintLossKind",
+        "impl Hash for PrintLossKind",
+        "impl PartialEq for PrintLossKind",
+        "impl StructuralPartialEq for PrintLossKind"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct PrintMetadata { /* private fields */ }",
+      "inherent_items": [
+        "pub fn center_horizontally(&self) -> Option<bool>",
+        "pub fn center_vertically(&self) -> Option<bool>",
+        "pub fn fidelity(&self) -> PrintFidelity",
+        "pub fn header_footer(&self) -> &HeaderFooterMetadata",
+        "pub fn losses(&self) -> &[PrintLoss]",
+        "pub fn manual_col_breaks(&self) -> &[u16]",
+        "pub fn manual_row_breaks(&self) -> &[u32]",
+        "pub fn page_order(&self) -> Option<PrintPageOrder>",
+        "pub fn print_areas(&self) -> &[(u32, u16, u32, u16)]",
+        "pub fn print_gridlines(&self) -> Option<bool>",
+        "pub fn print_headings(&self) -> Option<bool>"
+      ],
+      "kind": "struct",
+      "path": "rxls::PrintMetadata",
+      "trait_implementations": [
+        "impl Clone for PrintMetadata",
+        "impl Debug for PrintMetadata",
+        "impl Default for PrintMetadata",
+        "impl Eq for PrintMetadata",
+        "impl PartialEq for PrintMetadata",
+        "impl StructuralPartialEq for PrintMetadata"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum PrintPageOrder { DownThenOver, OverThenDown, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::PrintPageOrder",
+      "trait_implementations": [
+        "impl Clone for PrintPageOrder",
+        "impl Copy for PrintPageOrder",
+        "impl Debug for PrintPageOrder",
+        "impl Eq for PrintPageOrder",
+        "impl Hash for PrintPageOrder",
+        "impl PartialEq for PrintPageOrder",
+        "impl StructuralPartialEq for PrintPageOrder"
+      ]
+    },
+    {
+      "declaration": "pub struct ProtectionOptions { pub sort: bool, pub auto_filter: bool, pub format_cells: bool, pub format_columns: bool, pub format_rows: bool, pub insert_columns: bool, pub insert_rows: bool, pub insert_hyperlinks: bool, pub delete_columns: bool, pub delete_rows: bool, pub pivot_tables: bool, }",
+      "inherent_items": [
+        "pub fn allow_auto_filter(self) -> Self",
+        "pub fn allow_delete_columns(self) -> Self",
+        "pub fn allow_delete_rows(self) -> Self",
+        "pub fn allow_format_cells(self) -> Self",
+        "pub fn allow_format_columns(self) -> Self",
+        "pub fn allow_format_rows(self) -> Self",
+        "pub fn allow_insert_columns(self) -> Self",
+        "pub fn allow_insert_hyperlinks(self) -> Self",
+        "pub fn allow_insert_rows(self) -> Self",
+        "pub fn allow_pivot_tables(self) -> Self",
+        "pub fn allow_sort(self) -> Self",
+        "pub fn new() -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::ProtectionOptions",
+      "trait_implementations": [
+        "impl Clone for ProtectionOptions",
+        "impl Copy for ProtectionOptions",
+        "impl Debug for ProtectionOptions",
+        "impl Default for ProtectionOptions",
+        "impl Eq for ProtectionOptions",
+        "impl Hash for ProtectionOptions",
+        "impl PartialEq for ProtectionOptions",
+        "impl StructuralPartialEq for ProtectionOptions"
+      ]
+    },
+    {
+      "declaration": "pub const REPORT_SCHEMA_VERSION: u32 = 2;",
+      "inherent_items": [],
+      "kind": "constant",
+      "path": "rxls::REPORT_SCHEMA_VERSION",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub struct Range<'a> { /* private fields */ }",
+      "inherent_items": [
+        "pub fn cells( &self, ) -> impl DoubleEndedIterator<Item = (usize, usize, Option<&Cell>)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn deserialize<D>(&'a self) -> Result<RangeDeserializer<'a, D>, DeError>where D: Deserialize<'a>,",
+        "pub fn dimensions_info(&self) -> Option<Dimensions>",
+        "pub fn empty() -> Self",
+        "pub fn end(&self) -> Option<(u32, u32)>",
+        "pub fn formatted(&self, pos: (usize, usize)) -> Option<&str>",
+        "pub fn formatted_abs(&self, row: u32, col: u16) -> Option<&str>",
+        "pub fn from_sparse<I, V>(cells: I) -> Selfwhere I: IntoIterator<Item = ((u32, u32), V)>, V: Into<Cell>,",
+        "pub fn get(&self, pos: (usize, usize)) -> Option<&Cell>",
+        "pub fn get_abs(&self, row: u32, col: u16) -> Option<&Cell>",
+        "pub fn get_size(&self) -> (usize, usize)",
+        "pub fn get_value(&self, pos: (u32, u32)) -> Option<&Cell>",
+        "pub fn headers(&self) -> Option<Vec<String>>",
+        "pub fn height(&self) -> usize",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn new(start: (u32, u32), end: (u32, u32)) -> Self",
+        "pub fn range(&self, start: (u32, u32), end: (u32, u32)) -> Self",
+        "pub fn row_views(&self) -> RangeRows<'_, 'a> \u24d8",
+        "pub fn rows( &self, ) -> impl DoubleEndedIterator<Item = Vec<Option<&Cell>>> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn set_value(&mut self, pos: (u32, u32), value: impl Into<Cell>)",
+        "pub fn size(&self) -> (usize, usize)",
+        "pub fn start(&self) -> Option<(u32, u32)>",
+        "pub fn used_cells( &self, ) -> impl DoubleEndedIterator<Item = (u32, u16, &Cell)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn used_cells_abs( &self, ) -> impl DoubleEndedIterator<Item = (u32, u16, &Cell)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn width(&self) -> usize"
+      ],
+      "kind": "struct",
+      "path": "rxls::Range",
+      "trait_implementations": [
+        "impl<'a> Clone for Range<'a>",
+        "impl<'a> Debug for Range<'a>",
+        "impl<'a> Default for Range<'a>",
+        "impl<'right> PartialEq<Range<'right>> for Range<'_>"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeDeserializer<'cell, D>where D: Deserialize<'cell>,{ /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::RangeDeserializer",
+      "trait_implementations": [
+        "impl<'cell, D> Debug for RangeDeserializer<'cell, D>where D: Deserialize<'cell> + Debug,",
+        "impl<'cell, D> ExactSizeIterator for RangeDeserializer<'cell, D>where D: Deserialize<'cell>,",
+        "impl<'cell, D> FusedIterator for RangeDeserializer<'cell, D>where D: Deserialize<'cell>,",
+        "impl<'cell, D> Iterator for RangeDeserializer<'cell, D>where D: Deserialize<'cell>,"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeDeserializerBuilder { /* private fields */ }",
+      "inherent_items": [
+        "pub fn from_range<'cell, D>( &self, range: &'cell Range<'cell>, ) -> Result<RangeDeserializer<'cell, D>, DeError>where D: Deserialize<'cell>,",
+        "pub fn has_headers(&mut self, yes: bool) -> &mut Self",
+        "pub fn new() -> Self",
+        "pub fn with_deserialize_headers<D>() -> Selfwhere D: for<'de> Deserialize<'de>,",
+        "pub fn with_header_row(&mut self, row: impl Into<HeaderRow>) -> &mut Self",
+        "pub fn with_headers<H>(headers: &[H]) -> Selfwhere H: AsRef<str>,"
+      ],
+      "kind": "struct",
+      "path": "rxls::RangeDeserializerBuilder",
+      "trait_implementations": [
+        "impl Clone for RangeDeserializerBuilder",
+        "impl Debug for RangeDeserializerBuilder",
+        "impl Default for RangeDeserializerBuilder"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeRow<'range, 'cell> { /* private fields */ }",
+      "inherent_items": [
+        "pub fn cells( &self, ) -> impl DoubleEndedIterator<Item = (usize, Option<&'range Cell>)> + ExactSizeIterator + FusedIterator + '_",
+        "pub fn end_col(&self) -> u16",
+        "pub fn get(&self, col: usize) -> Option<&Cell>",
+        "pub fn get_abs(&self, col: u16) -> Option<&Cell>",
+        "pub fn is_empty(&self) -> bool",
+        "pub fn iter(&self) -> RangeRowCells<'range, 'cell> \u24d8",
+        "pub fn len(&self) -> usize",
+        "pub fn row(&self) -> u32",
+        "pub fn start_col(&self) -> u16",
+        "pub fn used_cells(&self) -> RangeRowUsedCells<'range, 'cell> \u24d8"
+      ],
+      "kind": "struct",
+      "path": "rxls::RangeRow",
+      "trait_implementations": [
+        "impl<'range, 'cell> Clone for RangeRow<'range, 'cell>",
+        "impl<'range, 'cell> Copy for RangeRow<'range, 'cell>",
+        "impl<'range, 'cell> Debug for RangeRow<'range, 'cell>"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeRowCells<'range, 'cell> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::RangeRowCells",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for RangeRowCells<'_, '_>",
+        "impl ExactSizeIterator for RangeRowCells<'_, '_>",
+        "impl FusedIterator for RangeRowCells<'_, '_>",
+        "impl<'range, 'cell> Clone for RangeRowCells<'range, 'cell>",
+        "impl<'range, 'cell> Debug for RangeRowCells<'range, 'cell>",
+        "impl<'range> Iterator for RangeRowCells<'range, '_>"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeRowUsedCells<'range, 'cell> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::RangeRowUsedCells",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for RangeRowUsedCells<'_, '_>",
+        "impl ExactSizeIterator for RangeRowUsedCells<'_, '_>",
+        "impl FusedIterator for RangeRowUsedCells<'_, '_>",
+        "impl<'range, 'cell> Clone for RangeRowUsedCells<'range, 'cell>",
+        "impl<'range, 'cell> Debug for RangeRowUsedCells<'range, 'cell>",
+        "impl<'range> Iterator for RangeRowUsedCells<'range, '_>"
+      ]
+    },
+    {
+      "declaration": "pub struct RangeRows<'range, 'cell> { /* private fields */ }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::RangeRows",
+      "trait_implementations": [
+        "impl DoubleEndedIterator for RangeRows<'_, '_>",
+        "impl ExactSizeIterator for RangeRows<'_, '_>",
+        "impl FusedIterator for RangeRows<'_, '_>",
+        "impl<'range, 'cell> Clone for RangeRows<'range, 'cell>",
+        "impl<'range, 'cell> Debug for RangeRows<'range, 'cell>",
+        "impl<'range, 'cell> Iterator for RangeRows<'range, 'cell>"
+      ]
+    },
+    {
+      "declaration": "pub trait Reader { // Required methods fn sheet_names(&self) -> Vec<&str>; fn sheets_metadata(&self) -> Vec<SheetMetadata>; fn defined_names(&self) -> &[(String, String)]; fn local_defined_names(&self) -> &[LocalDefinedName]; fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self where Self: Sized; fn header_row(&self) -> HeaderRow; fn worksheet_range(&self, name: &str) -> Option<Range<'_>>; fn worksheet_range_at(&self, index: usize) -> Option<Range<'_>>; fn worksheet_formula(&self, name: &str) -> Option<FormulaRange<'_>>; fn worksheet_formula_at(&self, index: usize) -> Option<FormulaRange<'_>>; fn worksheet_merge_cells( &self, name: &str, ) -> Option<&[(u32, u16, u32, u16)]>; fn worksheet_merge_cells_at( &self, index: usize, ) -> Option<&[(u32, u16, u32, u16)]>; fn merged_regions(&self) -> Vec<(&str, Dimensions)>; fn merged_regions_by_sheet(&self, name: &str) -> Vec<Dimensions>; fn worksheet_metadata(&self, name: &str) -> Option<WorksheetMetadata<'_>>; fn worksheet_metadata_at( &self, index: usize, ) -> Option<WorksheetMetadata<'_>>; fn worksheets_metadata(&self) -> Vec<WorksheetMetadata<'_>>; fn worksheets(&self) -> Vec<(String, Range<'_>)>; fn metadata(&self) -> WorkbookMetadata<'_>; fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>>; fn pictures_with_metadata(&self) -> Vec<Picture>; fn table_names(&self) -> Vec<&str>; fn table_names_in_sheet(&self, sheet_name: &str) -> Vec<&str>; fn table_by_name(&self, table_name: &str) -> Option<(&str, &Table)>; fn table_data_by_name(&self, table_name: &str) -> Option<(&str, Range<'_>)>; // Provided methods fn worksheet_range_ref(&self, name: &str) -> Option<Range<'_>> { ... } fn worksheet_range_at_ref(&self, index: usize) -> Option<Range<'_>> { ... } fn worksheet_formula_ref(&self, name: &str) -> Option<FormulaRange<'_>> { ... } fn worksheet_formula_at_ref(&self, index: usize) -> Option<FormulaRange<'_>> { ... } fn has_1904_epoch(&self) -> bool { ... } fn active_sheet_index(&self) -> Option<usize> { ... } fn active_sheet_name(&self) -> Option<&str> { ... } fn table_by_name_ref(&self, table_name: &str) -> Option<(&str, &Table)> { ... } fn table_data_by_name_ref( &self, table_name: &str, ) -> Option<(&str, Range<'_>)> { ... } }",
+      "inherent_items": [],
+      "kind": "trait",
+      "path": "rxls::Reader",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum RecoveryCode { TolerantCfbDirectoryWalk, }",
+      "inherent_items": [
+        "pub const fn code(self) -> &'static str"
+      ],
+      "kind": "enum",
+      "path": "rxls::RecoveryCode",
+      "trait_implementations": [
+        "impl Clone for RecoveryCode",
+        "impl Copy for RecoveryCode",
+        "impl Debug for RecoveryCode",
+        "impl Eq for RecoveryCode",
+        "impl PartialEq for RecoveryCode",
+        "impl StructuralPartialEq for RecoveryCode"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ReportEvaluation { pub computed: usize, pub errors: usize, pub cached: usize, pub unsupported: usize, pub by_reason: BTreeMap<String, usize>, pub truncated: bool, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ReportEvaluation",
+      "trait_implementations": [
+        "impl Clone for ReportEvaluation",
+        "impl Debug for ReportEvaluation",
+        "impl Default for ReportEvaluation"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ReportFeatures { pub comments: usize, pub data_validations: usize, pub tables: usize, pub merged_ranges: usize, pub hyperlinks: usize, pub images: usize, pub charts: usize, pub sparklines: usize, pub conditional_formatting: usize, pub hidden_sheets: usize, pub frozen_panes: usize, pub page_setup: usize, pub protection: usize, pub pivot_tables: usize, pub vba_project: bool, pub threaded_comments: usize, pub external_links: usize, pub custom_xml: usize, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ReportFeatures",
+      "trait_implementations": [
+        "impl Clone for ReportFeatures",
+        "impl Copy for ReportFeatures",
+        "impl Debug for ReportFeatures",
+        "impl Default for ReportFeatures"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ReportProperties { pub title: Option<String>, pub subject: Option<String>, pub creator: Option<String>, pub keywords: Option<String>, pub description: Option<String>, pub last_modified_by: Option<String>, pub company: Option<String>, pub created: Option<String>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ReportProperties",
+      "trait_implementations": [
+        "impl Clone for ReportProperties",
+        "impl Debug for ReportProperties",
+        "impl Default for ReportProperties"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ReportStats { pub sheets: usize, pub cells: usize, pub formulas: usize, pub text_truncated: bool, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ReportStats",
+      "trait_implementations": [
+        "impl Clone for ReportStats",
+        "impl Copy for ReportStats",
+        "impl Debug for ReportStats"
+      ]
+    },
+    {
+      "declaration": "pub type Result<T> = Result<T, Error>;",
+      "inherent_items": [],
+      "kind": "type",
+      "path": "rxls::Result",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub struct Series { pub name: Option<String>, pub categories: Option<String>, pub values: String, pub bubble_sizes: Option<String>, }",
+      "inherent_items": [
+        "pub fn new(values: impl AsRef<str>) -> Self",
+        "pub fn with_bubble_sizes(self, bubble_sizes: impl AsRef<str>) -> Self",
+        "pub fn with_categories(self, categories: impl AsRef<str>) -> Self",
+        "pub fn with_name(self, name: impl AsRef<str>) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Series",
+      "trait_implementations": [
+        "impl Clone for Series",
+        "impl Debug for Series",
+        "impl Eq for Series",
+        "impl PartialEq for Series",
+        "impl StructuralPartialEq for Series"
+      ]
+    },
+    {
+      "declaration": "pub struct Sheet { pub name: String, pub is_worksheet: bool, /* private fields */ }",
+      "inherent_items": [
+        "pub fn add_chart(&mut self, chart: Chart)",
+        "pub fn add_comment( &mut self, row: u32, col: u16, text: impl AsRef<str>, author: impl Into<CommentAuthor>, )",
+        "pub fn add_conditional_format(&mut self, cf: CondFormat)",
+        "pub fn add_data_validation(&mut self, dv: DataValidation)",
+        "pub fn add_image(&mut self, img: Image)",
+        "pub fn add_sparkline(&mut self, sparkline: Sparkline)",
+        "pub fn add_table(&mut self, table: Table)",
+        "pub fn autofilter(&mut self, r0: u32, c0: u16, r1: u32, c1: u16)",
+        "pub fn autofilter_range(&self) -> Option<(u32, u16, u32, u16)>",
+        "pub fn blank_cell_styles(&self) -> &BTreeMap<(u32, u16), CellStyle>",
+        "pub fn cell(&self, row: u32, col: u16) -> Option<&Cell>",
+        "pub fn cell_style(&self, row: u32, col: u16) -> Option<&CellStyle>",
+        "pub fn cells(&self) -> impl Iterator<Item = (u32, u16, &Cell)>",
+        "pub fn charts(&self) -> &[Chart]",
+        "pub fn col_outline_levels(&self) -> &BTreeMap<u16, u8>",
+        "pub fn collapse_row(&mut self, row: u32)",
+        "pub fn collapsed_rows(&self) -> &BTreeSet<u32>",
+        "pub fn column_styles(&self) -> &BTreeMap<u16, CellStyle>",
+        "pub fn column_widths(&self) -> &BTreeMap<u16, f32>",
+        "pub fn comments(&self) -> &[Comment]",
+        "pub fn conditional_format_metadata(&self) -> &[ConditionalFormatMetadata]",
+        "pub fn conditional_formats(&self) -> &[CondFormat]",
+        "pub fn data_validations(&self) -> &[DataValidation]",
+        "pub fn default_cell_style(&self) -> Option<&CellStyle>",
+        "pub fn default_column_width(&self) -> Option<f32>",
+        "pub fn default_row_height(&self) -> Option<f32>",
+        "pub fn dimensions(&self) -> Option<(u32, u16, u32, u16)>",
+        "pub fn dimensions_info(&self) -> Option<Dimensions>",
+        "pub fn display_cells(&self) -> impl Iterator<Item = DisplayCell<'_>>",
+        "pub fn drawing_metadata(&self) -> &[DrawingMetadata]",
+        "pub fn formatted(&self, row: u32, col: u16) -> Option<&str>",
+        "pub fn freeze_panes(&mut self, row: u32, col: u16)",
+        "pub fn group_cols(&mut self, first: u16, last: u16, level: u8)",
+        "pub fn group_rows(&mut self, first: u32, last: u32, level: u8)",
+        "pub fn hidden_columns(&self) -> &BTreeSet<u16>",
+        "pub fn hidden_rows(&self) -> &BTreeSet<u32>",
+        "pub fn hide(&mut self)",
+        "pub fn hide_column(&mut self, col: u16)",
+        "pub fn hide_gridlines(&mut self)",
+        "pub fn hide_row(&mut self, row: u32)",
+        "pub fn hide_very(&mut self)",
+        "pub fn hyperlinks(&self) -> &[(u32, u16, String)]",
+        "pub fn images(&self) -> &[Image]",
+        "pub fn is_hidden(&self) -> bool",
+        "pub fn is_protected(&self) -> bool",
+        "pub fn is_very_hidden(&self) -> bool",
+        "pub fn merge(&mut self, r0: u32, c0: u16, r1: u32, c1: u16)",
+        "pub fn merge_range( &mut self, r0: u32, c0: u16, r1: u32, c1: u16, text: impl AsRef<str>, format: &Format, )",
+        "pub fn merged_ranges(&self) -> &[(u32, u16, u32, u16)]",
+        "pub fn metadata(&self) -> WorksheetMetadata<'_>",
+        "pub fn new(name: impl AsRef<str>) -> Self",
+        "pub fn outline_summary_below(&self) -> bool",
+        "pub fn outline_summary_right(&self) -> bool",
+        "pub fn page_setup(&self) -> Option<&PageSetup>",
+        "pub fn physical_column_widths(&self) -> &BTreeMap<u16, f32>",
+        "pub fn print_gridlines(&self) -> bool",
+        "pub fn print_headings(&self) -> bool",
+        "pub fn print_metadata(&self) -> &PrintMetadata",
+        "pub fn protect(&mut self)",
+        "pub fn protect_with(&mut self, opts: ProtectionOptions)",
+        "pub fn protection_options(&self) -> Option<ProtectionOptions>",
+        "pub fn range(&self) -> Range<'_>",
+        "pub fn resolved_cell_style(&self, row: u32, col: u16) -> Option<CellStyle>",
+        "pub fn rich_text_runs(&self, row: u32, col: u16) -> Option<&[TextRun]>",
+        "pub fn row_heights(&self) -> &BTreeMap<u32, f32>",
+        "pub fn row_outline_levels(&self) -> &BTreeMap<u32, u8>",
+        "pub fn row_styles(&self) -> &BTreeMap<u32, CellStyle>",
+        "pub fn rows(&self) -> impl Iterator<Item = (u32, Vec<(u16, &Cell)>)>",
+        "pub fn set_autofit(&mut self)",
+        "pub fn set_col_format(&mut self, col: u16, format: &Format)",
+        "pub fn set_col_width(&mut self, col: u16, chars: f32)",
+        "pub fn set_default_col_width(&mut self, chars: f32)",
+        "pub fn set_default_format(&mut self, format: &Format)",
+        "pub fn set_default_row_height(&mut self, points: f32)",
+        "pub fn set_outline_summary(&mut self, below: bool, right: bool)",
+        "pub fn set_page_setup(&mut self, ps: PageSetup)",
+        "pub fn set_print_gridlines(&mut self)",
+        "pub fn set_print_headings(&mut self)",
+        "pub fn set_right_to_left(&mut self, rtl: bool)",
+        "pub fn set_row_format(&mut self, row: u32, format: &Format)",
+        "pub fn set_row_height(&mut self, row: u32, points: f32)",
+        "pub fn set_sheet_view(&mut self, view: SheetView)",
+        "pub fn set_show_headers(&mut self, show: bool)",
+        "pub fn set_tab_color(&mut self, color: impl Into<Color>)",
+        "pub fn set_table_header_format( &mut self, table_name: impl AsRef<str>, format: &Format, )",
+        "pub fn set_zoom(&mut self, percent: u16)",
+        "pub fn sheet_type(&self) -> SheetType",
+        "pub fn sheet_view(&self) -> SheetView",
+        "pub fn sparklines(&self) -> &[Sparkline]",
+        "pub fn style_fidelity(&self) -> StyleFidelity",
+        "pub fn style_losses(&self) -> &[StyleLoss]",
+        "pub fn tab_color(&self) -> Option<Color>",
+        "pub fn table_header_styles(&self) -> &BTreeMap<String, CellStyle>",
+        "pub fn tables(&self) -> &[Table]",
+        "pub fn to_csv(&self) -> String",
+        "pub fn to_csv_with_delimiter(&self, delimiter: char) -> String",
+        "pub fn to_html(&self) -> String",
+        "pub fn to_markdown(&self) -> String",
+        "pub fn to_text(&self) -> String",
+        "pub fn visible(&self) -> SheetVisible",
+        "pub fn visual_dimensions(&self) -> Option<(u32, u16, u32, u16)>",
+        "pub fn write(&mut self, row: u32, col: u16, value: impl Into<Cell>)",
+        "pub fn write_blank_styled(&mut self, row: u32, col: u16, style: &CellStyle)",
+        "pub fn write_blank_with_format(&mut self, row: u32, col: u16, format: &Format)",
+        "pub fn write_boolean(&mut self, row: u32, col: u16, value: bool)",
+        "pub fn write_boolean_with_format( &mut self, row: u32, col: u16, value: bool, format: &Format, )",
+        "pub fn write_datetime(&mut self, row: u32, col: u16, serial: impl Into<f64>)",
+        "pub fn write_datetime_with_format( &mut self, row: u32, col: u16, serial: impl Into<f64>, format: &Format, )",
+        "pub fn write_error(&mut self, row: u32, col: u16, error: CellErrorType)",
+        "pub fn write_error_with_format( &mut self, row: u32, col: u16, error: CellErrorType, format: &Format, )",
+        "pub fn write_formula( &mut self, row: u32, col: u16, formula: impl AsRef<str>, cached: impl Into<Cell>, )",
+        "pub fn write_formula_with_format( &mut self, row: u32, col: u16, formula: impl AsRef<str>, cached: impl Into<Cell>, format: &Format, )",
+        "pub fn write_number(&mut self, row: u32, col: u16, value: impl Into<f64>)",
+        "pub fn write_number_with_format( &mut self, row: u32, col: u16, value: impl Into<f64>, format: &Format, )",
+        "pub fn write_rich<I>(&mut self, row: u32, col: u16, runs: I)where I: IntoIterator<Item = TextRun>,",
+        "pub fn write_rich_styled<I>( &mut self, row: u32, col: u16, runs: I, style: &CellStyle, )where I: IntoIterator<Item = TextRun>,",
+        "pub fn write_rich_with_format<I>( &mut self, row: u32, col: u16, runs: I, format: &Format, )where I: IntoIterator<Item = TextRun>,",
+        "pub fn write_string(&mut self, row: u32, col: u16, value: impl AsRef<str>)",
+        "pub fn write_string_with_format( &mut self, row: u32, col: u16, value: impl AsRef<str>, format: &Format, )",
+        "pub fn write_styled( &mut self, row: u32, col: u16, value: impl Into<Cell>, style: &CellStyle, )",
+        "pub fn write_url( &mut self, row: u32, col: u16, url: impl AsRef<str>, text: impl AsRef<str>, )",
+        "pub fn write_url_with_format( &mut self, row: u32, col: u16, url: impl AsRef<str>, format: &Format, )",
+        "pub fn write_url_with_text( &mut self, row: u32, col: u16, url: impl AsRef<str>, text: impl AsRef<str>, )",
+        "pub fn write_url_with_text_and_format( &mut self, row: u32, col: u16, url: impl AsRef<str>, text: impl AsRef<str>, format: &Format, )",
+        "pub fn write_with_format( &mut self, row: u32, col: u16, value: impl Into<Cell>, format: &Format, )"
+      ],
+      "kind": "struct",
+      "path": "rxls::Sheet",
+      "trait_implementations": [
+        "impl Clone for Sheet",
+        "impl Debug for Sheet",
+        "impl Default for Sheet"
+      ]
+    },
+    {
+      "declaration": "pub struct SheetMetadata { pub name: String, pub typ: SheetType, pub visible: SheetVisible, }",
+      "inherent_items": [
+        "pub fn is_hidden(&self) -> bool",
+        "pub fn is_very_hidden(&self) -> bool",
+        "pub fn is_visible(&self) -> bool",
+        "pub fn is_worksheet(&self) -> bool",
+        "pub fn name(&self) -> &str",
+        "pub fn sheet_type(&self) -> SheetType",
+        "pub fn visible(&self) -> SheetVisible"
+      ],
+      "kind": "struct",
+      "path": "rxls::SheetMetadata",
+      "trait_implementations": [
+        "impl Clone for SheetMetadata",
+        "impl Debug for SheetMetadata",
+        "impl Eq for SheetMetadata",
+        "impl PartialEq for SheetMetadata",
+        "impl StructuralPartialEq for SheetMetadata"
+      ]
+    },
+    {
+      "declaration": "pub enum SheetType { WorkSheet, DialogSheet, MacroSheet, ChartSheet, Vba, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::SheetType",
+      "trait_implementations": [
+        "impl Clone for SheetType",
+        "impl Copy for SheetType",
+        "impl Debug for SheetType",
+        "impl Eq for SheetType",
+        "impl PartialEq for SheetType",
+        "impl StructuralPartialEq for SheetType"
+      ]
+    },
+    {
+      "declaration": "pub struct SheetView { pub freeze: Option<(u32, u16)>, pub hide_gridlines: bool, pub zoom: Option<u16>, pub show_headers: Option<bool>, pub right_to_left: bool, }",
+      "inherent_items": [
+        "pub fn new() -> Self",
+        "pub fn with_freeze(self, row: u32, col: u16) -> Self",
+        "pub fn with_hidden_gridlines(self) -> Self",
+        "pub fn with_right_to_left(self, right_to_left: bool) -> Self",
+        "pub fn with_show_headers(self, show: bool) -> Self",
+        "pub fn with_zoom(self, percent: u16) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::SheetView",
+      "trait_implementations": [
+        "impl Clone for SheetView",
+        "impl Copy for SheetView",
+        "impl Debug for SheetView",
+        "impl Default for SheetView",
+        "impl Eq for SheetView",
+        "impl PartialEq for SheetView",
+        "impl StructuralPartialEq for SheetView"
+      ]
+    },
+    {
+      "declaration": "pub enum SheetVisible { Visible, Hidden, VeryHidden, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::SheetVisible",
+      "trait_implementations": [
+        "impl Clone for SheetVisible",
+        "impl Copy for SheetVisible",
+        "impl Debug for SheetVisible",
+        "impl Eq for SheetVisible",
+        "impl PartialEq for SheetVisible",
+        "impl StructuralPartialEq for SheetVisible"
+      ]
+    },
+    {
+      "declaration": "pub struct Sparkline { pub location: (u32, u16), pub range: String, pub kind: SparklineKind, }",
+      "inherent_items": [
+        "pub fn new(location: (u32, u16), range: impl AsRef<str>) -> Self",
+        "pub fn with_kind(self, kind: SparklineKind) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Sparkline",
+      "trait_implementations": [
+        "impl Clone for Sparkline",
+        "impl Debug for Sparkline",
+        "impl Eq for Sparkline",
+        "impl Hash for Sparkline",
+        "impl PartialEq for Sparkline",
+        "impl StructuralPartialEq for Sparkline"
+      ]
+    },
+    {
+      "declaration": "pub enum SparklineKind { Line, Column, WinLoss, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::SparklineKind",
+      "trait_implementations": [
+        "impl Clone for SparklineKind",
+        "impl Copy for SparklineKind",
+        "impl Debug for SparklineKind",
+        "impl Eq for SparklineKind",
+        "impl Hash for SparklineKind",
+        "impl PartialEq for SparklineKind",
+        "impl StructuralPartialEq for SparklineKind"
+      ]
+    },
+    {
+      "declaration": "pub struct Spreadsheet { /* private fields */ }",
+      "inherent_items": [
+        "pub fn add_sheet(&mut self, name: &str) -> Result<()>",
+        "pub fn append_row<I>(&mut self, sheet_name: &str, values: I) -> Result<u32>where I: IntoIterator<Item = Cell>,",
+        "pub fn clear_freeze_panes(&mut self, sheet_name: &str) -> Result<()>",
+        "pub fn clear_range( &mut self, sheet_name: &str, start_row: u32, start_col: u16, end_row: u32, end_col: u16, ) -> Result<()>",
+        "pub fn delete_comment( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",
+        "pub fn delete_data_validation( &mut self, sheet_name: &str, sqref: (u32, u16, u32, u16), ) -> Result<()>",
+        "pub fn delete_hyperlink( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",
+        "pub fn delete_sheet(&mut self, name: &str) -> Result<()>",
+        "pub fn edit_capability(&self) -> &EditCapability",
+        "pub fn edited_parts(&self) -> &[String]",
+        "pub fn merge_cells( &mut self, sheet_name: &str, first_row: u32, first_col: u16, last_row: u32, last_col: u16, ) -> Result<()>",
+        "pub fn open(bytes: &[u8]) -> Result<Self>",
+        "pub fn rename_sheet(&mut self, old_name: &str, new_name: &str) -> Result<()>",
+        "pub fn save(&self) -> Result<Vec<u8>>",
+        "pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()>",
+        "pub fn set_active_sheet(&mut self, sheet_name: &str) -> Result<()>",
+        "pub fn set_cell_formula( &mut self, sheet_name: &str, row: u32, col: u16, formula: impl AsRef<str>, cached: impl Into<Cell>, ) -> Result<()>",
+        "pub fn set_cell_value( &mut self, sheet_name: &str, row: u32, col: u16, value: Cell, ) -> Result<()>",
+        "pub fn set_column_hidden( &mut self, sheet_name: &str, col: u16, hidden: bool, ) -> Result<()>",
+        "pub fn set_column_width( &mut self, sheet_name: &str, col: u16, width: f32, ) -> Result<()>",
+        "pub fn set_comment( &mut self, sheet_name: &str, row: u32, col: u16, text: &str, author: Option<&str>, ) -> Result<()>",
+        "pub fn set_data_validation( &mut self, sheet_name: &str, validation: DataValidation, ) -> Result<()>",
+        "pub fn set_defined_name( &mut self, name: impl AsRef<str>, refers_to: impl AsRef<str>, ) -> Result<()>",
+        "pub fn set_document_properties( &mut self, properties: DocProperties, ) -> Result<()>",
+        "pub fn set_external_hyperlink( &mut self, sheet_name: &str, row: u32, col: u16, target: &str, ) -> Result<()>",
+        "pub fn set_freeze_panes( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",
+        "pub fn set_internal_hyperlink( &mut self, sheet_name: &str, row: u32, col: u16, location: &str, ) -> Result<()>",
+        "pub fn set_print_area( &mut self, sheet_name: &str, area: Option<(u32, u16, u32, u16)>, ) -> Result<()>",
+        "pub fn set_row_height( &mut self, sheet_name: &str, row: u32, points: f32, ) -> Result<()>",
+        "pub fn set_row_hidden( &mut self, sheet_name: &str, row: u32, hidden: bool, ) -> Result<()>",
+        "pub fn set_sheet_tab_color( &mut self, sheet_name: &str, color: impl Into<Color>, ) -> Result<()>",
+        "pub fn set_sheet_visibility( &mut self, sheet_name: &str, visible: SheetVisible, ) -> Result<()>",
+        "pub fn set_table_range( &mut self, sheet_name: &str, table_name: &str, range: (u32, u16, u32, u16), ) -> Result<()>",
+        "pub fn transaction<T>( &mut self, edit: impl FnOnce(&mut Spreadsheet) -> Result<T>, ) -> Result<T>",
+        "pub fn unmerge_cells( &mut self, sheet_name: &str, first_row: u32, first_col: u16, last_row: u32, last_col: u16, ) -> Result<()>",
+        "pub fn workbook(&self) -> &Workbook"
+      ],
+      "kind": "struct",
+      "path": "rxls::Spreadsheet",
+      "trait_implementations": [
+        "impl Clone for Spreadsheet",
+        "impl Debug for Spreadsheet"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum StyleFidelity { Unavailable, Partial, Retained, Authored, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::StyleFidelity",
+      "trait_implementations": [
+        "impl Clone for StyleFidelity",
+        "impl Copy for StyleFidelity",
+        "impl Debug for StyleFidelity",
+        "impl Default for StyleFidelity",
+        "impl Eq for StyleFidelity",
+        "impl Hash for StyleFidelity",
+        "impl PartialEq for StyleFidelity",
+        "impl StructuralPartialEq for StyleFidelity"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct StyleLoss { pub kind: StyleLossKind, pub occurrences: u32, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::StyleLoss",
+      "trait_implementations": [
+        "impl Clone for StyleLoss",
+        "impl Copy for StyleLoss",
+        "impl Debug for StyleLoss",
+        "impl Eq for StyleLoss",
+        "impl Hash for StyleLoss",
+        "impl PartialEq for StyleLoss",
+        "impl StructuralPartialEq for StyleLoss"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum StyleLossKind { UnsupportedProperty, MissingReference, InheritanceCycle, LimitExceeded, UnresolvedColor, DrawingMetadataPartial, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::StyleLossKind",
+      "trait_implementations": [
+        "impl Clone for StyleLossKind",
+        "impl Copy for StyleLossKind",
+        "impl Debug for StyleLossKind",
+        "impl Eq for StyleLossKind",
+        "impl Hash for StyleLossKind",
+        "impl PartialEq for StyleLossKind",
+        "impl StructuralPartialEq for StyleLossKind"
+      ]
+    },
+    {
+      "declaration": "pub struct Table { pub range: (u32, u16, u32, u16), pub name: String, pub columns: Vec<String>, pub style: Option<String>, }",
+      "inherent_items": [
+        "pub fn columns(&self) -> &[String]",
+        "pub fn data<'a>(&self, sheet: &'a Sheet) -> Range<'a>",
+        "pub fn name(&self) -> &str",
+        "pub fn new<I, S>( range: (u32, u16, u32, u16), name: impl AsRef<str>, columns: I, ) -> Selfwhere I: IntoIterator<Item = S>, S: AsRef<str>,",
+        "pub fn range(&self) -> (u32, u16, u32, u16)",
+        "pub fn with_style(self, style: impl AsRef<str>) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::Table",
+      "trait_implementations": [
+        "impl Clone for Table",
+        "impl Debug for Table",
+        "impl Eq for Table",
+        "impl PartialEq for Table",
+        "impl StructuralPartialEq for Table"
+      ]
+    },
+    {
+      "declaration": "pub struct TextRun { pub text: String, pub font: Font, }",
+      "inherent_items": [
+        "pub fn new(text: impl Into<String>, font: Font) -> Self"
+      ],
+      "kind": "struct",
+      "path": "rxls::TextRun",
+      "trait_implementations": [
+        "impl Clone for TextRun",
+        "impl Debug for TextRun",
+        "impl Default for TextRun",
+        "impl Eq for TextRun",
+        "impl Hash for TextRun",
+        "impl PartialEq for TextRun",
+        "impl StructuralPartialEq for TextRun"
+      ]
+    },
+    {
+      "declaration": "pub enum VAlign { Top, Middle, Bottom, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::VAlign",
+      "trait_implementations": [
+        "impl Clone for VAlign",
+        "impl Copy for VAlign",
+        "impl Debug for VAlign",
+        "impl Eq for VAlign",
+        "impl Hash for VAlign",
+        "impl PartialEq for VAlign",
+        "impl StructuralPartialEq for VAlign"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct Workbook { pub sheets: Vec<Sheet>, pub date1904: bool, pub text_truncated: bool, pub properties: DocProperties, pub defined_names: Vec<(String, String)>, pub local_defined_names: Vec<LocalDefinedName>, /* private fields */ }",
+      "inherent_items": [
+        "pub fn active_sheet_index(&self) -> Option<usize>",
+        "pub fn active_sheet_name(&self) -> Option<&str>",
+        "pub fn add_sheet(&mut self, name: impl AsRef<str>) -> &mut Sheet",
+        "pub fn define_local_name( &mut self, sheet: impl AsRef<str>, name: impl AsRef<str>, refers_to: impl AsRef<str>, )",
+        "pub fn define_name(&mut self, name: impl AsRef<str>, refers_to: impl AsRef<str>)",
+        "pub fn defined_names(&self) -> &[(String, String)]",
+        "pub fn evaluate_cell( &self, sheet: &str, row: u32, col: u16, ) -> FormulaEvaluation",
+        "pub fn has_1904_epoch(&self) -> bool",
+        "pub fn header_row(&self) -> HeaderRow",
+        "pub fn is_partial(&self) -> bool",
+        "pub fn is_structure_protected(&self) -> bool",
+        "pub fn local_defined_names(&self) -> &[LocalDefinedName]",
+        "pub fn merged_regions(&self) -> Vec<(&str, Dimensions)>",
+        "pub fn merged_regions_by_sheet(&self, name: &str) -> Vec<Dimensions>",
+        "pub fn metadata(&self) -> WorkbookMetadata<'_>",
+        "pub fn new() -> Self",
+        "pub fn open(bytes: &[u8]) -> Result<Self>",
+        "pub fn open_with_codepage( bytes: &[u8], force_codepage: Option<u16>, ) -> Result<Self>",
+        "pub fn parse_provenance(&self) -> ParseProvenance",
+        "pub fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>>",
+        "pub fn pictures_with_metadata(&self) -> Vec<Picture>",
+        "pub fn protect_structure(&mut self)",
+        "pub fn set_active_sheet(&mut self, idx: usize)",
+        "pub fn set_properties(&mut self, properties: DocProperties)",
+        "pub fn sheet_by_name(&self, name: &str) -> Option<&Sheet>",
+        "pub fn sheet_names(&self) -> Vec<&str>",
+        "pub fn sheets_metadata(&self) -> Vec<SheetMetadata>",
+        "pub fn table_by_name(&self, table_name: &str) -> Option<(&str, &Table)>",
+        "pub fn table_by_name_ref(&self, table_name: &str) -> Option<(&str, &Table)>",
+        "pub fn table_data_by_name(&self, table_name: &str) -> Option<(&str, Range<'_>)>",
+        "pub fn table_data_by_name_ref( &self, table_name: &str, ) -> Option<(&str, Range<'_>)>",
+        "pub fn table_names(&self) -> Vec<&str>",
+        "pub fn table_names_in_sheet(&self, sheet_name: &str) -> Vec<&str>",
+        "pub fn text(&self) -> String",
+        "pub fn to_csv(&self, sheet_index: usize) -> Option<String>",
+        "pub fn to_csv_with_delimiter( &self, sheet_index: usize, delimiter: char, ) -> Option<String>",
+        "pub fn to_html(&self, sheet_index: usize) -> Option<String>",
+        "pub fn to_markdown(&self, sheet_index: usize) -> Option<String>",
+        "pub fn to_xlsx(&self) -> Vec<u8> \u24d8",
+        "pub fn to_xlsx_checked(&self) -> Result<Vec<u8>, WriteError>",
+        "pub fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self",
+        "pub fn worksheet_formula(&self, name: &str) -> Option<FormulaRange<'_>>",
+        "pub fn worksheet_formula_at(&self, index: usize) -> Option<FormulaRange<'_>>",
+        "pub fn worksheet_formula_at_ref(&self, index: usize) -> Option<FormulaRange<'_>>",
+        "pub fn worksheet_formula_ref(&self, name: &str) -> Option<FormulaRange<'_>>",
+        "pub fn worksheet_merge_cells( &self, name: &str, ) -> Option<&[(u32, u16, u32, u16)]>",
+        "pub fn worksheet_merge_cells_at( &self, index: usize, ) -> Option<&[(u32, u16, u32, u16)]>",
+        "pub fn worksheet_metadata(&self, name: &str) -> Option<WorksheetMetadata<'_>>",
+        "pub fn worksheet_metadata_at( &self, index: usize, ) -> Option<WorksheetMetadata<'_>>",
+        "pub fn worksheet_range(&self, name: &str) -> Option<Range<'_>>",
+        "pub fn worksheet_range_at(&self, index: usize) -> Option<Range<'_>>",
+        "pub fn worksheet_range_at_ref(&self, index: usize) -> Option<Range<'_>>",
+        "pub fn worksheet_range_ref(&self, name: &str) -> Option<Range<'_>>",
+        "pub fn worksheets(&self) -> Vec<(String, Range<'_>)>",
+        "pub fn worksheets_metadata(&self) -> Vec<WorksheetMetadata<'_>>"
+      ],
+      "kind": "struct",
+      "path": "rxls::Workbook",
+      "trait_implementations": [
+        "impl Clone for Workbook",
+        "impl Debug for Workbook",
+        "impl Default for Workbook",
+        "impl Reader for Workbook"
+      ]
+    },
+    {
+      "declaration": "pub struct WorkbookMetadata<'a> { pub date1904: bool, pub text_truncated: bool, pub structure_protected: bool, pub active_sheet: Option<usize>, pub active_sheet_name: Option<&'a str>, pub properties: &'a DocProperties, pub defined_names: &'a [(String, String)], pub local_defined_names: &'a [LocalDefinedName], pub sheets: Vec<SheetMetadata>, }",
+      "inherent_items": [
+        "pub fn active_sheet_index(&self) -> Option<usize>",
+        "pub fn active_sheet_name(&self) -> Option<&'a str>",
+        "pub fn defined_names(&self) -> &'a [(String, String)]",
+        "pub fn document_properties(&self) -> &'a DocProperties",
+        "pub fn has_1904_epoch(&self) -> bool",
+        "pub fn is_structure_protected(&self) -> bool",
+        "pub fn is_text_truncated(&self) -> bool",
+        "pub fn sheets(&self) -> &[SheetMetadata]"
+      ],
+      "kind": "struct",
+      "path": "rxls::WorkbookMetadata",
+      "trait_implementations": [
+        "impl<'a> Clone for WorkbookMetadata<'a>",
+        "impl<'a> Debug for WorkbookMetadata<'a>",
+        "impl<'a> Eq for WorkbookMetadata<'a>",
+        "impl<'a> PartialEq for WorkbookMetadata<'a>",
+        "impl<'a> StructuralPartialEq for WorkbookMetadata<'a>"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct WorkbookReport { pub schema_version: u32, pub format: String, pub stats: ReportStats, pub properties: ReportProperties, pub defined_names_count: usize, pub local_defined_names_count: usize, pub features: ReportFeatures, pub evaluation: ReportEvaluation, pub provenance: ParseProvenance, pub warnings: Vec<String>, }",
+      "inherent_items": [
+        "pub fn from_workbook(format: impl Into<String>, workbook: &Workbook) -> Self",
+        "pub fn from_workbook_with_package( format: impl Into<String>, workbook: &Workbook, bytes: &[u8], ) -> Self",
+        "pub fn to_json(&self) -> String"
+      ],
+      "kind": "struct",
+      "path": "rxls::WorkbookReport",
+      "trait_implementations": [
+        "impl Clone for WorkbookReport",
+        "impl Debug for WorkbookReport"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum WriteError { DuplicateTableName(String), DuplicateDefinedName(String), InvalidDefinedName(String), UnknownDefinedNameSheet { name: String, sheet: String, }, InvalidTableName(String), TableRangeColumnsMismatch { table: String, }, UnknownTableHeaderFormat { table: String, }, CellOutOfGrid { row: u32, col: u16, }, CellUnderMergedRange { row: u32, col: u16, }, NonFiniteNumber { row: u32, col: u16, }, InvalidHyperlinkTarget { row: u32, col: u16, target: String, }, InvalidXmlText { field: String, value: String, }, CellTextTooLong { row: u32, col: u16, length: usize, }, OutputTooLarge { estimated_bytes: usize, limit: usize, }, MergeOutOfGrid, InvalidSheetLayout(String), InvalidSheetViewZoom { value: u16, }, InvalidChartReference(String), InvalidSparklineReference(String), InvalidConditionalFormatRule(String), InvalidDataValidationRule(String), InvalidSheetName(String), DuplicateSheetName(String), TooManySheets, ActiveSheetOutOfRange { index: usize, sheets: usize, }, InvalidPageSetupScale { value: u16, }, InvalidPageSetupMargins, InvalidDocPropertyTimestamp(String), }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::WriteError",
+      "trait_implementations": [
+        "impl Clone for WriteError",
+        "impl Debug for WriteError",
+        "impl Display for WriteError",
+        "impl Eq for WriteError",
+        "impl Error for WriteError",
+        "impl PartialEq for WriteError",
+        "impl StructuralPartialEq for WriteError"
+      ]
+    },
+    {
+      "declaration": "pub fn deserialize_as_date_1900_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveDate>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_date_1900_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_date_1900_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveDate, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_date_1900_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_date_1904_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveDate>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_date_1904_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_date_1904_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveDate, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_date_1904_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_datetime_1900_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveDateTime>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_datetime_1900_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_datetime_1900_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveDateTime, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_datetime_1900_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_datetime_1904_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveDateTime>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_datetime_1904_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_datetime_1904_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveDateTime, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_datetime_1904_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_duration_or_none<'de, D>( deserializer: D, ) -> Result<Option<Duration>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_duration_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_duration_or_string<'de, D>( deserializer: D, ) -> Result<Result<Duration, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_duration_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_f64_or_none<'de, D>( deserializer: D, ) -> Result<Option<f64>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_f64_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_f64_or_string<'de, D>( deserializer: D, ) -> Result<Result<f64, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_f64_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_i64_or_none<'de, D>( deserializer: D, ) -> Result<Option<i64>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_i64_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_i64_or_string<'de, D>( deserializer: D, ) -> Result<Result<i64, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_i64_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_time_1900_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveTime>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_time_1900_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_time_1900_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveTime, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_time_1900_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_time_1904_or_none<'de, D>( deserializer: D, ) -> Result<Option<NaiveTime>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_time_1904_or_none",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn deserialize_as_time_1904_or_string<'de, D>( deserializer: D, ) -> Result<Result<NaiveTime, String>, D::Error>where D: Deserializer<'de>,",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::deserialize_as_time_1904_or_string",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn excel_serial_to_datetime( serial: f64, date1904: bool, ) -> Option<ExcelDateTime>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::excel_serial_to_datetime",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn excel_serial_to_duration(serial: f64) -> Option<Duration>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::excel_serial_to_duration",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn excel_serial_to_naive_datetime( serial: f64, date1904: bool, ) -> Option<NaiveDateTime>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::excel_serial_to_naive_datetime",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn export_csv( sheet: &Sheet, options: CsvOptions, ) -> Result<String, CsvExportError>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::export_csv",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn extract_text(bytes: &[u8]) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::extract_text",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub mod wasm",
+      "inherent_items": [],
+      "kind": "module",
+      "path": "rxls::wasm",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn extract_text_bytes(bytes: &[u8]) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::wasm::extract_text_bytes",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn report_json_bytes(bytes: &[u8]) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::wasm::report_json_bytes",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn to_csv_bytes(bytes: &[u8], sheet_index: usize) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::wasm::to_csv_bytes",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn to_html_bytes(bytes: &[u8], sheet_index: usize) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::wasm::to_html_bytes",
+      "trait_implementations": []
+    }
+  ],
+  "schema": "rxls.public-api.v1",
+  "summary": {
+    "by_kind": {
+      "constant": 3,
+      "enum": 39,
+      "fn": 27,
+      "module": 1,
+      "struct": 61,
+      "trait": 2,
+      "type": 6
+    },
+    "items": 139
+  }
+}

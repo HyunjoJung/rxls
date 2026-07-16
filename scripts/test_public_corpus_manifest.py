@@ -174,6 +174,54 @@ class PublicCorpusManifestTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_manifest_files_selects_only_eligible_deduplicated_render_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ready = base / "payload" / "ready.xlsx"
+            quarantined = base / "payload" / "quarantined.xlsx"
+            ready.parent.mkdir()
+            ready.write_bytes(b"ready")
+            quarantined.write_bytes(b"quarantined")
+            manifest_path = base / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "rxls.render-corpus-manifest.v1",
+                        "files": [
+                            {
+                                "source_path": "scope/ready.xlsx",
+                                "local_path": "payload/ready.xlsx",
+                                "status": "ready",
+                                "eligible": True,
+                                "render_selected": True,
+                            },
+                            {
+                                "source_path": "scope/duplicate.xlsx",
+                                "local_path": "payload/ready.xlsx",
+                                "status": "duplicate",
+                                "eligible": True,
+                                "render_selected": False,
+                            },
+                            {
+                                "source_path": "scope/legacy.xlsx",
+                                "local_path": "payload/ready.xlsx",
+                                "status": "ready",
+                                "eligible": True,
+                            },
+                            {
+                                "source_path": "scope/quarantined.xlsx",
+                                "local_path": "payload/quarantined.xlsx",
+                                "status": "quarantined",
+                                "eligible": False,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(manifest_files(manifest_path, {".xlsx"}), [str(ready)])
+
     def test_corpus_files_selects_flat_directory_files_by_extension(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

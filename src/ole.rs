@@ -4,6 +4,12 @@ use std::io::{Cursor, Read};
 
 use crate::error::{Error, Result};
 
+#[derive(Debug)]
+pub(crate) struct WorkbookStream {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) container_mode: crate::ContainerParseMode,
+}
+
 /// `.xls` magic — OLE2/CFB compound file header.
 pub(crate) fn is_ole2(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && bytes[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
@@ -21,7 +27,7 @@ fn is_legacy_biff(bytes: &[u8]) -> bool {
 }
 
 /// Read the BIFF workbook stream (`Workbook` for BIFF8, `Book` for BIFF5/7).
-pub(crate) fn read_workbook_stream(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn read_workbook_stream(bytes: &[u8]) -> Result<WorkbookStream> {
     if !is_ole2(bytes) {
         if is_legacy_biff(bytes) {
             return Err(Error::LegacyBiff);
@@ -36,7 +42,10 @@ pub(crate) fn read_workbook_stream(bytes: &[u8]) -> Result<Vec<u8>> {
                     let mut s = cfb.open_stream(name)?;
                     let mut buf = Vec::new();
                     s.read_to_end(&mut buf)?;
-                    return Ok(buf);
+                    return Ok(WorkbookStream {
+                        bytes: buf,
+                        container_mode: crate::ContainerParseMode::Primary,
+                    });
                 }
             }
             if cfb.exists("/EncryptedPackage")
@@ -48,7 +57,7 @@ pub(crate) fn read_workbook_stream(bytes: &[u8]) -> Result<Vec<u8>> {
             }
             Err(Error::MissingWorkbook)
         }
-        // The strict `cfb` crate rejects some containers that Excel/POI/xlrd
+        // The primary `cfb` reader rejects some containers that Excel/POI/xlrd
         // accept — most commonly a directory whose red-black-tree sibling
         // ordering violates [MS-CFB] though the streams are otherwise intact.
         // Fall back to a lenient, bounds-checked walk that scans the directory
@@ -58,6 +67,10 @@ pub(crate) fn read_workbook_stream(bytes: &[u8]) -> Result<Vec<u8>> {
                 return Err(Error::EncryptedPackage);
             }
             tolerant::read_workbook_stream(bytes)
+                .map(|bytes| WorkbookStream {
+                    bytes,
+                    container_mode: crate::ContainerParseMode::TolerantCfbDirectoryWalk,
+                })
                 .ok_or(Error::InvalidCfb("not a valid .xls compound file"))
         }
     }
@@ -389,7 +402,34 @@ mod tests {
             .unwrap();
         comp.flush().unwrap();
         let bytes = comp.into_inner().into_inner();
-        assert_eq!(read_workbook_stream(&bytes).unwrap(), b"hello-biff");
+        let stream = read_workbook_stream(&bytes).unwrap();
+        assert_eq!(stream.bytes, b"hello-biff");
+        assert_eq!(stream.container_mode, crate::ContainerParseMode::Primary);
+    }
+
+    #[test]
+    fn tolerant_recovery_reports_the_exact_container_mode() {
+        use std::io::{Cursor, Write};
+        let mut comp = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        comp.create_stream("/Workbook")
+            .unwrap()
+            .write_all(b"hello-biff")
+            .unwrap();
+        comp.flush().unwrap();
+        let mut bytes = comp.into_inner().into_inner();
+
+        // Force the primary reader to reject the header while retaining the
+        // bounded directory/FAT shape used by the rxls fallback.
+        bytes[0x1C] = 0;
+        bytes[0x1D] = 0;
+        assert!(cfb::CompoundFile::open(Cursor::new(bytes.clone())).is_err());
+
+        let stream = read_workbook_stream(&bytes).unwrap();
+        assert_eq!(stream.bytes, b"hello-biff");
+        assert_eq!(
+            stream.container_mode,
+            crate::ContainerParseMode::TolerantCfbDirectoryWalk
+        );
     }
 
     #[test]

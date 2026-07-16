@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-READY_STATUSES = {"cached", "downloaded"}
+READY_STATUSES = {"cached", "downloaded", "duplicate", "ready"}
 
 
 def manifest_sha256(manifest_path: str | os.PathLike[str]) -> str:
@@ -146,6 +146,13 @@ def manifest_files(
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        if entry.get("eligible") is False:
+            continue
+        # New render-corpus manifests retain every licensed source row for
+        # provenance but select exactly one canonical package per semantic
+        # rendering payload. Older manifests do not have this field.
+        if entry.get("render_selected") is False:
+            continue
         status = entry.get("status")
         if status is not None and status not in READY_STATUSES:
             continue
@@ -155,7 +162,7 @@ def manifest_files(
         path = entry_path(manifest_path, entry)
         if path and os.path.exists(path):
             files.append(path)
-    files.sort()
+    files = sorted(set(files))
     if limit is not None:
         return files[:limit]
     return files

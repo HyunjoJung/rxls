@@ -1,0 +1,56 @@
+{
+  "base_image": {
+    "created": "2026-07-13T00:00:00Z",
+    "manifest_sha256": "63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e",
+    "platform": "linux/amd64",
+    "reference": "docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e"
+  },
+  "built_image": {
+    "expected_id": null,
+    "identity_kind": "oci_image_config_digest",
+    "source_date_epoch": 1783900800,
+    "unpinned_verification": "bootstrap_only_runtime_image_id_plus_exact_build_contract_and_labels"
+  },
+  "debian_snapshot": {
+    "timestamp": "20260713T000000Z",
+    "url": "http://snapshot.debian.org/archive/debian/20260713T000000Z"
+  },
+  "files": [
+    {
+      "bytes": 3631,
+      "path": "Containerfile",
+      "sha256": "4c1ef9e1b09c06c7b1f0f231fa995e0a7686424cf843ca8d2f22132653ebd8a2"
+    },
+    {
+      "bytes": 4554,
+      "path": "oracle-entrypoint.sh",
+      "sha256": "d3c706b1947d3ee0ec3db17dcfadb04893d596c2aacd17df6cc7f7abef446c63"
+    },
+    {
+      "bytes": 1217,
+      "path": "profile/registrymodifications.xcu",
+      "sha256": "ee369a71ea799bc096af6fda095f428359afce9633ca517a8d2cbeb7d44d4ba9"
+    }
+  ],
+  "libreoffice": {
+    "artifact": {
+      "bytes": 216816909,
+      "sha256": "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5",
+      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+    },
+    "platform": "linux/x86_64",
+    "version": "26.2.3.2"
+  },
+  "runtime_defaults": {
+    "capabilities": "none",
+    "cpus": "2.00",
+    "evidence_mib": 256,
+    "memory_mib": 2048,
+    "network": "none",
+    "nofile": 256,
+    "pids": 128,
+    "root_filesystem": "read_only",
+    "timeout_seconds": 180
+  },
+  "schema": "rxls.render-oracle-container-lock.v2"
+}

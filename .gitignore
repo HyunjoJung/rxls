@@ -1,6 +1,7 @@
 /target
 /dist
 bindings/wasm/target
+render/target
 fuzz/target
 fuzz/Cargo.lock
 __pycache__/

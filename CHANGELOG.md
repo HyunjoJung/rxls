@@ -6,7 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-No unreleased changes are recorded yet.
+### Added
+
+- Added typed, bounded parse provenance for primary and tolerant CFB container
+  paths, surfaced consistently through `Workbook`, diagnose JSON, CLI, and WASM.
+- Added a deterministic Korean BIFF8 exact-oracle fixture covering an
+  SST/CONTINUE compression transition, Unicode sheet/text, numeric adjacency,
+  and a cached-string formula, plus malformed CP949 panic-free coverage.
+- Added a bounded deterministic Excel custom-number-format engine covering
+  section selection, conditions, locale/currency markers, fractions,
+  scientific notation, date/time and elapsed tokens, literals, and text
+  placeholders across XLS, XLSX, and XLSB display paths.
+- Added standalone `rxls-render` with one backend-neutral fixed-point scene,
+  deterministic SVG/PDF/PNG replay, authored and single-page pagination,
+  verified caller/OFL font packs, CJK/complex-script shaping, rich text,
+  cross-format style and conditional-format resolution, images, drawings,
+  charts, sparklines, path-free bundle identities, and explicit resource and
+  fidelity warnings.
+- Added the worker-based `@rxls/render-worker` browser/WASM distribution with
+  cancellation, progress, virtual sheet/tile/page output, strict CSP and
+  memory limits, installed-package Chromium coverage, immutable package
+  inspection, third-party notices, SBOM evidence, and a protected tag-only npm
+  publication workflow.
+- Added a license-reviewed, semantically deduplicated rendering corpus plus a
+  deterministic four-format 800-workbook lattice, pinned LibreOffice/Poppler
+  container oracle, multi-metric visual and semantic gates, authored-print
+  parity, same-SHA full-campaign comparison, and reviewed per-format/feature
+  baseline ratcheting.
+
+### Changed
+
+- Advanced the stable diagnose JSON contract to schema v2 for the new
+  provenance object; schema v1 remains frozen rather than receiving new keys.
 
 ## [0.1.2] - 2026-07-16
 

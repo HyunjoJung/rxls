@@ -84,7 +84,7 @@ class CrateDistributionSmokeTests(unittest.TestCase):
                     print("usage: rxls <command> <file>")
                     print("commands:")
                 elif len(args) == 2 and args[0] == "diagnose":
-                    print(json.dumps({{"schema_version": 1}}))
+                    print(json.dumps({{"schema_version": 2}}))
                 elif args == ["diagnose"]:
                     print("usage: rxls diagnose <file>", file=sys.stderr)
                     raise SystemExit(64)
