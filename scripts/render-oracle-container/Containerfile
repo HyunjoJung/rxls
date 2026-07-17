@@ -26,7 +26,17 @@ RUN set -eux; \
       > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends ca-certificates curl fontconfig; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      fontconfig \
+      libcairo2=1.16.0-7 \
+      libcups2=2.4.2-3+deb12u9 \
+      libdbus-1-3=1.14.10-1~deb12u1 \
+      libglib2.0-0=2.74.6-2+deb12u9 \
+      libnss3=2:3.87.1-1+deb12u2 \
+      libx11-xcb1=2:1.8.4-2+deb12u2 \
+      libxinerama1=2:1.1.4-3; \
     archive=/tmp/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz; \
     curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
       --output "${archive}" \
@@ -39,6 +49,28 @@ RUN set -eux; \
     tar --extract --gzip --file "${archive}" --directory /tmp/libreoffice \
       --no-same-owner --no-same-permissions; \
     apt-get install -y --no-install-recommends /tmp/libreoffice/*/DEBS/*.deb; \
+    ldd_output=/tmp/libreoffice-ldd.txt; \
+    if ! ldd \
+        /opt/libreoffice26.2/program/oosplash \
+        /opt/libreoffice26.2/program/soffice.bin \
+        > "${ldd_output}" 2>&1; then \
+      echo 'LibreOffice runtime dependency scan failed' >&2; \
+      exit 66; \
+    fi; \
+    missing_output=/tmp/libreoffice-missing.txt; \
+    grep_status=0; \
+    grep --fixed-strings '=> not found' "${ldd_output}" \
+      > "${missing_output}" || grep_status=$?; \
+    case "${grep_status}" in \
+      0) \
+        echo 'LibreOffice runtime dependency closure is incomplete' >&2; \
+        LC_ALL=C sort --unique "${missing_output}" >&2; \
+        exit 65 \
+        ;; \
+      1) ;; \
+      *) echo 'LibreOffice runtime dependency closure check failed' >&2; exit 67 ;; \
+    esac; \
+    rm -f "${ldd_output}" "${missing_output}"; \
     /opt/libreoffice26.2/program/soffice --headless --version \
       | grep --fixed-strings 'LibreOffice 26.2.3.2'; \
     fc-cache --version; \

@@ -280,6 +280,36 @@ class RenderOracleContainerTests(unittest.TestCase):
         self.assertIn(str(artifact["bytes"]), containerfile)
         self.assertIn(artifact["sha256"], containerfile)
         self.assertIn(lock["debian_snapshot"]["timestamp"], containerfile)
+        for dependency in (
+            "libcairo2=1.16.0-7",
+            "libcups2=2.4.2-3+deb12u9",
+            "libdbus-1-3=1.14.10-1~deb12u1",
+            "libglib2.0-0=2.74.6-2+deb12u9",
+            "libnss3=2:3.87.1-1+deb12u2",
+            "libx11-xcb1=2:1.8.4-2+deb12u2",
+            "libxinerama1=2:1.1.4-3",
+        ):
+            self.assertIn(dependency, containerfile)
+        self.assertIn("if ! ldd", containerfile)
+        self.assertIn("/opt/libreoffice26.2/program/oosplash", containerfile)
+        self.assertIn("/opt/libreoffice26.2/program/soffice.bin", containerfile)
+        self.assertIn("grep --fixed-strings '=> not found'", containerfile)
+        self.assertIn("grep_status=0", containerfile)
+        self.assertIn("|| grep_status=$?", containerfile)
+        self.assertIn("1) ;;", containerfile)
+        self.assertIn('LC_ALL=C sort --unique "${missing_output}"', containerfile)
+        self.assertIn(
+            "LibreOffice runtime dependency closure is incomplete",
+            containerfile,
+        )
+        self.assertIn(
+            "LibreOffice runtime dependency closure check failed",
+            containerfile,
+        )
+        self.assertIn(
+            "LibreOffice runtime dependency scan failed",
+            containerfile,
+        )
         self.assertIn(
             f"ARG SOURCE_DATE_EPOCH={lock['built_image']['source_date_epoch']}",
             containerfile,
