@@ -65,15 +65,32 @@ fn command_count(scene: &Scene) -> u64 {
     scene
         .nodes
         .iter()
-        .map(|node| match node {
-            SceneNode::Rect(_) | SceneNode::Image(_) | SceneNode::Text(_) => 1,
-            SceneNode::Line(_) => 2,
-            SceneNode::Path(node) => node.commands.len() as u64,
-            SceneNode::GlyphRun(node) => {
-                node.commands.len() as u64 + node.decorations.len() as u64 * 2
-            }
-        })
+        .map(node_command_count)
         .fold(0, u64::saturating_add)
+}
+
+fn node_command_count(node: &SceneNode) -> u64 {
+    match node {
+        SceneNode::ClipGroup(group) => group
+            .nodes
+            .iter()
+            .map(node_command_count)
+            .fold(2, u64::saturating_add),
+        SceneNode::Rect(_) | SceneNode::Image(_) | SceneNode::Text(_) => 1,
+        SceneNode::Line(_) => 2,
+        SceneNode::Path(node) => node.commands.len() as u64,
+        SceneNode::GlyphRun(node) => {
+            node.commands.len() as u64 + node.decorations.len() as u64 * 2
+        }
+    }
+}
+
+fn has_glyph_outlines(nodes: &[SceneNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        SceneNode::ClipGroup(group) => has_glyph_outlines(&group.nodes),
+        SceneNode::GlyphRun(run) => !run.commands.is_empty(),
+        _ => false,
+    })
 }
 
 fn rendered_scene(label: &str, scene: &Scene, svg: &[u8]) -> Metrics {
@@ -111,12 +128,7 @@ fn render_workbook_with_outlines(
 ) -> Result<Metrics, String> {
     match render_sheet_svg(workbook, 0, options) {
         Ok(output) => {
-            if !output
-                .scene
-                .nodes
-                .iter()
-                .any(|node| matches!(node, SceneNode::GlyphRun(run) if !run.commands.is_empty()))
-            {
+            if !has_glyph_outlines(&output.scene.nodes) {
                 return Err(format!("{label} did not exercise verified glyph outlines"));
             }
             Ok(rendered_scene(label, &output.scene, output.svg.as_bytes()))
@@ -495,6 +507,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rxls_render::{ClipGroupNode, Fixed, GlyphRunNode, PathCommand, Rect, Rgb};
 
     #[test]
     fn case_names_are_unique_and_stable() {
@@ -524,5 +537,65 @@ mod tests {
             chart_point_limits().unwrap().limit_kind,
             Some("chart_points")
         );
+    }
+
+    #[test]
+    fn command_count_includes_nested_clip_boundaries() {
+        let clip = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(1),
+            height: Fixed::from_pixels(1),
+        };
+        let scene = Scene {
+            title: "nested-clips".to_string(),
+            width: Fixed::from_pixels(1),
+            height: Fixed::from_pixels(1),
+            background: rxls_render::Rgb::WHITE,
+            nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip,
+                    nodes: Vec::new(),
+                })],
+            })],
+        };
+
+        assert_eq!(command_count(&scene), 4);
+    }
+
+    #[test]
+    fn glyph_outline_detection_descends_through_nested_clip_groups() {
+        let clip = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(1),
+            height: Fixed::from_pixels(1),
+        };
+        let glyph = SceneNode::GlyphRun(GlyphRunNode {
+            text: "x".to_string(),
+            clip_bounds: clip,
+            commands: vec![PathCommand::MoveTo {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+            }],
+            clusters: Vec::new(),
+            paints: Vec::new(),
+            decorations: Vec::new(),
+            color: Rgb::BLACK,
+            rotation_degrees: 0,
+            pivot_x: Fixed::ZERO,
+            pivot_y: Fixed::ZERO,
+            hyperlink: None,
+        });
+        let nodes = vec![SceneNode::ClipGroup(ClipGroupNode {
+            clip,
+            nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip,
+                nodes: vec![glyph],
+            })],
+        })];
+
+        assert!(has_glyph_outlines(&nodes));
     }
 }

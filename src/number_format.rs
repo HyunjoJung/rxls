@@ -285,10 +285,9 @@ fn parse_condition(inner: &str) -> Option<Condition> {
         (Comparison::Lt, rest)
     } else if let Some(rest) = inner.strip_prefix('>') {
         (Comparison::Gt, rest)
-    } else if let Some(rest) = inner.strip_prefix('=') {
-        (Comparison::Eq, rest)
     } else {
-        return None;
+        let rest = inner.strip_prefix('=')?;
+        (Comparison::Eq, rest)
     };
     let threshold = rest.trim().parse::<f64>().ok()?;
     threshold.is_finite().then_some(Condition {
@@ -470,15 +469,19 @@ fn render_fixed(atoms: &[Atom], value: f64, automatic_minus: bool) -> Option<Str
     }
     scaled /= 1_000_f64.powi(scaling_commas.len() as i32);
 
-    let decimal = atoms[first..=last]
+    // A decimal separator may precede the first digit placeholder (`.0`).
+    // It still divides the integer and fractional layouts; treating it as a
+    // prefix literal rounds 0.5 to the integer text `.1`.
+    let decimal = atoms[..=last]
         .iter()
-        .position(|atom| matches!(atom, Atom::Char('.')))
-        .map(|offset| first + offset);
+        .position(|atom| matches!(atom, Atom::Char('.')));
     let integer_end = decimal.unwrap_or(last + 1);
-    let integer_pattern: Vec<char> = atoms[first..integer_end]
-        .iter()
-        .filter_map(placeholder_char)
-        .collect();
+    let integer_atoms = if first < integer_end {
+        &atoms[first..integer_end]
+    } else {
+        &[]
+    };
+    let integer_pattern: Vec<char> = integer_atoms.iter().filter_map(placeholder_char).collect();
     let fraction_pattern: Vec<char> = decimal
         .map(|decimal| {
             atoms[decimal + 1..=last]
@@ -488,7 +491,7 @@ fn render_fixed(atoms: &[Atom], value: f64, automatic_minus: bool) -> Option<Str
                 .collect()
         })
         .unwrap_or_default();
-    let grouping = atoms[first..integer_end]
+    let grouping = integer_atoms
         .iter()
         .any(|atom| matches!(atom, Atom::Char(',')));
 
@@ -496,12 +499,7 @@ fn render_fixed(atoms: &[Atom], value: f64, automatic_minus: bool) -> Option<Str
     let rounded = round_to_precision(scaled, precision);
     let rendered = format!("{rounded:.precision$}");
     let (integer_digits, fraction_digits) = rendered.split_once('.').unwrap_or((&rendered, ""));
-    let integer = format_integer_layout(
-        integer_digits,
-        &atoms[first..integer_end],
-        &integer_pattern,
-        grouping,
-    );
+    let integer = format_integer_layout(integer_digits, integer_atoms, &integer_pattern, grouping);
     let fraction = decimal
         .map(|decimal| {
             format_fraction_layout(
@@ -516,7 +514,8 @@ fn render_fixed(atoms: &[Atom], value: f64, automatic_minus: bool) -> Option<Str
     if automatic_minus {
         out.push('-');
     }
-    render_atoms_literal(&mut out, &atoms[..first], &[]);
+    let prefix_end = decimal.filter(|decimal| *decimal < first).unwrap_or(first);
+    render_atoms_literal(&mut out, &atoms[..prefix_end], &[]);
     out.push_str(&integer);
     if decimal.is_some() && (!fraction.is_empty() || fraction_pattern.contains(&'0')) {
         out.push('.');
@@ -1312,6 +1311,8 @@ mod tests {
     #[test]
     fn grouping_optional_digits_percent_and_scaling() {
         assert_eq!(number(1234.5, "#,##0.00"), "1,234.50");
+        assert_eq!(number(0.5, ".0"), ".5");
+        assert_eq!(number(1.5, ".0"), "1.5");
         assert_eq!(number(0.125, "0.0%"), "12.5%");
         assert_eq!(number(12_345_678.0, "0.0,,\"M\""), "12.3M");
         assert_eq!(number(0.0, "#.##"), "");

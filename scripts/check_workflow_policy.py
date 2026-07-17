@@ -27,7 +27,196 @@ RENDER_ORACLE_FULL_SHARDS = "4"
 RENDER_ORACLE_MAX_PARALLEL_SHARDS = "2"
 RENDER_PACKAGE_NODE_VERSION = "24.18.0"
 RENDER_PACKAGE_NPM_VERSION = "11.16.0"
+RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST = "1.88.0"
 RENDER_PACKAGE_WASM_BINDGEN_VERSION = "0.2.126"
+
+
+def _without_commented_lines(text: str) -> str:
+    """Remove fully commented lines while preserving YAML indentation and blocks."""
+
+    return "\n".join(
+        "" if line.lstrip().startswith("#") else line for line in text.splitlines()
+    )
+
+
+def _yaml_blocks(text: str, header: str, indent: int) -> list[str]:
+    """Return active YAML blocks beginning with an exact, indentation-scoped header."""
+
+    lines = _without_commented_lines(text).splitlines()
+    target = " " * indent + header
+    starts = [index for index, line in enumerate(lines) if line.rstrip() == target]
+    blocks: list[str] = []
+    for start in starts:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            if not line.strip():
+                continue
+            current_indent = len(line) - len(line.lstrip(" "))
+            if current_indent <= indent:
+                end = index
+                break
+        blocks.append("\n".join(lines[start:end]))
+    return blocks
+
+
+def _single_yaml_block(
+    path: Path,
+    text: str,
+    header: str,
+    indent: int,
+    label: str,
+    errors: list[str],
+) -> str:
+    blocks = _yaml_blocks(text, header, indent)
+    if len(blocks) != 1:
+        errors.append(f"{path}: expected exactly one active {label}")
+        return ""
+    return blocks[0]
+
+
+def _normalized_active_commands(text: str) -> list[str]:
+    active = _without_commented_lines(text)
+    normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", active)
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+def _audit_exact_wasm_bindgen_install(
+    path: Path,
+    workflow_text: str,
+    install_step: str,
+    build_step: str,
+    build_command: str,
+    label: str,
+) -> list[str]:
+    """Require an exact wasm-bindgen CLI rebuilt into an isolated temporary root."""
+
+    errors: list[str] = []
+    expected_root = (
+        'tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"'
+    )
+    expected_remove = 'rm -rf "$tool_root"'
+    expected_mkdir = 'mkdir -p "$tool_root"'
+    expected_rustup = (
+        'rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal'
+    )
+    expected_cargo = (
+        'cargo "+$WASM_BINDGEN_BUILD_RUST" install wasm-bindgen-cli '
+        '--version "$WASM_BINDGEN_VERSION" --locked --root "$tool_root"'
+    )
+    expected_version = (
+        'test "$("$tool_root/bin/wasm-bindgen" --version)" = '
+        '"wasm-bindgen $WASM_BINDGEN_VERSION"'
+    )
+    expected_github_path = 'echo "$tool_root/bin" >> "$GITHUB_PATH"'
+    expected_path_export = (
+        'export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-'
+        '$WASM_BINDGEN_VERSION/bin:$PATH"'
+    )
+    expected_resolution = (
+        'test "$(command -v wasm-bindgen)" = '
+        '"$RUNNER_TEMP/rxls-wasm-bindgen-cli-'
+        '$WASM_BINDGEN_VERSION/bin/wasm-bindgen"'
+    )
+    step_commands = _normalized_active_commands(install_step)
+    build_commands = _normalized_active_commands(build_step)
+    workflow_commands = _normalized_active_commands(workflow_text)
+    step_installs = [
+        command
+        for command in step_commands
+        if "install wasm-bindgen-cli" in command
+    ]
+    workflow_installs = [
+        command
+        for command in workflow_commands
+        if "install wasm-bindgen-cli" in command
+    ]
+    step_roots = [
+        command for command in step_commands if command.startswith("tool_root=")
+    ]
+    step_github_paths = [
+        command for command in step_commands if "$GITHUB_PATH" in command
+    ]
+    build_path_exports = [
+        command for command in build_commands if command.startswith("export PATH=")
+    ]
+    required_install_commands = (
+        "set -euo pipefail",
+        'test -n "$RUNNER_TEMP"',
+        expected_root,
+        expected_remove,
+        expected_mkdir,
+        expected_rustup,
+        expected_cargo,
+        expected_version,
+        expected_github_path,
+    )
+    if step_commands.count("shell: bash") != 1:
+        errors.append(f"{path}: {label} must run under an explicit Bash shell")
+    if any(step_commands.count(command) != 1 for command in required_install_commands):
+        errors.append(
+            f"{path}: {label} must create one fresh RUNNER_TEMP tool root and "
+            "verify the exact build-only Rust/wasm-bindgen tool"
+        )
+    if step_installs != [expected_cargo]:
+        errors.append(
+            f"{path}: {label} must install wasm-bindgen-cli only into its "
+            "fresh dedicated root"
+        )
+    if workflow_installs != [expected_cargo]:
+        errors.append(
+            f"{path}: workflow must contain exactly one active, isolated, pinned "
+            "wasm-bindgen-cli install"
+        )
+    if step_roots != [expected_root] or step_github_paths != [expected_github_path]:
+        errors.append(
+            f"{path}: {label} must expose only the fresh RUNNER_TEMP tool bin "
+            "through GITHUB_PATH"
+        )
+    install_positions = [
+        step_commands.index(command)
+        for command in required_install_commands
+        if step_commands.count(command) == 1
+    ]
+    if len(install_positions) != len(required_install_commands) or install_positions != sorted(
+        install_positions
+    ):
+        errors.append(
+            f"{path}: {label} must clean the temporary root before installing and "
+            "export it only after exact-version verification"
+        )
+    scoped_commands = (
+        "set -euo pipefail",
+        'test -n "$RUNNER_TEMP"',
+        expected_path_export,
+        expected_resolution,
+        build_command,
+    )
+    if build_commands.count("shell: bash") != 1:
+        errors.append(f"{path}: {label} build must run under an explicit Bash shell")
+    if build_path_exports != [expected_path_export]:
+        errors.append(
+            f"{path}: {label} build must prepend only the isolated tool bin to PATH"
+        )
+    if any(build_commands.count(command) != 1 for command in scoped_commands):
+        errors.append(
+            f"{path}: {label} must prepend only the isolated tool bin to PATH, "
+            "verify command resolution, and build exactly once"
+        )
+    build_positions = [
+        build_commands.index(command)
+        for command in scoped_commands
+        if build_commands.count(command) == 1
+    ]
+    if len(build_positions) != len(scoped_commands) or build_positions != sorted(
+        build_positions
+    ):
+        errors.append(
+            f"{path}: {label} must export and verify the isolated PATH before building"
+        )
+    if any("--force" in command for command in workflow_installs):
+        errors.append(f"{path}: forced wasm-bindgen-cli installation is forbidden")
+    return errors
 
 
 def audit_action_pins(path: Path, text: str) -> list[str]:
@@ -424,31 +613,216 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
 
 
 def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
-    """Require the PDF hardening lane to consume the same exact Poppler lock."""
+    """Require scoped, fail-closed host and OCI rendering identity gates."""
 
     errors: list[str] = []
+    active = _without_commented_lines(text)
+
+    pull_request = _single_yaml_block(
+        path, active, "pull_request:", 2, "pull_request trigger", errors
+    )
+    for trigger_path in (
+        '      - "scripts/render-oracle-container/**"',
+        '      - "scripts/run-render-oracle-container.py"',
+        '      - "scripts/test_render_oracle_container.py"',
+    ):
+        if trigger_path not in pull_request.splitlines():
+            errors.append(
+                f"{path}: pull requests must trigger hardening for {trigger_path.strip()[2:]}"
+            )
+
+    pdf_job = _single_yaml_block(path, active, "pdf:", 2, "pdf job", errors)
+    pdf_runners = re.findall(r"^\s{4}runs-on:\s*(\S+)\s*$", pdf_job, re.MULTILINE)
+    if pdf_runners != ["ubuntu-24.04"]:
+        errors.append(f"{path}: PDF hardening must use only ubuntu-24.04")
+    if 'python-version: "3.13.14"' not in pdf_job:
+        errors.append(
+            f"{path}: PDF hardening must match the render-oracle Python identity"
+        )
+    pdf_policy_step = _single_yaml_block(
+        path,
+        pdf_job,
+        "- name: Enforce hosted workflow policy",
+        6,
+        "PDF policy step",
+        errors,
+    )
+    if "run: python3 scripts/check_workflow_policy.py" not in pdf_policy_step:
+        errors.append(f"{path}: PDF job must actively enforce hosted workflow policy")
+
+    host_bootstrap = _single_yaml_block(
+        path,
+        pdf_job,
+        "- name: Capture an unpinned host identity and fail closed",
+        6,
+        "host identity bootstrap step",
+        errors,
+    )
     for snippet, message in {
-        "runs-on: ubuntu-24.04": "PDF hardening must use the locked host family",
-        "scripts/render-oracle-host-tools.py verify": (
-            "PDF hardening must verify the hosted-tool lock"
+        'if [[ "$EXPECTED_IDENTITY" != "null" ]]; then': (
+            "host bootstrap must run only while the reviewed identity is absent"
         ),
-        "--scope poppler": "PDF hardening must verify the complete Poppler closure",
-        "--output target/poppler-identity.json": (
-            "PDF hardening must emit path-neutral Poppler evidence"
+        "sudo apt-get update": "host bootstrap must refresh its package source",
+        "sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils": (
+            "host bootstrap must install only the declared comparison tools"
         ),
-        "scripts/render-oracle-host-tools.py apt-specs --scope poppler": (
-            "PDF hardening must install the pinned Poppler package closure"
-        ),
-        'sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"': (
-            "PDF hardening must install only exact locked package specs"
+        'echo "Review and pin the uploaded host identity before this gate can pass." >&2': (
+            "host bootstrap must explain the deliberate failure"
         ),
     }.items():
-        if snippet not in text:
+        if snippet not in host_bootstrap:
             errors.append(f"{path}: {message}")
-    apt_lines = [line for line in text.splitlines() if "apt-get " in line]
-    if len(apt_lines) != 2 or any("poppler-utils" in line for line in apt_lines):
-        errors.append(f"{path}: PDF hardening apt inputs must come only from the exact lock")
-    if "poppler-version.txt" in text or "command -v pdfinfo |" in text:
+    host_bootstrap_commands = _normalized_active_commands(host_bootstrap)
+    for command, message in {
+        (
+            "python3 -m pip install --disable-pip-version-check --force-reinstall "
+            "--no-deps --only-binary=:all: --require-hashes --requirement "
+            "scripts/render-oracle-host-requirements.txt"
+        ): "host bootstrap must install the exact hash-locked Python wheel closure",
+        (
+            "python3 scripts/render-oracle-host-tools.py verify --scope all "
+            "--bootstrap-identities --output target/poppler-identity.json"
+        ): "host bootstrap must emit complete typed identity evidence",
+    }.items():
+        if command not in host_bootstrap_commands:
+            errors.append(f"{path}: {message}")
+    if host_bootstrap_commands.count("exit 1") != 1:
+        errors.append(f"{path}: unpinned host identity capture must fail closed")
+
+    strict_host = _single_yaml_block(
+        path,
+        pdf_job,
+        "- name: Verify the pinned Poppler PDF gate and complete native closure",
+        6,
+        "strict Poppler verification step",
+        errors,
+    )
+    strict_commands = _normalized_active_commands(strict_host)
+    for command, message in {
+        "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler": (
+            "strict PDF gate must install the pinned Poppler closure"
+        ),
+        'sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"': (
+            "strict PDF gate must install only exact locked package specs"
+        ),
+        (
+            "python3 scripts/render-oracle-host-tools.py verify --scope poppler "
+            "--output target/poppler-identity.json"
+        ): "strict PDF gate must verify and record the complete Poppler closure",
+    }.items():
+        if command not in strict_commands:
+            errors.append(f"{path}: {message}")
+    bootstrap_index = pdf_job.find("Capture an unpinned host identity and fail closed")
+    strict_index = pdf_job.find("Verify the pinned Poppler PDF gate")
+    if bootstrap_index < 0 or strict_index < 0 or bootstrap_index >= strict_index:
+        errors.append(f"{path}: host bootstrap must precede the strict PDF gate")
+
+    image_job = _single_yaml_block(
+        path, active, "oracle-image:", 2, "oracle-image job", errors
+    )
+    image_runners = re.findall(
+        r"^\s{4}runs-on:\s*(\S+)\s*$", image_job, re.MULTILINE
+    )
+    if image_runners != ["ubuntu-24.04"]:
+        errors.append(f"{path}: oracle-image job must use only ubuntu-24.04")
+    if "    name: locked LibreOffice oracle image" not in image_job.splitlines():
+        errors.append(f"{path}: oracle-image job must retain its reviewed identity")
+    image_policy_step = _single_yaml_block(
+        path,
+        image_job,
+        "- name: Enforce hosted workflow policy",
+        6,
+        "oracle-image policy step",
+        errors,
+    )
+    if "run: python3 scripts/check_workflow_policy.py" not in image_policy_step:
+        errors.append(
+            f"{path}: oracle-image job must actively enforce hosted workflow policy"
+        )
+    image_build = _single_yaml_block(
+        path,
+        image_job,
+        "- name: Build and verify the locked oracle image",
+        6,
+        "oracle-image build step",
+        errors,
+    )
+    for snippet, message in {
+        'if [[ "$EXPECTED_IMAGE_ID" == "null" ]]; then': (
+            "oracle image bootstrap must run only while the pin is absent"
+        ),
+        "BOOTSTRAP_ARGS+=(--bootstrap-identities)": (
+            "oracle image bootstrap must pass the explicit bootstrap argument"
+        ),
+        'assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence': (
+            "unpinned image evidence must have the bootstrap status"
+        ),
+        'assert evidence["expected_image_id"] is None, evidence': (
+            "unpinned image evidence must not claim a reviewed identity"
+        ),
+        "raise SystemExit(1)": "unpinned oracle image capture must fail closed",
+        'assert evidence["image_identity_status"] == "pinned_match", evidence': (
+            "pinned oracle image evidence must require pinned_match"
+        ),
+        'assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence': (
+            "pinned oracle image evidence must match expected and built identities"
+        ),
+    }.items():
+        if snippet not in image_build:
+            errors.append(f"{path}: {message}")
+    image_commands = _normalized_active_commands(image_build)
+    for command, message in {
+        (
+            'python3 scripts/run-render-oracle-container.py verify-lock "${BOOTSTRAP_ARGS[@]}"'
+        ): "oracle image gate must verify the reproducible build contract",
+        (
+            "python3 scripts/run-render-oracle-container.py build --engine docker "
+            "--image rxls-render-oracle:lo-26.2.3 --execute "
+            '"${BOOTSTRAP_ARGS[@]}" > target/render-oracle-image-build.json'
+        ): "oracle image gate must execute and record the reproducible OCI build",
+    }.items():
+        if command not in image_commands:
+            errors.append(f"{path}: {message}")
+    if image_build.count('"${BOOTSTRAP_ARGS[@]}"') != 2:
+        errors.append(
+            f"{path}: verify-lock and build must consume the same bootstrap argument array"
+        )
+    image_upload = _single_yaml_block(
+        path,
+        image_job,
+        "- name: Upload oracle image identity evidence",
+        6,
+        "oracle-image evidence upload step",
+        errors,
+    )
+    if (
+        "if: always()" not in image_upload
+        or "path: target/render-oracle-image-build.json" not in image_upload
+        or "if-no-files-found: error" not in image_upload
+    ):
+        errors.append(f"{path}: oracle-image identity evidence must always upload")
+
+    apt_lines = [line for line in active.splitlines() if "apt-get " in line]
+    if (
+        len(apt_lines) != 4
+        or sum("apt-get update" in line for line in apt_lines) != 2
+        or sum(
+            'apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"'
+            in line
+            for line in apt_lines
+        )
+        != 1
+        or sum(
+            "apt-get install --yes --no-install-recommends libcairo2 poppler-utils"
+            in line
+            for line in apt_lines
+        )
+        != 1
+    ):
+        errors.append(
+            f"{path}: PDF apt inputs must be the fail-closed bootstrap or exact lock"
+        )
+    if "poppler-version.txt" in active or "command -v pdfinfo |" in active:
         errors.append(f"{path}: path-bearing Poppler evidence is forbidden")
     return errors
 
@@ -479,6 +853,69 @@ def audit_codeql_workflow(path: Path, text: str) -> list[str]:
         or max(build_indices) >= analyze_index
     ):
         errors.append(f"{path}: explicit Rust builds must run between CodeQL init and analysis")
+    return errors
+
+
+def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
+    """Require the browser lane to build wasm-bindgen with its exact Rust pin."""
+
+    errors: list[str] = []
+    active = _without_commented_lines(text)
+    for name, value in {
+        "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
+        "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
+    }.items():
+        assignment = re.compile(
+            rf"^\s*{re.escape(name)}:\s*[\"']?{re.escape(value)}[\"']?\s*$",
+            re.MULTILINE,
+        )
+        if len(assignment.findall(active)) != 1:
+            errors.append(f"{path}: expected exact {name}={value}")
+
+    worker_job = _single_yaml_block(
+        path, active, "worker-wasm:", 2, "worker-wasm job", errors
+    )
+    metadata_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Verify publishable package and pinned toolchain metadata",
+        6,
+        "browser toolchain metadata step",
+        errors,
+    )
+    if (
+        "l.wasmBindgen.buildRust !== process.env.WASM_BINDGEN_BUILD_RUST"
+        not in metadata_step
+    ):
+        errors.append(
+            f"{path}: browser metadata gate must bind wasm-bindgen to its build Rust pin"
+        )
+    install_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Install exact wasm-bindgen CLI",
+        6,
+        "browser wasm-bindgen install step",
+        errors,
+    )
+    build_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Build exact wasm32 package",
+        6,
+        "browser wasm package build step",
+        errors,
+    )
+    errors.extend(
+        _audit_exact_wasm_bindgen_install(
+            path,
+            active,
+            install_step,
+            build_step,
+            "npm run build:wasm",
+            "browser wasm-bindgen install step",
+        )
+    )
     return errors
 
 
@@ -620,6 +1057,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     exact_assignments = {
         "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,
         "NPM_VERSION": RENDER_PACKAGE_NPM_VERSION,
+        "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
         "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
     }
     for name, value in exact_assignments.items():
@@ -659,6 +1097,28 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     build_index = text.find("npm --prefix bindings/render-wasm run build:wasm")
     if deny_index < 0 or build_index < 0 or deny_index > build_index:
         errors.append(f"{path}: nested dependency policy must run before building WASM")
+    active = _without_commented_lines(text)
+    verify_job = _single_yaml_block(
+        path, active, "verify:", 2, "render package verify job", errors
+    )
+    build_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Build the exact worker/WASM package",
+        6,
+        "render package wasm-bindgen build step",
+        errors,
+    )
+    errors.extend(
+        _audit_exact_wasm_bindgen_install(
+            path,
+            active,
+            build_step,
+            build_step,
+            "npm --prefix bindings/render-wasm run build:wasm",
+            "render package wasm-bindgen build step",
+        )
+    )
     return errors
 
 
@@ -681,6 +1141,8 @@ def audit_repository(root: Path) -> list[str]:
             errors.extend(audit_render_oracle_workflow(relative, text))
         elif path.name == "render-hardening.yml":
             errors.extend(audit_render_hardening_workflow(relative, text))
+        elif path.name == "render-browser.yml":
+            errors.extend(audit_render_browser_workflow(relative, text))
         elif path.name == "render-package-release.yml":
             errors.extend(audit_render_package_release_workflow(relative, text))
         elif path.name == "codeql.yml":

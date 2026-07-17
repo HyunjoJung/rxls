@@ -5,9 +5,9 @@ xlrd (the canonical Python `.xls` reader) is used as an independent oracle —
 NOT the production POI golden — so this measures rxls against a real reference
 parser, including Excel-faithful date rendering (xlrd `xldate`).
 
-For each `.xls` in the corpus it renders an xlrd "golden" text the same way rxls
-does (cells in row/col order; dates as ISO; literal-aware percent ×100; numbers
-whole->int) and compares it to the rxls `extract` example output with a
+For each `.xls` in the corpus it renders an xlrd "golden" text the same way the
+rxls `extract --typed-values` projection does (cells in row/col order; dates as
+ISO; literal-aware percent ×100; numbers whole->int) and compares them with a
 whitespace-insensitive ratio. It also tallies rxls extraction coverage and the
 files xlrd itself cannot read (a robustness datapoint for rxls).
 
@@ -30,6 +30,7 @@ bounded SHA-256 path capped by `--max-hash-chars`.
 import argparse
 import difflib
 import hashlib
+import math
 import os
 import re
 import subprocess
@@ -83,9 +84,125 @@ def _strip_literals(fmt):
     return "".join(out)
 
 
-def _is_percent(fmt):
-    """True only if '%' survives literal-stripping (matches rxls classify_string)."""
-    return "%" in _strip_literals(fmt)
+def _split_number_format_sections(fmt):
+    sections = []
+    start = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c == '"':
+            i = fmt.find('"', i + 1)
+            if i < 0:
+                return None
+        elif c == "[":
+            i = fmt.find("]", i + 1)
+            if i < 0:
+                return None
+        elif c in "\\_*":
+            i += 1
+            if i >= len(fmt):
+                return None
+        elif c == ";":
+            if len(sections) == 3:
+                return None
+            sections.append(fmt[start:i])
+            start = i + 1
+        i += 1
+    sections.append(fmt[start:])
+    return sections
+
+
+def _section_condition(section):
+    condition = None
+    i = 0
+    while i < len(section):
+        c = section[i]
+        if c == '"':
+            i = section.find('"', i + 1)
+            if i < 0:
+                return False, None
+        elif c == "[":
+            end = section.find("]", i + 1)
+            if end < 0:
+                return False, None
+            inner = section[i + 1 : end]
+            if inner.startswith(("<", ">", "=")):
+                match = re.fullmatch(r"(<=|>=|<>|<|>|=)\s*(.+?)\s*", inner)
+                if match is None or condition is not None:
+                    return False, None
+                try:
+                    threshold = float(match.group(2))
+                except ValueError:
+                    return False, None
+                if not math.isfinite(threshold):
+                    return False, None
+                condition = (match.group(1), threshold)
+            i = end
+        elif c in "\\_*":
+            i += 1
+            if i >= len(section):
+                return False, None
+        i += 1
+    return True, condition
+
+
+def _condition_matches(condition, value):
+    operator, threshold = condition
+    return {
+        "<": value < threshold,
+        "<=": value <= threshold,
+        "=": value == threshold,
+        "<>": value != threshold,
+        ">=": value >= threshold,
+        ">": value > threshold,
+    }[operator]
+
+
+def _active_number_format(fmt, value):
+    sections = _split_number_format_sections(fmt)
+    if not sections:
+        return ""
+    numeric = sections[:3]
+    parsed = [_section_condition(section) for section in numeric]
+    if not all(valid for valid, _condition in parsed):
+        return ""
+    conditions = [condition for _valid, condition in parsed]
+    if any(condition is not None for condition in conditions):
+        for section, condition in zip(numeric, conditions):
+            if condition is not None and _condition_matches(condition, value):
+                return section
+        for section, condition in reversed(list(zip(numeric, conditions))):
+            if condition is None:
+                return section
+        return ""
+    if len(numeric) == 1:
+        return numeric[0]
+    if len(numeric) == 2:
+        return numeric[1] if math.copysign(1.0, value) < 0.0 else numeric[0]
+    if value > 0.0:
+        return numeric[0]
+    if value < 0.0:
+        return numeric[1]
+    return numeric[2]
+
+
+def _format_kind(fmt):
+    if "%" in _strip_literals(fmt):
+        return "percent"
+    if _is_elapsed_time(fmt):
+        return "elapsed"
+    low = _strip_literals(fmt).replace("am/pm", "").replace("a/p", "")
+    has_time = "h" in low or "s" in low
+    month_tokens = low.count("m")
+    has_month = month_tokens >= 3 or (month_tokens >= 1 and not has_time)
+    has_date = "y" in low or "d" in low or has_month
+    if has_date and has_time:
+        return "datetime"
+    if has_date:
+        return "date"
+    if has_time:
+        return "time"
+    return "plain"
 
 
 def _is_elapsed_time(fmt):
@@ -127,25 +244,31 @@ def render_xlrd_cell_value(cell_type, value, fmt, datemode):
         return None
     if cell_type == xlrd.XL_CELL_TEXT:
         return value
-    if cell_type == xlrd.XL_CELL_DATE:
-        if _is_elapsed_time(fmt):
+    if cell_type in (xlrd.XL_CELL_DATE, xlrd.XL_CELL_NUMBER):
+        active_fmt = _active_number_format(fmt, value)
+        kind = _format_kind(active_fmt)
+        if kind == "percent":
+            return _fnum(value * 100) + "%"
+        if kind == "plain":
+            return _fnum(value)
+        if kind == "elapsed":
+            if value < 0.0 or not math.isfinite(value):
+                return _fnum(value)
             return _elapsed_time(value)
         # Date-vs-datetime is decided by the FORMAT, not the value's fraction
         # (a date-only format never shows time, even if the serial has one) —
         # matching Excel and rxls.
-        low = _strip_literals(fmt)
-        has_time = "h" in low or "s" in low
-        has_date = "y" in low or "d" in low
-        if datemode == 0 and value == 0.0 and has_date:
+        if datemode == 0 and value == 0.0 and kind in ("date", "datetime"):
             return "00:00:00"
-        dt = xldate_as_datetime(value, datemode)
-        if has_date and has_time:
+        try:
+            dt = xldate_as_datetime(value, datemode)
+        except (OverflowError, ValueError):
+            return _fnum(value)
+        if kind == "datetime":
             return dt.strftime("%Y-%m-%d %H:%M:%S")
-        if has_time:
+        if kind == "time":
             return dt.strftime("%H:%M:%S")
         return dt.strftime("%Y-%m-%d")
-    if cell_type == xlrd.XL_CELL_NUMBER:
-        return _fnum(value * 100) + "%" if _is_percent(fmt) else _fnum(value)
     if cell_type == xlrd.XL_CELL_BOOLEAN:
         return "TRUE" if value else "FALSE"
     if cell_type == xlrd.XL_CELL_ERROR:
@@ -344,7 +467,9 @@ def main():
     records, skips = [], []
     by_skip_decision, by_skip_evidence, by_skip_corpus_kind = {}, {}, {}
     for f in files:
-        rt = subprocess.run([binary, f], capture_output=True).stdout.decode("utf-8", "replace")
+        rt = subprocess.run(
+            [binary, f, "--typed-values"], capture_output=True
+        ).stdout.decode("utf-8", "replace")
         if rt.strip():
             rxls_ok += 1
         failure = corpus_failure_for_path(f, corpus_failures)

@@ -25,6 +25,7 @@ permissions:
 
 env:
   RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
   WASM_BINDGEN_VERSION: "0.2.126"
   CHROMIUM_VERSION: "150.0.7871.115"
   CHROMIUM_ARCHIVE_SHA256: "1be2db033133c5e2dd1a4e8664bf67b19a61bcf6ed28d2b00f433b3f0b4f9585"
@@ -54,7 +55,7 @@ jobs:
       - name: Verify publishable package and pinned toolchain metadata
         working-directory: bindings/render-wasm
         run: |
-          node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync("package.json")); const l=JSON.parse(fs.readFileSync("toolchain-lock.json")); const a=l.chromium.archive; if (p.private === true || p.publishConfig?.access !== "public" || p.publishConfig?.provenance !== true || l.rust !== process.env.RENDER_MSRV || l.wasmBindgen.version !== process.env.WASM_BINDGEN_VERSION || l.chromium.version !== process.env.CHROMIUM_VERSION || a.platform !== "linux64" || a.file !== "chrome-linux64.zip" || a.sha256 !== process.env.CHROMIUM_ARCHIVE_SHA256 || String(a.sizeBytes) !== process.env.CHROMIUM_ARCHIVE_SIZE) process.exit(1)'
+          node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync("package.json")); const l=JSON.parse(fs.readFileSync("toolchain-lock.json")); const a=l.chromium.archive; if (p.private === true || p.publishConfig?.access !== "public" || p.publishConfig?.provenance !== true || l.rust !== process.env.RENDER_MSRV || l.wasmBindgen.buildRust !== process.env.WASM_BINDGEN_BUILD_RUST || l.wasmBindgen.version !== process.env.WASM_BINDGEN_VERSION || l.chromium.version !== process.env.CHROMIUM_VERSION || a.platform !== "linux64" || a.file !== "chrome-linux64.zip" || a.sha256 !== process.env.CHROMIUM_ARCHIVE_SHA256 || String(a.sizeBytes) !== process.env.CHROMIUM_ARCHIVE_SIZE) process.exit(1)'
           cargo fmt -- --check
       - name: Test native facade and JavaScript protocol
         working-directory: bindings/render-wasm
@@ -63,10 +64,30 @@ jobs:
           cargo test --locked
           npm test
       - name: Install exact wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
       - name: Build exact wasm32 package
         working-directory: bindings/render-wasm
-        run: npm run build:wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          npm run build:wasm
       - name: Install exact Chrome for Testing
         shell: bash
         run: |

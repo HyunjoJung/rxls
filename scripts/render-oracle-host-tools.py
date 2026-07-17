@@ -662,22 +662,15 @@ def normalize_machine(value: str) -> str:
     return "x86_64" if value.lower() in {"amd64", "x86_64"} else value.lower()
 
 
-def capture_identity(lock: dict[str, Any]) -> dict[str, object]:
+def capture_identity(lock: dict[str, Any], scope: str) -> dict[str, Any]:
+    if scope not in {"all", "poppler"}:
+        raise HostToolError("scope")
     actual_platform = {
         "machine": normalize_machine(platform.machine()),
         "system": platform.system().lower(),
     }
     if actual_platform != lock["platform"]:
         raise HostToolError("capture_platform")
-    if (
-        sys.implementation.name != lock["python"]["implementation"]
-        or platform.python_version() != lock["python"]["version"]
-    ):
-        raise HostToolError("capture_python_version")
-    try:
-        python_path = Path(sys.executable).resolve(strict=True)
-    except OSError as error:
-        raise HostToolError("capture_python") from error
 
     executable_rows: list[dict[str, object]] = []
     poppler_libraries: set[Path] = set()
@@ -685,6 +678,27 @@ def capture_identity(lock: dict[str, Any]) -> dict[str, object]:
         identity, path = executable_identity(name)
         executable_rows.append(identity)
         poppler_libraries.update(ldd_paths(path))
+
+    poppler_identity = {
+        "platform": actual_platform,
+        "poppler": {
+            "executables": executable_rows,
+            "native_libraries": library_facts(sorted(poppler_libraries)),
+        },
+    }
+    if scope == "poppler":
+        return validate_scoped_identity(poppler_identity, lock, scope)
+
+    python_version = platform.python_version()
+    if (
+        sys.implementation.name != lock["python"]["implementation"]
+        or python_version != lock["python"]["version"]
+    ):
+        raise HostToolError("capture_python_version")
+    try:
+        python_path = Path(sys.executable).resolve(strict=True)
+    except OSError as error:
+        raise HostToolError("capture_python") from error
 
     cairo_path = resolve_cairo(lock["cairo"]["soname"])
     cairo_paths = {cairo_path, *ldd_paths(cairo_path)}
@@ -696,11 +710,7 @@ def capture_identity(lock: dict[str, Any]) -> dict[str, object]:
             "native_libraries": library_facts(sorted(cairo_paths)),
             "version": cairo_version(cairo_path),
         },
-        "platform": actual_platform,
-        "poppler": {
-            "executables": executable_rows,
-            "native_libraries": library_facts(sorted(poppler_libraries)),
-        },
+        **poppler_identity,
         "python": {
             "distributions": [
                 distribution_identity(item)
@@ -709,12 +719,12 @@ def capture_identity(lock: dict[str, Any]) -> dict[str, object]:
             "executable": file_fact(python_path),
             "implementation": sys.implementation.name,
             "native_libraries": python_library_facts(
-                ldd_paths(python_path), platform.python_version()
+                ldd_paths(python_path), python_version
             ),
-            "version": platform.python_version(),
+            "version": python_version,
         },
     }
-    return validate_identity(identity, lock)
+    return validate_scoped_identity(identity, lock, scope)
 
 
 def reject_path_strings(value: object) -> None:
@@ -733,6 +743,20 @@ def scoped_identity(identity: dict[str, Any], scope: str) -> dict[str, Any]:
         return identity
     if scope == "poppler":
         return {"platform": identity["platform"], "poppler": identity["poppler"]}
+    raise HostToolError("scope")
+
+
+def validate_scoped_identity(
+    value: object, lock: dict[str, Any], scope: str
+) -> dict[str, Any]:
+    if scope == "all":
+        return validate_identity(value, lock)
+    if scope == "poppler":
+        row = exact_keys(value, {"platform", "poppler"}, "identity_keys")
+        validate_platform(row["platform"], lock["platform"])
+        validate_poppler_identity(row["poppler"], lock["poppler"])
+        reject_path_strings(row)
+        return row
     raise HostToolError("scope")
 
 
@@ -786,11 +810,10 @@ def verify_host(
     *,
     scope: str,
     bootstrap_identities: bool,
-    capture: Callable[[dict[str, Any]], dict[str, Any]] = capture_identity,
+    capture: Callable[[dict[str, Any], str], dict[str, Any]] = capture_identity,
 ) -> dict[str, Any]:
     lock, lock_payload = load_lock(lock_path)
-    actual_full = capture(lock)
-    actual = scoped_identity(actual_full, scope)
+    actual = validate_scoped_identity(capture(lock, scope), lock, scope)
     expected_full = lock["expected_identity"]
     expected = (
         None if expected_full is None else scoped_identity(expected_full, scope)

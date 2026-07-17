@@ -15,6 +15,7 @@ concurrency:
 
 env:
   RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
   WASM_BINDGEN_VERSION: "0.2.126"
   NODE_VERSION: "24.18.0"
   NPM_VERSION: "11.16.0"
@@ -215,8 +216,23 @@ jobs:
           cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked
           npm --prefix bindings/render-wasm test
       - name: Build the exact worker/WASM package
+        shell: bash
         run: |
-          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
           npm --prefix bindings/render-wasm run build:wasm
       - name: Pack, inspect, dry-run, and consume
         shell: bash

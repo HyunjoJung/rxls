@@ -542,19 +542,16 @@ impl XlsStyles {
                     .and_then(|data| parse_biff_font(data, ctx, palette))
             })
             .collect();
-        let raw_xfs = self
+        // Cell XFs already store the complete formatting set. Their parent and
+        // fAtr* fields describe how an authoring application propagates later
+        // style edits; they are not read-time inheritance switches.
+        self.xfs = self
             .xf_records
             .iter()
-            .map(|data| parse_biff_xf(data, ctx.biff8, &self.fonts, formats, palette))
-            .collect::<Vec<_>>();
-        let mut cache = vec![None; raw_xfs.len()];
-        let mut visiting = vec![false; raw_xfs.len()];
-        for index in 0..raw_xfs.len() {
-            let _ = resolve_biff_xf(index, &raw_xfs, &mut cache, &mut visiting, 0);
-        }
-        self.xfs = cache
-            .into_iter()
-            .map(|components| components.map(XfComponents::into_cell_style))
+            .map(|data| {
+                parse_biff_xf(data, ctx.biff8, &self.fonts, formats, palette)
+                    .map(|raw| raw.components.into_cell_style())
+            })
             .collect();
         self.compiled = true;
     }
@@ -611,57 +608,7 @@ impl XfComponents {
 
 #[derive(Debug, Clone)]
 struct RawXf {
-    parent: usize,
-    is_style: bool,
-    used: [bool; 6],
     components: XfComponents,
-}
-
-fn resolve_biff_xf(
-    index: usize,
-    xfs: &[Option<RawXf>],
-    cache: &mut [Option<XfComponents>],
-    visiting: &mut [bool],
-    depth: usize,
-) -> Option<XfComponents> {
-    if let Some(cached) = cache.get(index)?.clone() {
-        return Some(cached);
-    }
-    let raw = xfs.get(index)?.as_ref()?;
-    if depth >= 64 || visiting.get(index).copied().unwrap_or(true) {
-        return Some(raw.components.clone());
-    }
-    visiting[index] = true;
-    let parent = (!raw.is_style && raw.parent != index)
-        .then(|| resolve_biff_xf(raw.parent, xfs, cache, visiting, depth + 1))
-        .flatten();
-    let mut resolved = match parent {
-        Some(parent) => parent,
-        None => raw.components.clone(),
-    };
-    if !raw.is_style && raw.parent < xfs.len() && raw.parent != index {
-        if raw.used[0] {
-            resolved.num_fmt = raw.components.num_fmt.clone();
-        }
-        if raw.used[1] {
-            resolved.font = raw.components.font.clone();
-        }
-        if raw.used[2] {
-            resolved.alignment = raw.components.alignment.clone();
-        }
-        if raw.used[3] {
-            resolved.border = raw.components.border.clone();
-        }
-        if raw.used[4] {
-            resolved.fill = raw.components.fill;
-        }
-        if raw.used[5] {
-            resolved.protection = raw.components.protection.clone();
-        }
-    }
-    visiting[index] = false;
-    cache[index] = Some(resolved.clone());
-    Some(resolved)
 }
 
 fn parse_biff_font(data: &[u8], ctx: Ctx, palette: &[Color; 56]) -> Option<Font> {
@@ -706,8 +653,6 @@ fn parse_biff_xf(
     let font_index = u16le(data, 0)?;
     let format_index = u16le(data, 2)?;
     let type_parent = u16le(data, 4)?;
-    let is_style = type_parent & 0x0004 != 0;
-    let parent = usize::from(type_parent >> 4);
     let protection = CellProtection {
         locked: Some(type_parent & 0x0001 != 0),
         hidden: type_parent & 0x0002 != 0,
@@ -715,19 +660,17 @@ fn parse_biff_xf(
     let font = fonts.get(usize::from(font_index)).cloned().flatten();
     let num_fmt = formats.code_for_ifmt(format_index);
 
-    let (used, alignment, border, fill) = if biff8 {
+    let (alignment, border, fill) = if biff8 {
         if data.len() < 20 {
             return None;
         }
         let align1 = data[6];
         let rotation = data[7];
         let align2 = data[8];
-        let used = parse_used_attributes(data[9]);
         let border1 = u32le(data, 10)?;
         let border2 = u32le(data, 14)?;
         let fill_colors = u16le(data, 18)?;
         (
-            used,
             parse_biff8_alignment(align1, rotation, align2),
             Border {
                 left: biff_border_style(border1 & 0x0F),
@@ -771,7 +714,6 @@ fn parse_biff_xf(
         let border_fill1 = u32le(data, 8)?;
         let border2 = u32le(data, 12)?;
         (
-            parse_used_attributes(orient_used),
             parse_biff5_alignment(align1, orient_used & 0x03),
             Border {
                 left: biff_border_style((border2 >> 3) & 0x07),
@@ -808,9 +750,6 @@ fn parse_biff_xf(
         )
     };
     Some(RawXf {
-        parent,
-        is_style,
-        used,
         components: XfComponents {
             font,
             num_fmt,
@@ -820,11 +759,6 @@ fn parse_biff_xf(
             protection,
         },
     })
-}
-
-fn parse_used_attributes(value: u8) -> [bool; 6] {
-    let value = value >> 2;
-    std::array::from_fn(|index| value & (1 << index) != 0)
 }
 
 fn parse_biff8_alignment(align1: u8, rotation: u8, align2: u8) -> Alignment {
@@ -982,7 +916,9 @@ impl Workbook {
         let mut formats = Formats::default();
         let mut xls_styles = XlsStyles::default();
         let mut palette = BIFF_DEFAULT_PALETTE;
-        // Per-workbook text budget (shared across sheets) — see MAX_TEXT_BYTES.
+        // Per-workbook retained-cell budget (shared across sheets). The
+        // MAX_TEXT_BYTES ceiling also accounts for entry/Box storage so empty
+        // display formats cannot bypass the shared-string amplification bound.
         let mut budget = MAX_TEXT_BYTES;
         // Style cloning is independently bounded because repeated XF references
         // can amplify font/format strings across many materialized cells.
@@ -1404,6 +1340,7 @@ impl Workbook {
                                     &definition,
                                     &mut sheets[si].cells,
                                     &mut last_formula,
+                                    &mut budget,
                                     ctx,
                                     &formula_sheet_names,
                                     &extern_sheets,
@@ -2729,6 +2666,7 @@ fn apply_formula_definition(
     definition: &FormulaDefinition,
     cells: &mut [CellEntry],
     last_formula: &mut Option<PendingFormula>,
+    budget: &mut usize,
     ctx: Ctx,
     sheet_names: &[String],
     extern_sheets: &[crate::ptg::ExternSheet],
@@ -2765,12 +2703,37 @@ fn apply_formula_definition(
         match &mut cell.value {
             Cell::Formula {
                 formula: source, ..
-            } => *source = formula,
+            } => {
+                // A late ARRAY/SHRFMLA record can replace a formula source
+                // after the cached cell was already retained. Charge any
+                // growth before mutating so an exhausted budget leaves the
+                // existing typed value and source intact.
+                let growth = formula.capacity().saturating_sub(source.capacity());
+                if growth > *budget {
+                    *budget = 0;
+                } else {
+                    *budget -= growth;
+                    *source = formula;
+                }
+            }
             cached => {
-                cell.value = Cell::Formula {
-                    formula,
-                    cached: Box::new(cached.clone()),
-                };
+                // Moving the existing cached value into the Box avoids a
+                // transient clone. Its heap payload was charged when the cell
+                // was first retained, so only the formula source and Box<Cell>
+                // allocation are additional retained storage.
+                let growth = formula
+                    .capacity()
+                    .saturating_add(std::mem::size_of::<Cell>());
+                if growth > *budget {
+                    *budget = 0;
+                } else {
+                    *budget -= growth;
+                    let cached = std::mem::replace(cached, Cell::Bool(false));
+                    cell.value = Cell::Formula {
+                        formula,
+                        cached: Box::new(cached),
+                    };
+                }
             }
         }
     }
@@ -2971,24 +2934,24 @@ fn decode_cell(
                         }
                         _ => {
                             // 0x03 empty cached result. Surface formula identity
-                            // when rgce decompiled. Pushed directly because
-                            // `push_cell` skips empty-text cells; gated on the text
-                            // budget so a flood of blank-result formulas can't grow
-                            // the cell vector past the global allocation bound.
-                            if let (Some(fs), true) = (formula, *budget > 0) {
-                                let cost = fs.len().min(*budget);
-                                *budget -= cost;
-                                cells.push(CellEntry {
+                            // when rgce decompiled. `push_cell` charges an
+                            // allocation budget even though the display text is
+                            // empty.
+                            if let Some(fs) = formula {
+                                push_cell(
+                                    cells,
                                     row,
                                     col,
-                                    value: Cell::Formula {
+                                    Cell::Formula {
                                         formula: fs,
                                         cached: Box::new(Cell::Text(String::new())),
                                     },
-                                    text: String::new(),
-                                    style: styles.clone_xf(ixfe, style_budget),
-                                    hyperlink: None,
-                                });
+                                    String::new(),
+                                    ixfe,
+                                    styles,
+                                    style_budget,
+                                    budget,
+                                );
                             }
                         }
                     }
@@ -3533,7 +3496,7 @@ fn push_text(
         cells,
         row,
         col,
-        Cell::Text(s.clone()),
+        Cell::Text(s),
         text,
         ixfe,
         styles,
@@ -3585,23 +3548,54 @@ fn push_cell(
     style_budget: &mut usize,
     budget: &mut usize,
 ) {
-    if !text.is_empty() {
-        // Bound total accumulated text so shared-string reference amplification
-        // (cloning one large pooled string into very many cells) cannot exhaust
-        // memory; once the budget is spent, further cells are dropped.
-        if text.len() > *budget {
-            *budget = 0;
-            return;
+    // Empty source text is not a value cell. Numeric, boolean, date, error, and
+    // formula records remain semantically present even when their number format
+    // deliberately renders no display text (for example zero under `# ?/?`).
+    if matches!(&value, Cell::Text(source) if source.is_empty()) {
+        return;
+    }
+
+    // Account for every retained allocation, independently of display text.
+    // LABELSST can clone one pooled string into many cells, and a fourth number-
+    // format section can hide every clone; charging only rendered bytes would
+    // therefore turn a small SST into unbounded retained heap growth.
+    let cost = retained_cell_cost(&value, &text);
+    if cost > *budget {
+        *budget = 0;
+        return;
+    }
+    *budget -= cost;
+    cells.push(CellEntry {
+        row,
+        col,
+        value,
+        text,
+        style: styles.clone_xf(ixfe, style_budget),
+        hyperlink: None,
+    });
+}
+
+fn retained_cell_cost(value: &Cell, text: &String) -> usize {
+    std::mem::size_of::<CellEntry>()
+        .saturating_add(text.capacity())
+        .saturating_add(retained_cell_value_heap_bytes(value))
+}
+
+fn retained_cell_value_heap_bytes(mut value: &Cell) -> usize {
+    let mut bytes = 0usize;
+    loop {
+        match value {
+            Cell::Text(source) | Cell::Error(source) => {
+                return bytes.saturating_add(source.capacity());
+            }
+            Cell::Formula { formula, cached } => {
+                bytes = bytes
+                    .saturating_add(formula.capacity())
+                    .saturating_add(std::mem::size_of::<Cell>());
+                value = cached;
+            }
+            Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => return bytes,
         }
-        *budget -= text.len();
-        cells.push(CellEntry {
-            row,
-            col,
-            value,
-            text,
-            style: styles.clone_xf(ixfe, style_budget),
-            hyperlink: None,
-        });
     }
 }
 
@@ -5523,6 +5517,329 @@ mod tests {
         }
     }
 
+    #[test]
+    fn biff8_empty_display_formula_retains_its_typed_cached_value() {
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+
+        let code = r#"##;##;"""#;
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0); // compressed BIFF8 characters
+        format.extend_from_slice(code.as_bytes());
+        stream.extend_from_slice(&rec(FORMAT, &format));
+
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        stream.extend_from_slice(&rec(XF, &xf));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Hidden zero")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        let rgce = [0x1E, 0, 0]; // PtgInt(0)
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(0, 0, 0.0, &rgce)));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some(""));
+        assert_eq!(sheet.display_cells().count(), 1);
+        assert_eq!(
+            sheet.cell(0, 0),
+            Some(&Cell::Formula {
+                formula: "0".to_string(),
+                cached: Box::new(Cell::Number(0.0)),
+            })
+        );
+    }
+
+    #[test]
+    fn empty_display_value_cells_remain_typed_and_bounded() {
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let values = vec![
+            Cell::Number(0.0),
+            Cell::Date(0.0),
+            Cell::Formula {
+                formula: "A1".to_string(),
+                cached: Box::new(Cell::Number(0.0)),
+            },
+            Cell::Bool(false),
+            Cell::Error("#N/A".to_string()),
+        ];
+        let empty = String::new();
+        let mut budget = values
+            .iter()
+            .map(|value| retained_cell_cost(value, &empty))
+            .sum();
+        let starting_budget = budget;
+        let mut cells = Vec::new();
+
+        push_cell(
+            &mut cells,
+            0,
+            0,
+            Cell::Text(String::new()),
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert!(cells.is_empty());
+        assert_eq!(budget, starting_budget);
+
+        for (col, value) in values.into_iter().enumerate() {
+            push_cell(
+                &mut cells,
+                0,
+                col as u16,
+                value,
+                String::new(),
+                0,
+                &styles,
+                &mut style_budget,
+                &mut budget,
+            );
+        }
+        assert_eq!(cells.len(), 5);
+        assert_eq!(budget, 0);
+
+        push_cell(
+            &mut cells,
+            0,
+            6,
+            Cell::Number(1.0),
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 5, "zero budget must bound retained cells");
+    }
+
+    #[test]
+    fn hidden_formula_strings_charge_source_cache_and_box_storage() {
+        let code = r#"0;0;0;"""#;
+        let mut formats = Formats::default();
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0);
+        format.extend_from_slice(code.as_bytes());
+        formats.push_format(&format, || Some(code.to_string()));
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        formats.push_xf(&xf);
+
+        // Keep capacities deliberately larger than lengths: retained bytes,
+        // rather than visible bytes, are the security boundary.
+        let mut formula = String::with_capacity(4 << 10);
+        formula.push_str("A1");
+        let mut cached = String::with_capacity(8 << 10);
+        cached.push_str("secret");
+        let display = formats.render_text(&cached, 0);
+        assert!(display.is_empty());
+        let formula_capacity = formula.capacity();
+        let cached_capacity = cached.capacity();
+        let display_capacity = display.capacity();
+        let value = Cell::Formula {
+            formula,
+            cached: Box::new(Cell::Text(cached)),
+        };
+        let expected = std::mem::size_of::<CellEntry>()
+            .saturating_add(display_capacity)
+            .saturating_add(formula_capacity)
+            .saturating_add(std::mem::size_of::<Cell>())
+            .saturating_add(cached_capacity);
+        assert_eq!(retained_cell_cost(&value, &display), expected);
+
+        let mut cells = Vec::new();
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let mut budget = expected;
+        push_cell(
+            &mut cells,
+            0,
+            0,
+            value,
+            display,
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 1);
+        assert_eq!(budget, 0);
+        let Cell::Formula { formula, cached } = &cells[0].value else {
+            panic!("hidden formula must remain typed");
+        };
+        assert_eq!(formula.capacity(), formula_capacity);
+        let Cell::Text(cached) = cached.as_ref() else {
+            panic!("formula cache must remain text");
+        };
+        assert_eq!(cached.capacity(), cached_capacity);
+
+        push_cell(
+            &mut cells,
+            0,
+            1,
+            Cell::Formula {
+                formula: "B1".to_string(),
+                cached: Box::new(Cell::Text("another secret".to_string())),
+            },
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 1, "zero budget must reject another formula");
+    }
+
+    #[test]
+    fn late_formula_definition_growth_is_charged_and_atomic() {
+        fn entry(value: Cell) -> CellEntry {
+            CellEntry {
+                row: 0,
+                col: 0,
+                value,
+                text: "cached".to_string(),
+                style: None,
+                hyperlink: None,
+            }
+        }
+
+        let definition = FormulaDefinition {
+            anchor: (0, 0),
+            range: (0, 0, 0, 0),
+            rgce: vec![0x1E, 42, 0], // PtgInt(42)
+            rgb_extra: Vec::new(),
+            is_array: false,
+        };
+
+        let mut cells = vec![entry(Cell::Error("cached".to_string()))];
+        let mut last_formula = None;
+        let starting_budget = 4096;
+        let mut budget = starting_budget;
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let Cell::Formula { formula, cached } = &cells[0].value else {
+            panic!("definition must wrap the cached scalar");
+        };
+        assert_eq!(formula, "42");
+        assert_eq!(cached.as_ref(), &Cell::Error("cached".to_string()));
+        let growth = formula
+            .capacity()
+            .saturating_add(std::mem::size_of::<Cell>());
+        assert_eq!(budget, starting_budget - growth);
+
+        let original = Cell::Error("cached".to_string());
+        let mut cells = vec![entry(original.clone())];
+        let mut last_formula = None;
+        let mut budget = std::mem::size_of::<Cell>().saturating_sub(1);
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(cells[0].value, original);
+        assert_eq!(budget, 0);
+
+        let original = Cell::Formula {
+            formula: String::new(),
+            cached: Box::new(Cell::Number(42.0)),
+        };
+        let mut cells = vec![entry(original.clone())];
+        let mut last_formula = None;
+        let mut budget = 0;
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(cells[0].value, original);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn repeated_hidden_labelsst_clones_exhaust_the_retained_cell_budget() {
+        let code = r#"0;0;0;"""#;
+        let mut formats = Formats::default();
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0);
+        format.extend_from_slice(code.as_bytes());
+        formats.push_format(&format, || Some(code.to_string()));
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        formats.push_xf(&xf);
+
+        let sst = vec!["x".repeat(64 << 10)];
+        let hidden = formats.render_text(&sst[0], 0);
+        assert!(hidden.is_empty());
+        let mut budget = retained_cell_cost(&Cell::Text(sst[0].clone()), &hidden);
+        let mut cells = Vec::new();
+        let mut last_formula = None;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let definitions = FormulaDefinitions::new();
+
+        for row in 0..2u16 {
+            let mut labelsst = Vec::with_capacity(10);
+            labelsst.extend_from_slice(&row.to_le_bytes());
+            labelsst.extend_from_slice(&0u16.to_le_bytes());
+            labelsst.extend_from_slice(&0u16.to_le_bytes());
+            labelsst.extend_from_slice(&0u32.to_le_bytes());
+            decode_cell(
+                LABELSST,
+                &labelsst,
+                &sst,
+                0,
+                &mut cells,
+                &mut last_formula,
+                &formats,
+                &mut budget,
+                &styles,
+                &mut style_budget,
+                &[],
+                &[],
+                &[],
+                &[],
+                ctx8(),
+                &definitions,
+            );
+        }
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].text, "");
+        assert_eq!(cells[0].value, Cell::Text(sst[0].clone()));
+        assert_eq!(budget, 0);
+    }
+
     fn biff8_bof(substream_type: u16) -> Vec<u8> {
         let mut body = Vec::with_capacity(16);
         body.extend_from_slice(&0x0600u16.to_le_bytes());
@@ -5904,6 +6221,116 @@ mod tests {
                 rotation: 90,
                 indent: 0,
                 shrink_to_fit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn biff8_retained_number_format_matches_the_raw_cell_xf() {
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+
+        let mut parent = vec![0u8; 20];
+        parent[4..6].copy_from_slice(&0xFFF4u16.to_le_bytes()); // parentless style XF
+        stream.extend_from_slice(&rec(XF, &parent));
+
+        let mut cell_xf = vec![0u8; 20];
+        cell_xf[2..4].copy_from_slice(&10u16.to_le_bytes()); // built-in 0.00%
+        cell_xf[4..6].copy_from_slice(&0u16.to_le_bytes()); // cell XF, parent 0
+        cell_xf[9] = 0; // fAtrNum clear: future parent ifmt edits propagate
+        stream.extend_from_slice(&rec(XF, &cell_xf));
+        stream.extend_from_slice(&rec(STYLE, &[0x00, 0x80, 0x00, 0x00]));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Percent")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        let mut number = Vec::new();
+        number.extend_from_slice(&0u16.to_le_bytes());
+        number.extend_from_slice(&0u16.to_le_bytes());
+        number.extend_from_slice(&1u16.to_le_bytes());
+        number.extend_from_slice(&0.0042f64.to_le_bytes());
+        stream.extend_from_slice(&rec(NUMBER, &number));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("0.42%"));
+        assert_eq!(
+            sheet
+                .cell_style(0, 0)
+                .and_then(|style| style.num_fmt.as_deref()),
+            Some("0.00%")
+        );
+    }
+
+    #[test]
+    fn biff8_cell_xf_keeps_all_raw_components_when_fatr_bits_are_clear() {
+        let font_record = |name: &str, height_twips: u16, weight: u16| {
+            let mut font = Vec::new();
+            font.extend_from_slice(&height_twips.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&8u16.to_le_bytes());
+            font.extend_from_slice(&weight.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&[0, 0, 0, 0]);
+            font.push(name.len() as u8);
+            font.push(0);
+            font.extend_from_slice(name.as_bytes());
+            font
+        };
+
+        let mut styles = XlsStyles::default();
+        styles.push_font(&font_record("Parent", 200, 400));
+        styles.push_font(&font_record("Child", 240, 700));
+
+        let mut parent = vec![0u8; 20];
+        parent[4..6].copy_from_slice(&0xFFF7u16.to_le_bytes());
+        styles.push_xf(&parent);
+
+        let mut child = vec![0u8; 20];
+        child[0..2].copy_from_slice(&1u16.to_le_bytes());
+        child[2..4].copy_from_slice(&10u16.to_le_bytes());
+        child[4..6].copy_from_slice(&0u16.to_le_bytes());
+        child[6] = 3 | 0x08 | (2 << 4);
+        child[7] = 45;
+        child[8] = 2 | 0x10;
+        child[9] = 0; // all fAtr* clear: future style edits may update the child
+        child[10..14].copy_from_slice(&1u32.to_le_bytes());
+        child[14..18].copy_from_slice(&(1u32 << 26).to_le_bytes());
+        child[18..20].copy_from_slice(&(10u16 | (11 << 7)).to_le_bytes());
+        styles.push_xf(&child);
+
+        styles.compile(ctx8(), &Formats::default(), &BIFF_DEFAULT_PALETTE);
+        let style = styles.xfs[1].as_ref().expect("compiled child XF");
+
+        let font = style.font.as_ref().expect("child font");
+        assert_eq!(font.name.as_deref(), Some("Child"));
+        assert_eq!(font.size_pt, Some(12));
+        assert!(font.bold);
+        assert_eq!(style.num_fmt.as_deref(), Some("0.00%"));
+        assert_eq!(
+            style.align,
+            Some(Alignment {
+                horizontal: Some(HAlign::Right),
+                vertical: Some(VAlign::Bottom),
+                wrap: true,
+                rotation: 45,
+                indent: 2,
+                shrink_to_fit: true,
+            })
+        );
+        assert_eq!(
+            style.border.as_ref().map(|border| border.left),
+            Some(BorderStyle::Thin)
+        );
+        assert_eq!(
+            style.pattern_fill.as_ref().map(|fill| fill.pattern),
+            Some(FormatPattern::Solid)
+        );
+        assert_eq!(
+            style.protection,
+            Some(CellProtection {
+                locked: Some(false),
+                hidden: false,
             })
         );
     }

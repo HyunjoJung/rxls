@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{fmt::Write as _, io::Write};
 
 use rxls::{PageSetup, Workbook};
 use rxls_render::{
@@ -43,16 +43,15 @@ fn solid_rgba_png() -> Vec<u8> {
 }
 
 fn imported_page_images(images: &[PageImage]) -> Workbook {
-    let frames = images
-        .iter()
-        .enumerate()
-        .map(|(index, image)| {
-            format!(
-                r#"<draw:frame draw:name="Page image {index}" text:anchor-type="page" svg:x="{}in" svg:y="{}in" svg:width="{}in" svg:height="{}in"><draw:image xlink:href="Pictures/page.png"/></draw:frame>"#,
-                image.x_inches, image.y_inches, image.width_inches, image.height_inches,
-            )
-        })
-        .collect::<String>();
+    let mut frames = String::new();
+    for (index, image) in images.iter().enumerate() {
+        write!(
+            frames,
+            r#"<draw:frame draw:name="Page image {index}" text:anchor-type="page" svg:x="{}in" svg:y="{}in" svg:width="{}in" svg:height="{}in"><draw:image xlink:href="Pictures/page.png"/></draw:frame>"#,
+            image.x_inches, image.y_inches, image.width_inches, image.height_inches,
+        )
+        .expect("write page-image frame");
+    }
     let content = format!(
         r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:spreadsheet><table:table table:name="Page images"><table:table-column table:number-columns-repeated="3"/><table:shapes>{frames}</table:shapes><table:table-row table:number-rows-repeated="3"><table:table-cell table:number-columns-repeated="3"/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#,
     );

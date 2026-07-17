@@ -186,7 +186,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             lock_path = root / "lock.json"
             evidence_path = root / "evidence.json"
             lock_path.write_bytes(MODULE.canonical_json_bytes(lock))
-            capture = lambda _: json.loads(json.dumps(identity))
+            capture = lambda _, __: json.loads(json.dumps(identity))
 
             with self.assertRaisesRegex(
                 MODULE.HostToolError, "host_identity_pin_required"
@@ -231,7 +231,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                     evidence_path,
                     scope="all",
                     bootstrap_identities=True,
-                    capture=lambda _: mismatch,
+                    capture=lambda _, __: mismatch,
                 )
             evidence = json.loads(evidence_path.read_bytes())
             self.assertEqual(evidence["identity_status"], "mismatch")
@@ -240,12 +240,55 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                 MODULE.sha256_bytes(MODULE.canonical_json_bytes(mismatch)),
             )
 
-    def test_poppler_scope_does_not_depend_on_python_but_is_still_pinned(self) -> None:
+    def test_poppler_capture_never_probes_python_or_cairo(self) -> None:
+        lock, _ = MODULE.load_lock()
+        identity = fixture_identity(lock)
+        executable_by_name = {
+            row["name"]: row for row in identity["poppler"]["executables"]
+        }
+        executable_paths = {
+            name: Path(f"/fixture/{name}") for name in executable_by_name
+        }
+
+        def poppler_executable(name: str):
+            return executable_by_name[name], executable_paths[name]
+
+        with (
+            mock.patch.object(MODULE.platform, "machine", return_value="x86_64"),
+            mock.patch.object(MODULE.platform, "system", return_value="Linux"),
+            mock.patch.object(
+                MODULE.platform,
+                "python_version",
+                side_effect=AssertionError("Python identity was probed"),
+            ),
+            mock.patch.object(
+                MODULE.importlib.metadata,
+                "distribution",
+                side_effect=AssertionError("Python distributions were probed"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "resolve_cairo",
+                side_effect=AssertionError("Cairo was probed"),
+            ),
+            mock.patch.object(
+                MODULE, "executable_identity", side_effect=poppler_executable
+            ),
+            mock.patch.object(MODULE, "ldd_paths", return_value=[Path("/fixture/lib")]),
+            mock.patch.object(
+                MODULE,
+                "library_facts",
+                return_value=identity["poppler"]["native_libraries"],
+            ),
+        ):
+            captured = MODULE.capture_identity(lock, "poppler")
+
+        self.assertEqual(captured, MODULE.scoped_identity(identity, "poppler"))
+
+    def test_poppler_scope_is_still_pinned(self) -> None:
         lock, _ = MODULE.load_lock()
         identity = fixture_identity(lock)
         lock["expected_identity"] = identity
-        changed_python = json.loads(json.dumps(identity))
-        changed_python["python"]["executable"]["sha256"] = digest("changed")
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             lock_path = root / "lock.json"
@@ -256,7 +299,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                 evidence_path,
                 scope="poppler",
                 bootstrap_identities=False,
-                capture=lambda _: changed_python,
+                capture=lambda _, scope: MODULE.scoped_identity(identity, scope),
             )
             self.assertEqual(evidence["identity_status"], "pinned_match")
             self.assertEqual(set(evidence["identity"]), {"platform", "poppler"})
@@ -306,7 +349,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                 evidence_path,
                 scope="all",
                 bootstrap_identities=True,
-                capture=lambda _: identity,
+                capture=lambda _, __: identity,
             )
             for key in ("lock_file_sha256", "captured_identity_sha256"):
                 evidence = json.loads(evidence_path.read_bytes())

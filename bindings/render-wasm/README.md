@@ -57,17 +57,22 @@ Run focused gates from this directory:
 cargo +1.85.0 test --locked
 cargo +1.85.0 check --target wasm32-unknown-unknown --locked
 npm test
-npm run build:wasm
+rustup toolchain install 1.88.0 --profile minimal
+WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.126.XXXXXX")"
+cargo +1.88.0 install wasm-bindgen-cli --version 0.2.126 --locked \
+  --root "$WASM_BINDGEN_TOOL_ROOT"
+PATH="$WASM_BINDGEN_TOOL_ROOT/bin:$PATH" npm run build:wasm
 npm run test:browser
 ```
 
-`toolchain-lock.json` pins Rust, wasm-pack/wasm-bindgen, the exact Chrome for
-Testing archive identity, and browser heap/retention ceilings. The real worker
-smoke attaches separately to the page and dedicated worker targets, samples
-their combined V8, embedder, and backing-store memory through the DevTools
-protocol, synchronizes garbage collection before baseline/retained samples,
-and fails above those ceilings. The Node protocol tests have no
-third-party npm dependencies.
+`toolchain-lock.json` pins the Rust 1.85 source MSRV, the separate Rust 1.88
+host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
+isolated tool root, wasm-pack/wasm-bindgen, the exact Chrome for Testing archive
+identity, and browser heap/retention ceilings. The real worker smoke attaches
+separately to the page and dedicated worker targets, samples their combined V8,
+embedder, and backing-store memory through the DevTools protocol, synchronizes
+garbage collection before baseline/retained samples, and fails above those
+ceilings. The Node protocol tests have no third-party npm dependencies.
 
 `THIRD_PARTY_NOTICES.txt` records the exact Cargo normal-dependency closure used
 to build the WebAssembly artifact for `wasm32-unknown-unknown`, including

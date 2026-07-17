@@ -15,6 +15,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 RENDER_ORACLE_WORKFLOW = ROOT / ".github" / "workflows" / "render-oracle.yml"
 RENDER_HARDENING_WORKFLOW = ROOT / ".github" / "workflows" / "render-hardening.yml"
+RENDER_BROWSER_WORKFLOW = ROOT / ".github" / "workflows" / "render-browser.yml"
 RENDER_PACKAGE_RELEASE_WORKFLOW = (
     ROOT / ".github" / "workflows" / "render-package-release.yml"
 )
@@ -308,6 +309,24 @@ steps:
             ),
             original.replace("--scope poppler", "--scope all"),
             original.replace("poppler-identity.json", "poppler-version.txt"),
+            original.replace(
+                'if [[ "$EXPECTED_IDENTITY" != "null" ]]; then',
+                'if [[ "$EXPECTED_IDENTITY" == "null" ]]; then',
+            ),
+            original.replace("            --require-hashes \\\n", "", 1),
+            original.replace(
+                '          echo "Review and pin the uploaded host identity before this gate can pass." >&2\n'
+                "          exit 1\n",
+                '          echo "bootstrap accepted"\n',
+            ),
+            original.replace(
+                '              raise SystemExit(1)\n',
+                '              print("bootstrap accepted")\n',
+            ),
+            original.replace(
+                '          assert evidence["image_identity_status"] == "pinned_match", evidence\n',
+                '          assert evidence["image_identity_status"] != "mismatch", evidence\n',
+            ),
         )
         for workflow in mutations:
             with self.subTest(workflow=workflow):
@@ -315,6 +334,188 @@ steps:
                     Path("render-hardening.yml"), workflow
                 )
                 self.assertTrue(errors)
+
+    def test_render_hardening_rejects_unscoped_or_commented_oci_guards(self) -> None:
+        original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        image_start = original.index("  oracle-image:\n")
+        image_end = original.index("  performance:\n", image_start)
+
+        def mutate_image(old: str, new: str) -> str:
+            image_job = original[image_start:image_end]
+            mutated_job = image_job.replace(old, new, 1)
+            self.assertNotEqual(image_job, mutated_job)
+            return original[:image_start] + mutated_job + original[image_end:]
+
+        mutations = {
+            "container_trigger_commented": original.replace(
+                '      - "scripts/render-oracle-container/**"',
+                '      # - "scripts/render-oracle-container/**"',
+                1,
+            ),
+            "runner_trigger_commented": original.replace(
+                '      - "scripts/run-render-oracle-container.py"',
+                '      # - "scripts/run-render-oracle-container.py"',
+                1,
+            ),
+            "container_test_trigger_commented": original.replace(
+                '      - "scripts/test_render_oracle_container.py"',
+                '      # - "scripts/test_render_oracle_container.py"',
+                1,
+            ),
+            "oci_runner": mutate_image(
+                "    runs-on: ubuntu-24.04", "    runs-on: ubuntu-latest"
+            ),
+            "oci_policy_step": mutate_image(
+                "        run: python3 scripts/check_workflow_policy.py",
+                "        run: true",
+            ),
+            "oci_build_step_scope": mutate_image(
+                "      - name: Build and verify the locked oracle image",
+                "      - name: Describe the locked oracle image",
+            ),
+            "bootstrap_argument_commented": mutate_image(
+                "            BOOTSTRAP_ARGS+=(--bootstrap-identities)",
+                "            # BOOTSTRAP_ARGS+=(--bootstrap-identities)",
+            ),
+            "verify_bootstrap_use_commented": mutate_image(
+                '            "${BOOTSTRAP_ARGS[@]}"',
+                '            # "${BOOTSTRAP_ARGS[@]}"',
+            ),
+            "bootstrap_status_commented": mutate_image(
+                '              assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence',
+                '              # assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence',
+            ),
+            "bootstrap_identity_commented": mutate_image(
+                '              assert evidence["expected_image_id"] is None, evidence',
+                '              # assert evidence["expected_image_id"] is None, evidence',
+            ),
+            "bootstrap_failure_commented": mutate_image(
+                "              raise SystemExit(1)",
+                "              # raise SystemExit(1)",
+            ),
+            "pinned_status_commented": mutate_image(
+                '          assert evidence["image_identity_status"] == "pinned_match", evidence',
+                '          # assert evidence["image_identity_status"] == "pinned_match", evidence',
+            ),
+            "pinned_identity_commented": mutate_image(
+                '          assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence',
+                '          # assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence',
+            ),
+            "host_bootstrap_argument_commented": original.replace(
+                "            --bootstrap-identities \\\n",
+                "            # --bootstrap-identities \\\n",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_hardening_workflow(
+                    Path("render-hardening.yml"), workflow
+                )
+                self.assertTrue(errors)
+
+    def test_checked_in_render_browser_policy_passes(self) -> None:
+        text = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            self.policy.audit_render_browser_workflow(
+                Path("render-browser.yml"), text
+            ),
+            [],
+        )
+
+    def test_render_browser_rejects_mutable_or_commented_wasm_build_tools(self) -> None:
+        original = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "build_rust": original.replace(
+                'WASM_BINDGEN_BUILD_RUST: "1.88.0"',
+                'WASM_BINDGEN_BUILD_RUST: "1.88"',
+            ),
+            "metadata": original.replace(
+                "l.wasmBindgen.buildRust !== process.env.WASM_BINDGEN_BUILD_RUST || ",
+                "",
+            ),
+            "step_scope": original.replace(
+                "      - name: Install exact wasm-bindgen CLI",
+                "      - name: Install mutable wasm-bindgen CLI",
+            ),
+            "rustup_toolchain": original.replace(
+                'rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal',
+                'rustup toolchain install "$RENDER_MSRV" --profile minimal',
+            ),
+            "runner_temp_guard": original.replace(
+                '          test -n "$RUNNER_TEMP"',
+                "          true",
+            ),
+            "cached_tool_root": original.replace(
+                'tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"',
+                'tool_root="$CARGO_HOME"',
+            ),
+            "cached_tool_root_after_pin": original.replace(
+                '          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"',
+                '          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"\n'
+                '          tool_root="$CARGO_HOME"',
+            ),
+            "missing_fresh_root_cleanup": original.replace(
+                '          rm -rf "$tool_root"',
+                "          true",
+            ),
+            "cargo_toolchain": original.replace(
+                'cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                'cargo "+$RENDER_MSRV" install \\\n',
+            ),
+            "cargo_unqualified": original.replace(
+                'cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                "cargo install \\\n",
+            ),
+            "cargo_commented": original.replace(
+                '          cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                '          # cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+            ),
+            "cargo_default_root": original.replace(
+                '            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \\\n'
+                '            --root "$tool_root"',
+                '            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked',
+            ),
+            "cargo_force": original.replace(
+                '            --root "$tool_root"',
+                '            --root "$tool_root" --force',
+            ),
+            "github_path_missing": original.replace(
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"',
+                '          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"',
+            ),
+            "github_path_cached_alternative": original.replace(
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"',
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"\n'
+                '          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"',
+            ),
+            "isolated_path_export_missing": original.replace(
+                '          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"',
+                '          export PATH="$CARGO_HOME/bin:$PATH"',
+            ),
+            "isolated_resolution_missing": original.replace(
+                '          test "$(command -v wasm-bindgen)" = \\\n'
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"',
+                "          command -v wasm-bindgen",
+            ),
+            "cached_path_after_verification": original.replace(
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"\n'
+                "          npm run build:wasm",
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"\n'
+                '          export PATH="$CARGO_HOME/bin:$PATH"\n'
+                "          npm run build:wasm",
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                self.assertTrue(
+                    self.policy.audit_render_browser_workflow(
+                        Path("render-browser.yml"), workflow
+                    )
+                )
 
     def test_checked_in_render_package_release_policy_passes(self) -> None:
         text = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -424,6 +625,81 @@ steps:
                 "--output target/notice.txt",
             ),
             "sbom_determinism": original.replace("cmp --silent \\", "cmp --silently \\", 1),
+            "wasm_build_rust": original.replace(
+                'WASM_BINDGEN_BUILD_RUST: "1.88.0"',
+                'WASM_BINDGEN_BUILD_RUST: "1.88"',
+            ),
+            "wasm_build_step_scope": original.replace(
+                "      - name: Build the exact worker/WASM package",
+                "      - name: Build a mutable worker/WASM package",
+            ),
+            "wasm_rustup_toolchain": original.replace(
+                'rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal',
+                'rustup toolchain install "$RENDER_MSRV" --profile minimal',
+            ),
+            "wasm_runner_temp_guard": original.replace(
+                '          test -n "$RUNNER_TEMP"',
+                "          true",
+            ),
+            "wasm_cached_tool_root": original.replace(
+                'tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"',
+                'tool_root="$CARGO_HOME"',
+            ),
+            "wasm_cached_tool_root_after_pin": original.replace(
+                '          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"',
+                '          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"\n'
+                '          tool_root="$CARGO_HOME"',
+            ),
+            "wasm_missing_fresh_root_cleanup": original.replace(
+                '          rm -rf "$tool_root"',
+                "          true",
+            ),
+            "wasm_cargo_toolchain": original.replace(
+                'cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                'cargo "+$RENDER_MSRV" install \\\n',
+            ),
+            "wasm_cargo_unqualified": original.replace(
+                'cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                "cargo install \\\n",
+            ),
+            "wasm_cargo_commented": original.replace(
+                '          cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+                '          # cargo "+$WASM_BINDGEN_BUILD_RUST" install \\\n',
+            ),
+            "wasm_cargo_default_root": original.replace(
+                '            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \\\n'
+                '            --root "$tool_root"',
+                '            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked',
+            ),
+            "wasm_cargo_force": original.replace(
+                '            --root "$tool_root"',
+                '            --root "$tool_root" --force',
+            ),
+            "wasm_github_path_missing": original.replace(
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"',
+                '          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"',
+            ),
+            "wasm_github_path_cached_alternative": original.replace(
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"',
+                '          echo "$tool_root/bin" >> "$GITHUB_PATH"\n'
+                '          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"',
+            ),
+            "wasm_isolated_path_export_missing": original.replace(
+                '          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"',
+                '          export PATH="$CARGO_HOME/bin:$PATH"',
+            ),
+            "wasm_isolated_resolution_missing": original.replace(
+                '          test "$(command -v wasm-bindgen)" = \\\n'
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"',
+                "          command -v wasm-bindgen",
+            ),
+            "wasm_cached_path_after_verification": original.replace(
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"\n'
+                "          npm --prefix bindings/render-wasm run build:wasm",
+                '            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"\n'
+                '          export PATH="$CARGO_HOME/bin:$PATH"\n'
+                "          npm --prefix bindings/render-wasm run build:wasm",
+            ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):

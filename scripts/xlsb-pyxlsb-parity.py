@@ -13,7 +13,8 @@
 
 Requires: pip install pyxlsb . Exits non-zero if mean parity < --min (0.90).
 Whitespace- and case-insensitive (TRUE/FALSE vs True/False); the oracle is the
-multiset of non-empty cell values, compared to the rxls text dump.
+multiset of non-empty cell values, compared to the rxls `extract
+--typed-values` projection.
 Known formatted-display rows can be supplied through --expected-values when
 pyxlsb exposes only raw serial values.
 """
@@ -266,7 +267,10 @@ def main() -> None:
         if oracle_source == "expected":
             expected_used += 1
         got = subprocess.run(
-            [binary, f], capture_output=True, text=True, encoding="utf-8"
+            [binary, f, "--typed-values"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
         ).stdout
         if got.strip():
             rxls_ok += 1
