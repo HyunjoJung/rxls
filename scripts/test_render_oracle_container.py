@@ -295,36 +295,67 @@ class RenderOracleContainerTests(unittest.TestCase):
             command,
         )
 
-    def test_profile_allows_embedded_charts_but_blocks_execution_and_links(self) -> None:
-        profile_path = CONTAINER_DIR / "profile" / "registrymodifications.xcu"
-        root = ET.parse(profile_path).getroot()
-        oor = "{http://openoffice.org/2001/registry}"
-        settings: dict[tuple[str, str], str] = {}
-        for item in root.findall("item"):
-            path = item.attrib[f"{oor}path"]
-            for prop in item.findall("prop"):
-                name = prop.attrib[f"{oor}name"]
-                value = prop.findtext("value")
-                self.assertIsNotNone(value)
-                key = (path, name)
-                self.assertNotIn(key, settings)
-                settings[key] = value
+    def test_container_and_host_profiles_split_active_content_policy(self) -> None:
+        container_profile = CONTAINER_DIR / "profile" / "registrymodifications.xcu"
+        host_profile = ROOT / "scripts" / "render-oracle-host-profile.xcu"
+        container_profile_sha256 = sha256(container_profile.read_bytes())
+        host_profile_sha256 = sha256(host_profile.read_bytes())
+        self.assertNotEqual(container_profile_sha256, host_profile_sha256)
+
+        container_lock = json.loads((CONTAINER_DIR / "lock.json").read_text())
+        profile_rows = [
+            row
+            for row in container_lock["files"]
+            if row["path"] == "profile/registrymodifications.xcu"
+        ]
+        self.assertEqual(len(profile_rows), 1)
+        self.assertEqual(profile_rows[0]["sha256"], container_profile_sha256)
+
+        host_lock = json.loads(
+            (ROOT / "scripts" / "render-oracle-lock.json").read_text()
+        )
+        self.assertGreater(len(host_lock["profiles"]), 0)
+        for profile in host_lock["profiles"]:
+            self.assertEqual(
+                profile["configuration"]["profile_sha256"], host_profile_sha256
+            )
+
+        def profile_settings(path: Path) -> dict[tuple[str, str], str]:
+            root = ET.parse(path).getroot()
+            oor = "{http://openoffice.org/2001/registry}"
+            settings: dict[tuple[str, str], str] = {}
+            for item in root.findall("item"):
+                item_path = item.attrib[f"{oor}path"]
+                for prop in item.findall("prop"):
+                    name = prop.attrib[f"{oor}name"]
+                    value = prop.findtext("value")
+                    self.assertIsNotNone(value)
+                    key = (item_path, name)
+                    self.assertNotIn(key, settings)
+                    settings[key] = value
+            return settings
 
         scripting = "/org.openoffice.Office.Common/Security/Scripting"
-        self.assertEqual(settings[(scripting, "DisableActiveContent")], "false")
-        for name in (
-            "DisableMacrosExecution",
-            "DisablePythonRuntime",
-            "DisableOLEAutomation",
-            "BlockUntrustedRefererLinks",
-            "CheckDocumentEvents",
-        ):
-            self.assertEqual(settings[(scripting, name)], "true")
-        self.assertEqual(settings[(scripting, "MacroSecurityLevel")], "3")
+        container_settings = profile_settings(container_profile)
+        host_settings = profile_settings(host_profile)
         self.assertEqual(
-            settings[("/org.openoffice.Office.Calc/Content/Update", "Link")],
-            "0",
+            container_settings[(scripting, "DisableActiveContent")], "false"
         )
+        self.assertEqual(host_settings[(scripting, "DisableActiveContent")], "true")
+        for settings in (container_settings, host_settings):
+            for name in (
+                "DisableMacrosExecution",
+                "DisablePythonRuntime",
+                "DisableOLEAutomation",
+                "BlockUntrustedRefererLinks",
+                "CheckDocumentEvents",
+            ):
+                self.assertEqual(settings[(scripting, name)], "true")
+            self.assertEqual(settings[(scripting, "MacroSecurityLevel")], "3")
+            self.assertEqual(
+                settings[("/org.openoffice.Office.Calc/Content/Update", "Link")],
+                "1",
+            )
 
         entrypoint = (CONTAINER_DIR / "oracle-entrypoint.sh").read_text()
         self.assertIn("SinglePageSheets", entrypoint)

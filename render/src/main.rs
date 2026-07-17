@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rxls::Workbook;
 use rxls_render::{
     build_print_document, render_print_document_pdf, render_print_page_png, render_scene_svg,
-    render_sheet_svg, FontPack, PathCommand, PrintOptions, Rect, RenderOptions, RenderRange,
+    render_sheet_svg, Fixed, FontPack, PathCommand, PrintOptions, Rect, RenderOptions, RenderRange,
     RenderSelection, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, FIXED_UNITS_PER_PIXEL,
     MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
@@ -721,6 +721,21 @@ fn scene_sha256_hex(scene: &Scene) -> String {
     digest.update((scene.nodes.len() as u64).to_le_bytes());
     for node in &scene.nodes {
         match node {
+            SceneNode::ClipGroup(group) => {
+                digest.update([6]);
+                update_rect(&mut digest, group.clip);
+                digest.update((group.nodes.len() as u64).to_le_bytes());
+                for child in &group.nodes {
+                    let child_scene = Scene {
+                        title: String::new(),
+                        width: Fixed::ZERO,
+                        height: Fixed::ZERO,
+                        background: Rgb::BLACK,
+                        nodes: vec![child.clone()],
+                    };
+                    update_string(&mut digest, &scene_sha256_hex(&child_scene));
+                }
+            }
             SceneNode::Rect(node) => {
                 digest.update([0]);
                 update_rect(&mut digest, node.rect);

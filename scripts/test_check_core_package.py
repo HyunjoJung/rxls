@@ -161,6 +161,7 @@ class CorePackageGateTests(unittest.TestCase):
 
     def test_rejects_host_oracle_identity_files(self) -> None:
         names = (
+            "render-oracle-host-profile.xcu",
             "render-oracle-host-requirements.txt",
             "render-oracle-host-tools-lock.json",
             "render-oracle-host-tools.py",

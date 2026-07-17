@@ -2,13 +2,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rxls::{PageSetup, PrintLossKind, PrintPageOrder, Sheet, Workbook};
+use rxls::{
+    DrawingAnchorBehavior, DrawingObjectKind, PageSetup, PrintLossKind, PrintPageOrder, Sheet,
+    Workbook,
+};
 
 use crate::error::{LimitKind, RenderError};
 use crate::layout::{
-    build_auxiliary_text_node, build_sheet_scene, measure_sheet_axes, render_used_range,
-    MeasuredAxisSlot, RenderOptions, RenderRange, RenderReport, RenderSelection, WarningCode,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene,
+    measure_sheet_axes, render_used_print_range, MeasuredAxisSlot, RenderLimits, RenderOptions,
+    RenderRange, RenderReport, RenderSelection, WarningCode, MAX_WORKSHEET_COLUMN,
+    MAX_WORKSHEET_ROW,
 };
 use crate::scene::{
     Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextStyle,
@@ -385,6 +389,7 @@ pub struct PreparedPrintDocument {
     pub report: PrintReport,
     /// Backend safety limits captured with the plan.
     pub limits: PrintLimits,
+    render_limits: RenderLimits,
     state: PreparedPrintState,
 }
 
@@ -424,6 +429,57 @@ impl PrintWarnings {
             .into_iter()
             .map(|(code, occurrences)| PrintWarning { code, occurrences })
             .collect()
+    }
+}
+
+#[derive(Debug)]
+struct DecodedMediaBudget {
+    limit: u64,
+    retained: u64,
+}
+
+impl DecodedMediaBudget {
+    fn new(limit: u64) -> Self {
+        Self { limit, retained: 0 }
+    }
+
+    fn build_sheet_scene(
+        &mut self,
+        sheet: &Sheet,
+        sheet_index: usize,
+        base_options: &RenderOptions,
+    ) -> Result<Scene, RenderError> {
+        let mut options = base_options.clone();
+        options.limits.max_decoded_media_bytes = self
+            .limit
+            .checked_sub(self.retained)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let build = match build_sheet_scene(sheet, sheet_index, &options) {
+            Ok(build) => build,
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::DecodedMediaBytes,
+                actual,
+                ..
+            }) => {
+                let actual = self
+                    .retained
+                    .checked_add(actual)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                return Err(RenderError::LimitExceeded {
+                    kind: LimitKind::DecodedMediaBytes,
+                    limit: self.limit,
+                    actual,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let retained = self
+            .retained
+            .checked_add(scene_decoded_media_bytes(&build.scene)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce_print_limit(LimitKind::DecodedMediaBytes, self.limit, retained)?;
+        self.retained = retained;
+        Ok(build.scene)
     }
 }
 
@@ -583,12 +639,11 @@ fn choose_print_ranges(
                     .map(validate_range)
                     .collect()
             } else {
-                Ok(vec![validate_range(
-                    setup
-                        .print_area
-                        .map(RenderRange::from)
-                        .unwrap_or_else(|| render_used_range(sheet)),
-                )?])
+                let range = match setup.print_area {
+                    Some(range) => RenderRange::from(range),
+                    None => render_used_print_range(sheet, options)?,
+                };
+                Ok(vec![validate_range(range)?])
             }
         }
     }
@@ -771,7 +826,9 @@ fn prepare_print_area(
                         rows,
                         columns,
                     };
-                    if !options.omit_sparse_pages || page_has_content(sheet, slot, range) {
+                    if !options.omit_sparse_pages
+                        || page_has_content(sheet, slot, range, &source_options)?
+                    {
                         slots.push(slot);
                     }
                 }
@@ -786,7 +843,9 @@ fn prepare_print_area(
                         rows,
                         columns,
                     };
-                    if !options.omit_sparse_pages || page_has_content(sheet, slot, range) {
+                    if !options.omit_sparse_pages
+                        || page_has_content(sheet, slot, range, &source_options)?
+                    {
                         slots.push(slot);
                     }
                 }
@@ -845,7 +904,7 @@ fn prepare_single_page_sheet_document(
     source
         .warnings
         .retain(|warning| warning.code != WarningCode::PaginationDeferred);
-    let scene_nodes = scene.nodes.len() as u64;
+    let scene_nodes = scene_node_count(&scene.nodes)?;
     enforce_print_limit(
         LimitKind::PageSceneNodes,
         options
@@ -909,6 +968,7 @@ fn prepare_single_page_sheet_document(
     Ok(PreparedPrintDocument {
         report,
         limits: options.limits.clone(),
+        render_limits: options.render.limits.clone(),
         state: PreparedPrintState::SinglePage { render_options },
     })
 }
@@ -1071,6 +1131,7 @@ pub fn prepare_sheet_print_document(
     Ok(PreparedPrintDocument {
         report,
         limits: options.limits.clone(),
+        render_limits: options.render.limits.clone(),
         state: PreparedPrintState::Paginated {
             behavior,
             paper,
@@ -1113,7 +1174,8 @@ pub fn build_print_page(
             requested: sheet_index,
             sheet_count: workbook.sheets.len(),
         })?;
-    build_sheet_print_page(sheet, prepared, page_index)
+    let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
+    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget)
 }
 
 /// Materialize exactly one requested page without an owning workbook.
@@ -1121,6 +1183,16 @@ pub fn build_sheet_print_page(
     sheet: &Sheet,
     prepared: &PreparedPrintDocument,
     page_index: usize,
+) -> Result<PrintPage, RenderError> {
+    let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
+    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget)
+}
+
+fn build_sheet_print_page_with_budget(
+    sheet: &Sheet,
+    prepared: &PreparedPrintDocument,
+    page_index: usize,
+    media_budget: &mut DecodedMediaBudget,
 ) -> Result<PrintPage, RenderError> {
     let map = prepared
         .report
@@ -1134,8 +1206,8 @@ pub fn build_sheet_print_page(
     let sheet_index = prepared.report.source.sheet_index;
     let scene = match &prepared.state {
         PreparedPrintState::SinglePage { render_options } => {
-            let scene = build_sheet_scene(sheet, sheet_index, render_options)?.scene;
-            let scene_nodes = scene.nodes.len() as u64;
+            let scene = media_budget.build_sheet_scene(sheet, sheet_index, render_options)?;
+            let scene_nodes = scene_node_count(&scene.nodes)?;
             enforce_print_limit(
                 LimitKind::PageSceneNodes,
                 prepared
@@ -1212,6 +1284,7 @@ pub fn build_sheet_print_page(
                 *total_pages,
                 &mut discarded_warnings,
                 &prepared.limits,
+                media_budget,
             )?
         }
     };
@@ -1225,12 +1298,22 @@ pub fn build_print_document(
     options: &PrintOptions,
 ) -> Result<PrintDocument, RenderError> {
     let prepared = prepare_print_document(workbook, sheet_index, options)?;
+    let sheet_index = prepared.report.source.sheet_index;
+    let sheet = workbook
+        .sheets
+        .get(sheet_index)
+        .ok_or(RenderError::SheetIndexOutOfRange {
+            requested: sheet_index,
+            sheet_count: workbook.sheets.len(),
+        })?;
     let mut pages = Vec::with_capacity(prepared.report.pages.len());
     let mut total_scene_nodes = 0_u64;
+    let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
     for page_index in 0..prepared.report.pages.len() {
-        let page = build_print_page(workbook, &prepared, page_index)?;
+        let page =
+            build_sheet_print_page_with_budget(sheet, &prepared, page_index, &mut media_budget)?;
         total_scene_nodes = total_scene_nodes
-            .checked_add(page.scene.nodes.len() as u64)
+            .checked_add(scene_node_count(&page.scene.nodes)?)
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce_print_limit(
             LimitKind::TotalSceneNodes,
@@ -1255,10 +1338,12 @@ pub fn build_sheet_print_document(
     let prepared = prepare_sheet_print_document(sheet, sheet_index, options)?;
     let mut pages = Vec::with_capacity(prepared.report.pages.len());
     let mut total_scene_nodes = 0_u64;
+    let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
     for page_index in 0..prepared.report.pages.len() {
-        let page = build_sheet_print_page(sheet, &prepared, page_index)?;
+        let page =
+            build_sheet_print_page_with_budget(sheet, &prepared, page_index, &mut media_budget)?;
         total_scene_nodes = total_scene_nodes
-            .checked_add(page.scene.nodes.len() as u64)
+            .checked_add(scene_node_count(&page.scene.nodes)?)
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce_print_limit(
             LimitKind::TotalSceneNodes,
@@ -1297,6 +1382,7 @@ fn build_page_scene(
     total_pages: u64,
     warnings: &mut PrintWarnings,
     limits: &PrintLimits,
+    media_budget: &mut DecodedMediaBudget,
 ) -> Result<Scene, RenderError> {
     let unscaled_width = headings_width
         .checked_add(repeated_width)
@@ -1397,6 +1483,7 @@ fn build_page_scene(
             body_y,
             scale_permille,
             limits,
+            media_budget,
         )?;
     }
     if let Some((first_row, last_row)) = repeat_rows.filter(|_| slot.columns.size.raw() > 0) {
@@ -1410,6 +1497,7 @@ fn build_page_scene(
             repeat_y,
             scale_permille,
             limits,
+            media_budget,
         )?;
     }
     if let Some((first_col, last_col)) = repeat_cols.filter(|_| slot.rows.size.raw() > 0) {
@@ -1423,6 +1511,7 @@ fn build_page_scene(
             body_y,
             scale_permille,
             limits,
+            media_budget,
         )?;
     }
     if let (Some((first_row, last_row)), Some((first_col, last_col))) = (repeat_rows, repeat_cols) {
@@ -1436,6 +1525,7 @@ fn build_page_scene(
             repeat_y,
             scale_permille,
             limits,
+            media_budget,
         )?;
     }
 
@@ -1488,7 +1578,7 @@ fn build_page_scene(
     enforce_print_limit(
         LimitKind::PageSceneNodes,
         limits.max_total_scene_nodes.min(u64::from(u32::MAX)),
-        nodes.len() as u64,
+        scene_node_count(&nodes)?,
     )?;
     let backend_commands = backend_command_count(&nodes)?;
     enforce_print_limit(
@@ -1508,6 +1598,9 @@ fn build_page_scene(
 fn backend_command_count(nodes: &[SceneNode]) -> Result<u64, RenderError> {
     nodes.iter().try_fold(0_u64, |sum, node| {
         sum.checked_add(match node {
+            SceneNode::ClipGroup(group) => backend_command_count(&group.nodes)?
+                .checked_add(2)
+                .ok_or(RenderError::CoordinateOverflow)?,
             SceneNode::Rect(_) | SceneNode::Text(_) => 1,
             SceneNode::Line(_) => 2,
             SceneNode::Path(node) => node.commands.len() as u64,
@@ -1517,6 +1610,36 @@ fn backend_command_count(nodes: &[SceneNode]) -> Result<u64, RenderError> {
             }
         })
         .ok_or(RenderError::CoordinateOverflow)
+    })
+}
+
+fn scene_decoded_media_bytes(scene: &Scene) -> Result<u64, RenderError> {
+    decoded_media_bytes(&scene.nodes)
+}
+
+fn decoded_media_bytes(nodes: &[SceneNode]) -> Result<u64, RenderError> {
+    nodes.iter().try_fold(0_u64, |total, node| {
+        let bytes = match node {
+            SceneNode::ClipGroup(group) => decoded_media_bytes(&group.nodes)?,
+            SceneNode::Image(image) => image.rgba.len() as u64,
+            _ => 0,
+        };
+        total
+            .checked_add(bytes)
+            .ok_or(RenderError::CoordinateOverflow)
+    })
+}
+
+fn scene_node_count(nodes: &[SceneNode]) -> Result<u64, RenderError> {
+    nodes.iter().try_fold(0_u64, |total, node| {
+        let descendants = match node {
+            SceneNode::ClipGroup(group) => scene_node_count(&group.nodes)?,
+            _ => 0,
+        };
+        total
+            .checked_add(1)
+            .and_then(|total| total.checked_add(descendants))
+            .ok_or(RenderError::CoordinateOverflow)
     })
 }
 
@@ -1531,17 +1654,18 @@ fn append_block(
     y: Fixed,
     scale_permille: u16,
     limits: &PrintLimits,
+    media_budget: &mut DecodedMediaBudget,
 ) -> Result<(), RenderError> {
     let mut options = base_options.clone();
     options.selection = RenderSelection::Range(range);
-    let build = build_sheet_scene(sheet, sheet_index, &options)?;
-    for node in build.scene.nodes {
+    let scene = media_budget.build_sheet_scene(sheet, sheet_index, &options)?;
+    for node in scene.nodes {
         let transformed = transform_node(node, x, y, scale_permille)?;
         output.push(transformed);
         enforce_print_limit(
             LimitKind::PageSceneNodes,
             limits.max_total_scene_nodes.min(u64::from(u32::MAX)),
-            output.len() as u64,
+            scene_node_count(output)?,
         )?;
     }
     Ok(())
@@ -2367,7 +2491,12 @@ fn ensure_column_segment(
     }
 }
 
-fn page_has_content(sheet: &Sheet, slot: PageSlot, print_range: RenderRange) -> bool {
+fn page_has_content(
+    sheet: &Sheet,
+    slot: PageSlot,
+    print_range: RenderRange,
+    options: &RenderOptions,
+) -> Result<bool, RenderError> {
     let contains = |row: u32, col: u16| {
         row >= slot.rows.first
             && row <= slot.rows.last
@@ -2386,14 +2515,97 @@ fn page_has_content(sheet: &Sheet, slot: PageSlot, print_range: RenderRange) -> 
             .keys()
             .any(|&(row, col)| contains(row, col))
     {
-        return true;
+        return Ok(true);
     }
-    sheet.merged_ranges().iter().any(|&(r0, c0, r1, c1)| {
+    if sheet.merged_ranges().iter().any(|&(r0, c0, r1, c1)| {
         r0 <= slot.rows.last
             && r1 >= slot.rows.first
             && c0 <= slot.columns.last
             && c1 >= slot.columns.first
-    })
+    }) {
+        return Ok(true);
+    }
+
+    let intersects = |r0: u32, c0: u16, r1: u32, c1: u16| {
+        r0 <= slot.rows.last
+            && r1 >= slot.rows.first
+            && c0 <= slot.columns.last
+            && c1 >= slot.columns.first
+            && r0 <= print_range.last_row
+            && r1 >= print_range.first_row
+            && c0 <= print_range.last_col
+            && c1 >= print_range.first_col
+    };
+    let mut image_metadata = vec![None; sheet.images().len()];
+    let mut chart_metadata = vec![None; sheet.charts().len()];
+    for metadata in sheet.drawing_metadata() {
+        let slot = match metadata.kind {
+            DrawingObjectKind::Image => image_metadata.get_mut(metadata.object_index),
+            DrawingObjectKind::Chart => chart_metadata.get_mut(metadata.object_index),
+            _ => None,
+        };
+        if let Some(slot) = slot.filter(|slot| slot.is_none()) {
+            *slot = Some(metadata);
+        }
+    }
+    for (index, image) in sheet.images().iter().enumerate() {
+        let metadata = image_metadata[index];
+        if metadata.is_some_and(|metadata| {
+            metadata.behavior == DrawingAnchorBehavior::Absolute && metadata.from_cell.is_none()
+        }) {
+            continue;
+        }
+        let to = image.to.unwrap_or((
+            image.from.0.saturating_add(10),
+            image.from.1.saturating_add(4),
+        ));
+        if intersects(image.from.0, image.from.1, to.0, to.1) {
+            return Ok(true);
+        }
+    }
+    for (index, chart) in sheet.charts().iter().enumerate() {
+        let metadata = chart_metadata[index];
+        if metadata.is_some_and(|metadata| {
+            metadata.behavior == DrawingAnchorBehavior::Absolute && metadata.from_cell.is_none()
+        }) {
+            continue;
+        }
+        if intersects(chart.from.0, chart.from.1, chart.to.0, chart.to.1) {
+            return Ok(true);
+        }
+    }
+    if sheet
+        .sparklines()
+        .iter()
+        .any(|sparkline| contains(sparkline.location.0, sparkline.location.1))
+    {
+        return Ok(true);
+    }
+    if sheet.drawing_metadata().iter().any(|metadata| {
+        if metadata.kind != DrawingObjectKind::Shape {
+            return false;
+        }
+        let Some(from) = metadata.from_cell else {
+            return false;
+        };
+        let to = metadata.to_cell.unwrap_or(from);
+        intersects(from.0, from.1, to.0, to.1)
+    }) {
+        return Ok(true);
+    }
+
+    absolute_drawings_intersect_range(
+        sheet,
+        RenderRange::new(
+            slot.rows.first,
+            slot.columns.first,
+            slot.rows.last,
+            slot.columns.last,
+        ),
+        slot.columns.size,
+        slot.rows.size,
+        options,
+    )
 }
 
 fn merge_intervals_rows(sheet: &Sheet, first: u32, last: u32) -> Vec<(u32, u32)> {
@@ -2469,7 +2681,33 @@ fn transform_node(
     y: Fixed,
     scale_permille: u16,
 ) -> Result<SceneNode, RenderError> {
+    transform_node_inner(node, x, y, scale_permille, 0)
+}
+
+fn transform_node_inner(
+    node: SceneNode,
+    x: Fixed,
+    y: Fixed,
+    scale_permille: u16,
+    depth: u16,
+) -> Result<SceneNode, RenderError> {
+    if depth > 64 {
+        return Err(RenderError::Backend {
+            reason: "scene_nesting_too_deep",
+        });
+    }
     Ok(match node {
+        SceneNode::ClipGroup(mut group) => {
+            group.clip = transform_rect(group.clip, x, y, scale_permille)?;
+            group.nodes = group
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    transform_node_inner(node, x, y, scale_permille, depth.saturating_add(1))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            SceneNode::ClipGroup(group)
+        }
         SceneNode::Rect(mut node) => {
             node.rect = transform_rect(node.rect, x, y, scale_permille)?;
             node.stroke_width = scale_fixed(node.stroke_width, scale_permille)?;
@@ -2785,6 +3023,33 @@ mod tests {
                 occurrences: 1,
             }]
         );
+    }
+
+    #[test]
+    fn clip_groups_count_both_backend_boundary_operations() {
+        let clip = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(10),
+            height: Fixed::from_pixels(10),
+        };
+        let nodes = vec![SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+            clip,
+            nodes: vec![
+                SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip,
+                    nodes: Vec::new(),
+                }),
+                SceneNode::Rect(RectNode {
+                    rect: clip,
+                    fill: Some(Rgb::WHITE),
+                    stroke: None,
+                    stroke_width: Fixed::ZERO,
+                }),
+            ],
+        })];
+
+        assert_eq!(backend_command_count(&nodes).unwrap(), 5);
     }
 
     #[test]

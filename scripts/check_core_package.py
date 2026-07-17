@@ -58,6 +58,7 @@ FORBIDDEN_RENDER_SCRIPTS = {
     "render-corpus-sources.json",
     "render-fonts-lock.json",
     "render-oracle-host-requirements.txt",
+    "render-oracle-host-profile.xcu",
     "render-oracle-host-tools-lock.json",
     "render-oracle-host-tools.py",
     "render-oracle-lock.json",

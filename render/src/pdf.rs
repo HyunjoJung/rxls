@@ -21,6 +21,7 @@ const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
 const PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR: i64 = 4;
 const TYPE3_GLYPHS_PER_SUBSET: usize = 255;
 const MAX_TYPE3_GLYPH_PROGRAMS: u64 = 1_000_000;
+const MAX_CLIP_GROUP_DEPTH: usize = 64;
 
 #[derive(Debug)]
 struct PdfPage {
@@ -526,13 +527,29 @@ fn build_pdf_page(
     max_bytes: u64,
     command_count: &mut u64,
     font_registry: &mut PdfFontRegistry,
-    mut trace: Option<&mut BackendGeometryTrace>,
+    trace: Option<&mut BackendGeometryTrace>,
 ) -> Result<PdfPage, RenderError> {
+    let page_command_count = scene.nodes.iter().try_fold(0_u64, |sum, node| {
+        sum.checked_add(node_command_count(node, 0)?)
+            .ok_or(RenderError::CoordinateOverflow)
+    })?;
+    *command_count = (*command_count)
+        .checked_add(page_command_count)
+        .ok_or(RenderError::CoordinateOverflow)?;
     let width_points = fixed_to_pdf_points(scene.width)?;
     let height_points = fixed_to_pdf_points(scene.height)?;
     let mut content = BoundedContent::new(max_bytes);
     content.push("q\n")?;
     content.push(&format!("0.75 0 0 -0.75 0 {} cm\n", height_points))?;
+    push_clip(
+        &mut content,
+        Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: scene.width,
+            height: scene.height,
+        },
+    )?;
     push_rgb_fill(&mut content, scene.background)?;
     content.push(&format!(
         "0 0 {} {} re f\n",
@@ -543,26 +560,100 @@ fn build_pdf_page(
     let mut images = Vec::new();
     let mut uses_standard_font = false;
     let mut subset_fonts = BTreeSet::new();
-    for node in &scene.nodes {
-        *command_count = command_count
-            .checked_add(node_command_count(node))
-            .ok_or(RenderError::CoordinateOverflow)?;
+    push_scene_nodes(
+        &mut content,
+        &scene.nodes,
+        scene.height,
+        font_registry,
+        &mut subset_fonts,
+        &mut links,
+        &mut images,
+        &mut uses_standard_font,
+        Some(Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: scene.width,
+            height: scene.height,
+        }),
+        trace,
+        0,
+    )?;
+    content.push("Q\n")?;
+    Ok(PdfPage {
+        width_points,
+        height_points,
+        content: content.finish(),
+        links,
+        images,
+        uses_standard_font,
+        subset_fonts,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_scene_nodes(
+    content: &mut BoundedContent,
+    nodes: &[SceneNode],
+    scene_height: Fixed,
+    font_registry: &mut PdfFontRegistry,
+    subset_fonts: &mut BTreeSet<usize>,
+    links: &mut Vec<PdfLink>,
+    images: &mut Vec<PdfImage>,
+    uses_standard_font: &mut bool,
+    active_clip: Option<Rect>,
+    mut trace: Option<&mut BackendGeometryTrace>,
+    depth: usize,
+) -> Result<(), RenderError> {
+    for node in nodes {
         match node {
+            SceneNode::ClipGroup(group) => {
+                if depth >= MAX_CLIP_GROUP_DEPTH {
+                    return Err(RenderError::Backend {
+                        reason: "pdf_clip_group_depth",
+                    });
+                }
+                content.push("q\n")?;
+                push_clip(content, group.clip)?;
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipStart(group.clip));
+                }
+                let nested_clip = match active_clip {
+                    Some(active_clip) => intersect_clip_rects(active_clip, group.clip)?,
+                    None => None,
+                };
+                push_scene_nodes(
+                    content,
+                    &group.nodes,
+                    scene_height,
+                    font_registry,
+                    subset_fonts,
+                    links,
+                    images,
+                    uses_standard_font,
+                    nested_clip,
+                    trace.as_deref_mut(),
+                    depth + 1,
+                )?;
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipEnd);
+                }
+                content.push("Q\n")?;
+            }
             SceneNode::Rect(node) => {
-                push_rect(&mut content, node)?;
+                push_rect(content, node)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Rect(node.clone()));
                 }
             }
             SceneNode::Line(node) => {
-                push_line(&mut content, node)?;
+                push_line(content, node)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Line(node.clone()));
                 }
             }
             SceneNode::Path(node) => {
                 let mut path_trace = trace.is_some().then(|| BackendPathTraceBuilder::new(node));
-                push_path_node(&mut content, node, path_trace.as_mut())?;
+                push_path_node(content, node, path_trace.as_mut())?;
                 if let (Some(trace), Some(path_trace)) = (trace.as_deref_mut(), path_trace) {
                     trace.push(BackendNodeTrace::Path(
                         path_trace.finish().map_err(trace_error)?,
@@ -572,19 +663,27 @@ fn build_pdf_page(
             SceneNode::Image(node) => {
                 let image_index = images.len();
                 images.push(pdf_image(node)?);
-                push_image(&mut content, node, image_index)?;
+                push_image(content, node, image_index)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Image(backend_image_trace(node)));
                 }
             }
             SceneNode::Text(node) => {
-                uses_standard_font = true;
-                push_text(&mut content, node)?;
+                *uses_standard_font = true;
+                push_text(content, node)?;
                 let mut accepted_link = None;
                 if let Some(target) = node.hyperlink.as_deref() {
                     if is_safe_hyperlink(target) {
-                        links.push(pdf_link(node.clip_bounds, scene.height, target)?);
                         accepted_link = Some(target);
+                        let link_rect = match active_clip {
+                            Some(active_clip) => {
+                                intersect_clip_rects(active_clip, node.clip_bounds)?
+                            }
+                            None => None,
+                        };
+                        if let Some(link_rect) = link_rect {
+                            links.push(pdf_link(link_rect, scene_height, target)?);
+                        }
                     }
                 }
                 if let Some(trace) = trace.as_deref_mut() {
@@ -597,15 +696,23 @@ fn build_pdf_page(
             SceneNode::GlyphRun(node) => {
                 let mut glyph_trace = trace.is_some().then(|| BackendGlyphTraceBuilder::new(node));
                 push_glyph_run(
-                    &mut content,
+                    content,
                     node,
                     font_registry,
-                    &mut subset_fonts,
+                    subset_fonts,
                     glyph_trace.as_mut(),
                 )?;
                 if let Some(target) = node.hyperlink.as_deref() {
                     if is_safe_hyperlink(target) {
-                        links.push(pdf_link(node.clip_bounds, scene.height, target)?);
+                        let link_rect = match active_clip {
+                            Some(active_clip) => {
+                                intersect_clip_rects(active_clip, node.clip_bounds)?
+                            }
+                            None => None,
+                        };
+                        if let Some(link_rect) = link_rect {
+                            links.push(pdf_link(link_rect, scene_height, target)?);
+                        }
                         if let Some(trace) = glyph_trace.as_mut() {
                             trace
                                 .record_link(node.clip_bounds, target)
@@ -621,16 +728,7 @@ fn build_pdf_page(
             }
         }
     }
-    content.push("Q\n")?;
-    Ok(PdfPage {
-        width_points,
-        height_points,
-        content: content.finish(),
-        links,
-        images,
-        uses_standard_font,
-        subset_fonts,
-    })
+    Ok(())
 }
 
 fn push_rect(content: &mut BoundedContent, node: &RectNode) -> Result<(), RenderError> {
@@ -1187,6 +1285,49 @@ fn is_safe_hyperlink(target: &str) -> bool {
             .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
 }
 
+fn intersect_clip_rects(left: Rect, right: Rect) -> Result<Option<Rect>, RenderError> {
+    if left.width <= Fixed::ZERO
+        || left.height <= Fixed::ZERO
+        || right.width <= Fixed::ZERO
+        || right.height <= Fixed::ZERO
+    {
+        return Ok(None);
+    }
+    let left_right = left
+        .x
+        .checked_add(left.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left_bottom = left
+        .y
+        .checked_add(left.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_right = right
+        .x
+        .checked_add(right.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_bottom = right
+        .y
+        .checked_add(right.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let end_x = left_right.min(right_right);
+    let end_y = left_bottom.min(right_bottom);
+    if end_x <= x || end_y <= y {
+        return Ok(None);
+    }
+    Ok(Some(Rect {
+        x,
+        y,
+        width: end_x
+            .checked_sub(x)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: end_y
+            .checked_sub(y)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    }))
+}
+
 fn pdf_link(rect: Rect, page_height: Fixed, target: &str) -> Result<PdfLink, RenderError> {
     let right = rect
         .x
@@ -1287,17 +1428,27 @@ fn pdf_literal_escaped_ascii(text: &str) -> String {
     output
 }
 
-fn node_command_count(node: &SceneNode) -> u64 {
+fn node_command_count(node: &SceneNode, depth: usize) -> Result<u64, RenderError> {
     match node {
-        SceneNode::Rect(_) | SceneNode::Text(_) => 1,
-        SceneNode::Line(_) => 2,
-        SceneNode::Path(node) => node.commands.len() as u64,
-        SceneNode::Image(_) => 1,
-        SceneNode::GlyphRun(node) => {
-            node.commands.len() as u64
-                + node.clusters.len().max(1) as u64
-                + node.decorations.len() as u64 * 2
+        SceneNode::ClipGroup(group) => {
+            if depth >= MAX_CLIP_GROUP_DEPTH {
+                return Err(RenderError::Backend {
+                    reason: "pdf_clip_group_depth",
+                });
+            }
+            group.nodes.iter().try_fold(2_u64, |sum, node| {
+                sum.checked_add(node_command_count(node, depth + 1)?)
+                    .ok_or(RenderError::CoordinateOverflow)
+            })
         }
+        SceneNode::Rect(_) | SceneNode::Text(_) => Ok(1),
+        SceneNode::Line(_) => Ok(2),
+        SceneNode::Path(node) => Ok(node.commands.len() as u64),
+        SceneNode::Image(_) => Ok(1),
+        SceneNode::GlyphRun(node) => (node.commands.len() as u64)
+            .checked_add(node.clusters.len().max(1) as u64)
+            .and_then(|count| count.checked_add(node.decorations.len() as u64 * 2))
+            .ok_or(RenderError::CoordinateOverflow),
     }
 }
 
@@ -1569,8 +1720,8 @@ mod tests {
     use crate::png::render_print_page_png_with_trace;
     use crate::print::{build_print_document, PrintOptions};
     use crate::scene::{
-        BackendCommandRangeTrace, BackendNodeTrace, GlyphCluster, GlyphPaint, ImageNode, LineNode,
-        PathCommand, PathNode, RectNode,
+        BackendCommandRangeTrace, BackendNodeTrace, ClipGroupNode, GlyphCluster, GlyphPaint,
+        ImageNode, LineNode, PathCommand, PathNode, RectNode,
     };
     use crate::svg::render_scene_svg_with_trace;
 
@@ -1784,6 +1935,124 @@ mod tests {
                 .map(|link| (link.rect, link.target.as_str())),
             Some((glyph.clip_bounds, "https://example.com/render"))
         );
+    }
+
+    #[test]
+    fn clip_groups_are_replayed_identically_and_bound_paint() {
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("clip").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        let clip = Rect {
+            x: Fixed::from_pixels(1),
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(2),
+            height: Fixed::from_pixels(4),
+        };
+        let painted = RectNode {
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(4),
+                height: Fixed::from_pixels(4),
+            },
+            fill: Some(Rgb::new(220, 20, 60)),
+            stroke: None,
+            stroke_width: Fixed::ZERO,
+        };
+        let scene = Scene {
+            title: "clip-equivalence".to_string(),
+            width: Fixed::from_pixels(4),
+            height: Fixed::from_pixels(4),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip,
+                nodes: vec![SceneNode::Rect(painted.clone())],
+            })],
+        };
+        document.pages[0].scene = scene.clone();
+
+        let (svg, svg_trace) = render_scene_svg_with_trace(&scene, 1 << 20).unwrap();
+        let (pdf, pdf_traces) = render_print_document_pdf_with_trace(&document).unwrap();
+        let (png, png_trace) =
+            render_print_page_png_with_trace(&document.pages[0], 96, &document).unwrap();
+        assert_eq!(pdf_traces, vec![svg_trace.clone()]);
+        assert_eq!(png_trace, svg_trace);
+        assert_eq!(
+            png_trace.nodes,
+            vec![
+                BackendNodeTrace::ClipStart(clip),
+                BackendNodeTrace::Rect(painted),
+                BackendNodeTrace::ClipEnd,
+            ]
+        );
+
+        assert!(svg.contains("overflow=\"hidden\""));
+        assert!(svg
+            .contains("<clipPath id=\"clip-0\"><rect x=\"1\" y=\"0\" width=\"2\" height=\"4\"/>"));
+        assert!(svg.contains("<g clip-path=\"url(#clip-0)\">"));
+        let pdf_text = String::from_utf8_lossy(&pdf);
+        assert!(pdf_text.contains("0 0 4 4 re W n"));
+        assert!(pdf_text.contains("1 0 2 4 re W n"));
+
+        let raster = tiny_skia::Pixmap::decode_png(&png).unwrap();
+        assert_eq!(raster.pixel(0, 1).unwrap().red(), 255);
+        assert_eq!(raster.pixel(1, 1).unwrap().red(), 220);
+        assert_eq!(raster.pixel(2, 1).unwrap().red(), 220);
+        assert_eq!(raster.pixel(3, 1).unwrap().red(), 255);
+    }
+
+    #[test]
+    fn clip_groups_bound_pdf_link_annotations() {
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("clip-link").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        let full_page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(20),
+            height: Fixed::from_pixels(20),
+        };
+        let clip = Rect {
+            x: Fixed::from_pixels(4),
+            y: Fixed::from_pixels(5),
+            width: Fixed::from_pixels(6),
+            height: Fixed::from_pixels(7),
+        };
+        document.pages[0].scene = Scene {
+            title: "clip-link".to_string(),
+            width: full_page.width,
+            height: full_page.height,
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip,
+                nodes: vec![SceneNode::Text(TextNode {
+                    text: "link".to_string(),
+                    bounds: full_page,
+                    clip_bounds: full_page,
+                    horizontal_padding: Fixed::ZERO,
+                    style: crate::scene::TextStyle {
+                        family: "sans-serif".to_string(),
+                        size: Fixed::from_pixels(10),
+                        color: Rgb::BLACK,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        strikethrough: false,
+                        anchor: TextAnchor::Start,
+                        baseline: TextBaseline::Top,
+                        rotation_degrees: 0,
+                    },
+                    hyperlink: Some("https://example.com/clipped".to_string()),
+                })],
+            })],
+        };
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Rect [3 6 7.5 11.25]"));
+        assert!(!source.contains("/Rect [0 0 15 15]"));
     }
 
     #[test]

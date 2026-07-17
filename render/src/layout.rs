@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use rxls::{
     Border, BorderStyle, Cell, CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint,
-    ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell, DrawingMetadata,
-    DrawingObjectKind, DvOp, FormatPattern, FormatScript, HAlign, Sheet, Sparkline, SparklineKind,
-    StyleFidelity, VAlign, Workbook,
+    ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell, DrawingAnchorBehavior,
+    DrawingMetadata, DrawingObjectKind, DvOp, FormatPattern, FormatScript, HAlign, Sheet,
+    Sparkline, SparklineKind, StyleFidelity, VAlign, Workbook,
 };
 
 use crate::error::{LimitKind, RenderError};
@@ -18,8 +18,8 @@ use crate::font::{
 };
 use crate::media::decode_image;
 use crate::scene::{
-    Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, ImageNode, LineNode, PathCommand, PathNode,
-    Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, TextStyle,
+    ClipGroupNode, Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, ImageNode, LineNode, PathCommand,
+    PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, TextStyle,
     FIXED_UNITS_PER_PIXEL,
 };
 use crate::typography::wrap_text_ranges;
@@ -541,6 +541,7 @@ pub(crate) type MeasuredAxes = (Vec<MeasuredAxisSlot<u32>>, Vec<MeasuredAxisSlot
 struct AxisMeasurement {
     rows: Vec<MeasuredAxisSlot<u32>>,
     columns: Vec<MeasuredAxisSlot<u16>>,
+    maximum_digit_width: Fixed,
     typography: TypographyStats,
 }
 
@@ -768,6 +769,7 @@ fn measure_sheet_axes_inner(
     Ok(AxisMeasurement {
         rows,
         columns,
+        maximum_digit_width,
         typography,
     })
 }
@@ -868,6 +870,13 @@ struct DrawingPlaceholder {
     z_order: i64,
     ordinal: u64,
     source: CellCoordinate,
+    clip: Option<Rect>,
+}
+
+enum DrawingPlacement {
+    Placed(Rect),
+    OutsideViewport,
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -974,11 +983,20 @@ pub fn build_sheet_scene(
     sheet_index: usize,
     options: &RenderOptions,
 ) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(sheet, sheet_index, options)
+}
+
+fn build_sheet_scene_inner(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
+    let used_selection = matches!(options.selection, RenderSelection::Used);
     let used_extent = match options.selection {
         RenderSelection::Used => {
             style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-            Some(render_used_extent(sheet, &style_snapshot))
+            Some(render_used_extent(sheet, &style_snapshot)?)
         }
         RenderSelection::Range(_) => None,
     };
@@ -1080,6 +1098,7 @@ pub fn build_sheet_scene(
             shapes_without_cell_geometry,
             None,
         );
+        add_empty_absolute_anchor_warnings(sheet, &mut warnings)?;
         if sheet.page_setup().is_some() {
             warnings.add(WarningCode::PaginationDeferred, None);
         }
@@ -1119,15 +1138,32 @@ pub fn build_sheet_scene(
         });
     }
     let measured = measure_sheet_axes_inner(sheet, range, &style_snapshot, options, &mut warnings)?;
-    let row_slots = measured.rows;
-    let col_slots = measured.columns;
+    let mut row_slots = measured.rows;
+    let mut col_slots = measured.columns;
+    let maximum_digit_width = measured.maximum_digit_width;
     let mut typography_stats = measured.typography;
     let hidden_rows_skipped = rows_considered.saturating_sub(row_slots.len() as u64);
     let hidden_columns_skipped = columns_considered.saturating_sub(col_slots.len() as u64);
     let y = axis_slots_end(&row_slots)?;
     let x = axis_slots_end(&col_slots)?;
+    let viewport = drawing_layout_viewport(
+        sheet,
+        range,
+        x,
+        y,
+        maximum_digit_width,
+        used_selection,
+        options,
+        &mut warnings,
+    )?;
+    offset_axis_slots(&mut col_slots, viewport.cell.x)?;
+    offset_axis_slots(&mut row_slots, viewport.cell.y)?;
+    let canvas_width = viewport.sheet.width.max(Fixed::from_pixels(1));
+    let canvas_height = viewport.sheet.height.max(Fixed::from_pixels(1));
+    enforce_dimension(canvas_width, options)?;
+    enforce_dimension(canvas_height, options)?;
     let sheet_right_to_left = sheet.sheet_view().right_to_left;
-    let reflected_col_slots = visual_column_slots(&col_slots, x, sheet_right_to_left)?;
+    let reflected_col_slots = visual_column_slots(&col_slots, canvas_width, sheet_right_to_left)?;
     let visual_col_slots = reflected_col_slots.as_deref().unwrap_or(&col_slots);
 
     let mut merge_cover = BTreeMap::<CellCoordinate, usize>::new();
@@ -1419,8 +1455,10 @@ pub fn build_sheet_scene(
         sheet,
         &row_slots,
         &col_slots,
-        x,
-        y,
+        viewport.cell,
+        viewport.sheet,
+        canvas_width,
+        canvas_height,
         sheet_right_to_left,
         &mut text_bytes,
         &mut glyphs,
@@ -1448,7 +1486,7 @@ pub fn build_sheet_scene(
         merged_regions: merge_layouts.len() as u64,
         text_bytes,
         glyphs,
-        scene_nodes: nodes.len() as u64,
+        scene_nodes: scene_node_count(&nodes)?,
         svg_bytes: 0,
         font_pack_sha256: options
             .font_pack
@@ -1460,8 +1498,8 @@ pub fn build_sheet_scene(
     Ok(SceneBuild {
         scene: Scene {
             title: sheet.name.clone(),
-            width: x,
-            height: y,
+            width: canvas_width,
+            height: canvas_height,
             background: options.background,
             nodes,
         },
@@ -1482,9 +1520,13 @@ struct UsedRenderExtent {
 /// detached empty merges and font/alignment/number-format-only blanks therefore
 /// cannot create giant canvases. Public image, chart, and sparkline anchors are
 /// included independently because they carry visible sheet content.
-fn render_used_extent(sheet: &Sheet, style_snapshot: &RenderStyleSnapshot) -> UsedRenderExtent {
+fn render_used_extent(
+    sheet: &Sheet,
+    style_snapshot: &RenderStyleSnapshot,
+) -> Result<UsedRenderExtent, RenderError> {
     let mut extent = UsedRenderExtent::default();
     let mut retained_cells = BTreeMap::<u32, BTreeSet<u16>>::new();
+    let metadata_index = DrawingMetadataIndex::new(sheet);
 
     for (row, col, _) in sheet.cells() {
         include_render_coordinate(&mut extent.range, row, col);
@@ -1513,6 +1555,15 @@ fn render_used_extent(sheet: &Sheet, style_snapshot: &RenderStyleSnapshot) -> Us
         }
     }
     for (index, image) in sheet.images().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Image, index);
+        if is_sheet_absolute_metadata(metadata) {
+            if absolute_drawing_paint_bounds(DrawingObjectKind::Image, metadata)?
+                .is_some_and(rect_intersects_positive_sheet)
+            {
+                include_render_coordinate(&mut extent.range, 0, 0);
+            }
+            continue;
+        }
         include_render_coordinate(
             &mut extent.range,
             image.from.0.min(MAX_WORKSHEET_ROW),
@@ -1522,11 +1573,7 @@ fn render_used_extent(sheet: &Sheet, style_snapshot: &RenderStyleSnapshot) -> Us
             image.from.0.saturating_add(10),
             image.from.1.saturating_add(4),
         ));
-        let to = drawing_visible_to(
-            image.from,
-            to,
-            drawing_metadata(sheet, DrawingObjectKind::Image, index),
-        );
+        let to = drawing_visible_to(image.from, to, metadata);
         include_render_coordinate(
             &mut extent.range,
             to.0.min(MAX_WORKSHEET_ROW),
@@ -1534,16 +1581,21 @@ fn render_used_extent(sheet: &Sheet, style_snapshot: &RenderStyleSnapshot) -> Us
         );
     }
     for (index, chart) in sheet.charts().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
+        if is_sheet_absolute_metadata(metadata) {
+            if absolute_drawing_paint_bounds(DrawingObjectKind::Chart, metadata)?
+                .is_some_and(rect_intersects_positive_sheet)
+            {
+                include_render_coordinate(&mut extent.range, 0, 0);
+            }
+            continue;
+        }
         include_render_coordinate(
             &mut extent.range,
             chart.from.0.min(MAX_WORKSHEET_ROW),
             chart.from.1.min(MAX_WORKSHEET_COLUMN),
         );
-        let to = drawing_visible_to(
-            chart.from,
-            chart.to,
-            drawing_metadata(sheet, DrawingObjectKind::Chart, index),
-        );
+        let to = drawing_visible_to(chart.from, chart.to, metadata);
         include_render_coordinate(
             &mut extent.range,
             to.0.min(MAX_WORKSHEET_ROW),
@@ -1579,7 +1631,47 @@ fn render_used_extent(sheet: &Sheet, style_snapshot: &RenderStyleSnapshot) -> Us
             sparkline.location.1.min(MAX_WORKSHEET_COLUMN),
         );
     }
-    extent
+    Ok(extent)
+}
+
+fn add_empty_absolute_anchor_warnings(
+    sheet: &Sheet,
+    warnings: &mut Warnings,
+) -> Result<(), RenderError> {
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    for (kind, anchors) in [
+        (
+            DrawingObjectKind::Image,
+            sheet
+                .images()
+                .iter()
+                .map(|image| image.from)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            DrawingObjectKind::Chart,
+            sheet
+                .charts()
+                .iter()
+                .map(|chart| chart.from)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        for (object_index, anchor) in anchors.into_iter().enumerate() {
+            let metadata = metadata_index.get(kind, object_index);
+            if is_sheet_absolute_metadata(metadata) && absolute_drawing_bounds(metadata)?.is_none()
+            {
+                warnings.add(
+                    WarningCode::DrawingAnchorUnavailable,
+                    Some(CellCoordinate {
+                        row: anchor.0,
+                        col: anchor.1,
+                    }),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn drawing_visible_to(
@@ -1632,20 +1724,101 @@ fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
     has_fill || has_border
 }
 
-/// Resolve the renderer's non-empty visual used range, falling back to A1 for
-/// print-range bookkeeping when the sheet has no retained visual content.
-pub(crate) fn render_used_range(sheet: &Sheet) -> RenderRange {
+/// Resolve the cell range needed to paginate all used visual content.
+///
+/// A sheet-absolute drawing is positioned in physical sheet coordinates, so
+/// representing it only as A1 is sufficient for a single expanded scene but
+/// not for cell-partitioned print pages. Extend the fallback print range to
+/// the row and column whose persisted geometry reaches the drawing bounds.
+pub(crate) fn render_used_print_range(
+    sheet: &Sheet,
+    options: &RenderOptions,
+) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
-    let options = RenderOptions::default();
-    if style_snapshot
-        .capture_sparse_visual_candidates(sheet, &options)
-        .is_err()
-    {
-        return RenderRange::new(0, 0, 0, 0);
-    }
-    render_used_extent(sheet, &style_snapshot)
+    style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
+    let mut range = render_used_extent(sheet, &style_snapshot)?
         .range
-        .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0))
+        .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0));
+    let Some((absolute_right, absolute_bottom)) = absolute_drawing_positive_extent(sheet)? else {
+        return Ok(range);
+    };
+
+    let mut warnings = Warnings::default();
+    let mut typography = TypographyStats::default();
+    let maximum_digit_width =
+        maximum_digit_width(&style_snapshot, options, &mut warnings, &mut typography)?;
+    range.last_col = range.last_col.max(print_column_for_absolute_extent(
+        sheet,
+        absolute_right,
+        maximum_digit_width,
+        options,
+        &mut warnings,
+    )?);
+    range.last_row = range.last_row.max(print_row_for_absolute_extent(
+        sheet,
+        absolute_bottom,
+        maximum_digit_width,
+        options,
+        &mut warnings,
+    )?);
+    Ok(range)
+}
+
+fn print_column_for_absolute_extent(
+    sheet: &Sheet,
+    target_right: Fixed,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<u16, RenderError> {
+    let mut right = Fixed::ZERO;
+    for column in 0..=MAX_WORKSHEET_COLUMN {
+        if options.include_hidden || !sheet.hidden_columns().contains(&column) {
+            right = right
+                .checked_add(column_width(
+                    sheet,
+                    column,
+                    maximum_digit_width,
+                    options,
+                    warnings,
+                ))
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+        if right >= target_right {
+            return Ok(column);
+        }
+    }
+    Ok(MAX_WORKSHEET_COLUMN)
+}
+
+fn print_row_for_absolute_extent(
+    sheet: &Sheet,
+    target_bottom: Fixed,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<u32, RenderError> {
+    let mut first = 0_u32;
+    let mut last = MAX_WORKSHEET_ROW;
+    while first < last {
+        let middle = first + (last - first) / 2;
+        let next_row = middle
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let (_, bottom) = sheet_grid_origin(
+            sheet,
+            RenderRange::new(next_row, 0, next_row, 0),
+            maximum_digit_width,
+            options,
+            warnings,
+        )?;
+        if bottom >= target_bottom {
+            last = middle;
+        } else {
+            first = middle.saturating_add(1);
+        }
+    }
+    Ok(first)
 }
 
 impl From<(u32, u16, u32, u16)> for RenderRange {
@@ -3529,8 +3702,10 @@ fn push_drawing_placeholders(
     sheet: &Sheet,
     row_slots: &[AxisSlot<u32>],
     col_slots: &[AxisSlot<u16>],
-    canvas_width: Fixed,
-    canvas_height: Fixed,
+    cell_viewport: Rect,
+    sheet_viewport: Rect,
+    scene_width: Fixed,
+    scene_height: Fixed,
     right_to_left: bool,
     text_bytes: &mut u64,
     glyphs: &mut u64,
@@ -3538,10 +3713,11 @@ fn push_drawing_placeholders(
     options: &RenderOptions,
     warnings: &mut Warnings,
 ) -> Result<(), RenderError> {
+    let metadata_index = DrawingMetadataIndex::new(sheet);
     let mut placeholders = Vec::<DrawingPlaceholder>::new();
     let mut ordinal = 0_u64;
     for (index, image) in sheet.images().iter().enumerate() {
-        let metadata = drawing_metadata(sheet, DrawingObjectKind::Image, index);
+        let metadata = metadata_index.get(DrawingObjectKind::Image, index);
         let to = image.to.unwrap_or((
             image.from.0.saturating_add(10),
             image.from.1.saturating_add(4),
@@ -3549,14 +3725,16 @@ fn push_drawing_placeholders(
         match drawing_rect(
             row_slots,
             col_slots,
-            canvas_width,
-            canvas_height,
+            cell_viewport,
+            sheet_viewport,
+            scene_width,
+            DrawingObjectKind::Image,
             image.from,
             to,
             metadata,
             right_to_left,
         )? {
-            Some(rect) => placeholders.push(DrawingPlaceholder {
+            DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Image(index),
                 rect,
                 z_order: metadata
@@ -3567,30 +3745,39 @@ fn push_drawing_placeholders(
                     row: image.from.0,
                     col: image.from.1,
                 },
+                clip: is_sheet_absolute_metadata(metadata).then_some(Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: scene_width,
+                    height: scene_height,
+                }),
             }),
-            None => warnings.add(
+            DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::DrawingAnchorUnavailable,
                 Some(CellCoordinate {
                     row: image.from.0,
                     col: image.from.1,
                 }),
             ),
+            DrawingPlacement::OutsideViewport => {}
         }
         ordinal = ordinal.saturating_add(1);
     }
     for (index, chart) in sheet.charts().iter().enumerate() {
-        let metadata = drawing_metadata(sheet, DrawingObjectKind::Chart, index);
+        let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
         match drawing_rect(
             row_slots,
             col_slots,
-            canvas_width,
-            canvas_height,
+            cell_viewport,
+            sheet_viewport,
+            scene_width,
+            DrawingObjectKind::Chart,
             chart.from,
             chart.to,
             metadata,
             right_to_left,
         )? {
-            Some(rect) => placeholders.push(DrawingPlaceholder {
+            DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Chart(index, chart.kind),
                 rect,
                 z_order: metadata
@@ -3601,14 +3788,21 @@ fn push_drawing_placeholders(
                     row: chart.from.0,
                     col: chart.from.1,
                 },
+                clip: is_sheet_absolute_metadata(metadata).then_some(Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: scene_width,
+                    height: scene_height,
+                }),
             }),
-            None => warnings.add(
+            DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::DrawingAnchorUnavailable,
                 Some(CellCoordinate {
                     row: chart.from.0,
                     col: chart.from.1,
                 }),
             ),
+            DrawingPlacement::OutsideViewport => {}
         }
         ordinal = ordinal.saturating_add(1);
     }
@@ -3625,14 +3819,16 @@ fn push_drawing_placeholders(
         match drawing_rect(
             row_slots,
             col_slots,
-            canvas_width,
-            canvas_height,
+            cell_viewport,
+            sheet_viewport,
+            scene_width,
+            DrawingObjectKind::Shape,
             from,
             to,
             Some(metadata),
             right_to_left,
         )? {
-            Some(rect) => placeholders.push(DrawingPlaceholder {
+            DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Shape,
                 rect,
                 z_order: metadata.z_order.map_or(ordinal as i64, i64::from),
@@ -3641,14 +3837,16 @@ fn push_drawing_placeholders(
                     row: from.0,
                     col: from.1,
                 },
+                clip: None,
             }),
-            None => warnings.add(
+            DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::ShapeAnchorUnavailable,
                 Some(CellCoordinate {
                     row: from.0,
                     col: from.1,
                 }),
             ),
+            DrawingPlacement::OutsideViewport => {}
         }
         ordinal = ordinal.saturating_add(1);
     }
@@ -3657,13 +3855,14 @@ fn push_drawing_placeholders(
             row: sparkline.location.0,
             col: sparkline.location.1,
         };
-        match cell_rect(row_slots, col_slots, source, canvas_width, right_to_left)? {
+        match cell_rect(row_slots, col_slots, source, scene_width, right_to_left)? {
             Some(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Sparkline(index, sparkline.kind),
                 rect,
                 z_order: i64::MAX,
                 ordinal,
                 source,
+                clip: None,
             }),
             None => warnings.add(WarningCode::DrawingAnchorUnavailable, Some(source)),
         }
@@ -3673,10 +3872,11 @@ fn push_drawing_placeholders(
     let mut decoded_media_bytes = 0_u64;
     let mut chart_points = 0_u64;
     for placeholder in placeholders {
+        let mut object_nodes = Vec::new();
         match placeholder.kind {
             DrawingPlaceholderKind::Image(index) => {
                 let image = &sheet.images()[index];
-                let metadata = drawing_metadata(sheet, DrawingObjectKind::Image, index);
+                let metadata = metadata_index.get(DrawingObjectKind::Image, index);
                 match decode_image(
                     image,
                     metadata.and_then(|metadata| metadata.crop),
@@ -3684,7 +3884,7 @@ fn push_drawing_placeholders(
                     &mut decoded_media_bytes,
                 )? {
                     Some(decoded) => push_node(
-                        nodes,
+                        &mut object_nodes,
                         SceneNode::Image(ImageNode {
                             rect: placeholder.rect,
                             pixel_width: decoded.width,
@@ -3699,15 +3899,15 @@ fn push_drawing_placeholders(
                         options,
                     )?,
                     None => {
-                        push_image_placeholder(nodes, placeholder.rect, options)?;
+                        push_image_placeholder(&mut object_nodes, placeholder.rect, options)?;
                         warnings.add(WarningCode::ImagePlaceholder, Some(placeholder.source));
                     }
                 }
             }
             DrawingPlaceholderKind::Chart(index, kind) => {
-                let metadata = drawing_metadata(sheet, DrawingObjectKind::Chart, index);
+                let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
                 if !try_push_chart(
-                    nodes,
+                    &mut object_nodes,
                     placeholder.rect,
                     &sheet.charts()[index],
                     metadata,
@@ -3720,41 +3920,508 @@ fn push_drawing_placeholders(
                     warnings,
                     placeholder.source,
                 )? {
-                    push_chart_placeholder(nodes, placeholder.rect, kind, options)?;
+                    push_chart_placeholder(&mut object_nodes, placeholder.rect, kind, options)?;
                     warnings.add(WarningCode::ChartPlaceholder, Some(placeholder.source));
                 }
             }
             DrawingPlaceholderKind::Sparkline(index, kind) => {
                 if !try_push_sparkline(
-                    nodes,
+                    &mut object_nodes,
                     placeholder.rect,
                     &sheet.sparklines()[index],
                     sheet,
                     &mut chart_points,
                     options,
                 )? {
-                    push_sparkline_placeholder(nodes, placeholder.rect, kind, options)?;
+                    push_sparkline_placeholder(&mut object_nodes, placeholder.rect, kind, options)?;
                     warnings.add(WarningCode::SparklinePlaceholder, Some(placeholder.source));
                 }
             }
             DrawingPlaceholderKind::Shape => {
-                push_shape_placeholder(nodes, placeholder.rect, options)?;
+                push_shape_placeholder(&mut object_nodes, placeholder.rect, options)?;
                 warnings.add(WarningCode::ShapePlaceholder, Some(placeholder.source));
             }
         }
+        append_drawing_nodes(nodes, placeholder.clip, object_nodes, options)?;
     }
     Ok(())
 }
 
-fn drawing_metadata(
-    sheet: &Sheet,
+fn append_drawing_nodes(
+    output: &mut Vec<SceneNode>,
+    clip: Option<Rect>,
+    children: Vec<SceneNode>,
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    let child_count = scene_node_count(&children)?;
+    let added = child_count
+        .checked_add(u64::from(clip.is_some()))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let actual = scene_node_count(output)?
+        .checked_add(added)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    enforce(
+        LimitKind::SceneNodes,
+        options.limits.max_scene_nodes,
+        actual,
+    )?;
+    if let Some(clip) = clip {
+        output.push(SceneNode::ClipGroup(ClipGroupNode {
+            clip,
+            nodes: children,
+        }));
+    } else {
+        output.extend(children);
+    }
+    Ok(())
+}
+
+fn scene_node_count(nodes: &[SceneNode]) -> Result<u64, RenderError> {
+    nodes.iter().try_fold(0_u64, |count, node| {
+        let descendants = match node {
+            SceneNode::ClipGroup(group) => scene_node_count(&group.nodes)?,
+            _ => 0,
+        };
+        count
+            .checked_add(1)
+            .and_then(|count| count.checked_add(descendants))
+            .ok_or(RenderError::CoordinateOverflow)
+    })
+}
+
+struct DrawingMetadataIndex<'a> {
+    images: Vec<Option<&'a DrawingMetadata>>,
+    charts: Vec<Option<&'a DrawingMetadata>>,
+}
+
+impl<'a> DrawingMetadataIndex<'a> {
+    fn new(sheet: &'a Sheet) -> Self {
+        let mut index = Self {
+            images: vec![None; sheet.images().len()],
+            charts: vec![None; sheet.charts().len()],
+        };
+        for metadata in sheet.drawing_metadata() {
+            let slot = match metadata.kind {
+                DrawingObjectKind::Image => index.images.get_mut(metadata.object_index),
+                DrawingObjectKind::Chart => index.charts.get_mut(metadata.object_index),
+                _ => None,
+            };
+            if let Some(slot) = slot.filter(|slot| slot.is_none()) {
+                *slot = Some(metadata);
+            }
+        }
+        index
+    }
+
+    fn get(&self, kind: DrawingObjectKind, object_index: usize) -> Option<&'a DrawingMetadata> {
+        match kind {
+            DrawingObjectKind::Image => self.images.get(object_index).copied().flatten(),
+            DrawingObjectKind::Chart => self.charts.get(object_index).copied().flatten(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DrawingLayoutViewport {
+    /// Selected sheet-space viewport. Its origin is global sheet geometry and
+    /// its width/height are the local scene dimensions before the 1px clamp.
+    sheet: Rect,
+    /// Cell-grid rectangle in local scene coordinates.
+    cell: Rect,
+}
+
+fn is_sheet_absolute_metadata(metadata: Option<&DrawingMetadata>) -> bool {
+    metadata.is_some_and(|metadata| {
+        metadata.behavior == DrawingAnchorBehavior::Absolute && metadata.from_cell.is_none()
+    })
+}
+
+fn absolute_drawing_positive_extent(sheet: &Sheet) -> Result<Option<(Fixed, Fixed)>, RenderError> {
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    let mut rightmost = Fixed::ZERO;
+    let mut bottommost = Fixed::ZERO;
+    let mut visible = false;
+    for (kind, object_count) in [
+        (DrawingObjectKind::Image, sheet.images().len()),
+        (DrawingObjectKind::Chart, sheet.charts().len()),
+    ] {
+        for object_index in 0..object_count {
+            let Some(rect) =
+                absolute_drawing_paint_bounds(kind, metadata_index.get(kind, object_index))?
+            else {
+                continue;
+            };
+            let right = rect
+                .x
+                .checked_add(rect.width)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let bottom = rect
+                .y
+                .checked_add(rect.height)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            if right <= Fixed::ZERO || bottom <= Fixed::ZERO {
+                continue;
+            }
+            visible = true;
+            rightmost = rightmost.max(right);
+            bottommost = bottommost.max(bottom);
+        }
+    }
+    Ok(visible.then_some((rightmost, bottommost)))
+}
+
+fn absolute_drawing_bounds(
+    metadata: Option<&DrawingMetadata>,
+) -> Result<Option<Rect>, RenderError> {
+    let Some(metadata) = metadata.filter(|metadata| is_sheet_absolute_metadata(Some(metadata)))
+    else {
+        return Ok(None);
+    };
+    let (Some((x, y)), Some((width, height))) =
+        (metadata.from_offset_emu, metadata.absolute_size_emu)
+    else {
+        return Ok(None);
+    };
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    let left = emu_to_fixed(x)?;
+    let top = emu_to_fixed(y)?;
+    let width = emu_size_to_fixed(width)?;
+    let height = emu_size_to_fixed(height)?;
+    left.checked_add(width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    top.checked_add(height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(Some(Rect {
+        x: left,
+        y: top,
+        width,
+        height,
+    }))
+}
+
+fn absolute_drawing_paint_bounds(
     kind: DrawingObjectKind,
-    object_index: usize,
-) -> Option<&DrawingMetadata> {
-    sheet
-        .drawing_metadata()
-        .iter()
-        .find(|metadata| metadata.kind == kind && metadata.object_index == object_index)
+    metadata: Option<&DrawingMetadata>,
+) -> Result<Option<Rect>, RenderError> {
+    let Some(rect) = absolute_drawing_bounds(metadata)? else {
+        return Ok(None);
+    };
+    if kind != DrawingObjectKind::Image {
+        return Ok(Some(rect));
+    }
+    let rotation_mdeg = metadata
+        .and_then(|metadata| metadata.rotation_mdeg)
+        .unwrap_or(0);
+    rotated_rect_bounds(rect, rotation_mdeg).map(Some)
+}
+
+fn rotated_rect_bounds(rect: Rect, rotation_mdeg: i32) -> Result<Rect, RenderError> {
+    let rotation_mdeg = rotation_mdeg.rem_euclid(360_000);
+    if rotation_mdeg == 0 || rotation_mdeg == 180_000 {
+        return Ok(rect);
+    }
+    if rotation_mdeg == 90_000 || rotation_mdeg == 270_000 {
+        return centered_rect_bounds(rect, rect.height.raw(), rect.width.raw());
+    }
+
+    let radians = f64::from(rotation_mdeg) * std::f64::consts::PI / 180_000.0;
+    let cosine = radians.cos().abs();
+    let sine = radians.sin().abs();
+    let width = rect.width.raw() as f64;
+    let height = rect.height.raw() as f64;
+    let rotated_width = width * cosine + height * sine;
+    let rotated_height = width * sine + height * cosine;
+    let center_x = rect.x.raw() as f64 + width / 2.0;
+    let center_y = rect.y.raw() as f64 + height / 2.0;
+    // Expand by a scale-aware floating-point margin before rounding outward.
+    // This prevents a backend-painted edge from being clipped when libm lands
+    // immediately to the other side of an integer fixed-point boundary.
+    let x_margin = ((center_x.abs() + rotated_width + 1.0) * f64::EPSILON * 8.0).max(1.0);
+    let y_margin = ((center_y.abs() + rotated_height + 1.0) * f64::EPSILON * 8.0).max(1.0);
+    let left = f64_floor_to_i64(center_x - rotated_width / 2.0 - x_margin)?;
+    let right = f64_ceil_to_i64(center_x + rotated_width / 2.0 + x_margin)?;
+    let top = f64_floor_to_i64(center_y - rotated_height / 2.0 - y_margin)?;
+    let bottom = f64_ceil_to_i64(center_y + rotated_height / 2.0 + y_margin)?;
+    Ok(Rect {
+        x: Fixed::from_raw(left),
+        y: Fixed::from_raw(top),
+        width: Fixed::from_raw(
+            right
+                .checked_sub(left)
+                .ok_or(RenderError::CoordinateOverflow)?,
+        ),
+        height: Fixed::from_raw(
+            bottom
+                .checked_sub(top)
+                .ok_or(RenderError::CoordinateOverflow)?,
+        ),
+    })
+}
+
+fn centered_rect_bounds(
+    rect: Rect,
+    rotated_width: i64,
+    rotated_height: i64,
+) -> Result<Rect, RenderError> {
+    let center_x_twice = i128::from(rect.x.raw())
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(i128::from(rect.width.raw())))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let center_y_twice = i128::from(rect.y.raw())
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(i128::from(rect.height.raw())))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left = floor_half(center_x_twice - i128::from(rotated_width))?;
+    let right = ceil_half(center_x_twice + i128::from(rotated_width))?;
+    let top = floor_half(center_y_twice - i128::from(rotated_height))?;
+    let bottom = ceil_half(center_y_twice + i128::from(rotated_height))?;
+    Ok(Rect {
+        x: Fixed::from_raw(left),
+        y: Fixed::from_raw(top),
+        width: Fixed::from_raw(
+            right
+                .checked_sub(left)
+                .ok_or(RenderError::CoordinateOverflow)?,
+        ),
+        height: Fixed::from_raw(
+            bottom
+                .checked_sub(top)
+                .ok_or(RenderError::CoordinateOverflow)?,
+        ),
+    })
+}
+
+fn floor_half(value: i128) -> Result<i64, RenderError> {
+    let quotient = value.div_euclid(2);
+    i64::try_from(quotient).map_err(|_| RenderError::CoordinateOverflow)
+}
+
+fn ceil_half(value: i128) -> Result<i64, RenderError> {
+    let quotient = value
+        .checked_add(1)
+        .ok_or(RenderError::CoordinateOverflow)?
+        .div_euclid(2);
+    i64::try_from(quotient).map_err(|_| RenderError::CoordinateOverflow)
+}
+
+fn f64_floor_to_i64(value: f64) -> Result<i64, RenderError> {
+    let value = value.floor();
+    if !value.is_finite() || value < i64::MIN as f64 || value >= 9_223_372_036_854_775_808.0 {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    Ok(value as i64)
+}
+
+fn f64_ceil_to_i64(value: f64) -> Result<i64, RenderError> {
+    let value = value.ceil();
+    if !value.is_finite() || value < i64::MIN as f64 || value >= 9_223_372_036_854_775_808.0 {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    Ok(value as i64)
+}
+
+fn rect_intersects_positive_sheet(rect: Rect) -> bool {
+    let right = i128::from(rect.x.raw()) + i128::from(rect.width.raw());
+    let bottom = i128::from(rect.y.raw()) + i128::from(rect.height.raw());
+    right > 0 && bottom > 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drawing_layout_viewport(
+    sheet: &Sheet,
+    range: RenderRange,
+    grid_width: Fixed,
+    grid_height: Fixed,
+    maximum_digit_width: Fixed,
+    used_selection: bool,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<DrawingLayoutViewport, RenderError> {
+    let absolute_extent = absolute_drawing_positive_extent(sheet)?;
+    let Some((absolute_right, absolute_bottom)) = absolute_extent else {
+        return Ok(DrawingLayoutViewport {
+            sheet: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: grid_width,
+                height: grid_height,
+            },
+            cell: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: grid_width,
+                height: grid_height,
+            },
+        });
+    };
+    let (grid_x, grid_y) = sheet_grid_origin(sheet, range, maximum_digit_width, options, warnings)?;
+    if used_selection {
+        let grid_right = grid_x
+            .checked_add(grid_width)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let grid_bottom = grid_y
+            .checked_add(grid_height)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        Ok(DrawingLayoutViewport {
+            sheet: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: grid_right.max(absolute_right),
+                height: grid_bottom.max(absolute_bottom),
+            },
+            cell: Rect {
+                x: grid_x,
+                y: grid_y,
+                width: grid_width,
+                height: grid_height,
+            },
+        })
+    } else {
+        Ok(DrawingLayoutViewport {
+            sheet: Rect {
+                x: grid_x,
+                y: grid_y,
+                width: grid_width,
+                height: grid_height,
+            },
+            cell: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: grid_width,
+                height: grid_height,
+            },
+        })
+    }
+}
+
+fn sheet_grid_origin(
+    sheet: &Sheet,
+    range: RenderRange,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<(Fixed, Fixed), RenderError> {
+    let mut x = Fixed::ZERO;
+    for column in 0..range.first_col {
+        if !options.include_hidden && sheet.hidden_columns().contains(&column) {
+            continue;
+        }
+        x = x
+            .checked_add(column_width(
+                sheet,
+                column,
+                maximum_digit_width,
+                options,
+                warnings,
+            ))
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+
+    // A sheet-absolute object does not move with renderer-derived automatic
+    // text height. Its sheet-space row boundary therefore follows persisted
+    // default/explicit row geometry. Compute that prefix sparsely instead of
+    // scanning up to Excel's million-row ceiling.
+    let base_row_height = match sheet.default_row_height().and_then(points_to_fixed) {
+        Some(height) => height,
+        None => options.default_row_height.max(Fixed::from_raw(1)),
+    };
+    let hidden_rows = if options.include_hidden {
+        0_u64
+    } else {
+        sheet.hidden_rows().range(..range.first_row).count() as u64
+    };
+    let visible_rows = u64::from(range.first_row).saturating_sub(hidden_rows);
+    let mut y_raw = i128::from(base_row_height.raw())
+        .checked_mul(i128::from(visible_rows))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    for (&row, _) in sheet.row_heights().range(..range.first_row) {
+        if !options.include_hidden && sheet.hidden_rows().contains(&row) {
+            continue;
+        }
+        let height = row_height(sheet, row, options, warnings);
+        y_raw = y_raw
+            .checked_add(i128::from(height.raw()) - i128::from(base_row_height.raw()))
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    let y = Fixed::from_raw(i64::try_from(y_raw).map_err(|_| RenderError::CoordinateOverflow)?);
+    Ok((x, y))
+}
+
+fn offset_axis_slots<I>(
+    slots: &mut [MeasuredAxisSlot<I>],
+    offset: Fixed,
+) -> Result<(), RenderError> {
+    if offset == Fixed::ZERO {
+        return Ok(());
+    }
+    for slot in slots {
+        slot.offset = slot
+            .offset
+            .checked_add(offset)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn absolute_drawings_intersect_range(
+    sheet: &Sheet,
+    range: RenderRange,
+    width: Fixed,
+    height: Fixed,
+    options: &RenderOptions,
+) -> Result<bool, RenderError> {
+    if width <= Fixed::ZERO || height <= Fixed::ZERO {
+        return Ok(false);
+    }
+    let mut warnings = Warnings::default();
+    let mut typography = TypographyStats::default();
+    let style_snapshot = RenderStyleSnapshot::new(sheet);
+    let maximum_digit_width =
+        maximum_digit_width(&style_snapshot, options, &mut warnings, &mut typography)?;
+    let (x, y) = sheet_grid_origin(
+        sheet,
+        range.validate()?,
+        maximum_digit_width,
+        options,
+        &mut warnings,
+    )?;
+    let viewport = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    for (kind, object_count) in [
+        (DrawingObjectKind::Image, sheet.images().len()),
+        (DrawingObjectKind::Chart, sheet.charts().len()),
+    ] {
+        for object_index in 0..object_count {
+            if absolute_drawing_paint_bounds(kind, metadata_index.get(kind, object_index))?
+                .is_some_and(|rect| rectangles_intersect(rect, viewport))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn rectangles_intersect(left: Rect, right: Rect) -> bool {
+    let left_right = i128::from(left.x.raw()) + i128::from(left.width.raw());
+    let left_bottom = i128::from(left.y.raw()) + i128::from(left.height.raw());
+    let right_right = i128::from(right.x.raw()) + i128::from(right.width.raw());
+    let right_bottom = i128::from(right.y.raw()) + i128::from(right.height.raw());
+    i128::from(left.x.raw()) < right_right
+        && left_right > i128::from(right.x.raw())
+        && i128::from(left.y.raw()) < right_bottom
+        && left_bottom > i128::from(right.y.raw())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5481,15 +6148,41 @@ fn pixels_as_fixed(value: f64) -> Result<Fixed, RenderError> {
 fn drawing_rect(
     row_slots: &[AxisSlot<u32>],
     col_slots: &[AxisSlot<u16>],
-    canvas_width: Fixed,
-    canvas_height: Fixed,
+    cell_viewport: Rect,
+    sheet_viewport: Rect,
+    scene_width: Fixed,
+    kind: DrawingObjectKind,
     from: (u32, u16),
     to: (u32, u16),
     metadata: Option<&DrawingMetadata>,
     right_to_left: bool,
-) -> Result<Option<Rect>, RenderError> {
+) -> Result<DrawingPlacement, RenderError> {
+    if is_sheet_absolute_metadata(metadata) {
+        let Some(mut rect) = absolute_drawing_bounds(metadata)? else {
+            return Ok(DrawingPlacement::Unavailable);
+        };
+        let Some(paint_bounds) = absolute_drawing_paint_bounds(kind, metadata)? else {
+            return Ok(DrawingPlacement::Unavailable);
+        };
+        if !rectangles_intersect(paint_bounds, sheet_viewport) {
+            return Ok(DrawingPlacement::OutsideViewport);
+        }
+        rect.x = rect
+            .x
+            .checked_sub(sheet_viewport.x)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        rect.y = rect
+            .y
+            .checked_sub(sheet_viewport.y)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        return Ok(DrawingPlacement::Placed(if right_to_left {
+            reflect_rect_horizontally(rect, scene_width)?
+        } else {
+            rect
+        }));
+    }
     if row_slots.is_empty() || col_slots.is_empty() {
-        return Ok(None);
+        return Ok(DrawingPlacement::Unavailable);
     }
     let first_row = row_slots.first().map_or(0, |slot| slot.index);
     let last_row = row_slots.last().map_or(0, |slot| slot.index);
@@ -5500,12 +6193,20 @@ fn drawing_rect(
     // top-left marker to be selected. This is also what lets paginated output
     // retain images/charts across a row or column break.
     if from.0 > last_row || from.1 > last_col || to.0 < first_row || to.1 < first_col {
-        return Ok(None);
+        return Ok(DrawingPlacement::OutsideViewport);
     }
     let clipped_from_row = from.0 < first_row;
     let clipped_from_col = from.1 < first_col;
-    let mut left = row_or_column_boundary_col(col_slots, from.1, canvas_width);
-    let mut top = row_or_column_boundary_row(row_slots, from.0, canvas_height);
+    let cell_right = cell_viewport
+        .x
+        .checked_add(cell_viewport.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let cell_bottom = cell_viewport
+        .y
+        .checked_add(cell_viewport.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let mut left = row_or_column_boundary_col(col_slots, from.1, cell_right);
+    let mut top = row_or_column_boundary_row(row_slots, from.0, cell_bottom);
     if let Some((x, y)) = metadata.and_then(|metadata| metadata.from_offset_emu) {
         // An offset belonging to a marker before the selected range has
         // already been consumed by the clipped-away portion of the drawing.
@@ -5521,8 +6222,8 @@ fn drawing_rect(
         }
     }
 
-    let mut anchored_right = row_or_column_boundary_col(col_slots, to.1, canvas_width);
-    let mut anchored_bottom = row_or_column_boundary_row(row_slots, to.0, canvas_height);
+    let mut anchored_right = row_or_column_boundary_col(col_slots, to.1, cell_right);
+    let mut anchored_bottom = row_or_column_boundary_row(row_slots, to.0, cell_bottom);
     if let Some((x, y)) = metadata.and_then(|metadata| metadata.to_offset_emu) {
         if to.1 <= last_col {
             anchored_right = anchored_right
@@ -5556,15 +6257,14 @@ fn drawing_rect(
         } else {
             (anchored_right, anchored_bottom)
         };
-    clip_to_canvas(left, top, right, bottom, canvas_width, canvas_height)?
-        .map(|rect| {
-            if right_to_left {
-                reflect_rect_horizontally(rect, canvas_width)
-            } else {
-                Ok(rect)
-            }
-        })
-        .transpose()
+    let Some(rect) = clip_to_rect(left, top, right, bottom, cell_viewport)? else {
+        return Ok(DrawingPlacement::OutsideViewport);
+    };
+    Ok(DrawingPlacement::Placed(if right_to_left {
+        reflect_rect_horizontally(rect, scene_width)?
+    } else {
+        rect
+    }))
 }
 
 fn row_or_column_boundary_row(slots: &[AxisSlot<u32>], index: u32, total: Fixed) -> Fixed {
@@ -5626,18 +6326,25 @@ fn emu_size_to_fixed(emu: u64) -> Result<Fixed, RenderError> {
     emu_to_fixed(emu).map(|value| value.max(Fixed::from_raw(1)))
 }
 
-fn clip_to_canvas(
+fn clip_to_rect(
     left: Fixed,
     top: Fixed,
     right: Fixed,
     bottom: Fixed,
-    width: Fixed,
-    height: Fixed,
+    bounds: Rect,
 ) -> Result<Option<Rect>, RenderError> {
-    let left = Fixed::from_raw(left.raw().clamp(0, width.raw()));
-    let top = Fixed::from_raw(top.raw().clamp(0, height.raw()));
-    let right = Fixed::from_raw(right.raw().clamp(0, width.raw()));
-    let bottom = Fixed::from_raw(bottom.raw().clamp(0, height.raw()));
+    let bounds_right = bounds
+        .x
+        .checked_add(bounds.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bounds_bottom = bounds
+        .y
+        .checked_add(bounds.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left = Fixed::from_raw(left.raw().clamp(bounds.x.raw(), bounds_right.raw()));
+    let top = Fixed::from_raw(top.raw().clamp(bounds.y.raw(), bounds_bottom.raw()));
+    let right = Fixed::from_raw(right.raw().clamp(bounds.x.raw(), bounds_right.raw()));
+    let bottom = Fixed::from_raw(bottom.raw().clamp(bounds.y.raw(), bounds_bottom.raw()));
     if right <= left || bottom <= top {
         return Ok(None);
     }

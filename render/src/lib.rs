@@ -35,8 +35,8 @@ pub use print::{
     PrintPage, PrintReport, PrintWarning, PrintWarningCode,
 };
 pub use scene::{
-    Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, ImageNode, LineNode, PathCommand, PathNode,
-    Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, TextStyle,
+    ClipGroupNode, Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, ImageNode, LineNode, PathCommand,
+    PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, TextStyle,
     FIXED_UNITS_PER_PIXEL,
 };
 pub use svg::render_scene_svg;

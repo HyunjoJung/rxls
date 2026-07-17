@@ -1,7 +1,7 @@
 use rxls::{Border, BorderStyle, CellStyle, Chart, ChartKind, Color, Format, Sparkline, Workbook};
 use rxls_render::{
-    build_print_document, build_scene, Fixed, LimitKind, PrintOptions, RenderError, RenderLimits,
-    RenderOptions, RenderRange, RenderSelection,
+    build_print_document, build_scene, render_scene_svg, Fixed, LimitKind, PrintOptions,
+    RenderError, RenderLimits, RenderOptions, RenderRange, RenderSelection,
 };
 
 #[test]
@@ -164,6 +164,103 @@ fn empty_used_selection_is_one_pixel_but_explicit_ranges_are_unchanged() {
     .unwrap();
     assert_eq!(explicit_print.pages[0].scene.width, Fixed::from_pixels(64));
     assert_eq!(explicit_print.pages[0].scene.height, Fixed::from_pixels(20));
+}
+
+#[test]
+fn fully_hidden_selected_rows_keep_a_nonempty_canvas_without_painting_content() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("hidden rows");
+    sheet.write(3, 0, "hidden");
+    sheet.hide_row(3);
+
+    let options = RenderOptions {
+        gridlines: false,
+        ..RenderOptions::default()
+    };
+    let build = build_scene(&workbook, 0, &options).unwrap();
+    assert_eq!(build.scene.width, Fixed::from_pixels(64));
+    assert_eq!(build.scene.height, Fixed::from_pixels(1));
+    assert!(build.scene.nodes.is_empty());
+    assert_eq!(build.report.visible_rows, 0);
+    assert_eq!(build.report.visible_columns, 1);
+    assert_eq!(build.report.hidden_rows_skipped, 1);
+    assert_eq!(build.report.rendered_regions, 0);
+
+    let svg = render_scene_svg(&build.scene, options.limits.max_output_bytes).unwrap();
+    assert!(svg.contains("width=\"64\" height=\"1\" viewBox=\"0 0 64 1\""));
+
+    let print = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            render: options,
+            single_page_sheets: true,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(print.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(print.pages[0].scene.height, Fixed::from_pixels(1));
+    assert!(print.pages[0].scene.nodes.is_empty());
+}
+
+#[test]
+fn fully_hidden_selected_columns_keep_a_nonempty_canvas_and_honor_limits() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("hidden columns");
+    sheet.write(0, 3, "hidden");
+    sheet.hide_column(3);
+
+    let options = RenderOptions {
+        gridlines: false,
+        ..RenderOptions::default()
+    };
+    let build = build_scene(&workbook, 0, &options).unwrap();
+    assert_eq!(build.scene.width, Fixed::from_pixels(1));
+    assert_eq!(build.scene.height, Fixed::from_pixels(20));
+    assert!(build.scene.nodes.is_empty());
+    assert_eq!(build.report.visible_rows, 1);
+    assert_eq!(build.report.visible_columns, 0);
+    assert_eq!(build.report.hidden_columns_skipped, 1);
+    assert_eq!(build.report.rendered_regions, 0);
+
+    let svg = render_scene_svg(&build.scene, options.limits.max_output_bytes).unwrap();
+    assert!(svg.contains("width=\"1\" height=\"20\" viewBox=\"0 0 1 20\""));
+
+    let print = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            render: options,
+            single_page_sheets: true,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(print.pages[0].scene.width, Fixed::from_pixels(1));
+    assert_eq!(print.pages[0].scene.height, Fixed::from_pixels(20));
+    assert!(print.pages[0].scene.nodes.is_empty());
+
+    let mut hidden_both = Workbook::new();
+    let sheet = hidden_both.add_sheet("hidden axes");
+    sheet.write(0, 0, "hidden");
+    sheet.hide_row(0);
+    sheet.hide_column(0);
+    let too_small = RenderOptions {
+        limits: RenderLimits {
+            max_dimension_raw: 1_023,
+            ..RenderLimits::default()
+        },
+        ..RenderOptions::default()
+    };
+    assert_eq!(
+        build_scene(&hidden_both, 0, &too_small),
+        Err(RenderError::LimitExceeded {
+            kind: LimitKind::Dimension,
+            limit: 1_023,
+            actual: 1_024,
+        })
+    );
 }
 
 #[test]

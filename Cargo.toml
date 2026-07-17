@@ -33,6 +33,7 @@ exclude = [
     "scripts/render-corpus-sources.json",
     "scripts/render-fonts-lock.json",
     "scripts/render-oracle-container/",
+    "scripts/render-oracle-host-profile.xcu",
     "scripts/render-oracle-host-requirements.txt",
     "scripts/render-oracle-host-tools-lock.json",
     "scripts/render-oracle-host-tools.py",

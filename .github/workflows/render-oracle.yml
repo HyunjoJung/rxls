@@ -34,6 +34,7 @@ on:
       - "scripts/merge-render-parity-reports.py"
       - "scripts/render-fonts-lock.json"
       - "scripts/render-oracle-lock.json"
+      - "scripts/render-oracle-host-profile.xcu"
       - "scripts/render-parity-baseline-full.json"
       - "scripts/render-oracle-host-requirements.txt"
       - "scripts/render-oracle-host-tools-lock.json"

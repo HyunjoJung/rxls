@@ -104,7 +104,10 @@ The wrapper always creates an ephemeral container with:
 - fixed PIDs, CPU quota, memory/swap, file-descriptor, file-size, output, and
   wall-time limits;
 - a unique HOME, XDG directories, and LibreOffice profile for every run;
-- macro, Python macro, OLE/DDE, and external-link update suppression; and
+- macro and Python execution disabled, with automatic external-link updates
+  disabled;
+- active embedded OLE/DDE enabled only inside this isolated container because
+  LibreOffice uses the same global switch for native Calc chart objects;
 - pinned OOXML/ODF load-recalculation policy with OpenCL and threaded formula
   calculation disabled;
 - process-group termination followed by forced container cleanup on timeout.
@@ -112,3 +115,8 @@ The wrapper always creates an ephemeral container with:
 Evidence is streamed from the bounded tmpfs, validated before installation,
 and rejected if it contains a host input path. The host evidence directory is
 installed atomically only after all checks pass.
+
+Direct, unsandboxed host diagnostics use the separate
+`scripts/render-oracle-host-profile.xcu`, which disables active OLE/DDE content
+and therefore does not provide chart-acceptance evidence. Acquired or otherwise
+untrusted chart workbooks must run only through this container path.

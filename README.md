@@ -10,10 +10,10 @@
 > GitHub Release bundle, SBOM, and checksums are bound to commit
 > `33b4db17f2047febf9e6550299c3dde572afd6e5`.
 
-> **Development status:** `main` contains additive, unreleased work that is not
-> part of the crates.io `v0.1.2` package. The installation commands below
-> describe the published package; build from source to evaluate development
-> APIs and behavior.
+> **Development status:** The repository may contain additive, unreleased work
+> that is not part of the crates.io `v0.1.2` package. The installation commands
+> below describe the published package; build the checked-out source to evaluate
+> its development APIs and behavior.
 
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
 **`.xlsb`**, and **`.ods`** into one typed cell model; writes styled **`.xlsx`**;
@@ -209,7 +209,7 @@ for initialization and memory guidance.
 
 ## Rendering workspace
 
-Development `main` also contains a separate `rxls-render` crate and
+The unreleased source workspace also contains a separate `rxls-render` crate and
 `@rxls/render-worker` browser/WASM package. They are not part of the published
 core crate `v0.1.2`: the renderer builds one bounded fixed-point scene and
 replays it to deterministic SVG, PDF, and PNG, while the browser surface keeps

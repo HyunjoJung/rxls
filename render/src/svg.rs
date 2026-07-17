@@ -8,6 +8,8 @@ use crate::scene::{
     SceneNode, TextAnchor, TextBaseline, TextNode,
 };
 
+const MAX_CLIP_GROUP_DEPTH: usize = 64;
+
 /// Serialize a backend-neutral scene as deterministic SVG.
 pub fn render_scene_svg(scene: &Scene, max_output_bytes: u64) -> Result<String, RenderError> {
     render_scene_svg_impl(scene, max_output_bytes, None)
@@ -26,7 +28,7 @@ pub(crate) fn render_scene_svg_with_trace(
 fn render_scene_svg_impl(
     scene: &Scene,
     max_output_bytes: u64,
-    mut trace: Option<&mut BackendGeometryTrace>,
+    trace: Option<&mut BackendGeometryTrace>,
 ) -> Result<String, RenderError> {
     let mut out = BoundedString::new(max_output_bytes);
     out.push("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
@@ -38,34 +40,20 @@ fn render_scene_svg_impl(
     out.push(&format_fixed(scene.width))?;
     out.push(" ")?;
     out.push(&format_fixed(scene.height))?;
-    out.push("\" role=\"img\">\n<title>")?;
+    out.push("\" role=\"img\" overflow=\"hidden\">\n<title>")?;
     push_xml_escaped(&mut out, &scene.title, false)?;
     out.push("</title>\n")?;
 
-    let clipped_count = scene
-        .nodes
-        .iter()
-        .filter(|node| matches!(node, SceneNode::Text(_) | SceneNode::GlyphRun(_)))
-        .count();
-    if clipped_count != 0 {
+    let mut clip_bounds = Vec::new();
+    collect_clip_bounds(&scene.nodes, 0, &mut clip_bounds)?;
+    if !clip_bounds.is_empty() {
         out.push("<defs>\n")?;
-        let mut clip_index = 0_usize;
-        for node in &scene.nodes {
-            let bounds = match node {
-                SceneNode::Text(text) => Some(text.clip_bounds),
-                SceneNode::GlyphRun(glyphs) => Some(glyphs.clip_bounds),
-                SceneNode::Rect(_)
-                | SceneNode::Line(_)
-                | SceneNode::Path(_)
-                | SceneNode::Image(_) => None,
-            };
-            let Some(bounds) = bounds else { continue };
+        for (clip_index, bounds) in clip_bounds.into_iter().enumerate() {
             out.push("<clipPath id=\"clip-")?;
             out.push(&clip_index.to_string())?;
             out.push("\"><rect")?;
             push_rect_geometry(&mut out, bounds)?;
             out.push("/></clipPath>\n")?;
-            clip_index += 1;
         }
         out.push("</defs>\n")?;
     }
@@ -75,53 +63,120 @@ fn render_scene_svg_impl(
     out.push("\"/>\n")?;
 
     let mut clip_index = 0_usize;
-    for node in &scene.nodes {
+    push_scene_nodes(&mut out, &scene.nodes, &mut clip_index, trace, 0)?;
+    out.push("</svg>\n")?;
+    Ok(out.finish())
+}
+
+fn collect_clip_bounds(
+    nodes: &[SceneNode],
+    depth: usize,
+    output: &mut Vec<Rect>,
+) -> Result<(), RenderError> {
+    for node in nodes {
         match node {
+            SceneNode::ClipGroup(group) => {
+                if depth >= MAX_CLIP_GROUP_DEPTH {
+                    return Err(RenderError::Backend {
+                        reason: "svg_clip_group_depth",
+                    });
+                }
+                output.push(group.clip);
+                collect_clip_bounds(&group.nodes, depth + 1, output)?;
+            }
+            SceneNode::Text(text) => output.push(text.clip_bounds),
+            SceneNode::GlyphRun(glyphs) => output.push(glyphs.clip_bounds),
+            SceneNode::Rect(_) | SceneNode::Line(_) | SceneNode::Path(_) | SceneNode::Image(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn push_scene_nodes(
+    out: &mut BoundedString,
+    nodes: &[SceneNode],
+    clip_index: &mut usize,
+    mut trace: Option<&mut BackendGeometryTrace>,
+    depth: usize,
+) -> Result<(), RenderError> {
+    for node in nodes {
+        match node {
+            SceneNode::ClipGroup(group) => {
+                if depth >= MAX_CLIP_GROUP_DEPTH {
+                    return Err(RenderError::Backend {
+                        reason: "svg_clip_group_depth",
+                    });
+                }
+                let group_clip_index = *clip_index;
+                *clip_index = (*clip_index)
+                    .checked_add(1)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                out.push("<g clip-path=\"url(#clip-")?;
+                out.push(&group_clip_index.to_string())?;
+                out.push(")\">\n")?;
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipStart(group.clip));
+                }
+                push_scene_nodes(
+                    out,
+                    &group.nodes,
+                    clip_index,
+                    trace.as_deref_mut(),
+                    depth + 1,
+                )?;
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipEnd);
+                }
+                out.push("</g>\n")?;
+            }
             SceneNode::Rect(rect) => {
-                push_rect(&mut out, rect)?;
+                push_rect(out, rect)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Rect(rect.clone()));
                 }
             }
             SceneNode::Line(line) => {
-                push_line(&mut out, line)?;
+                push_line(out, line)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Line(line.clone()));
                 }
             }
             SceneNode::Path(path) => {
-                let path_trace = push_path_node(&mut out, path, trace.is_some())?;
+                let path_trace = push_path_node(out, path, trace.is_some())?;
                 if let (Some(trace), Some(path_trace)) = (trace.as_deref_mut(), path_trace) {
                     trace.push(BackendNodeTrace::Path(path_trace));
                 }
             }
             SceneNode::Image(image) => {
-                push_image(&mut out, image)?;
+                push_image(out, image)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Image(backend_image_trace(image)));
                 }
             }
             SceneNode::Text(text) => {
-                push_text(&mut out, text, clip_index)?;
+                push_text(out, text, *clip_index)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Text(backend_text_trace(
                         text,
                         text.hyperlink.as_deref(),
                     )));
                 }
-                clip_index += 1;
+                *clip_index = (*clip_index)
+                    .checked_add(1)
+                    .ok_or(RenderError::CoordinateOverflow)?;
             }
             SceneNode::GlyphRun(glyphs) => {
-                let glyph_trace = push_glyph_run(&mut out, glyphs, clip_index, trace.is_some())?;
+                let glyph_trace = push_glyph_run(out, glyphs, *clip_index, trace.is_some())?;
                 if let (Some(trace), Some(glyph_trace)) = (trace.as_deref_mut(), glyph_trace) {
                     trace.push(BackendNodeTrace::Glyph(glyph_trace));
                 }
-                clip_index += 1;
+                *clip_index = (*clip_index)
+                    .checked_add(1)
+                    .ok_or(RenderError::CoordinateOverflow)?;
             }
         }
     }
-    out.push("</svg>\n")?;
-    Ok(out.finish())
+    Ok(())
 }
 
 fn push_path_node(

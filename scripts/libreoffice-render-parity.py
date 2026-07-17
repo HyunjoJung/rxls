@@ -76,13 +76,9 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ORACLE_PROFILE_PATH = (
-    ROOT
-    / "scripts"
-    / "render-oracle-container"
-    / "profile"
-    / "registrymodifications.xcu"
-)
+# Direct host runs must disable active OLE/DDE content. The isolated container
+# owns a separate chart-enabled profile locked by render-oracle-container/lock.json.
+ORACLE_PROFILE_PATH = ROOT / "scripts" / "render-oracle-host-profile.xcu"
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
 RENDER_MANIFEST_SCHEMA = "rxls.render.bundle.v1"
 CONTAINER_OUTPUT_SCHEMA = "rxls.render-oracle-container-output.v2"

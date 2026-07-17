@@ -13,6 +13,8 @@ use crate::scene::{
     FIXED_UNITS_PER_PIXEL,
 };
 
+const MAX_CLIP_GROUP_DEPTH: usize = 64;
+
 /// Rasterize one print page at an explicit integer DPI.
 ///
 /// The page is preflighted before pixel allocation and encoded independently,
@@ -42,7 +44,7 @@ fn render_print_page_png_impl(
     page: &PrintPage,
     dpi: u32,
     document: &PrintDocument,
-    mut trace: Option<&mut BackendGeometryTrace>,
+    trace: Option<&mut BackendGeometryTrace>,
 ) -> Result<Vec<u8>, RenderError> {
     if !(36..=1_200).contains(&dpi) {
         return Err(RenderError::Backend {
@@ -64,30 +66,10 @@ fn render_print_page_png_impl(
         document.limits.max_raster_pixels,
         pixels,
     )?;
-    let mut commands = 0_u64;
-    for node in &page.scene.nodes {
-        commands = commands
-            .checked_add(match node {
-                SceneNode::Rect(_) => 1,
-                SceneNode::Line(_) => 2,
-                SceneNode::Path(node) => node.commands.len() as u64,
-                SceneNode::Image(_) => 1,
-                SceneNode::Text(_) => {
-                    return Err(RenderError::Backend {
-                        reason: "png_requires_outlined_text",
-                    });
-                }
-                SceneNode::GlyphRun(node) => {
-                    if !node.metadata_is_valid() {
-                        return Err(RenderError::Backend {
-                            reason: "invalid_glyph_metadata",
-                        });
-                    }
-                    node.commands.len() as u64 + node.decorations.len() as u64 * 2
-                }
-            })
-            .ok_or(RenderError::CoordinateOverflow)?;
-    }
+    let commands = page.scene.nodes.iter().try_fold(0_u64, |sum, node| {
+        sum.checked_add(node_command_count(node, 0)?)
+            .ok_or(RenderError::CoordinateOverflow)
+    })?;
     enforce(
         LimitKind::BackendCommands,
         document.limits.max_backend_commands,
@@ -100,15 +82,117 @@ fn render_print_page_png_impl(
     pixmap.fill(color(page.scene.background));
     let scale = dpi as f32 / 96.0;
     let base_transform = Transform::from_scale(scale, scale);
-    for node in &page.scene.nodes {
+    draw_scene_nodes(
+        &mut pixmap,
+        &page.scene.nodes,
+        width,
+        height,
+        dpi,
+        scale,
+        base_transform,
+        None,
+        trace,
+        0,
+    )?;
+    let png = pixmap.encode_png().map_err(|_| RenderError::Backend {
+        reason: "png_encoding",
+    })?;
+    enforce(
+        LimitKind::PngBytes,
+        document.limits.max_png_bytes_per_page,
+        png.len() as u64,
+    )?;
+    Ok(png)
+}
+
+fn node_command_count(node: &SceneNode, depth: usize) -> Result<u64, RenderError> {
+    match node {
+        SceneNode::ClipGroup(group) => {
+            if depth >= MAX_CLIP_GROUP_DEPTH {
+                return Err(RenderError::Backend {
+                    reason: "png_clip_group_depth",
+                });
+            }
+            group.nodes.iter().try_fold(2_u64, |sum, node| {
+                sum.checked_add(node_command_count(node, depth + 1)?)
+                    .ok_or(RenderError::CoordinateOverflow)
+            })
+        }
+        SceneNode::Rect(_) => Ok(1),
+        SceneNode::Line(_) => Ok(2),
+        SceneNode::Path(node) => Ok(node.commands.len() as u64),
+        SceneNode::Image(_) => Ok(1),
+        SceneNode::Text(_) => Err(RenderError::Backend {
+            reason: "png_requires_outlined_text",
+        }),
+        SceneNode::GlyphRun(node) => {
+            if !node.metadata_is_valid() {
+                return Err(RenderError::Backend {
+                    reason: "invalid_glyph_metadata",
+                });
+            }
+            (node.commands.len() as u64)
+                .checked_add(node.decorations.len() as u64 * 2)
+                .ok_or(RenderError::CoordinateOverflow)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_scene_nodes(
+    pixmap: &mut Pixmap,
+    nodes: &[SceneNode],
+    width: u32,
+    height: u32,
+    dpi: u32,
+    scale: f32,
+    base_transform: Transform,
+    active_clip: Option<Rect>,
+    mut trace: Option<&mut BackendGeometryTrace>,
+    depth: usize,
+) -> Result<(), RenderError> {
+    // A group clip is shared by every child. Build its page-sized raster mask
+    // once per recursion level instead of reallocating and refilling it for
+    // every rectangle, path, and image in a complex chart.
+    let active_mask = optional_clip_mask(width, height, active_clip, base_transform)?;
+    for node in nodes {
         match node {
+            SceneNode::ClipGroup(group) => {
+                if depth >= MAX_CLIP_GROUP_DEPTH {
+                    return Err(RenderError::Backend {
+                        reason: "png_clip_group_depth",
+                    });
+                }
+                let nested_clip = match active_clip {
+                    Some(active_clip) => intersect_rects(active_clip, group.clip)?,
+                    None => normalize_clip(group.clip),
+                };
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipStart(group.clip));
+                }
+                draw_scene_nodes(
+                    pixmap,
+                    &group.nodes,
+                    width,
+                    height,
+                    dpi,
+                    scale,
+                    base_transform,
+                    Some(nested_clip),
+                    trace.as_deref_mut(),
+                    depth + 1,
+                )?;
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(BackendNodeTrace::ClipEnd);
+                }
+            }
             SceneNode::Rect(node) => {
                 let Some(rect) = sk_rect(node.rect) else {
                     continue;
                 };
                 if let Some(fill) = node.fill {
                     let paint = solid_paint(fill, false);
-                    pixmap.fill_rect(rect, &paint, base_transform, None);
+                    pixmap.fill_rect(rect, &paint, base_transform, active_mask.as_ref());
                 }
                 if let Some(stroke_color) = node.stroke {
                     let path = rect_path(node.rect)?;
@@ -117,7 +201,13 @@ fn render_print_page_png_impl(
                         width: fixed_f32(node.stroke_width),
                         ..Stroke::default()
                     };
-                    pixmap.stroke_path(&path, &paint, &stroke, base_transform, None);
+                    pixmap.stroke_path(
+                        &path,
+                        &paint,
+                        &stroke,
+                        base_transform,
+                        active_mask.as_ref(),
+                    );
                 }
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Rect(node.clone()));
@@ -135,14 +225,20 @@ fn render_print_page_png_impl(
                     width: fixed_f32(node.width),
                     ..Stroke::default()
                 };
-                pixmap.stroke_path(&path, &paint, &stroke, base_transform, None);
+                pixmap.stroke_path(&path, &paint, &stroke, base_transform, active_mask.as_ref());
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Line(node.clone()));
                 }
             }
             SceneNode::Path(node) => {
                 let mut path_trace = trace.is_some().then(|| BackendPathTraceBuilder::new(node));
-                draw_path_node(&mut pixmap, node, base_transform, path_trace.as_mut())?;
+                draw_path_node(
+                    pixmap,
+                    node,
+                    base_transform,
+                    active_mask.as_ref(),
+                    path_trace.as_mut(),
+                )?;
                 if let (Some(trace), Some(path_trace)) = (trace.as_deref_mut(), path_trace) {
                     trace.push(BackendNodeTrace::Path(
                         path_trace.finish().map_err(trace_error)?,
@@ -150,7 +246,7 @@ fn render_print_page_png_impl(
                 }
             }
             SceneNode::Image(node) => {
-                draw_image_node(&mut pixmap, node, dpi)?;
+                draw_image_node(pixmap, node, dpi, active_mask.as_ref())?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Image(backend_image_trace(node)));
                 }
@@ -158,7 +254,11 @@ fn render_print_page_png_impl(
             SceneNode::Text(_) => unreachable!("preflight rejects approximate text"),
             SceneNode::GlyphRun(node) => {
                 let mut glyph_trace = trace.is_some().then(|| BackendGlyphTraceBuilder::new(node));
-                let mask = clip_mask(width, height, node.clip_bounds, base_transform)?;
+                let effective_clip = match active_clip {
+                    Some(active_clip) => intersect_rects(active_clip, node.clip_bounds)?,
+                    None => normalize_clip(node.clip_bounds),
+                };
+                let mask = clip_mask(width, height, effective_clip, base_transform)?;
                 if let Some(trace) = glyph_trace.as_mut() {
                     trace.record_clip(node.clip_bounds).map_err(trace_error)?;
                     // PNG cannot serialize an interactive annotation, but it
@@ -230,21 +330,14 @@ fn render_print_page_png_impl(
             }
         }
     }
-    let png = pixmap.encode_png().map_err(|_| RenderError::Backend {
-        reason: "png_encoding",
-    })?;
-    enforce(
-        LimitKind::PngBytes,
-        document.limits.max_png_bytes_per_page,
-        png.len() as u64,
-    )?;
-    Ok(png)
+    Ok(())
 }
 
 fn draw_path_node(
     pixmap: &mut Pixmap,
     node: &PathNode,
     transform: Transform,
+    mask: Option<&Mask>,
     mut trace: Option<&mut BackendPathTraceBuilder<'_>>,
 ) -> Result<(), RenderError> {
     let Some(path) = scene_path_with_trace(&node.commands, |index, command| {
@@ -258,7 +351,7 @@ fn draw_path_node(
     };
     if let Some(fill) = node.fill {
         let paint = solid_paint(fill, true);
-        pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        pixmap.fill_path(&path, &paint, FillRule::Winding, transform, mask);
     }
     if let Some(stroke_color) = node.stroke {
         let paint = solid_paint(stroke_color, true);
@@ -266,12 +359,17 @@ fn draw_path_node(
             width: fixed_f32(node.stroke_width),
             ..Stroke::default()
         };
-        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
+        pixmap.stroke_path(&path, &paint, &stroke, transform, mask);
     }
     Ok(())
 }
 
-fn draw_image_node(pixmap: &mut Pixmap, node: &ImageNode, dpi: u32) -> Result<(), RenderError> {
+fn draw_image_node(
+    pixmap: &mut Pixmap,
+    node: &ImageNode,
+    dpi: u32,
+    mask: Option<&Mask>,
+) -> Result<(), RenderError> {
     let expected = u64::from(node.pixel_width)
         .checked_mul(u64::from(node.pixel_height))
         .and_then(|value| value.checked_mul(4))
@@ -322,7 +420,7 @@ fn draw_image_node(pixmap: &mut Pixmap, node: &ImageNode, dpi: u32) -> Result<()
         quality: FilterQuality::Bilinear,
         ..PixmapPaint::default()
     };
-    pixmap.draw_pixmap(0, 0, source.as_ref(), &paint, transform, None);
+    pixmap.draw_pixmap(0, 0, source.as_ref(), &paint, transform, mask);
     Ok(())
 }
 
@@ -439,6 +537,81 @@ fn rect_path(rect: Rect) -> Result<Path, RenderError> {
     })
 }
 
+fn normalize_clip(rect: Rect) -> Rect {
+    Rect {
+        width: if rect.width.raw() > 0 {
+            rect.width
+        } else {
+            Fixed::ZERO
+        },
+        height: if rect.height.raw() > 0 {
+            rect.height
+        } else {
+            Fixed::ZERO
+        },
+        ..rect
+    }
+}
+
+fn intersect_rects(left: Rect, right: Rect) -> Result<Rect, RenderError> {
+    let left = normalize_clip(left);
+    let right = normalize_clip(right);
+    let left_right = left
+        .x
+        .checked_add(left.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left_bottom = left
+        .y
+        .checked_add(left.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_right = right
+        .x
+        .checked_add(right.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_bottom = right
+        .y
+        .checked_add(right.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let x = Fixed::from_raw(left.x.raw().max(right.x.raw()));
+    let y = Fixed::from_raw(left.y.raw().max(right.y.raw()));
+    let end_x = left_right.raw().min(right_right.raw());
+    let end_y = left_bottom.raw().min(right_bottom.raw());
+    let width = if end_x <= x.raw() {
+        Fixed::ZERO
+    } else {
+        Fixed::from_raw(
+            end_x
+                .checked_sub(x.raw())
+                .ok_or(RenderError::CoordinateOverflow)?,
+        )
+    };
+    let height = if end_y <= y.raw() {
+        Fixed::ZERO
+    } else {
+        Fixed::from_raw(
+            end_y
+                .checked_sub(y.raw())
+                .ok_or(RenderError::CoordinateOverflow)?,
+        )
+    };
+    Ok(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn optional_clip_mask(
+    width: u32,
+    height: u32,
+    rect: Option<Rect>,
+    transform: Transform,
+) -> Result<Option<Mask>, RenderError> {
+    rect.map(|rect| clip_mask(width, height, rect, transform))
+        .transpose()
+}
+
 fn clip_mask(
     width: u32,
     height: u32,
@@ -448,6 +621,9 @@ fn clip_mask(
     let mut mask = Mask::new(width, height).ok_or(RenderError::Backend {
         reason: "png_clip_allocation",
     })?;
+    if rect.width.raw() <= 0 || rect.height.raw() <= 0 {
+        return Ok(mask);
+    }
     let path = rect_path(rect)?;
     mask.fill_path(&path, FillRule::Winding, false, transform);
     Ok(mask)
@@ -561,6 +737,7 @@ mod tests {
                 alt_text: None,
             },
             96,
+            None,
         )
         .unwrap();
         let pixel = pixmap.pixel(2, 2).unwrap();

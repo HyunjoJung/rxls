@@ -4,7 +4,7 @@
     <prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop>
     <prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>
     <prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>
-    <prop oor:name="DisableActiveContent" oor:op="fuse"><value>false</value></prop>
+    <prop oor:name="DisableActiveContent" oor:op="fuse"><value>true</value></prop>
     <prop oor:name="DisablePythonRuntime" oor:op="fuse"><value>true</value></prop>
     <prop oor:name="DisableOLEAutomation" oor:op="fuse"><value>true</value></prop>
     <prop oor:name="CheckDocumentEvents" oor:op="fuse"><value>true</value></prop>

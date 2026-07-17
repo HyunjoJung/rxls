@@ -6,7 +6,7 @@
         "dpi": 96,
         "locale": "C.UTF-8",
         "pdf_filter": "pdf:calc_pdf_Export:{\"SinglePageSheets\":{\"type\":\"boolean\",\"value\":\"true\"}}",
-        "profile_sha256": "37bdaeb9ce539b8cecde680473746c5cbba5c562c95c78b6e952c554271061ba",
+        "profile_sha256": "14531ee278caed3e6b63195ad13295bc72a033de7d7b07dbc2f111a7aebddc46",
         "timezone": "UTC"
       },
       "font_pack_sha256": "ee367f523759b60294f38b8ed3c9c08738b9dea6c412605020eafdede4cfaeaa",

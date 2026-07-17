@@ -395,9 +395,23 @@ pub struct TextNode {
     pub hyperlink: Option<String>,
 }
 
+/// A deterministic rectangular clip applied to an ordered group of nodes.
+///
+/// Print tiles use this to retain full drawing geometry while preventing a
+/// partially intersecting object from bleeding into adjacent page regions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClipGroupNode {
+    /// Clip rectangle in the containing scene's coordinate system.
+    pub clip: Rect,
+    /// Ordered child paint operations.
+    pub nodes: Vec<SceneNode>,
+}
+
 /// One backend-neutral scene operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SceneNode {
+    /// Ordered child operations clipped as one rectangular group.
+    ClipGroup(ClipGroupNode),
     /// Filled and/or stroked rectangle.
     Rect(RectNode),
     /// Independent line, used for explicit cell borders.
@@ -505,6 +519,8 @@ pub(crate) struct BackendTextTrace {
 /// One scene node as independently consumed by a concrete backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BackendNodeTrace {
+    ClipStart(Rect),
+    ClipEnd,
     Rect(RectNode),
     Line(LineNode),
     Path(BackendPathTrace),
