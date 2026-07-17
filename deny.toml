@@ -2,12 +2,19 @@
 all-features = true
 
 [advisories]
-ignore = []
+# These notices report maintenance status, not a vulnerability, and provide no
+# safe upgrade. Keep the exact IDs visible while the rendering stack retains
+# rustybuzz/ttf-parser for deterministic shaping and font inspection.
+ignore = [
+  "RUSTSEC-2026-0192",
+  "RUSTSEC-2026-0206",
+]
 
 [licenses]
 allow = [
   "0BSD",
   "Apache-2.0",
+  "BSD-2-Clause",
   "BSD-3-Clause",
   "MIT",
   "Unicode-3.0",

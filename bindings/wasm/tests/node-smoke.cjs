@@ -69,7 +69,7 @@ for (const fixture of fixtures) {
   assert.ok(output.text.length > 0, `${fixture.id} text export is empty`);
   assert.equal(typeof output.csv, "string", `${fixture.id} CSV export is not text`);
   assert.match(output.html, /^<table>/, `${fixture.id} HTML export is not a table`);
-  assert.equal(output.report.schema_version, 1);
+  assert.equal(output.report.schema_version, 2);
   assert.equal(output.report.format, fixture.format);
   assert.ok(output.report.stats.sheets > 0);
   if (fixture.id === "xlsm") {

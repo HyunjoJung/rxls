@@ -234,6 +234,26 @@ class XlsXlrdParityTests(unittest.TestCase):
             "1904-01-01",
         )
 
+    def test_number_formats_select_sign_zero_and_conditional_sections(self) -> None:
+        module = load_xls_xlrd_parity_module()
+
+        cases = [
+            (2, 0.5, "0%;0", "50%"),
+            (2, -0.5, "0%;0", "-0.5"),
+            (2, 0.5, "0;0%", "0.5"),
+            (2, -0.5, "0;0%", "-50%"),
+            (2, 0.0, "0;0;yyyy-mm-dd", "00:00:00"),
+            (2, 42_803.0, "[>=40000]yyyy-mm-dd;0%", "2017-03-09"),
+            (2, 0.5, "[>=40000]yyyy-mm-dd;0%", "50%"),
+            (3, -1.0, "yyyy-mm-dd;0", "-1"),
+        ]
+        for cell_type, value, fmt, expected in cases:
+            with self.subTest(value=value, fmt=fmt):
+                self.assertEqual(
+                    module.render_xlrd_cell_value(cell_type, value, fmt, datemode=0),
+                    expected,
+                )
+
     def test_cli_skips_corpus_reported_expected_rejections(self) -> None:
         module = load_xls_xlrd_parity_module()
 
@@ -265,7 +285,8 @@ class XlsXlrdParityTests(unittest.TestCase):
                 return "ok"
 
             def fake_run(args, **_kwargs):
-                stdout = b"" if Path(args[-1]).name != "perfect.xls" else b"ok"
+                self.assertEqual(args[-1], "--typed-values")
+                stdout = b"" if Path(args[1]).name != "perfect.xls" else b"ok"
                 return SimpleNamespace(stdout=stdout)
 
             argv = [
@@ -351,7 +372,8 @@ class XlsXlrdParityTests(unittest.TestCase):
                 return "ok"
 
             def fake_run(args, **_kwargs):
-                name = Path(args[-1]).name
+                self.assertEqual(args[-1], "--typed-values")
+                name = Path(args[1]).name
                 stdout = {
                     "encrypted.xls": b"rxls text",
                     "oversized.xls": b"R",
@@ -502,7 +524,8 @@ class XlsXlrdParityTests(unittest.TestCase):
                 return "# Small\nok"
 
             def fake_run(args, **_kwargs):
-                if Path(args[-1]).name == "large.xls":
+                self.assertEqual(args[-1], "--typed-values")
+                if Path(args[1]).name == "large.xls":
                     stdout = b"# Large\n" + (b"x" * 200)
                 else:
                     stdout = b"# Small\nok"
@@ -559,7 +582,8 @@ class XlsXlrdParityTests(unittest.TestCase):
                 return "# Large\n" + "x" * 200
 
             def fake_run(args, **_kwargs):
-                name = Path(args[-1]).name
+                self.assertEqual(args[-1], "--typed-values")
+                name = Path(args[1]).name
                 if name == "small.xls":
                     stdout = b"# Small\nok"
                 elif name == "mismatch.xls":

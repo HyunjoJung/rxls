@@ -1,0 +1,1012 @@
+name: Render Oracle
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Run the 40-workbook pilot or two exact-SHA 800-workbook full campaigns
+        required: true
+        default: pilot
+        type: choice
+        options:
+          - pilot
+          - full
+      bootstrap_identities:
+        description: Capture the initially-null hosted and OCI identities without running parity
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/render-oracle.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "render/**"
+      - "scripts/check-authored-print-parity.py"
+      - "scripts/check-render-fidelity-targets.py"
+      - "scripts/check-render-parity-baseline.py"
+      - "scripts/check_workflow_policy.py"
+      - "scripts/compare-render-parity-runs.py"
+      - "scripts/fetch-render-fonts.py"
+      - "scripts/generate-render-corpus.py"
+      - "scripts/libreoffice-render-parity.py"
+      - "scripts/merge-render-parity-reports.py"
+      - "scripts/render-fonts-lock.json"
+      - "scripts/render-oracle-lock.json"
+      - "scripts/render-oracle-host-profile.xcu"
+      - "scripts/render-parity-baseline-full.json"
+      - "scripts/render-oracle-host-requirements.txt"
+      - "scripts/render-oracle-host-tools-lock.json"
+      - "scripts/render-oracle-host-tools.py"
+      - "scripts/run-render-oracle-container.py"
+      - "scripts/test_compare_render_parity_runs.py"
+      - "scripts/test_check_authored_print_parity.py"
+      - "scripts/test_check_render_fidelity_targets.py"
+      - "scripts/test_check_render_parity_baseline.py"
+      - "scripts/test_fetch_render_fonts.py"
+      - "scripts/test_generate_render_corpus.py"
+      - "scripts/test_libreoffice_render_parity.py"
+      - "scripts/test_merge_render_parity_reports.py"
+      - "scripts/test_render_oracle_container.py"
+      - "scripts/test_render_oracle_host_tools.py"
+      - "scripts/test_workflow_policy.py"
+      - "scripts/render-oracle-container/**"
+      - "src/**"
+      - "tests/fixtures/xls/korean-unicode-biff8.xls"
+  schedule:
+    - cron: "17 4 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-oracle-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  locked-linux-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'full' && 330 || 120 }}
+    env:
+      FULL_CASE_COUNT: "800"
+      FULL_AUTHORED_PRINT_COUNT: "100"
+      FULL_REPEAT_COUNT: "2"
+      FULL_SHARD_COUNT: "4"
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      MAX_PARALLEL_SHARDS: "2"
+      ORACLE_IMAGE: rxls-render-oracle:lo-26.2.3
+      PILOT_CASE_COUNT: "40"
+      PILOT_AUTHORED_PRINT_COUNT: "4"
+      PYTHONHASHSEED: "0"
+      RXLS_ORACLE_CAMPAIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
+      RXLS_IDENTITY_BOOTSTRAP: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_identities && '1' || '0' }}
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify the exact checked-out commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+      - name: Verify container, adapter, corpus, and font contracts
+        shell: bash
+        run: |
+          BOOTSTRAP_ARGS=()
+          if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
+            BOOTSTRAP_ARGS+=(--bootstrap-identities)
+          fi
+          python3 scripts/run-render-oracle-container.py verify-lock "${BOOTSTRAP_ARGS[@]}"
+          python3 scripts/render-oracle-host-tools.py verify-lock
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
+          python3 scripts/test_check_authored_print_parity.py
+          python3 scripts/test_check_render_fidelity_targets.py
+          python3 scripts/test_compare_render_parity_runs.py
+          python3 scripts/test_merge_render_parity_reports.py
+          python3 scripts/test_render_oracle_container.py
+          python3 scripts/test_render_oracle_host_tools.py
+          python3 scripts/test_fetch_render_fonts.py
+          python3 scripts/test_generate_render_corpus.py
+          python3 scripts/test_libreoffice_render_parity.py
+          bash -n scripts/render-oracle-container/oracle-entrypoint.sh
+      - name: Acquire exact comparison dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
+            sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils
+          else
+            SYSTEM_PACKAGE_TEXT="$(
+              python3 scripts/render-oracle-host-tools.py apt-specs --scope all
+            )"
+            mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+            [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+            sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"
+          fi
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --force-reinstall \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement scripts/render-oracle-host-requirements.txt
+          mkdir -p target/render-oracle-hosted
+          HOST_ARGS=()
+          if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
+            HOST_ARGS+=(--bootstrap-identities)
+          fi
+          python3 scripts/render-oracle-host-tools.py verify \
+            --scope all \
+            --output target/render-oracle-hosted/host-tools.json \
+            "${HOST_ARGS[@]}"
+      - name: Acquire fonts and generate the selected deterministic corpus
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RXLS_ORACLE_CAMPAIGN" in
+            pilot)
+              EXPECTED_CASES="$PILOT_CASE_COUNT"
+              EXPECTED_PER_FORMAT="10"
+              ;;
+            full)
+              EXPECTED_CASES="$FULL_CASE_COUNT"
+              EXPECTED_PER_FORMAT="200"
+              ;;
+            *)
+              exit 64
+              ;;
+          esac
+          python3 scripts/fetch-render-fonts.py --acquire
+          python3 scripts/fetch-render-fonts.py --verify
+          # Scheduled/push pilot contract: generate-render-corpus.py --generate --profile pilot
+          python3 scripts/generate-render-corpus.py \
+            --generate \
+            --profile "$RXLS_ORACLE_CAMPAIGN"
+          python3 scripts/generate-render-corpus.py \
+            --verify \
+            --profile "$RXLS_ORACLE_CAMPAIGN"
+          python3 - "$RXLS_ORACLE_CAMPAIGN" "$EXPECTED_CASES" "$EXPECTED_PER_FORMAT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          profile, raw_cases, raw_per_format = sys.argv[1:]
+          manifest_path = pathlib.Path("local/render-corpus-generated") / profile / "manifest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected_cases = int(raw_cases)
+          expected_per_format = int(raw_per_format)
+          assert manifest["profile"] == profile
+          assert manifest["case_count"] == expected_cases
+          assert manifest["format_counts"] == {
+              "ods": expected_per_format,
+              "xls": expected_per_format,
+              "xlsb": expected_per_format,
+              "xlsx": expected_per_format,
+          }
+          assert len(manifest["files"]) == expected_cases
+          assert manifest["rights_tier"] == "S"
+          assert manifest["redistribution"] == "allowed"
+          assert manifest["source_redistributable"] is True
+          assert manifest["render_redistributable"] is True
+          if profile == "full":
+              shards = [
+                  [
+                      row
+                      for row in manifest["files"]
+                      if int(row["sha256"][:16], 16) % 4 == shard_index
+                  ]
+                  for shard_index in range(4)
+              ]
+              assert all(180 <= len(rows) <= 220 for rows in shards)
+              assert all(
+                  40 <= sum(row["format"] == format_name for row in rows) <= 60
+                  for rows in shards
+                  for format_name in ("ods", "xls", "xlsb", "xlsx")
+              )
+          PY
+      - name: Build the exact renderer binary
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 build --locked --release --manifest-path render/Cargo.toml
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          path = pathlib.Path("render/target/release/rxls-render")
+          payload = path.read_bytes()
+          document = {
+              "bytes": len(payload),
+              "sha256": hashlib.sha256(payload).hexdigest(),
+          }
+          pathlib.Path("target/render-oracle-hosted/renderer.json").write_text(
+              json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Build and inspect the locked oracle image
+        shell: bash
+        run: |
+          BOOTSTRAP_ARGS=()
+          if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
+            BOOTSTRAP_ARGS+=(--bootstrap-identities)
+          fi
+          python3 scripts/run-render-oracle-container.py build \
+            --engine docker \
+            --image "$ORACLE_IMAGE" \
+            --execute \
+            "${BOOTSTRAP_ARGS[@]}" \
+            > target/render-oracle-hosted/build.json
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          document = json.load(open("target/render-oracle-hosted/build.json", encoding="utf-8"))
+          image_id = document.get("built_image_id", "")
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", image_id), document
+          if os.environ["RXLS_IDENTITY_BOOTSTRAP"] == "1":
+              assert document["image_identity_status"] in {
+                  "bootstrap_capture_required", "pinned_match"
+              }
+          else:
+              assert document["image_identity_status"] == "pinned_match"
+              assert document["expected_image_id"] == image_id
+          pathlib.Path("target/render-oracle-hosted/image-id.txt").write_text(
+              image_id + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Run the bounded four-format campaign through the container adapter
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RENDERER="${{ github.workspace }}/render/target/release/rxls-render"
+          RENDERER_SHA256="$(python3 -c 'import json; print(json.load(open("target/render-oracle-hosted/renderer.json"))["sha256"])')"
+          IMAGE_ID="$(cat target/render-oracle-hosted/image-id.txt)"
+          PDFFONTS_SHA256="$(python3 - <<'PY'
+          import json
+          import re
+
+          evidence = json.load(open("target/render-oracle-hosted/host-tools.json", encoding="utf-8"))
+          rows = [
+              row
+              for row in evidence["identity"]["poppler"]["executables"]
+              if row.get("name") == "pdffonts"
+          ]
+          assert len(rows) == 1
+          digest = rows[0].get("sha256", "")
+          assert re.fullmatch(r"[0-9a-f]{64}", digest)
+          print(digest)
+          PY
+          )"
+          ADAPTER="python3 ${{ github.workspace }}/scripts/run-render-oracle-container.py --lock ${{ github.workspace }}/scripts/render-oracle-container/lock.json render --engine docker --image ${IMAGE_ID} --source {input} --font-pack {font_pack} --evidence-dir {output_dir} --run-id {run_id} --timeout-seconds 180 --execute"
+
+          run_parity() {
+            local report="$1"
+            local shard_count="$2"
+            local shard_index="$3"
+            local max_files="$4"
+            local manifest="local/render-corpus-generated/${RXLS_ORACLE_CAMPAIGN}/manifest.json"
+            # Scheduled/push pilot resolves to:
+            # --manifest local/render-corpus-generated/pilot/manifest.json
+            # --max-files 40
+            python3 scripts/libreoffice-render-parity.py \
+              --manifest "$manifest" \
+              --max-files "$max_files" \
+              --max-candidates "$max_files" \
+              --shard-count "$shard_count" \
+              --shard-index "$shard_index" \
+              --rxls-command "$RENDERER" \
+              --renderer-binary-sha256 "$RENDERER_SHA256" \
+              --require-renderer-binary-identity \
+              --font-pack-manifest local/render-fonts/pack/manifest.json \
+              --require-font-pack \
+              --pdffonts-binary-sha256 "$PDFFONTS_SHA256" \
+              --libreoffice-command "$ADAPTER" \
+              --timeout-seconds 240 \
+              --fail-on-incomparable \
+              --report "$report"
+          }
+
+          run_full_campaign() {
+            local label="$1"
+            local shard_index
+            local batch_failed=0
+            local -a pids=()
+            local -a shard_reports=()
+
+            wait_batch() {
+              local pid
+              for pid in "${pids[@]}"; do
+                if ! wait "$pid"; then
+                  batch_failed=1
+                fi
+              done
+              pids=()
+              if (( batch_failed != 0 )); then
+                return 1
+              fi
+            }
+
+            for ((shard_index = 0; shard_index < FULL_SHARD_COUNT; shard_index++)); do
+              local report="target/render-oracle-hosted/parity-${label}-shard-${shard_index}.json"
+              shard_reports+=("$report")
+              run_parity "$report" "$FULL_SHARD_COUNT" "$shard_index" "$FULL_CASE_COUNT" &
+              pids+=("$!")
+              if (( ${#pids[@]} == MAX_PARALLEL_SHARDS )); then
+                wait_batch
+              fi
+            done
+            if (( ${#pids[@]} != 0 )); then
+              wait_batch
+            fi
+            python3 scripts/merge-render-parity-reports.py \
+              "${shard_reports[@]}" \
+              --output "target/render-oracle-hosted/parity-report-${label}.json"
+            rm -- "${shard_reports[@]}"
+          }
+
+          run_authored_print_parity() {
+            local report="$1"
+            local shard_count="$2"
+            local shard_index="$3"
+            local expected_workbooks="$4"
+            local manifest="local/render-corpus-generated/${RXLS_ORACLE_CAMPAIGN}/manifest.json"
+            local corpus_case_count="$PILOT_CASE_COUNT"
+            if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
+              corpus_case_count="$FULL_CASE_COUNT"
+            fi
+            python3 scripts/libreoffice-render-parity.py \
+              --manifest "$manifest" \
+              --max-files "$expected_workbooks" \
+              --max-candidates "$corpus_case_count" \
+              --format xlsx \
+              --required-feature print-settings \
+              --print-mode authored \
+              --shard-count "$shard_count" \
+              --shard-index "$shard_index" \
+              --rxls-command "$RENDERER" \
+              --renderer-binary-sha256 "$RENDERER_SHA256" \
+              --require-renderer-binary-identity \
+              --font-pack-manifest local/render-fonts/pack/manifest.json \
+              --require-font-pack \
+              --pdffonts-binary-sha256 "$PDFFONTS_SHA256" \
+              --libreoffice-command "$ADAPTER" \
+              --timeout-seconds 240 \
+              --fail-on-incomparable \
+              --report "$report"
+          }
+
+          run_full_authored_print_campaign() {
+            local shard_index
+            local batch_failed=0
+            local -a pids=()
+            local -a shard_reports=()
+
+            wait_authored_batch() {
+              local pid
+              for pid in "${pids[@]}"; do
+                if ! wait "$pid"; then
+                  batch_failed=1
+                fi
+              done
+              pids=()
+              if (( batch_failed != 0 )); then
+                return 1
+              fi
+            }
+
+            for ((shard_index = 0; shard_index < FULL_SHARD_COUNT; shard_index++)); do
+              local report="target/render-oracle-hosted/authored-print-shard-${shard_index}.json"
+              shard_reports+=("$report")
+              run_authored_print_parity \
+                "$report" \
+                "$FULL_SHARD_COUNT" \
+                "$shard_index" \
+                "$FULL_AUTHORED_PRINT_COUNT" &
+              pids+=("$!")
+              if (( ${#pids[@]} == MAX_PARALLEL_SHARDS )); then
+                wait_authored_batch
+              fi
+            done
+            if (( ${#pids[@]} != 0 )); then
+              wait_authored_batch
+            fi
+            python3 scripts/merge-render-parity-reports.py \
+              "${shard_reports[@]}" \
+              --output target/render-oracle-hosted/authored-print-report.json
+            rm -- "${shard_reports[@]}"
+          }
+
+          case "$RXLS_ORACLE_CAMPAIGN" in
+            pilot)
+              run_parity \
+                target/render-oracle-hosted/parity-report-a.json \
+                1 \
+                0 \
+                "$PILOT_CASE_COUNT"
+              run_authored_print_parity \
+                target/render-oracle-hosted/authored-print-report.json \
+                1 \
+                0 \
+                "$PILOT_AUTHORED_PRINT_COUNT"
+              ;;
+            full)
+              test "$FULL_REPEAT_COUNT" = "2"
+              test "$FULL_SHARD_COUNT" = "4"
+              test "$MAX_PARALLEL_SHARDS" = "2"
+              run_full_campaign a
+              run_full_campaign b
+              run_full_authored_print_campaign
+              ;;
+            *)
+              exit 64
+              ;;
+          esac
+      - name: Run absolute, same-SHA, and reviewed full-campaign ratchet gates
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          STATUS=0
+          if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
+            python3 scripts/compare-render-parity-runs.py \
+              target/render-oracle-hosted/parity-report-a.json \
+              target/render-oracle-hosted/parity-report-b.json \
+              --output target/render-oracle-hosted/repeatability.json \
+              || STATUS=1
+          fi
+          python3 scripts/check-render-fidelity-targets.py \
+            target/render-oracle-hosted/parity-report-a.json \
+            > target/render-oracle-hosted/fidelity-a.json \
+            || STATUS=1
+          if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
+            python3 scripts/check-render-fidelity-targets.py \
+              target/render-oracle-hosted/parity-report-b.json \
+              > target/render-oracle-hosted/fidelity-b.json \
+              || STATUS=1
+            for label in a b; do
+              python3 scripts/check-render-parity-baseline.py \
+                --evidence "target/render-oracle-hosted/parity-report-${label}.json" \
+                --baseline scripts/render-parity-baseline-full.json \
+                --campaign-manifest local/render-corpus-generated/full/manifest.json \
+                --candidate-baseline "target/render-oracle-hosted/baseline-candidate-${label}.json" \
+                --report "target/render-oracle-hosted/baseline-gate-${label}.json" \
+                --require-hosted-full-800 \
+                || STATUS=1
+            done
+          fi
+          AUTHORED_PRINT_WORKBOOKS="$PILOT_AUTHORED_PRINT_COUNT"
+          if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
+            AUTHORED_PRINT_WORKBOOKS="$FULL_AUTHORED_PRINT_COUNT"
+          fi
+          python3 scripts/check-authored-print-parity.py \
+            target/render-oracle-hosted/authored-print-report.json \
+            --expected-workbooks "$AUTHORED_PRINT_WORKBOOKS" \
+            > target/render-oracle-hosted/authored-print-gate.json \
+            || STATUS=1
+          printf '%s\n' "$STATUS" > target/render-oracle-hosted/gate-status.txt
+      - name: Verify and minimize aggregate-only hosted evidence
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          from collections import Counter
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+
+          def load(path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def sha256(payload):
+              return hashlib.sha256(payload).hexdigest()
+
+          def warning_counts(report):
+              counts = Counter()
+              for row in report["files"]:
+                  for scene in row.get("scenes", []):
+                      for warning in scene.get("warnings", []):
+                          code = warning.get("code", "")
+                          occurrences = warning.get("occurrences")
+                          assert re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code)
+                          assert isinstance(occurrences, int) and occurrences > 0
+                          counts[code] += occurrences
+              return dict(sorted(counts.items()))
+
+          root = pathlib.Path("target/render-oracle-hosted")
+          profile = os.environ["RXLS_ORACLE_CAMPAIGN"]
+          assert profile in {"pilot", "full"}
+          expected_cases = 40 if profile == "pilot" else 800
+          expected_authored_print = 4 if profile == "pilot" else 100
+          expected_per_format = 10 if profile == "pilot" else 200
+          expected_repetitions = 1 if profile == "pilot" else 2
+          expected_shards = 1 if profile == "pilot" else 4
+          report_paths = [root / "parity-report-a.json"]
+          if profile == "full":
+              report_paths.append(root / "parity-report-b.json")
+
+          build = load(root / "build.json")
+          renderer = load(root / "renderer.json")
+          host_tools = load(root / "host-tools.json")
+          corpus_path = (
+              pathlib.Path("local/render-corpus-generated") / profile / "manifest.json"
+          )
+          corpus_payload = corpus_path.read_bytes()
+          corpus = json.loads(corpus_payload)
+          font_manifest = load(pathlib.Path("local/render-fonts/pack/manifest.json"))
+
+          head_sha = os.environ["EXPECTED_HEAD_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", head_sha)
+          assert build["image_identity_status"] == "pinned_match"
+          assert build["expected_image_id"] == build["built_image_id"]
+          assert host_tools["identity_status"] == "pinned_match"
+          assert host_tools["scope"] == "all"
+          assert host_tools["captured_identity_sha256"] == host_tools["expected_identity_sha256"]
+          pdffonts_rows = [
+              row
+              for row in host_tools["identity"]["poppler"]["executables"]
+              if row.get("name") == "pdffonts"
+          ]
+          assert len(pdffonts_rows) == 1
+          pdffonts_sha256 = pdffonts_rows[0]["sha256"]
+          assert re.fullmatch(r"[0-9a-f]{64}", pdffonts_sha256)
+          assert corpus["profile"] == profile
+          assert corpus["case_count"] == expected_cases
+          assert corpus["format_counts"] == {
+              "ods": expected_per_format,
+              "xls": expected_per_format,
+              "xlsb": expected_per_format,
+              "xlsx": expected_per_format,
+          }
+
+          evidence_runs = []
+          reports = []
+          gates = []
+          warning_runs = []
+          for index, report_path in enumerate(report_paths):
+              report_payload = report_path.read_bytes()
+              report = json.loads(report_payload)
+              reports.append(report)
+              warning_runs.append(warning_counts(report))
+              assert report["mode"] == "compare"
+              if profile == "pilot":
+                  assert report["summary"]["by_status"] == {"compared": 40}
+              assert report["summary"]["files"] == expected_cases
+              assert report["summary"]["by_status"] == {"compared": expected_cases}
+              assert report["discovery"] == {
+                  "candidate_count": expected_cases,
+                  "pre_shard_selected_count": expected_cases,
+                  "selected_count": expected_cases,
+                  "shard_candidate_count": expected_cases,
+                  "shard_count": 1,
+                  "shard_index": 0,
+                  "truncated": False,
+              }
+              assert Counter(row["format"] for row in report["files"]) == {
+                  "ods": expected_per_format,
+                  "xls": expected_per_format,
+                  "xlsb": expected_per_format,
+                  "xlsx": expected_per_format,
+              }
+              assert report["configuration"]["renderer_binary"] == renderer
+              assert (
+                  report["configuration"]["font_pack"]["pack_sha256"]
+                  == font_manifest["pack_sha256"]
+              )
+
+              adapters = [row.get("oracle_adapter") for row in report["files"]]
+              assert all(isinstance(row, dict) for row in adapters)
+              assert {row["schema"] for row in adapters} == {
+                  "rxls.render-oracle-container-execution.v2"
+              }
+              assert {row["image"]["architecture"] for row in adapters} == {
+                  "linux/amd64"
+              }
+              assert {row["image"]["id"] for row in adapters} == {
+                  build["built_image_id"]
+              }
+              assert {row["image"]["expected_id"] for row in adapters} == {
+                  build["built_image_id"]
+              }
+              assert {row["image"]["identity_status"] for row in adapters} == {
+                  "pinned_match"
+              }
+              assert {row["lock_sha256"] for row in adapters} == {
+                  build["build_contract_sha256"]
+              }
+              assert {row["lock_file_sha256"] for row in adapters} == {
+                  build["lock_file_sha256"]
+              }
+              assert {row["font_pack_sha256"] for row in adapters} == {
+                  font_manifest["pack_sha256"]
+              }
+              assert {row["runtime"] for row in adapters} == {"docker"}
+              assert {json.dumps(row["oracle"], sort_keys=True) for row in adapters} == {
+                  json.dumps(adapters[0]["oracle"], sort_keys=True)
+              }
+
+              oracle_lock = report["configuration"]["oracle_lock"]
+              assert set(oracle_lock) == {
+                  "build_contract_sha256",
+                  "font_pack_sha256",
+                  "image",
+                  "libreoffice",
+                  "lock_file_sha256",
+                  "pdf_font_inspector",
+                  "runtime",
+                  "schema",
+              }
+              assert oracle_lock["schema"] == "rxls.render-oracle-container-identity.v1"
+              assert oracle_lock["build_contract_sha256"] == build["build_contract_sha256"]
+              assert oracle_lock["lock_file_sha256"] == build["lock_file_sha256"]
+              assert oracle_lock["font_pack_sha256"] == font_manifest["pack_sha256"]
+              assert oracle_lock["image"] == {
+                  "architecture": "linux/amd64",
+                  "config_digest": build["built_image_id"],
+                  "expected_config_digest": build["built_image_id"],
+                  "identity_status": "pinned_match",
+              }
+              assert oracle_lock["libreoffice"] == adapters[0]["oracle"]
+              assert oracle_lock["runtime"] == "docker"
+              assert oracle_lock["pdf_font_inspector"] == {
+                  "kind": "poppler",
+                  "pdffonts_sha256": pdffonts_sha256,
+              }
+
+              for row in report["files"]:
+                  attestation = row.get("font_attestation")
+                  assert isinstance(attestation, dict)
+                  font_objects = attestation.get("font_objects")
+                  assert isinstance(font_objects, int) and font_objects > 0
+                  assert attestation["embedded_font_objects"] == font_objects
+                  assert attestation["subset_font_objects"] == font_objects
+                  assert attestation["unicode_font_objects"] == font_objects
+                  assert attestation["matched_font_objects"] == font_objects
+                  assert re.fullmatch(
+                      r"[0-9a-f]{64}",
+                      attestation["normalized_identities_sha256"],
+                  )
+
+              report_sha256 = sha256(report_payload)
+              gate_path = root / f"fidelity-{'ab'[index]}.json"
+              gate_payload = gate_path.read_bytes()
+              gate = json.loads(gate_payload)
+              gates.append(gate)
+              assert gate["passed"] is True
+              assert gate["failures"] == []
+              assert gate["coverage"]["report_workbooks"] == expected_cases
+              assert gate["evidence"]["sha256"] == report_sha256
+              assert gate["evidence"]["renderer_sha256"] == renderer["sha256"]
+              assert (
+                  gate["evidence"]["font_pack_sha256"]
+                  == font_manifest["pack_sha256"]
+              )
+              assert (
+                  gate["evidence"]["oracle_build_contract_sha256"]
+                  == build["build_contract_sha256"]
+              )
+              assert (
+                  gate["evidence"]["oracle_image_config_digest"]
+                  == build["built_image_id"]
+              )
+              assert (
+                  gate["evidence"]["oracle_lock_file_sha256"]
+                  == build["lock_file_sha256"]
+              )
+              assert (
+                  gate["evidence"]["oracle_libreoffice_artifact_sha256"]
+                  == adapters[0]["oracle"]["artifact_sha256"]
+              )
+              assert gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256
+              evidence_runs.append(
+                  {
+                      "fidelity_gate_sha256": sha256(gate_payload),
+                      "report_bytes": len(report_payload),
+                      "report_sha256": report_sha256,
+                  }
+              )
+
+          authored_report_path = root / "authored-print-report.json"
+          authored_report_payload = authored_report_path.read_bytes()
+          authored_report = json.loads(authored_report_payload)
+          assert authored_report["mode"] == "compare"
+          assert authored_report["configuration"]["print_mode"] == "authored"
+          assert authored_report["configuration"]["lane_filter"] == {
+              "formats": ["xlsx"],
+              "required_features": ["print-settings"],
+          }
+          assert authored_report["summary"]["files"] == expected_authored_print
+          assert authored_report["summary"]["by_status"] == {
+              "compared": expected_authored_print
+          }
+          assert {row["format"] for row in authored_report["files"]} == {"xlsx"}
+          assert all(
+              "print-settings" in row.get("features", [])
+              for row in authored_report["files"]
+          )
+          authored_gate_path = root / "authored-print-gate.json"
+          authored_gate_payload = authored_gate_path.read_bytes()
+          authored_gate = json.loads(authored_gate_payload)
+          assert authored_gate["schema"] == "rxls.authored-print-parity.v1"
+          assert authored_gate["passed"] is True
+          assert authored_gate["failures"] == []
+          assert authored_gate["coverage"]["workbooks"] == expected_authored_print
+          assert authored_gate["coverage"]["pages"] == expected_authored_print * 4
+          assert set(authored_gate["coverage"]["by_scale_mode"]) == {"fit", "scale"}
+          assert authored_gate["evidence"]["report_sha256"] == sha256(
+              authored_report_payload
+          )
+          assert authored_gate["evidence"]["renderer_sha256"] == renderer["sha256"]
+          assert (
+              authored_gate["evidence"]["font_pack_sha256"]
+              == font_manifest["pack_sha256"]
+          )
+          assert (
+              authored_gate["evidence"]["oracle_libreoffice_artifact_sha256"]
+              == adapters[0]["oracle"]["artifact_sha256"]
+          )
+          assert authored_gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256
+          authored_print_summary = {
+              "coverage": authored_gate["coverage"],
+              "evidence": authored_gate["evidence"],
+              "expected": authored_gate["expected"],
+              "metrics": authored_gate["metrics"],
+              "passed": authored_gate["passed"],
+              "sha256": sha256(authored_gate_payload),
+              "thresholds": authored_gate["thresholds"],
+          }
+
+          repeatability_summary = None
+          baseline_ratcheting = {
+              "applies": False,
+              "candidate_baselines": [],
+              "gates": [],
+              "passed": None,
+              "reviewed_baseline_available": False,
+              "reviewed_warning_policy": None,
+          }
+          if profile == "full":
+              assert warning_runs[0] == warning_runs[1]
+              repeatability_path = root / "repeatability.json"
+              repeatability_payload = repeatability_path.read_bytes()
+              repeatability = json.loads(repeatability_payload)
+              assert repeatability["status"] == "pass"
+              assert repeatability["failures"] == []
+              assert repeatability["coverage"]["workbooks"] == expected_cases
+              assert repeatability["identity"]["configuration"]["equal"] is True
+              assert repeatability["identity"]["input_set"]["equal"] is True
+              assert repeatability["identity"]["preflight"]["equal"] is True
+              assert repeatability["identity"]["renderer_binary"]["equal"] is True
+              assert repeatability["reports"]["baseline"]["sha256"] == evidence_runs[0]["report_sha256"]
+              assert repeatability["reports"]["candidate"]["sha256"] == evidence_runs[1]["report_sha256"]
+              repeatability_summary = {
+                  "coverage": repeatability["coverage"],
+                  "sha256": sha256(repeatability_payload),
+                  "status": repeatability["status"],
+                  "thresholds_ppm": repeatability["thresholds_ppm"],
+              }
+
+              baseline_candidates = []
+              baseline_gates = []
+              for label in ("a", "b"):
+                  candidate_path = root / f"baseline-candidate-{label}.json"
+                  candidate_payload = candidate_path.read_bytes()
+                  candidate = json.loads(candidate_payload)
+                  assert candidate["schema"] == "rxls.render-parity-baseline.v2"
+                  assert candidate["input_files"] == expected_cases
+                  assert candidate["campaign"]["schema"] == "rxls.render-parity-campaign.v1"
+                  assert candidate["campaign"]["kind"] == "project_generated_hosted_full"
+                  assert candidate["campaign"]["profile"] == "full"
+                  assert candidate["campaign"]["case_count"] == expected_cases
+                  assert candidate["campaign"]["format_counts"] == {
+                      "ods": expected_per_format,
+                      "xls": expected_per_format,
+                      "xlsb": expected_per_format,
+                      "xlsx": expected_per_format,
+                  }
+                  assert candidate["campaign"]["feature_counts"] == corpus["feature_counts"]
+                  assert candidate["campaign"]["manifest_sha256"] == sha256(corpus_payload)
+                  assert candidate["campaign"]["input_set_sha256"] == candidate["input_set_sha256"]
+                  baseline_candidates.append(
+                      {
+                          "campaign_sha256": sha256(
+                              (json.dumps(candidate["campaign"], indent=2, sort_keys=True) + "\n").encode()
+                          ),
+                          "sha256": sha256(candidate_payload),
+                          "warning_counts": candidate["warning_counts"],
+                      }
+                  )
+
+                  gate_path = root / f"baseline-gate-{label}.json"
+                  gate_payload = gate_path.read_bytes()
+                  gate = json.loads(gate_payload)
+                  assert gate["schema"] == "rxls.render-parity-baseline-check.v1"
+                  assert gate["candidate_sha256"] == sha256(candidate_payload)
+                  if gate.get("passed") is True:
+                      assert gate["failures"] == []
+                      assert gate["campaign"]["case_count"] == expected_cases
+                      assert gate["campaign"]["kind"] == "project_generated_hosted_full"
+                      assert gate["campaign"]["manifest_sha256"] == sha256(corpus_payload)
+                      warning_policy = gate["warning_policy"]
+                      assert warning_policy["unclassified_codes"] == []
+                      assert warning_policy["reviewed_code_count"] >= warning_policy["candidate_code_count"]
+                  baseline_gates.append(
+                      {
+                          "baseline_sha256": gate.get("baseline_sha256"),
+                          "candidate_sha256": gate["candidate_sha256"],
+                          "failures": gate["failures"],
+                          "passed": gate["passed"],
+                          "sha256": sha256(gate_payload),
+                          "warning_policy": gate.get("warning_policy"),
+                      }
+                  )
+
+              ratchets_passed = all(gate["passed"] for gate in baseline_gates)
+              warning_policies = [
+                  gate["warning_policy"]
+                  for gate in baseline_gates
+                  if gate["warning_policy"] is not None
+              ]
+              baseline_ratcheting = {
+                  "applies": True,
+                  "candidate_baselines": baseline_candidates,
+                  "gates": baseline_gates,
+                  "passed": ratchets_passed,
+                  "reviewed_baseline_available": all(
+                      gate["baseline_sha256"] is not None for gate in baseline_gates
+                  ),
+                  "reviewed_warning_policy": (
+                      warning_policies[0]
+                      if warning_policies and all(row == warning_policies[0] for row in warning_policies)
+                      else None
+                  ),
+              }
+
+          report = reports[-1]
+          adapters = [row["oracle_adapter"] for row in report["files"]]
+          shard_rows = [
+              [
+                  row
+                  for row in corpus["files"]
+                  if int(row["sha256"][:16], 16) % expected_shards == shard_index
+              ]
+              for shard_index in range(expected_shards)
+          ]
+          summary = {
+              "authored_print": authored_print_summary,
+              "baseline_ratcheting": baseline_ratcheting,
+              "campaign": {
+                  "case_count": expected_cases,
+                  "mode": profile,
+                  "parallel_shards": 1 if profile == "pilot" else 2,
+                  "repetitions": expected_repetitions,
+                  "shard_case_counts": [len(rows) for rows in shard_rows],
+                  "shard_count": expected_shards,
+                  "shard_format_counts": [
+                      {
+                          format_name: sum(
+                              row["format"] == format_name for row in rows
+                          )
+                          for format_name in ("ods", "xls", "xlsb", "xlsx")
+                      }
+                      for rows in shard_rows
+                  ],
+              },
+              "container": {
+                  "build_contract_sha256": build["build_contract_sha256"],
+                  "expected_image_id": build["expected_image_id"],
+                  "image_id": build["built_image_id"],
+                  "identity_status": build["image_identity_status"],
+                  "lock_file_sha256": build["lock_file_sha256"],
+                  "oracle_artifact_sha256": adapters[0]["oracle"]["artifact_sha256"],
+                  "oracle_version": adapters[0]["oracle"]["version"],
+              },
+              "corpus": {
+                  "acquired_corpus_included": False,
+                  "case_count": corpus["case_count"],
+                  "feature_counts": corpus["feature_counts"],
+                  "format_counts": corpus["format_counts"],
+                  "license": corpus["license"],
+                  "manifest_sha256": sha256(corpus_payload),
+                  "scope": "project_generated_hosted_acceptance",
+                  "profile": corpus["profile"],
+                  "redistribution": corpus["redistribution"],
+                  "rights_tier": corpus["rights_tier"],
+              },
+              "evidence_runs": evidence_runs,
+              "fidelity": [
+                  {
+                      "coverage": gate["coverage"],
+                      "metrics": gate["metrics"],
+                      "passed": gate["passed"],
+                      "thresholds": gate["thresholds"],
+                  }
+                  for gate in gates
+              ],
+              "font_pack": report["configuration"]["font_pack"],
+              "head_sha": head_sha,
+              "host_tools": host_tools,
+              "metrics": report["summary"]["metric_cohorts"],
+              "renderer": renderer,
+              "repeatability": repeatability_summary,
+              "schema": "rxls.render-oracle-hosted-campaign.v4",
+              "summary": {
+                  "by_classification": report["summary"]["by_classification"],
+                  "by_status": report["summary"]["by_status"],
+                  "files": report["summary"]["files"],
+                  "input_bytes_considered": report["summary"]["input_bytes_considered"],
+                  "warning_counts": warning_runs[-1],
+              },
+          }
+          summary_path = root / "hosted-summary.json"
+          summary_path.write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+
+          def reject_path_bearing_strings(value):
+              if isinstance(value, dict):
+                  assert "path" not in value
+                  for item in value.values():
+                      reject_path_bearing_strings(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      reject_path_bearing_strings(item)
+              elif isinstance(value, str):
+                  lowered = value.lower()
+                  assert not value.startswith("/")
+                  assert not re.match(r"[A-Za-z]:[\\/]", value)
+                  assert not lowered.startswith("file://")
+                  assert "local/render-corpus" not in lowered
+                  assert "render-corpus-generated" not in lowered
+                  assert "payload/" not in lowered
+
+          for aggregate_path in [
+              root / "build.json",
+              root / "authored-print-gate.json",
+              root / "baseline-candidate-a.json",
+              root / "baseline-candidate-b.json",
+              root / "baseline-gate-a.json",
+              root / "baseline-gate-b.json",
+              root / "fidelity-a.json",
+              root / "fidelity-b.json",
+              root / "host-tools.json",
+              root / "repeatability.json",
+              root / "renderer.json",
+              summary_path,
+          ]:
+              if aggregate_path.exists():
+                  reject_path_bearing_strings(load(aggregate_path))
+          for report_path in report_paths:
+              report_path.unlink()
+          authored_report_path.unlink()
+          PY
+          test "$(cat target/render-oracle-hosted/gate-status.txt)" = "0"
+      - name: Upload path-neutral aggregate identities only
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-oracle-${{ github.sha }}-${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
+          path: |
+            target/render-oracle-hosted/authored-print-gate.json
+            target/render-oracle-hosted/baseline-candidate-a.json
+            target/render-oracle-hosted/baseline-candidate-b.json
+            target/render-oracle-hosted/baseline-gate-a.json
+            target/render-oracle-hosted/baseline-gate-b.json
+            target/render-oracle-hosted/build.json
+            target/render-oracle-hosted/fidelity-a.json
+            target/render-oracle-hosted/fidelity-b.json
+            target/render-oracle-hosted/hosted-summary.json
+            target/render-oracle-hosted/host-tools.json
+            target/render-oracle-hosted/repeatability.json
+            target/render-oracle-hosted/renderer.json
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 30

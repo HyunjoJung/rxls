@@ -4,8 +4,8 @@
 openpyxl (the canonical Python OOXML reader) is used as an independent oracle —
 NOT the rxls golden — so this measures rxls against a real reference parser. For
 each `.xlsx`/`.xlsm` in the corpus it renders an openpyxl "golden" text the same
-way rxls does (cells in row/col order; dates as ISO; literal-aware percent ×100;
-numbers whole->int) and compares it to the rxls `extract` example output with a
+way rxls `extract --typed-values` does (cells in row/col order; dates as ISO;
+literal-aware percent ×100; numbers whole->int) and compares them with a
 whitespace-insensitive ratio. It mirrors `scripts/xls-xlrd-parity.py` closely,
 swapping xlrd→openpyxl, so the two harnesses apply identical rendering rules.
 
@@ -43,6 +43,7 @@ import datetime
 import difflib
 import hashlib
 import io
+import math
 import posixpath
 import re
 import subprocess
@@ -368,47 +369,181 @@ def _strip_literals(fmt):
     return "".join(out)
 
 
-def _is_percent(fmt):
-    return "%" in _strip_literals(fmt)
+def _split_number_format_sections(fmt):
+    sections = []
+    start = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c == '"':
+            i = fmt.find('"', i + 1)
+            if i < 0:
+                return None
+        elif c == "[":
+            i = fmt.find("]", i + 1)
+            if i < 0:
+                return None
+        elif c in "\\_*":
+            i += 1
+            if i >= len(fmt):
+                return None
+        elif c == ";":
+            if len(sections) == 3:
+                return None
+            sections.append(fmt[start:i])
+            start = i + 1
+        i += 1
+    sections.append(fmt[start:])
+    return sections
 
 
-def _format_timedelta(value, fmt):
-    low = fmt.lower().replace("\\", "")
+def _section_condition(section):
+    condition = None
+    i = 0
+    while i < len(section):
+        c = section[i]
+        if c == '"':
+            i = section.find('"', i + 1)
+            if i < 0:
+                return False, None
+        elif c == "[":
+            end = section.find("]", i + 1)
+            if end < 0:
+                return False, None
+            inner = section[i + 1 : end]
+            if inner.startswith(("<", ">", "=")):
+                match = re.fullmatch(r"(<=|>=|<>|<|>|=)\s*(.+?)\s*", inner)
+                if match is None or condition is not None:
+                    return False, None
+                try:
+                    threshold = float(match.group(2))
+                except ValueError:
+                    return False, None
+                if not math.isfinite(threshold):
+                    return False, None
+                condition = (match.group(1), threshold)
+            i = end
+        elif c in "\\_*":
+            i += 1
+            if i >= len(section):
+                return False, None
+        i += 1
+    return True, condition
+
+
+def _condition_matches(condition, value):
+    operator, threshold = condition
+    return {
+        "<": value < threshold,
+        "<=": value <= threshold,
+        "=": value == threshold,
+        "<>": value != threshold,
+        ">=": value >= threshold,
+        ">": value > threshold,
+    }[operator]
+
+
+def _active_number_format(fmt, value):
+    sections = _split_number_format_sections(fmt)
+    if not sections:
+        return ""
+    numeric = sections[:3]
+    parsed = [_section_condition(section) for section in numeric]
+    if not all(valid for valid, _condition in parsed):
+        return ""
+    conditions = [condition for _valid, condition in parsed]
+    if any(condition is not None for condition in conditions):
+        for section, condition in zip(numeric, conditions):
+            if condition is not None and _condition_matches(condition, value):
+                return section
+        for section, condition in reversed(list(zip(numeric, conditions))):
+            if condition is None:
+                return section
+        return ""
+    if len(numeric) == 1:
+        return numeric[0]
+    if len(numeric) == 2:
+        return numeric[1] if math.copysign(1.0, value) < 0.0 else numeric[0]
+    if value > 0.0:
+        return numeric[0]
+    if value < 0.0:
+        return numeric[1]
+    return numeric[2]
+
+
+def _is_elapsed_time(fmt):
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c == '"':
+            i = fmt.find('"', i + 1)
+            if i < 0:
+                return False
+        elif c == "[":
+            end = fmt.find("]", i + 1)
+            if end < 0:
+                return False
+            inner = fmt[i + 1 : end].lower()
+            if inner and all(field in {"h", "m", "s"} for field in inner):
+                return True
+            i = end
+        elif c in "\\_*":
+            i += 1
+        i += 1
+    return False
+
+
+def _format_kind(fmt):
+    if "%" in _strip_literals(fmt):
+        return "percent"
+    if _is_elapsed_time(fmt):
+        return "elapsed"
+    low = _strip_literals(fmt).replace("am/pm", "").replace("a/p", "")
+    has_time = "h" in low or "s" in low
+    month_tokens = low.count("m")
+    has_month = month_tokens >= 3 or (month_tokens >= 1 and not has_time)
+    has_date = "y" in low or "d" in low or has_month
+    if has_date and has_time:
+        return "datetime"
+    if has_date:
+        return "date"
+    if has_time:
+        return "time"
+    return "plain"
+
+
+def _format_timedelta(value, _fmt):
     total_seconds = int(round(value.total_seconds()))
     sign = "-" if total_seconds < 0 else ""
     total_seconds = abs(total_seconds)
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
     seconds = total_seconds % 60
-
-    match = re.search(r"\[(h+)\]", low)
-    if match:
-        return f"{sign}{hours}:{minutes:02d}:{seconds:02d}"
-
-    match = re.search(r"\[(m+)\]", low)
-    if match:
-        width = len(match.group(1))
-        total_minutes = total_seconds // 60
-        return f"{sign}{total_minutes:0{width}d}:{seconds:02d}"
-
-    match = re.search(r"\[(s+)\]", low)
-    if match:
-        width = len(match.group(1))
-        return f"{sign}{total_seconds:0{width}d}"
-
-    return str(value)
-
-
-def _is_numeric_time_format(fmt):
-    low = _strip_literals(fmt)
-    has_elapsed_time = re.search(r"\[(h+|m+|s+)\]", fmt.lower().replace("\\", "")) is not None
-    has_time = has_elapsed_time or "h" in low or "s" in low
-    has_date = "y" in low or "d" in low
-    return has_time and not has_date
+    return f"{sign}{hours}:{minutes:02d}:{seconds:02d}"
 
 
 def _format_numeric_time(value, fmt):
     return _format_timedelta(datetime.timedelta(days=value), fmt)
+
+
+def _format_serial_datetime(value, kind, epoch):
+    from openpyxl.utils.datetime import CALENDAR_WINDOWS_1900, from_excel
+
+    if value < 0.0 or not math.isfinite(value):
+        return _fnum(value)
+    if epoch == CALENDAR_WINDOWS_1900 and value == 0.0 and kind in ("date", "datetime"):
+        return "00:00:00"
+    try:
+        converted = from_excel(value, epoch)
+    except (OverflowError, ValueError):
+        return _fnum(value)
+    if isinstance(converted, datetime.time):
+        return converted.strftime("%H:%M:%S")
+    if kind == "datetime":
+        return converted.strftime("%Y-%m-%d %H:%M:%S")
+    if kind == "time":
+        return converted.strftime("%H:%M:%S")
+    return converted.strftime("%Y-%m-%d")
 
 
 def _cell_text(cell):
@@ -418,25 +553,53 @@ def _cell_text(cell):
     fmt = cell.number_format or ""
     if isinstance(v, bool):
         return "TRUE" if v else "FALSE"
+    from openpyxl.utils.datetime import to_excel
+
+    epoch = cell.parent.parent.epoch
     if isinstance(v, datetime.timedelta):
-        return _format_timedelta(v, fmt)
+        serial = to_excel(v, epoch)
+        active_fmt = _active_number_format(fmt, serial)
+        kind = _format_kind(active_fmt)
+        if kind == "percent":
+            return _fnum(serial * 100) + "%"
+        if kind == "plain":
+            return _fnum(serial)
+        if kind == "elapsed":
+            if serial < 0.0:
+                return _fnum(serial)
+            return _format_timedelta(v, active_fmt)
+        return _format_serial_datetime(serial, kind, epoch)
     if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+        serial = to_excel(v, epoch)
+        active_fmt = _active_number_format(fmt, serial)
+        kind = _format_kind(active_fmt)
+        if kind == "percent":
+            return _fnum(serial * 100) + "%"
+        if kind == "plain":
+            return _fnum(serial)
+        if kind == "elapsed":
+            if serial < 0.0:
+                return _fnum(serial)
+            return _format_timedelta(datetime.timedelta(days=serial), active_fmt)
         # Date-vs-datetime decided by the FORMAT, matching rxls/Excel.
-        low = _strip_literals(fmt)
-        has_time = "h" in low or "s" in low
-        has_date = "y" in low or "d" in low
         if isinstance(v, datetime.time):
             return v.strftime("%H:%M:%S")
         dt = v if isinstance(v, datetime.datetime) else datetime.datetime(v.year, v.month, v.day)
-        if has_date and has_time:
+        if kind == "datetime":
             return dt.strftime("%Y-%m-%d %H:%M:%S")
-        if has_time and not has_date:
+        if kind == "time":
             return dt.strftime("%H:%M:%S")
         return dt.strftime("%Y-%m-%d")
     if isinstance(v, (int, float)):
-        if _is_numeric_time_format(fmt):
-            return _format_numeric_time(v, fmt)
-        return _fnum(v * 100) + "%" if _is_percent(fmt) else _fnum(v)
+        active_fmt = _active_number_format(fmt, v)
+        kind = _format_kind(active_fmt)
+        if kind == "elapsed":
+            if v < 0.0:
+                return _fnum(v)
+            return _format_numeric_time(v, active_fmt)
+        if kind in ("date", "datetime", "time"):
+            return _format_serial_datetime(v, kind, epoch)
+        return _fnum(v * 100) + "%" if kind == "percent" else _fnum(v)
     return str(v)
 
 
@@ -679,7 +842,9 @@ def main():
     rxls_ok, opx_failed, oversized, oversized_worksheets, hash_exact = 0, 0, 0, 0, 0
     bounded_shared_strings = 0
     for f in files:
-        rt = subprocess.run([binary, f], capture_output=True).stdout.decode("utf-8", "replace")
+        rt = subprocess.run(
+            [binary, f, "--typed-values"], capture_output=True
+        ).stdout.decode("utf-8", "replace")
         if rt.strip():
             rxls_ok += 1
         expanded_shared_strings = _shared_string_expanded_chars(f)

@@ -30,8 +30,15 @@ jobs:
         run: python3 scripts/check_release_identity.py
       - name: Enforce hosted workflow policy
         run: python3 scripts/check_workflow_policy.py
-      - name: Install public reference readers
-        run: python3 -m pip install "xlrd==2.0.2" "openpyxl==3.1.5" "pyxlsb==1.0.10"
+      - name: Install public reference readers and render-harness libraries
+        run: |
+          python3 -m pip install \
+            "CairoSVG==2.9.0" \
+            "numpy==2.4.4" \
+            "openpyxl==3.1.5" \
+            "Pillow==12.2.0" \
+            "pyxlsb==1.0.10" \
+            "xlrd==2.0.2"
       - name: Public hygiene audit
         run: python3 scripts/public_hygiene_audit.py
       - name: Dependency security, license, and source policy
@@ -42,12 +49,16 @@ jobs:
           arguments: --locked --all-features
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Format standalone renderer
+        run: cargo fmt --manifest-path render/Cargo.toml -- --check
       - name: Clippy (default features)
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy (.xls-only)
         run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Clippy (standalone renderer)
+        run: cargo clippy --manifest-path render/Cargo.toml --all-targets --locked -- -D warnings
       - name: Check additive feature matrix and examples
         run: |
           cargo check --no-default-features --locked
@@ -71,8 +82,18 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features --locked
-      - name: Python harness tests
+      - name: Test standalone renderer
+        run: cargo test --manifest-path render/Cargo.toml --all-targets --locked
+      - name: Python harness unit tests
         run: python3 -m unittest discover -s scripts -p "test_*.py"
+      - name: LibreOffice render parity harness dry run
+        run: |
+          python3 scripts/libreoffice-render-parity.py \
+            --corpus tests/fixtures \
+            --dry-run \
+            --max-files 8 \
+            --report target/libreoffice-render-parity-dry-run.json
+          python3 -c 'import json; report=json.load(open("target/libreoffice-render-parity-dry-run.json", encoding="utf-8")); count=report["summary"]["files"]; assert report["mode"] == "dry_run" and count > 0 and report["summary"]["by_status"] == {"dry_run": count}'
       - name: Reproducible CycloneDX dependency manifest
         run: |
           python3 scripts/generate-sbom.py \
@@ -81,7 +102,9 @@ jobs:
             --output target/rxls-sbom.cdx.json
           git diff --exit-code -- Cargo.lock bindings/wasm/Cargo.lock
       - name: Package dry run
-        run: cargo package --locked
+        run: |
+          cargo package --locked
+          python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate
 
   msrv:
     name: MSRV 1.85
@@ -101,6 +124,8 @@ jobs:
         run: cargo build --locked
       - name: Build (all features)
         run: cargo build --all-features --locked
+      - name: Check standalone renderer
+        run: cargo check --manifest-path render/Cargo.toml --all-targets --locked
       - name: Build WebAssembly binding
         run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
       - name: Verify frozen public API and rustdoc contracts
@@ -138,7 +163,9 @@ jobs:
           CARGO_BIN_EXE_rxls: target/debug/${{ matrix.executable }}
         run: cargo test --test cli --locked
       - name: Package crate
-        run: cargo package --locked
+        run: |
+          cargo package --locked
+          python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate
       - name: Install CLI from the exact packaged crate contents
         run: cargo install --path target/package/rxls-0.1.2 --locked --root target/installed-product
       - name: Smoke installed CLI

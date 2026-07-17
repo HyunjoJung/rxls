@@ -106,6 +106,7 @@ jobs:
             | tee target/wasm-browser-smoke.json
           python3 -m unittest discover -s scripts -p "test_*.py"
           cargo package --locked
+          python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate
           cargo build --release --all-features --locked
           cargo build --release --example edit_save_benchmark --all-features --locked
           soffice --version | tee target/release-libreoffice-version.txt
@@ -864,7 +865,7 @@ jobs:
           const bytes = fs.readFileSync(process.env.RXLS_SMOKE_FIXTURE);
           assert.match(extractText(bytes), /item\tamount\tok/);
           const report = JSON.parse(reportJson(bytes));
-          assert.equal(report.schema_version, 1);
+          assert.equal(report.schema_version, 2);
           assert.equal(report.format, "xlsx");
           assert.ok(report.stats.sheets > 0);
           JS

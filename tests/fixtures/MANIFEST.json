@@ -69,6 +69,70 @@
     }
   },
   {
+    "path": "tests/fixtures/xls/korean-unicode-biff8.xls",
+    "format": "xls",
+    "source": "generated in-repository",
+    "license": "MIT",
+    "generation": "python3 scripts/generate-fixtures.py::generate_korean_biff8",
+    "sha256": "229bd223b176a103629248589912b837df786c978ab9abfb079b6d4eb6a0190f",
+    "workbook_stream_sha256": "0d20321cd70496ac8709e2a6bc940aee4404f1c87bd5add294c3e1bbac394633",
+    "biff_version": 8,
+    "stream_name": "Workbook",
+    "codepage": 1200,
+    "container_mode": "primary",
+    "covers": [
+      "cfb_package",
+      "biff8",
+      "workbook_stream",
+      "codepage_1200",
+      "korean_unicode",
+      "sst_continue_compression_transition",
+      "labelsst",
+      "numeric_adjacency",
+      "formula_cached_string",
+      "dimension_record"
+    ],
+    "exact_oracle": {
+      "sheet_names": ["한글표"],
+      "cells": [
+        {"coordinate": "A1", "variant": "Text", "value": "K-한글"},
+        {"coordinate": "B1", "variant": "Number", "value": 949.0},
+        {
+          "coordinate": "A2",
+          "variant": "Formula",
+          "formula": "\"확인\"",
+          "cached_variant": "Text",
+          "cached_value": "확인"
+        }
+      ],
+      "report": {
+        "sheets": 1,
+        "cells": 3,
+        "formulas": 1,
+        "computed": 1,
+        "warnings": []
+      }
+    },
+    "oracle": {
+      "sheets": 1,
+      "cells": 3,
+      "defined_names": 0,
+      "hidden_sheets": 0,
+      "merged_ranges": 0,
+      "hyperlinks": 0,
+      "comments": 0,
+      "tables": 0,
+      "data_validations": 0,
+      "autofilters": 0,
+      "page_setups": 0,
+      "images": 0,
+      "sheet_views": 0,
+      "tab_colors": 0,
+      "print_options": 0,
+      "sparklines": 0
+    }
+  },
+  {
     "path": "tests/fixtures/xlsx/reader-structural.xlsx",
     "format": "xlsx",
     "source": "generated in-repository",

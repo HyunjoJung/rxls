@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 
 use crate::model::Workbook;
-use crate::{Cell, DocProperties, FormulaEvaluation, SheetVisible};
+use crate::{Cell, DocProperties, FormulaEvaluation, ParseProvenance, SheetVisible};
 
 /// Current public diagnose JSON contract version.
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// A compact, deterministic diagnose report for a workbook.
 ///
@@ -31,6 +31,8 @@ pub struct WorkbookReport {
     pub features: ReportFeatures,
     /// Deterministic formula evaluation/cache fallback distribution.
     pub evaluation: ReportEvaluation,
+    /// Typed, bounded provenance for the successful parse.
+    pub provenance: ParseProvenance,
     /// Human-readable warnings derived from the parse results.
     pub warnings: Vec<String>,
 }
@@ -150,6 +152,7 @@ impl WorkbookReport {
         let properties = ReportProperties::from_doc_properties(metadata.properties);
         let features = ReportFeatures::from_workbook(&metadata, workbook);
         let evaluation = ReportEvaluation::from_workbook(workbook);
+        let provenance = workbook.parse_provenance();
         let warnings = derived_warnings(&stats, &features, &evaluation);
 
         Self {
@@ -161,6 +164,7 @@ impl WorkbookReport {
             local_defined_names_count: workbook.local_defined_names.len(),
             features,
             evaluation,
+            provenance,
             warnings,
         }
     }
@@ -219,12 +223,39 @@ impl WorkbookReport {
         self.evaluation.write_json(&mut out);
         out.push(',');
 
+        out.push_str(r#""provenance":"#);
+        write_parse_provenance_json(&mut out, &self.provenance);
+        out.push(',');
+
         out.push_str(r#""warnings":"#);
         push_json_string_array(&mut out, self.warnings.as_slice());
 
         out.push('}');
         out
     }
+}
+
+fn write_parse_provenance_json(out: &mut String, provenance: &ParseProvenance) {
+    out.push('{');
+    push_json_string_field(out, "container", provenance.container.code());
+    out.push(',');
+    out.push_str(r#""recoveries":"#);
+    out.push('[');
+    for (index, recovery) in provenance.recoveries().iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_json_string(out, recovery.code());
+    }
+    out.push(']');
+    out.push(',');
+    out.push_str(&format!(
+        "\"recoveries_truncated\":{}",
+        provenance.recoveries_truncated()
+    ));
+    out.push(',');
+    out.push_str(&format!("\"partial\":{}", provenance.partial));
+    out.push('}');
 }
 
 impl ReportEvaluation {

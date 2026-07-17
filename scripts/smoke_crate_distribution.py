@@ -304,8 +304,8 @@ def smoke(args: argparse.Namespace) -> dict[str, object]:
             report = json.loads(diagnose_result.stdout)
         except json.JSONDecodeError as error:
             raise SmokeError(f"installed rxls diagnose emitted invalid JSON: {error}") from error
-        if report.get("schema_version") != 1:
-            raise SmokeError("installed rxls diagnose did not emit schema version 1")
+        if report.get("schema_version") != 2:
+            raise SmokeError("installed rxls diagnose did not emit schema version 2")
 
         error_result = _run(
             [str(binary), "diagnose"], cwd=runtime, env=env, expected_code=64

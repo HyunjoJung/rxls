@@ -1423,6 +1423,49 @@ pub struct CellStyle {
     pub protection: Option<CellProtection>,
 }
 
+/// Sparse OOXML cell-XF overlay with explicit component replacement flags.
+///
+/// Table differential formats merge individual properties, while an applied
+/// cell-XF component replaces that entire component. Keeping the flags
+/// separate from [`CellStyle`] also represents explicit resets such as
+/// `numFmtId="0"`, whose resolved style value is `None` (General).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CellStyleOverlay {
+    pub(crate) style: CellStyle,
+    pub(crate) replace_font: bool,
+    pub(crate) replace_fill: bool,
+    pub(crate) replace_border: bool,
+    pub(crate) replace_num_fmt: bool,
+    pub(crate) replace_alignment: bool,
+    pub(crate) replace_protection: bool,
+}
+
+impl CellStyleOverlay {
+    fn apply_to(&self, base: Option<CellStyle>) -> CellStyle {
+        let mut resolved = base.unwrap_or_default();
+        if self.replace_font {
+            resolved.font = self.style.font.clone();
+        }
+        if self.replace_fill {
+            resolved.fill = self.style.fill;
+            resolved.pattern_fill = self.style.pattern_fill;
+        }
+        if self.replace_border {
+            resolved.border = self.style.border.clone();
+        }
+        if self.replace_num_fmt {
+            resolved.num_fmt = self.style.num_fmt.clone();
+        }
+        if self.replace_alignment {
+            resolved.align = self.style.align.clone();
+        }
+        if self.replace_protection {
+            resolved.protection = self.style.protection.clone();
+        }
+        resolved
+    }
+}
+
 /// Cell-level protection flags in an authored cell style.
 ///
 /// Excel treats cells as locked by default, so `locked = None` means "inherit the
@@ -2123,7 +2166,7 @@ impl RangeCell<'_> {
     }
 }
 
-impl<'left, 'right> PartialEq<RangeCell<'right>> for RangeCell<'left> {
+impl<'right> PartialEq<RangeCell<'right>> for RangeCell<'_> {
     fn eq(&self, other: &RangeCell<'right>) -> bool {
         self.value() == other.value() && self.text() == other.text()
     }
@@ -2144,15 +2187,15 @@ impl FormulaEntry<'_> {
     }
 }
 
-impl<'left, 'right> PartialEq<FormulaEntry<'right>> for FormulaEntry<'left> {
+impl<'right> PartialEq<FormulaEntry<'right>> for FormulaEntry<'_> {
     fn eq(&self, other: &FormulaEntry<'right>) -> bool {
         self.as_str() == other.as_str()
     }
 }
 
-impl<'a> Eq for FormulaEntry<'a> {}
+impl Eq for FormulaEntry<'_> {}
 
-impl<'left, 'right> PartialEq<Range<'right>> for Range<'left> {
+impl<'right> PartialEq<Range<'right>> for Range<'_> {
     fn eq(&self, other: &Range<'right>) -> bool {
         self.start == other.start
             && self.end == other.end
@@ -2165,7 +2208,7 @@ impl<'left, 'right> PartialEq<Range<'right>> for Range<'left> {
     }
 }
 
-impl<'left, 'right> PartialEq<FormulaRange<'right>> for FormulaRange<'left> {
+impl<'right> PartialEq<FormulaRange<'right>> for FormulaRange<'_> {
     fn eq(&self, other: &FormulaRange<'right>) -> bool {
         self.start == other.start
             && self.end == other.end
@@ -2178,7 +2221,7 @@ impl<'left, 'right> PartialEq<FormulaRange<'right>> for FormulaRange<'left> {
     }
 }
 
-impl<'a> Eq for FormulaRange<'a> {}
+impl Eq for FormulaRange<'_> {}
 
 fn row_span_len(start: u32, end: u32) -> usize {
     if start > end {
@@ -2631,9 +2674,9 @@ impl<'range, 'cell> Iterator for RangeRows<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> ExactSizeIterator for RangeRows<'range, 'cell> {}
+impl ExactSizeIterator for RangeRows<'_, '_> {}
 
-impl<'range, 'cell> DoubleEndedIterator for RangeRows<'range, 'cell> {
+impl DoubleEndedIterator for RangeRows<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done || self.next_row > self.end_row {
             return None;
@@ -2653,7 +2696,7 @@ impl<'range, 'cell> DoubleEndedIterator for RangeRows<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> std::iter::FusedIterator for RangeRows<'range, 'cell> {}
+impl std::iter::FusedIterator for RangeRows<'_, '_> {}
 
 /// A borrowed row view inside a [`Range`].
 #[derive(Debug, Clone, Copy)]
@@ -2747,7 +2790,7 @@ pub struct RangeRowUsedCells<'range, 'cell> {
     remaining: usize,
 }
 
-impl<'range, 'cell> Iterator for RangeRowUsedCells<'range, 'cell> {
+impl<'range> Iterator for RangeRowUsedCells<'range, '_> {
     type Item = (u16, &'range Cell);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2761,13 +2804,13 @@ impl<'range, 'cell> Iterator for RangeRowUsedCells<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> ExactSizeIterator for RangeRowUsedCells<'range, 'cell> {
+impl ExactSizeIterator for RangeRowUsedCells<'_, '_> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
 
-impl<'range, 'cell> DoubleEndedIterator for RangeRowUsedCells<'range, 'cell> {
+impl DoubleEndedIterator for RangeRowUsedCells<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let (&(_, col), entry) = self.entries.next_back()?;
         self.remaining = self.remaining.saturating_sub(1);
@@ -2775,7 +2818,7 @@ impl<'range, 'cell> DoubleEndedIterator for RangeRowUsedCells<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> std::iter::FusedIterator for RangeRowUsedCells<'range, 'cell> {}
+impl std::iter::FusedIterator for RangeRowUsedCells<'_, '_> {}
 
 /// Iterator over one borrowed [`RangeRow`]'s cells.
 #[derive(Debug, Clone)]
@@ -2787,7 +2830,7 @@ pub struct RangeRowCells<'range, 'cell> {
     done: bool,
 }
 
-impl<'range, 'cell> Iterator for RangeRowCells<'range, 'cell> {
+impl<'range> Iterator for RangeRowCells<'range, '_> {
     type Item = Option<&'range Cell>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2813,9 +2856,9 @@ impl<'range, 'cell> Iterator for RangeRowCells<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> ExactSizeIterator for RangeRowCells<'range, 'cell> {}
+impl ExactSizeIterator for RangeRowCells<'_, '_> {}
 
-impl<'range, 'cell> DoubleEndedIterator for RangeRowCells<'range, 'cell> {
+impl DoubleEndedIterator for RangeRowCells<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done || self.next_col > self.end_col {
             return None;
@@ -2830,7 +2873,7 @@ impl<'range, 'cell> DoubleEndedIterator for RangeRowCells<'range, 'cell> {
     }
 }
 
-impl<'range, 'cell> std::iter::FusedIterator for RangeRowCells<'range, 'cell> {}
+impl std::iter::FusedIterator for RangeRowCells<'_, '_> {}
 
 impl<'a> FormulaRange<'a> {
     /// Construct a rectangular sparse formula range with no populated formula
@@ -3230,9 +3273,9 @@ impl<'range, 'formula> Iterator for FormulaRangeRows<'range, 'formula> {
     }
 }
 
-impl<'range, 'formula> ExactSizeIterator for FormulaRangeRows<'range, 'formula> {}
+impl ExactSizeIterator for FormulaRangeRows<'_, '_> {}
 
-impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRows<'range, 'formula> {
+impl DoubleEndedIterator for FormulaRangeRows<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done || self.next_row > self.end_row {
             return None;
@@ -3252,7 +3295,7 @@ impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRows<'range, 'formula
     }
 }
 
-impl<'range, 'formula> std::iter::FusedIterator for FormulaRangeRows<'range, 'formula> {}
+impl std::iter::FusedIterator for FormulaRangeRows<'_, '_> {}
 
 /// A borrowed row view inside a [`FormulaRange`].
 #[derive(Debug, Clone, Copy)]
@@ -3346,7 +3389,7 @@ pub struct FormulaRangeRowUsedCells<'range, 'formula> {
     remaining: usize,
 }
 
-impl<'range, 'formula> Iterator for FormulaRangeRowUsedCells<'range, 'formula> {
+impl<'range> Iterator for FormulaRangeRowUsedCells<'range, '_> {
     type Item = (u16, &'range str);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3360,13 +3403,13 @@ impl<'range, 'formula> Iterator for FormulaRangeRowUsedCells<'range, 'formula> {
     }
 }
 
-impl<'range, 'formula> ExactSizeIterator for FormulaRangeRowUsedCells<'range, 'formula> {
+impl ExactSizeIterator for FormulaRangeRowUsedCells<'_, '_> {
     fn len(&self) -> usize {
         self.remaining
     }
 }
 
-impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRowUsedCells<'range, 'formula> {
+impl DoubleEndedIterator for FormulaRangeRowUsedCells<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let (&(_, col), formula) = self.entries.next_back()?;
         self.remaining = self.remaining.saturating_sub(1);
@@ -3374,7 +3417,7 @@ impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRowUsedCells<'range, 
     }
 }
 
-impl<'range, 'formula> std::iter::FusedIterator for FormulaRangeRowUsedCells<'range, 'formula> {}
+impl std::iter::FusedIterator for FormulaRangeRowUsedCells<'_, '_> {}
 
 /// Iterator over one borrowed [`FormulaRangeRow`]'s formulas.
 #[derive(Debug, Clone)]
@@ -3386,7 +3429,7 @@ pub struct FormulaRangeRowCells<'range, 'formula> {
     done: bool,
 }
 
-impl<'range, 'formula> Iterator for FormulaRangeRowCells<'range, 'formula> {
+impl<'range> Iterator for FormulaRangeRowCells<'range, '_> {
     type Item = Option<&'range str>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -3412,9 +3455,9 @@ impl<'range, 'formula> Iterator for FormulaRangeRowCells<'range, 'formula> {
     }
 }
 
-impl<'range, 'formula> ExactSizeIterator for FormulaRangeRowCells<'range, 'formula> {}
+impl ExactSizeIterator for FormulaRangeRowCells<'_, '_> {}
 
-impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRowCells<'range, 'formula> {
+impl DoubleEndedIterator for FormulaRangeRowCells<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.done || self.next_col > self.end_col {
             return None;
@@ -3429,7 +3472,7 @@ impl<'range, 'formula> DoubleEndedIterator for FormulaRangeRowCells<'range, 'for
     }
 }
 
-impl<'range, 'formula> std::iter::FusedIterator for FormulaRangeRowCells<'range, 'formula> {}
+impl std::iter::FusedIterator for FormulaRangeRowCells<'_, '_> {}
 
 /// Error type returned by range row deserialization.
 #[cfg(feature = "serde")]
@@ -3911,7 +3954,7 @@ struct HeaderExtractor<'a> {
 }
 
 #[cfg(feature = "serde")]
-impl<'de, 'a> serde::de::Deserializer<'de> for HeaderExtractor<'a> {
+impl<'de> serde::de::Deserializer<'de> for HeaderExtractor<'_> {
     type Error = HeaderError;
 
     fn deserialize_any<V>(self, _visitor: V) -> std::result::Result<V::Value, Self::Error>
@@ -4682,7 +4725,7 @@ struct RowDeserializer<'cols, 'cell> {
 }
 
 #[cfg(feature = "serde")]
-impl<'de, 'cols, 'cell: 'de> serde::de::Deserializer<'de> for RowDeserializer<'cols, 'cell> {
+impl<'de, 'cell: 'de> serde::de::Deserializer<'de> for RowDeserializer<'_, 'cell> {
     type Error = DeError;
 
     fn deserialize_any<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
@@ -4780,7 +4823,7 @@ struct RowSeqAccess<'cols, 'cell> {
 }
 
 #[cfg(feature = "serde")]
-impl<'de, 'cols, 'cell: 'de> serde::de::SeqAccess<'de> for RowSeqAccess<'cols, 'cell> {
+impl<'de, 'cell: 'de> serde::de::SeqAccess<'de> for RowSeqAccess<'_, 'cell> {
     type Error = DeError;
 
     fn next_element_seed<T>(
@@ -4816,7 +4859,7 @@ struct RowMapAccess<'cols, 'cell> {
 }
 
 #[cfg(feature = "serde")]
-impl<'de, 'cols, 'cell: 'de> serde::de::MapAccess<'de> for RowMapAccess<'cols, 'cell> {
+impl<'de, 'cell: 'de> serde::de::MapAccess<'de> for RowMapAccess<'_, 'cell> {
     type Error = DeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> std::result::Result<Option<K::Value>, Self::Error>
@@ -5260,6 +5303,314 @@ impl<'a> WorksheetMetadata<'a> {
     }
 }
 
+/// One deduplicated, display-ready worksheet cell.
+///
+/// Values follow Excel's last-write-wins coordinate semantics and carry the
+/// retained display text, explicit cell style, rich runs, and hyperlink needed
+/// by exporters and external rendering engines. Worksheet/column/row/table
+/// style inheritance remains available through [`Sheet::resolved_cell_style`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct DisplayCell<'a> {
+    /// Zero-based row index.
+    pub row: u32,
+    /// Zero-based column index.
+    pub col: u16,
+    /// Typed cell value.
+    pub value: &'a Cell,
+    /// Display-formatted text retained by the reader or authoring model.
+    pub formatted: &'a str,
+    /// Style stored directly on this cell, before inherited layers.
+    pub explicit_style: Option<&'a CellStyle>,
+    /// Retained rich-text runs, when present.
+    pub rich_text: Option<&'a [TextRun]>,
+    /// External hyperlink target retained for this coordinate.
+    pub hyperlink: Option<&'a str>,
+}
+
+/// Fidelity of worksheet style information retained in the public model.
+///
+/// This signal is intentionally sheet-scoped because some container formats can
+/// mix worksheet kinds and reader capabilities. Consumers such as renderers
+/// should surface a warning for [`Self::Partial`] or [`Self::Unavailable`]
+/// instead of assuming that absent style data means an unformatted source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StyleFidelity {
+    /// The reader did not retain source cell styles for this sheet.
+    #[default]
+    Unavailable,
+    /// A documented, useful subset of source styles was retained.
+    Partial,
+    /// Every source style property represented by the public model was retained.
+    Retained,
+    /// The sheet was created through rxls authoring APIs, so its model is the source.
+    Authored,
+}
+
+/// A bounded, typed reason why source styling could not be represented exactly.
+///
+/// Readers aggregate identical reasons per sheet. This keeps hostile documents
+/// from creating an unbounded warning list while allowing renderers to explain
+/// why [`StyleFidelity::Partial`] was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StyleLossKind {
+    /// A source property has no equivalent in rxls' public style model.
+    UnsupportedProperty,
+    /// A referenced source style was absent or outside the retained table.
+    MissingReference,
+    /// A parent-style cycle was detected and cut at the bounded resolver depth.
+    InheritanceCycle,
+    /// A format-defined or rxls safety limit was reached.
+    LimitExceeded,
+    /// Color information depended on an unavailable palette or theme entry.
+    UnresolvedColor,
+    /// Drawing/chart metadata was retained only partially.
+    DrawingMetadataPartial,
+}
+
+/// One aggregated source-style loss boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct StyleLoss {
+    /// Stable typed reason.
+    pub kind: StyleLossKind,
+    /// Number of occurrences, saturated at [`u32::MAX`].
+    pub occurrences: u32,
+}
+
+/// Kind of object described by [`DrawingMetadata`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DrawingObjectKind {
+    /// An entry in [`Sheet::images`].
+    #[default]
+    Image,
+    /// An entry in [`Sheet::charts`].
+    Chart,
+    /// A source drawing shape that is not represented by the Image/Chart APIs.
+    Shape,
+}
+
+/// How a drawing responds when its anchor cells are moved or resized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DrawingAnchorBehavior {
+    /// Move and resize with the anchor cells.
+    #[default]
+    MoveAndSize,
+    /// Move with cells while retaining an absolute size.
+    MoveOnly,
+    /// Use absolute page/sheet coordinates.
+    Absolute,
+}
+
+/// Source drawing crop, normalized to parts per million of each edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DrawingCrop {
+    /// Crop from the left edge.
+    pub left_ppm: u32,
+    /// Crop from the top edge.
+    pub top_ppm: u32,
+    /// Crop from the right edge.
+    pub right_ppm: u32,
+    /// Crop from the bottom edge.
+    pub bottom_ppm: u32,
+}
+
+/// One indexed value retained from an OOXML chart cache.
+///
+/// Values remain strings so malformed or non-finite numeric cache entries can
+/// be rejected by a renderer without weakening [`DrawingMetadata`]'s exact
+/// equality semantics. Readers bound both the number and byte length of cached
+/// points before storing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChartCachedPoint {
+    /// Zero-based point index declared by the chart part.
+    pub index: u32,
+    /// Cached display or numeric value.
+    pub value: String,
+}
+
+/// Bounded cached inputs for one chart series.
+///
+/// The entry at index `n` corresponds to `Chart::series[n]`. A renderer may use
+/// a complete, well-formed cache when a referenced worksheet range is missing
+/// or belongs to another sheet; incomplete caches must not be silently padded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChartSeriesCache {
+    /// Cached series-name points, normally containing index zero only.
+    pub name: Vec<ChartCachedPoint>,
+    /// Cached category labels or X values.
+    pub categories: Vec<ChartCachedPoint>,
+    /// Cached Y values.
+    pub values: Vec<ChartCachedPoint>,
+    /// Cached bubble-size values.
+    pub bubble_sizes: Vec<ChartCachedPoint>,
+}
+
+/// Marker shape retained for one imported chart series.
+///
+/// [`Self::Automatic`] preserves the source application's default. Renderers
+/// may use a deterministic fallback when no explicit marker was authored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartMarkerSymbol {
+    /// No explicit marker shape was retained.
+    #[default]
+    Automatic,
+    /// Do not paint markers.
+    None,
+    /// Circular markers.
+    Circle,
+    /// Square markers.
+    Square,
+    /// Diamond markers.
+    Diamond,
+    /// Triangular markers.
+    Triangle,
+}
+
+/// Typed reason that an imported chart-series style needs a rendering fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartSeriesStyleLossKind {
+    /// The source marker symbol is outside the retained subset.
+    UnsupportedMarkerSymbol,
+    /// The source marker size is absent from OOXML's bounded 2--72 point range.
+    InvalidMarkerSize,
+    /// The source line uses a paint or dash mode outside the retained subset.
+    UnsupportedLinePaint,
+}
+
+/// Bounded visual metadata retained for one imported chart series.
+///
+/// Entries are aligned with [`DrawingMetadata::chart_series_caches`] and the
+/// matching chart's `series` collection. A missing entry means application
+/// defaults: visible palette-colored lines and an automatic marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChartSeriesStyle {
+    /// Marker shape.
+    pub marker: ChartMarkerSymbol,
+    /// Explicit marker diameter in points, constrained to 2--72.
+    pub marker_size: Option<u8>,
+    /// Whether the series line is visible.
+    pub line_visible: bool,
+    /// Explicit RGB line color, or `None` for the chart palette default.
+    pub line_color: Option<Color>,
+    /// Deduplicated typed fallback boundaries observed while importing.
+    pub losses: Vec<ChartSeriesStyleLossKind>,
+}
+
+impl Default for ChartSeriesStyle {
+    fn default() -> Self {
+        Self {
+            marker: ChartMarkerSymbol::Automatic,
+            marker_size: None,
+            line_visible: true,
+            line_color: None,
+            losses: Vec::new(),
+        }
+    }
+}
+
+/// Unsupported source-chart construct retained for explicit placeholder rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartUnsupportedReason {
+    /// Multiple distinct plot kinds share one chart (a combo chart).
+    Combo,
+    /// A three-dimensional chart variant was requested.
+    ThreeDimensional,
+    /// The chart is backed by a pivot chart source.
+    Pivot,
+    /// Chart data refers to an external workbook or external chart-data part.
+    ExternalData,
+    /// The plot kind is not represented by [`ChartKind`].
+    UnsupportedKind,
+}
+
+/// Orientation of an OOXML `barChart` retained beside [`ChartKind::Bar`].
+///
+/// The public chart kind predates the distinction between vertical columns and
+/// horizontal bars, so readers retain it in [`DrawingMetadata`] without
+/// changing authored `Chart` literals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartBarDirection {
+    /// Values extend vertically from a horizontal baseline (`barDir="col"`).
+    #[default]
+    Column,
+    /// Values extend horizontally from a vertical baseline (`barDir="bar"`).
+    Horizontal,
+}
+
+/// Bounded rendering sidecar for a worksheet drawing object.
+///
+/// This intentionally leaves [`Image`] and [`Chart`] source-compatible while
+/// retaining offsets and absolute geometry used by higher-fidelity renderers.
+/// Strings are reader-bounded and object indexes always address the matching
+/// image/chart slice for the declared [`DrawingObjectKind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrawingMetadata {
+    /// Object kind.
+    pub kind: DrawingObjectKind,
+    /// Index into [`Sheet::images`] or [`Sheet::charts`].
+    pub object_index: usize,
+    /// Top-left cell marker retained for every placeable drawing kind.
+    pub from_cell: Option<(u32, u16)>,
+    /// Bottom-right cell marker for a two-cell anchor, when present.
+    pub to_cell: Option<(u32, u16)>,
+    /// Offset from the top-left anchor cell, in English Metric Units.
+    pub from_offset_emu: Option<(i64, i64)>,
+    /// Offset at the bottom-right anchor cell, in English Metric Units.
+    pub to_offset_emu: Option<(i64, i64)>,
+    /// Absolute width and height in English Metric Units.
+    pub absolute_size_emu: Option<(u64, u64)>,
+    /// Optional source crop.
+    pub crop: Option<DrawingCrop>,
+    /// Clockwise rotation in thousandths of a degree.
+    pub rotation_mdeg: Option<i32>,
+    /// Source stacking order.
+    pub z_order: Option<i32>,
+    /// Accessible alternative text, when present.
+    pub alt_text: Option<String>,
+    /// Source object name, when present.
+    pub name: Option<String>,
+    /// Move/resize behavior relative to cells.
+    pub behavior: DrawingAnchorBehavior,
+    /// Theme-derived chart series/slice palette in source order.
+    ///
+    /// Empty for non-chart drawings. Readers may use deterministic Office
+    /// defaults for theme slots omitted by the source package.
+    pub chart_palette: Vec<Color>,
+    /// Bounded cached chart data, aligned with the matching chart's series.
+    ///
+    /// Empty for authored charts and readers that cannot retain chart caches.
+    pub chart_series_caches: Vec<ChartSeriesCache>,
+    /// Bounded per-series marker and line metadata in chart-series order.
+    pub chart_series_styles: Vec<ChartSeriesStyle>,
+    /// Unsupported source constructs that require an explicit chart placeholder.
+    pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>,
+    /// Column versus horizontal-bar orientation for [`ChartKind::Bar`].
+    pub chart_bar_direction: ChartBarDirection,
+}
+
+#[cfg_attr(not(feature = "xlsx"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) enum OoxmlImplicitColumnWidth {
+    #[default]
+    None,
+    ApplicationDefault,
+    BaseCharacters(f32),
+}
+
 /// One worksheet: a name, its non-empty cells, and layout/structure (authoring).
 #[derive(Debug, Clone)]
 pub struct Sheet {
@@ -5267,11 +5618,20 @@ pub struct Sheet {
     pub name: String,
     /// Whether this is an actual worksheet (vs. a chart/macro sheet).
     pub is_worksheet: bool,
+    /// Style-retention fidelity for renderer/exporter diagnostics.
+    pub(crate) style_fidelity: StyleFidelity,
+    /// Date system used when formatting authored date cells. Workbook-created
+    /// sheets inherit the workbook flag at creation time.
+    pub(crate) display_date1904: bool,
     /// Parsed sheet type for metadata when the source format exposes it.
     pub(crate) sheet_type: Option<SheetType>,
     pub(crate) cells: Vec<CellEntry>,
     /// Per-column widths in character units, populated by readers and authoring.
     pub(crate) col_widths: BTreeMap<u16, f32>,
+    /// Source column widths expressed in physical points when the format stores
+    /// an absolute length (currently ODS). Renderers prefer these values over
+    /// the compatibility character-unit projection in `col_widths`.
+    pub(crate) physical_col_widths: BTreeMap<u16, f32>,
     /// Per-row heights in points, populated by readers and authoring.
     pub(crate) row_heights: BTreeMap<u32, f32>,
     /// Explicitly hidden columns.
@@ -5290,6 +5650,9 @@ pub struct Sheet {
     pub(crate) default_row_height: Option<f32>,
     /// Default column width in character units (authoring).
     pub(crate) default_col_width: Option<f32>,
+    /// OOXML-only provenance used to distinguish an absent application default
+    /// from an explicit `defaultColWidth` and from `baseColWidth`.
+    pub(crate) ooxml_implicit_col_width: OoxmlImplicitColumnWidth,
     /// Merged ranges `(r0, c0, r1, c1)` set when **authoring** (via
     /// [`Sheet::merge`]). The writer emits these as `<mergeCells>` and omits
     /// cells under them for OOXML conformance.
@@ -5311,6 +5674,8 @@ pub struct Sheet {
     pub(crate) autofilter: Option<(u32, u16, u32, u16)>,
     /// Print/page setup (authoring).
     pub(crate) page_setup: Option<PageSetup>,
+    /// Loss-aware source print metadata retained beside the compatibility setup.
+    pub(crate) print_metadata: PrintMetadata,
     /// Sheet tab color (authoring).
     pub(crate) tab_color: Option<Color>,
     /// Worksheet protection (authoring): lock cells against editing.
@@ -5323,10 +5688,18 @@ pub struct Sheet {
     pub(crate) data_validations: Vec<DataValidation>,
     /// Conditional formats (authoring).
     pub(crate) cond_formats: Vec<CondFormat>,
+    /// Read-side rule priority, stop behavior, and differential styles aligned
+    /// with `cond_formats` when available.
+    pub(crate) cond_format_metadata: Vec<ConditionalFormatMetadata>,
     /// Embedded images (authoring).
     pub(crate) images: Vec<Image>,
     /// Charts (authoring).
     pub(crate) charts: Vec<Chart>,
+    /// Read-side drawing geometry and accessibility metadata. Kept separate so
+    /// the long-standing [`Image`] and [`Chart`] structs remain source-compatible.
+    pub(crate) drawing_metadata: Vec<DrawingMetadata>,
+    /// Aggregated source-style loss boundaries.
+    pub(crate) style_losses: Vec<StyleLoss>,
     /// Sparklines (authoring): compact in-cell charts emitted as x14 worksheet
     /// extensions.
     pub(crate) sparklines: Vec<Sparkline>,
@@ -5334,6 +5707,17 @@ pub struct Sheet {
     pub(crate) tables: Vec<Table>,
     /// Per-table header row formats keyed by the authored table name.
     pub(crate) table_header_formats: BTreeMap<String, CellStyle>,
+    /// Loss-aware table-region styles retained from OOXML table definitions.
+    ///
+    /// This is separate from `table_header_formats`: the latter is a stable
+    /// authoring/public compatibility surface, while this sidecar retains the
+    /// complete bounded read-side cascade without changing [`Table`]'s public
+    /// struct shape.
+    pub(crate) table_region_formats: BTreeMap<String, TableStyleApplication>,
+    /// Sparse direct-cell overlays retained by readers that can distinguish a
+    /// cell XF's explicitly applied components from its resolved base style.
+    /// These overlays are applied after table styles.
+    pub(crate) direct_cell_formats: BTreeMap<(u32, u16), CellStyleOverlay>,
     /// Legacy cell comments / notes (authoring).
     pub(crate) comments: Vec<Comment>,
     /// Rich (mixed-format) string cells (authoring): coordinate → runs. Emitted as
@@ -5387,9 +5771,12 @@ impl Default for Sheet {
         Sheet {
             name: String::default(),
             is_worksheet: bool::default(),
+            style_fidelity: StyleFidelity::Unavailable,
+            display_date1904: false,
             sheet_type: None,
             cells: Vec::default(),
             col_widths: BTreeMap::default(),
+            physical_col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
             hidden_cols: BTreeSet::default(),
             hidden_rows: BTreeSet::default(),
@@ -5399,22 +5786,29 @@ impl Default for Sheet {
             blank_styles: BTreeMap::default(),
             default_row_height: None,
             default_col_width: None,
+            ooxml_implicit_col_width: OoxmlImplicitColumnWidth::None,
             merges: Vec::default(),
             read_merges: Vec::default(),
             read_hyperlinks: Vec::default(),
             freeze: None,
             autofilter: None,
             page_setup: None,
+            print_metadata: PrintMetadata::default(),
             tab_color: None,
             protect: bool::default(),
             protect_options: None,
             data_validations: Vec::default(),
             cond_formats: Vec::default(),
+            cond_format_metadata: Vec::default(),
             images: Vec::default(),
             charts: Vec::default(),
+            drawing_metadata: Vec::default(),
+            style_losses: Vec::default(),
             sparklines: Vec::default(),
             tables: Vec::default(),
             table_header_formats: BTreeMap::default(),
+            table_region_formats: BTreeMap::default(),
+            direct_cell_formats: BTreeMap::default(),
             comments: Vec::default(),
             rich: BTreeMap::default(),
             hide_gridlines: bool::default(),
@@ -5493,6 +5887,228 @@ pub struct Table {
     pub columns: Vec<String>,
     /// Table style name (default `TableStyleMedium2`).
     pub style: Option<String>,
+}
+
+/// A supported OOXML table-style region.
+///
+/// The declaration order is not used as rendering precedence. Resolution uses
+/// an explicit sequence in [`TableStyleApplication::resolve`] so output remains
+/// stable if this enum grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum TableStyleRegion {
+    WholeTable,
+    FirstColumnStripe,
+    SecondColumnStripe,
+    FirstRowStripe,
+    SecondRowStripe,
+    FirstColumn,
+    LastColumn,
+    HeaderRow,
+    TotalRow,
+    FirstHeaderCell,
+    LastHeaderCell,
+    FirstTotalCell,
+    LastTotalCell,
+}
+
+/// One differential table style plus its stripe width where applicable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableStyleElement {
+    pub(crate) style: CellStyle,
+    pub(crate) stripe_size: u32,
+}
+
+impl TableStyleElement {
+    #[cfg_attr(not(feature = "xlsx"), allow(dead_code))]
+    pub(crate) fn new(style: CellStyle, stripe_size: u32) -> Self {
+        Self {
+            style,
+            stripe_size: stripe_size.max(1),
+        }
+    }
+}
+
+/// Bounded table-style elements keyed by semantic region.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableStyleDefinition {
+    pub(crate) elements: BTreeMap<TableStyleRegion, TableStyleElement>,
+}
+
+impl TableStyleDefinition {
+    #[cfg_attr(not(feature = "xlsx"), allow(dead_code))]
+    pub(crate) fn insert(
+        &mut self,
+        region: TableStyleRegion,
+        style: CellStyle,
+        stripe_size: u32,
+    ) -> Option<TableStyleElement> {
+        self.elements
+            .insert(region, TableStyleElement::new(style, stripe_size))
+    }
+
+    pub(crate) fn get(&self, region: TableStyleRegion) -> Option<&TableStyleElement> {
+        self.elements.get(&region)
+    }
+}
+
+/// Per-table switches from OOXML `<table>` and `<tableStyleInfo>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableStyleApplication {
+    pub(crate) definition: TableStyleDefinition,
+    pub(crate) header_row: bool,
+    pub(crate) totals_row: bool,
+    pub(crate) show_first_column: bool,
+    pub(crate) show_last_column: bool,
+    pub(crate) show_row_stripes: bool,
+    pub(crate) show_column_stripes: bool,
+}
+
+impl Default for TableStyleApplication {
+    fn default() -> Self {
+        Self {
+            definition: TableStyleDefinition::default(),
+            header_row: true,
+            totals_row: false,
+            show_first_column: false,
+            show_last_column: false,
+            show_row_stripes: false,
+            show_column_stripes: false,
+        }
+    }
+}
+
+impl TableStyleApplication {
+    fn merge_layer(resolved: &mut Option<CellStyle>, layer: Option<&TableStyleElement>) {
+        let Some(layer) = layer else {
+            return;
+        };
+        *resolved = Some(match resolved.take() {
+            Some(base) => base.merge(&layer.style),
+            None => layer.style.clone(),
+        });
+    }
+
+    fn stripe_layer(
+        &self,
+        first: TableStyleRegion,
+        second: TableStyleRegion,
+        offset: u32,
+    ) -> Option<&TableStyleElement> {
+        let first_style = self.definition.get(first);
+        let second_style = self.definition.get(second);
+        if first_style.is_none() && second_style.is_none() {
+            return None;
+        }
+        // A missing half still occupies the default one-slot phase. This is
+        // required for styles that deliberately format only alternating bands.
+        let first_size = first_style.map_or(1, |style| style.stripe_size).max(1);
+        let second_size = second_style.map_or(1, |style| style.stripe_size).max(1);
+        let period = first_size.saturating_add(second_size).max(1);
+        if offset % period < first_size {
+            first_style
+        } else {
+            second_style
+        }
+    }
+
+    /// Resolve table regions in a fixed low-to-high precedence order:
+    /// whole table, column band, row band, first/last column, header/totals,
+    /// then the four header/totals corner intersections.
+    pub(crate) fn resolve(&self, table: &Table, row: u32, col: u16) -> Option<CellStyle> {
+        let (first_row, first_col, last_row, last_col) = table.range;
+        if first_row > last_row
+            || first_col > last_col
+            || row < first_row
+            || row > last_row
+            || col < first_col
+            || col > last_col
+        {
+            return None;
+        }
+
+        let is_header = self.header_row && row == first_row;
+        let is_totals = self.totals_row && row == last_row;
+        let body_first = first_row.saturating_add(u32::from(self.header_row));
+        let body_last = last_row.saturating_sub(u32::from(self.totals_row));
+        let is_body = body_first <= body_last && row >= body_first && row <= body_last;
+        let is_first_col = col == first_col;
+        let is_last_col = col == last_col;
+
+        let mut resolved = None;
+        Self::merge_layer(
+            &mut resolved,
+            self.definition.get(TableStyleRegion::WholeTable),
+        );
+        if is_body && self.show_column_stripes {
+            Self::merge_layer(
+                &mut resolved,
+                self.stripe_layer(
+                    TableStyleRegion::FirstColumnStripe,
+                    TableStyleRegion::SecondColumnStripe,
+                    u32::from(col - first_col),
+                ),
+            );
+        }
+        if is_body && self.show_row_stripes {
+            Self::merge_layer(
+                &mut resolved,
+                self.stripe_layer(
+                    TableStyleRegion::FirstRowStripe,
+                    TableStyleRegion::SecondRowStripe,
+                    row - body_first,
+                ),
+            );
+        }
+        if self.show_first_column && is_first_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::FirstColumn),
+            );
+        }
+        if self.show_last_column && is_last_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::LastColumn),
+            );
+        }
+        if is_header {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::HeaderRow),
+            );
+        }
+        if is_totals {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::TotalRow),
+            );
+        }
+        if is_header && is_first_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::FirstHeaderCell),
+            );
+        }
+        if is_header && is_last_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::LastHeaderCell),
+            );
+        }
+        if is_totals && is_first_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::FirstTotalCell),
+            );
+        }
+        if is_totals && is_last_col {
+            Self::merge_layer(
+                &mut resolved,
+                self.definition.get(TableStyleRegion::LastTotalCell),
+            );
+        }
+        resolved
+    }
 }
 
 impl Table {
@@ -5810,6 +6426,27 @@ impl CondFormat {
     pub fn new(sqref: (u32, u16, u32, u16), rule: CfRule) -> Self {
         CondFormat { sqref, rule }
     }
+}
+
+/// Read-side OOXML details retained beside a public [`CondFormat`].
+///
+/// This sidecar keeps the long-standing `CondFormat { sqref, rule }` literal
+/// source-compatible while preserving rule ordering and differential styles
+/// that cannot be represented by [`CfRule`] alone. Entries returned by
+/// [`Sheet::conditional_format_metadata`] are aligned with
+/// [`Sheet::conditional_formats`] by index when present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConditionalFormatMetadata {
+    /// Source `cfRule` priority. `None` preserves a missing or invalid value;
+    /// authored rules use document order instead.
+    pub priority: Option<u32>,
+    /// Whether a matching rule prevents lower-priority rules from applying.
+    pub stop_if_true: bool,
+    /// Full differential style retained from the referenced OOXML `dxf`.
+    pub differential_style: Option<CellStyle>,
+    /// Typed losses encountered while parsing the referenced differential style.
+    pub style_losses: Vec<StyleLoss>,
 }
 
 /// A conditional-formatting rule.
@@ -6189,6 +6826,419 @@ impl ProtectionOptions {
     }
 }
 
+const MAX_PRINT_AREAS: usize = 256;
+const MAX_MANUAL_PAGE_BREAKS: usize = 1_026;
+const MAX_HEADER_FOOTER_BYTES: usize = 8_192;
+
+/// Fidelity of source print metadata retained by a worksheet reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PrintFidelity {
+    /// The reader did not expose source print metadata for this sheet.
+    #[default]
+    Unavailable,
+    /// Useful print metadata was retained, with typed losses for omitted state.
+    Partial,
+    /// Every source print property represented by [`PrintMetadata`] was retained.
+    Retained,
+    /// The sheet was created through rxls authoring APIs.
+    Authored,
+}
+
+/// Stable reason why source print metadata could not be represented exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PrintLossKind {
+    /// A source print-area reference was malformed or outside the worksheet grid.
+    InvalidPrintArea,
+    /// A source manual page break was malformed or outside the worksheet grid.
+    InvalidPageBreak,
+    /// A referenced source definition or relationship was absent.
+    MissingReference,
+    /// A source property has no equivalent in the retained print model.
+    UnsupportedProperty,
+    /// Header or footer content was malformed and could not be retained exactly.
+    MalformedHeaderFooter,
+    /// A format-defined or rxls safety limit was reached.
+    LimitExceeded,
+}
+
+/// One aggregated source print-metadata loss boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PrintLoss {
+    /// Stable typed reason.
+    pub kind: PrintLossKind,
+    /// Number of occurrences, saturated at [`u32::MAX`].
+    pub occurrences: u32,
+}
+
+/// Authored order used to traverse a worksheet's printed pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PrintPageOrder {
+    /// Print down the worksheet first, then move to the next page column.
+    DownThenOver,
+    /// Print across the worksheet first, then move to the next page row.
+    OverThenDown,
+}
+
+/// One of the six independently authored worksheet header/footer strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HeaderFooterKind {
+    /// Header used on odd and default pages.
+    OddHeader,
+    /// Footer used on odd and default pages.
+    OddFooter,
+    /// Header used on even pages.
+    EvenHeader,
+    /// Footer used on even pages.
+    EvenFooter,
+    /// Header used on the first page.
+    FirstHeader,
+    /// Footer used on the first page.
+    FirstFooter,
+}
+
+/// Distinct source header/footer strings and their authored behavior flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HeaderFooterMetadata {
+    odd_header: Option<String>,
+    odd_footer: Option<String>,
+    even_header: Option<String>,
+    even_footer: Option<String>,
+    first_header: Option<String>,
+    first_footer: Option<String>,
+    different_odd_even: Option<bool>,
+    different_first: Option<bool>,
+    scale_with_document: Option<bool>,
+    align_with_margins: Option<bool>,
+}
+
+impl HeaderFooterMetadata {
+    /// Return the retained string for `kind`, preserving source control codes.
+    pub fn get(&self, kind: HeaderFooterKind) -> Option<&str> {
+        match kind {
+            HeaderFooterKind::OddHeader => self.odd_header.as_deref(),
+            HeaderFooterKind::OddFooter => self.odd_footer.as_deref(),
+            HeaderFooterKind::EvenHeader => self.even_header.as_deref(),
+            HeaderFooterKind::EvenFooter => self.even_footer.as_deref(),
+            HeaderFooterKind::FirstHeader => self.first_header.as_deref(),
+            HeaderFooterKind::FirstFooter => self.first_footer.as_deref(),
+        }
+    }
+
+    /// Header used on odd and default pages.
+    pub fn odd_header(&self) -> Option<&str> {
+        self.odd_header.as_deref()
+    }
+
+    /// Footer used on odd and default pages.
+    pub fn odd_footer(&self) -> Option<&str> {
+        self.odd_footer.as_deref()
+    }
+
+    /// Header used on even pages.
+    pub fn even_header(&self) -> Option<&str> {
+        self.even_header.as_deref()
+    }
+
+    /// Footer used on even pages.
+    pub fn even_footer(&self) -> Option<&str> {
+        self.even_footer.as_deref()
+    }
+
+    /// Header used on the first page.
+    pub fn first_header(&self) -> Option<&str> {
+        self.first_header.as_deref()
+    }
+
+    /// Footer used on the first page.
+    pub fn first_footer(&self) -> Option<&str> {
+        self.first_footer.as_deref()
+    }
+
+    /// Whether even pages use their distinct header/footer strings.
+    pub fn different_odd_even(&self) -> Option<bool> {
+        self.different_odd_even
+    }
+
+    /// Whether the first page uses its distinct header/footer strings.
+    pub fn different_first(&self) -> Option<bool> {
+        self.different_first
+    }
+
+    /// Whether header/footer text scales with the printed document.
+    pub fn scale_with_document(&self) -> Option<bool> {
+        self.scale_with_document
+    }
+
+    /// Whether header/footer positions align with page margins.
+    pub fn align_with_margins(&self) -> Option<bool> {
+        self.align_with_margins
+    }
+
+    fn slot_mut(&mut self, kind: HeaderFooterKind) -> &mut Option<String> {
+        match kind {
+            HeaderFooterKind::OddHeader => &mut self.odd_header,
+            HeaderFooterKind::OddFooter => &mut self.odd_footer,
+            HeaderFooterKind::EvenHeader => &mut self.even_header,
+            HeaderFooterKind::EvenFooter => &mut self.even_footer,
+            HeaderFooterKind::FirstHeader => &mut self.first_header,
+            HeaderFooterKind::FirstFooter => &mut self.first_footer,
+        }
+    }
+}
+
+/// Bounded, loss-aware source print metadata retained beside [`PageSetup`].
+///
+/// The long-standing [`PageSetup`] remains the authoring and compatibility
+/// facade. This sidecar preserves source-only details such as multiple print
+/// areas, manual page breaks, page traversal order, and all six header/footer
+/// variants without changing that public struct's fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PrintMetadata {
+    fidelity: PrintFidelity,
+    print_areas: Vec<(u32, u16, u32, u16)>,
+    manual_row_breaks: Vec<u32>,
+    manual_col_breaks: Vec<u16>,
+    page_order: Option<PrintPageOrder>,
+    print_gridlines: Option<bool>,
+    print_headings: Option<bool>,
+    center_horizontally: Option<bool>,
+    center_vertically: Option<bool>,
+    header_footer: HeaderFooterMetadata,
+    losses: Vec<PrintLoss>,
+}
+
+impl PrintMetadata {
+    /// Source-retention fidelity for this sheet's print metadata.
+    pub fn fidelity(&self) -> PrintFidelity {
+        self.fidelity
+    }
+
+    /// Source print areas in authored order, as inclusive zero-based ranges.
+    pub fn print_areas(&self) -> &[(u32, u16, u32, u16)] {
+        self.print_areas.as_slice()
+    }
+
+    /// Sorted, deduplicated zero-based row indexes with manual page breaks.
+    pub fn manual_row_breaks(&self) -> &[u32] {
+        self.manual_row_breaks.as_slice()
+    }
+
+    /// Sorted, deduplicated zero-based column indexes with manual page breaks.
+    pub fn manual_col_breaks(&self) -> &[u16] {
+        self.manual_col_breaks.as_slice()
+    }
+
+    /// Authored page traversal order, when the source exposes it.
+    pub fn page_order(&self) -> Option<PrintPageOrder> {
+        self.page_order
+    }
+
+    /// Explicit source setting for printing worksheet gridlines.
+    pub fn print_gridlines(&self) -> Option<bool> {
+        self.print_gridlines
+    }
+
+    /// Explicit source setting for printing row and column headings.
+    pub fn print_headings(&self) -> Option<bool> {
+        self.print_headings
+    }
+
+    /// Explicit source setting for horizontal print centering.
+    pub fn center_horizontally(&self) -> Option<bool> {
+        self.center_horizontally
+    }
+
+    /// Explicit source setting for vertical print centering.
+    pub fn center_vertically(&self) -> Option<bool> {
+        self.center_vertically
+    }
+
+    /// Distinct odd, even, and first-page header/footer metadata.
+    pub fn header_footer(&self) -> &HeaderFooterMetadata {
+        &self.header_footer
+    }
+
+    /// Aggregated typed source-loss reasons.
+    pub fn losses(&self) -> &[PrintLoss] {
+        self.losses.as_slice()
+    }
+
+    pub(crate) fn authored() -> Self {
+        Self {
+            fidelity: PrintFidelity::Authored,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn mark_source(&mut self) {
+        if self.fidelity == PrintFidelity::Unavailable {
+            self.fidelity = PrintFidelity::Retained;
+        }
+    }
+
+    pub(crate) fn add_loss(&mut self, kind: PrintLossKind) {
+        self.mark_source();
+        self.fidelity = PrintFidelity::Partial;
+        if let Some(loss) = self.losses.iter_mut().find(|loss| loss.kind == kind) {
+            loss.occurrences = loss.occurrences.saturating_add(1);
+        } else {
+            self.losses.push(PrintLoss {
+                kind,
+                occurrences: 1,
+            });
+        }
+    }
+
+    pub(crate) fn push_print_area(&mut self, area: (u32, u16, u32, u16)) {
+        self.mark_source();
+        if area.0 > area.2 || area.1 > area.3 || area.2 > 1_048_575 || area.3 > 16_383 {
+            self.add_loss(PrintLossKind::InvalidPrintArea);
+            return;
+        }
+        if self.print_areas.contains(&area) {
+            return;
+        }
+        if self.print_areas.len() == MAX_PRINT_AREAS {
+            self.add_loss(PrintLossKind::LimitExceeded);
+            return;
+        }
+        self.print_areas.push(area);
+    }
+
+    pub(crate) fn push_manual_row_break(&mut self, row: u32) {
+        self.mark_source();
+        if row > 1_048_575 {
+            self.add_loss(PrintLossKind::InvalidPageBreak);
+            return;
+        }
+        if self.manual_row_breaks.binary_search(&row).is_ok() {
+            return;
+        }
+        if self.manual_row_breaks.len() == MAX_MANUAL_PAGE_BREAKS {
+            self.add_loss(PrintLossKind::LimitExceeded);
+            return;
+        }
+        let index = self
+            .manual_row_breaks
+            .partition_point(|candidate| *candidate < row);
+        self.manual_row_breaks.insert(index, row);
+    }
+
+    pub(crate) fn push_manual_col_break(&mut self, col: u16) {
+        self.mark_source();
+        if col > 16_383 {
+            self.add_loss(PrintLossKind::InvalidPageBreak);
+            return;
+        }
+        if self.manual_col_breaks.binary_search(&col).is_ok() {
+            return;
+        }
+        if self.manual_col_breaks.len() == MAX_MANUAL_PAGE_BREAKS {
+            self.add_loss(PrintLossKind::LimitExceeded);
+            return;
+        }
+        let index = self
+            .manual_col_breaks
+            .partition_point(|candidate| *candidate < col);
+        self.manual_col_breaks.insert(index, col);
+    }
+
+    pub(crate) fn set_page_order(&mut self, order: PrintPageOrder) {
+        self.mark_source();
+        self.page_order = Some(order);
+    }
+
+    pub(crate) fn set_print_gridlines(&mut self, value: bool) {
+        self.mark_source();
+        self.print_gridlines = Some(value);
+    }
+
+    pub(crate) fn set_print_headings(&mut self, value: bool) {
+        self.mark_source();
+        self.print_headings = Some(value);
+    }
+
+    pub(crate) fn set_center_horizontally(&mut self, value: bool) {
+        self.mark_source();
+        self.center_horizontally = Some(value);
+    }
+
+    pub(crate) fn set_center_vertically(&mut self, value: bool) {
+        self.mark_source();
+        self.center_vertically = Some(value);
+    }
+
+    pub(crate) fn set_header_footer_flag(
+        &mut self,
+        different_odd_even: Option<bool>,
+        different_first: Option<bool>,
+        scale_with_document: Option<bool>,
+        align_with_margins: Option<bool>,
+    ) {
+        self.mark_source();
+        self.header_footer.different_odd_even = different_odd_even;
+        self.header_footer.different_first = different_first;
+        self.header_footer.scale_with_document = scale_with_document;
+        self.header_footer.align_with_margins = align_with_margins;
+    }
+
+    pub(crate) fn set_header_footer(&mut self, kind: HeaderFooterKind, value: String) {
+        self.mark_source();
+        let (value, truncated) = bounded_print_text(value);
+        *self.header_footer.slot_mut(kind) = Some(value);
+        if truncated {
+            self.add_loss(PrintLossKind::LimitExceeded);
+        }
+    }
+
+    #[cfg(any(feature = "xlsx", feature = "ods"))]
+    pub(crate) fn append_header_footer(&mut self, kind: HeaderFooterKind, value: &str) {
+        self.mark_source();
+        let current_len = self
+            .header_footer
+            .get(kind)
+            .map(str::len)
+            .unwrap_or_default();
+        if current_len >= MAX_HEADER_FOOTER_BYTES {
+            if !value.is_empty() {
+                self.add_loss(PrintLossKind::LimitExceeded);
+            }
+            return;
+        }
+        let available = MAX_HEADER_FOOTER_BYTES - current_len;
+        let mut boundary = value.len().min(available);
+        while boundary > 0 && !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.header_footer
+            .slot_mut(kind)
+            .get_or_insert_with(String::new)
+            .push_str(&value[..boundary]);
+        if boundary < value.len() {
+            self.add_loss(PrintLossKind::LimitExceeded);
+        }
+    }
+}
+
+fn bounded_print_text(mut value: String) -> (String, bool) {
+    if value.len() <= MAX_HEADER_FOOTER_BYTES {
+        return (value, false);
+    }
+    let mut boundary = MAX_HEADER_FOOTER_BYTES;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    (value, true)
+}
+
 /// Print / page setup for a worksheet (authoring). All fields optional; an
 /// unset field uses Excel's default.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -6563,6 +7613,37 @@ impl Sheet {
         self.cells.iter().map(|c| (c.row, c.col, &c.value))
     }
 
+    /// Iterate display-ready cells in ascending coordinate order with duplicate
+    /// records resolved by last-write-wins semantics.
+    ///
+    /// The iterator builds a bounded index proportional to the sheet's retained
+    /// cell count so consumers do not need repeated linear lookups for formatted
+    /// text, style, rich text, or hyperlinks.
+    pub fn display_cells(&self) -> impl Iterator<Item = DisplayCell<'_>> {
+        let mut cells = BTreeMap::new();
+        for entry in &self.cells {
+            cells.insert((entry.row, entry.col), entry);
+        }
+        let mut read_hyperlinks = BTreeMap::new();
+        for (row, col, target) in &self.read_hyperlinks {
+            read_hyperlinks.insert((*row, *col), target.as_str());
+        }
+        cells
+            .into_iter()
+            .map(move |((row, col), entry)| DisplayCell {
+                row,
+                col,
+                value: &entry.value,
+                formatted: &entry.text,
+                explicit_style: entry.style.as_ref(),
+                rich_text: self.rich.get(&(row, col)).map(Vec::as_slice),
+                hyperlink: entry
+                    .hyperlink
+                    .as_deref()
+                    .or_else(|| read_hyperlinks.get(&(row, col)).copied()),
+            })
+    }
+
     /// The typed value at `(row, col)`, if that cell is non-empty. When a
     /// coordinate has multiple records the last one wins (Excel semantics).
     pub fn cell(&self, row: u32, col: u16) -> Option<&Cell> {
@@ -6599,6 +7680,116 @@ impl Sheet {
             .or_else(|| self.blank_styles.get(&(row, col)))
     }
 
+    /// Report how completely source styles were retained for this worksheet.
+    pub fn style_fidelity(&self) -> StyleFidelity {
+        self.style_fidelity
+    }
+
+    /// Aggregated, typed boundaries that made source style retention partial.
+    pub fn style_losses(&self) -> &[StyleLoss] {
+        &self.style_losses
+    }
+
+    /// Resolve worksheet, column, row, table-region, and explicit cell styles
+    /// for `(row, col)` using deterministic low-to-high precedence.
+    ///
+    /// The returned style is owned because inherited layers are merged. `None`
+    /// means no style layer applies.
+    pub fn resolved_cell_style(&self, row: u32, col: u16) -> Option<CellStyle> {
+        let table_style = self.tables.iter().find_map(|table| {
+            self.table_region_formats
+                .get(&table.name)
+                .and_then(|application| application.resolve(table, row, col))
+        });
+        let legacy_table_header = self.tables.iter().find_map(|table| {
+            let (r0, c0, _, c1) = table.range;
+            (row == r0 && col >= c0 && col <= c1)
+                .then(|| self.table_header_formats.get(&table.name))
+                .flatten()
+        });
+
+        // Imported readers retain resolved XF/styles rather than authoring
+        // overlays. Select the highest-precedence retained layer directly so a
+        // normal-font row, for example, can clear a bold column default. XLSX
+        // table imports additionally retain sparse direct-cell XF overlays;
+        // those can safely compose over table differential styles.
+        if self.style_fidelity != StyleFidelity::Authored {
+            if !self.table_region_formats.is_empty() || !self.direct_cell_formats.is_empty() {
+                let direct = self.direct_cell_formats.get(&(row, col));
+                // Imported row/column XFs are fully resolved styles, so the
+                // highest-precedence inherited XF replaces the lower one.
+                // Table DXFs are sparse and therefore merge property-wise.
+                // Finally, explicitly applied direct-cell XF components
+                // replace their complete component (including false/None
+                // resets such as normal font, no border, or General format).
+                let mut resolved = self
+                    .row_formats
+                    .get(&row)
+                    .or_else(|| self.col_formats.get(&col))
+                    .or(self.default_format.as_ref())
+                    .cloned();
+                if let Some(table) = table_style.as_ref().or(legacy_table_header) {
+                    resolved = Some(match resolved {
+                        Some(base) => base.merge(table),
+                        None => table.clone(),
+                    });
+                }
+                if let Some(direct) = direct {
+                    resolved = Some(direct.apply_to(resolved));
+                }
+                return resolved.or_else(|| self.cell_style(row, col).cloned());
+            }
+            return self
+                .cell_style(row, col)
+                .or(table_style.as_ref())
+                .or(legacy_table_header)
+                .or_else(|| self.row_formats.get(&row))
+                .or_else(|| self.col_formats.get(&col))
+                .or(self.default_format.as_ref())
+                .cloned();
+        }
+        [
+            self.default_format.as_ref(),
+            self.col_formats.get(&col),
+            self.row_formats.get(&row),
+            table_style.as_ref().or(legacy_table_header),
+            self.cell_style(row, col),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(None, |resolved: Option<CellStyle>, style| {
+            Some(match resolved {
+                Some(base) => base.merge(style),
+                None => style.clone(),
+            })
+        })
+    }
+
+    /// Worksheet-default cell style before column, row, table, or cell layers.
+    pub fn default_cell_style(&self) -> Option<&CellStyle> {
+        self.default_format.as_ref()
+    }
+
+    /// Column-default styles keyed by zero-based column index.
+    pub fn column_styles(&self) -> &BTreeMap<u16, CellStyle> {
+        &self.col_formats
+    }
+
+    /// Row-default styles keyed by zero-based row index.
+    pub fn row_styles(&self) -> &BTreeMap<u32, CellStyle> {
+        &self.row_formats
+    }
+
+    /// Explicit styles for format-only blank cells.
+    pub fn blank_cell_styles(&self) -> &BTreeMap<(u32, u16), CellStyle> {
+        &self.blank_styles
+    }
+
+    /// Table-header style overrides keyed by authored table name.
+    pub fn table_header_styles(&self) -> &BTreeMap<String, CellStyle> {
+        &self.table_header_formats
+    }
+
     /// Rich-text runs retained for a cell. Plain strings return `None`; the
     /// concatenated value remains available through [`Sheet::cell`].
     pub fn rich_text_runs(&self, row: u32, col: u16) -> Option<&[TextRun]> {
@@ -6610,9 +7801,44 @@ impl Sheet {
         &self.col_widths
     }
 
+    /// Explicit absolute column widths in points, keyed by 0-based column.
+    ///
+    /// Formats such as ODS store physical lengths rather than Excel character
+    /// units. The ordinary [`Sheet::column_widths`] projection remains
+    /// available for compatibility; renderers should prefer this map when an
+    /// entry is present.
+    pub fn physical_column_widths(&self) -> &BTreeMap<u16, f32> {
+        &self.physical_col_widths
+    }
+
     /// Explicit row heights in points, keyed by 0-based row.
     pub fn row_heights(&self) -> &BTreeMap<u32, f32> {
         &self.row_heights
+    }
+
+    /// Default column width in character units when no explicit width exists.
+    pub fn default_column_width(&self) -> Option<f32> {
+        self.default_col_width
+    }
+
+    /// Return retained OOXML implicit-width provenance for the renderer.
+    ///
+    /// This is an internal cross-crate contract. `None` means the sheet did
+    /// not come from an implicit OOXML default; `Some(None)` means the OOXML
+    /// application default applies; and `Some(Some(chars))` retains an
+    /// explicitly authored `baseColWidth` / `cchDefColWidth` value.
+    #[doc(hidden)]
+    pub fn implicit_ooxml_column_width(&self) -> Option<Option<f32>> {
+        match self.ooxml_implicit_col_width {
+            OoxmlImplicitColumnWidth::None => None,
+            OoxmlImplicitColumnWidth::ApplicationDefault => Some(None),
+            OoxmlImplicitColumnWidth::BaseCharacters(chars) => Some(Some(chars)),
+        }
+    }
+
+    /// Default row height in points when no explicit height exists.
+    pub fn default_row_height(&self) -> Option<f32> {
+        self.default_row_height
     }
 
     /// Explicitly hidden columns, as 0-based indexes.
@@ -6724,6 +7950,16 @@ impl Sheet {
         &self.cond_formats
     }
 
+    /// Read-side conditional-formatting metadata aligned by rule index.
+    ///
+    /// Authored rules carry default metadata and therefore retain their
+    /// document-order precedence. Readers for formats without an equivalent
+    /// sidecar may return fewer entries; consumers should then use document
+    /// order and the public [`CfRule`] payload.
+    pub fn conditional_format_metadata(&self) -> &[ConditionalFormatMetadata] {
+        &self.cond_format_metadata
+    }
+
     /// Whether worksheet protection is enabled.
     pub fn is_protected(&self) -> bool {
         self.protect
@@ -6741,6 +7977,12 @@ impl Sheet {
     /// [`Sheet::set_page_setup`].
     pub fn page_setup(&self) -> Option<&PageSetup> {
         self.page_setup.as_ref()
+    }
+
+    /// Loss-aware source print metadata, including details not represented by
+    /// [`PageSetup`] such as multiple print areas and manual page breaks.
+    pub fn print_metadata(&self) -> &PrintMetadata {
+        &self.print_metadata
     }
 
     /// Worksheet view metadata discovered when reading supported spreadsheet
@@ -6775,6 +8017,15 @@ impl Sheet {
     /// [`Chart`] storage, so a read workbook round-trips its charts on write.
     pub fn charts(&self) -> &[Chart] {
         &self.charts
+    }
+
+    /// Rendering sidecars for retained images, charts, and unsupported shapes.
+    ///
+    /// `object_index` addresses [`Self::images`] or [`Self::charts`] according
+    /// to each entry's `kind`; unsupported shapes carry geometry but have no
+    /// Image/Chart object.
+    pub fn drawing_metadata(&self) -> &[DrawingMetadata] {
+        &self.drawing_metadata
     }
 
     /// Sparklines (`x14:sparklineGroup`) anchored to worksheet cells.
@@ -6834,6 +8085,27 @@ impl Sheet {
         Some((r0, c0, r1, c1))
     }
 
+    /// Inclusive dimensions covering values, format-only blanks, and merged
+    /// ranges. This is the render/export surface rather than only populated
+    /// value cells.
+    pub fn visual_dimensions(&self) -> Option<(u32, u16, u32, u16)> {
+        let mut dimensions = self.dimensions();
+        let mut include = |row: u32, col: u16| {
+            dimensions = Some(match dimensions {
+                Some((r0, c0, r1, c1)) => (r0.min(row), c0.min(col), r1.max(row), c1.max(col)),
+                None => (row, col, row, col),
+            });
+        };
+        for &(row, col) in self.blank_styles.keys() {
+            include(row, col);
+        }
+        for &(r0, c0, r1, c1) in self.merged_ranges() {
+            include(r0, c0);
+            include(r1, c1);
+        }
+        dimensions
+    }
+
     /// Used range dimensions as a typed inclusive rectangle.
     pub fn dimensions_info(&self) -> Option<Dimensions> {
         self.dimensions().map(Dimensions::from_range_tuple)
@@ -6889,6 +8161,9 @@ pub struct Workbook {
     pub defined_names: Vec<(String, String)>,
     /// Sheet-scoped defined names retained from readers and authoring.
     pub local_defined_names: Vec<LocalDefinedName>,
+    /// Container path retained from the reader. Authored workbooks use the
+    /// default `NotApplicable` value.
+    pub(crate) container_parse_mode: crate::ContainerParseMode,
     /// 0-based index of the active/selected sheet (authoring), emitted as
     /// `<workbookView activeTab="N"/>` plus `tabSelected="1"` on that sheet's
     /// view. Defaults to `0`; set via [`Workbook::set_active_sheet`].
@@ -7245,6 +8520,15 @@ impl Workbook {
         self.text_truncated
     }
 
+    /// Return typed, bounded provenance for this workbook's successful parse.
+    ///
+    /// Authored workbooks report [`crate::ContainerParseMode::NotApplicable`]. A
+    /// recovered parse remains subject to the normal strict edit/save
+    /// safeguards; provenance is an audit signal, not a validity certificate.
+    pub fn parse_provenance(&self) -> crate::ParseProvenance {
+        crate::ParseProvenance::from_state(self.container_parse_mode, self.text_truncated)
+    }
+
     /// `true` if the workbook uses the 1904 date epoch.
     ///
     /// This is a calamine-style alias over [`Workbook::date1904`].
@@ -7585,6 +8869,20 @@ fn display_text(v: &Cell) -> String {
     }
 }
 
+fn display_text_with_num_fmt(v: &Cell, num_fmt: Option<&str>, date1904: bool) -> String {
+    let Some(num_fmt) = num_fmt else {
+        return display_text(v);
+    };
+    match v {
+        Cell::Text(text) => crate::format::render_text_format(text, num_fmt),
+        Cell::Number(number) | Cell::Date(number) => {
+            crate::format::render_format(*number, num_fmt, date1904)
+        }
+        Cell::Formula { cached, .. } => display_text_with_num_fmt(cached, Some(num_fmt), date1904),
+        Cell::Bool(_) | Cell::Error(_) => display_text(v),
+    }
+}
+
 impl std::fmt::Display for Cell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&display_text(self))
@@ -7792,7 +9090,9 @@ impl Workbook {
     }
     /// Append a worksheet and return a mutable handle to it.
     pub fn add_sheet(&mut self, name: impl AsRef<str>) -> &mut Sheet {
-        self.sheets.push(Sheet::new(name));
+        let mut sheet = Sheet::new(name);
+        sheet.display_date1904 = self.date1904;
+        self.sheets.push(sheet);
         self.sheets
             .last_mut()
             .expect("just pushed a sheet, so last_mut is Some")
@@ -8128,6 +9428,8 @@ impl Sheet {
             name: name.as_ref().to_string(),
             is_worksheet: true,
             sheet_type: Some(SheetType::WorkSheet),
+            style_fidelity: StyleFidelity::Authored,
+            print_metadata: PrintMetadata::authored(),
             ..Default::default()
         }
     }
@@ -8344,10 +9646,12 @@ impl Sheet {
     /// Print the gridlines on the printed page (authoring).
     pub fn set_print_gridlines(&mut self) {
         self.print_gridlines = true;
+        self.print_metadata.set_print_gridlines(true);
     }
     /// Print the row and column headings on the printed page (authoring).
     pub fn set_print_headings(&mut self) {
         self.print_headings = true;
+        self.print_metadata.set_print_headings(true);
     }
     /// Write a rich (mixed-format) string at `(row, col)`: each [`TextRun`] carries
     /// its own font. Emitted as an inline rich string; the concatenated text is also
@@ -8478,16 +9782,19 @@ impl Sheet {
     /// Set the default format for cells in a row.
     pub fn set_row_format(&mut self, row: u32, format: &Format) {
         self.row_formats.insert(row, format.as_cell_style().clone());
+        self.refresh_authored_display_texts();
     }
     /// Set the default format for cells in a column.
     pub fn set_col_format(&mut self, col: u16, format: &Format) {
         self.col_formats.insert(col, format.as_cell_style().clone());
+        self.refresh_authored_display_texts();
     }
     /// Set the worksheet default format for cells without a more specific format.
     ///
     /// Column, row, and explicit cell formats merge over this base style.
     pub fn set_default_format(&mut self, format: &Format) {
         self.default_format = Some(format.as_cell_style().clone());
+        self.refresh_authored_display_texts();
     }
     /// Set the format for the header row cells of the named table.
     ///
@@ -8500,6 +9807,7 @@ impl Sheet {
             table_name.as_ref().to_string(),
             format.as_cell_style().clone(),
         );
+        self.refresh_authored_display_texts();
     }
     /// Set the default row height (points) for rows without an explicit height.
     pub fn set_default_row_height(&mut self, points: f32) {
@@ -8509,6 +9817,7 @@ impl Sheet {
     /// explicit width.
     pub fn set_default_col_width(&mut self, chars: f32) {
         self.default_col_width = Some(chars);
+        self.ooxml_implicit_col_width = OoxmlImplicitColumnWidth::None;
     }
     /// Freeze the panes above `row` and left of `col`.
     pub fn freeze_panes(&mut self, row: u32, col: u16) {
@@ -8520,6 +9829,30 @@ impl Sheet {
     }
     /// Set the print / page setup.
     pub fn set_page_setup(&mut self, ps: PageSetup) {
+        let print_gridlines = self.print_metadata.print_gridlines;
+        let print_headings = self.print_metadata.print_headings;
+        self.print_metadata = PrintMetadata::authored();
+        if let Some(value) = print_gridlines {
+            self.print_metadata.set_print_gridlines(value);
+        }
+        if let Some(value) = print_headings {
+            self.print_metadata.set_print_headings(value);
+        }
+        if let Some(area) = ps.print_area {
+            self.print_metadata.push_print_area(area);
+        }
+        self.print_metadata
+            .set_center_horizontally(ps.center_horizontally);
+        self.print_metadata
+            .set_center_vertically(ps.center_vertically);
+        if let Some(header) = ps.header.clone() {
+            self.print_metadata
+                .set_header_footer(HeaderFooterKind::OddHeader, header);
+        }
+        if let Some(footer) = ps.footer.clone() {
+            self.print_metadata
+                .set_header_footer(HeaderFooterKind::OddFooter, footer);
+        }
         self.page_setup = Some(ps);
     }
     /// Set the sheet tab color.
@@ -8544,6 +9877,8 @@ impl Sheet {
     /// Add a conditional-formatting rule over a range.
     pub fn add_conditional_format(&mut self, cf: CondFormat) {
         self.cond_formats.push(cf);
+        self.cond_format_metadata
+            .push(ConditionalFormatMetadata::default());
     }
     /// Embed an image anchored to a cell box.
     pub fn add_image(&mut self, img: Image) {
@@ -8560,6 +9895,7 @@ impl Sheet {
     /// Add a worksheet table over a range (first row = header).
     pub fn add_table(&mut self, table: Table) {
         self.tables.push(table);
+        self.refresh_authored_display_texts();
     }
     /// Attach a legacy cell comment / note to `(row, col)` with `text` and an
     /// optional `author`. Passing a direct author string is treated as `Some`.
@@ -8589,7 +9925,8 @@ impl Sheet {
         // `write_rich` re-inserts after calling this, so its own runs survive.
         self.rich.remove(&(row, col));
         self.blank_styles.remove(&(row, col));
-        let text = display_text(&value);
+        let num_fmt = self.effective_authored_num_fmt(row, col, style.as_ref());
+        let text = display_text_with_num_fmt(&value, num_fmt, self.display_date1904);
         self.cells.push(CellEntry {
             row,
             col,
@@ -8598,6 +9935,58 @@ impl Sheet {
             style,
             hyperlink,
         });
+    }
+
+    fn effective_authored_num_fmt<'a>(
+        &'a self,
+        row: u32,
+        col: u16,
+        explicit: Option<&'a CellStyle>,
+    ) -> Option<&'a str> {
+        explicit
+            .and_then(|style| style.num_fmt.as_deref())
+            .or_else(|| {
+                self.tables.iter().find_map(|table| {
+                    let (r0, c0, _, c1) = table.range;
+                    (row == r0 && col >= c0 && col <= c1)
+                        .then(|| self.table_header_formats.get(&table.name))
+                        .flatten()
+                        .and_then(|style| style.num_fmt.as_deref())
+                })
+            })
+            .or_else(|| {
+                self.row_formats
+                    .get(&row)
+                    .and_then(|style| style.num_fmt.as_deref())
+            })
+            .or_else(|| {
+                self.col_formats
+                    .get(&col)
+                    .and_then(|style| style.num_fmt.as_deref())
+            })
+            .or_else(|| {
+                self.default_format
+                    .as_ref()
+                    .and_then(|style| style.num_fmt.as_deref())
+            })
+    }
+
+    fn refresh_authored_display_texts(&mut self) {
+        if self.style_fidelity != StyleFidelity::Authored {
+            return;
+        }
+        let formats: Vec<Option<String>> = self
+            .cells
+            .iter()
+            .map(|cell| {
+                self.effective_authored_num_fmt(cell.row, cell.col, cell.style.as_ref())
+                    .map(str::to_string)
+            })
+            .collect();
+        for (cell, num_fmt) in self.cells.iter_mut().zip(formats) {
+            cell.text =
+                display_text_with_num_fmt(&cell.value, num_fmt.as_deref(), self.display_date1904);
+        }
     }
 }
 
@@ -9008,6 +10397,323 @@ mod tests {
         assert_eq!(s.cell(0, 0), Some(&Cell::Number(2.0)));
     }
 
+    #[test]
+    fn authored_number_formats_drive_retained_display_text() {
+        let mut sheet = Sheet::new("formatted");
+        sheet.write_with_format(
+            0,
+            0,
+            1_234.5,
+            &Format::new().set_num_format("[$₩-412]#,##0.00"),
+        );
+        sheet.write_with_format(
+            0,
+            1,
+            -2.0,
+            &Format::new().set_num_format("0;[Red](0);\"없음\";\"값: \"@"),
+        );
+        sheet.write_with_format(
+            0,
+            2,
+            "한글",
+            &Format::new().set_num_format("0;[Red](0);0;\"값: \"@"),
+        );
+        sheet.write_datetime_with_format(
+            0,
+            3,
+            45_366.0,
+            &Format::new().set_num_format("yyyy\"년\" m\"월\" d\"일\""),
+        );
+
+        assert_eq!(sheet.formatted(0, 0), Some("₩1,234.50"));
+        assert_eq!(sheet.formatted(0, 1), Some("(2)"));
+        assert_eq!(sheet.formatted(0, 2), Some("값: 한글"));
+        assert_eq!(sheet.formatted(0, 3), Some("2024년 3월 15일"));
+    }
+
+    #[test]
+    fn inherited_authored_number_format_precedence_refreshes_existing_cells() {
+        let mut sheet = Sheet::new("inherited");
+        sheet.write(2, 3, 1.25);
+        sheet.set_default_format(&Format::new().set_num_format("0.0"));
+        assert_eq!(sheet.formatted(2, 3), Some("1.3"));
+
+        sheet.set_col_format(3, &Format::new().set_num_format("0.00"));
+        assert_eq!(sheet.formatted(2, 3), Some("1.25"));
+
+        sheet.set_row_format(2, &Format::new().set_num_format("0.000"));
+        assert_eq!(sheet.formatted(2, 3), Some("1.250"));
+
+        sheet.write_with_format(2, 3, 0.5, &Format::new().set_num_format("0.0%"));
+        assert_eq!(sheet.formatted(2, 3), Some("50.0%"));
+    }
+
+    #[test]
+    fn workbook_created_authored_sheets_inherit_the_1904_display_epoch() {
+        let mut workbook = Workbook::new();
+        workbook.date1904 = true;
+        let sheet = workbook.add_sheet("mac-date");
+        sheet.write_datetime_with_format(0, 0, 0.0, &Format::new().set_num_format("yyyy-mm-dd"));
+        assert_eq!(sheet.formatted(0, 0), Some("1904-01-01"));
+    }
+
+    #[test]
+    fn display_cells_are_ordered_deduplicated_and_carry_render_metadata() {
+        let mut sheet = Sheet::new("render");
+        sheet.write(1, 1, "old");
+        sheet.write_url_with_text_and_format(
+            1,
+            1,
+            "https://example.com",
+            "새 값",
+            &Format::new().bold(),
+        );
+        sheet.write(0, 2, 3_i64);
+
+        let cells = sheet.display_cells().collect::<Vec<_>>();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            (cells[0].row, cells[0].col, cells[0].formatted),
+            (0, 2, "3")
+        );
+        assert_eq!((cells[1].row, cells[1].col), (1, 1));
+        assert_eq!(cells[1].formatted, "새 값");
+        assert!(cells[1]
+            .explicit_style
+            .and_then(|style| style.font.as_ref())
+            .is_some_and(|font| font.bold));
+        assert_eq!(cells[1].hyperlink, Some("https://example.com"));
+    }
+
+    #[test]
+    fn resolved_style_and_visual_dimensions_match_writer_precedence() {
+        let mut sheet = Sheet::new("render");
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Authored);
+        assert_eq!(
+            Sheet::default().style_fidelity(),
+            StyleFidelity::Unavailable
+        );
+        sheet.set_default_format(&Format::new().background_color([1, 2, 3]));
+        sheet.set_col_format(2, &Format::new().bold());
+        sheet.set_row_format(3, &Format::new().italic());
+        sheet.write_with_format(3, 2, "value", &Format::new().color([4, 5, 6]));
+        sheet.write_blank_with_format(8, 9, &Format::new().underline());
+        sheet.merge(10, 10, 11, 12);
+        sheet.set_default_row_height(18.0);
+        sheet.set_default_col_width(9.5);
+
+        let style = sheet.resolved_cell_style(3, 2).expect("resolved style");
+        let font = style.font.expect("merged font");
+        assert!(font.bold);
+        assert!(font.italic);
+        assert_eq!(font.color, Some(Color::rgb(4, 5, 6)));
+        assert_eq!(style.fill, Some(Color::rgb(1, 2, 3)));
+        assert_eq!(sheet.default_row_height(), Some(18.0));
+        assert_eq!(sheet.default_column_width(), Some(9.5));
+        assert_eq!(sheet.visual_dimensions(), Some((3, 2, 11, 12)));
+    }
+
+    #[test]
+    fn table_regions_merge_in_fixed_order_between_inherited_and_direct_styles() {
+        let mut sheet = Sheet::new("table-cascade");
+        sheet.set_default_format(&Format::new().set_num_format("0.0"));
+        sheet.set_col_format(0, &Format::new().bold());
+        sheet.set_row_format(2, &Format::new().italic());
+        sheet.tables.push(Table::new(
+            (1, 0, 6, 2),
+            "Sales",
+            ["first", "middle", "last"],
+        ));
+
+        let mut definition = TableStyleDefinition::default();
+        definition.insert(
+            TableStyleRegion::WholeTable,
+            CellStyle::new().underline(),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::FirstColumnStripe,
+            CellStyle::new().background_color([20, 20, 20]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::FirstRowStripe,
+            CellStyle::new().background_color([30, 30, 30]),
+            2,
+        );
+        definition.insert(
+            TableStyleRegion::SecondRowStripe,
+            CellStyle::new().background_color([40, 40, 40]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::FirstColumn,
+            CellStyle::new().color([50, 50, 50]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::LastColumn,
+            CellStyle::new().strikethrough(),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::HeaderRow,
+            CellStyle::new().background_color([60, 60, 60]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::TotalRow,
+            CellStyle::new().background_color([70, 70, 70]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::FirstHeaderCell,
+            CellStyle::new().color([80, 80, 80]),
+            1,
+        );
+        definition.insert(
+            TableStyleRegion::LastTotalCell,
+            CellStyle::new().color([90, 90, 90]),
+            1,
+        );
+        sheet.table_region_formats.insert(
+            "Sales".to_string(),
+            TableStyleApplication {
+                definition,
+                header_row: true,
+                totals_row: true,
+                show_first_column: true,
+                show_last_column: true,
+                show_row_stripes: true,
+                show_column_stripes: true,
+            },
+        );
+        sheet.write_with_format(
+            2,
+            0,
+            1.25,
+            &Format::new()
+                .background_color([100, 100, 100])
+                .color([110, 110, 110]),
+        );
+
+        let header = sheet.resolved_cell_style(1, 0).expect("header style");
+        assert_eq!(header.fill, Some(Color::rgb(60, 60, 60)));
+        assert_eq!(
+            header.font.as_ref().and_then(|font| font.color),
+            Some(Color::rgb(80, 80, 80))
+        );
+
+        let direct = sheet.resolved_cell_style(2, 0).expect("direct style");
+        assert_eq!(direct.fill, Some(Color::rgb(100, 100, 100)));
+        let font = direct.font.as_ref().expect("merged font");
+        assert!(font.bold);
+        assert!(font.italic);
+        assert!(font.underline);
+        assert_eq!(font.color, Some(Color::rgb(110, 110, 110)));
+        assert_eq!(direct.num_fmt.as_deref(), Some("0.0"));
+
+        assert_eq!(
+            sheet.resolved_cell_style(3, 1).and_then(|style| style.fill),
+            Some(Color::rgb(30, 30, 30)),
+            "two-row first stripe must cover the second body row"
+        );
+        assert_eq!(
+            sheet.resolved_cell_style(4, 1).and_then(|style| style.fill),
+            Some(Color::rgb(40, 40, 40)),
+            "the second stripe follows the first stripe's declared size"
+        );
+        let total = sheet.resolved_cell_style(6, 2).expect("total style");
+        assert_eq!(total.fill, Some(Color::rgb(70, 70, 70)));
+        assert_eq!(
+            total.font.as_ref().and_then(|font| font.color),
+            Some(Color::rgb(90, 90, 90))
+        );
+        assert!(total.font.as_ref().is_some_and(|font| font.strikethrough));
+
+        assert_eq!(
+            sheet.resolved_cell_style(3, 1),
+            sheet.resolved_cell_style(3, 1),
+            "resolution must not depend on map iteration order"
+        );
+    }
+
+    #[test]
+    fn imported_cell_xf_components_replace_inherited_and_table_properties() {
+        let mut sheet = Sheet {
+            style_fidelity: StyleFidelity::Partial,
+            ..Sheet::default()
+        };
+        sheet.col_formats.insert(
+            0,
+            CellStyle {
+                font: Some(Font::default().bold()),
+                border: Some(Border {
+                    left: BorderStyle::Thin,
+                    ..Border::default()
+                }),
+                num_fmt: Some("0.00".to_string()),
+                align: Some(Alignment {
+                    wrap: true,
+                    ..Alignment::default()
+                }),
+                ..CellStyle::default()
+            },
+        );
+        sheet.row_formats.insert(
+            2,
+            CellStyle {
+                font: Some(Font::default().italic()),
+                ..CellStyle::default()
+            },
+        );
+        sheet.tables.push(Table::new((1, 0, 3, 0), "T", ["value"]));
+        let mut definition = TableStyleDefinition::default();
+        definition.insert(
+            TableStyleRegion::WholeTable,
+            CellStyle::new().background_color([12, 34, 56]),
+            1,
+        );
+        sheet.table_region_formats.insert(
+            "T".to_string(),
+            TableStyleApplication {
+                definition,
+                header_row: true,
+                ..TableStyleApplication::default()
+            },
+        );
+        sheet.direct_cell_formats.insert(
+            (1, 0),
+            CellStyleOverlay {
+                style: CellStyle {
+                    font: Some(Font::default()),
+                    border: Some(Border::default()),
+                    num_fmt: None,
+                    align: Some(Alignment::default()),
+                    ..CellStyle::default()
+                },
+                replace_font: true,
+                replace_border: true,
+                replace_num_fmt: true,
+                replace_alignment: true,
+                ..CellStyleOverlay::default()
+            },
+        );
+
+        let direct = sheet.resolved_cell_style(1, 0).expect("direct style");
+        assert_eq!(direct.fill, Some(Color::rgb(12, 34, 56)));
+        assert!(direct.font.as_ref().is_some_and(|font| !font.bold));
+        assert_eq!(direct.border, Some(Border::default()));
+        assert_eq!(direct.num_fmt, None);
+        assert_eq!(direct.align, Some(Alignment::default()));
+
+        let row = sheet.resolved_cell_style(2, 0).expect("row style");
+        assert!(row.font.as_ref().is_some_and(|font| font.italic));
+        assert!(row.font.as_ref().is_some_and(|font| !font.bold));
+        assert_eq!(row.num_fmt, None, "row XF replaces the column XF");
+        assert_eq!(row.fill, Some(Color::rgb(12, 34, 56)));
+    }
+
     // Regression tests: HTML gap-fill column alignment and CSV delimiter
     // validation.
 
@@ -9091,5 +10797,57 @@ mod tests {
             None,
             "'\"' is not a valid delimiter and should be rejected like an invalid sheet index"
         );
+    }
+
+    #[test]
+    fn print_metadata_is_bounded_deduplicated_and_unicode_safe() {
+        let mut metadata = PrintMetadata::default();
+        metadata.push_print_area((0, 0, 9, 9));
+        metadata.push_print_area((0, 0, 9, 9));
+        metadata.push_print_area((10, 4, 3, 5));
+        for row in 0..=1_026 {
+            metadata.push_manual_row_break(row);
+        }
+        metadata.set_header_footer(HeaderFooterKind::OddHeader, "한".repeat(3_000));
+
+        assert_eq!(metadata.print_areas(), &[(0, 0, 9, 9)]);
+        assert_eq!(metadata.manual_row_breaks().len(), 1_026);
+        assert_eq!(metadata.manual_row_breaks()[0], 0);
+        assert_eq!(metadata.manual_row_breaks()[1_025], 1_025);
+        let header = metadata.header_footer().odd_header().expect("header");
+        assert!(header.len() <= MAX_HEADER_FOOTER_BYTES);
+        assert!(std::str::from_utf8(header.as_bytes()).is_ok());
+        assert_eq!(metadata.fidelity(), PrintFidelity::Partial);
+        assert!(metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::InvalidPrintArea));
+        assert!(metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::LimitExceeded));
+    }
+
+    #[test]
+    fn authored_page_setup_populates_compatible_print_sidecar() {
+        let mut sheet = Sheet::new("Print");
+        sheet.set_print_gridlines();
+        sheet.set_print_headings();
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((2, 1, 8, 4))
+                .with_center_horizontally(true)
+                .with_header("&CTitle")
+                .with_footer("&P/&N"),
+        );
+
+        let metadata = sheet.print_metadata();
+        assert_eq!(metadata.fidelity(), PrintFidelity::Authored);
+        assert_eq!(metadata.print_areas(), &[(2, 1, 8, 4)]);
+        assert_eq!(metadata.print_gridlines(), Some(true));
+        assert_eq!(metadata.print_headings(), Some(true));
+        assert_eq!(metadata.center_horizontally(), Some(true));
+        assert_eq!(metadata.header_footer().odd_header(), Some("&CTitle"));
+        assert_eq!(metadata.header_footer().odd_footer(), Some("&P/&N"));
     }
 }

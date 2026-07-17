@@ -1,0 +1,455 @@
+{
+  "default_include_tiers": [
+    "S"
+  ],
+  "provenance_classes": {
+    "issue_or_bug_submission": "issue or bug submission whose artifact-level redistribution grant has not been independently verified",
+    "project_authored_fixture": "fixture with repository evidence tying it to project-authored examples, generators, or feature tests",
+    "third_party_or_unreviewed_fixture": "known third-party data or a fixture whose original authorship remains unreviewed",
+    "unreviewed_upstream_fixture": "repository-distributed fixture without sufficient file-level authorship evidence"
+  },
+  "rights_policy": {
+    "active_content": {
+      "handling": "quarantine; never include in a shareable render run without an explicit Q-tier opt-in",
+      "tier": "Q"
+    },
+    "embedded_media": {
+      "handling": "internal-only until every bundled asset has a documented redistribution basis",
+      "tier": "U"
+    },
+    "external_relationship": {
+      "handling": "internal-only; render oracles must run with networking disabled",
+      "tier": "U"
+    },
+    "invalid_or_encrypted_package": {
+      "handling": "quarantine; do not send to a renderer outside an isolated negative-test lane",
+      "tier": "Q"
+    }
+  },
+  "rights_tiers": {
+    "Q": "quarantine: active, encrypted, malformed, executable, or otherwise unsafe/uncertain content",
+    "S": "shareable: selected upstream fixture scope is covered by the declared license and no package-level risk was detected",
+    "U": "internal-only: usable for local evaluation but media, external references, or provenance still require review"
+  },
+  "schema": "rxls.render-corpus-sources.v1",
+  "sources": [
+    {
+      "attribution": "Copyright 2003-2026 The Apache Software Foundation",
+      "commit": "86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96",
+      "declared_license": "Apache-2.0",
+      "declared_license_blob_sha1": "990301df8a1b7b0436b250682f52d79da93857eb",
+      "declared_license_path": "legal/LICENSE",
+      "declared_license_url": "https://github.com/apache/poi/blob/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/legal/LICENSE",
+      "default_provenance": {
+        "basis": "Repository distribution and the repository license do not establish the original authorship of each binary test artifact; unmatched files remain internal-only pending file-level review.",
+        "class": "unreviewed_upstream_fixture",
+        "evidence": [
+          "https://github.com/apache/poi/tree/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/test-data"
+        ],
+        "rights_tier": "U"
+      },
+      "expected_files": 816,
+      "expected_source_bytes": 67053589,
+      "id": "apache-poi-spreadsheets",
+      "include_extensions": [
+        ".ods",
+        ".xls",
+        ".xlsb",
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "poi-examples/src/main/java/org/apache/poi/examples/ss/formula/mortgage-calculation.xls",
+        "test-data"
+      ],
+      "provenance_rules": [
+        {
+          "basis": "The name identifies malformed, encrypted, protected, crash, or fuzz-oriented input; it is quarantined before download in normal and internal corpus lanes.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/apache/poi/tree/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/test-data"
+          ],
+          "id": "a-malformed-encrypted-or-fuzz",
+          "path_regex": "(?i)^test-data/.*(?:bad|corrupt|crash|encrypted|fuzz|invalid|malformed|password|protected|pwd).*\\.(?:ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "Q"
+        },
+        {
+          "basis": "Bug, issue, or numeric tracker naming is treated as submission-derived; the Apache repository license is not used as evidence of artifact-level redistribution permission.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/apache/poi/tree/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/test-data"
+          ],
+          "id": "b-issue-or-bug-submission",
+          "path_regex": "(?i)^test-data/.*(?:bug|clusterfuzz|github|issue|[0-9]{4,}).*\\.(?:ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "U"
+        },
+        {
+          "basis": "The workbook is colocated with and consumed by the Apache-licensed mortgage formula example rather than a test-data submission tree.",
+          "class": "project_authored_fixture",
+          "evidence": [
+            "https://github.com/apache/poi/blob/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/poi-examples/src/main/java/org/apache/poi/examples/ss/formula/CalculateMortgage.java",
+            "https://github.com/apache/poi/blob/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/poi-examples/src/main/java/org/apache/poi/examples/ss/formula/mortgage-calculation.xls"
+          ],
+          "id": "c-project-mortgage-example",
+          "path_regex": "^poi-examples/src/main/java/org/apache/poi/examples/ss/formula/mortgage-calculation\\.xls$",
+          "rights_tier": "S"
+        }
+      ],
+      "repo": "apache/poi",
+      "rights_tier": "S",
+      "scope_basis": "All spreadsheet-shaped POI test data is discoverable, but only file-level project evidence can assign S; bug-like and otherwise unreviewed artifacts remain U, and dangerous inputs are Q.",
+      "source_url": "https://github.com/apache/poi/tree/86e967d9b28d6a322a87ae8fcbf2a7eeb56cef96/test-data"
+    },
+    {
+      "attribution": "Copyright (c) Calamine contributors",
+      "commit": "2872ac1c7c02d03fc8549239f5ce629f6b08e54a",
+      "declared_license": "MIT",
+      "declared_license_blob_sha1": "16a30bcb7493efb21c2cf5a80df1c0208a5307d9",
+      "declared_license_path": "LICENSE-MIT.md",
+      "declared_license_url": "https://github.com/tafia/calamine/blob/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/LICENSE-MIT.md",
+      "default_provenance": {
+        "basis": "Unmatched binary fixtures lack a checked-in artifact-level authorship statement and remain internal-only even though they are distributed in the MIT-licensed repository.",
+        "class": "unreviewed_upstream_fixture",
+        "evidence": [
+          "https://github.com/tafia/calamine/tree/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/tests"
+        ],
+        "rights_tier": "U"
+      },
+      "expected_files": 126,
+      "expected_source_bytes": 21949274,
+      "id": "calamine-spreadsheets",
+      "include_extensions": [
+        ".ods",
+        ".xls",
+        ".xlsb",
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "tests"
+      ],
+      "provenance_rules": [
+        {
+          "basis": "The fixture is explicitly malformed, protected, macro-enabled, undersized, or a denial-of-service regression and belongs only in quarantine.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/tafia/calamine/blob/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/tests/test.rs"
+          ],
+          "id": "a-quarantine-negative-input",
+          "path_regex": "(?i)^tests/(?:issue_594_dos|malformed|pass_protected|too_small|vba).*\\.(?:ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "Q"
+        },
+        {
+          "basis": "The filename or test references an issue, bug, GitHub report, or allocation regression; no independent artifact-level redistribution grant was verified.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/tafia/calamine/blob/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/tests/test.rs"
+          ],
+          "id": "b-issue-or-bug-submission",
+          "path_regex": "(?i)^tests/.*(?:bug|formula\\.issue|gh[0-9]+|issue|oom|richtext_issue).*\\.(?:ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "U"
+        },
+        {
+          "basis": "The workbook name identifies an external baby-names dataset and no dataset redistribution terms are pinned by Calamine.",
+          "class": "third_party_or_unreviewed_fixture",
+          "evidence": [
+            "https://github.com/tafia/calamine/blob/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/tests/adhocallbabynames1996to2016.xls"
+          ],
+          "id": "c-third-party-dataset",
+          "path_regex": "^tests/adhocallbabynames1996to2016\\.xls$",
+          "rights_tier": "U"
+        },
+        {
+          "basis": "The fixture was introduced in the feature commit that added sheet type and visibility support.",
+          "class": "project_authored_fixture",
+          "evidence": [
+            "https://github.com/tafia/calamine/commit/a763e2b37f74c8858942f6fca939868f4b2641e1"
+          ],
+          "id": "d-project-any-sheets",
+          "path_regex": "^tests/any_sheets\\.(?:ods|xls|xlsb|xlsx)$",
+          "rights_tier": "S"
+        },
+        {
+          "basis": "The XLSX fixture was introduced with Calamine's date/time formatted-cell implementation.",
+          "class": "project_authored_fixture",
+          "evidence": [
+            "https://github.com/tafia/calamine/commit/fbb4d4bb2636b26aafb6dd2da352491cc9c8d5f9"
+          ],
+          "id": "e-project-date-xlsx",
+          "path_regex": "^tests/date\\.xlsx$",
+          "rights_tier": "S"
+        },
+        {
+          "basis": "The XLS and XLSX fixtures were introduced with the feature implementation that reads merged cells.",
+          "class": "project_authored_fixture",
+          "evidence": [
+            "https://github.com/tafia/calamine/commit/6b25dbc1e418743c3831ab839ca01683114924d6"
+          ],
+          "id": "f-project-merge-cells",
+          "path_regex": "^tests/merge_cells\\.(?:xls|xlsx)$",
+          "rights_tier": "S"
+        },
+        {
+          "basis": "The XLSX fixture was introduced with Calamine's serde deserializer implementation.",
+          "class": "project_authored_fixture",
+          "evidence": [
+            "https://github.com/tafia/calamine/commit/d5c65f3879901e59fa62537116f2101c61e2c841"
+          ],
+          "id": "g-project-temperature-xlsx",
+          "path_regex": "^tests/temperature\\.xlsx$",
+          "rights_tier": "S"
+        }
+      ],
+      "repo": "tafia/calamine",
+      "rights_tier": "S",
+      "scope_basis": "Calamine's complete spreadsheet fixture directory is discoverable with per-file provenance; named issue submissions remain U and hostile negative inputs remain Q.",
+      "source_url": "https://github.com/tafia/calamine/tree/2872ac1c7c02d03fc8549239f5ce629f6b08e54a/tests"
+    },
+    {
+      "attribution": "Copyright (c) 2016 ClosedXML",
+      "commit": "4e89dcedd83cad553e84d2d97f77fc3d7deb630f",
+      "declared_license": "MIT",
+      "declared_license_blob_sha1": "f054603e7633dcd22d57382517af1eef1211473f",
+      "declared_license_path": "LICENSE",
+      "declared_license_url": "https://github.com/ClosedXML/ClosedXML/blob/4e89dcedd83cad553e84d2d97f77fc3d7deb630f/LICENSE",
+      "default_provenance": {
+        "basis": "The scope contains the project's generated example workbooks and excludes the Other and TryToLoad submission-oriented fixture trees.",
+        "class": "project_authored_fixture",
+        "evidence": [
+          "https://github.com/ClosedXML/ClosedXML/tree/4e89dcedd83cad553e84d2d97f77fc3d7deb630f/ClosedXML.Tests/Resource/Examples"
+        ],
+        "rights_tier": "S"
+      },
+      "expected_files": 122,
+      "expected_source_bytes": 1127909,
+      "id": "closedxml-examples",
+      "include_extensions": [
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "ClosedXML.Tests/Resource/Examples"
+      ],
+      "provenance_rules": [],
+      "repo": "ClosedXML/ClosedXML",
+      "rights_tier": "S",
+      "source_url": "https://github.com/ClosedXML/ClosedXML/tree/4e89dcedd83cad553e84d2d97f77fc3d7deb630f/ClosedXML.Tests/Resource/Examples",
+      "scope_basis": "Generated example workbooks only; Resource/Other and Resource/TryToLoad are intentionally outside the shareable scope."
+    },
+    {
+      "attribution": "Copyright LibreOffice contributors",
+      "commit": "fae8a7da316653998a1d177bedeb66dd65694421",
+      "declared_license": "MPL-2.0",
+      "declared_license_blob_sha1": "a612ad9813b006ce81d1ee438dd784da99a54007",
+      "declared_license_path": "COPYING.MPL",
+      "declared_license_url": "https://github.com/LibreOffice/core/blob/fae8a7da316653998a1d177bedeb66dd65694421/COPYING.MPL",
+      "default_provenance": {
+        "basis": "LibreOffice Calc QA includes regression submissions and imported documents whose file-level authorship, personal-data history, and redistribution grants are not established by repository distribution; every unmatched workbook remains internal-only.",
+        "class": "unreviewed_upstream_fixture",
+        "evidence": [
+          "https://github.com/LibreOffice/core/tree/fae8a7da316653998a1d177bedeb66dd65694421/sc/qa/unit/data"
+        ],
+        "rights_tier": "U"
+      },
+      "expected_files": 1538,
+      "expected_source_bytes": 150366520,
+      "id": "libreoffice-calc-qa",
+      "include_extensions": [
+        ".fods",
+        ".ods",
+        ".xls",
+        ".xlsb",
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "sc/qa/unit/data"
+      ],
+      "provenance_rules": [
+        {
+          "basis": "Security advisories, fuzz artifacts, malformed or encrypted samples, crashes, and macro-oriented fixtures are quarantined before any rendering lane.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/LibreOffice/core/tree/fae8a7da316653998a1d177bedeb66dd65694421/sc/qa/unit/data"
+          ],
+          "id": "a-quarantine-security-or-active-input",
+          "path_regex": "(?i)^sc/qa/unit/data/.*(?:corrupt|crash|cve[-_]|encrypted|encryption|fuzz|invalid|macro|malformed|ofz|password|vba).*\\.(?:fods|ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "Q"
+        },
+        {
+          "basis": "Tracker-number and bug-oriented filenames are classified as submission-derived; no artifact-level redistribution grant is inferred from the LibreOffice source license.",
+          "class": "issue_or_bug_submission",
+          "evidence": [
+            "https://github.com/LibreOffice/core/tree/fae8a7da316653998a1d177bedeb66dd65694421/sc/qa/unit/data"
+          ],
+          "id": "b-issue-or-bug-submission",
+          "path_regex": "(?i)^sc/qa/unit/data/.*(?:bnc[0-9]+|bug|fdo[0-9]+|issue|ooo[0-9]+|tdf[0-9]+).*\\.(?:fods|ods|xls|xlsb|xlsm|xlsx)$",
+          "rights_tier": "U"
+        }
+      ],
+      "repo": "LibreOffice/core",
+      "rights_tier": "U",
+      "scope_basis": "Exactly the 1,538 Calc unit-data workbooks in FODS, ODS, XLS, XLSB, XLSM, and XLSX formats; CSV and unrelated legacy/support files are excluded, and no payload is public or redistributable by default.",
+      "source_url": "https://github.com/LibreOffice/core/tree/fae8a7da316653998a1d177bedeb66dd65694421/sc/qa/unit/data",
+      "tree_traversal": "scoped"
+    },
+    {
+      "attribution": "Copyright 2014-2026, John McNamara <jmcnamara@cpan.org>",
+      "commit": "3227eb0c1556ba41d94605a7abee0e097782d10a",
+      "declared_license": "BSD-2-Clause",
+      "declared_license_blob_sha1": "50010a345abea9e3082f3c7fd89cf7bcf5f9c1ef",
+      "declared_license_path": "License.txt",
+      "declared_license_url": "https://github.com/jmcnamara/libxlsxwriter/blob/3227eb0c1556ba41d94605a7abee0e097782d10a/License.txt",
+      "default_provenance": {
+        "basis": "The scoped reference packages are generated by the project's functional test programs and are not issue-attachment directories.",
+        "class": "project_authored_fixture",
+        "evidence": [
+          "https://github.com/jmcnamara/libxlsxwriter/tree/3227eb0c1556ba41d94605a7abee0e097782d10a/test/functional"
+        ],
+        "rights_tier": "S"
+      },
+      "expected_files": 748,
+      "expected_source_bytes": 7211282,
+      "id": "libxlsxwriter",
+      "include_extensions": [
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "test/functional/xlsx_files"
+      ],
+      "provenance_rules": [],
+      "repo": "jmcnamara/libxlsxwriter",
+      "rights_tier": "S",
+      "source_url": "https://github.com/jmcnamara/libxlsxwriter/tree/3227eb0c1556ba41d94605a7abee0e097782d10a/test/functional/xlsx_files",
+      "scope_basis": "Project-authored functional reference workbooks; macro-enabled packages are quarantined independently."
+    },
+    {
+      "attribution": "Copyright 2011-2018 The Apache Software Foundation; portions copyright IBM, Oracle, OASIS Open, W3C, Sun Microsystems, and Kohsuke Kawaguchi as recorded in NOTICE",
+      "commit": "cfd3a9fbbda351fad38aad5e112e3598d08e23f0",
+      "declared_license": "Apache-2.0",
+      "declared_license_blob_sha1": "71af77c4b85ea8b520233262340c06c1218160e2",
+      "declared_license_path": "LICENSE",
+      "declared_license_url": "https://github.com/tdf/odftoolkit/blob/cfd3a9fbbda351fad38aad5e112e3598d08e23f0/LICENSE",
+      "default_provenance": {
+        "basis": "The scoped ODFDOM test-input packages are maintained as project fixtures; per-package media and active-content checks still downgrade risky files.",
+        "class": "project_authored_fixture",
+        "evidence": [
+          "https://github.com/tdf/odftoolkit/tree/cfd3a9fbbda351fad38aad5e112e3598d08e23f0/odfdom/src/test/resources/test-input"
+        ],
+        "rights_tier": "S"
+      },
+      "expected_files": 113,
+      "expected_source_bytes": 7165438,
+      "id": "odftoolkit-odfdom",
+      "include_extensions": [
+        ".ods"
+      ],
+      "path_scopes": [
+        "odfdom/src/test/resources/test-input"
+      ],
+      "provenance_rules": [],
+      "repo": "tdf/odftoolkit",
+      "rights_tier": "S",
+      "source_url": "https://github.com/tdf/odftoolkit/tree/cfd3a9fbbda351fad38aad5e112e3598d08e23f0/odfdom/src/test/resources/test-input",
+      "scope_basis": "ODFDOM project test-input packages distributed in the licensed repository scope; package media and active-content risks are downgraded independently."
+    },
+    {
+      "attribution": "Copyright (c) .NET Foundation and Contributors",
+      "commit": "00967dc871f06776ae969762c6703d062308a6c9",
+      "declared_license": "MIT",
+      "declared_license_blob_sha1": "12bd8f3f79693e49ff70d4ce182ff8d2e7baa390",
+      "declared_license_path": "LICENSE",
+      "declared_license_url": "https://github.com/dotnet/Open-XML-SDK/blob/00967dc871f06776ae969762c6703d062308a6c9/LICENSE",
+      "default_provenance": {
+        "basis": "The scoped assets are maintained by the project as Open XML conformance and storage fixtures; package risks are evaluated independently.",
+        "class": "project_authored_fixture",
+        "evidence": [
+          "https://github.com/dotnet/Open-XML-SDK/tree/00967dc871f06776ae969762c6703d062308a6c9/test/DocumentFormat.OpenXml.Tests.Assets/assets"
+        ],
+        "rights_tier": "S"
+      },
+      "expected_files": 109,
+      "expected_source_bytes": 6879463,
+      "id": "openxml-sdk-spreadsheets",
+      "include_extensions": [
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "test/DocumentFormat.OpenXml.Tests.Assets/assets/TestDataStorage",
+        "test/DocumentFormat.OpenXml.Tests.Assets/assets/TestFiles",
+        "test/DocumentFormat.OpenXml.Tests.Assets/assets/TestFilesValidation"
+      ],
+      "provenance_rules": [],
+      "repo": "dotnet/Open-XML-SDK",
+      "rights_tier": "S",
+      "source_url": "https://github.com/dotnet/Open-XML-SDK/tree/00967dc871f06776ae969762c6703d062308a6c9/test/DocumentFormat.OpenXml.Tests.Assets/assets",
+      "scope_basis": "Repository-distributed Open XML spreadsheet test assets only; macro-enabled, embedded-media, external-link, and malformed packages are downgraded or quarantined independently."
+    },
+    {
+      "attribution": "Copyright (c) 2019-2026 PhpSpreadsheet Authors",
+      "commit": "05e99ebf61238a70227b4d9cc02d0030d34f6339",
+      "declared_license": "MIT",
+      "declared_license_blob_sha1": "e4bc4a3ae45dbbcbcfb99da13aed75aa5411f04b",
+      "declared_license_path": "LICENSE",
+      "declared_license_url": "https://github.com/PHPOffice/PhpSpreadsheet/blob/05e99ebf61238a70227b4d9cc02d0030d34f6339/LICENSE",
+      "default_provenance": {
+        "basis": "The scoped files are the project's sample template and generated read/write reference workbooks, but artifact-level authorship has not been independently reconstructed for every binary.",
+        "class": "unreviewed_upstream_fixture",
+        "evidence": [
+          "https://github.com/PHPOffice/PhpSpreadsheet/tree/05e99ebf61238a70227b4d9cc02d0030d34f6339/samples/templates"
+        ],
+        "rights_tier": "U"
+      },
+      "expected_files": 114,
+      "expected_source_bytes": 2995343,
+      "id": "phpspreadsheet-templates",
+      "include_extensions": [
+        ".ods",
+        ".xls",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "samples/templates"
+      ],
+      "provenance_rules": [],
+      "repo": "PHPOffice/PhpSpreadsheet",
+      "rights_tier": "U",
+      "source_url": "https://github.com/PHPOffice/PhpSpreadsheet/tree/05e99ebf61238a70227b4d9cc02d0030d34f6339/samples/templates",
+      "scope_basis": "Repository sample template and generated/read-write reference workbooks only; Reader issue fixtures and arbitrary test-data trees are excluded, and all selected payloads remain internal-only pending artifact-level provenance review."
+    },
+    {
+      "attribution": "Copyright (c) 2013-2025, John McNamara <jmcnamara@cpan.org>",
+      "commit": "cf3fe78d3eab5e4c7d825d4451af3a60e2a04011",
+      "declared_license": "BSD-2-Clause",
+      "declared_license_blob_sha1": "e1e6c8a50f5dbc0916f417a5c3605e4a980ae926",
+      "declared_license_path": "LICENSE.txt",
+      "declared_license_url": "https://github.com/jmcnamara/XlsxWriter/blob/cf3fe78d3eab5e4c7d825d4451af3a60e2a04011/LICENSE.txt",
+      "default_provenance": {
+        "basis": "The scoped comparison packages are generated by the project's test suite and exclude issue-attachment fixture paths.",
+        "class": "project_authored_fixture",
+        "evidence": [
+          "https://github.com/jmcnamara/XlsxWriter/tree/cf3fe78d3eab5e4c7d825d4451af3a60e2a04011/xlsxwriter/test/comparison"
+        ],
+        "rights_tier": "S"
+      },
+      "expected_files": 994,
+      "expected_source_bytes": 9780526,
+      "id": "xlsxwriter",
+      "include_extensions": [
+        ".xlsm",
+        ".xlsx"
+      ],
+      "path_scopes": [
+        "xlsxwriter/test/comparison/themes/technic.xlsx",
+        "xlsxwriter/test/comparison/xlsx_files"
+      ],
+      "provenance_rules": [],
+      "repo": "jmcnamara/XlsxWriter",
+      "rights_tier": "S",
+      "source_url": "https://github.com/jmcnamara/XlsxWriter/tree/cf3fe78d3eab5e4c7d825d4451af3a60e2a04011/xlsxwriter/test/comparison/xlsx_files",
+      "scope_basis": "Project-authored comparison reference workbooks; macro-enabled packages are quarantined independently."
+    }
+  ]
+}

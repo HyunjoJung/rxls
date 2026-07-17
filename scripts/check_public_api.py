@@ -24,7 +24,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = "rxls.public-api.v1"
-DEFAULT_BASELINE = ROOT / "tests" / "oracles" / "public-api-0.1.2.json"
+# The tagged 0.1.2 snapshot remains immutable for SemVer comparisons. This
+# rolling snapshot freezes the reviewed additive surface on the main branch.
+DEFAULT_BASELINE = ROOT / "tests" / "oracles" / "public-api-main.json"
 DEFAULT_TARGET_DIR = ROOT / "target" / "public-api-doc"
 DEFAULT_TOOLCHAIN = "1.85.0"
 ITEM_KINDS = {

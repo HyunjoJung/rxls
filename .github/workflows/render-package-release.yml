@@ -1,0 +1,446 @@
+name: Render package release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "render-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-package-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  verify:
+    name: Verify immutable npm artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Audit nested Rust advisories, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.85.0"
+          command: check
+          manifest-path: bindings/render-wasm/Cargo.toml
+          arguments: --config deny.toml --locked --all-features
+      - name: Validate event and package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version=$(node -p 'require("./bindings/render-wasm/package.json").version')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "render-v$version"
+            git fetch origin main --no-tags
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          else
+            echo "workflow_dispatch is verification-only; npm publish will not run"
+          fi
+      - name: Require exact-SHA hosted gates and reviewed full oracle evidence
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_successful_run() {
+            local workflow="$1"
+            local expected_path="$2"
+            local expected_event="$3"
+            local label="$4"
+            local selected=""
+            local run_id
+            local record
+            local head_sha
+            local event
+            local conclusion
+            local status
+            local run_path
+            mapfile -t run_ids < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$workflow" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            for run_id in "${run_ids[@]}"; do
+              record=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+                --jq '[.head_sha, .event, .conclusion, .status, .path] | @tsv')
+              IFS=$'\t' read -r head_sha event conclusion status run_path <<< "$record"
+              [[ "$head_sha" == "$GITHUB_SHA" \
+                && "$event" == "$expected_event" \
+                && "$conclusion" == "success" \
+                && "$status" == "completed" \
+                && "$run_path" == "$expected_path" ]] || continue
+              selected="$run_id"
+              break
+            done
+            test -n "$selected" || {
+              echo "$label has no successful $expected_event run for exact SHA $GITHUB_SHA" >&2
+              return 1
+            }
+            echo "$label exact-SHA gate passed in run $selected"
+          }
+
+          require_successful_run ci.yml .github/workflows/ci.yml push CI
+          require_successful_run codeql.yml .github/workflows/codeql.yml push CodeQL
+          require_successful_run \
+            render-hardening.yml \
+            .github/workflows/render-hardening.yml \
+            workflow_dispatch \
+            render-hardening
+          require_successful_run \
+            render-browser.yml \
+            .github/workflows/render-browser.yml \
+            push \
+            render-browser
+
+          artifact_name="render-oracle-${GITHUB_SHA}-full"
+          evidence_root="$RUNNER_TEMP/render-oracle-release-prerequisites"
+          rm -rf "$evidence_root"
+          mkdir -p "$evidence_root" target/render-package
+          selected_oracle=""
+          mapfile -t oracle_run_ids < <(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow render-oracle.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 100 \
+            --json databaseId \
+            --jq '.[].databaseId')
+          for run_id in "${oracle_run_ids[@]}"; do
+            record=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '[.head_sha, .event, .conclusion, .status, .path] | @tsv')
+            IFS=$'\t' read -r head_sha event conclusion status run_path <<< "$record"
+            [[ "$head_sha" == "$GITHUB_SHA" \
+              && "$event" == "workflow_dispatch" \
+              && "$conclusion" == "success" \
+              && "$status" == "completed" \
+              && "$run_path" == ".github/workflows/render-oracle.yml" ]] || continue
+
+            mapfile -t artifact_rows < <(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '.artifacts[] | [.id, .name, .expired, .size_in_bytes, .digest] | @tsv')
+            matching_artifacts=()
+            for artifact_row in "${artifact_rows[@]}"; do
+              IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+                <<< "$artifact_row"
+              [[ "$name" == "$artifact_name" ]] || continue
+              matching_artifacts+=("$artifact_row")
+            done
+            [[ "${#matching_artifacts[@]}" == "1" ]] || continue
+            IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+              <<< "${matching_artifacts[0]}"
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ \
+              && "$expired" == "false" \
+              && "$size_bytes" =~ ^[1-9][0-9]*$ \
+              && "$size_bytes" -le 67108864 \
+              && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+
+            candidate="$evidence_root/$run_id"
+            rm -rf "$candidate"
+            mkdir -p "$candidate"
+            if ! gh run download "$run_id" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "$artifact_name" \
+              --dir "$candidate"; then
+              rm -rf "$candidate"
+              continue
+            fi
+            if python3 scripts/check_render_oracle_release_evidence.py \
+              --artifact-dir "$candidate" \
+              --head-sha "$GITHUB_SHA" \
+              --reviewed-baseline scripts/render-parity-baseline-full.json \
+              --workflow-run-id "$run_id" \
+              --artifact-digest "$digest" \
+              --write-report target/render-package/oracle-prerequisite.json; then
+              selected_oracle="$run_id"
+              break
+            fi
+            rm -rf "$candidate"
+          done
+          test -n "$selected_oracle" || {
+            echo "Render Oracle has no valid reviewed full run for exact SHA $GITHUB_SHA" >&2
+            exit 1
+          }
+          echo "Render Oracle full evidence passed in run $selected_oracle"
+      - name: Enforce workflow and package policy
+        run: |
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
+          python3 scripts/test_check_render_package.py
+          python3 scripts/test_render_supply_chain.py
+          python3 scripts/test_check_render_oracle_release_evidence.py
+          python3 scripts/render_supply_chain.py notice \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --check bindings/render-wasm/THIRD_PARTY_NOTICES.txt
+          cargo fmt --manifest-path bindings/render-wasm/Cargo.toml -- --check
+          cargo clippy --manifest-path bindings/render-wasm/Cargo.toml \
+            --all-targets --locked -- -D warnings
+          cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked
+          npm --prefix bindings/render-wasm test
+      - name: Build the exact worker/WASM package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          npm --prefix bindings/render-wasm run build:wasm
+      - name: Pack, inspect, dry-run, and consume
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          output=target/render-package
+          archive="$output/rxls-render-worker-$version.tgz"
+          mkdir -p "$output"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --output "$output/render-worker-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --output "$RUNNER_TEMP/render-worker-sbom.cdx.json"
+          cmp --silent \
+            "$output/render-worker-sbom.cdx.json" \
+            "$RUNNER_TEMP/render-worker-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --check "$output/render-worker-sbom.cdx.json"
+          sha256sum "$output/render-worker-sbom.cdx.json" \
+            > "$output/render-worker-sbom.cdx.json.sha256"
+          npm pack --json --pack-destination "$output" ./bindings/render-wasm \
+            | tee "$output/npm-pack.json"
+          python3 scripts/check_render_package.py bindings/render-wasm \
+            --archive "$archive" \
+            --git-rev "$GITHUB_SHA" \
+            --write-report "$output/package-report.json"
+          npm publish --dry-run --ignore-scripts --access public "$archive" \
+            2>&1 | tee "$output/npm-publish-dry-run.txt"
+          sha256sum "$archive" > "$archive.sha256"
+          consumer="$RUNNER_TEMP/render-worker-consumer"
+          rm -rf "$consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$GITHUB_WORKSPACE/$archive"
+          node --input-type=module - <<'NODE'
+          const root = await import("@rxls/render-worker");
+          const protocol = await import("@rxls/render-worker/protocol");
+          const runtime = await import("@rxls/render-worker/worker-runtime");
+          if (typeof root.RenderWorkerClient !== "function" ||
+              protocol.PROTOCOL !== "rxls.render-worker.v1" ||
+              typeof runtime.RenderWorkerRuntime !== "function") {
+            process.exit(1);
+          }
+          NODE
+      - name: Upload verified package candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-worker-${{ github.sha }}
+          path: target/render-package/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  publish:
+    name: Publish protected tag to npm
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-render-worker
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: render-worker-${{ github.sha }}
+          path: target/render-package
+          digest-mismatch: error
+      - name: Reverify the immutable candidate
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          version=$(node -p 'require("./bindings/render-wasm/package.json").version')
+          test "$GITHUB_REF_NAME" = "render-v$version"
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          archive="target/render-package/rxls-render-worker-$version.tgz"
+          sha256sum --check "$archive.sha256"
+          sha256sum --check \
+            target/render-package/render-worker-sbom.cdx.json.sha256
+          python3 scripts/check_render_package.py bindings/render-wasm \
+            --archive "$archive" \
+            --archive-only \
+            --git-rev "$GITHUB_SHA"
+          ARCHIVE="$archive" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          report = json.loads(
+              Path("target/render-package/package-report.json").read_text(encoding="utf-8")
+          )
+          archive = Path(os.environ["ARCHIVE"])
+          if report.get("schema") != "rxls.render-worker-package.v1":
+              raise SystemExit("unexpected package-report schema")
+          if report.get("passed") is not True or report.get("git_rev") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("package report is not bound to this exact commit")
+          if report.get("archive", {}).get("sha256") != hashlib.sha256(archive.read_bytes()).hexdigest():
+              raise SystemExit("package report archive digest differs")
+          notice = report.get("third_party_notice", {})
+          notice_file = report.get("files", {}).get("THIRD_PARTY_NOTICES.txt", {})
+          if (
+              not isinstance(notice.get("packages"), int)
+              or notice["packages"] < 1
+              or not isinstance(notice.get("legal_texts"), int)
+              or notice["legal_texts"] < 1
+              or notice.get("sha256") != notice_file.get("sha256")
+          ):
+              raise SystemExit("package report lacks exact third-party notice evidence")
+          prerequisites = json.loads(
+              Path("target/render-package/oracle-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          if (
+              prerequisites.get("schema")
+              != "rxls.render-worker-release-prerequisites.v1"
+              or prerequisites.get("passed") is not True
+              or prerequisites.get("head_sha") != os.environ["GITHUB_SHA"]
+              or prerequisites.get("full_cases") != 800
+              or prerequisites.get("ratchets") != 2
+              or not isinstance(prerequisites.get("workflow_run_id"), int)
+              or prerequisites["workflow_run_id"] < 1
+              or re.fullmatch(
+                  r"sha256:[0-9a-f]{64}",
+                  prerequisites.get("artifact_digest", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  prerequisites.get("reviewed_baseline_sha256", ""),
+              )
+              is None
+          ):
+              raise SystemExit("full Render Oracle prerequisite evidence differs")
+          PY
+      - name: Publish exact package with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${{ steps.package.outputs.version }}"
+          npm publish \
+            "target/render-package/rxls-render-worker-$version.tgz" \
+            --ignore-scripts --access public
+      - name: Verify the registry distribution and installed consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          spec="@rxls/render-worker@$version"
+          for attempt in {1..12}; do
+            if npm view "$spec" version dist.integrity repository.url --json \
+              > target/render-package/registry.json; then
+              break
+            fi
+            test "$attempt" -lt 12
+            sleep 5
+          done
+          VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/render-package/registry.json").read_text(encoding="utf-8")
+          )
+          if registry.get("version") != os.environ["VERSION"]:
+              raise SystemExit("registry version differs")
+          if registry.get("dist.integrity") != packed.get("integrity"):
+              raise SystemExit("registry integrity differs from the verified candidate")
+          if registry.get("repository.url") != "git+https://github.com/HyunjoJung/rxls.git":
+              raise SystemExit("registry repository metadata differs")
+          PY
+          consumer="$RUNNER_TEMP/render-worker-registry-consumer"
+          rm -rf "$consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$spec"
+          node --input-type=module -e \
+            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v1") process.exit(1)'
+      - name: Upload registry evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-worker-registry-${{ github.sha }}
+          path: target/render-package/registry.json
+          if-no-files-found: warn
+          retention-days: 30

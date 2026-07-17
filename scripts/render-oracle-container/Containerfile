@@ -1,0 +1,108 @@
+# The architecture-specific manifest digest is locked in lock.json. The tag is
+# documentary; the digest is authoritative.
+FROM --platform=linux/amd64 docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
+
+ARG ORACLE_LOCK_SHA256
+ARG SOURCE_DATE_EPOCH=1783900800
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    SAL_USE_VCLPLUGIN=svp \
+    SAL_DISABLE_OPENCL=1 \
+    SC_FORCE_CALCULATION=core \
+    TZ=UTC
+
+# Debian dependencies are resolved from a dated snapshot. LibreOffice itself
+# is the official TDF x86_64 artifact and is checked by exact byte count and
+# SHA-256 before any package is installed.
+RUN set -eux; \
+    printf '%s' "${ORACLE_LOCK_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+      || { echo "invalid ORACLE_LOCK_SHA256" >&2; exit 64; }; \
+    printf '%s\n' \
+      'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260713T000000Z bookworm main' \
+      'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260713T000000Z bookworm-updates main' \
+      'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260713T000000Z bookworm-security main' \
+      > /etc/apt/sources.list; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      fontconfig \
+      libcairo2=1.16.0-7 \
+      libcups2=2.4.2-3+deb12u9 \
+      libdbus-1-3=1.14.10-1~deb12u1 \
+      libglib2.0-0=2.74.6-2+deb12u9 \
+      libnss3=2:3.87.1-1+deb12u2 \
+      libx11-xcb1=2:1.8.4-2+deb12u2 \
+      libxinerama1=2:1.1.4-3; \
+    archive=/tmp/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz; \
+    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --output "${archive}" \
+      'https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
+    test "$(wc -c < "${archive}")" = '216816909'; \
+    printf '%s  %s\n' \
+      '18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5' \
+      "${archive}" | sha256sum --check --strict -; \
+    mkdir /tmp/libreoffice; \
+    tar --extract --gzip --file "${archive}" --directory /tmp/libreoffice \
+      --no-same-owner --no-same-permissions; \
+    apt-get install -y --no-install-recommends /tmp/libreoffice/*/DEBS/*.deb; \
+    ldd_output=/tmp/libreoffice-ldd.txt; \
+    if ! ldd \
+        /opt/libreoffice26.2/program/oosplash \
+        /opt/libreoffice26.2/program/soffice.bin \
+        > "${ldd_output}" 2>&1; then \
+      echo 'LibreOffice runtime dependency scan failed' >&2; \
+      exit 66; \
+    fi; \
+    missing_output=/tmp/libreoffice-missing.txt; \
+    grep_status=0; \
+    grep --fixed-strings '=> not found' "${ldd_output}" \
+      > "${missing_output}" || grep_status=$?; \
+    case "${grep_status}" in \
+      0) \
+        echo 'LibreOffice runtime dependency closure is incomplete' >&2; \
+        LC_ALL=C sort --unique "${missing_output}" >&2; \
+        exit 65 \
+        ;; \
+      1) ;; \
+      *) echo 'LibreOffice runtime dependency closure check failed' >&2; exit 67 ;; \
+    esac; \
+    rm -f "${ldd_output}" "${missing_output}"; \
+    /opt/libreoffice26.2/program/soffice --headless --version \
+      | grep --fixed-strings 'LibreOffice 26.2.3.2'; \
+    fc-cache --version; \
+    rm -rf \
+      /root/.cache/fontconfig \
+      /root/.config/libreoffice \
+      /tmp/libreoffice \
+      "${archive}" \
+      /var/lib/apt/lists/* \
+      /var/cache/apt/*; \
+    rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/*
+
+COPY --chmod=0555 oracle-entrypoint.sh /opt/rxls/oracle-entrypoint.sh
+COPY --chmod=0444 profile/registrymodifications.xcu /opt/rxls/profile/registrymodifications.xcu
+
+RUN set -eux; \
+    mkdir -p /oracle/source /oracle/corpus /oracle/fonts /oracle/evidence /oracle/runtime; \
+    touch \
+      /oracle/source/input.xls \
+      /oracle/source/input.xlsx \
+      /oracle/source/input.xlsm \
+      /oracle/source/input.xlsb \
+      /oracle/source/input.ods; \
+    chmod 0444 /oracle/source/input.*; \
+    chmod 0555 /oracle /oracle/source /oracle/corpus /oracle/fonts /oracle/evidence /oracle/runtime
+
+LABEL org.opencontainers.image.title="rxls LibreOffice render oracle" \
+      org.opencontainers.image.version="26.2.3.2" \
+      org.rxls.render-oracle.architecture="linux/amd64" \
+      org.rxls.render-oracle.libreoffice-artifact-sha256="18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5" \
+      org.rxls.render-oracle.lock-sha256="${ORACLE_LOCK_SHA256}"
+
+USER 65534:65534
+WORKDIR /oracle
+ENTRYPOINT ["/opt/rxls/oracle-entrypoint.sh"]

@@ -38,6 +38,12 @@
       "source": "tests/fixtures/xls/korean-cp949-biff5.xls"
     },
     {
+      "id": "reader-xls-biff8-korean",
+      "name": "korean-unicode-biff8.xls",
+      "sha256": "229bd223b176a103629248589912b837df786c978ab9abfb079b6d4eb6a0190f",
+      "source": "tests/fixtures/xls/korean-unicode-biff8.xls"
+    },
+    {
       "id": "reader-xls-biff8",
       "name": "reader-basic.xls",
       "sha256": "85c305746d22d202744b7c26e5a0218f739a152dbe3f4fa8e909c095d9915dda",
@@ -74,6 +80,7 @@
       "seeds": [
         "reader-xls-biff8",
         "reader-xls-biff5",
+        "reader-xls-biff8-korean",
         "reader-xlsx",
         "reader-xlsb",
         "reader-ods",

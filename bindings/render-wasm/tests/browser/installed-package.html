@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>rxls installed render worker smoke</title>
+    <script type="importmap" nonce="rxls-installed-package">
+      {
+        "imports": {
+          "@rxls/render-worker": "/installed-package/js/client.mjs"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <pre id="result">RUNNING</pre>
+    <div id="viewer" aria-label="rendered spreadsheet"></div>
+    <script type="module" src="./installed-package-bootstrap.mjs"></script>
+  </body>
+</html>

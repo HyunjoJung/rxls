@@ -1,0 +1,37 @@
+{
+  "name": "@rxls/render-worker",
+  "version": "0.1.2",
+  "type": "module",
+  "description": "CSP-safe worker facade for bounded rxls spreadsheet rendering",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HyunjoJung/rxls.git",
+    "directory": "bindings/render-wasm"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "files": [
+    "js/",
+    "pkg/",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "exports": {
+    ".": "./js/client.mjs",
+    "./protocol": "./js/protocol.mjs",
+    "./worker-runtime": "./js/worker-runtime.mjs",
+    "./worker": "./js/worker.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "test:browser": "node --experimental-websocket tests/browser/run.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

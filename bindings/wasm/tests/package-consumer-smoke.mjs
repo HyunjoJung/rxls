@@ -25,7 +25,7 @@ assert.equal(api.maxInputBytes(), 32 * 1024 * 1024);
 assert.ok(api.extractText(bytes).length > 0);
 assert.equal(typeof api.toCsv(bytes, 0), "string");
 assert.match(api.toHtml(bytes, 0), /^<table>/);
-assert.equal(JSON.parse(api.reportJson(bytes)).schema_version, 1);
+assert.equal(JSON.parse(api.reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "consumer.cjs"), common);
 
@@ -38,7 +38,7 @@ assert.equal(maxInputBytes(), 32 * 1024 * 1024);
 assert.ok(extractText(bytes).length > 0);
 assert.equal(typeof toCsv(bytes, 0), "string");
 assert.match(toHtml(bytes, 0), /^<table>/);
-assert.equal(JSON.parse(reportJson(bytes)).schema_version, 1);
+assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "consumer.mjs"), esm);
 
@@ -54,7 +54,7 @@ assert.equal(maxInputBytes(), 32 * 1024 * 1024);
 assert.ok(extractText(bytes).length > 0);
 assert.equal(typeof toCsv(bytes, 0), "string");
 assert.match(toHtml(bytes, 0), /^<table>/);
-assert.equal(JSON.parse(reportJson(bytes)).schema_version, 1);
+assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "browser-consumer.mjs"), browser);
 
@@ -85,7 +85,7 @@ const typedError = (error: unknown): RxlsErrorObject | null =>
 ensure(text.length > 0, "text export is empty");
 ensure(typeof csv === "string", "CSV export is not text");
 ensure(/^<table>/.test(html), "HTML export is not a table");
-ensure(report.schema_version === 1, "report schema mismatch");
+ensure(report.schema_version === 2, "report schema mismatch");
 ensure(limit === 32 * 1024 * 1024, "input limit mismatch");
 void typedError;
 `;

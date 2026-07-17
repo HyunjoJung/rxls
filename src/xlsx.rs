@@ -15,11 +15,19 @@ use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
+use crate::model::{
+    CellStyleOverlay, OoxmlImplicitColumnWidth, TableStyleApplication, TableStyleDefinition,
+    TableStyleRegion,
+};
 use crate::{
     format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
-    Chart, ChartKind, Color, Comment, CondFormat, DataValidation, DocProperties, DvKind, DvOp,
-    Fill, Font, FormatPattern, FormatScript, HAlign, Image, ImageFmt, PageSetup, ProtectionOptions,
-    Series, Sheet, SheetType, Sparkline, SparklineKind, Table, VAlign, Workbook,
+    Chart, ChartBarDirection, ChartCachedPoint, ChartKind, ChartMarkerSymbol, ChartSeriesCache,
+    ChartSeriesStyle, ChartSeriesStyleLossKind, ChartUnsupportedReason, Color, Comment, CondFormat,
+    ConditionalFormatMetadata, DataValidation, DocProperties, DrawingAnchorBehavior, DrawingCrop,
+    DrawingMetadata, DrawingObjectKind, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript,
+    HAlign, HeaderFooterKind, Image, ImageFmt, PageSetup, PrintLossKind, PrintMetadata,
+    PrintPageOrder, ProtectionOptions, Series, Sheet, SheetType, Sparkline, SparklineKind,
+    StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign, Workbook,
 };
 
 /// Detect the ZIP/OOXML magic (`PK\x03\x04`).
@@ -128,6 +136,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         };
         let ParsedSheet {
             cells,
+            direct_cell_formats,
             rich,
             merges,
             hyperlink_refs,
@@ -135,7 +144,9 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             mut autofilter,
             data_validations,
             cond_formats,
+            cond_format_metadata,
             mut page_setup,
+            mut print_metadata,
             sparklines,
             tab_color,
             print_gridlines,
@@ -144,10 +155,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            col_formats,
+            row_formats,
             hidden_cols,
             hidden_rows,
             default_row_height,
             default_col_width,
+            base_col_width,
             collapsed_rows,
             outline_summary_below,
             outline_summary_right,
@@ -159,6 +173,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             right_to_left,
             tab_selected,
         } = parsed_sheet;
+        let ooxml_implicit_col_width = if !is_worksheet || default_col_width.is_some() {
+            OoxmlImplicitColumnWidth::None
+        } else if let Some(chars) = base_col_width {
+            OoxmlImplicitColumnWidth::BaseCharacters(chars)
+        } else {
+            OoxmlImplicitColumnWidth::ApplicationDefault
+        };
         if tab_selected && tab_selected_sheet.is_none() {
             tab_selected_sheet = Some(sheet_idx);
         }
@@ -196,7 +217,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             .unwrap_or_default();
         // Resolve every `table{N}.xml` part (relationship Type `.../table`) and
         // parse each into the authoring `tables` storage (round-trip friendly).
-        let tables = sheet_rels_xml
+        let parsed_tables: Vec<ParsedTable> = sheet_rels_xml
             .as_deref()
             .map(table_targets)
             .unwrap_or_default()
@@ -205,10 +226,46 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             .filter_map(|p| part(&mut zip, &p))
             .filter_map(|s| parse_table(&s))
             .collect();
-        let images = read_drawing_images(&mut zip, &path, sheet_rels_xml.as_deref());
-        let charts = read_drawing_charts(&mut zip, &path, sheet_rels_xml.as_deref());
+        let tables = parsed_tables
+            .iter()
+            .map(|parsed| parsed.table.clone())
+            .collect::<Vec<_>>();
+        let mut table_header_formats = BTreeMap::new();
+        let mut table_region_formats = BTreeMap::new();
+        let mut table_style_losses = styles.losses.clone();
+        for parsed in parsed_tables {
+            for loss in parsed.losses {
+                add_drawing_loss(&mut table_style_losses, loss.kind, loss.occurrences);
+            }
+            let Some(style_name) = parsed.table.style.as_deref() else {
+                continue;
+            };
+            let Some(table_style) = styles.table_style(style_name, &theme) else {
+                add_drawing_loss(&mut table_style_losses, StyleLossKind::MissingReference, 1);
+                continue;
+            };
+            for loss in table_style.losses {
+                add_drawing_loss(&mut table_style_losses, loss.kind, loss.occurrences);
+            }
+            if let Some(header) = table_style
+                .definition
+                .get(TableStyleRegion::HeaderRow)
+                .map(|element| element.style.clone())
+            {
+                table_header_formats.insert(parsed.table.name.clone(), header);
+            }
+            let mut application = parsed.application;
+            application.definition = table_style.definition;
+            table_region_formats.insert(parsed.table.name, application);
+        }
+        let (images, charts, drawing_metadata, mut drawing_losses) =
+            read_sheet_drawings(&mut zip, &path, sheet_rels_xml.as_deref(), &theme);
+        for loss in table_style_losses {
+            add_drawing_loss(&mut drawing_losses, loss.kind, loss.occurrences);
+        }
         apply_sheet_defined_names(
             &mut page_setup,
+            &mut print_metadata,
             &mut autofilter,
             sheet_defined_names
                 .iter()
@@ -217,6 +274,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         sheets.push(Sheet {
             name,
             is_worksheet,
+            style_fidelity: StyleFidelity::Partial,
             sheet_type: Some(sheet_type),
             cells,
             rich,
@@ -224,13 +282,20 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             read_hyperlinks,
             comments,
             tables,
+            table_header_formats,
+            table_region_formats,
+            direct_cell_formats,
             images,
             charts,
+            drawing_metadata,
+            style_losses: drawing_losses,
             freeze,
             autofilter,
             page_setup,
+            print_metadata,
             data_validations,
             cond_formats,
+            cond_format_metadata,
             sparklines,
             tab_color,
             print_gridlines,
@@ -239,10 +304,14 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            col_formats,
+            row_formats,
+            default_format: styles.cell_styles.first().cloned(),
             hidden_cols,
             hidden_rows,
             default_row_height,
             default_col_width,
+            ooxml_implicit_col_width,
             collapsed_rows,
             outline_summary_below: outline_summary_below.unwrap_or(true),
             outline_summary_right: outline_summary_right.unwrap_or(true),
@@ -263,6 +332,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         protect_structure: structure_protected,
         active_sheet: active_sheet.or(tab_selected_sheet).unwrap_or_default(),
         text_truncated: budget == 0,
+        container_parse_mode: crate::ContainerParseMode::Primary,
         properties,
         defined_names,
         local_defined_names,
@@ -284,15 +354,6 @@ fn part_raw(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Op
     let mut s = String::new();
     f.take(MAX_PART).read_to_string(&mut s).ok()?;
     Some(s)
-}
-
-fn part_bytes(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
-    const MAX_PART: u64 = 256 << 20; // 256 MiB per entry
-    let idx = part_index(zip, name)?;
-    let f = zip.by_index(idx).ok()?;
-    let mut v = Vec::new();
-    f.take(MAX_PART).read_to_end(&mut v).ok()?;
-    Some(v)
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
@@ -357,6 +418,11 @@ fn sheet_rels_path(path: &str) -> String {
     }
 }
 
+const MAX_XLSX_STYLE_RECORDS: usize = 65_536;
+const MAX_XLSX_CUSTOM_NUMBER_FORMATS: usize = 65_536;
+const MAX_XLSX_FORMAT_CODE_BYTES: usize = 4_096;
+const MAX_XLSX_INDEXED_COLORS: usize = 256;
+
 /// Per-style number format, derived from `styles.xml`.
 #[derive(Default)]
 struct Styles {
@@ -366,25 +432,70 @@ struct Styles {
     custom: HashMap<u16, String>,
     /// Custom OOXML indexed color table from `<colors><indexedColors>`.
     indexed_colors: Vec<Color>,
-    /// Solid fill color per `dxfs` index, used by conditional formatting rules.
-    dxf_fills: Vec<Option<Color>>,
+    /// Full differential styles and typed parse losses per `dxfs` index.
+    differential_styles: Vec<DifferentialStyle>,
     /// Common public style subset per `cellXfs` index.
     cell_styles: Vec<CellStyle>,
+    /// Sparse direct-format overlays per `cellXfs` style index.
+    cell_style_overlays: Vec<CellStyleOverlay>,
+    /// Imported custom table region styles keyed by `<tableStyle name>`.
+    table_styles: HashMap<String, ParsedTableStyle>,
+    /// Workbook-global style-table truncation and parse losses.
+    losses: Vec<StyleLoss>,
 }
 
 impl Styles {
+    fn format_id(&self, style_idx: usize) -> u16 {
+        self.xf_numfmt.get(style_idx).copied().unwrap_or(0)
+    }
+
     fn kind(&self, style_idx: usize) -> format::Kind {
-        let numfmt_id = self.xf_numfmt.get(style_idx).copied().unwrap_or(0);
+        let numfmt_id = self.format_id(style_idx);
         format::classify(numfmt_id, self.custom.get(&numfmt_id).map(String::as_str))
     }
 
-    fn dxf_fill(&self, dxf_id: usize) -> Option<Color> {
-        self.dxf_fills.get(dxf_id).copied().flatten()
+    fn custom_format(&self, style_idx: usize) -> Option<&str> {
+        let numfmt_id = self.xf_numfmt.get(style_idx).copied()?;
+        self.custom.get(&numfmt_id).map(String::as_str)
+    }
+
+    fn render_text(&self, style_idx: usize, value: &str) -> String {
+        self.custom_format(style_idx).map_or_else(
+            || value.to_string(),
+            |code| format::render_text_format(value, code),
+        )
+    }
+
+    fn differential_style(&self, dxf_id: usize) -> Option<&DifferentialStyle> {
+        self.differential_styles.get(dxf_id)
     }
 
     fn cell_style(&self, style_idx: usize) -> Option<&CellStyle> {
         self.cell_styles.get(style_idx)
     }
+
+    fn cell_style_overlay(&self, style_idx: usize) -> Option<&CellStyleOverlay> {
+        self.cell_style_overlays.get(style_idx)
+    }
+
+    fn table_style(&self, name: &str, theme: &ThemeColors) -> Option<ParsedTableStyle> {
+        self.table_styles
+            .get(name)
+            .cloned()
+            .or_else(|| built_in_table_style(name, theme))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DifferentialStyle {
+    style: CellStyle,
+    losses: Vec<StyleLoss>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedTableStyle {
+    definition: TableStyleDefinition,
+    losses: Vec<StyleLoss>,
 }
 
 fn local(name: &[u8]) -> &[u8] {
@@ -499,10 +610,25 @@ struct ThemeColors {
     colors: [Option<Color>; 12],
 }
 
+const OFFICE_CHART_ACCENTS: [Color; 6] = [
+    Color::rgb(68, 114, 196),
+    Color::rgb(237, 125, 49),
+    Color::rgb(165, 165, 165),
+    Color::rgb(255, 192, 0),
+    Color::rgb(91, 155, 213),
+    Color::rgb(112, 173, 71),
+];
+
 impl ThemeColors {
     fn color(&self, idx: usize, tint: Option<f64>) -> Option<Color> {
         let color = self.colors.get(idx).copied().flatten()?;
         Some(apply_optional_tint(color, tint))
+    }
+
+    fn chart_palette(&self) -> Vec<Color> {
+        (0..OFFICE_CHART_ACCENTS.len())
+            .map(|index| self.colors[index + 4].unwrap_or(OFFICE_CHART_ACCENTS[index]))
+            .collect()
     }
 }
 
@@ -616,7 +742,7 @@ fn color_attr(
         })
 }
 
-fn parse_indexed_colors(xml: &str) -> Vec<Color> {
+fn parse_indexed_colors(xml: &str, losses: &mut Vec<StyleLoss>) -> Vec<Color> {
     let mut r = Reader::from_str(xml);
     let mut colors = Vec::new();
     let mut in_indexed_colors = false;
@@ -626,14 +752,22 @@ fn parse_indexed_colors(xml: &str) -> Vec<Color> {
                 b"indexedColors" => in_indexed_colors = true,
                 b"rgbColor" if in_indexed_colors => {
                     if let Some(color) = attr(&e, b"rgb").as_deref().and_then(parse_color) {
-                        colors.push(color);
+                        if colors.len() < MAX_XLSX_INDEXED_COLORS {
+                            colors.push(color);
+                        } else {
+                            add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        }
                     }
                 }
                 _ => {}
             },
             Ok(Event::Empty(e)) if in_indexed_colors && local(e.name().as_ref()) == b"rgbColor" => {
                 if let Some(color) = attr(&e, b"rgb").as_deref().and_then(parse_color) {
-                    colors.push(color);
+                    if colors.len() < MAX_XLSX_INDEXED_COLORS {
+                        colors.push(color);
+                    } else {
+                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                    }
                 }
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"indexedColors" => {
@@ -868,75 +1002,712 @@ fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Ve
 
 /// `<styleSheet>`: `<numFmts><numFmt numFmtId formatCode/>` + the `<cellXfs>`
 /// `<xf numFmtId/>` list (cell `s` indexes cellXfs).
+fn retain_custom_number_format(styles: &mut Styles, e: &quick_xml::events::BytesStart<'_>) {
+    let (Some(id), Some(code)) = (attr(e, b"numFmtId"), attr(e, b"formatCode")) else {
+        return;
+    };
+    let Ok(id) = id.parse::<u16>() else {
+        return;
+    };
+    if code.len() > MAX_XLSX_FORMAT_CODE_BYTES {
+        add_differential_loss(&mut styles.losses, StyleLossKind::LimitExceeded, 1);
+        return;
+    }
+    if !styles.custom.contains_key(&id) && styles.custom.len() >= MAX_XLSX_CUSTOM_NUMBER_FORMATS {
+        add_differential_loss(&mut styles.losses, StyleLossKind::LimitExceeded, 1);
+        return;
+    }
+    styles.custom.insert(id, code);
+}
+
+fn retain_cell_xf_number_format(styles: &mut Styles, e: &quick_xml::events::BytesStart<'_>) {
+    if styles.xf_numfmt.len() >= MAX_XLSX_STYLE_RECORDS {
+        add_differential_loss(&mut styles.losses, StyleLossKind::LimitExceeded, 1);
+        return;
+    }
+    let id = attr(e, b"numFmtId")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    styles.xf_numfmt.push(id);
+}
+
 fn parse_styles(xml: &str, theme: &ThemeColors) -> Styles {
     let mut r = Reader::from_str(xml);
-    let mut styles = Styles {
-        indexed_colors: parse_indexed_colors(xml),
-        ..Styles::default()
-    };
+    let mut styles = Styles::default();
+    styles.indexed_colors = parse_indexed_colors(xml, &mut styles.losses);
     let mut in_cell_xfs = false;
-    let mut in_dxfs = false;
-    let mut current_dxf_fill: Option<Color> = None;
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
-                b"numFmt" => {
-                    if let (Some(id), Some(code)) = (attr(&e, b"numFmtId"), attr(&e, b"formatCode"))
-                    {
-                        if let Ok(id) = id.parse::<u16>() {
-                            styles.custom.insert(id, code);
-                        }
-                    }
-                }
+                b"numFmt" => retain_custom_number_format(&mut styles, &e),
                 b"cellXfs" => in_cell_xfs = true,
-                b"dxfs" => in_dxfs = true,
-                b"dxf" if in_dxfs => current_dxf_fill = None,
-                b"xf" if in_cell_xfs => {
-                    let id = attr(&e, b"numFmtId")
-                        .and_then(|s| s.parse::<u16>().ok())
-                        .unwrap_or(0);
-                    styles.xf_numfmt.push(id);
-                }
-                b"fgColor" | b"bgColor" if in_dxfs && current_dxf_fill.is_none() => {
-                    current_dxf_fill = color_attr(&e, theme, &styles.indexed_colors);
-                }
+                b"xf" if in_cell_xfs => retain_cell_xf_number_format(&mut styles, &e),
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
-                b"numFmt" => {
-                    if let (Some(id), Some(code)) = (attr(&e, b"numFmtId"), attr(&e, b"formatCode"))
-                    {
-                        if let Ok(id) = id.parse::<u16>() {
-                            styles.custom.insert(id, code);
-                        }
-                    }
-                }
-                b"xf" if in_cell_xfs => {
-                    let id = attr(&e, b"numFmtId")
-                        .and_then(|s| s.parse::<u16>().ok())
-                        .unwrap_or(0);
-                    styles.xf_numfmt.push(id);
-                }
-                b"dxf" if in_dxfs => styles.dxf_fills.push(None),
-                b"fgColor" | b"bgColor" if in_dxfs && current_dxf_fill.is_none() => {
-                    current_dxf_fill = color_attr(&e, theme, &styles.indexed_colors);
-                }
+                b"numFmt" => retain_custom_number_format(&mut styles, &e),
+                b"xf" if in_cell_xfs => retain_cell_xf_number_format(&mut styles, &e),
                 _ => {}
             },
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"cellXfs" => in_cell_xfs = false,
-            Ok(Event::End(e)) if local(e.name().as_ref()) == b"dxf" && in_dxfs => {
-                styles.dxf_fills.push(current_dxf_fill.take());
-            }
-            Ok(Event::End(e)) if local(e.name().as_ref()) == b"dxfs" => in_dxfs = false,
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    styles.cell_styles = parse_cell_styles(xml, theme, &styles.indexed_colors, &styles.custom);
+    let (cell_styles, cell_style_overlays) = parse_cell_styles(
+        xml,
+        theme,
+        &styles.indexed_colors,
+        &styles.custom,
+        &mut styles.losses,
+    );
+    styles.cell_styles = cell_styles;
+    styles.cell_style_overlays = cell_style_overlays;
+    let differential_styles =
+        parse_differential_styles(xml, theme, &styles.indexed_colors, &styles.custom);
+    styles.table_styles = parse_table_styles(xml, &differential_styles);
+    styles.differential_styles = differential_styles;
     styles
 }
 
-fn parse_font_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Font> {
+fn add_differential_loss(losses: &mut Vec<StyleLoss>, kind: StyleLossKind, occurrences: u32) {
+    if occurrences == 0 {
+        return;
+    }
+    if let Some(loss) = losses.iter_mut().find(|loss| loss.kind == kind) {
+        loss.occurrences = loss.occurrences.saturating_add(occurrences);
+    } else {
+        losses.push(StyleLoss { kind, occurrences });
+    }
+}
+
+fn retain_xlsx_style_record<T>(records: &mut Vec<T>, value: T, losses: &mut Vec<StyleLoss>) {
+    if records.len() < MAX_XLSX_STYLE_RECORDS {
+        records.push(value);
+    } else {
+        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+    }
+}
+
+fn retain_cell_xf_style(
+    styles: &mut Vec<CellStyle>,
+    overlays: &mut Vec<CellStyleOverlay>,
+    style: CellStyle,
+    overlay: CellStyleOverlay,
+    losses: &mut Vec<StyleLoss>,
+) {
+    if styles.len() < MAX_XLSX_STYLE_RECORDS {
+        styles.push(style);
+        overlays.push(overlay);
+    } else {
+        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+    }
+}
+
+fn differential_alignment_is_lossy(e: &quick_xml::events::BytesStart<'_>) -> bool {
+    let horizontal = attr(e, b"horizontal");
+    let vertical = attr(e, b"vertical");
+    let explicit_false = |name| {
+        attr(e, name)
+            .as_deref()
+            .is_some_and(|value| !attr_true(value))
+    };
+    horizontal
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "general" | "left" | "center" | "right"))
+        || vertical
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "top" | "center" | "bottom"))
+        || attr(e, b"textRotation")
+            .and_then(|value| value.parse::<i16>().ok())
+            .is_some_and(|value| value > 180)
+        || explicit_false(b"wrapText")
+        || explicit_false(b"shrinkToFit")
+        || attr(e, b"indent").as_deref() == Some("0")
+        || [
+            b"relativeIndent".as_slice(),
+            b"justifyLastLine".as_slice(),
+            b"readingOrder".as_slice(),
+            b"mergeCell".as_slice(),
+        ]
+        .into_iter()
+        .any(|name| attr(e, name).is_some())
+}
+
+fn parse_differential_styles(
+    xml: &str,
+    theme: &ThemeColors,
+    indexed: &[Color],
+    custom: &HashMap<u16, String>,
+) -> Vec<DifferentialStyle> {
+    const MAX_DXFS: usize = 4_096;
+    let mut reader = Reader::from_str(xml);
+    let mut in_dxfs = false;
+    let mut current: Option<CellStyle> = None;
+    let mut font: Option<Font> = None;
+    let mut fill: Option<Fill> = None;
+    let mut border: Option<Border> = None;
+    let mut border_edge = None;
+    let mut losses = Vec::<StyleLoss>::new();
+    let mut styles = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let qualified_name = e.name();
+                let name = local(qualified_name.as_ref());
+                if name == b"dxfs" {
+                    in_dxfs = true;
+                    continue;
+                }
+                if !in_dxfs {
+                    continue;
+                }
+                match name {
+                    b"dxf" => {
+                        if current.is_some() && styles.len() < MAX_DXFS {
+                            styles.push(DifferentialStyle {
+                                style: current.take().unwrap_or_default(),
+                                losses: std::mem::take(&mut losses),
+                            });
+                        }
+                        current = Some(CellStyle::default());
+                        losses.clear();
+                        font = None;
+                        fill = None;
+                        border = None;
+                        border_edge = None;
+                        if e.is_empty() {
+                            let style = current.take().unwrap_or_default();
+                            if styles.len() < MAX_DXFS {
+                                styles.push(DifferentialStyle {
+                                    style,
+                                    losses: std::mem::take(&mut losses),
+                                });
+                            }
+                        }
+                    }
+                    b"font" if current.is_some() => {
+                        font = (!e.is_empty()).then(Font::default);
+                    }
+                    b"fill" if current.is_some() => {
+                        fill = (!e.is_empty()).then(Fill::default);
+                    }
+                    b"border" if current.is_some() => {
+                        border = (!e.is_empty()).then(Border::default);
+                    }
+                    b"name" if font.is_some() => {
+                        font.as_mut().expect("dxf font").name = attr(&e, b"val");
+                    }
+                    b"sz" if font.is_some() => {
+                        font.as_mut().expect("dxf font").size_pt = attr(&e, b"val")
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                    }
+                    b"color" if font.is_some() => {
+                        let color = color_attr(&e, theme, indexed);
+                        if color.is_none() {
+                            add_differential_loss(&mut losses, StyleLossKind::UnresolvedColor, 1);
+                        }
+                        font.as_mut().expect("dxf font").color = color;
+                    }
+                    b"b" if font.is_some() => {
+                        let enabled = attr(&e, b"val").as_deref().is_none_or(attr_true);
+                        if !enabled {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        font.as_mut().expect("dxf font").bold = enabled;
+                    }
+                    b"i" if font.is_some() => {
+                        let enabled = attr(&e, b"val").as_deref().is_none_or(attr_true);
+                        if !enabled {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        font.as_mut().expect("dxf font").italic = enabled;
+                    }
+                    b"u" if font.is_some() => {
+                        let enabled = attr(&e, b"val").as_deref().is_none_or(attr_true);
+                        if !enabled {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        font.as_mut().expect("dxf font").underline = enabled;
+                    }
+                    b"strike" if font.is_some() => {
+                        let enabled = attr(&e, b"val").as_deref().is_none_or(attr_true);
+                        if !enabled {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        font.as_mut().expect("dxf font").strikethrough = enabled;
+                    }
+                    b"vertAlign" if font.is_some() => {
+                        font.as_mut().expect("dxf font").script = match attr(&e, b"val").as_deref()
+                        {
+                            Some("superscript") => FormatScript::Superscript,
+                            Some("subscript") => FormatScript::Subscript,
+                            _ => FormatScript::None,
+                        };
+                    }
+                    b"patternFill" if fill.is_some() => {
+                        let source_pattern = attr(&e, b"patternType");
+                        let pattern = format_pattern(source_pattern.as_deref());
+                        if pattern == FormatPattern::None
+                            && source_pattern
+                                .as_deref()
+                                .is_some_and(|value| value != "none")
+                        {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        fill.as_mut().expect("dxf fill").pattern = pattern;
+                    }
+                    b"fgColor" if fill.is_some() => {
+                        let color = color_attr(&e, theme, indexed);
+                        if color.is_none() {
+                            add_differential_loss(&mut losses, StyleLossKind::UnresolvedColor, 1);
+                        }
+                        fill.as_mut().expect("dxf fill").foreground = color;
+                    }
+                    b"bgColor" if fill.is_some() => {
+                        let color = color_attr(&e, theme, indexed);
+                        if color.is_none() {
+                            add_differential_loss(&mut losses, StyleLossKind::UnresolvedColor, 1);
+                        }
+                        fill.as_mut().expect("dxf fill").background = color;
+                    }
+                    b"left" | b"right" | b"top" | b"bottom" if border.is_some() => {
+                        let edge = match name {
+                            b"left" => BorderEdge::Left,
+                            b"right" => BorderEdge::Right,
+                            b"top" => BorderEdge::Top,
+                            _ => BorderEdge::Bottom,
+                        };
+                        let source_style = attr(&e, b"style");
+                        let parsed_style = border_style(source_style.as_deref());
+                        if parsed_style == BorderStyle::None
+                            && source_style.as_deref().is_some_and(|value| value != "none")
+                        {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        set_border_edge(border.as_mut().expect("dxf border"), edge, parsed_style);
+                        border_edge = (!e.is_empty()).then_some(edge);
+                    }
+                    b"color" if border.is_some() && border_edge.is_some() => {
+                        if let Some(color) = color_attr(&e, theme, indexed) {
+                            set_border_color(
+                                border.as_mut().expect("dxf border"),
+                                border_edge.expect("dxf border edge"),
+                                color,
+                            );
+                        } else {
+                            add_differential_loss(&mut losses, StyleLossKind::UnresolvedColor, 1);
+                        }
+                    }
+                    b"gradientFill" if fill.is_some() => {
+                        add_differential_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1)
+                    }
+                    b"diagonal" | b"vertical" | b"horizontal" | b"start" | b"end"
+                        if border.is_some() =>
+                    {
+                        add_differential_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    }
+                    b"numFmt" if current.is_some() => {
+                        current.as_mut().expect("dxf").num_fmt =
+                            attr(&e, b"formatCode").or_else(|| {
+                                attr(&e, b"numFmtId")
+                                    .and_then(|value| value.parse::<u16>().ok())
+                                    .and_then(|id| {
+                                        custom
+                                            .get(&id)
+                                            .cloned()
+                                            .or_else(|| built_in_num_fmt(id).map(str::to_string))
+                                    })
+                            });
+                    }
+                    b"alignment" if current.is_some() => {
+                        current.as_mut().expect("dxf").align = Some(parse_alignment(&e));
+                        if differential_alignment_is_lossy(&e) {
+                            add_differential_loss(
+                                &mut losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                    }
+                    b"protection" if current.is_some() => {
+                        current.as_mut().expect("dxf").protection = Some(CellProtection {
+                            locked: attr(&e, b"locked").as_deref().and_then(parse_bool_attr),
+                            hidden: attr(&e, b"hidden").as_deref().is_some_and(attr_true),
+                        });
+                    }
+                    _ if font.is_some() || fill.is_some() || border.is_some() => {
+                        add_differential_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    }
+                    b"extLst" if current.is_some() => {
+                        add_differential_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1)
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => match local(e.name().as_ref()) {
+                b"font" if current.is_some() => {
+                    let value = font.take().unwrap_or_default();
+                    if value != Font::default() {
+                        current.as_mut().expect("dxf").font = Some(value);
+                    }
+                }
+                b"fill" if current.is_some() => {
+                    let value = fill.take().unwrap_or_default();
+                    if value != Fill::default() {
+                        if value.pattern == FormatPattern::Solid {
+                            current.as_mut().expect("dxf").fill =
+                                value.foreground.or(value.background);
+                        }
+                        current.as_mut().expect("dxf").pattern_fill = Some(value);
+                    }
+                }
+                b"left" | b"right" | b"top" | b"bottom" => border_edge = None,
+                b"border" if current.is_some() => {
+                    let value = border.take().unwrap_or_default();
+                    if value != Border::default() {
+                        current.as_mut().expect("dxf").border = Some(value);
+                    }
+                }
+                b"dxf" if current.is_some() => {
+                    if styles.len() < MAX_DXFS {
+                        styles.push(DifferentialStyle {
+                            style: current.take().unwrap_or_default(),
+                            losses: std::mem::take(&mut losses),
+                        });
+                    } else {
+                        current = None;
+                        losses.clear();
+                    }
+                    font = None;
+                    fill = None;
+                    border = None;
+                    border_edge = None;
+                }
+                b"dxfs" => in_dxfs = false,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    styles
+}
+
+fn table_style_region(value: &str) -> Option<TableStyleRegion> {
+    match value {
+        "wholeTable" => Some(TableStyleRegion::WholeTable),
+        "firstColumnStripe" => Some(TableStyleRegion::FirstColumnStripe),
+        "secondColumnStripe" => Some(TableStyleRegion::SecondColumnStripe),
+        "firstRowStripe" => Some(TableStyleRegion::FirstRowStripe),
+        "secondRowStripe" => Some(TableStyleRegion::SecondRowStripe),
+        "firstColumn" => Some(TableStyleRegion::FirstColumn),
+        "lastColumn" => Some(TableStyleRegion::LastColumn),
+        "headerRow" => Some(TableStyleRegion::HeaderRow),
+        "totalRow" => Some(TableStyleRegion::TotalRow),
+        "firstHeaderCell" => Some(TableStyleRegion::FirstHeaderCell),
+        "lastHeaderCell" => Some(TableStyleRegion::LastHeaderCell),
+        "firstTotalCell" => Some(TableStyleRegion::FirstTotalCell),
+        "lastTotalCell" => Some(TableStyleRegion::LastTotalCell),
+        _ => None,
+    }
+}
+
+fn table_style_region_is_stripe(region: TableStyleRegion) -> bool {
+    matches!(
+        region,
+        TableStyleRegion::FirstColumnStripe
+            | TableStyleRegion::SecondColumnStripe
+            | TableStyleRegion::FirstRowStripe
+            | TableStyleRegion::SecondRowStripe
+    )
+}
+
+fn parse_table_styles(xml: &str, dxfs: &[DifferentialStyle]) -> HashMap<String, ParsedTableStyle> {
+    const MAX_TABLE_STYLES: usize = 4_096;
+    const MAX_ELEMENTS_PER_TABLE_STYLE: usize = 64;
+    const MAX_TABLE_STRIPE_SIZE: u32 = 1_048_576;
+    let mut reader = Reader::from_str(xml);
+    let mut in_table_styles = false;
+    let mut current_name: Option<String> = None;
+    let mut current_elements = 0usize;
+    let mut styles = HashMap::<String, ParsedTableStyle>::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
+                b"tableStyles" => in_table_styles = true,
+                b"tableStyle" if in_table_styles => {
+                    current_elements = 0;
+                    current_name = attr(&e, b"name").filter(|name| !name.is_empty());
+                    if let Some(name) = current_name.clone() {
+                        if !styles.contains_key(&name) && styles.len() >= MAX_TABLE_STYLES {
+                            current_name = None;
+                        } else {
+                            let duplicate = styles.contains_key(&name);
+                            let parsed = styles.entry(name).or_default();
+                            if duplicate {
+                                add_differential_loss(
+                                    &mut parsed.losses,
+                                    StyleLossKind::UnsupportedProperty,
+                                    1,
+                                );
+                            }
+                        }
+                    }
+                    if e.is_empty() {
+                        current_name = None;
+                    }
+                }
+                b"tableStyleElement" if current_name.is_some() => {
+                    current_elements = current_elements.saturating_add(1);
+                    let parsed = styles
+                        .get_mut(current_name.as_ref().expect("table style name"))
+                        .expect("current table style");
+                    if current_elements > MAX_ELEMENTS_PER_TABLE_STYLE {
+                        add_differential_loss(&mut parsed.losses, StyleLossKind::LimitExceeded, 1);
+                        continue;
+                    }
+                    let Some(region) = attr(&e, b"type").as_deref().and_then(table_style_region)
+                    else {
+                        add_differential_loss(
+                            &mut parsed.losses,
+                            StyleLossKind::UnsupportedProperty,
+                            1,
+                        );
+                        continue;
+                    };
+                    let stripe_size = if table_style_region_is_stripe(region) {
+                        match attr(&e, b"size") {
+                            None => 1,
+                            Some(value) => match value.parse::<u32>() {
+                                Ok(size @ 1..=MAX_TABLE_STRIPE_SIZE) => size,
+                                Ok(_) => {
+                                    add_differential_loss(
+                                        &mut parsed.losses,
+                                        StyleLossKind::LimitExceeded,
+                                        1,
+                                    );
+                                    1
+                                }
+                                Err(_) => {
+                                    add_differential_loss(
+                                        &mut parsed.losses,
+                                        StyleLossKind::UnsupportedProperty,
+                                        1,
+                                    );
+                                    1
+                                }
+                            },
+                        }
+                    } else {
+                        if attr(&e, b"size").is_some() {
+                            add_differential_loss(
+                                &mut parsed.losses,
+                                StyleLossKind::UnsupportedProperty,
+                                1,
+                            );
+                        }
+                        1
+                    };
+                    let Some(dxf) = attr(&e, b"dxfId")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .and_then(|index| dxfs.get(index))
+                    else {
+                        add_differential_loss(
+                            &mut parsed.losses,
+                            StyleLossKind::MissingReference,
+                            1,
+                        );
+                        continue;
+                    };
+                    for loss in &dxf.losses {
+                        add_differential_loss(&mut parsed.losses, loss.kind, loss.occurrences);
+                    }
+                    if parsed
+                        .definition
+                        .insert(region, dxf.style.clone(), stripe_size)
+                        .is_some()
+                    {
+                        add_differential_loss(
+                            &mut parsed.losses,
+                            StyleLossKind::UnsupportedProperty,
+                            1,
+                        );
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match local(e.name().as_ref()) {
+                b"tableStyle" => {
+                    current_name = None;
+                    current_elements = 0;
+                }
+                b"tableStyles" => in_table_styles = false,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    styles
+}
+
+fn built_in_table_style(name: &str, theme: &ThemeColors) -> Option<ParsedTableStyle> {
+    const OFFICE_ACCENTS: [Color; 6] = [
+        Color::rgb(0x44, 0x72, 0xC4),
+        Color::rgb(0xED, 0x7D, 0x31),
+        Color::rgb(0xA5, 0xA5, 0xA5),
+        Color::rgb(0xFF, 0xC0, 0x00),
+        Color::rgb(0x5B, 0x9B, 0xD5),
+        Color::rgb(0x70, 0xAD, 0x47),
+    ];
+    let (family, number) = ["TableStyleLight", "TableStyleMedium", "TableStyleDark"]
+        .into_iter()
+        .find_map(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .map(|number| (prefix, number))
+        })?;
+    let valid = match family {
+        "TableStyleLight" => (1..=21).contains(&number),
+        "TableStyleMedium" => (1..=28).contains(&number),
+        "TableStyleDark" => (1..=11).contains(&number),
+        _ => false,
+    };
+    if !valid {
+        return None;
+    }
+    let accent_index = match family {
+        "TableStyleLight" => number.saturating_sub(2) % OFFICE_ACCENTS.len(),
+        "TableStyleMedium" => number.saturating_sub(2) % OFFICE_ACCENTS.len(),
+        "TableStyleDark" => number.saturating_sub(2) % OFFICE_ACCENTS.len(),
+        _ => 0,
+    };
+    let accent = theme.colors[4 + accent_index].unwrap_or(OFFICE_ACCENTS[accent_index]);
+    let white = Color::rgb(0xFF, 0xFF, 0xFF);
+    let mut header = CellStyle {
+        font: Some(Font::default().bold()),
+        ..CellStyle::default()
+    };
+    match family {
+        "TableStyleLight" => {
+            header.font.as_mut().expect("table font").color = Some(accent);
+            header.border = Some(
+                Border::default()
+                    .with_bottom(BorderStyle::Medium)
+                    .with_color(accent),
+            );
+        }
+        "TableStyleMedium" | "TableStyleDark" => {
+            header.font.as_mut().expect("table font").color = Some(white);
+            header.fill = Some(accent);
+            header.pattern_fill = Some(Fill::solid(accent));
+        }
+        _ => unreachable!("validated table style family"),
+    }
+    let mut definition = TableStyleDefinition::default();
+    definition.insert(TableStyleRegion::HeaderRow, header, 1);
+    definition.insert(
+        TableStyleRegion::TotalRow,
+        CellStyle {
+            font: Some(Font::default().bold()),
+            border: Some(
+                Border::default()
+                    .with_top(BorderStyle::Medium)
+                    .with_color(accent),
+            ),
+            ..CellStyle::default()
+        },
+        1,
+    );
+    let emphasis = CellStyle {
+        font: Some(Font::default().bold()),
+        ..CellStyle::default()
+    };
+    definition.insert(TableStyleRegion::FirstColumn, emphasis.clone(), 1);
+    definition.insert(TableStyleRegion::LastColumn, emphasis, 1);
+
+    let stripe = match family {
+        "TableStyleLight" => apply_tint(accent, 0.90),
+        "TableStyleMedium" => apply_tint(accent, 0.80),
+        "TableStyleDark" => apply_tint(accent, -0.15),
+        _ => unreachable!("validated table style family"),
+    };
+    let stripe_style = CellStyle {
+        fill: Some(stripe),
+        pattern_fill: Some(Fill::solid(stripe)),
+        ..CellStyle::default()
+    };
+    definition.insert(TableStyleRegion::FirstRowStripe, stripe_style.clone(), 1);
+    definition.insert(TableStyleRegion::FirstColumnStripe, stripe_style, 1);
+    if family == "TableStyleDark" {
+        let body = apply_tint(accent, -0.30);
+        definition.insert(
+            TableStyleRegion::WholeTable,
+            CellStyle {
+                font: Some(Font::default().with_color(white)),
+                fill: Some(body),
+                pattern_fill: Some(Fill::solid(body)),
+                ..CellStyle::default()
+            },
+            1,
+        );
+    }
+    Some(ParsedTableStyle {
+        definition,
+        // The built-in family recipes preserve the visible cascade regions,
+        // but they do not yet encode every per-style Office border/fill
+        // variation. Surface that approximation instead of presenting it as
+        // exact source fidelity.
+        losses: vec![StyleLoss {
+            kind: StyleLossKind::UnsupportedProperty,
+            occurrences: 1,
+        }],
+    })
+}
+
+#[cfg(test)]
+fn built_in_table_header_style(name: &str, theme: &ThemeColors) -> Option<CellStyle> {
+    built_in_table_style(name, theme).and_then(|style| {
+        style
+            .definition
+            .get(TableStyleRegion::HeaderRow)
+            .map(|element| element.style.clone())
+    })
+}
+
+fn parse_font_table(
+    xml: &str,
+    theme: &ThemeColors,
+    indexed: &[Color],
+    losses: &mut Vec<StyleLoss>,
+) -> Vec<Font> {
     let mut reader = Reader::from_str(xml);
     let mut in_fonts = false;
     let mut current: Option<Font> = None;
@@ -947,11 +1718,24 @@ fn parse_font_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fo
                 b"fonts" => in_fonts = true,
                 b"font" if in_fonts => {
                     if current.is_some() {
-                        fonts.push(current.take().unwrap_or_default());
+                        retain_xlsx_style_record(
+                            &mut fonts,
+                            current.take().unwrap_or_default(),
+                            losses,
+                        );
+                    }
+                    if fonts.len() >= MAX_XLSX_STYLE_RECORDS {
+                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        current = None;
+                        continue;
                     }
                     current = Some(Font::default());
                     if e.is_empty() {
-                        fonts.push(current.take().unwrap_or_default());
+                        retain_xlsx_style_record(
+                            &mut fonts,
+                            current.take().unwrap_or_default(),
+                            losses,
+                        );
                     }
                 }
                 b"name" if current.is_some() => {
@@ -981,7 +1765,7 @@ fn parse_font_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fo
                 _ => {}
             },
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"font" && current.is_some() => {
-                fonts.push(current.take().unwrap_or_default());
+                retain_xlsx_style_record(&mut fonts, current.take().unwrap_or_default(), losses);
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"fonts" => in_fonts = false,
             Ok(Event::Eof) | Err(_) => break,
@@ -1015,7 +1799,12 @@ fn format_pattern(value: Option<&str>) -> FormatPattern {
     }
 }
 
-fn parse_fill_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fill> {
+fn parse_fill_table(
+    xml: &str,
+    theme: &ThemeColors,
+    indexed: &[Color],
+    losses: &mut Vec<StyleLoss>,
+) -> Vec<Fill> {
     let mut reader = Reader::from_str(xml);
     let mut in_fills = false;
     let mut current: Option<Fill> = None;
@@ -1025,9 +1814,21 @@ fn parse_fill_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fi
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
                 b"fills" => in_fills = true,
                 b"fill" if in_fills => {
+                    if let Some(previous) = current.take() {
+                        retain_xlsx_style_record(&mut fills, previous, losses);
+                    }
+                    if fills.len() >= MAX_XLSX_STYLE_RECORDS {
+                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        current = None;
+                        continue;
+                    }
                     current = Some(Fill::default());
                     if e.is_empty() {
-                        fills.push(current.take().unwrap_or_default());
+                        retain_xlsx_style_record(
+                            &mut fills,
+                            current.take().unwrap_or_default(),
+                            losses,
+                        );
                     }
                 }
                 b"patternFill" if current.is_some() => {
@@ -1043,7 +1844,7 @@ fn parse_fill_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Fi
                 _ => {}
             },
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"fill" && current.is_some() => {
-                fills.push(current.take().unwrap_or_default());
+                retain_xlsx_style_record(&mut fills, current.take().unwrap_or_default(), losses);
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"fills" => in_fills = false,
             Ok(Event::Eof) | Err(_) => break,
@@ -1089,7 +1890,12 @@ fn set_border_color(border: &mut Border, edge: BorderEdge, color: Color) {
     }
 }
 
-fn parse_border_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<Border> {
+fn parse_border_table(
+    xml: &str,
+    theme: &ThemeColors,
+    indexed: &[Color],
+    losses: &mut Vec<StyleLoss>,
+) -> Vec<Border> {
     let mut reader = Reader::from_str(xml);
     let mut in_borders = false;
     let mut current: Option<Border> = None;
@@ -1100,9 +1906,21 @@ fn parse_border_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
                 b"borders" => in_borders = true,
                 b"border" if in_borders => {
+                    if let Some(previous) = current.take() {
+                        retain_xlsx_style_record(&mut borders, previous, losses);
+                    }
+                    if borders.len() >= MAX_XLSX_STYLE_RECORDS {
+                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        current = None;
+                        continue;
+                    }
                     current = Some(Border::default());
                     if e.is_empty() {
-                        borders.push(current.take().unwrap_or_default());
+                        retain_xlsx_style_record(
+                            &mut borders,
+                            current.take().unwrap_or_default(),
+                            losses,
+                        );
                     }
                 }
                 b"left" | b"right" | b"top" | b"bottom" if current.is_some() => {
@@ -1139,7 +1957,7 @@ fn parse_border_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<
                 edge = None
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"border" && current.is_some() => {
-                borders.push(current.take().unwrap_or_default());
+                retain_xlsx_style_record(&mut borders, current.take().unwrap_or_default(), losses);
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"borders" => in_borders = false,
             Ok(Event::Eof) | Err(_) => break,
@@ -1150,21 +1968,7 @@ fn parse_border_table(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Vec<
 }
 
 fn built_in_num_fmt(id: u16) -> Option<&'static str> {
-    match id {
-        1 => Some("0"),
-        2 => Some("0.00"),
-        3 => Some("#,##0"),
-        4 => Some("#,##0.00"),
-        9 => Some("0%"),
-        10 => Some("0.00%"),
-        11 => Some("0.00E+00"),
-        14 => Some("mm-dd-yy"),
-        20 => Some("h:mm"),
-        21 => Some("h:mm:ss"),
-        22 => Some("m/d/yy h:mm"),
-        49 => Some("@"),
-        _ => None,
-    }
+    format::built_in_format_code(id)
 }
 
 fn parse_alignment(e: &quick_xml::events::BytesStart<'_>) -> Alignment {
@@ -1229,61 +2033,163 @@ fn cell_style_from_xf(
     }
 }
 
+fn cell_style_overlay_from_xf(
+    e: &quick_xml::events::BytesStart<'_>,
+    fonts: &[Font],
+    fills: &[Fill],
+    borders: &[Border],
+    custom: &HashMap<u16, String>,
+) -> CellStyleOverlay {
+    let num_fmt_id = attr(e, b"numFmtId")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let font_id = attr(e, b"fontId").and_then(|value| value.parse::<usize>().ok());
+    let fill_id = attr(e, b"fillId").and_then(|value| value.parse::<usize>().ok());
+    let border_id = attr(e, b"borderId").and_then(|value| value.parse::<usize>().ok());
+    let applies = |name: &[u8], fallback: bool| {
+        attr(e, name)
+            .as_deref()
+            .and_then(parse_bool_attr)
+            .unwrap_or(fallback)
+    };
+    let replace_font = applies(b"applyFont", font_id.is_some_and(|id| id != 0));
+    let replace_fill = applies(b"applyFill", fill_id.is_some_and(|id| id != 0));
+    let replace_border = applies(b"applyBorder", border_id.is_some_and(|id| id != 0));
+    let replace_num_fmt = applies(b"applyNumberFormat", num_fmt_id != 0);
+    CellStyleOverlay {
+        style: CellStyle {
+            font: replace_font
+                .then(|| font_id.and_then(|id| fonts.get(id).cloned()))
+                .flatten(),
+            fill: None,
+            pattern_fill: replace_fill
+                .then(|| fill_id.and_then(|id| fills.get(id).copied()))
+                .flatten(),
+            border: replace_border
+                .then(|| border_id.and_then(|id| borders.get(id).cloned()))
+                .flatten(),
+            num_fmt: replace_num_fmt
+                .then(|| {
+                    custom
+                        .get(&num_fmt_id)
+                        .cloned()
+                        .or_else(|| built_in_num_fmt(num_fmt_id).map(str::to_string))
+                })
+                .flatten(),
+            align: None,
+            protection: None,
+        },
+        replace_font,
+        replace_fill,
+        replace_border,
+        replace_num_fmt,
+        replace_alignment: applies(b"applyAlignment", false),
+        replace_protection: applies(b"applyProtection", false),
+    }
+}
+
 fn parse_cell_styles(
     xml: &str,
     theme: &ThemeColors,
     indexed: &[Color],
     custom: &HashMap<u16, String>,
-) -> Vec<CellStyle> {
-    let fonts = parse_font_table(xml, theme, indexed);
-    let fills = parse_fill_table(xml, theme, indexed);
-    let borders = parse_border_table(xml, theme, indexed);
+    losses: &mut Vec<StyleLoss>,
+) -> (Vec<CellStyle>, Vec<CellStyleOverlay>) {
+    let fonts = parse_font_table(xml, theme, indexed, losses);
+    let fills = parse_fill_table(xml, theme, indexed, losses);
+    let borders = parse_border_table(xml, theme, indexed, losses);
     let mut reader = Reader::from_str(xml);
     let mut in_cell_xfs = false;
-    let mut current: Option<CellStyle> = None;
+    let mut current: Option<(CellStyle, CellStyleOverlay, Option<bool>, Option<bool>)> = None;
     let mut styles = Vec::new();
+    let mut overlays = Vec::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
                 b"cellXfs" => in_cell_xfs = true,
                 b"xf" if in_cell_xfs => {
-                    current = Some(cell_style_from_xf(&e, &fonts, &fills, &borders, custom));
+                    if styles.len() >= MAX_XLSX_STYLE_RECORDS {
+                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        current = None;
+                        continue;
+                    }
+                    current = Some((
+                        cell_style_from_xf(&e, &fonts, &fills, &borders, custom),
+                        cell_style_overlay_from_xf(&e, &fonts, &fills, &borders, custom),
+                        attr(&e, b"applyAlignment")
+                            .as_deref()
+                            .and_then(parse_bool_attr),
+                        attr(&e, b"applyProtection")
+                            .as_deref()
+                            .and_then(parse_bool_attr),
+                    ));
                 }
                 b"alignment" if current.is_some() => {
-                    current.as_mut().expect("xf").align = Some(parse_alignment(&e));
+                    let alignment = parse_alignment(&e);
+                    let (resolved, overlay, apply_alignment, _) = current.as_mut().expect("xf");
+                    resolved.align = Some(alignment.clone());
+                    if *apply_alignment != Some(false) {
+                        overlay.style.align = Some(alignment);
+                        overlay.replace_alignment = true;
+                    }
                 }
                 b"protection" if current.is_some() => {
-                    current.as_mut().expect("xf").protection = Some(CellProtection {
+                    let protection = CellProtection {
                         locked: attr(&e, b"locked").as_deref().and_then(parse_bool_attr),
                         hidden: attr(&e, b"hidden").as_deref().is_some_and(attr_true),
-                    });
+                    };
+                    let (resolved, overlay, _, apply_protection) = current.as_mut().expect("xf");
+                    resolved.protection = Some(protection.clone());
+                    if *apply_protection != Some(false) {
+                        overlay.style.protection = Some(protection);
+                        overlay.replace_protection = true;
+                    }
                 }
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
                 b"xf" if in_cell_xfs => {
-                    styles.push(cell_style_from_xf(&e, &fonts, &fills, &borders, custom));
+                    retain_cell_xf_style(
+                        &mut styles,
+                        &mut overlays,
+                        cell_style_from_xf(&e, &fonts, &fills, &borders, custom),
+                        cell_style_overlay_from_xf(&e, &fonts, &fills, &borders, custom),
+                        losses,
+                    );
                 }
                 b"alignment" if current.is_some() => {
-                    current.as_mut().expect("xf").align = Some(parse_alignment(&e));
+                    let alignment = parse_alignment(&e);
+                    let (resolved, overlay, apply_alignment, _) = current.as_mut().expect("xf");
+                    resolved.align = Some(alignment.clone());
+                    if *apply_alignment != Some(false) {
+                        overlay.style.align = Some(alignment);
+                        overlay.replace_alignment = true;
+                    }
                 }
                 b"protection" if current.is_some() => {
-                    current.as_mut().expect("xf").protection = Some(CellProtection {
+                    let protection = CellProtection {
                         locked: attr(&e, b"locked").as_deref().and_then(parse_bool_attr),
                         hidden: attr(&e, b"hidden").as_deref().is_some_and(attr_true),
-                    });
+                    };
+                    let (resolved, overlay, _, apply_protection) = current.as_mut().expect("xf");
+                    resolved.protection = Some(protection.clone());
+                    if *apply_protection != Some(false) {
+                        overlay.style.protection = Some(protection);
+                        overlay.replace_protection = true;
+                    }
                 }
                 _ => {}
             },
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"xf" && current.is_some() => {
-                styles.push(current.take().unwrap_or_default());
+                let (style, overlay, _, _) = current.take().expect("xf");
+                retain_cell_xf_style(&mut styles, &mut overlays, style, overlay, losses);
             }
             Ok(Event::End(e)) if local(e.name().as_ref()) == b"cellXfs" => in_cell_xfs = false,
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    styles
+    (styles, overlays)
 }
 
 /// A worksheet's visibility, from the `<sheet state>` attribute.
@@ -1599,17 +2505,23 @@ fn drawing_target(xml: &str) -> Option<String> {
     }
 }
 
+const MAX_XLSX_DRAWINGS: usize = 16_384;
+const MAX_XLSX_DRAWING_TEXT: usize = 4_096;
+const MAX_XLSX_DRAWING_NUMBER_TEXT: usize = 128;
+
 struct DrawingRef {
     kind: DrawingRefKind,
-    rid: String,
+    rid: Option<String>,
     from: (u32, u16),
     to: Option<(u32, u16)>,
+    metadata: DrawingMetadata,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DrawingRefKind {
     Image,
     Chart,
+    Shape,
 }
 
 #[derive(Clone, Copy)]
@@ -1622,121 +2534,501 @@ enum AnchorSection {
 enum AnchorField {
     Row,
     Col,
+    RowOffset,
+    ColOffset,
 }
 
-fn parse_drawing_refs(xml: &str) -> Vec<DrawingRef> {
-    const XLSX_MAX_ROW: u32 = 1_048_575;
-    const XLSX_MAX_COL: u16 = 16_383;
+fn add_drawing_loss(losses: &mut Vec<StyleLoss>, kind: StyleLossKind, occurrences: u32) {
+    if occurrences == 0 {
+        return;
+    }
+    if let Some(loss) = losses.iter_mut().find(|loss| loss.kind == kind) {
+        loss.occurrences = loss.occurrences.saturating_add(occurrences);
+    } else {
+        losses.push(StyleLoss { kind, occurrences });
+    }
+}
+
+fn truncate_drawing_text(value: &mut String, max: usize) -> bool {
+    if value.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    true
+}
+
+fn bounded_drawing_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    losses: &mut Vec<StyleLoss>,
+) -> Option<String> {
+    attr(e, key).map(|mut value| {
+        if truncate_drawing_text(&mut value, MAX_XLSX_DRAWING_TEXT) {
+            add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+        }
+        value
+    })
+}
+
+fn append_bounded_drawing_ref(
+    out: &mut String,
+    reference: &BytesRef<'_>,
+    max: usize,
+    losses: &mut Vec<StyleLoss>,
+) {
+    if out.len() >= max {
+        add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+        return;
+    }
+    match reference.resolve_char_ref() {
+        Ok(Some(ch)) => out.push(ch),
+        Ok(None) => {
+            if let Ok(name) = reference.decode() {
+                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
+                    out.push_str(value);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    if truncate_drawing_text(out, max) {
+        add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+    }
+}
+
+fn drawing_anchor_behavior(
+    element: &[u8],
+    e: &quick_xml::events::BytesStart<'_>,
+) -> DrawingAnchorBehavior {
+    match element {
+        b"absoluteAnchor" => DrawingAnchorBehavior::Absolute,
+        b"oneCellAnchor" => DrawingAnchorBehavior::MoveOnly,
+        b"twoCellAnchor" => match attr(e, b"editAs").as_deref() {
+            Some("absolute") => DrawingAnchorBehavior::Absolute,
+            Some("oneCell") => DrawingAnchorBehavior::MoveOnly,
+            _ => DrawingAnchorBehavior::MoveAndSize,
+        },
+        _ => DrawingAnchorBehavior::MoveAndSize,
+    }
+}
+
+fn drawing_crop(e: &quick_xml::events::BytesStart<'_>) -> DrawingCrop {
+    let edge = |name| {
+        attr(e, name)
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|value| value.saturating_mul(10).min(1_000_000))
+            .unwrap_or(0)
+    };
+    DrawingCrop {
+        left_ppm: edge(b"l"),
+        top_ppm: edge(b"t"),
+        right_ppm: edge(b"r"),
+        bottom_ppm: edge(b"b"),
+    }
+}
+
+fn parse_drawing_refs_bounded(xml: &str, losses: &mut Vec<StyleLoss>) -> Vec<DrawingRef> {
+    const XLSX_MAX_ROW: i64 = 1_048_575;
+    const XLSX_MAX_COL: i64 = 16_383;
 
     let mut r = Reader::from_str(xml);
     let mut out = Vec::new();
-    let mut in_anchor = false;
+    let mut current: Option<DrawingRef> = None;
+    let mut anchor_depth = 0usize;
+    let mut anchor_requires_from = false;
+    let mut anchor_requires_to = false;
     let mut section: Option<AnchorSection> = None;
     let mut field: Option<AnchorField> = None;
     let mut field_text = String::new();
-    let mut rid: Option<String> = None;
-    let mut kind: Option<DrawingRefKind> = None;
-    let mut from = (0u32, 0u16);
-    let mut to_row: Option<u32> = None;
-    let mut to_col: Option<u16> = None;
+    let mut from_row_seen = false;
+    let mut from_col_seen = false;
+    let mut to_row_seen = false;
+    let mut to_col_seen = false;
+    let mut from_offset = (0i64, 0i64);
+    let mut to_offset = (0i64, 0i64);
+    let mut from_row_offset_seen = false;
+    let mut from_col_offset_seen = false;
+    let mut to_row_offset_seen = false;
+    let mut to_col_offset_seen = false;
+    let mut desc_depth = 0usize;
+    let mut desc_text = String::new();
 
     loop {
         match r.read_event() {
-            Ok(Event::Start(e)) => match local(e.name().as_ref()) {
-                b"twoCellAnchor" | b"oneCellAnchor" => {
-                    in_anchor = true;
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local_name = local(name.as_ref());
+                if matches!(
+                    local_name,
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor"
+                ) {
+                    if current.is_some() {
+                        anchor_depth = anchor_depth.saturating_add(1);
+                        add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        continue;
+                    }
+                    if out.len() >= MAX_XLSX_DRAWINGS {
+                        add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+                        break;
+                    }
+                    anchor_depth = 1;
+                    anchor_requires_from = local_name != b"absoluteAnchor";
+                    anchor_requires_to = local_name == b"twoCellAnchor";
+                    current = Some(DrawingRef {
+                        kind: DrawingRefKind::Shape,
+                        rid: None,
+                        from: (0, 0),
+                        to: None,
+                        metadata: DrawingMetadata {
+                            behavior: drawing_anchor_behavior(local_name, &e),
+                            z_order: Some(out.len().min(i32::MAX as usize) as i32),
+                            ..Default::default()
+                        },
+                    });
                     section = None;
                     field = None;
                     field_text.clear();
-                    rid = None;
-                    kind = None;
-                    from = (0, 0);
-                    to_row = None;
-                    to_col = None;
+                    from_row_seen = false;
+                    from_col_seen = false;
+                    to_row_seen = false;
+                    to_col_seen = false;
+                    from_offset = (0, 0);
+                    to_offset = (0, 0);
+                    from_row_offset_seen = false;
+                    from_col_offset_seen = false;
+                    to_row_offset_seen = false;
+                    to_col_offset_seen = false;
+                    desc_depth = 0;
+                    desc_text.clear();
+                    continue;
                 }
-                b"from" if in_anchor => section = Some(AnchorSection::From),
-                b"to" if in_anchor => section = Some(AnchorSection::To),
-                b"row" if in_anchor => {
-                    field = Some(AnchorField::Row);
-                    field_text.clear();
+                if current.is_none() || anchor_depth > 1 {
+                    continue;
                 }
-                b"col" if in_anchor => {
-                    field = Some(AnchorField::Col);
-                    field_text.clear();
-                }
-                b"blip" if in_anchor && rid.is_none() => {
-                    rid = attr(&e, b"embed");
-                    kind = Some(DrawingRefKind::Image);
-                }
-                b"chart" if in_anchor && rid.is_none() => {
-                    rid = attr(&e, b"id");
-                    kind = Some(DrawingRefKind::Chart);
-                }
-                _ => {}
-            },
-            Ok(Event::Empty(e)) if in_anchor && rid.is_none() => match local(e.name().as_ref()) {
-                b"blip" => {
-                    rid = attr(&e, b"embed");
-                    kind = Some(DrawingRefKind::Image);
-                }
-                b"chart" => {
-                    rid = attr(&e, b"id");
-                    kind = Some(DrawingRefKind::Chart);
-                }
-                _ => {}
-            },
-            Ok(Event::Text(t)) if in_anchor && field.is_some() => {
-                field_text.push_str(&text_of(&t));
-            }
-            Ok(Event::GeneralRef(reference)) if in_anchor && field.is_some() => {
-                append_general_ref(&mut field_text, &reference);
-            }
-            Ok(Event::CData(t)) if in_anchor && field.is_some() => {
-                field_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
-            }
-            Ok(Event::End(e)) => match local(e.name().as_ref()) {
-                b"row" | b"col" => {
-                    if let (Some(section), Some(field), Ok(n)) =
-                        (section, field, field_text.trim().parse::<u32>())
-                    {
-                        match (section, field) {
-                            (AnchorSection::From, AnchorField::Row) => from.0 = n.min(XLSX_MAX_ROW),
-                            (AnchorSection::From, AnchorField::Col) => {
-                                from.1 = (n.min(u32::from(XLSX_MAX_COL))) as u16;
-                            }
-                            (AnchorSection::To, AnchorField::Row) => {
-                                to_row = Some(n.min(XLSX_MAX_ROW))
-                            }
-                            (AnchorSection::To, AnchorField::Col) => {
-                                to_col = Some((n.min(u32::from(XLSX_MAX_COL))) as u16);
-                            }
+                match local_name {
+                    b"from" => section = Some(AnchorSection::From),
+                    b"to" => section = Some(AnchorSection::To),
+                    b"row" => {
+                        field = Some(AnchorField::Row);
+                        field_text.clear();
+                    }
+                    b"col" => {
+                        field = Some(AnchorField::Col);
+                        field_text.clear();
+                    }
+                    b"rowOff" => {
+                        field = Some(AnchorField::RowOffset);
+                        field_text.clear();
+                    }
+                    b"colOff" => {
+                        field = Some(AnchorField::ColOffset);
+                        field_text.clear();
+                    }
+                    b"pic" => current.as_mut().expect("drawing").kind = DrawingRefKind::Image,
+                    b"blip" => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.kind == DrawingRefKind::Image && item.rid.is_none() {
+                            item.rid = bounded_drawing_attr(&e, b"embed", losses);
                         }
                     }
-                    field_text.clear();
-                    field = None;
-                }
-                b"from" | b"to" => section = None,
-                b"twoCellAnchor" | b"oneCellAnchor" if in_anchor => {
-                    if let (Some(rid), Some(kind)) = (rid.take(), kind) {
-                        out.push(DrawingRef {
-                            kind,
-                            rid,
-                            from,
-                            to: to_row.zip(to_col),
-                        });
+                    b"chart" => {
+                        let item = current.as_mut().expect("drawing");
+                        item.kind = DrawingRefKind::Chart;
+                        if item.rid.is_none() {
+                            item.rid = bounded_drawing_attr(&e, b"id", losses);
+                        }
                     }
-                    in_anchor = false;
+                    b"cNvPr" => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.metadata.name.is_none() {
+                            item.metadata.name = bounded_drawing_attr(&e, b"name", losses);
+                        }
+                        if item.metadata.alt_text.is_none() {
+                            item.metadata.alt_text = bounded_drawing_attr(&e, b"descr", losses)
+                                .or_else(|| bounded_drawing_attr(&e, b"title", losses));
+                        }
+                    }
+                    b"xfrm" => {
+                        current.as_mut().expect("drawing").metadata.rotation_mdeg =
+                            attr(&e, b"rot")
+                                .and_then(|value| value.parse::<i32>().ok())
+                                .map(|value| value / 60);
+                    }
+                    b"ext"
+                        if !anchor_requires_to
+                            || current.as_ref().is_some_and(|item| {
+                                item.metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+                            }) =>
+                    {
+                        let width = attr(&e, b"cx").and_then(|value| value.parse::<u64>().ok());
+                        let height = attr(&e, b"cy").and_then(|value| value.parse::<u64>().ok());
+                        let item = current.as_mut().expect("drawing");
+                        if item.metadata.absolute_size_emu.is_none() {
+                            item.metadata.absolute_size_emu = width.zip(height);
+                        }
+                        if width.is_some() ^ height.is_some() {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                    }
+                    b"pos" => {
+                        let x = attr(&e, b"x").and_then(|value| value.parse::<i64>().ok());
+                        let y = attr(&e, b"y").and_then(|value| value.parse::<i64>().ok());
+                        current.as_mut().expect("drawing").metadata.from_offset_emu = x.zip(y);
+                        if x.is_some() ^ y.is_some() {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                    }
+                    b"srcRect" => {
+                        current.as_mut().expect("drawing").metadata.crop = Some(drawing_crop(&e));
+                    }
+                    b"desc" => {
+                        desc_depth = 1;
+                        desc_text.clear();
+                    }
+                    _ if desc_depth > 0 => desc_depth += 1,
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) if current.is_some() && anchor_depth == 1 => {
+                match local(e.name().as_ref()) {
+                    b"pic" => current.as_mut().expect("drawing").kind = DrawingRefKind::Image,
+                    b"blip" => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.kind == DrawingRefKind::Image && item.rid.is_none() {
+                            item.rid = bounded_drawing_attr(&e, b"embed", losses);
+                        }
+                    }
+                    b"chart" => {
+                        let item = current.as_mut().expect("drawing");
+                        item.kind = DrawingRefKind::Chart;
+                        if item.rid.is_none() {
+                            item.rid = bounded_drawing_attr(&e, b"id", losses);
+                        }
+                    }
+                    b"cNvPr" => {
+                        let item = current.as_mut().expect("drawing");
+                        if item.metadata.name.is_none() {
+                            item.metadata.name = bounded_drawing_attr(&e, b"name", losses);
+                        }
+                        if item.metadata.alt_text.is_none() {
+                            item.metadata.alt_text = bounded_drawing_attr(&e, b"descr", losses)
+                                .or_else(|| bounded_drawing_attr(&e, b"title", losses));
+                        }
+                    }
+                    b"xfrm" => {
+                        current.as_mut().expect("drawing").metadata.rotation_mdeg =
+                            attr(&e, b"rot")
+                                .and_then(|value| value.parse::<i32>().ok())
+                                .map(|value| value / 60);
+                    }
+                    b"ext"
+                        if !anchor_requires_to
+                            || current.as_ref().is_some_and(|item| {
+                                item.metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+                            }) =>
+                    {
+                        let width = attr(&e, b"cx").and_then(|value| value.parse::<u64>().ok());
+                        let height = attr(&e, b"cy").and_then(|value| value.parse::<u64>().ok());
+                        let item = current.as_mut().expect("drawing");
+                        if item.metadata.absolute_size_emu.is_none() {
+                            item.metadata.absolute_size_emu = width.zip(height);
+                        }
+                        if width.is_some() ^ height.is_some() {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                    }
+                    b"pos" => {
+                        let x = attr(&e, b"x").and_then(|value| value.parse::<i64>().ok());
+                        let y = attr(&e, b"y").and_then(|value| value.parse::<i64>().ok());
+                        current.as_mut().expect("drawing").metadata.from_offset_emu = x.zip(y);
+                        if x.is_some() ^ y.is_some() {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                    }
+                    b"srcRect" => {
+                        current.as_mut().expect("drawing").metadata.crop = Some(drawing_crop(&e));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) if field.is_some() => {
+                field_text.push_str(&text_of(&t));
+                if truncate_drawing_text(&mut field_text, MAX_XLSX_DRAWING_NUMBER_TEXT) {
+                    add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
+            Ok(Event::Text(t)) if desc_depth > 0 => {
+                desc_text.push_str(&text_of(&t));
+                if truncate_drawing_text(&mut desc_text, MAX_XLSX_DRAWING_TEXT) {
+                    add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) if field.is_some() => {
+                append_bounded_drawing_ref(
+                    &mut field_text,
+                    &reference,
+                    MAX_XLSX_DRAWING_NUMBER_TEXT,
+                    losses,
+                );
+            }
+            Ok(Event::GeneralRef(reference)) if desc_depth > 0 => {
+                append_bounded_drawing_ref(
+                    &mut desc_text,
+                    &reference,
+                    MAX_XLSX_DRAWING_TEXT,
+                    losses,
+                );
+            }
+            Ok(Event::CData(t)) if field.is_some() => {
+                field_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                if truncate_drawing_text(&mut field_text, MAX_XLSX_DRAWING_NUMBER_TEXT) {
+                    add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
+            Ok(Event::CData(t)) if desc_depth > 0 => {
+                desc_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                if truncate_drawing_text(&mut desc_text, MAX_XLSX_DRAWING_TEXT) {
+                    add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local_name = local(name.as_ref());
+                if matches!(
+                    local_name,
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor"
+                ) && current.is_some()
+                {
+                    if anchor_depth > 1 {
+                        anchor_depth -= 1;
+                        continue;
+                    }
+                    if let Some(mut item) = current.take() {
+                        if from_row_offset_seen || from_col_offset_seen {
+                            item.metadata.from_offset_emu = Some(from_offset);
+                            if from_row_offset_seen ^ from_col_offset_seen {
+                                add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                            }
+                        }
+                        if to_row_offset_seen || to_col_offset_seen {
+                            item.metadata.to_offset_emu = Some(to_offset);
+                            if to_row_offset_seen ^ to_col_offset_seen {
+                                add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                            }
+                        }
+                        if anchor_requires_from && !(from_row_seen && from_col_seen) {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                        if anchor_requires_to && !(to_row_seen && to_col_seen) {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                        if from_row_seen && from_col_seen {
+                            item.metadata.from_cell = Some(item.from);
+                        }
+                        if to_row_seen && to_col_seen {
+                            item.metadata.to_cell = item.to;
+                        }
+                        out.push(item);
+                    }
+                    anchor_depth = 0;
                     section = None;
                     field = None;
-                    field_text.clear();
+                    desc_depth = 0;
+                    continue;
                 }
-                _ => {}
-            },
-            Ok(Event::Eof) | Err(_) => break,
+                if current.is_none() || anchor_depth > 1 {
+                    continue;
+                }
+                match local_name {
+                    b"row" | b"col" | b"rowOff" | b"colOff" => {
+                        if let (Some(section), Some(field), Ok(value)) =
+                            (section, field, field_text.trim().parse::<i64>())
+                        {
+                            let item = current.as_mut().expect("drawing");
+                            match (section, field) {
+                                (AnchorSection::From, AnchorField::Row) => {
+                                    item.from.0 = value.clamp(0, XLSX_MAX_ROW) as u32;
+                                    from_row_seen = true;
+                                }
+                                (AnchorSection::From, AnchorField::Col) => {
+                                    item.from.1 = value.clamp(0, XLSX_MAX_COL) as u16;
+                                    from_col_seen = true;
+                                }
+                                (AnchorSection::To, AnchorField::Row) => {
+                                    item.to.get_or_insert((0, 0)).0 =
+                                        value.clamp(0, XLSX_MAX_ROW) as u32;
+                                    to_row_seen = true;
+                                }
+                                (AnchorSection::To, AnchorField::Col) => {
+                                    item.to.get_or_insert((0, 0)).1 =
+                                        value.clamp(0, XLSX_MAX_COL) as u16;
+                                    to_col_seen = true;
+                                }
+                                (AnchorSection::From, AnchorField::RowOffset) => {
+                                    from_offset.1 = value;
+                                    from_row_offset_seen = true;
+                                }
+                                (AnchorSection::From, AnchorField::ColOffset) => {
+                                    from_offset.0 = value;
+                                    from_col_offset_seen = true;
+                                }
+                                (AnchorSection::To, AnchorField::RowOffset) => {
+                                    to_offset.1 = value;
+                                    to_row_offset_seen = true;
+                                }
+                                (AnchorSection::To, AnchorField::ColOffset) => {
+                                    to_offset.0 = value;
+                                    to_col_offset_seen = true;
+                                }
+                            }
+                        } else if field.is_some() {
+                            add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        }
+                        field = None;
+                        field_text.clear();
+                    }
+                    b"from" | b"to" => section = None,
+                    b"desc" if desc_depth > 0 => {
+                        if current
+                            .as_ref()
+                            .expect("drawing")
+                            .metadata
+                            .alt_text
+                            .is_none()
+                            && !desc_text.trim().is_empty()
+                        {
+                            current.as_mut().expect("drawing").metadata.alt_text =
+                                Some(desc_text.trim().to_string());
+                        }
+                        desc_depth = 0;
+                    }
+                    _ if desc_depth > 0 => desc_depth -= 1,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => {
+                if current.is_some() {
+                    add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                }
+                break;
+            }
+            Err(_) => {
+                add_drawing_loss(losses, StyleLossKind::DrawingMetadataPartial, 1);
+                break;
+            }
             _ => {}
         }
     }
     out
+}
+
+#[cfg(test)]
+fn parse_drawing_refs(xml: &str) -> Vec<DrawingRef> {
+    parse_drawing_refs_bounded(xml, &mut Vec::new())
 }
 
 fn image_format(path: &str) -> Option<ImageFmt> {
@@ -1752,76 +3044,186 @@ fn image_format(path: &str) -> Option<ImageFmt> {
     }
 }
 
-fn read_drawing_images(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
-    sheet_path: &str,
-    sheet_rels_xml: Option<&str>,
-) -> Vec<Image> {
-    let Some(drawing_target) = sheet_rels_xml.and_then(drawing_target) else {
-        return Vec::new();
-    };
-    let drawing_path = normalize_part_target(sheet_path, &drawing_target);
-    let Some(drawing_xml) = part(zip, &drawing_path) else {
-        return Vec::new();
-    };
-    let refs = parse_drawing_refs(&drawing_xml);
-    if refs.is_empty() {
-        return Vec::new();
-    }
-    let drawing_rels = part(zip, &sheet_rels_path(&drawing_path))
-        .map(|s| parse_rels(&s))
-        .unwrap_or_default();
-
-    refs.into_iter()
-        .filter(|item| item.kind == DrawingRefKind::Image)
-        .filter_map(|img| {
-            let target = drawing_rels.get(&img.rid)?;
-            let media_path = normalize_part_target(&drawing_path, target);
-            let format = image_format(&media_path)?;
-            let data = part_bytes(zip, &media_path)?;
-            Some(Image {
-                data,
-                format,
-                from: img.from,
-                to: img.to,
-            })
-        })
-        .collect()
+enum DrawingPartRead {
+    Missing,
+    LimitExceeded,
+    Data(Vec<u8>),
 }
 
-fn read_drawing_charts(
+fn drawing_part_bytes(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    path: &str,
+    max: u64,
+) -> DrawingPartRead {
+    let Some(index) = part_index(zip, path) else {
+        return DrawingPartRead::Missing;
+    };
+    let Ok(file) = zip.by_index(index) else {
+        return DrawingPartRead::Missing;
+    };
+    if file.size() > max {
+        return DrawingPartRead::LimitExceeded;
+    }
+    let mut data = Vec::new();
+    if file
+        .take(max.saturating_add(1))
+        .read_to_end(&mut data)
+        .is_err()
+    {
+        return DrawingPartRead::Missing;
+    }
+    if data.len() as u64 > max {
+        DrawingPartRead::LimitExceeded
+    } else {
+        DrawingPartRead::Data(data)
+    }
+}
+
+fn retain_unrepresented_drawing(mut sidecar: DrawingMetadata, metadata: &mut Vec<DrawingMetadata>) {
+    sidecar.kind = DrawingObjectKind::Shape;
+    sidecar.object_index = 0;
+    metadata.push(sidecar);
+}
+
+type DrawingReadResult = (Vec<Image>, Vec<Chart>, Vec<DrawingMetadata>, Vec<StyleLoss>);
+
+fn read_sheet_drawings(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     sheet_path: &str,
     sheet_rels_xml: Option<&str>,
-) -> Vec<Chart> {
+    theme: &ThemeColors,
+) -> DrawingReadResult {
+    const MAX_IMAGE_PART: u64 = 64 << 20;
+    const MAX_IMAGE_TOTAL: usize = 256 << 20;
     let Some(drawing_target) = sheet_rels_xml.and_then(drawing_target) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     };
     let drawing_path = normalize_part_target(sheet_path, &drawing_target);
     let Some(drawing_xml) = part(zip, &drawing_path) else {
-        return Vec::new();
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![StyleLoss {
+                kind: StyleLossKind::DrawingMetadataPartial,
+                occurrences: 1,
+            }],
+        );
     };
-    let refs = parse_drawing_refs(&drawing_xml);
-    if refs.is_empty() {
-        return Vec::new();
-    }
+    let mut losses = Vec::new();
+    let refs = parse_drawing_refs_bounded(&drawing_xml, &mut losses);
     let drawing_rels = part(zip, &sheet_rels_path(&drawing_path))
         .map(|s| parse_rels(&s))
         .unwrap_or_default();
+    let mut images = Vec::new();
+    let mut charts = Vec::new();
+    let mut metadata = Vec::new();
+    let mut image_bytes = 0usize;
+    let mut chart_cache_points_remaining = MAX_XLSX_CHART_CACHE_POINTS_PER_SHEET;
+    let mut chart_series_remaining = MAX_XLSX_CHART_SERIES_PER_SHEET;
 
-    refs.into_iter()
-        .filter(|item| item.kind == DrawingRefKind::Chart)
-        .filter_map(|chart_ref| {
-            let target = drawing_rels.get(&chart_ref.rid)?;
-            let chart_path = normalize_part_target(&drawing_path, target);
-            let chart_xml = part(zip, &chart_path)?;
-            parse_chart(
-                &chart_xml,
-                chart_ref.from,
-                chart_ref.to.unwrap_or(chart_ref.from),
-            )
-        })
-        .collect()
+    for drawing in refs {
+        match drawing.kind {
+            DrawingRefKind::Image => {
+                let Some(target) = drawing.rid.as_ref().and_then(|rid| drawing_rels.get(rid))
+                else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let media_path = normalize_part_target(&drawing_path, target);
+                let Some(format) = image_format(&media_path) else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                let data = match drawing_part_bytes(zip, &media_path, MAX_IMAGE_PART) {
+                    DrawingPartRead::Data(data) => data,
+                    DrawingPartRead::Missing => {
+                        retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                        add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        continue;
+                    }
+                    DrawingPartRead::LimitExceeded => {
+                        retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                        add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                        continue;
+                    }
+                };
+                if image_bytes.saturating_add(data.len()) > MAX_IMAGE_TOTAL {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                image_bytes += data.len();
+                let index = images.len();
+                images.push(Image {
+                    data,
+                    format,
+                    from: drawing.from,
+                    to: drawing.to,
+                });
+                let mut sidecar = drawing.metadata;
+                sidecar.kind = DrawingObjectKind::Image;
+                sidecar.object_index = index;
+                metadata.push(sidecar);
+            }
+            DrawingRefKind::Chart => {
+                let Some(target) = drawing.rid.as_ref().and_then(|rid| drawing_rels.get(rid))
+                else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let chart_path = normalize_part_target(&drawing_path, target);
+                let Some(chart_xml) = part(zip, &chart_path) else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let Some(parsed) = parse_chart_with_theme(
+                    &chart_xml,
+                    drawing.from,
+                    drawing.to.unwrap_or(drawing.from),
+                    &mut chart_cache_points_remaining,
+                    &mut chart_series_remaining,
+                    theme,
+                ) else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                let has_unsupported_chart_content = !parsed.unsupported_reasons.is_empty()
+                    || parsed
+                        .series_styles
+                        .iter()
+                        .any(|style| !style.losses.is_empty());
+                let index = charts.len();
+                charts.push(parsed.chart);
+                let mut sidecar = drawing.metadata;
+                sidecar.kind = DrawingObjectKind::Chart;
+                sidecar.object_index = index;
+                sidecar.chart_palette = theme.chart_palette();
+                sidecar.chart_series_caches = parsed.series_caches;
+                sidecar.chart_series_styles = parsed.series_styles;
+                sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
+                sidecar.chart_bar_direction = parsed.bar_direction;
+                metadata.push(sidecar);
+                if parsed.limit_exceeded {
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                }
+                if has_unsupported_chart_content {
+                    add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                }
+            }
+            DrawingRefKind::Shape => {
+                retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+            }
+        }
+    }
+
+    (images, charts, metadata, losses)
 }
 
 #[derive(Default)]
@@ -1830,6 +3232,21 @@ struct ParsedChartSeries {
     categories: Option<String>,
     values: Option<String>,
     bubble_sizes: Option<String>,
+    cache: ChartSeriesCache,
+    style: ChartSeriesStyle,
+}
+
+const MAX_XLSX_CHART_SERIES_PER_SHEET: usize = 4_096;
+const MAX_XLSX_CHART_CACHE_POINTS_PER_SHEET: usize = 1_000_000;
+const MAX_XLSX_CHART_CACHE_VALUE_BYTES: usize = 4_096;
+
+pub(crate) struct ParsedChart {
+    pub(crate) chart: Chart,
+    pub(crate) series_caches: Vec<ChartSeriesCache>,
+    pub(crate) series_styles: Vec<ChartSeriesStyle>,
+    pub(crate) limit_exceeded: bool,
+    pub(crate) unsupported_reasons: Vec<ChartUnsupportedReason>,
+    pub(crate) bar_direction: ChartBarDirection,
 }
 
 #[derive(Clone, Copy)]
@@ -1853,15 +3270,28 @@ enum ChartTitleTarget {
     YAxis,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_chart_text(
     current_series: &mut Option<ParsedChartSeries>,
     capture_series_field: Option<ChartSeriesField>,
+    capture_cache_value: bool,
+    cache_value: &mut String,
     title_target: Option<ChartTitleTarget>,
     in_title_text: bool,
     title_text: &mut String,
     text: &str,
+    limit_exceeded: &mut bool,
+    cache_value_valid: &mut bool,
 ) {
-    if let Some(field) = capture_series_field {
+    if capture_cache_value {
+        let remaining = MAX_XLSX_CHART_CACHE_VALUE_BYTES.saturating_sub(cache_value.len());
+        if text.len() <= remaining {
+            cache_value.push_str(text);
+        } else {
+            *limit_exceeded = true;
+            *cache_value_valid = false;
+        }
+    } else if let Some(field) = capture_series_field {
         if let Some(series) = current_series.as_mut() {
             let slot = match field {
                 ChartSeriesField::Name => &mut series.name,
@@ -1876,7 +3306,164 @@ fn append_chart_text(
     }
 }
 
-fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
+fn chart_cache_points_mut(
+    cache: &mut ChartSeriesCache,
+    field: ChartSeriesField,
+) -> &mut Vec<ChartCachedPoint> {
+    match field {
+        ChartSeriesField::Name => &mut cache.name,
+        ChartSeriesField::Categories => &mut cache.categories,
+        ChartSeriesField::Values => &mut cache.values,
+        ChartSeriesField::BubbleSizes => &mut cache.bubble_sizes,
+    }
+}
+
+fn chart_kind_element(name: &[u8]) -> Option<ChartKind> {
+    match name {
+        b"barChart" => Some(ChartKind::Bar),
+        b"lineChart" => Some(ChartKind::Line),
+        b"pieChart" => Some(ChartKind::Pie),
+        b"scatterChart" => Some(ChartKind::Scatter),
+        b"areaChart" => Some(ChartKind::Area),
+        b"doughnutChart" => Some(ChartKind::Doughnut),
+        b"radarChart" => Some(ChartKind::Radar),
+        b"bubbleChart" => Some(ChartKind::Bubble),
+        _ => None,
+    }
+}
+
+fn chart_3d_kind_element(name: &[u8]) -> Option<ChartKind> {
+    match name {
+        b"bar3DChart" => Some(ChartKind::Bar),
+        b"line3DChart" => Some(ChartKind::Line),
+        b"pie3DChart" => Some(ChartKind::Pie),
+        b"area3DChart" => Some(ChartKind::Area),
+        _ => None,
+    }
+}
+
+fn add_chart_unsupported(
+    reasons: &mut Vec<ChartUnsupportedReason>,
+    reason: ChartUnsupportedReason,
+) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+fn add_chart_series_style_loss(style: &mut ChartSeriesStyle, loss: ChartSeriesStyleLossKind) {
+    if !style.losses.contains(&loss) {
+        style.losses.push(loss);
+    }
+}
+
+fn retain_chart_marker_symbol(style: &mut ChartSeriesStyle, value: Option<&str>) {
+    style.marker = match value {
+        Some("none") => ChartMarkerSymbol::None,
+        Some("circle") => ChartMarkerSymbol::Circle,
+        Some("square") => ChartMarkerSymbol::Square,
+        Some("diamond") => ChartMarkerSymbol::Diamond,
+        Some("triangle") => ChartMarkerSymbol::Triangle,
+        Some("auto") | None => ChartMarkerSymbol::Automatic,
+        Some(_) => {
+            add_chart_series_style_loss(style, ChartSeriesStyleLossKind::UnsupportedMarkerSymbol);
+            ChartMarkerSymbol::Automatic
+        }
+    };
+}
+
+fn retain_chart_marker_size(style: &mut ChartSeriesStyle, value: Option<&str>) {
+    match value.and_then(|value| value.parse::<u8>().ok()) {
+        Some(size @ 2..=72) => style.marker_size = Some(size),
+        _ => add_chart_series_style_loss(style, ChartSeriesStyleLossKind::InvalidMarkerSize),
+    }
+}
+
+fn chart_series_line_color(
+    element: &[u8],
+    value: Option<&str>,
+    theme: &ThemeColors,
+) -> Option<Color> {
+    match element {
+        b"srgbClr" => value.and_then(parse_color),
+        b"sysClr" => value.and_then(parse_color),
+        element => {
+            let name = if element == b"schemeClr" {
+                value?.as_bytes()
+            } else {
+                element
+            };
+            theme_color_slot(name)
+                .and_then(|slot| theme.color(slot, None))
+                .or_else(|| {
+                    let index = match name {
+                        b"accent1" => 0,
+                        b"accent2" => 1,
+                        b"accent3" => 2,
+                        b"accent4" => 3,
+                        b"accent5" => 4,
+                        b"accent6" => 5,
+                        _ => return None,
+                    };
+                    theme.chart_palette().get(index).copied()
+                })
+        }
+    }
+}
+
+fn observe_chart_kind(
+    kind: &mut Option<ChartKind>,
+    next: ChartKind,
+    reasons: &mut Vec<ChartUnsupportedReason>,
+) {
+    match *kind {
+        Some(previous) if previous != next => {
+            add_chart_unsupported(reasons, ChartUnsupportedReason::Combo);
+        }
+        None => *kind = Some(next),
+        _ => {}
+    }
+}
+
+fn is_external_chart_reference(reference: &str) -> bool {
+    let Some(open) = reference.find('[') else {
+        return false;
+    };
+    let Some(close) = reference[open + 1..]
+        .find(']')
+        .map(|index| index + open + 1)
+    else {
+        return false;
+    };
+    reference[close + 1..].contains('!')
+}
+
+#[cfg(any(test, feature = "xlsb"))]
+pub(crate) fn parse_chart(
+    xml: &str,
+    from: (u32, u16),
+    to: (u32, u16),
+    chart_cache_points_remaining: &mut usize,
+    chart_series_remaining: &mut usize,
+) -> Option<ParsedChart> {
+    parse_chart_with_theme(
+        xml,
+        from,
+        to,
+        chart_cache_points_remaining,
+        chart_series_remaining,
+        &ThemeColors::default(),
+    )
+}
+
+fn parse_chart_with_theme(
+    xml: &str,
+    from: (u32, u16),
+    to: (u32, u16),
+    chart_cache_points_remaining: &mut usize,
+    chart_series_remaining: &mut usize,
+    theme: &ThemeColors,
+) -> Option<ParsedChart> {
     let mut r = Reader::from_str(xml);
     let mut kind: Option<ChartKind> = None;
     let mut title: Option<String> = None;
@@ -1888,24 +3475,88 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
     let mut legend = false;
     let mut data_labels = false;
     let mut series = Vec::new();
+    let mut series_caches = Vec::new();
+    let mut series_styles = Vec::new();
     let mut current_series: Option<ParsedChartSeries> = None;
     let mut series_field: Option<ChartSeriesField> = None;
     let mut capture_series_field: Option<ChartSeriesField> = None;
     let mut series_cache_depth = 0usize;
+    let mut cache_field: Option<ChartSeriesField> = None;
+    let mut cache_point_index: Option<u32> = None;
+    let mut cache_value = String::new();
+    let mut cache_value_valid = true;
+    let mut capture_cache_value = false;
+    let mut limit_exceeded = false;
+    let mut unsupported_reasons = Vec::new();
+    let mut bar_direction = ChartBarDirection::Column;
+    let mut bar_chart_depth = 0usize;
     let mut axis_context: Option<ChartAxisContext> = None;
     let mut val_axis_count = 0usize;
+    let mut marker_depth = 0usize;
+    let mut data_point_depth = 0usize;
+    let mut trendline_depth = 0usize;
+    let mut error_bars_depth = 0usize;
+    let mut series_shape_depth = 0usize;
+    let mut series_line_depth = 0usize;
+    let mut series_line_solid_fill_depth = 0usize;
 
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
-                b"barChart" => kind = Some(ChartKind::Bar),
-                b"lineChart" => kind = Some(ChartKind::Line),
-                b"pieChart" => kind = Some(ChartKind::Pie),
-                b"scatterChart" => kind = Some(ChartKind::Scatter),
-                b"areaChart" => kind = Some(ChartKind::Area),
-                b"doughnutChart" => kind = Some(ChartKind::Doughnut),
-                b"radarChart" => kind = Some(ChartKind::Radar),
-                b"bubbleChart" => kind = Some(ChartKind::Bubble),
+                name if chart_kind_element(name).is_some() => {
+                    let observed = chart_kind_element(name).expect("guarded chart kind");
+                    observe_chart_kind(&mut kind, observed, &mut unsupported_reasons);
+                    if observed == ChartKind::Bar {
+                        bar_chart_depth = bar_chart_depth.saturating_add(1);
+                    }
+                }
+                name if chart_3d_kind_element(name).is_some() => {
+                    observe_chart_kind(
+                        &mut kind,
+                        chart_3d_kind_element(name).expect("guarded 3-D chart kind"),
+                        &mut unsupported_reasons,
+                    );
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::ThreeDimensional,
+                    );
+                }
+                b"stockChart" | b"surfaceChart" | b"surface3DChart" | b"ofPieChart" => {
+                    let fallback = match local(e.name().as_ref()) {
+                        b"stockChart" => ChartKind::Line,
+                        b"ofPieChart" => ChartKind::Pie,
+                        _ => ChartKind::Area,
+                    };
+                    observe_chart_kind(&mut kind, fallback, &mut unsupported_reasons);
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedKind,
+                    );
+                    if local(e.name().as_ref()) == b"surface3DChart" {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::ThreeDimensional,
+                        );
+                    }
+                }
+                b"view3D" | b"bubble3D" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::ThreeDimensional,
+                ),
+                b"pivotSource" => {
+                    add_chart_unsupported(&mut unsupported_reasons, ChartUnsupportedReason::Pivot)
+                }
+                b"externalData" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::ExternalData,
+                ),
+                b"barDir" if bar_chart_depth > 0 => {
+                    bar_direction = if attr(&e, b"val").as_deref() == Some("bar") {
+                        ChartBarDirection::Horizontal
+                    } else {
+                        ChartBarDirection::Column
+                    };
+                }
                 b"catAx" | b"dateAx" => axis_context = Some(ChartAxisContext::Category),
                 b"valAx" => {
                     val_axis_count += 1;
@@ -1940,6 +3591,107 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                     series_field = None;
                     capture_series_field = None;
                     series_cache_depth = 0;
+                    marker_depth = 0;
+                    data_point_depth = 0;
+                    trendline_depth = 0;
+                    error_bars_depth = 0;
+                    series_shape_depth = 0;
+                    series_line_depth = 0;
+                    series_line_solid_fill_depth = 0;
+                }
+                b"marker" if current_series.is_some() => marker_depth = 1,
+                b"dPt" if current_series.is_some() => data_point_depth = 1,
+                b"trendline" if current_series.is_some() => trendline_depth = 1,
+                b"errBars" if current_series.is_some() => error_bars_depth = 1,
+                b"spPr"
+                    if current_series.is_some()
+                        && marker_depth == 0
+                        && data_point_depth == 0
+                        && trendline_depth == 0
+                        && error_bars_depth == 0
+                        && series_shape_depth == 0 =>
+                {
+                    series_shape_depth = 1;
+                }
+                b"ln" if series_shape_depth > 0 => series_line_depth = 1,
+                b"solidFill" if series_line_depth > 0 => {
+                    series_line_solid_fill_depth = 1;
+                    if let Some(series) = current_series.as_mut() {
+                        series.style.line_visible = true;
+                    }
+                }
+                b"noFill" if series_line_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        series.style.line_visible = false;
+                        series.style.line_color = None;
+                    }
+                }
+                b"srgbClr" | b"schemeClr" if series_line_solid_fill_depth > 0 => {
+                    let qualified_name = e.name();
+                    let name = local(qualified_name.as_ref());
+                    if let Some(series) = current_series.as_mut() {
+                        let value = attr(&e, b"val");
+                        if let Some(color) = chart_series_line_color(name, value.as_deref(), theme)
+                        {
+                            series.style.line_color = Some(color);
+                        } else {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"sysClr" if series_line_solid_fill_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        let value = attr(&e, b"lastClr");
+                        if let Some(color) =
+                            chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                        {
+                            series.style.line_color = Some(color);
+                        } else {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"gradFill" | b"pattFill" | b"blipFill" if series_line_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"prstDash" if series_line_depth > 0 => {
+                    if attr(&e, b"val").as_deref() != Some("solid") {
+                        if let Some(series) = current_series.as_mut() {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"tint" | b"shade" | b"lumMod" | b"lumOff" if series_line_solid_fill_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"symbol" if marker_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_marker_symbol(&mut series.style, attr(&e, b"val").as_deref());
+                    }
+                }
+                b"size" if marker_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_marker_size(&mut series.style, attr(&e, b"val").as_deref());
+                    }
                 }
                 b"tx" if current_series.is_some() => series_field = Some(ChartSeriesField::Name),
                 b"cat" | b"xVal" if current_series.is_some() => {
@@ -1951,11 +3703,34 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                 b"bubbleSize" if current_series.is_some() => {
                     series_field = Some(ChartSeriesField::BubbleSizes);
                 }
-                b"strCache" | b"numCache" | b"multiLvlStrCache" if current_series.is_some() => {
+                b"strCache" | b"numCache" | b"strLit" | b"numLit" if current_series.is_some() => {
+                    if series_cache_depth == 0 {
+                        cache_field = series_field;
+                    }
                     series_cache_depth += 1;
+                }
+                b"multiLvlStrCache" if current_series.is_some() => {
+                    // Multi-level categories cannot be represented faithfully by
+                    // the flat public Series API. Keep the A1 reference and
+                    // deliberately leave this cache unusable.
+                    if series_cache_depth == 0 {
+                        cache_field = None;
+                    }
+                    series_cache_depth += 1;
+                }
+                b"pt" if current_series.is_some() && series_cache_depth > 0 => {
+                    cache_point_index = attr(&e, b"idx").and_then(|value| value.parse().ok());
+                    cache_value.clear();
+                    cache_value_valid = true;
                 }
                 b"f" if current_series.is_some() => {
                     capture_series_field = series_field;
+                }
+                b"v" if current_series.is_some()
+                    && series_cache_depth > 0
+                    && cache_point_index.is_some() =>
+                {
+                    capture_cache_value = true;
                 }
                 b"v" if current_series.is_some() && series_cache_depth == 0 => {
                     capture_series_field = series_field;
@@ -1964,26 +3739,149 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                 _ => {}
             },
             Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
-                b"barChart" => kind = Some(ChartKind::Bar),
-                b"lineChart" => kind = Some(ChartKind::Line),
-                b"pieChart" => kind = Some(ChartKind::Pie),
-                b"scatterChart" => kind = Some(ChartKind::Scatter),
-                b"areaChart" => kind = Some(ChartKind::Area),
-                b"doughnutChart" => kind = Some(ChartKind::Doughnut),
-                b"radarChart" => kind = Some(ChartKind::Radar),
-                b"bubbleChart" => kind = Some(ChartKind::Bubble),
+                name if chart_kind_element(name).is_some() => observe_chart_kind(
+                    &mut kind,
+                    chart_kind_element(name).expect("guarded chart kind"),
+                    &mut unsupported_reasons,
+                ),
+                name if chart_3d_kind_element(name).is_some() => {
+                    observe_chart_kind(
+                        &mut kind,
+                        chart_3d_kind_element(name).expect("guarded 3-D chart kind"),
+                        &mut unsupported_reasons,
+                    );
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::ThreeDimensional,
+                    );
+                }
+                b"stockChart" | b"surfaceChart" | b"surface3DChart" | b"ofPieChart" => {
+                    let qualified_name = e.name();
+                    let name = local(qualified_name.as_ref());
+                    let fallback = match name {
+                        b"stockChart" => ChartKind::Line,
+                        b"ofPieChart" => ChartKind::Pie,
+                        _ => ChartKind::Area,
+                    };
+                    observe_chart_kind(&mut kind, fallback, &mut unsupported_reasons);
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedKind,
+                    );
+                    if name == b"surface3DChart" {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::ThreeDimensional,
+                        );
+                    }
+                }
+                b"view3D" | b"bubble3D" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::ThreeDimensional,
+                ),
+                b"pivotSource" => {
+                    add_chart_unsupported(&mut unsupported_reasons, ChartUnsupportedReason::Pivot)
+                }
+                b"externalData" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::ExternalData,
+                ),
+                b"barDir" if bar_chart_depth > 0 => {
+                    bar_direction = if attr(&e, b"val").as_deref() == Some("bar") {
+                        ChartBarDirection::Horizontal
+                    } else {
+                        ChartBarDirection::Column
+                    };
+                }
                 b"legend" => legend = true,
                 b"dLbls" => data_labels = true,
+                b"symbol" if marker_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_marker_symbol(&mut series.style, attr(&e, b"val").as_deref());
+                    }
+                }
+                b"size" if marker_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_marker_size(&mut series.style, attr(&e, b"val").as_deref());
+                    }
+                }
+                b"noFill" if series_line_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        series.style.line_visible = false;
+                        series.style.line_color = None;
+                    }
+                }
+                b"srgbClr" | b"schemeClr" if series_line_solid_fill_depth > 0 => {
+                    let qualified_name = e.name();
+                    let name = local(qualified_name.as_ref());
+                    if let Some(series) = current_series.as_mut() {
+                        let value = attr(&e, b"val");
+                        if let Some(color) = chart_series_line_color(name, value.as_deref(), theme)
+                        {
+                            series.style.line_color = Some(color);
+                        } else {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"sysClr" if series_line_solid_fill_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        let value = attr(&e, b"lastClr");
+                        if let Some(color) =
+                            chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                        {
+                            series.style.line_color = Some(color);
+                        } else {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"gradFill" | b"pattFill" | b"blipFill" if series_line_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"prstDash" if series_line_depth > 0 => {
+                    if attr(&e, b"val").as_deref() != Some("solid") {
+                        if let Some(series) = current_series.as_mut() {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                }
+                b"tint" | b"shade" | b"lumMod" | b"lumOff" if series_line_solid_fill_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
                 _ => {}
             },
             Ok(Event::Text(t)) => {
                 append_chart_text(
                     &mut current_series,
                     capture_series_field,
+                    capture_cache_value,
+                    &mut cache_value,
                     title_target,
                     in_title_text,
                     &mut title_text,
                     &text_of(&t),
+                    &mut limit_exceeded,
+                    &mut cache_value_valid,
                 );
             }
             Ok(Event::GeneralRef(reference)) => {
@@ -1991,10 +3889,14 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                     append_chart_text(
                         &mut current_series,
                         capture_series_field,
+                        capture_cache_value,
+                        &mut cache_value,
                         title_target,
                         in_title_text,
                         &mut title_text,
                         text,
+                        &mut limit_exceeded,
+                        &mut cache_value_valid,
                     );
                 });
             }
@@ -2003,13 +3905,37 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                 append_chart_text(
                     &mut current_series,
                     capture_series_field,
+                    capture_cache_value,
+                    &mut cache_value,
                     title_target,
                     in_title_text,
                     &mut title_text,
                     &text,
+                    &mut limit_exceeded,
+                    &mut cache_value_valid,
                 );
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
+                b"barChart" if bar_chart_depth > 0 => {
+                    bar_chart_depth -= 1;
+                }
+                b"marker" if marker_depth > 0 => marker_depth = 0,
+                b"dPt" if data_point_depth > 0 => data_point_depth = 0,
+                b"trendline" if trendline_depth > 0 => trendline_depth = 0,
+                b"errBars" if error_bars_depth > 0 => error_bars_depth = 0,
+                b"solidFill" if series_line_solid_fill_depth > 0 => {
+                    series_line_solid_fill_depth = 0;
+                }
+                b"ln" if series_line_depth > 0 => {
+                    series_line_depth = 0;
+                    series_line_solid_fill_depth = 0;
+                }
+                b"spPr" if series_shape_depth > 0 => {
+                    series_shape_depth = 0;
+                    series_line_depth = 0;
+                    series_line_solid_fill_depth = 0;
+                }
+                b"v" if capture_cache_value => capture_cache_value = false,
                 b"t" | b"v" if in_title_text => in_title_text = false,
                 b"title" if title_target.is_some() => {
                     let text = title_text.trim();
@@ -2026,8 +3952,40 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                 }
                 b"catAx" | b"dateAx" | b"valAx" => axis_context = None,
                 b"f" | b"v" if capture_series_field.is_some() => capture_series_field = None,
-                b"strCache" | b"numCache" | b"multiLvlStrCache" if series_cache_depth > 0 => {
+                b"pt" if series_cache_depth > 0 => {
+                    if cache_value_valid {
+                        if let (Some(field), Some(index), Some(parsed)) =
+                            (cache_field, cache_point_index, current_series.as_mut())
+                        {
+                            if *chart_cache_points_remaining == 0 {
+                                limit_exceeded = true;
+                            } else {
+                                chart_cache_points_mut(&mut parsed.cache, field).push(
+                                    ChartCachedPoint {
+                                        index,
+                                        value: std::mem::take(&mut cache_value),
+                                    },
+                                );
+                                *chart_cache_points_remaining -= 1;
+                            }
+                        }
+                    }
+                    cache_point_index = None;
+                    cache_value.clear();
+                    cache_value_valid = true;
+                    capture_cache_value = false;
+                }
+                b"strCache" | b"numCache" | b"strLit" | b"numLit" | b"multiLvlStrCache"
+                    if series_cache_depth > 0 =>
+                {
                     series_cache_depth -= 1;
+                    if series_cache_depth == 0 {
+                        cache_field = None;
+                        cache_point_index = None;
+                        cache_value.clear();
+                        cache_value_valid = true;
+                        capture_cache_value = false;
+                    }
                 }
                 b"tx" | b"cat" | b"xVal" | b"val" | b"yVal" | b"bubbleSize"
                     if current_series.is_some() =>
@@ -2036,18 +3994,52 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
                 }
                 b"ser" => {
                     if let Some(parsed) = current_series.take() {
+                        if [
+                            parsed.name.as_deref(),
+                            parsed.categories.as_deref(),
+                            parsed.values.as_deref(),
+                            parsed.bubble_sizes.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(is_external_chart_reference)
+                        {
+                            add_chart_unsupported(
+                                &mut unsupported_reasons,
+                                ChartUnsupportedReason::ExternalData,
+                            );
+                        }
                         if let Some(values) = parsed.values {
-                            series.push(Series {
-                                name: parsed.name,
-                                categories: parsed.categories,
-                                values,
-                                bubble_sizes: parsed.bubble_sizes,
-                            });
+                            if *chart_series_remaining > 0 {
+                                series.push(Series {
+                                    name: parsed.name,
+                                    categories: parsed.categories,
+                                    values,
+                                    bubble_sizes: parsed.bubble_sizes,
+                                });
+                                series_caches.push(parsed.cache);
+                                series_styles.push(parsed.style);
+                                *chart_series_remaining -= 1;
+                            } else {
+                                limit_exceeded = true;
+                            }
                         }
                     }
                     series_field = None;
                     capture_series_field = None;
                     series_cache_depth = 0;
+                    cache_field = None;
+                    cache_point_index = None;
+                    cache_value.clear();
+                    cache_value_valid = true;
+                    capture_cache_value = false;
+                    marker_depth = 0;
+                    data_point_depth = 0;
+                    trendline_depth = 0;
+                    error_bars_depth = 0;
+                    series_shape_depth = 0;
+                    series_line_depth = 0;
+                    series_line_solid_fill_depth = 0;
                 }
                 _ => {}
             },
@@ -2056,20 +4048,73 @@ fn parse_chart(xml: &str, from: (u32, u16), to: (u32, u16)) -> Option<Chart> {
         }
     }
 
-    Some(Chart {
-        kind: kind?,
-        title,
-        series,
-        legend,
-        data_labels,
-        x_axis_title,
-        y_axis_title,
-        from,
-        to,
+    Some(ParsedChart {
+        chart: Chart {
+            kind: kind?,
+            title,
+            series,
+            legend,
+            data_labels,
+            x_axis_title,
+            y_axis_title,
+            from,
+            to,
+        },
+        series_caches,
+        series_styles,
+        limit_exceeded,
+        unsupported_reasons,
+        bar_direction,
     })
 }
 
-fn parse_table(xml: &str) -> Option<Table> {
+#[derive(Debug)]
+struct ParsedTable {
+    table: Table,
+    application: TableStyleApplication,
+    losses: Vec<StyleLoss>,
+}
+
+fn table_bool_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    default: bool,
+    losses: &mut Vec<StyleLoss>,
+) -> bool {
+    match attr(e, key) {
+        Some(value) => parse_bool_attr(&value).unwrap_or_else(|| {
+            add_differential_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+            default
+        }),
+        None => default,
+    }
+}
+
+fn table_single_row_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    default: bool,
+    losses: &mut Vec<StyleLoss>,
+) -> bool {
+    match attr(e, key) {
+        None => default,
+        Some(value) => match value.parse::<u32>() {
+            Ok(0) => false,
+            Ok(1) => true,
+            Ok(_) => {
+                add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                true
+            }
+            Err(_) => {
+                add_differential_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+                default
+            }
+        },
+    }
+}
+
+fn parse_table(xml: &str) -> Option<ParsedTable> {
+    const MAX_TABLE_COLUMNS: usize = 16_384;
     let mut r = Reader::from_str(xml);
     let mut range: Option<(u32, u16, u32, u16)> = None;
     // Prefer `displayName`, falling back to `name`.
@@ -2077,6 +4122,8 @@ fn parse_table(xml: &str) -> Option<Table> {
     let mut name: Option<String> = None;
     let mut style: Option<String> = None;
     let mut columns: Vec<String> = Vec::new();
+    let mut application = TableStyleApplication::default();
+    let mut losses = Vec::new();
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
@@ -2084,24 +4131,48 @@ fn parse_table(xml: &str) -> Option<Table> {
                     range = attr(&e, b"ref").as_deref().and_then(parse_range);
                     display_name = attr(&e, b"displayName");
                     name = attr(&e, b"name");
+                    application.header_row =
+                        table_single_row_attr(&e, b"headerRowCount", true, &mut losses);
+                    let totals_count =
+                        table_single_row_attr(&e, b"totalsRowCount", false, &mut losses);
+                    let totals_shown = table_bool_attr(&e, b"totalsRowShown", false, &mut losses);
+                    application.totals_row = totals_count || totals_shown;
                 }
                 b"tableColumn" => {
                     if let Some(n) = attr(&e, b"name") {
-                        columns.push(n);
+                        if columns.len() < MAX_TABLE_COLUMNS {
+                            columns.push(n);
+                        } else {
+                            add_differential_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                        }
                     }
                 }
-                b"tableStyleInfo" => style = attr(&e, b"name"),
+                b"tableStyleInfo" => {
+                    style = attr(&e, b"name");
+                    application.show_first_column =
+                        table_bool_attr(&e, b"showFirstColumn", false, &mut losses);
+                    application.show_last_column =
+                        table_bool_attr(&e, b"showLastColumn", false, &mut losses);
+                    application.show_row_stripes =
+                        table_bool_attr(&e, b"showRowStripes", false, &mut losses);
+                    application.show_column_stripes =
+                        table_bool_attr(&e, b"showColumnStripes", false, &mut losses);
+                }
                 _ => {}
             },
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
-    Some(Table {
-        range: range?,
-        name: display_name.or(name).unwrap_or_default(),
-        columns,
-        style,
+    Some(ParsedTable {
+        table: Table {
+            range: range?,
+            name: display_name.or(name).unwrap_or_default(),
+            columns,
+            style,
+        },
+        application,
+        losses,
     })
 }
 
@@ -2531,6 +4602,7 @@ fn shift_formula(f: &str, drow: i64, dcol: i64) -> String {
 #[derive(Debug, Default)]
 struct ParsedSheet {
     cells: Vec<CellEntry>,
+    direct_cell_formats: BTreeMap<(u32, u16), CellStyleOverlay>,
     rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
     merges: Vec<(u32, u16, u32, u16)>,
     hyperlink_refs: Vec<(u32, u16, String)>,
@@ -2538,7 +4610,9 @@ struct ParsedSheet {
     autofilter: Option<(u32, u16, u32, u16)>,
     data_validations: Vec<DataValidation>,
     cond_formats: Vec<CondFormat>,
+    cond_format_metadata: Vec<ConditionalFormatMetadata>,
     page_setup: Option<PageSetup>,
+    print_metadata: PrintMetadata,
     sparklines: Vec<Sparkline>,
     tab_color: Option<Color>,
     print_gridlines: bool,
@@ -2547,10 +4621,13 @@ struct ParsedSheet {
     col_outline: BTreeMap<u16, u8>,
     col_widths: BTreeMap<u16, f32>,
     row_heights: BTreeMap<u32, f32>,
+    col_formats: BTreeMap<u16, CellStyle>,
+    row_formats: BTreeMap<u32, CellStyle>,
     hidden_cols: BTreeSet<u16>,
     hidden_rows: BTreeSet<u32>,
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
+    base_col_width: Option<f32>,
     collapsed_rows: BTreeSet<u32>,
     outline_summary_below: Option<bool>,
     outline_summary_right: Option<bool>,
@@ -2570,6 +4647,18 @@ type ParsedDataValidation = (DataValidation, Vec<SheetRange>);
 enum HeaderFooterField {
     Header,
     Footer,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeaderFooterCapture {
+    kind: HeaderFooterKind,
+    legacy: Option<HeaderFooterField>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PageBreakAxis {
+    Row,
+    Column,
 }
 
 #[derive(Debug)]
@@ -2605,6 +4694,7 @@ struct PendingCfRule {
     kind: PendingCfKind,
     formulas: Vec<String>,
     colors: Vec<Color>,
+    metadata: ConditionalFormatMetadata,
 }
 
 impl PendingCfRule {
@@ -2701,7 +4791,8 @@ fn parse_sheet(
     let mut current_cf_ranges: Vec<SheetRange> = Vec::new();
     let mut current_cf: Option<PendingCfRule> = None;
     let mut in_cf_formula = false;
-    let mut header_footer_capture: Option<HeaderFooterField> = None;
+    let mut header_footer_capture: Option<HeaderFooterCapture> = None;
+    let mut page_break_axis: Option<PageBreakAxis> = None;
     let mut current_sparkline_kind = SparklineKind::Line;
     let mut current_sparkline_range = String::new();
     let mut current_sparkline_location = String::new();
@@ -2743,9 +4834,17 @@ fn parse_sheet(
                     b"dataValidation" | b"formula1" | b"formula2"
                 ) => {}
             Ok(Event::Empty(e)) if header_footer_field(local(e.name().as_ref())).is_some() => {
-                if let Some((field, preferred)) = header_footer_field(local(e.name().as_ref())) {
-                    begin_header_footer_capture(&mut parsed, field, preferred);
+                if let Some((kind, field, preferred)) =
+                    header_footer_field(local(e.name().as_ref()))
+                {
+                    begin_header_footer_capture(&mut parsed, kind, field, preferred);
                 }
+            }
+            Ok(Event::Empty(e))
+                if matches!(local(e.name().as_ref()), b"rowBreaks" | b"colBreaks") =>
+            {
+                parsed.print_metadata.mark_source();
+                page_break_axis = None;
             }
             Ok(Event::Empty(e)) if local(e.name().as_ref()) == b"conditionalFormatting" => {
                 push_current_conditional_format(&mut parsed, current_cf.take());
@@ -2780,12 +4879,20 @@ fn parse_sheet(
                     if attr(&e, b"hidden").as_deref().is_some_and(attr_true) {
                         parsed.hidden_rows.insert(cur_row);
                     }
+                    if let Some(style) = attr(&e, b"s")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .and_then(|index| styles.cell_style(index))
+                    {
+                        parsed.row_formats.insert(cur_row, style.clone());
+                    }
                 }
                 b"sheetFormatPr" => {
                     parsed.default_row_height =
                         attr(&e, b"defaultRowHeight").and_then(|s| s.parse::<f32>().ok());
                     parsed.default_col_width =
                         attr(&e, b"defaultColWidth").and_then(|s| s.parse::<f32>().ok());
+                    parsed.base_col_width =
+                        attr(&e, b"baseColWidth").and_then(|s| s.parse::<f32>().ok());
                 }
                 b"outlinePr" => {
                     if let Some(value) = attr(&e, b"summaryBelow")
@@ -2813,6 +4920,9 @@ fn parse_sheet(
                     if first <= last {
                         let width = attr(&e, b"width").and_then(|s| s.parse::<f32>().ok());
                         let hidden = attr(&e, b"hidden").as_deref().is_some_and(attr_true);
+                        let style = attr(&e, b"style")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .and_then(|index| styles.cell_style(index));
                         for col in first..=last {
                             if let Ok(col) = u16::try_from(col - 1) {
                                 if let Some(width) = width {
@@ -2820,6 +4930,9 @@ fn parse_sheet(
                                 }
                                 if hidden {
                                     parsed.hidden_cols.insert(col);
+                                }
+                                if let Some(style) = style {
+                                    parsed.col_formats.insert(col, style.clone());
                                 }
                             }
                         }
@@ -2996,22 +5109,26 @@ fn parse_sheet(
                     }
                 }
                 b"printOptions" => {
-                    if attr(&e, b"gridLines").as_deref().is_some_and(attr_true) {
+                    let gridlines = print_bool_attr(&e, b"gridLines", &mut parsed.print_metadata);
+                    let headings = print_bool_attr(&e, b"headings", &mut parsed.print_metadata);
+                    let horizontal =
+                        print_bool_attr(&e, b"horizontalCentered", &mut parsed.print_metadata);
+                    let vertical =
+                        print_bool_attr(&e, b"verticalCentered", &mut parsed.print_metadata);
+                    parsed.print_metadata.set_print_gridlines(gridlines);
+                    parsed.print_metadata.set_print_headings(headings);
+                    parsed.print_metadata.set_center_horizontally(horizontal);
+                    parsed.print_metadata.set_center_vertically(vertical);
+                    if gridlines {
                         parsed.print_gridlines = true;
                     }
-                    if attr(&e, b"headings").as_deref().is_some_and(attr_true) {
+                    if headings {
                         parsed.print_headings = true;
                     }
-                    if attr(&e, b"horizontalCentered")
-                        .as_deref()
-                        .is_some_and(attr_true)
-                    {
+                    if horizontal {
                         page_setup_mut(&mut parsed).center_horizontally = true;
                     }
-                    if attr(&e, b"verticalCentered")
-                        .as_deref()
-                        .is_some_and(attr_true)
-                    {
+                    if vertical {
                         page_setup_mut(&mut parsed).center_vertically = true;
                     }
                 }
@@ -3038,6 +5155,17 @@ fn parse_sheet(
                     }
                 }
                 b"pageSetup" => {
+                    match attr(&e, b"pageOrder").as_deref() {
+                        Some("overThenDown") => parsed
+                            .print_metadata
+                            .set_page_order(PrintPageOrder::OverThenDown),
+                        Some("downThenOver") | None => parsed
+                            .print_metadata
+                            .set_page_order(PrintPageOrder::DownThenOver),
+                        Some(_) => parsed
+                            .print_metadata
+                            .add_loss(PrintLossKind::UnsupportedProperty),
+                    }
                     let ps = page_setup_mut(&mut parsed);
                     ps.landscape = attr(&e, b"orientation")
                         .as_deref()
@@ -3052,13 +5180,55 @@ fn parse_sheet(
                         .then(|| attr_u16(&e, b"firstPageNumber"))
                         .flatten();
                 }
+                b"headerFooter" => {
+                    let different_odd_even = header_footer_bool_attr(
+                        &e,
+                        b"differentOddEven",
+                        false,
+                        &mut parsed.print_metadata,
+                    );
+                    let different_first = header_footer_bool_attr(
+                        &e,
+                        b"differentFirst",
+                        false,
+                        &mut parsed.print_metadata,
+                    );
+                    let scale_with_document = header_footer_bool_attr(
+                        &e,
+                        b"scaleWithDoc",
+                        true,
+                        &mut parsed.print_metadata,
+                    );
+                    let align_with_margins = header_footer_bool_attr(
+                        &e,
+                        b"alignWithMargins",
+                        true,
+                        &mut parsed.print_metadata,
+                    );
+                    parsed.print_metadata.set_header_footer_flag(
+                        Some(different_odd_even),
+                        Some(different_first),
+                        Some(scale_with_document),
+                        Some(align_with_margins),
+                    );
+                }
                 b"oddHeader" | b"firstHeader" | b"evenHeader" | b"oddFooter" | b"firstFooter"
                 | b"evenFooter" => {
-                    if let Some((field, preferred)) = header_footer_field(local(e.name().as_ref()))
+                    if let Some((kind, field, preferred)) =
+                        header_footer_field(local(e.name().as_ref()))
                     {
-                        header_footer_capture =
-                            begin_header_footer_capture(&mut parsed, field, preferred);
+                        header_footer_capture = Some(begin_header_footer_capture(
+                            &mut parsed,
+                            kind,
+                            field,
+                            preferred,
+                        ));
                     }
+                }
+                b"rowBreaks" => page_break_axis = Some(PageBreakAxis::Row),
+                b"colBreaks" => page_break_axis = Some(PageBreakAxis::Column),
+                b"brk" if page_break_axis.is_some() => {
+                    parse_manual_page_break(&e, page_break_axis, &mut parsed.print_metadata);
                 }
                 b"sparklineGroup" => {
                     current_sparkline_kind = attr(&e, b"type")
@@ -3140,8 +5310,8 @@ fn parse_sheet(
                 _ => {}
             },
             Ok(Event::Text(t)) if header_footer_capture.is_some() => {
-                if let Some(field) = header_footer_capture {
-                    append_header_footer_text(&mut parsed, field, &text_of(&t));
+                if let Some(capture) = header_footer_capture {
+                    append_header_footer_text(&mut parsed, capture, &text_of(&t));
                 }
             }
             Ok(Event::Text(t)) if in_sparkline_formula => {
@@ -3178,8 +5348,8 @@ fn parse_sheet(
             }
             Ok(Event::GeneralRef(reference)) => {
                 with_general_ref_text(&reference, |text| {
-                    if let Some(field) = header_footer_capture {
-                        append_header_footer_text(&mut parsed, field, text);
+                    if let Some(capture) = header_footer_capture {
+                        append_header_footer_text(&mut parsed, capture, text);
                     } else if in_sparkline_formula {
                         current_sparkline_range.push_str(text);
                     } else if in_sparkline_sqref {
@@ -3213,10 +5383,10 @@ fn parse_sheet(
                 });
             }
             Ok(Event::CData(t)) if header_footer_capture.is_some() => {
-                if let Some(field) = header_footer_capture {
+                if let Some(capture) = header_footer_capture {
                     let bytes = t.into_inner();
                     let text = String::from_utf8_lossy(bytes.as_ref());
-                    append_header_footer_text(&mut parsed, field, text.as_ref());
+                    append_header_footer_text(&mut parsed, capture, text.as_ref());
                 }
             }
             Ok(Event::CData(t)) if in_sparkline_formula => {
@@ -3270,6 +5440,7 @@ fn parse_sheet(
                 b"sheetView" => in_selected_sheet_view = false,
                 b"oddHeader" | b"firstHeader" | b"evenHeader" | b"oddFooter" | b"firstFooter"
                 | b"evenFooter" => header_footer_capture = None,
+                b"rowBreaks" | b"colBreaks" => page_break_axis = None,
                 b"sqref" if in_sparkline_sqref => in_sparkline_sqref = false,
                 b"sparkline" => {
                     in_sparkline = false;
@@ -3371,6 +5542,13 @@ fn parse_sheet(
                             } else if ctype == "inlineStr" && !inline_runs.is_empty() {
                                 parsed.rich.insert((row, col), inline_runs.clone());
                             }
+                            if style_idx != 0 {
+                                if let Some(overlay) = styles.cell_style_overlay(style_idx) {
+                                    parsed
+                                        .direct_cell_formats
+                                        .insert((row, col), overlay.clone());
+                                }
+                            }
                             parsed.cells.push(entry);
                         }
                     }
@@ -3400,6 +5578,35 @@ fn parse_bool_attr(value: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+fn print_bool_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    metadata: &mut PrintMetadata,
+) -> bool {
+    match attr(e, key).as_deref() {
+        Some(value) => parse_bool_attr(value).unwrap_or_else(|| {
+            metadata.add_loss(PrintLossKind::UnsupportedProperty);
+            false
+        }),
+        None => false,
+    }
+}
+
+fn header_footer_bool_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    default: bool,
+    metadata: &mut PrintMetadata,
+) -> bool {
+    match attr(e, key).as_deref() {
+        Some(value) => parse_bool_attr(value).unwrap_or_else(|| {
+            metadata.add_loss(PrintLossKind::MalformedHeaderFooter);
+            default
+        }),
+        None => default,
     }
 }
 
@@ -3458,46 +5665,103 @@ fn page_setup_mut(parsed: &mut ParsedSheet) -> &mut PageSetup {
     parsed.page_setup.get_or_insert_with(PageSetup::default)
 }
 
-fn header_footer_field(name: &[u8]) -> Option<(HeaderFooterField, bool)> {
+fn header_footer_field(name: &[u8]) -> Option<(HeaderFooterKind, HeaderFooterField, bool)> {
     match name {
-        b"oddHeader" => Some((HeaderFooterField::Header, true)),
-        b"firstHeader" | b"evenHeader" => Some((HeaderFooterField::Header, false)),
-        b"oddFooter" => Some((HeaderFooterField::Footer, true)),
-        b"firstFooter" | b"evenFooter" => Some((HeaderFooterField::Footer, false)),
+        b"oddHeader" => Some((HeaderFooterKind::OddHeader, HeaderFooterField::Header, true)),
+        b"firstHeader" => Some((
+            HeaderFooterKind::FirstHeader,
+            HeaderFooterField::Header,
+            false,
+        )),
+        b"evenHeader" => Some((
+            HeaderFooterKind::EvenHeader,
+            HeaderFooterField::Header,
+            false,
+        )),
+        b"oddFooter" => Some((HeaderFooterKind::OddFooter, HeaderFooterField::Footer, true)),
+        b"firstFooter" => Some((
+            HeaderFooterKind::FirstFooter,
+            HeaderFooterField::Footer,
+            false,
+        )),
+        b"evenFooter" => Some((
+            HeaderFooterKind::EvenFooter,
+            HeaderFooterField::Footer,
+            false,
+        )),
         _ => None,
     }
 }
 
 fn begin_header_footer_capture(
     parsed: &mut ParsedSheet,
+    kind: HeaderFooterKind,
     field: HeaderFooterField,
     preferred: bool,
-) -> Option<HeaderFooterField> {
+) -> HeaderFooterCapture {
+    parsed.print_metadata.set_header_footer(kind, String::new());
     let page_setup = page_setup_mut(parsed);
     let slot = match field {
         HeaderFooterField::Header => &mut page_setup.header,
         HeaderFooterField::Footer => &mut page_setup.footer,
     };
-    if preferred || slot.is_none() {
+    let legacy = if preferred || slot.is_none() {
         *slot = Some(String::new());
         Some(field)
     } else {
         None
-    }
+    };
+    HeaderFooterCapture { kind, legacy }
 }
 
-fn append_header_footer_text(parsed: &mut ParsedSheet, field: HeaderFooterField, text: &str) {
-    match field {
-        HeaderFooterField::Header => {
+fn append_header_footer_text(parsed: &mut ParsedSheet, capture: HeaderFooterCapture, text: &str) {
+    parsed
+        .print_metadata
+        .append_header_footer(capture.kind, text);
+    match capture.legacy {
+        Some(HeaderFooterField::Header) => {
             if let Some(header) = page_setup_mut(parsed).header.as_mut() {
                 header.push_str(text);
             }
         }
-        HeaderFooterField::Footer => {
+        Some(HeaderFooterField::Footer) => {
             if let Some(footer) = page_setup_mut(parsed).footer.as_mut() {
                 footer.push_str(text);
             }
         }
+        None => {}
+    }
+}
+
+fn parse_manual_page_break(
+    e: &quick_xml::events::BytesStart<'_>,
+    axis: Option<PageBreakAxis>,
+    metadata: &mut PrintMetadata,
+) {
+    let manual = match attr(e, b"man").as_deref() {
+        Some(value) => match parse_bool_attr(value) {
+            Some(value) => value,
+            None => {
+                metadata.add_loss(PrintLossKind::InvalidPageBreak);
+                return;
+            }
+        },
+        None => false,
+    };
+    if !manual {
+        return;
+    }
+    let Some(id) = attr(e, b"id").and_then(|value| value.parse::<u32>().ok()) else {
+        metadata.add_loss(PrintLossKind::InvalidPageBreak);
+        return;
+    };
+    match axis {
+        Some(PageBreakAxis::Row) => metadata.push_manual_row_break(id),
+        Some(PageBreakAxis::Column) => match u16::try_from(id) {
+            Ok(col) => metadata.push_manual_col_break(col),
+            Err(_) => metadata.add_loss(PrintLossKind::InvalidPageBreak),
+        },
+        None => metadata.add_loss(PrintLossKind::InvalidPageBreak),
     }
 }
 
@@ -3511,6 +5775,7 @@ fn attr_u16(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<u16> {
 
 fn apply_sheet_defined_names<'a, I>(
     page_setup: &mut Option<PageSetup>,
+    print_metadata: &mut PrintMetadata,
     autofilter: &mut Option<SheetRange>,
     names: I,
 ) where
@@ -3519,7 +5784,18 @@ fn apply_sheet_defined_names<'a, I>(
     for name in names {
         match name.name.as_str() {
             "_xlnm.Print_Area" => {
-                if let Some(range) = parse_defined_name_range(&name.refers_to) {
+                let mut first = None;
+                for part in split_defined_name_refs(&name.refers_to) {
+                    if let Some(range) = parse_defined_name_range(part) {
+                        first.get_or_insert(range);
+                        print_metadata.push_print_area(range);
+                    } else if part.contains("#REF!") {
+                        print_metadata.add_loss(PrintLossKind::MissingReference);
+                    } else {
+                        print_metadata.add_loss(PrintLossKind::InvalidPrintArea);
+                    }
+                }
+                if let Some(range) = first {
                     page_setup.get_or_insert_with(PageSetup::default).print_area = Some(range);
                 }
             }
@@ -3637,10 +5913,50 @@ fn parse_sparkline(kind: SparklineKind, range: &str, location: &str) -> Option<S
     })
 }
 
-fn parse_dxf_fill(e: &quick_xml::events::BytesStart<'_>, styles: &Styles) -> Option<Color> {
-    attr(e, b"dxfId")
-        .and_then(|s| s.parse::<usize>().ok())
-        .and_then(|id| styles.dxf_fill(id))
+fn parse_conditional_metadata(
+    e: &quick_xml::events::BytesStart<'_>,
+    styles: &Styles,
+) -> ConditionalFormatMetadata {
+    let mut metadata = ConditionalFormatMetadata {
+        priority: attr(e, b"priority")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|priority| *priority != 0),
+        stop_if_true: attr(e, b"stopIfTrue").as_deref().is_some_and(attr_true),
+        ..ConditionalFormatMetadata::default()
+    };
+    let Some(dxf_id) = attr(e, b"dxfId") else {
+        return metadata;
+    };
+    let Some(dxf) = dxf_id
+        .parse::<usize>()
+        .ok()
+        .and_then(|id| styles.differential_style(id))
+    else {
+        metadata.style_losses.push(StyleLoss {
+            kind: StyleLossKind::MissingReference,
+            occurrences: 1,
+        });
+        return metadata;
+    };
+    metadata.differential_style = Some(dxf.style.clone());
+    metadata.style_losses = dxf.losses.clone();
+    metadata
+}
+
+fn conditional_compatibility_fill(metadata: &ConditionalFormatMetadata) -> Color {
+    metadata
+        .differential_style
+        .as_ref()
+        .and_then(|style| {
+            style.fill.or_else(|| {
+                style.pattern_fill.and_then(|fill| {
+                    (fill.pattern == FormatPattern::Solid)
+                        .then(|| fill.foreground.or(fill.background))
+                        .flatten()
+                })
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn parse_conditional_rule(
@@ -3652,13 +5968,15 @@ fn parse_conditional_rule(
         return None;
     }
     let ty = attr(e, b"type")?;
+    let metadata = parse_conditional_metadata(e, styles);
+    let compatibility_fill = conditional_compatibility_fill(&metadata);
     let kind = match ty.as_str() {
         "cellIs" => PendingCfKind::CellIs {
             op: attr(e, b"operator")
                 .as_deref()
                 .and_then(parse_dv_op)
                 .unwrap_or(DvOp::Between),
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         "colorScale" => PendingCfKind::ColorScale,
         "dataBar" => PendingCfKind::DataBar,
@@ -3668,22 +5986,22 @@ fn parse_conditional_rule(
                 .unwrap_or(10),
             bottom: attr(e, b"bottom").as_deref().is_some_and(attr_true),
             percent: attr(e, b"percent").as_deref().is_some_and(attr_true),
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         "aboveAverage" => PendingCfKind::AboveAverage {
             below: attr(e, b"aboveAverage").as_deref().is_some_and(attr_false),
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         "duplicateValues" => PendingCfKind::DuplicateValues {
             unique: false,
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         "uniqueValues" => PendingCfKind::DuplicateValues {
             unique: true,
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         "expression" => PendingCfKind::Expression {
-            fill: parse_dxf_fill(e, styles)?,
+            fill: compatibility_fill,
         },
         _ => return None,
     };
@@ -3692,6 +6010,7 @@ fn parse_conditional_rule(
         kind,
         formulas: Vec::new(),
         colors: Vec::new(),
+        metadata,
     })
 }
 
@@ -3707,6 +6026,7 @@ fn push_current_conditional_format(parsed: &mut ParsedSheet, current: Option<Pen
             sqref,
             rule: rule.clone(),
         });
+        parsed.cond_format_metadata.push(current.metadata.clone());
     }
 }
 
@@ -3840,10 +6160,16 @@ fn build_cell(
             .parse::<usize>()
             .ok()
             .and_then(|idx| shared.get(idx))
-            .map(|shared| (Cell::Text(shared.text.clone()), shared.text.clone())),
-        "str" | "inlineStr" if !value.is_empty() => {
-            Some((Cell::Text(value.to_string()), value.to_string()))
-        }
+            .map(|shared| {
+                (
+                    Cell::Text(shared.text.clone()),
+                    styles.render_text(style_idx, &shared.text),
+                )
+            }),
+        "str" | "inlineStr" if !value.is_empty() => Some((
+            Cell::Text(value.to_string()),
+            styles.render_text(style_idx, value),
+        )),
         "b" if !value.trim().is_empty() => {
             let b = value.trim() == "1";
             Some((Cell::Bool(b), if b { "TRUE" } else { "FALSE" }.to_string()))
@@ -3852,7 +6178,9 @@ fn build_cell(
         // ISO-8601 date/time cell (`t="d"`, emitted by some non-Excel writers).
         "d" if !value.is_empty() => format::iso_date_to_serial(value).map(|serial| {
             let kind = styles.kind(style_idx);
-            let display = if kind.is_datetime() {
+            let display = if let Some(code) = styles.custom_format(style_idx) {
+                format::render_format(serial, code, false)
+            } else if kind.is_datetime() {
                 format::render_value(serial, kind, false)
             } else {
                 value.to_string()
@@ -3863,7 +6191,10 @@ fn build_cell(
         // "" or "n" → number.
         _ => value.trim().parse::<f64>().ok().map(|f| {
             let kind = styles.kind(style_idx);
-            let display = format::render_value(f, kind, date1904);
+            let display = styles.custom_format(style_idx).map_or_else(
+                || format::render_indexed(f, styles.format_id(style_idx), date1904),
+                |code| format::render_format(f, code, date1904),
+            );
             let cell = if kind.is_datetime() {
                 Cell::Date(f)
             } else {
@@ -3912,6 +6243,15 @@ fn build_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overlay_is_empty(overlay: &CellStyleOverlay) -> bool {
+        !overlay.replace_font
+            && !overlay.replace_fill
+            && !overlay.replace_border
+            && !overlay.replace_num_fmt
+            && !overlay.replace_alignment
+            && !overlay.replace_protection
+    }
 
     fn shared_texts(xml: &str) -> Vec<String> {
         parse_shared_strings(xml, &ThemeColors::default(), &[])
@@ -4008,22 +6348,239 @@ mod tests {
         let drawing = r#"<wsDr><twoCellAnchor><from><col>1&#48;</col><row>2&#48;</row></from><to><col>3&#48;</col><row>4&#48;</row></to><graphicFrame><chart r:id="rId&amp;Chart"/></graphicFrame></twoCellAnchor></wsDr>"#;
         let refs = parse_drawing_refs(drawing);
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].rid, "rId&Chart");
+        assert_eq!(refs[0].rid.as_deref(), Some("rId&Chart"));
         assert_eq!(refs[0].from, (20, 10));
         assert_eq!(refs[0].to, Some((40, 30)));
 
+        let mut cache_points = 16;
+        let mut chart_series = 16;
         let chart = parse_chart(
             r#"<chartSpace><chart><plotArea><lineChart><ser><tx><strRef><f>Data&amp;More!$A$1</f></strRef></tx><cat><strRef><f>Data!$A$2:$A$3</f></strRef></cat><val><numRef><f>Data!$B$2:$B$3</f></numRef></val></ser></lineChart></plotArea></chart></chartSpace>"#,
             (20, 10),
             (40, 30),
+            &mut cache_points,
+            &mut chart_series,
         )
-        .unwrap();
+        .unwrap()
+        .chart;
         assert_eq!(chart.series[0].name.as_deref(), Some("Data&More!$A$1"));
         assert_eq!(
             chart.series[0].categories.as_deref(),
             Some("Data!$A$2:$A$3")
         );
         assert_eq!(chart.series[0].values, "Data!$B$2:$B$3");
+    }
+
+    #[test]
+    fn drawing_sidecars_retain_all_anchor_geometry_and_unsupported_shapes() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <xdr:twoCellAnchor editAs="oneCell">
+                <xdr:from><xdr:col>1</xdr:col><xdr:colOff>123</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>456</xdr:rowOff></xdr:from>
+                <xdr:to><xdr:col>4</xdr:col><xdr:colOff>789</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>1011</xdr:rowOff></xdr:to>
+                <xdr:pic>
+                    <xdr:nvPicPr><xdr:cNvPr id="2" name="Logo &amp; mark" descr="Accessible logo"/></xdr:nvPicPr>
+                    <xdr:blipFill><a:blip r:embed="rIdImage"/><a:srcRect l="1000" t="2000" r="3000" b="4000"/></xdr:blipFill>
+                    <xdr:spPr><a:xfrm rot="60000"><a:ext cx="914400" cy="457200"/></a:xfrm></xdr:spPr>
+                </xdr:pic>
+            </xdr:twoCellAnchor>
+            <xdr:oneCellAnchor>
+                <xdr:from><xdr:col>6</xdr:col><xdr:colOff>-5</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>6</xdr:rowOff></xdr:from>
+                <xdr:ext cx="1828800" cy="914400"/>
+                <xdr:graphicFrame>
+                    <xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Sales chart" title="Chart fallback text"/></xdr:nvGraphicFramePr>
+                    <a:graphic><a:graphicData><c:chart r:id="rIdChart"/></a:graphicData></a:graphic>
+                </xdr:graphicFrame>
+            </xdr:oneCellAnchor>
+            <xdr:absoluteAnchor>
+                <xdr:pos x="1234" y="5678"/><xdr:ext cx="777" cy="888"/>
+                <xdr:sp><xdr:nvSpPr><xdr:cNvPr id="4" name="Callout" descr="Unsupported callout"/></xdr:nvSpPr>
+                    <xdr:spPr><a:xfrm rot="-120000"/></xdr:spPr>
+                </xdr:sp>
+            </xdr:absoluteAnchor>
+        </xdr:wsDr>"#;
+        let parts = [
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#.as_slice(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#.as_slice(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#.as_slice(),
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                br#"<Relationships><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#.as_slice(),
+            ),
+            ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                br#"<Relationships><Relationship Id="rIdImage" Target="../media/image1.png"/><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#.as_slice(),
+            ),
+            (
+                "xl/charts/chart1.xml",
+                br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart/></c:plotArea></c:chart></c:chartSpace>"#.as_slice(),
+            ),
+            ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n".as_slice()),
+        ];
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in parts {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let workbook = Workbook::open(&bytes).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.images().len(), 1);
+        assert_eq!(sheet.images()[0].from, (2, 1));
+        assert_eq!(sheet.images()[0].to, Some((5, 4)));
+        assert_eq!(sheet.charts().len(), 1);
+        assert_eq!(sheet.charts()[0].from, (7, 6));
+        assert_eq!(sheet.charts()[0].to, (7, 6));
+
+        let metadata = sheet.drawing_metadata();
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(metadata[0].kind, DrawingObjectKind::Image);
+        assert_eq!(metadata[0].object_index, 0);
+        assert_eq!(metadata[0].from_cell, Some((2, 1)));
+        assert_eq!(metadata[0].to_cell, Some((5, 4)));
+        assert_eq!(metadata[0].from_offset_emu, Some((123, 456)));
+        assert_eq!(metadata[0].to_offset_emu, Some((789, 1011)));
+        assert_eq!(metadata[0].absolute_size_emu, Some((914400, 457200)));
+        assert_eq!(
+            metadata[0].crop,
+            Some(DrawingCrop {
+                left_ppm: 10_000,
+                top_ppm: 20_000,
+                right_ppm: 30_000,
+                bottom_ppm: 40_000,
+            })
+        );
+        assert_eq!(metadata[0].rotation_mdeg, Some(1000));
+        assert_eq!(metadata[0].z_order, Some(0));
+        assert_eq!(metadata[0].name.as_deref(), Some("Logo & mark"));
+        assert_eq!(metadata[0].alt_text.as_deref(), Some("Accessible logo"));
+        assert_eq!(metadata[0].behavior, DrawingAnchorBehavior::MoveOnly);
+
+        assert_eq!(metadata[1].kind, DrawingObjectKind::Chart);
+        assert_eq!(metadata[1].object_index, 0);
+        assert_eq!(metadata[1].from_cell, Some((7, 6)));
+        assert_eq!(metadata[1].to_cell, None);
+        assert_eq!(metadata[1].from_offset_emu, Some((-5, 6)));
+        assert_eq!(metadata[1].to_offset_emu, None);
+        assert_eq!(metadata[1].absolute_size_emu, Some((1_828_800, 914_400)));
+        assert_eq!(metadata[1].z_order, Some(1));
+        assert_eq!(metadata[1].name.as_deref(), Some("Sales chart"));
+        assert_eq!(metadata[1].alt_text.as_deref(), Some("Chart fallback text"));
+        assert_eq!(metadata[1].behavior, DrawingAnchorBehavior::MoveOnly);
+
+        assert_eq!(metadata[2].kind, DrawingObjectKind::Shape);
+        assert_eq!(metadata[2].from_cell, None);
+        assert_eq!(metadata[2].to_cell, None);
+        assert_eq!(metadata[2].from_offset_emu, Some((1234, 5678)));
+        assert_eq!(metadata[2].absolute_size_emu, Some((777, 888)));
+        assert_eq!(metadata[2].rotation_mdeg, Some(-2000));
+        assert_eq!(metadata[2].z_order, Some(2));
+        assert_eq!(metadata[2].name.as_deref(), Some("Callout"));
+        assert_eq!(metadata[2].alt_text.as_deref(), Some("Unsupported callout"));
+        assert_eq!(metadata[2].behavior, DrawingAnchorBehavior::Absolute);
+        assert_eq!(
+            sheet.style_losses(),
+            &[StyleLoss {
+                kind: StyleLossKind::UnsupportedProperty,
+                occurrences: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn drawing_sidecar_strings_are_utf8_bounded_and_loss_aware() {
+        let long_name = format!("{}한", "a".repeat(MAX_XLSX_DRAWING_TEXT));
+        let xml = format!(
+            r#"<wsDr><absoluteAnchor><pos x="1" y="2"/><ext cx="3" cy="4"/><sp><nvSpPr><cNvPr name="{long_name}"/></nvSpPr></sp></absoluteAnchor></wsDr>"#
+        );
+        let mut losses = Vec::new();
+        let refs = parse_drawing_refs_bounded(&xml, &mut losses);
+
+        assert_eq!(refs.len(), 1);
+        let name = refs[0].metadata.name.as_deref().unwrap();
+        assert_eq!(name.len(), MAX_XLSX_DRAWING_TEXT);
+        assert!(name.is_char_boundary(name.len()));
+        assert_eq!(
+            losses,
+            vec![StyleLoss {
+                kind: StyleLossKind::LimitExceeded,
+                occurrences: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn drawing_anchor_behavior_matrix_and_zero_offsets_are_exact() {
+        let cases = [
+            (None, DrawingAnchorBehavior::MoveAndSize),
+            (Some("twoCell"), DrawingAnchorBehavior::MoveAndSize),
+            (Some("oneCell"), DrawingAnchorBehavior::MoveOnly),
+            (Some("absolute"), DrawingAnchorBehavior::Absolute),
+        ];
+        for (edit_as, expected) in cases {
+            let edit_as = edit_as
+                .map(|value| format!(r#" editAs="{value}""#))
+                .unwrap_or_default();
+            let xml = format!(
+                r#"<wsDr><twoCellAnchor{edit_as}><from><col>0</col><colOff>0</colOff><row>0</row><rowOff>0</rowOff></from><to><col>1</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></to><sp/></twoCellAnchor></wsDr>"#
+            );
+            let refs = parse_drawing_refs(&xml);
+            assert_eq!(refs.len(), 1);
+            assert_eq!(refs[0].metadata.behavior, expected);
+            assert_eq!(refs[0].metadata.from_offset_emu, Some((0, 0)));
+            assert_eq!(refs[0].metadata.to_offset_emu, Some((0, 0)));
+        }
+
+        let one_cell = parse_drawing_refs(
+            "<wsDr><oneCellAnchor><from><col>0</col><row>0</row></from><sp/></oneCellAnchor></wsDr>",
+        );
+        assert_eq!(
+            one_cell[0].metadata.behavior,
+            DrawingAnchorBehavior::MoveOnly
+        );
+        let absolute = parse_drawing_refs(
+            "<wsDr><absoluteAnchor><pos x=\"0\" y=\"0\"/><ext cx=\"1\" cy=\"1\"/><sp/></absoluteAnchor></wsDr>",
+        );
+        assert_eq!(
+            absolute[0].metadata.behavior,
+            DrawingAnchorBehavior::Absolute
+        );
+    }
+
+    #[test]
+    fn drawing_anchor_count_is_bounded_and_reports_the_limit() {
+        let anchor =
+            "<absoluteAnchor><pos x=\"0\" y=\"0\"/><ext cx=\"1\" cy=\"1\"/><sp/></absoluteAnchor>";
+        let xml = format!("<wsDr>{}</wsDr>", anchor.repeat(MAX_XLSX_DRAWINGS + 1));
+        let mut losses = Vec::new();
+        let refs = parse_drawing_refs_bounded(&xml, &mut losses);
+
+        assert_eq!(refs.len(), MAX_XLSX_DRAWINGS);
+        assert_eq!(
+            losses,
+            vec![StyleLoss {
+                kind: StyleLossKind::LimitExceeded,
+                occurrences: 1,
+            }]
+        );
     }
 
     #[test]
@@ -4160,6 +6717,30 @@ mod tests {
 
     /// Build a minimal `.xlsx` in memory and read it end-to-end.
     #[test]
+    fn custom_number_formats_are_applied_to_xlsx_display_text() {
+        let styles = parse_styles(
+            r#"<styleSheet><numFmts count="3"><numFmt numFmtId="164" formatCode="[$₩-412]#,##0.00"/><numFmt numFmtId="165" formatCode="yyyy&quot;년&quot; m&quot;월&quot; d&quot;일&quot;"/><numFmt numFmtId="166" formatCode="0;[Red](0);0;&quot;값: &quot;@"/></numFmts><cellXfs count="3"><xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="166"/></cellXfs></styleSheet>"#,
+            &ThemeColors::default(),
+        );
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1" s="0"><v>1234.5</v></c><c r="B1" s="1"><v>45366</v></c><c r="C1" s="2" t="inlineStr"><is><t>한글</t></is></c></row></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.cells[0].text, "₩1,234.50");
+        assert_eq!(parsed.cells[1].text, "2024년 3월 15일");
+        assert!(matches!(parsed.cells[1].value, Cell::Date(45_366.0)));
+        assert_eq!(parsed.cells[2].text, "값: 한글");
+    }
+
+    /// Build a minimal `.xlsx` in memory and read it end-to-end.
+    #[test]
     fn reads_a_minimal_xlsx() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -4199,6 +6780,38 @@ mod tests {
         assert_eq!(s.cell(0, 2), Some(&Cell::Date(45366.0))); // numFmt 14 → date
         assert_eq!(s.cell(0, 3), Some(&Cell::Bool(true)));
         assert!(s.to_text().contains("2024-03-15"));
+        assert_eq!(s.default_column_width(), None);
+        assert_eq!(s.implicit_ooxml_column_width(), Some(None));
+    }
+
+    #[test]
+    fn sheet_format_retains_explicit_and_base_column_width_provenance() {
+        let parse = |format: &str| {
+            let xml = format!(
+                r#"<worksheet>{format}<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+            );
+            let mut budget = crate::MAX_TEXT_BYTES;
+            parse_sheet(
+                &xml,
+                &[],
+                &Styles::default(),
+                &ThemeColors::default(),
+                false,
+                &mut budget,
+            )
+        };
+
+        let absent = parse("");
+        assert_eq!(absent.default_col_width, None);
+        assert_eq!(absent.base_col_width, None);
+
+        let explicit = parse(r#"<sheetFormatPr baseColWidth="8" defaultColWidth="8.43"/>"#);
+        assert_eq!(explicit.default_col_width, Some(8.43));
+        assert_eq!(explicit.base_col_width, Some(8.0));
+
+        let base = parse(r#"<sheetFormatPr baseColWidth="10"/>"#);
+        assert_eq!(base.default_col_width, None);
+        assert_eq!(base.base_col_width, Some(10.0));
     }
 
     #[test]
@@ -4363,7 +6976,7 @@ mod tests {
     }
 
     #[test]
-    fn chart_series_refs_ignore_cached_point_values() {
+    fn chart_series_refs_retain_bounded_caches_and_theme_palette_sidecar() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -4375,7 +6988,11 @@ mod tests {
             ),
             (
                 "xl/_rels/workbook.xml.rels",
-                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rIdTheme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/theme/theme1.xml",
+                r#"<theme><themeElements><clrScheme><accent1><srgbClr val="010203"/></accent1><accent2><srgbClr val="A0B0C0"/></accent2></clrScheme></themeElements></theme>"#,
             ),
             (
                 "xl/worksheets/sheet1.xml",
@@ -4409,6 +7026,8 @@ mod tests {
                 "xl/charts/chart1.xml",
                 r#"<chartSpace><chart><plotArea><lineChart><ser>
                     <tx><strRef><f>Data!$C$1</f><strCache><pt idx="0"><v>Cached Series</v></pt></strCache></strRef></tx>
+                    <marker><symbol val="circle"/><size val="5"/></marker>
+                    <spPr><a:ln><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></a:ln></spPr>
                     <cat><strRef><f>Data!$A$2:$A$4</f><strCache><pt idx="0"><v>Q1</v></pt><pt idx="1"><v>Q2</v></pt><pt idx="2"><v>Q3</v></pt></strCache></strRef></cat>
                     <val><numRef><f>Data!$B$2:$B$4</f><numCache><pt idx="0"><v>10</v></pt><pt idx="1"><v>20</v></pt><pt idx="2"><v>30</v></pt></numCache></numRef></val>
                 </ser></lineChart></plotArea></chart></chartSpace>"#,
@@ -4434,6 +7053,150 @@ mod tests {
             Some("Data!$A$2:$A$4")
         );
         assert_eq!(charts[0].series[0].values, "Data!$B$2:$B$4");
+        let sidecar = wb.sheets[0]
+            .drawing_metadata()
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("chart rendering sidecar");
+        assert_eq!(sidecar.chart_palette[0], Color::rgb(1, 2, 3));
+        assert_eq!(sidecar.chart_palette[1], Color::rgb(160, 176, 192));
+        assert_eq!(sidecar.chart_series_caches.len(), 1);
+        assert_eq!(sidecar.chart_series_styles.len(), 1);
+        assert_eq!(
+            sidecar.chart_series_styles[0].marker,
+            ChartMarkerSymbol::Circle
+        );
+        assert_eq!(sidecar.chart_series_styles[0].marker_size, Some(5));
+        assert!(sidecar.chart_series_styles[0].line_visible);
+        assert_eq!(
+            sidecar.chart_series_styles[0].line_color,
+            Some(Color::rgb(160, 176, 192))
+        );
+        assert!(sidecar.chart_series_styles[0].losses.is_empty());
+        let cache = &sidecar.chart_series_caches[0];
+        assert_eq!(cache.name[0].value, "Cached Series");
+        assert_eq!(
+            cache
+                .categories
+                .iter()
+                .map(|point| point.value.as_str())
+                .collect::<Vec<_>>(),
+            ["Q1", "Q2", "Q3"]
+        );
+        assert_eq!(
+            cache
+                .values
+                .iter()
+                .map(|point| point.value.as_str())
+                .collect::<Vec<_>>(),
+            ["10", "20", "30"]
+        );
+    }
+
+    #[test]
+    fn chart_cache_and_series_sidecars_stop_at_exact_budgets() {
+        let xml = r#"<chartSpace><chart><plotArea><lineChart>
+            <ser><val><numRef><f>S!$A$1:$A$2</f><numCache>
+                <pt idx="0"><v>1</v></pt><pt idx="1"><v>2</v></pt>
+            </numCache></numRef></val></ser>
+            <ser><val><numRef><f>S!$B$1:$B$2</f><numCache>
+                <pt idx="0"><v>3</v></pt><pt idx="1"><v>4</v></pt>
+            </numCache></numRef></val></ser>
+        </lineChart></plotArea></chart></chartSpace>"#;
+        let mut cache_points = 2;
+        let mut chart_series = 1;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+        assert_eq!(cache_points, 0);
+        assert_eq!(chart_series, 0);
+        assert!(parsed.limit_exceeded);
+        assert_eq!(parsed.chart.series.len(), 1);
+        assert_eq!(parsed.series_caches.len(), 1);
+        assert_eq!(parsed.series_styles.len(), 1);
+        assert_eq!(parsed.series_caches[0].values.len(), 2);
+    }
+
+    #[test]
+    fn unsupported_chart_series_style_metadata_is_typed_and_bounded() {
+        let xml = r#"<chartSpace><chart><plotArea><lineChart><ser>
+            <marker><symbol val="picture"/><size val="255"/></marker>
+            <spPr><a:ln><a:gradFill/><a:prstDash val="dash"/></a:ln></spPr>
+            <val><numRef><f>S!$A$1:$A$2</f></numRef></val>
+        </ser></lineChart></plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+        assert_eq!(parsed.series_styles.len(), 1);
+        let style = &parsed.series_styles[0];
+        assert_eq!(style.marker, ChartMarkerSymbol::Automatic);
+        assert_eq!(style.marker_size, None);
+        assert_eq!(
+            style.losses,
+            [
+                ChartSeriesStyleLossKind::UnsupportedMarkerSymbol,
+                ChartSeriesStyleLossKind::InvalidMarkerSize,
+                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+            ]
+        );
+    }
+
+    #[test]
+    fn bar_chart_direction_is_retained_without_changing_chart_kind() {
+        for (value, expected) in [
+            ("col", ChartBarDirection::Column),
+            ("bar", ChartBarDirection::Horizontal),
+        ] {
+            let xml = format!(
+                r#"<chartSpace><chart><plotArea><barChart><barDir val="{value}"/><ser><val><numRef><f>Data!$A$1:$A$2</f></numRef></val></ser></barChart></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            assert_eq!(parsed.chart.kind, ChartKind::Bar);
+            assert_eq!(parsed.bar_direction, expected);
+        }
+    }
+
+    #[test]
+    fn unsupported_combo_3d_pivot_and_external_charts_are_explicit() {
+        let xml = r#"<chartSpace><pivotSource/><externalData/><chart><view3D/><plotArea>
+            <barChart><ser><val><numRef><f>Data!$A$1:$A$2</f></numRef></val></ser></barChart>
+            <lineChart><ser><val><numRef><f>'[Other.xlsx]Data'!$B$1:$B$2</f></numRef></val></ser></lineChart>
+        </plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+        assert_eq!(parsed.chart.kind, ChartKind::Bar);
+        assert_eq!(parsed.chart.series.len(), 2);
+        for reason in [
+            ChartUnsupportedReason::Combo,
+            ChartUnsupportedReason::ThreeDimensional,
+            ChartUnsupportedReason::Pivot,
+            ChartUnsupportedReason::ExternalData,
+        ] {
+            assert!(parsed.unsupported_reasons.contains(&reason), "{reason:?}");
+        }
+
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let surface = parse_chart(
+            r#"<chartSpace><chart><plotArea><surface3DChart><ser><val><numRef><f>Data!$A$1:$A$2</f></numRef></val></ser></surface3DChart></plotArea></chart></chartSpace>"#,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+        )
+        .unwrap();
+        assert_eq!(surface.chart.kind, ChartKind::Area);
+        assert!(surface
+            .unsupported_reasons
+            .contains(&ChartUnsupportedReason::ThreeDimensional));
+        assert!(surface
+            .unsupported_reasons
+            .contains(&ChartUnsupportedReason::UnsupportedKind));
     }
 
     #[test]
@@ -4734,7 +7497,8 @@ mod tests {
         // `displayName` is preferred over `name`; `ref` → 0-based inclusive range;
         // `<tableColumn name>` list → header columns; `<tableStyleInfo name>` → style.
         let xml = r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="가격표" ref="A1:C3"><autoFilter ref="A1:C3"/><tableColumns count="3"><tableColumn id="1" name="품목"/><tableColumn id="2" name="단가"/><tableColumn id="3" name="수량"/></tableColumns><tableStyleInfo name="TableStyleMedium2"/></table>"#;
-        let t = parse_table(xml).unwrap();
+        let parsed = parse_table(xml).unwrap();
+        let t = parsed.table;
         assert_eq!(t.name, "가격표");
         assert_eq!(t.range, (0, 0, 2, 2)); // A1:C3
         assert_eq!(t.columns, vec!["품목", "단가", "수량"]);
@@ -4757,7 +7521,11 @@ mod tests {
             ),
             (
                 "xl/_rels/workbook.xml.rels",
-                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/styles.xml",
+                r#"<styleSheet><dxfs count="1"><dxf><font><b/><color rgb="FFFFFFFF"/></font><fill><patternFill patternType="solid"><fgColor rgb="FF123456"/></patternFill></fill><border><bottom style="medium"><color rgb="FFABCDEF"/></bottom></border><alignment horizontal="center" wrapText="1"/></dxf></dxfs><tableStyles count="1" defaultTableStyle="NamedBlue"><tableStyle name="NamedBlue" pivot="0" count="1"><tableStyleElement type="headerRow" dxfId="0"/></tableStyle></tableStyles></styleSheet>"#,
             ),
             (
                 "xl/worksheets/sheet1.xml",
@@ -4769,7 +7537,7 @@ mod tests {
             ),
             (
                 "xl/tables/table1.xml",
-                r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="가격표" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="품목"/><tableColumn id="2" name="단가"/></tableColumns><tableStyleInfo name="TableStyleMedium2"/></table>"#,
+                r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="가격표" ref="A1:B2"><tableColumns count="2"><tableColumn id="1" name="품목"/><tableColumn id="2" name="단가"/></tableColumns><tableStyleInfo name="NamedBlue"/></table>"#,
             ),
         ];
         for (name, body) in parts {
@@ -4785,6 +7553,372 @@ mod tests {
         assert_eq!(tables[0].name, "가격표");
         assert_eq!(tables[0].range, (0, 0, 1, 1)); // A1:B2
         assert_eq!(tables[0].columns, vec!["품목", "단가"]);
+        let header = wb.sheets[0]
+            .table_header_styles()
+            .get("가격표")
+            .expect("imported named table header style");
+        assert_eq!(header.fill, Some(Color::rgb(0x12, 0x34, 0x56)));
+        assert_eq!(
+            header.font.as_ref().and_then(|font| font.color),
+            Some(Color::rgb(0xFF, 0xFF, 0xFF))
+        );
+        assert!(header.font.as_ref().is_some_and(|font| font.bold));
+        assert_eq!(
+            header.border.as_ref().map(|border| border.bottom),
+            Some(BorderStyle::Medium)
+        );
+        assert_eq!(
+            header
+                .border
+                .as_ref()
+                .and_then(|border| border.bottom_color),
+            Some(Color::rgb(0xAB, 0xCD, 0xEF))
+        );
+        assert_eq!(
+            header.align.as_ref().and_then(|align| align.horizontal),
+            Some(HAlign::Center)
+        );
+        assert!(header.align.as_ref().is_some_and(|align| align.wrap));
+    }
+
+    #[test]
+    fn built_in_table_style_header_uses_theme_accent() {
+        let mut theme = ThemeColors::default();
+        theme.colors[4] = Some(Color::rgb(1, 2, 3));
+        let built_in = built_in_table_style("TableStyleMedium2", &theme).unwrap();
+        let style = built_in_table_header_style("TableStyleMedium2", &theme).unwrap();
+        assert_eq!(style.fill, Some(Color::rgb(1, 2, 3)));
+        assert_eq!(
+            style.font.as_ref().and_then(|font| font.color),
+            Some(Color::rgb(0xFF, 0xFF, 0xFF))
+        );
+        assert!(style.font.as_ref().is_some_and(|font| font.bold));
+        for region in [
+            TableStyleRegion::HeaderRow,
+            TableStyleRegion::TotalRow,
+            TableStyleRegion::FirstColumn,
+            TableStyleRegion::LastColumn,
+            TableStyleRegion::FirstRowStripe,
+            TableStyleRegion::FirstColumnStripe,
+        ] {
+            assert!(built_in.definition.get(region).is_some(), "{region:?}");
+        }
+        assert!(built_in_table_header_style("TableStyleMedium29", &theme).is_none());
+    }
+
+    #[test]
+    fn direct_xf_masks_retain_explicit_resets_and_complete_builtin_formats() {
+        let xml = r#"<styleSheet>
+            <fonts count="2"><font><name val="Base"/></font><font><b/></font></fonts>
+            <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+            <borders count="1"><border/></borders>
+            <cellXfs count="3">
+                <xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="0"/>
+                <xf numFmtId="0" fontId="0" fillId="0" borderId="0"
+                    applyFont="1" applyBorder="1" applyNumberFormat="1"
+                    applyAlignment="1"><alignment wrapText="0"/></xf>
+                <xf numFmtId="46" fontId="0" fillId="0" borderId="0"
+                    applyNumberFormat="1"/>
+            </cellXfs>
+        </styleSheet>"#;
+        let styles = parse_styles(xml, &ThemeColors::default());
+
+        let disabled = styles.cell_style_overlay(0).expect("disabled overlay");
+        assert!(!disabled.replace_font, "explicit applyFont=0 must win");
+        assert!(overlay_is_empty(disabled));
+
+        let reset = styles.cell_style_overlay(1).expect("reset overlay");
+        assert!(reset.replace_font);
+        assert!(reset.replace_border);
+        assert!(reset.replace_num_fmt);
+        assert!(reset.replace_alignment);
+        assert!(reset
+            .style
+            .font
+            .as_ref()
+            .is_some_and(|font| font.name.as_deref() == Some("Base") && !font.bold));
+        assert_eq!(reset.style.border, None, "borderId=0 clears the border");
+        assert_eq!(reset.style.num_fmt, None, "numFmtId=0 means General");
+        assert_eq!(reset.style.align, Some(Alignment::default()));
+
+        assert_eq!(styles.cell_styles[2].num_fmt.as_deref(), Some("[h]:mm:ss"));
+        assert_eq!(
+            styles.cell_style_overlays[2].style.num_fmt.as_deref(),
+            Some("[h]:mm:ss")
+        );
+    }
+
+    #[test]
+    fn xlsx_style_table_limits_are_bounded_and_typed() {
+        let colors = r#"<rgbColor rgb="FF010203"/>"#.repeat(MAX_XLSX_INDEXED_COLORS + 1);
+        let overlong_format = "0".repeat(MAX_XLSX_FORMAT_CODE_BYTES + 1);
+        let xml = format!(
+            r#"<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="{overlong_format}"/></numFmts><colors><indexedColors>{colors}</indexedColors></colors><cellXfs count="1"><xf numFmtId="0"/></cellXfs></styleSheet>"#
+        );
+        let styles = parse_styles(&xml, &ThemeColors::default());
+        assert!(styles.custom.is_empty());
+        assert_eq!(styles.indexed_colors.len(), MAX_XLSX_INDEXED_COLORS);
+        assert!(styles
+            .losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::LimitExceeded && loss.occurrences >= 2));
+
+        let mut records = vec![(); MAX_XLSX_STYLE_RECORDS];
+        let mut losses = Vec::new();
+        retain_xlsx_style_record(&mut records, (), &mut losses);
+        assert_eq!(records.len(), MAX_XLSX_STYLE_RECORDS);
+        assert_eq!(
+            losses,
+            vec![StyleLoss {
+                kind: StyleLossKind::LimitExceeded,
+                occurrences: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_direct_xf_mask_still_prevents_full_style_fallback() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="styles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/styles.xml",
+                r#"<styleSheet><fonts count="2"><font><name val="Base"/></font><font><b/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="0"/></cellXfs></styleSheet>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c></row></sheetData></worksheet>"#,
+            ),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        let workbook = Workbook::open(&zip.finish().unwrap().into_inner()).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert!(sheet
+            .direct_cell_formats
+            .get(&(0, 0))
+            .is_some_and(overlay_is_empty));
+        let font = sheet
+            .resolved_cell_style(0, 0)
+            .and_then(|style| style.font)
+            .expect("resolved base font");
+        assert_eq!(font.name.as_deref(), Some("Base"));
+        assert!(!font.bold, "explicit applyFont=0 must not use fontId=1");
+    }
+
+    #[test]
+    fn custom_table_style_parser_retains_regions_sizes_and_typed_losses() {
+        let regions = [
+            TableStyleRegion::WholeTable,
+            TableStyleRegion::FirstColumnStripe,
+            TableStyleRegion::SecondColumnStripe,
+            TableStyleRegion::FirstRowStripe,
+            TableStyleRegion::SecondRowStripe,
+            TableStyleRegion::FirstColumn,
+            TableStyleRegion::LastColumn,
+            TableStyleRegion::HeaderRow,
+            TableStyleRegion::TotalRow,
+            TableStyleRegion::FirstHeaderCell,
+            TableStyleRegion::LastHeaderCell,
+            TableStyleRegion::FirstTotalCell,
+            TableStyleRegion::LastTotalCell,
+        ];
+        let dxfs = regions
+            .iter()
+            .enumerate()
+            .map(|(index, _)| DifferentialStyle {
+                style: CellStyle::new().background_color([index as u8, 1, 2]),
+                losses: (index == 0)
+                    .then_some(StyleLoss {
+                        kind: StyleLossKind::UnresolvedColor,
+                        occurrences: 1,
+                    })
+                    .into_iter()
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let xml = r#"<styleSheet><tableStyles count="1"><tableStyle name="AllRegions" count="17">
+            <tableStyleElement type="wholeTable" dxfId="0"/>
+            <tableStyleElement type="firstColumnStripe" size="3" dxfId="1"/>
+            <tableStyleElement type="secondColumnStripe" size="9999999" dxfId="2"/>
+            <tableStyleElement type="firstRowStripe" size="2" dxfId="3"/>
+            <tableStyleElement type="secondRowStripe" dxfId="4"/>
+            <tableStyleElement type="firstColumn" dxfId="5"/>
+            <tableStyleElement type="lastColumn" dxfId="6"/>
+            <tableStyleElement type="headerRow" dxfId="7"/>
+            <tableStyleElement type="totalRow" dxfId="8"/>
+            <tableStyleElement type="firstHeaderCell" dxfId="9"/>
+            <tableStyleElement type="lastHeaderCell" dxfId="10"/>
+            <tableStyleElement type="firstTotalCell" dxfId="11"/>
+            <tableStyleElement type="lastTotalCell" dxfId="12"/>
+            <tableStyleElement type="pageFieldLabels" dxfId="0"/>
+            <tableStyleElement type="headerRow" dxfId="999"/>
+            <tableStyleElement type="wholeTable" dxfId="1"/>
+        </tableStyle></tableStyles></styleSheet>"#;
+        let parsed = parse_table_styles(xml, &dxfs)
+            .remove("AllRegions")
+            .expect("parsed table style");
+
+        for region in regions {
+            assert!(
+                parsed.definition.get(region).is_some(),
+                "missing region {region:?}"
+            );
+        }
+        assert_eq!(
+            parsed
+                .definition
+                .get(TableStyleRegion::FirstColumnStripe)
+                .map(|style| style.stripe_size),
+            Some(3)
+        );
+        assert_eq!(
+            parsed
+                .definition
+                .get(TableStyleRegion::FirstRowStripe)
+                .map(|style| style.stripe_size),
+            Some(2)
+        );
+        for kind in [
+            StyleLossKind::UnsupportedProperty,
+            StyleLossKind::MissingReference,
+            StyleLossKind::LimitExceeded,
+            StyleLossKind::UnresolvedColor,
+        ] {
+            assert!(
+                parsed.losses.iter().any(|loss| loss.kind == kind),
+                "missing typed loss {kind:?}: {:?}",
+                parsed.losses
+            );
+        }
+    }
+
+    #[test]
+    fn xlsx_table_regions_compose_with_sheet_column_row_and_direct_cell_styles() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let styles = r#"<styleSheet>
+            <fonts count="3"><font><name val="Base"/></font><font><b/></font><font><i/></font></fonts>
+            <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF636363"/></patternFill></fill></fills>
+            <borders count="1"><border/></borders>
+            <cellXfs count="4">
+                <xf numFmtId="2" fontId="0" fillId="0" borderId="0"/>
+                <xf numFmtId="2" fontId="1" fillId="0" borderId="0" applyFont="1"/>
+                <xf numFmtId="2" fontId="2" fillId="0" borderId="0" applyFont="1"/>
+                <xf numFmtId="2" fontId="0" fillId="1" borderId="0" applyFill="1"/>
+            </cellXfs>
+            <dxfs count="11">
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF0A0A0A"/></patternFill></fill></dxf>
+                <dxf><font><b/><color rgb="FFFFFFFF"/></font><fill><patternFill patternType="solid"><fgColor rgb="FF141414"/></patternFill></fill></dxf>
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF1E1E1E"/></patternFill></fill></dxf>
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF282828"/></patternFill></fill></dxf>
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF323232"/></patternFill></fill></dxf>
+                <dxf><font><color rgb="FF3C3C3C"/></font></dxf>
+                <dxf><font><i/></font></dxf>
+                <dxf><font><color rgb="FF505050"/></font></dxf>
+                <dxf><font><color rgb="FF5A5A5A"/></font></dxf>
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF464646"/></patternFill></fill></dxf>
+                <dxf><fill><patternFill patternType="solid"><fgColor rgb="FF484848"/></patternFill></fill></dxf>
+            </dxfs>
+            <tableStyles count="1"><tableStyle name="Layered" count="12">
+                <tableStyleElement type="wholeTable" dxfId="0"/>
+                <tableStyleElement type="headerRow" dxfId="1"/>
+                <tableStyleElement type="totalRow" dxfId="2"/>
+                <tableStyleElement type="firstRowStripe" size="2" dxfId="3"/>
+                <tableStyleElement type="secondRowStripe" dxfId="4"/>
+                <tableStyleElement type="firstColumn" dxfId="5"/>
+                <tableStyleElement type="lastColumn" dxfId="6"/>
+                <tableStyleElement type="firstHeaderCell" dxfId="7"/>
+                <tableStyleElement type="lastTotalCell" dxfId="8"/>
+                <tableStyleElement type="firstColumnStripe" dxfId="9"/>
+                <tableStyleElement type="secondColumnStripe" dxfId="10"/>
+                <tableStyleElement type="pageFieldLabels" dxfId="0"/>
+            </tableStyle></tableStyles>
+        </styleSheet>"#;
+        let worksheet = r#"<worksheet><cols><col min="1" max="1" style="1"/></cols><sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>H1</t></is></c><c r="B1" t="inlineStr"><is><t>H2</t></is></c><c r="C1" t="inlineStr"><is><t>H3</t></is></c></row>
+            <row r="2" s="2" customFormat="1"><c r="A2"><v>1</v></c><c r="B2" s="3"><v>2</v></c><c r="C2"><v>3</v></c></row>
+            <row r="3"><c r="A3"><v>4</v></c><c r="B3"><v>5</v></c><c r="C3"><v>6</v></c></row>
+            <row r="4"><c r="A4"><v>7</v></c><c r="B4"><v>8</v></c><c r="C4"><v>9</v></c></row>
+            <row r="5"><c r="A5"><v>10</v></c><c r="B5"><v>11</v></c><c r="C5"><v>12</v></c></row>
+        </sheetData><tableParts count="1"><tablePart r:id="rIdTable"/></tableParts></worksheet>"#;
+        let table = r#"<table id="1" name="LayeredTable" displayName="LayeredTable" ref="A1:C5" headerRowCount="1" totalsRowCount="1"><tableColumns count="3"><tableColumn id="1" name="H1"/><tableColumn id="2" name="H2"/><tableColumn id="3" name="H3"/></tableColumns><tableStyleInfo name="Layered" showFirstColumn="1" showLastColumn="1" showRowStripes="1" showColumnStripes="1"/></table>"#;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="styles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            ("xl/styles.xml", styles),
+            ("xl/worksheets/sheet1.xml", worksheet),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                r#"<Relationships><Relationship Id="rIdTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#,
+            ),
+            ("xl/tables/table1.xml", table),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        let workbook = Workbook::open(&zip.finish().unwrap().into_inner()).unwrap();
+        let sheet = &workbook.sheets[0];
+        let effective_fill = |row, col| {
+            let style = sheet.resolved_cell_style(row, col)?;
+            style
+                .pattern_fill
+                .and_then(|fill| fill.foreground.or(fill.background))
+                .or(style.fill)
+        };
+
+        assert_eq!(effective_fill(0, 0), Some(Color::rgb(0x14, 0x14, 0x14)));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.font)
+                .and_then(|font| font.color),
+            Some(Color::rgb(0x50, 0x50, 0x50))
+        );
+        assert_eq!(
+            effective_fill(1, 1),
+            Some(Color::rgb(0x63, 0x63, 0x63)),
+            "direct cell fill must win over both row and column banding"
+        );
+        let direct = sheet.resolved_cell_style(1, 1).expect("direct style");
+        assert!(direct.font.as_ref().is_some_and(|font| font.italic));
+        assert_eq!(direct.num_fmt.as_deref(), Some("0.00"));
+        assert_eq!(effective_fill(2, 1), Some(Color::rgb(0x28, 0x28, 0x28)));
+        assert_eq!(effective_fill(3, 1), Some(Color::rgb(0x32, 0x32, 0x32)));
+        assert_eq!(effective_fill(4, 2), Some(Color::rgb(0x1E, 0x1E, 0x1E)));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(4, 2)
+                .and_then(|style| style.font)
+                .and_then(|font| font.color),
+            Some(Color::rgb(0x5A, 0x5A, 0x5A))
+        );
+        assert!(sheet.style_losses().iter().any(|loss| {
+            loss.kind == StyleLossKind::UnsupportedProperty && loss.occurrences == 1
+        }));
+        assert_eq!(
+            sheet.resolved_cell_style(2, 1),
+            sheet.resolved_cell_style(2, 1)
+        );
     }
 
     #[test]
@@ -4976,6 +8110,130 @@ mod tests {
         let page_setup = parsed.page_setup.expect("page setup metadata");
         assert_eq!(page_setup.header.as_deref(), Some("&COdd pages"));
         assert_eq!(page_setup.footer.as_deref(), Some("&COdd footer"));
+    }
+
+    #[test]
+    fn print_sidecar_retains_exact_ooxml_source_metadata() {
+        let xml = r#"<worksheet>
+            <sheetData/>
+            <printOptions gridLines="0" headings="1" horizontalCentered="1" verticalCentered="0"/>
+            <pageSetup pageOrder="overThenDown"/>
+            <headerFooter differentOddEven="1" differentFirst="1" scaleWithDoc="0" alignWithMargins="1">
+                <oddHeader>&amp;COdd</oddHeader><oddFooter>&amp;LOddF</oddFooter>
+                <evenHeader>&amp;CEven</evenHeader><evenFooter>&amp;LEvenF</evenFooter>
+                <firstHeader>&amp;CFirst</firstHeader><firstFooter>&amp;LFirstF</firstFooter>
+            </headerFooter>
+            <rowBreaks count="3" manualBreakCount="2">
+                <brk id="20" min="0" max="16383" man="1"/>
+                <brk id="5" min="0" max="16383" man="1"/>
+                <brk id="8" min="0" max="16383" man="0"/>
+            </rowBreaks>
+            <colBreaks count="2" manualBreakCount="2">
+                <brk id="7" min="0" max="1048575" man="1"/>
+                <brk id="3" min="0" max="1048575" man="1"/>
+            </colBreaks>
+        </worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let mut parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        let names = [SheetDefinedName {
+            local_sheet_id: 0,
+            name: "_xlnm.Print_Area".to_string(),
+            refers_to: "'Print Sheet'!$A$1:$B$2,'Print Sheet'!$D$4:$F$9".to_string(),
+        }];
+        apply_sheet_defined_names(
+            &mut parsed.page_setup,
+            &mut parsed.print_metadata,
+            &mut parsed.autofilter,
+            names.iter(),
+        );
+
+        let metadata = &parsed.print_metadata;
+        assert_eq!(metadata.fidelity(), crate::PrintFidelity::Retained);
+        assert_eq!(metadata.print_areas(), &[(0, 0, 1, 1), (3, 3, 8, 5)]);
+        assert_eq!(metadata.manual_row_breaks(), &[5, 20]);
+        assert_eq!(metadata.manual_col_breaks(), &[3, 7]);
+        assert_eq!(metadata.page_order(), Some(PrintPageOrder::OverThenDown));
+        assert_eq!(metadata.print_gridlines(), Some(false));
+        assert_eq!(metadata.print_headings(), Some(true));
+        assert_eq!(metadata.center_horizontally(), Some(true));
+        assert_eq!(metadata.center_vertically(), Some(false));
+        let header_footer = metadata.header_footer();
+        assert_eq!(header_footer.odd_header(), Some("&COdd"));
+        assert_eq!(header_footer.odd_footer(), Some("&LOddF"));
+        assert_eq!(header_footer.even_header(), Some("&CEven"));
+        assert_eq!(header_footer.even_footer(), Some("&LEvenF"));
+        assert_eq!(header_footer.first_header(), Some("&CFirst"));
+        assert_eq!(header_footer.first_footer(), Some("&LFirstF"));
+        assert_eq!(header_footer.different_odd_even(), Some(true));
+        assert_eq!(header_footer.different_first(), Some(true));
+        assert_eq!(header_footer.scale_with_document(), Some(false));
+        assert_eq!(header_footer.align_with_margins(), Some(true));
+        assert_eq!(
+            parsed
+                .page_setup
+                .as_ref()
+                .and_then(|setup| setup.print_area),
+            Some((0, 0, 1, 1))
+        );
+    }
+
+    #[test]
+    fn malformed_ooxml_print_state_is_typed_not_flattened() {
+        let xml = r#"<worksheet><sheetData/><pageSetup pageOrder="sideways"/>
+            <rowBreaks><brk id="bad" man="1"/></rowBreaks>
+            <headerFooter differentFirst="maybe"><firstHeader>first</firstHeader></headerFooter>
+        </worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        assert_eq!(
+            parsed.print_metadata.fidelity(),
+            crate::PrintFidelity::Partial
+        );
+        assert!(parsed
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::InvalidPageBreak));
+        assert!(parsed
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::MalformedHeaderFooter));
+        assert!(parsed
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::UnsupportedProperty));
+    }
+
+    #[test]
+    fn self_closing_ooxml_break_container_does_not_capture_stray_breaks() {
+        let xml = r#"<worksheet><sheetData/><rowBreaks/><brk id="9" man="1"/></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        assert!(parsed.print_metadata.manual_row_breaks().is_empty());
+        assert!(parsed.print_metadata.manual_col_breaks().is_empty());
     }
 
     #[test]
@@ -5269,6 +8527,57 @@ mod tests {
             other => panic!("expected a formula cell, got {other:?}"),
         }
         assert_eq!(a1.text, "30"); // display text is the cached value
+    }
+
+    #[test]
+    fn conditional_metadata_retains_priority_stop_full_dxf_and_losses() {
+        let styles_xml = r#"<styleSheet>
+            <dxfs count="1"><dxf>
+                <font><b/><color rgb="FF112233"/><outline/></font>
+                <fill><patternFill patternType="solid"><fgColor rgb="FF445566"/></patternFill></fill>
+                <border><left style="thin"><color rgb="FF778899"/></left><diagonal style="thin"/></border>
+                <numFmt numFmtId="166" formatCode="0.000"/>
+                <alignment horizontal="center" wrapText="1" readingOrder="2"/>
+                <protection locked="0" hidden="1"/>
+            </dxf></dxfs>
+        </styleSheet>"#;
+        let theme = ThemeColors::default();
+        let styles = parse_styles(styles_xml, &theme);
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData>
+            <conditionalFormatting sqref="A1">
+                <cfRule type="cellIs" dxfId="0" priority="7" stopIfTrue="1" operator="greaterThan"><formula>1</formula></cfRule>
+            </conditionalFormatting></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(xml, &[], &styles, &theme, false, &mut budget);
+
+        assert_eq!(parsed.cond_formats.len(), 1);
+        assert_eq!(parsed.cond_format_metadata.len(), 1);
+        let metadata = &parsed.cond_format_metadata[0];
+        assert_eq!(metadata.priority, Some(7));
+        assert!(metadata.stop_if_true);
+        let dxf = metadata
+            .differential_style
+            .as_ref()
+            .expect("retained differential style");
+        assert_eq!(dxf.fill, Some(Color::rgb(0x44, 0x55, 0x66)));
+        assert_eq!(
+            dxf.font.as_ref().and_then(|font| font.color),
+            Some(Color::rgb(0x11, 0x22, 0x33))
+        );
+        assert!(dxf.font.as_ref().is_some_and(|font| font.bold));
+        assert_eq!(
+            dxf.border.as_ref().map(|border| border.left),
+            Some(BorderStyle::Thin)
+        );
+        assert_eq!(dxf.num_fmt.as_deref(), Some("0.000"));
+        assert!(dxf.align.as_ref().is_some_and(|align| align.wrap));
+        assert!(dxf
+            .protection
+            .as_ref()
+            .is_some_and(|protection| protection.locked == Some(false) && protection.hidden));
+        assert!(metadata.style_losses.iter().any(|loss| {
+            loss.kind == StyleLossKind::UnsupportedProperty && loss.occurrences >= 2
+        }));
     }
 }
 #[test]

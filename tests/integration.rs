@@ -1663,6 +1663,38 @@ fn committed_korean_biff5_fixture_decodes_cp949_exactly() {
     );
 }
 
+/// The synthetic BIFF8 Korean fixture exercises an SST/CONTINUE compression
+/// transition, numeric adjacency, and a cached-string formula end to end.
+#[test]
+fn committed_korean_biff8_fixture_matches_the_exact_typed_oracle() {
+    use rxls::{Cell, ContainerParseMode, RecoveryCode, WorkbookReport};
+
+    let wb = Workbook::open(include_bytes!("fixtures/xls/korean-unicode-biff8.xls"))
+        .expect("Korean BIFF8 fixture");
+    assert_eq!(wb.sheets.len(), 1);
+    let sheet = wb.sheet_by_name("한글표").expect("Korean sheet name");
+    assert_eq!(sheet.cell(0, 0), Some(&Cell::Text("K-한글".into())));
+    assert_eq!(sheet.cell(0, 1), Some(&Cell::Number(949.0)));
+    assert_eq!(
+        sheet.cell(1, 0),
+        Some(&Cell::Formula {
+            formula: "\"확인\"".into(),
+            cached: Box::new(Cell::Text("확인".into())),
+        })
+    );
+
+    let provenance = wb.parse_provenance();
+    assert_eq!(provenance.container, ContainerParseMode::Primary);
+    assert_eq!(provenance.recoveries(), &[] as &[RecoveryCode]);
+    assert!(!provenance.recoveries_truncated());
+    assert!(!provenance.partial);
+
+    assert_eq!(
+        WorkbookReport::from_workbook("xls", &wb).to_json(),
+        r#"{"schema_version":2,"format":"xls","stats":{"sheets":1,"cells":3,"formulas":1,"text_truncated":false},"properties":{"title":null,"subject":null,"creator":null,"keywords":null,"description":null,"last_modified_by":null,"company":null,"created":null},"defined_names_count":0,"local_defined_names_count":0,"features":{"comments":0,"data_validations":0,"tables":0,"merged_ranges":0,"hyperlinks":0,"images":0,"charts":0,"sparklines":0,"conditional_formatting":0,"hidden_sheets":0,"frozen_panes":0,"page_setup":0,"protection":0,"pivot_tables":0,"vba_project":false,"threaded_comments":0,"external_links":0,"custom_xml":0},"evaluation":{"computed":1,"errors":0,"cached":0,"unsupported":0,"truncated":false,"by_reason":{}},"provenance":{"container":"primary","recoveries":[],"recoveries_truncated":false,"partial":false},"warnings":[]}"#
+    );
+}
+
 /// Formula text is reconstructed from BIFF tokens, not from cached results.
 /// This workbook was saved as BIFF8 by LibreOffice from the committed OOXML
 /// source, so these expectations are independent of rxls' token writer/tests.
@@ -3794,17 +3826,11 @@ fn range_sparse_construction_and_set_value_populate_owned_cells() {
 fn range_default_and_equality_support_borrowed_and_owned_ranges() {
     use rxls::Cell;
 
-    fn assert_range_eq_across_lifetimes<'left, 'right>(
-        left: &rxls::Range<'left>,
-        right: &rxls::Range<'right>,
-    ) {
+    fn assert_range_eq_across_lifetimes(left: &rxls::Range<'_>, right: &rxls::Range<'_>) {
         assert_eq!(left, right);
     }
 
-    fn assert_range_ne_across_lifetimes<'left, 'right>(
-        left: &rxls::Range<'left>,
-        right: &rxls::Range<'right>,
-    ) {
+    fn assert_range_ne_across_lifetimes(left: &rxls::Range<'_>, right: &rxls::Range<'_>) {
         assert_ne!(left, right);
     }
 
@@ -4187,16 +4213,16 @@ fn formula_range_sparse_construction_and_set_value_populate_owned_formulas() {
 fn formula_range_default_and_equality_support_borrowed_and_owned_ranges() {
     use rxls::Cell;
 
-    fn assert_formula_range_eq_across_lifetimes<'left, 'right>(
-        left: &rxls::FormulaRange<'left>,
-        right: &rxls::FormulaRange<'right>,
+    fn assert_formula_range_eq_across_lifetimes(
+        left: &rxls::FormulaRange<'_>,
+        right: &rxls::FormulaRange<'_>,
     ) {
         assert_eq!(left, right);
     }
 
-    fn assert_formula_range_ne_across_lifetimes<'left, 'right>(
-        left: &rxls::FormulaRange<'left>,
-        right: &rxls::FormulaRange<'right>,
+    fn assert_formula_range_ne_across_lifetimes(
+        left: &rxls::FormulaRange<'_>,
+        right: &rxls::FormulaRange<'_>,
     ) {
         assert_ne!(left, right);
     }

@@ -10,6 +10,9 @@
 
 use std::collections::HashMap;
 
+#[path = "number_format.rs"]
+mod number_format;
+
 /// What a numeric cell's format means for text rendering. Shared by the BIFF
 /// (`.xls`) and SpreadsheetML (`.xlsx`) paths — both use the same number-format
 /// classification and serial-date arithmetic.
@@ -67,6 +70,38 @@ pub(crate) fn render_value(value: f64, kind: Kind, is_1904: bool) -> String {
     }
 }
 
+/// Render a numeric value with an explicit spreadsheet number-format code.
+/// Malformed or hostile codes fall back to the crate's stable plain-number
+/// representation instead of panicking or emitting partial output.
+pub(crate) fn render_format(value: f64, format_code: &str, is_1904: bool) -> String {
+    number_format::render_number(value, format_code, is_1904)
+        .unwrap_or_else(|| crate::format_number(value))
+}
+
+/// Apply an explicit fourth text section to an authored text cell. Number
+/// formats without a text section leave the source text unchanged.
+pub(crate) fn render_text_format(value: &str, format_code: &str) -> String {
+    number_format::render_text(value, format_code).unwrap_or_else(|| value.to_string())
+}
+
+/// Render a built-in format while retaining the crate's established canonical
+/// date/time strings. Percentage precision, grouping, fraction, and scientific
+/// built-ins use the complete format engine.
+pub(crate) fn render_indexed(value: f64, numfmt_id: u16, is_1904: bool) -> String {
+    let kind = classify_builtin(numfmt_id);
+    if matches!(
+        kind,
+        Kind::Date | Kind::Time | Kind::DateTime | Kind::ElapsedTime
+    ) || matches!(numfmt_id, 0 | 49)
+    {
+        return render_value(value, kind, is_1904);
+    }
+    built_in_format_code(numfmt_id).map_or_else(
+        || render_value(value, kind, is_1904),
+        |code| render_format(value, code, is_1904),
+    )
+}
+
 /// Accumulated formatting tables for a workbook.
 #[derive(Debug, Default)]
 pub(crate) struct Formats {
@@ -111,6 +146,15 @@ impl Formats {
         self.xf_ifmt.get(ixfe as usize).copied().unwrap_or(0)
     }
 
+    /// Resolve a number-format code for style retention. Locale-dependent
+    /// built-ins are deliberately left unset rather than guessed.
+    pub(crate) fn code_for_ifmt(&self, ifmt: u16) -> Option<String> {
+        self.custom
+            .get(&ifmt)
+            .cloned()
+            .or_else(|| built_in_format_code(ifmt).map(str::to_string))
+    }
+
     fn kind(&self, ixfe: u16) -> Kind {
         let ifmt = self.ifmt_for(ixfe);
         if let Some(s) = self.custom.get(&ifmt) {
@@ -128,7 +172,48 @@ impl Formats {
 
     /// Render a numeric cell value according to its format.
     pub(crate) fn render(&self, value: f64, ixfe: u16) -> String {
-        render_value(value, self.kind(ixfe), self.datemode_1904)
+        let ifmt = self.ifmt_for(ixfe);
+        match self.custom.get(&ifmt) {
+            Some(code) => render_format(value, code, self.datemode_1904),
+            None => render_indexed(value, ifmt, self.datemode_1904),
+        }
+    }
+
+    /// Apply an explicit fourth text section for a cell XF.
+    pub(crate) fn render_text(&self, value: &str, ixfe: u16) -> String {
+        let ifmt = self.ifmt_for(ixfe);
+        self.custom
+            .get(&ifmt)
+            .map_or_else(|| value.to_string(), |code| render_text_format(value, code))
+    }
+}
+
+pub(crate) fn built_in_format_code(ifmt: u16) -> Option<&'static str> {
+    match ifmt {
+        1 => Some("0"),
+        2 => Some("0.00"),
+        3 => Some("#,##0"),
+        4 => Some("#,##0.00"),
+        9 => Some("0%"),
+        10 => Some("0.00%"),
+        11 => Some("0.00E+00"),
+        12 => Some("# ?/?"),
+        13 => Some("# ??/??"),
+        14 => Some("m/d/yy"),
+        15 => Some("d-mmm-yy"),
+        16 => Some("d-mmm"),
+        17 => Some("mmm-yy"),
+        18 => Some("h:mm AM/PM"),
+        19 => Some("h:mm:ss AM/PM"),
+        20 => Some("h:mm"),
+        21 => Some("h:mm:ss"),
+        22 => Some("m/d/yy h:mm"),
+        45 => Some("mm:ss"),
+        46 => Some("[h]:mm:ss"),
+        47 => Some("mm:ss.0"),
+        48 => Some("##0.0E+0"),
+        49 => Some("@"),
+        _ => None,
     }
 }
 
@@ -537,13 +622,15 @@ mod tests {
         let mut f = Formats::default();
         f.push_xf(&[0, 0, 14, 0]); // XF[0] -> ifmt 14 (date)
         f.push_xf(&[0, 0, 9, 0]); // XF[1] -> ifmt 9 (percent)
-        f.push_xf(&[0, 0, 0, 0]); // XF[2] -> ifmt 0 (plain)
+        f.push_xf(&[0, 0, 10, 0]); // XF[2] -> ifmt 10 (two-decimal percent)
+        f.push_xf(&[0, 0, 0, 0]); // XF[3] -> ifmt 0 (plain)
         f.push_format(&[165, 0], || Some("[h]:mm".to_string()));
-        f.push_xf(&[0, 0, 165, 0]); // XF[3] -> custom elapsed-time format
+        f.push_xf(&[0, 0, 165, 0]); // XF[4] -> custom elapsed-time format
         assert_eq!(f.render(45366.0, 0), "2024-03-15");
         assert_eq!(f.render(0.5, 1), "50%");
-        assert_eq!(f.render(1234.0, 2), "1234");
-        assert_eq!(f.render(1.5, 3), "36:00:00");
+        assert_eq!(f.render(0.5, 2), "50.00%");
+        assert_eq!(f.render(1234.0, 3), "1234");
+        assert_eq!(f.render(1.5, 4), "36:00");
     }
 
     #[test]

@@ -31,6 +31,37 @@ SCRIPT = ROOT / "scripts" / "xlsx-openpyxl-parity.py"
 
 @unittest.skipIf(openpyxl is None, "openpyxl is not installed")
 class XlsxOpenpyxlParityTests(unittest.TestCase):
+    def test_number_formats_select_sign_zero_and_conditional_sections(self) -> None:
+        module = _load_xlsx_openpyxl_parity()
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        cases = [
+            (0.5, "0%;0", "50%"),
+            (-0.5, "0%;0", "-0.5"),
+            (0.5, "0;0%", "0.5"),
+            (-0.5, "0;0%", "-50%"),
+            (0.0, "0;0;yyyy-mm-dd", "00:00:00"),
+            (42_803.0, "[>=40000]yyyy-mm-dd;0%", "2017-03-09"),
+            (0.5, "[>=40000]yyyy-mm-dd;0%", "50%"),
+            (1.5, "h:mm:ss", "12:00:00"),
+            (1.5, "[hh]:mm:ss", "36:00:00"),
+            (1.5, "[m]:ss", "36:00:00"),
+            (1.5, "[mm]:ss", "36:00:00"),
+            (1.5, "[s]", "36:00:00"),
+            (1.5, "[ss]", "36:00:00"),
+        ]
+        for row, (value, fmt, expected) in enumerate(cases, start=1):
+            cell = sheet.cell(row=row, column=1, value=value)
+            cell.number_format = fmt
+            with self.subTest(value=value, fmt=fmt):
+                self.assertEqual(module._cell_text(cell), expected)
+
+        date_cell = sheet.cell(row=len(cases) + 1, column=1, value=datetime.datetime(2017, 3, 9))
+        date_cell.number_format = "[>=40000]yyyy-mm-dd;0%"
+        self.assertEqual(module._cell_text(date_cell), "2017-03-09")
+        date_cell.number_format = "[>50000]yyyy-mm-dd;0%"
+        self.assertEqual(module._cell_text(date_cell), "4280300%")
+
     def test_skip_classification_maps_rows_to_decisions_and_evidence(self) -> None:
         module = _load_xlsx_openpyxl_parity()
 
@@ -1789,15 +1820,19 @@ class XlsxOpenpyxlParityTests(unittest.TestCase):
             self.assertIn("comparable: 1", output.stdout)
             self.assertIn("rxls vs openpyxl: mean parity 100.000%", output.stdout)
 
-    def test_timedelta_oracle_uses_elapsed_hour_format(self) -> None:
+    def test_timedelta_oracle_canonicalizes_all_elapsed_formats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             workbook_path = base / "duration.xlsx"
             workbook = openpyxl.Workbook()
             sheet = workbook.active
             sheet.title = "Durations"
-            sheet["A1"] = datetime.timedelta(days=10, hours=15, minutes=10, seconds=10)
-            sheet["A1"].number_format = "[hh]:mm:ss"
+            duration = datetime.timedelta(days=10, hours=15, minutes=10, seconds=10)
+            for row, number_format in enumerate(
+                ("[hh]:mm:ss", "[m]:ss", "[mm]:ss", "[s]", "[ss]"), start=1
+            ):
+                cell = sheet.cell(row=row, column=1, value=duration)
+                cell.number_format = number_format
             workbook.save(workbook_path)
 
             manifest_path = base / "manifest.json"
@@ -1823,7 +1858,7 @@ class XlsxOpenpyxlParityTests(unittest.TestCase):
                     """\
                     #!/usr/bin/env python3
                     print("# Durations")
-                    print("255:10:10")
+                    print("255:10:10\\n" * 5, end="")
                     """
                 ),
                 encoding="utf-8",

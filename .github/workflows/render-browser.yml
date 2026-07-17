@@ -1,0 +1,132 @@
+name: render-browser
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/render-browser.yml"
+      - "bindings/render-wasm/**"
+      - "render/**"
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/render-browser.yml"
+      - "bindings/render-wasm/**"
+      - "render/**"
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  CHROMIUM_VERSION: "150.0.7871.115"
+  CHROMIUM_ARCHIVE_SHA256: "1be2db033133c5e2dd1a4e8664bf67b19a61bcf6ed28d2b00f433b3f0b4f9585"
+  CHROMIUM_ARCHIVE_SIZE: "187332810"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  worker-wasm:
+    name: bounded worker in pinned Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: bindings/render-wasm
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "20"
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Verify publishable package and pinned toolchain metadata
+        working-directory: bindings/render-wasm
+        run: |
+          node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync("package.json")); const l=JSON.parse(fs.readFileSync("toolchain-lock.json")); const a=l.chromium.archive; if (p.private === true || p.publishConfig?.access !== "public" || p.publishConfig?.provenance !== true || l.rust !== process.env.RENDER_MSRV || l.wasmBindgen.buildRust !== process.env.WASM_BINDGEN_BUILD_RUST || l.wasmBindgen.version !== process.env.WASM_BINDGEN_VERSION || l.chromium.version !== process.env.CHROMIUM_VERSION || a.platform !== "linux64" || a.file !== "chrome-linux64.zip" || a.sha256 !== process.env.CHROMIUM_ARCHIVE_SHA256 || String(a.sizeBytes) !== process.env.CHROMIUM_ARCHIVE_SIZE) process.exit(1)'
+          cargo fmt -- --check
+      - name: Test native facade and JavaScript protocol
+        working-directory: bindings/render-wasm
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          npm test
+      - name: Install exact wasm-bindgen CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+      - name: Build exact wasm32 package
+        working-directory: bindings/render-wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          npm run build:wasm
+      - name: Install exact Chrome for Testing
+        shell: bash
+        run: |
+          mkdir -p target/render-chrome
+          curl --fail --location --retry 3 \
+            --output target/render-chrome/chrome.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chrome-linux64.zip"
+          test "$(stat --format=%s target/render-chrome/chrome.zip)" = "$CHROMIUM_ARCHIVE_SIZE"
+          printf '%s  %s\n' "$CHROMIUM_ARCHIVE_SHA256" target/render-chrome/chrome.zip \
+            | sha256sum --check --strict
+          unzip -q target/render-chrome/chrome.zip -d target/render-chrome
+          chmod +x target/render-chrome/chrome-linux64/chrome
+          echo "RXLS_CHROMIUM_BIN=$GITHUB_WORKSPACE/target/render-chrome/chrome-linux64/chrome" >> "$GITHUB_ENV"
+      - name: Exercise worker under strict CSP in pinned Chromium
+        working-directory: bindings/render-wasm
+        run: |
+          mkdir -p ../../target/render-browser-evidence
+          npm run test:browser | tee ../../target/render-browser-evidence/chromium.log
+      - name: Pack and consume the publishable artifact
+        working-directory: bindings/render-wasm
+        run: |
+          npm pack --json --pack-destination ../../target/render-browser-evidence | tee ../../target/render-browser-evidence/npm-pack.json
+          node -e 'const fs=require("node:fs"); const [p]=JSON.parse(fs.readFileSync("../../target/render-browser-evidence/npm-pack.json")); const wasm=p.files.find((f)=>f.path==="pkg/rxls_render_wasm_bg.wasm"); const notices=p.files.find((f)=>f.path==="THIRD_PARTY_NOTICES.txt"); if (p.entryCount !== 12 || p.size > 2*1024*1024 || p.unpackedSize > 5*1024*1024 || !wasm || wasm.size > 4*1024*1024 || !notices) process.exit(1)'
+          mkdir -p ../../target/render-browser-consumer
+          cd ../../target/render-browser-consumer
+          npm init --yes
+          npm install --ignore-scripts --no-audit --no-fund \
+            ../render-browser-evidence/rxls-render-worker-0.1.2.tgz
+          node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v1") process.exit(1)'
+          RXLS_RENDER_INSTALLED_PACKAGE_ROOT="$PWD/node_modules/@rxls/render-worker" \
+            node --experimental-websocket \
+            "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \
+            | tee ../render-browser-evidence/installed-package-chromium.log
+          sha256sum ../render-browser-evidence/rxls-render-worker-0.1.2.tgz > ../render-browser-evidence/npm-pack.sha256
+      - name: Upload browser-rendering evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-browser-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-browser-evidence
+          if-no-files-found: error
+          retention-days: 14

@@ -4518,12 +4518,10 @@ fn delete_sheet_plan(tree: &XmlTree, name: &str) -> Result<SheetDeletePlan> {
     }
 
     let active = workbook_active_tab(tree).min(sheet_nodes.len() - 1);
-    let new_active = if active > sheet_index {
-        active - 1
-    } else if active == sheet_index {
-        sheet_index.min(sheet_nodes.len() - 2)
-    } else {
-        active
+    let new_active = match active.cmp(&sheet_index) {
+        std::cmp::Ordering::Greater => active - 1,
+        std::cmp::Ordering::Equal => sheet_index.min(sheet_nodes.len() - 2),
+        std::cmp::Ordering::Less => active,
     };
     Ok(SheetDeletePlan {
         sheet_index,
@@ -4572,14 +4570,14 @@ fn sml_repair_local_defined_names_after_delete(
         else {
             continue;
         };
-        if local_index == deleted_index {
-            tree.remove_child(defined_names, name)?;
-        } else if local_index > deleted_index {
-            tree.set_attr(
+        match local_index.cmp(&deleted_index) {
+            std::cmp::Ordering::Equal => tree.remove_child(defined_names, name)?,
+            std::cmp::Ordering::Greater => tree.set_attr(
                 name,
                 b"localSheetId",
                 (local_index - 1).to_string().as_bytes(),
-            )?;
+            )?,
+            std::cmp::Ordering::Less => {}
         }
     }
     let has_names = tree
@@ -4614,12 +4612,10 @@ fn sml_repair_workbook_view_after_delete(
     else {
         return Ok(());
     };
-    let repaired = if first_sheet > deleted_index {
-        first_sheet - 1
-    } else if first_sheet == deleted_index {
-        new_active_tab
-    } else {
-        first_sheet
+    let repaired = match first_sheet.cmp(&deleted_index) {
+        std::cmp::Ordering::Greater => first_sheet - 1,
+        std::cmp::Ordering::Equal => new_active_tab,
+        std::cmp::Ordering::Less => first_sheet,
     };
     tree.set_attr(view, b"firstSheet", repaired.to_string().as_bytes())?;
     Ok(())

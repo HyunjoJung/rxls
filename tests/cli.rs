@@ -5,6 +5,19 @@ use std::process::Command;
 #[cfg(feature = "xlsx")]
 use rxls::{Cell, Workbook};
 
+fn rxls_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_rxls")
+        .ok()
+        .or_else(|| option_env!("CARGO_BIN_EXE_rxls").map(str::to_owned))
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "target\\debug\\rxls.exe".to_string()
+            } else {
+                "target/debug/rxls".to_string()
+            }
+        })
+}
+
 #[cfg(any(feature = "xlsx", feature = "ods"))]
 fn json_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "\\\\")
@@ -12,13 +25,7 @@ fn json_path(path: &std::path::Path) -> String {
 
 #[test]
 fn cli_version_reports_crate_identity() {
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .arg("--version")
         .output()
@@ -37,13 +44,7 @@ fn cli_version_reports_crate_identity() {
 
 #[test]
 fn cli_help_is_successful_stdout_contract() {
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .arg("--help")
         .output()
@@ -59,13 +60,7 @@ fn cli_help_is_successful_stdout_contract() {
 
 #[test]
 fn cli_invalid_usage_remains_stderr_only() {
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .arg("not-a-command")
         .output()
@@ -86,13 +81,7 @@ fn cli_info_reports_workbook_and_sheet_structure() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xlsx/reader-structural.xlsx"
     );
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["info", fixture])
         .output()
@@ -122,13 +111,7 @@ fn cli_dump_reports_bounded_sheet_cells() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xlsx/reader-structural.xlsx"
     );
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["dump", fixture, "--sheet", "0", "--limit", "4"])
         .output()
@@ -171,7 +154,7 @@ fn cli_dump_reports_formatted_display_text() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write display fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "dump",
@@ -223,7 +206,7 @@ fn cli_csv_exports_sheet_with_delimiter() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write csv fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "csv",
@@ -268,7 +251,7 @@ fn cli_csv_applies_bom_crlf_and_formula_injection_policy() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write csv fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "csv",
@@ -309,7 +292,7 @@ fn cli_csv_output_limit_fails_without_partial_stdout() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write csv fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "csv",
@@ -360,7 +343,7 @@ fn cli_formula_reports_bounded_formula_cells() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write formula fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "formula",
@@ -419,13 +402,7 @@ fn cli_diagnose_reports_machine_readable_counts() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write diagnose fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["diagnose", path.to_str().expect("utf8 fixture path")])
         .output()
@@ -440,7 +417,7 @@ fn cli_diagnose_reports_machine_readable_counts() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
-    assert!(stdout.contains(r#""schema_version":1"#));
+    assert!(stdout.contains(r#""schema_version":2"#));
     assert!(stdout.contains(r#""format":"xlsx""#));
     assert!(
         stdout.contains(r#""stats":{"sheets":2,"cells":3,"formulas":1,"text_truncated":false}"#)
@@ -448,12 +425,13 @@ fn cli_diagnose_reports_machine_readable_counts() {
     assert!(stdout.contains(r#""defined_names_count":1"#));
     assert!(stdout.contains(r#""features":{"comments":0,"data_validations":0,"tables":0,"merged_ranges":0,"hyperlinks":0,"images":0,"charts":0,"sparklines":0,"conditional_formatting":0,"hidden_sheets":1,"frozen_panes":1,"page_setup":0,"protection":0,"pivot_tables":0,"vba_project":false,"threaded_comments":0,"external_links":0,"custom_xml":0}"#));
     assert!(stdout.contains(r#""evaluation":{"computed":1,"errors":0,"cached":0,"unsupported":0,"truncated":false,"by_reason":{}}"#));
+    assert!(stdout.contains(r#""provenance":{"container":"primary","recoveries":[],"recoveries_truncated":false,"partial":false}"#));
     assert!(stdout.contains(r#""warnings":[]"#));
 }
 
 #[cfg(feature = "xlsx")]
 #[test]
-fn cli_diagnose_schema_v1_matches_exact_golden() {
+fn cli_diagnose_schema_v2_matches_exact_golden() {
     let mut workbook = Workbook::new();
     workbook.add_sheet("Data").write(0, 0, "value");
 
@@ -464,7 +442,7 @@ fn cli_diagnose_schema_v1_matches_exact_golden() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write diagnose fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["diagnose", path.to_str().expect("utf8 fixture path")])
         .output()
@@ -479,9 +457,64 @@ fn cli_diagnose_schema_v1_matches_exact_golden() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is utf8"),
-        include_str!("golden/diagnose-v1.json")
+        include_str!("golden/diagnose-v2.json")
     );
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn cli_diagnose_surfaces_tolerant_cfb_recovery_without_changing_dump_or_csv() {
+    let clean = include_bytes!("fixtures/xls/reader-basic.xls").to_vec();
+    let mut recovered = clean.clone();
+    // The bounded CFB fallback does not depend on the primary reader's byte
+    // order marker, so this forces the recovery path without touching BIFF.
+    recovered[0x1C] = 0;
+    recovered[0x1D] = 0;
+
+    let base = std::env::temp_dir().join(format!(
+        "rxls_cli_provenance_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::create_dir_all(&base).expect("create provenance fixture dir");
+    let clean_path = base.join("clean.xls");
+    let recovered_path = base.join("recovered.xls");
+    std::fs::write(&clean_path, clean).expect("write primary fixture");
+    std::fs::write(&recovered_path, recovered).expect("write recovered fixture");
+
+    let bin = rxls_bin();
+    let run = |args: &[&str]| {
+        let output = Command::new(&bin).args(args).output().expect("run rxls");
+        assert!(
+            output.status.success(),
+            "rxls {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).expect("stdout is utf8")
+    };
+    let clean_name = clean_path.to_str().expect("utf8 clean path");
+    let recovered_name = recovered_path.to_str().expect("utf8 recovered path");
+
+    let clean_report = run(&["diagnose", clean_name]);
+    let recovered_report = run(&["diagnose", recovered_name]);
+    assert!(clean_report.contains(r#""provenance":{"container":"primary","recoveries":[],"recoveries_truncated":false,"partial":false}"#));
+    assert!(recovered_report.contains(r#""provenance":{"container":"tolerant_cfb_directory_walk","recoveries":["tolerant_cfb_directory_walk"],"recoveries_truncated":false,"partial":false}"#));
+
+    assert_eq!(
+        run(&["csv", clean_name, "--sheet", "0"]),
+        run(&["csv", recovered_name, "--sheet", "0"])
+    );
+    let clean_dump = run(&["dump", clean_name, "--sheet", "0", "--limit", "50"]);
+    let recovered_dump = run(&["dump", recovered_name, "--sheet", "0", "--limit", "50"]);
+    assert_eq!(
+        clean_dump.lines().skip(2).collect::<Vec<_>>(),
+        recovered_dump.lines().skip(2).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[cfg(feature = "xlsx")]
@@ -494,13 +527,7 @@ fn cli_diagnose_reports_preserved_package_inventory() {
     ));
     std::fs::write(&path, synthetic_xlsm_with_inventory()).expect("write diagnose fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "target\\debug\\rxls.exe".to_string()
-        } else {
-            "target/debug/rxls".to_string()
-        }
-    });
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["diagnose", path.to_str().expect("utf8 fixture path")])
         .output()
@@ -614,7 +641,7 @@ fn cli_metadata_reports_workbook_metadata() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write metadata fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["metadata", path.to_str().expect("utf8 fixture path")])
         .output()
@@ -648,7 +675,7 @@ fn cli_metadata_reports_aggregate_r3_metadata_counts() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xlsx/reader-structural.xlsx"
     );
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["metadata", fixture])
         .output()
@@ -714,7 +741,7 @@ fn cli_metadata_reports_sheet_display_metadata_values() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write metadata display fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["metadata", path.to_str().expect("utf8 fixture path")])
         .output()
@@ -750,7 +777,7 @@ fn cli_inspect_package_reports_bounded_zip_parts() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xlsx/reader-structural.xlsx"
     );
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["inspect-package", fixture, "--limit", "3"])
         .output()
@@ -794,7 +821,7 @@ fn cli_inspect_output_reports_generated_writer_package() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write workbook fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "inspect-output",
@@ -880,7 +907,7 @@ fn cli_inspect_output_reports_readback_metadata_counts() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write workbook fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "inspect-output",
@@ -944,7 +971,7 @@ fn cli_inspect_output_reports_bounded_semantic_difference_rows() {
     ));
     std::fs::write(&path, bytes).expect("write semantic difference fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "inspect-output",
@@ -998,7 +1025,7 @@ fn cli_compare_reports_bounded_workbook_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1071,7 +1098,7 @@ fn cli_compare_reports_formula_cached_value_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1130,7 +1157,7 @@ fn cli_compare_reports_formatted_display_text_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1184,7 +1211,7 @@ fn cli_compare_reports_workbook_view_metadata_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1239,7 +1266,7 @@ fn cli_compare_reports_workbook_property_and_defined_name_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1303,7 +1330,7 @@ fn cli_compare_reports_sheet_metadata_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1382,7 +1409,7 @@ fn cli_compare_reports_detailed_sheet_metadata_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1466,7 +1493,7 @@ fn cli_compare_reports_table_style_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1542,7 +1569,7 @@ fn cli_compare_reports_data_validation_option_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1612,7 +1639,7 @@ fn cli_compare_reports_page_setup_margin_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1683,7 +1710,7 @@ fn cli_compare_reports_sheet_view_tab_color_and_print_option_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1768,7 +1795,7 @@ fn cli_compare_reports_sheet_protection_and_outline_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1874,7 +1901,7 @@ fn cli_compare_reports_chart_series_and_axis_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -1946,7 +1973,7 @@ fn cli_compare_reports_image_payload_differences() {
     std::fs::write(&left_path, left.to_xlsx()).expect("write left workbook");
     std::fs::write(&right_path, right.to_xlsx()).expect("write right workbook");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "compare",
@@ -2015,7 +2042,7 @@ fn cli_corpus_report_summarizes_manifest_parse_results() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2087,7 +2114,7 @@ fn cli_corpus_report_fails_when_an_expected_rejection_opens() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2133,7 +2160,7 @@ fn cli_corpus_report_fails_on_unexpected_io_errors() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2179,7 +2206,7 @@ fn cli_corpus_report_tags_misleading_zip_signature_failures() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2234,7 +2261,7 @@ fn cli_corpus_report_counts_xlsm_as_ooxml_eligible() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2310,7 +2337,7 @@ fn cli_corpus_report_tags_encrypted_ods_evidence() {
     )
     .expect("write manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "corpus-report",
@@ -2348,9 +2375,9 @@ fn cli_corpus_report_tags_encrypted_ods_evidence() {
 #[test]
 fn cli_fixture_report_validates_committed_fixture_manifest() {
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/MANIFEST.json");
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
-        .args(["fixture-report", manifest, "--limit", "5"])
+        .args(["fixture-report", manifest, "--limit", "6"])
         .output()
         .expect("run rxls fixture-report");
 
@@ -2363,16 +2390,16 @@ fn cli_fixture_report_validates_committed_fixture_manifest() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf8");
     assert!(stdout.contains("rxls fixture-report"));
-    assert!(stdout.contains("manifest_entries: 5"));
-    assert!(stdout.contains("opened: 5"));
-    assert!(stdout.contains("hash_ok: 5"));
-    assert!(stdout.contains("oracle_entries: 5"));
-    assert!(stdout.contains("oracle_ok: 5"));
+    assert!(stdout.contains("manifest_entries: 6"));
+    assert!(stdout.contains("opened: 6"));
+    assert!(stdout.contains("hash_ok: 6"));
+    assert!(stdout.contains("oracle_entries: 6"));
+    assert!(stdout.contains("oracle_ok: 6"));
     assert!(stdout.contains("oracle_failed: 0"));
     assert!(stdout.contains("failed: 0"));
     assert!(stdout.contains("coverage_tags: "));
     assert!(stdout.contains("by_format: ods files=1 opened=1 hash_ok=1"));
-    assert!(stdout.contains("by_format: xls files=2 opened=2 hash_ok=2"));
+    assert!(stdout.contains("by_format: xls files=3 opened=3 hash_ok=3"));
     assert!(stdout.contains("by_format: xlsb files=1 opened=1 hash_ok=1"));
     assert!(stdout.contains("by_format: xlsx files=1 opened=1 hash_ok=1"));
     assert!(stdout.contains(
@@ -2383,6 +2410,7 @@ fn cli_fixture_report_validates_committed_fixture_manifest() {
     ));
     assert!(stdout.contains("oracle: xls tests/fixtures/xls/reader-basic.xls sheets=2 cells=7 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=0 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
     assert!(stdout.contains("oracle: xls tests/fixtures/xls/korean-cp949-biff5.xls sheets=1 cells=4 defined_names=0 hidden_sheets=0 merged_ranges=0 hyperlinks=0 comments=0 tables=0 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
+    assert!(stdout.contains("oracle: xls tests/fixtures/xls/korean-unicode-biff8.xls sheets=1 cells=3 defined_names=0 hidden_sheets=0 merged_ranges=0 hyperlinks=0 comments=0 tables=0 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
     assert!(stdout.contains("oracle: xlsx tests/fixtures/xlsx/reader-structural.xlsx sheets=2 cells=12 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=0 autofilters=1 page_setups=1 images=0 sheet_views=1 tab_colors=1 print_options=1 sparklines=0"));
     assert!(stdout.contains("oracle: xlsb tests/fixtures/xlsb/reader-basic.xlsb sheets=2 cells=8 defined_names=0 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=0 autofilters=0 page_setups=0 images=0 sheet_views=0 tab_colors=0 print_options=0 sparklines=0"));
     assert!(stdout.contains("oracle: ods tests/fixtures/ods/repeated-hidden.ods sheets=2 cells=10 defined_names=1 hidden_sheets=1 merged_ranges=1 hyperlinks=1 comments=1 tables=1 data_validations=2 autofilters=1 page_setups=1 images=1 sheet_views=1 tab_colors=0 print_options=0 sparklines=0"));
@@ -2430,7 +2458,7 @@ fn cli_fixture_report_rejects_missing_metadata_oracle_counts() {
     )
     .expect("write fixture manifest");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "fixture-report",
@@ -2455,7 +2483,7 @@ fn cli_sheet_reports_focused_sheet_metadata() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/xlsx/reader-structural.xlsx"
     );
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args(["sheet", fixture, "--sheet", "0"])
         .output()
@@ -2517,7 +2545,7 @@ fn cli_sheet_reports_detailed_display_metadata() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write sheet metadata fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "sheet",
@@ -2616,7 +2644,7 @@ fn cli_sheet_reports_detailed_r3_metadata_values() {
     ));
     std::fs::write(&path, workbook.to_xlsx()).expect("write sheet R3 metadata fixture");
 
-    let bin = std::env::var("CARGO_BIN_EXE_rxls").expect("rxls binary path");
+    let bin = rxls_bin();
     let output = Command::new(bin)
         .args([
             "sheet",

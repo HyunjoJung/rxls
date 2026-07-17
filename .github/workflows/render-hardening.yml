@@ -1,0 +1,252 @@
+name: render-hardening
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/render-hardening.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "render/**"
+      - "scripts/check_workflow_policy.py"
+      - "scripts/fetch-render-fonts.py"
+      - "scripts/render-fonts-lock.json"
+      - "scripts/render-oracle-host-requirements.txt"
+      - "scripts/render-oracle-host-tools-lock.json"
+      - "scripts/render-oracle-host-tools.py"
+      - "scripts/render-oracle-container/**"
+      - "scripts/render-performance-gates.py"
+      - "scripts/run-render-oracle-container.py"
+      - "scripts/test_render_oracle_container.py"
+      - "scripts/test_render_oracle_host_tools.py"
+      - "scripts/test_render_fuzz_assets.py"
+      - "scripts/test_render_performance_gates.py"
+      - "src/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  RENDER_MSRV: "1.85.0"
+  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
+  CARGO_FUZZ_VERSION: "0.13.2"
+
+jobs:
+  pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RXLS_REQUIRE_POPPLER: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Capture an unpinned host identity and fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_IDENTITY="$(
+            python3 -c 'import json; print(json.dumps(json.load(open("scripts/render-oracle-host-tools-lock.json"))["expected_identity"], separators=(",", ":")))'
+          )"
+          if [[ "$EXPECTED_IDENTITY" != "null" ]]; then
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --force-reinstall \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement scripts/render-oracle-host-requirements.txt
+          mkdir -p target
+          python3 scripts/render-oracle-host-tools.py verify \
+            --scope all \
+            --bootstrap-identities \
+            --output target/poppler-identity.json
+          echo "Review and pin the uploaded host identity before this gate can pass." >&2
+          exit 1
+      - name: Verify the pinned Poppler PDF gate and complete native closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          python3 scripts/test_render_oracle_host_tools.py
+          SYSTEM_PACKAGE_TEXT="$(
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler
+          )"
+          mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+          [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"
+          python3 scripts/render-oracle-host-tools.py verify \
+            --scope poppler \
+            --output target/poppler-identity.json
+      - name: Reopen deterministic PDFs and extract Latin, Korean, and RTL text
+        run: >-
+          cargo test --locked --manifest-path render/Cargo.toml --test printing
+          deterministic_pdf_reopens_has_exact_page_count_and_extractable_text
+          -- --exact
+      - name: Upload verified Poppler identity
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-pdf-poppler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/poppler-identity.json
+          if-no-files-found: error
+          retention-days: 14
+
+  oracle-image:
+    name: locked LibreOffice oracle image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Build and verify the locked oracle image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          EXPECTED_IMAGE_ID="$(
+            python3 -c 'import json; print(json.dumps(json.load(open("scripts/render-oracle-container/lock.json"))["built_image"]["expected_id"], separators=(",", ":")))'
+          )"
+          BOOTSTRAP_ARGS=()
+          if [[ "$EXPECTED_IMAGE_ID" == "null" ]]; then
+            BOOTSTRAP_ARGS+=(--bootstrap-identities)
+          fi
+          python3 scripts/run-render-oracle-container.py verify-lock \
+            "${BOOTSTRAP_ARGS[@]}"
+          python3 scripts/run-render-oracle-container.py build \
+            --engine docker \
+            --image rxls-render-oracle:lo-26.2.3 \
+            --execute \
+            "${BOOTSTRAP_ARGS[@]}" \
+            > target/render-oracle-image-build.json
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          lock = json.loads(pathlib.Path("scripts/render-oracle-container/lock.json").read_text())
+          evidence = json.loads(pathlib.Path("target/render-oracle-image-build.json").read_text())
+          expected = lock["built_image"]["expected_id"]
+          if expected is None:
+              assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence
+              assert evidence["expected_image_id"] is None, evidence
+              print("Review and pin the uploaded oracle image identity before this gate can pass.", file=sys.stderr)
+              raise SystemExit(1)
+          assert evidence["image_identity_status"] == "pinned_match", evidence
+          assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence
+          PY
+      - name: Upload oracle image identity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-oracle-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-oracle-image-build.json
+          if-no-files-found: error
+          retention-days: 14
+
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Test the performance gate
+        run: |
+          python3 -m unittest \
+            scripts/test_render_fuzz_assets.py \
+            scripts/test_fetch_render_fonts.py \
+            scripts/test_render_performance_gates.py
+      - name: Acquire and verify the pinned OFL performance font pack
+        run: |
+          python3 scripts/fetch-render-fonts.py --acquire
+          python3 scripts/fetch-render-fonts.py --verify
+      - name: Test the generated workload driver at MSRV
+        run: cargo test --locked --manifest-path render/perf/Cargo.toml
+      - name: Build the generated workload driver
+        run: cargo build --locked --release --manifest-path render/perf/Cargo.toml
+      - name: Enforce renderer wall, RSS, page, command, and output caps
+        run: |
+          python3 scripts/render-performance-gates.py \
+            --driver render/perf/target/release/rxls-render-perf \
+            --font-pack-manifest local/render-fonts/pack/manifest.json \
+            --repeat 2 \
+            --output target/render-performance-evidence.json
+      - name: Upload renderer performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-performance-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '10' || '60' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY_VERSION }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Build renderer fuzz targets
+        working-directory: render
+        run: cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build
+      - name: Replay deterministic renderer seeds
+        working-directory: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../target/render-fuzz
+          for target in snapshot_construction pagination svg_emission chart_range_resolution image_headers backend_command_replay; do
+            for seed in "fuzz/seeds/$target"/*; do
+              cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run "$target" "$seed" -- \
+                -runs=1 -seed=1 -timeout=10 -rss_limit_mb=2048 \
+                2>&1 | tee -a ../target/render-fuzz/replay.log
+            done
+          done
+      - name: Run bounded renderer fuzz campaigns
+        working-directory: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../target/render-fuzz/corpus
+          for target in snapshot_construction pagination svg_emission chart_range_resolution image_headers backend_command_replay; do
+            cp -R "fuzz/seeds/$target" "../target/render-fuzz/corpus/$target"
+            cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run "$target" "../target/render-fuzz/corpus/$target" -- \
+              -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 \
+              2>&1 | tee "../target/render-fuzz/$target.log"
+          done
+      - name: Upload renderer fuzz diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/render-fuzz/*.log
+            render/fuzz/artifacts/**
+          if-no-files-found: warn
+          retention-days: 14

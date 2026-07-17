@@ -10,8 +10,10 @@
 
 use crate::format::Formats;
 use crate::model::{
-    Cell, CellEntry, Color, Comment, DataValidation, DocProperties, DvKind, DvOp, PageSetup, Sheet,
-    SheetType,
+    Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, Color, Comment,
+    DataValidation, DocProperties, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript, HAlign,
+    HeaderFooterKind, PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder, Sheet, SheetType,
+    StyleFidelity, VAlign,
 };
 use crate::{error_code, rk_to_f64, Error, Result, Workbook, MAX_TEXT_BYTES};
 
@@ -35,11 +37,15 @@ const CODEPAGE: u16 = 0x0042;
 const FILEPASS: u16 = 0x002F;
 const PROTECT: u16 = 0x0012;
 const DATEMODE: u16 = 0x0022;
+const FONT: u16 = 0x0031;
 const XF: u16 = 0x00E0;
 const FORMAT: u16 = 0x041E;
+const STYLE: u16 = 0x0293;
 const PALETTE: u16 = 0x0092;
 const HEADER: u16 = 0x0014;
 const FOOTER: u16 = 0x0015;
+const VERTICALPAGEBREAKS: u16 = 0x001A;
+const HORIZONTALPAGEBREAKS: u16 = 0x001B;
 const NOTE: u16 = 0x001C;
 const LEFTMARGIN: u16 = 0x0026;
 const RIGHTMARGIN: u16 = 0x0027;
@@ -50,10 +56,13 @@ const PRINTGRIDLINES: u16 = 0x002B;
 const HCENTER: u16 = 0x0083;
 const VCENTER: u16 = 0x0084;
 const SETUP: u16 = 0x00A1;
+const HEADERFOOTER: u16 = 0x089C;
 const SHEETEXT: u16 = 0x0862;
 const LABELSST: u16 = 0x00FD;
 const LABEL: u16 = 0x0204;
 const RSTRING: u16 = 0x00D6;
+const BLANK: u16 = 0x0201;
+const MULBLANK: u16 = 0x00BE;
 const RK: u16 = 0x027E;
 const MULRK: u16 = 0x00BD;
 const NUMBER: u16 = 0x0203;
@@ -65,6 +74,9 @@ const SHRFMLA: u16 = 0x04BC;
 const STRING: u16 = 0x0207;
 const ROW: u16 = 0x0208;
 const COLINFO: u16 = 0x007D;
+const DEFAULTCOLWIDTH: u16 = 0x0055;
+const STANDARDWIDTH: u16 = 0x0099;
+const DEFAULTROWHEIGHT: u16 = 0x0225;
 const PANE: u16 = 0x0041;
 const OBJ: u16 = 0x005D;
 const WINDOW1: u16 = 0x003D;
@@ -83,6 +95,14 @@ const RRD_HEAD: u16 = 0x0138;
 const DEFAULT_XOR_PASSWORD: &[u8] = b"VelvetSweatshop";
 const MAX_HLINK_ANCHORS: usize = 4096;
 const MAX_DV_RANGES: usize = 8192;
+const MAX_XLS_STYLE_RECORDS: usize = 4096;
+const MAX_XLS_RETAINED_STYLE_BYTES: usize = 64 << 20;
+// Valid BIFF8 FONT records are at most 78 bytes (31 UTF-16 code units); XF is
+// fixed at 20 bytes. Retain no hostile tail that the style decoder cannot use.
+const MAX_BIFF_FONT_RECORD_BYTES: usize = 78;
+const MAX_BIFF_XF_RECORD_BYTES: usize = 20;
+const MAX_BIFF_DEFAULT_COL_WIDTH_CHARS: u16 = 255;
+const MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS: i16 = 8179;
 const BIFF_DEFAULT_PALETTE: [Color; 56] = [
     Color::rgb(0x00, 0x00, 0x00),
     Color::rgb(0xFF, 0xFF, 0xFF),
@@ -141,6 +161,16 @@ const BIFF_DEFAULT_PALETTE: [Color; 56] = [
     Color::rgb(0x33, 0x33, 0x99),
     Color::rgb(0x33, 0x33, 0x33),
 ];
+const BIFF_INVARIANT_COLORS: [Color; 8] = [
+    Color::rgb(0x00, 0x00, 0x00),
+    Color::rgb(0xFF, 0xFF, 0xFF),
+    Color::rgb(0xFF, 0x00, 0x00),
+    Color::rgb(0x00, 0xFF, 0x00),
+    Color::rgb(0x00, 0x00, 0xFF),
+    Color::rgb(0xFF, 0xFF, 0x00),
+    Color::rgb(0xFF, 0x00, 0xFF),
+    Color::rgb(0x00, 0xFF, 0xFF),
+];
 
 type SheetRange = (u32, u16, u32, u16);
 type SheetRanges = Vec<SheetRange>;
@@ -155,6 +185,7 @@ struct FormulaDefinition {
 }
 
 type FormulaDefinitions = HashMap<(usize, u32, u16), FormulaDefinition>;
+type PendingFormula = (usize, u32, u16, u16, Option<String>);
 
 /// Decode context: the BIFF generation and the codepage for 8-bit strings.
 #[derive(Clone, Copy)]
@@ -164,6 +195,89 @@ struct Ctx {
     biff8: bool,
     /// Codec for BIFF5/7 8-bit strings (cp1252 default, cp949 for Korean, …).
     enc: &'static Encoding,
+}
+
+/// Sheet-wide BIFF geometry records are retained separately until the workbook
+/// generation is known and record-order-independent precedence can be applied.
+#[derive(Debug, Default)]
+struct XlsSheetDefaults {
+    def_col_width: Option<f32>,
+    standard_col_width: Option<f32>,
+    row_height: Option<f32>,
+}
+
+impl XlsSheetDefaults {
+    fn apply_record(&mut self, typ: u16, data: &[u8]) {
+        match typ {
+            DEFAULTCOLWIDTH => {
+                if let Some(width) = parse_biff_default_col_width(data) {
+                    self.def_col_width = Some(width);
+                }
+            }
+            STANDARDWIDTH => {
+                if let Some(width) = parse_biff_standard_width(data) {
+                    self.standard_col_width = Some(width);
+                }
+            }
+            DEFAULTROWHEIGHT => {
+                if let Some(height) = parse_biff_default_row_height(data) {
+                    self.row_height = Some(height);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_to(self, sheet: &mut Sheet, biff8: bool) {
+        // BIFF8 defines STANDARDWIDTH as the width for every column without a
+        // COLINFO record, with DEFCOLWIDTH as its fallback. In BIFF4/5,
+        // STANDARDWIDTH is selected per column by GCW, so promoting it to the
+        // model's single sheet-wide default would be incorrect for mixed GCW
+        // bitmaps. Retain the universal DEFCOLWIDTH fallback for BIFF5 instead;
+        // explicit COLINFO widths remain in `Sheet::col_widths` and win later.
+        sheet.default_col_width = if biff8 {
+            self.standard_col_width.or(self.def_col_width)
+        } else {
+            self.def_col_width
+        };
+        sheet.default_row_height = self.row_height;
+    }
+}
+
+fn parse_biff_default_col_width(data: &[u8]) -> Option<f32> {
+    if data.len() != 2 {
+        return None;
+    }
+    u16le(data, 0)
+        .filter(|width| (1..=MAX_BIFF_DEFAULT_COL_WIDTH_CHARS).contains(width))
+        .map(f32::from)
+}
+
+fn parse_biff_standard_width(data: &[u8]) -> Option<f32> {
+    if data.len() != 2 {
+        return None;
+    }
+    u16le(data, 0)
+        .filter(|width| *width > 0)
+        .map(|width| f32::from(width) / 256.0)
+}
+
+fn parse_biff_default_row_height(data: &[u8]) -> Option<f32> {
+    // rxls accepts BIFF5/8 workbooks. Both use the BIFF3+ four-byte layout:
+    // option flags first, then a signed twip height. A two-byte body is the
+    // incompatible BIFF2 layout and must not be reinterpreted here.
+    if data.len() != 4 {
+        return None;
+    }
+    let _flags = u16le(data, 0)?;
+    let twips = i16le(data, 2)?;
+    // fDyZero (flags bit 1) makes empty rows hidden while the payload retains
+    // their unhidden height. The current public model has no sheet-wide hidden
+    // row flag, so preserve that positive source height without expanding the
+    // worksheet into individual hidden rows.
+    (1..=MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS)
+        .contains(&twips)
+        .then(|| f32::from(twips) / 20.0)
 }
 
 /// Resolve a BIFF `CODEPAGE` value to its `encoding_rs` codec.
@@ -369,13 +483,405 @@ fn xor_decrypt_method1(data: &mut [u8], initial_index: usize) {
     }
 }
 
+/// Raw BIFF style tables are compiled only after the Globals Substream ends, so
+/// BIFF5 font names see the final CODEPAGE and FONT records see the final custom
+/// PALETTE even though those records can appear later in the stream.
+#[derive(Debug, Default)]
+struct XlsStyles {
+    font_records: Vec<Option<Vec<u8>>>,
+    xf_records: Vec<Vec<u8>>,
+    normal_style_xf: Option<u16>,
+    fonts: Vec<Option<Font>>,
+    xfs: Vec<Option<CellStyle>>,
+    compiled: bool,
+}
+
+impl XlsStyles {
+    fn push_font(&mut self, data: &[u8]) {
+        if self.font_records.len() >= MAX_XLS_STYLE_RECORDS {
+            return;
+        }
+        // BIFF's font index 4 is reserved and has no corresponding FONT record.
+        if self.font_records.len() == 4 {
+            self.font_records.push(None);
+        }
+        if self.font_records.len() < MAX_XLS_STYLE_RECORDS {
+            self.font_records.push(Some(
+                data[..data.len().min(MAX_BIFF_FONT_RECORD_BYTES)].to_vec(),
+            ));
+        }
+    }
+
+    fn push_xf(&mut self, data: &[u8]) {
+        if self.xf_records.len() < MAX_XLS_STYLE_RECORDS {
+            self.xf_records
+                .push(data[..data.len().min(MAX_BIFF_XF_RECORD_BYTES)].to_vec());
+        }
+    }
+
+    fn push_style(&mut self, data: &[u8]) {
+        let Some(flags) = u16le(data, 0) else {
+            return;
+        };
+        let built_in = flags & 0x8000 != 0;
+        if built_in && data.get(2).copied() == Some(0) {
+            self.normal_style_xf = Some(flags & 0x0FFF);
+        }
+    }
+
+    fn compile(&mut self, ctx: Ctx, formats: &Formats, palette: &[Color; 56]) {
+        if self.compiled {
+            return;
+        }
+        self.fonts = self
+            .font_records
+            .iter()
+            .map(|record| {
+                record
+                    .as_deref()
+                    .and_then(|data| parse_biff_font(data, ctx, palette))
+            })
+            .collect();
+        // Cell XFs already store the complete formatting set. Their parent and
+        // fAtr* fields describe how an authoring application propagates later
+        // style edits; they are not read-time inheritance switches.
+        self.xfs = self
+            .xf_records
+            .iter()
+            .map(|data| {
+                parse_biff_xf(data, ctx.biff8, &self.fonts, formats, palette)
+                    .map(|raw| raw.components.into_cell_style())
+            })
+            .collect();
+        self.compiled = true;
+    }
+
+    fn clone_xf(&self, index: u16, budget: &mut usize) -> Option<CellStyle> {
+        let style = self.xfs.get(usize::from(index))?.as_ref()?;
+        let cost = retained_style_cost(style);
+        if cost > *budget {
+            *budget = 0;
+            return None;
+        }
+        *budget -= cost;
+        Some(style.clone())
+    }
+
+    fn default_style(&self, budget: &mut usize) -> Option<CellStyle> {
+        self.clone_xf(15, budget).or_else(|| {
+            self.normal_style_xf
+                .and_then(|index| self.clone_xf(index, budget))
+        })
+    }
+
+    fn font(&self, index: u16) -> Option<Font> {
+        self.fonts.get(usize::from(index))?.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct XfComponents {
+    font: Option<Font>,
+    num_fmt: Option<String>,
+    alignment: Alignment,
+    border: Border,
+    fill: Fill,
+    protection: CellProtection,
+}
+
+impl XfComponents {
+    fn into_cell_style(self) -> CellStyle {
+        let legacy_fill = (self.fill.pattern == FormatPattern::Solid)
+            .then_some(self.fill.foreground)
+            .flatten();
+        CellStyle {
+            font: self.font,
+            fill: legacy_fill,
+            pattern_fill: Some(self.fill),
+            border: Some(self.border),
+            num_fmt: self.num_fmt,
+            align: Some(self.alignment),
+            protection: Some(self.protection),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawXf {
+    components: XfComponents,
+}
+
+fn parse_biff_font(data: &[u8], ctx: Ctx, palette: &[Color; 56]) -> Option<Font> {
+    if data.len() < 15 {
+        return None;
+    }
+    let height_twips = u16le(data, 0)?;
+    let flags = u16le(data, 2)?;
+    let color_index = u16le(data, 4)?;
+    let weight = u16le(data, 6)?;
+    let script = match u16le(data, 8).unwrap_or(0) {
+        1 => FormatScript::Superscript,
+        2 => FormatScript::Subscript,
+        _ => FormatScript::None,
+    };
+    let underline = matches!(
+        data.get(10).copied(),
+        Some(0x01) | Some(0x02) | Some(0x21) | Some(0x22)
+    );
+    let name = read_short_string(data, 14, ctx).filter(|name| !name.is_empty());
+    Some(Font {
+        name,
+        size_pt: (20..=8191)
+            .contains(&height_twips)
+            .then(|| (((u32::from(height_twips) + 10) / 20) as u16).max(1)),
+        color: biff_style_color(color_index, palette),
+        bold: (700..=1000).contains(&weight),
+        italic: flags & 0x0002 != 0,
+        underline,
+        strikethrough: flags & 0x0008 != 0,
+        script,
+    })
+}
+
+fn parse_biff_xf(
+    data: &[u8],
+    biff8: bool,
+    fonts: &[Option<Font>],
+    formats: &Formats,
+    palette: &[Color; 56],
+) -> Option<RawXf> {
+    let font_index = u16le(data, 0)?;
+    let format_index = u16le(data, 2)?;
+    let type_parent = u16le(data, 4)?;
+    let protection = CellProtection {
+        locked: Some(type_parent & 0x0001 != 0),
+        hidden: type_parent & 0x0002 != 0,
+    };
+    let font = fonts.get(usize::from(font_index)).cloned().flatten();
+    let num_fmt = formats.code_for_ifmt(format_index);
+
+    let (alignment, border, fill) = if biff8 {
+        if data.len() < 20 {
+            return None;
+        }
+        let align1 = data[6];
+        let rotation = data[7];
+        let align2 = data[8];
+        let border1 = u32le(data, 10)?;
+        let border2 = u32le(data, 14)?;
+        let fill_colors = u16le(data, 18)?;
+        (
+            parse_biff8_alignment(align1, rotation, align2),
+            Border {
+                left: biff_border_style(border1 & 0x0F),
+                right: biff_border_style((border1 >> 4) & 0x0F),
+                top: biff_border_style((border1 >> 8) & 0x0F),
+                bottom: biff_border_style((border1 >> 12) & 0x0F),
+                color: None,
+                left_color: biff_border_color(
+                    biff_border_style(border1 & 0x0F),
+                    (border1 >> 16) & 0x7F,
+                    palette,
+                ),
+                right_color: biff_border_color(
+                    biff_border_style((border1 >> 4) & 0x0F),
+                    (border1 >> 23) & 0x7F,
+                    palette,
+                ),
+                top_color: biff_border_color(
+                    biff_border_style((border1 >> 8) & 0x0F),
+                    border2 & 0x7F,
+                    palette,
+                ),
+                bottom_color: biff_border_color(
+                    biff_border_style((border1 >> 12) & 0x0F),
+                    (border2 >> 7) & 0x7F,
+                    palette,
+                ),
+            },
+            Fill {
+                pattern: biff_fill_pattern((border2 >> 26) & 0x3F),
+                foreground: biff_style_color(fill_colors & 0x7F, palette),
+                background: biff_style_color((fill_colors >> 7) & 0x7F, palette),
+            },
+        )
+    } else {
+        if data.len() < 16 {
+            return None;
+        }
+        let align1 = data[6];
+        let orient_used = data[7];
+        let border_fill1 = u32le(data, 8)?;
+        let border2 = u32le(data, 12)?;
+        (
+            parse_biff5_alignment(align1, orient_used & 0x03),
+            Border {
+                left: biff_border_style((border2 >> 3) & 0x07),
+                right: biff_border_style((border2 >> 6) & 0x07),
+                top: biff_border_style(border2 & 0x07),
+                bottom: biff_border_style((border_fill1 >> 22) & 0x07),
+                color: None,
+                left_color: biff_border_color(
+                    biff_border_style((border2 >> 3) & 0x07),
+                    (border2 >> 16) & 0x7F,
+                    palette,
+                ),
+                right_color: biff_border_color(
+                    biff_border_style((border2 >> 6) & 0x07),
+                    (border2 >> 23) & 0x7F,
+                    palette,
+                ),
+                top_color: biff_border_color(
+                    biff_border_style(border2 & 0x07),
+                    (border2 >> 9) & 0x7F,
+                    palette,
+                ),
+                bottom_color: biff_border_color(
+                    biff_border_style((border_fill1 >> 22) & 0x07),
+                    (border_fill1 >> 25) & 0x7F,
+                    palette,
+                ),
+            },
+            Fill {
+                pattern: biff_fill_pattern((border_fill1 >> 16) & 0x3F),
+                foreground: biff_style_color((border_fill1 & 0x7F) as u16, palette),
+                background: biff_style_color(((border_fill1 >> 7) & 0x7F) as u16, palette),
+            },
+        )
+    };
+    Some(RawXf {
+        components: XfComponents {
+            font,
+            num_fmt,
+            alignment,
+            border,
+            fill,
+            protection,
+        },
+    })
+}
+
+fn parse_biff8_alignment(align1: u8, rotation: u8, align2: u8) -> Alignment {
+    Alignment {
+        horizontal: biff_horizontal_alignment(align1 & 0x07),
+        vertical: biff_vertical_alignment((align1 >> 4) & 0x07),
+        wrap: align1 & 0x08 != 0,
+        rotation: biff_text_rotation(rotation),
+        indent: align2 & 0x0F,
+        shrink_to_fit: align2 & 0x10 != 0,
+    }
+}
+
+fn parse_biff5_alignment(align1: u8, orientation: u8) -> Alignment {
+    Alignment {
+        horizontal: biff_horizontal_alignment(align1 & 0x07),
+        vertical: biff_vertical_alignment((align1 >> 4) & 0x07),
+        wrap: align1 & 0x08 != 0,
+        rotation: match orientation {
+            2 => 90,
+            3 => -90,
+            _ => 0,
+        },
+        indent: 0,
+        shrink_to_fit: false,
+    }
+}
+
+fn biff_horizontal_alignment(value: u8) -> Option<HAlign> {
+    match value {
+        1 => Some(HAlign::Left),
+        2 => Some(HAlign::Center),
+        3 => Some(HAlign::Right),
+        _ => None,
+    }
+}
+
+fn biff_vertical_alignment(value: u8) -> Option<VAlign> {
+    match value {
+        0 => Some(VAlign::Top),
+        1 => Some(VAlign::Middle),
+        2 => Some(VAlign::Bottom),
+        _ => None,
+    }
+}
+
+fn biff_text_rotation(value: u8) -> i16 {
+    match value {
+        0..=90 => i16::from(value),
+        91..=180 => 90 - i16::from(value),
+        _ => 0,
+    }
+}
+
+fn biff_border_style(value: u32) -> BorderStyle {
+    match value {
+        1 => BorderStyle::Thin,
+        2 => BorderStyle::Medium,
+        5 => BorderStyle::Thick,
+        6 => BorderStyle::Double,
+        _ => BorderStyle::None,
+    }
+}
+
+fn biff_fill_pattern(value: u32) -> FormatPattern {
+    match value {
+        1 => FormatPattern::Solid,
+        2 => FormatPattern::MediumGray,
+        3 => FormatPattern::DarkGray,
+        4 => FormatPattern::LightGray,
+        5 => FormatPattern::DarkHorizontal,
+        6 => FormatPattern::DarkVertical,
+        7 => FormatPattern::DarkDown,
+        8 => FormatPattern::DarkUp,
+        9 => FormatPattern::DarkGrid,
+        10 => FormatPattern::DarkTrellis,
+        11 => FormatPattern::LightHorizontal,
+        12 => FormatPattern::LightVertical,
+        13 => FormatPattern::LightDown,
+        14 => FormatPattern::LightUp,
+        15 => FormatPattern::LightGrid,
+        16 => FormatPattern::LightTrellis,
+        17 => FormatPattern::Gray125,
+        18 => FormatPattern::Gray0625,
+        _ => FormatPattern::None,
+    }
+}
+
+fn biff_border_color(style: BorderStyle, value: u32, palette: &[Color; 56]) -> Option<Color> {
+    (style != BorderStyle::None)
+        .then(|| biff_style_color(value as u16, palette))
+        .flatten()
+}
+
+fn biff_style_color(index: u16, palette: &[Color; 56]) -> Option<Color> {
+    match index {
+        0..=7 => BIFF_INVARIANT_COLORS.get(usize::from(index)).copied(),
+        8..=63 => palette.get(usize::from(index - 8)).copied(),
+        _ => None,
+    }
+}
+
+fn retained_style_cost(style: &CellStyle) -> usize {
+    std::mem::size_of::<CellStyle>()
+        .saturating_add(
+            style
+                .font
+                .as_ref()
+                .and_then(|font| font.name.as_ref())
+                .map_or(0, String::len),
+        )
+        .saturating_add(style.num_fmt.as_ref().map_or(0, String::len))
+}
+
 impl Workbook {
     /// Like [`open`](Self::open) but forces the codepage for BIFF5/7 8-bit
     /// strings, overriding the workbook's `CODEPAGE` record. Useful when a
     /// legacy file has a missing or wrong codepage (e.g. force `949` for a
     /// Korean workbook). Ignored for BIFF8 (which uses UTF-16).
     pub fn open_with_codepage(bytes: &[u8], force_codepage: Option<u16>) -> Result<Self> {
-        let mut wb = crate::ole::read_workbook_stream(bytes)?;
+        let stream = crate::ole::read_workbook_stream(bytes)?;
+        let mut wb = stream.bytes;
+        let container_parse_mode = stream.container_mode;
         let default_xor_decrypted = maybe_decrypt_default_xor(&mut wb)?;
         if wb.is_empty() {
             return Err(Error::Biff("empty BIFF stream"));
@@ -393,6 +899,7 @@ impl Workbook {
         let mut current_supbook = None;
         let mut sheet_builtin_names: Vec<SheetBuiltinName> = Vec::new();
         let mut sheet_page_setups: Vec<XlsPageSetup> = Vec::new();
+        let mut sheet_defaults: Vec<XlsSheetDefaults> = Vec::new();
         let mut sheet_note_texts: Vec<HashMap<u16, String>> = Vec::new();
         let mut sheet_unkeyed_note_texts: Vec<VecDeque<String>> = Vec::new();
         let mut pending_note_obj: Option<(usize, u16)> = None;
@@ -404,12 +911,18 @@ impl Workbook {
         let mut depth = 0usize;
         let mut top_count = 0usize;
         let mut cur_sheet: Option<usize> = None;
-        let mut last_formula: Option<(usize, u32, u16, Option<String>)> = None;
+        let mut last_formula: Option<PendingFormula> = None;
         let mut formula_definitions = FormulaDefinitions::new();
         let mut formats = Formats::default();
+        let mut xls_styles = XlsStyles::default();
         let mut palette = BIFF_DEFAULT_PALETTE;
-        // Per-workbook text budget (shared across sheets) — see MAX_TEXT_BYTES.
+        // Per-workbook retained-cell budget (shared across sheets). The
+        // MAX_TEXT_BYTES ceiling also accounts for entry/Box storage so empty
+        // display formats cannot bypass the shared-string amplification bound.
         let mut budget = MAX_TEXT_BYTES;
+        // Style cloning is independently bounded because repeated XF references
+        // can amplify font/format strings across many materialized cells.
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
 
         // Decode context: assume BIFF8 until the first global BOF says otherwise;
         // codepage defaults to cp1252 and is refined by the CODEPAGE record (or
@@ -514,7 +1027,17 @@ impl Workbook {
                     }
                 }
                 DATEMODE => formats.set_datemode(data),
-                XF => formats.push_xf(data),
+                FONT => {
+                    if cur_sheet.is_none() {
+                        xls_styles.push_font(data);
+                    }
+                }
+                XF => {
+                    formats.push_xf(data);
+                    if cur_sheet.is_none() {
+                        xls_styles.push_xf(data);
+                    }
+                }
                 FORMAT => formats.push_format(data, || {
                     if ctx.biff8 {
                         read_xl_string(data, 2, ctx)
@@ -525,6 +1048,11 @@ impl Workbook {
                 PALETTE => {
                     if cur_sheet.is_none() {
                         apply_palette_record(data, &mut palette);
+                    }
+                }
+                STYLE => {
+                    if cur_sheet.is_none() {
+                        xls_styles.push_style(data);
                     }
                 }
                 LBL => {
@@ -569,6 +1097,7 @@ impl Workbook {
                         name,
                         is_worksheet: sheet_type == SheetType::WorkSheet,
                         sheet_type: Some(sheet_type),
+                        style_fidelity: StyleFidelity::Partial,
                         cells: Vec::new(),
                         hidden,
                         very_hidden,
@@ -576,6 +1105,7 @@ impl Workbook {
                     });
                     frozen_views.push(false);
                     sheet_page_setups.push(XlsPageSetup::default());
+                    sheet_defaults.push(XlsSheetDefaults::default());
                     sheet_note_texts.push(HashMap::new());
                     sheet_unkeyed_note_texts.push(VecDeque::new());
                 }
@@ -590,6 +1120,12 @@ impl Workbook {
                         return Err(Error::Biff("unexpected BIFF EOF record"));
                     }
                     depth -= 1;
+                    if depth == 0 && cur_sheet.is_none() {
+                        xls_styles.compile(ctx, &formats, &palette);
+                        for sheet in &mut sheets {
+                            sheet.default_format = xls_styles.default_style(&mut style_budget);
+                        }
+                    }
                 }
                 WINDOW1 if cur_sheet.is_none() && active_sheet.is_none() => {
                     active_sheet = parse_window1_active_sheet(data);
@@ -722,7 +1258,12 @@ impl Workbook {
                     if depth == 1 {
                         if let Some(si) = cur_sheet {
                             if si < sheets.len() {
-                                apply_row_outline(data, &mut sheets[si]);
+                                apply_row_outline(
+                                    data,
+                                    &mut sheets[si],
+                                    &xls_styles,
+                                    &mut style_budget,
+                                );
                             }
                         }
                     }
@@ -731,8 +1272,21 @@ impl Workbook {
                     if depth == 1 {
                         if let Some(si) = cur_sheet {
                             if si < sheets.len() {
-                                apply_col_outline(data, &mut sheets[si]);
+                                apply_col_outline(
+                                    data,
+                                    &mut sheets[si],
+                                    &xls_styles,
+                                    &mut style_budget,
+                                );
                             }
+                        }
+                    }
+                }
+                DEFAULTCOLWIDTH | STANDARDWIDTH | DEFAULTROWHEIGHT => {
+                    if depth == 1 {
+                        if let Some(defaults) = cur_sheet.and_then(|si| sheet_defaults.get_mut(si))
+                        {
+                            defaults.apply_record(typ, data);
                         }
                     }
                 }
@@ -764,8 +1318,9 @@ impl Workbook {
                         }
                     }
                 }
-                HEADER | FOOTER | LEFTMARGIN | RIGHTMARGIN | TOPMARGIN | BOTTOMMARGIN
-                | PRINTHEADERS | PRINTGRIDLINES | HCENTER | VCENTER | SETUP => {
+                HEADER | FOOTER | VERTICALPAGEBREAKS | HORIZONTALPAGEBREAKS | LEFTMARGIN
+                | RIGHTMARGIN | TOPMARGIN | BOTTOMMARGIN | PRINTHEADERS | PRINTGRIDLINES
+                | HCENTER | VCENTER | SETUP | HEADERFOOTER => {
                     if depth == 1 {
                         if let Some(si) = cur_sheet {
                             if si < sheet_page_setups.len() {
@@ -785,6 +1340,7 @@ impl Workbook {
                                     &definition,
                                     &mut sheets[si].cells,
                                     &mut last_formula,
+                                    &mut budget,
                                     ctx,
                                     &formula_sheet_names,
                                     &extern_sheets,
@@ -792,6 +1348,19 @@ impl Workbook {
                                     &formula_names,
                                 );
                             }
+                        }
+                    }
+                }
+                BLANK | MULBLANK => {
+                    if depth == 1 {
+                        if let Some(si) = cur_sheet.filter(|si| *si < sheets.len()) {
+                            retain_blank_cell_styles(
+                                typ,
+                                data,
+                                &mut sheets[si].blank_styles,
+                                &xls_styles,
+                                &mut style_budget,
+                            );
                         }
                     }
                 }
@@ -828,6 +1397,9 @@ impl Workbook {
                                     &mut last_formula,
                                     ctx,
                                     &mut budget,
+                                    &formats,
+                                    &xls_styles,
+                                    &mut style_budget,
                                 );
                             }
                         }
@@ -851,6 +1423,8 @@ impl Workbook {
                                     &mut last_formula,
                                     &formats,
                                     &mut budget,
+                                    &xls_styles,
+                                    &mut style_budget,
                                     &formula_sheet_names,
                                     &extern_sheets,
                                     &external_names,
@@ -872,6 +1446,9 @@ impl Workbook {
         }
         if pos != wb.len() {
             return Err(Error::Biff("truncated BIFF record header"));
+        }
+        for (sheet, defaults) in sheets.iter_mut().zip(sheet_defaults) {
+            defaults.apply_to(sheet, ctx.biff8);
         }
         apply_sheet_page_setups(&mut sheets, sheet_page_setups);
         apply_sheet_builtin_names(&mut sheets, sheet_builtin_names);
@@ -931,6 +1508,7 @@ impl Workbook {
             active_sheet: active_sheet.or(selected_sheet_fallback).unwrap_or_default(),
             protect_structure,
             text_truncated: budget == 0,
+            container_parse_mode,
             ..Default::default()
         })
     }
@@ -1124,6 +1702,7 @@ fn civil_from_unix_days(z: i64) -> (i64, u32, u32) {
 #[derive(Default)]
 struct XlsPageSetup {
     setup: PageSetup,
+    print_metadata: PrintMetadata,
     touched: bool,
     left_margin: Option<f64>,
     right_margin: Option<f64>,
@@ -1137,24 +1716,39 @@ struct XlsPageSetup {
 
 impl XlsPageSetup {
     fn apply_record(&mut self, typ: u16, data: &[u8], ctx: Ctx) {
+        self.print_metadata.mark_source();
         match typ {
             HEADER => self.set_header(data, ctx),
             FOOTER => self.set_footer(data, ctx),
+            HORIZONTALPAGEBREAKS => self.set_page_breaks(data, true, ctx),
+            VERTICALPAGEBREAKS => self.set_page_breaks(data, false, ctx),
             LEFTMARGIN => self.left_margin = read_margin(data),
             RIGHTMARGIN => self.right_margin = read_margin(data),
             TOPMARGIN => self.top_margin = read_margin(data),
             BOTTOMMARGIN => self.bottom_margin = read_margin(data),
-            PRINTHEADERS => self.print_headings = u16le(data, 0).unwrap_or(0) != 0,
-            PRINTGRIDLINES => self.print_gridlines = u16le(data, 0).unwrap_or(0) != 0,
+            PRINTHEADERS => {
+                self.print_headings = u16le(data, 0).unwrap_or(0) != 0;
+                self.print_metadata.set_print_headings(self.print_headings);
+            }
+            PRINTGRIDLINES => {
+                self.print_gridlines = u16le(data, 0).unwrap_or(0) != 0;
+                self.print_metadata
+                    .set_print_gridlines(self.print_gridlines);
+            }
             HCENTER => {
                 self.setup.center_horizontally = u16le(data, 0).unwrap_or(0) != 0;
+                self.print_metadata
+                    .set_center_horizontally(self.setup.center_horizontally);
                 self.touched = true;
             }
             VCENTER => {
                 self.setup.center_vertically = u16le(data, 0).unwrap_or(0) != 0;
+                self.print_metadata
+                    .set_center_vertically(self.setup.center_vertically);
                 self.touched = true;
             }
             SETUP => self.set_setup(data),
+            HEADERFOOTER => self.set_extended_header_footer(data, ctx),
             _ => {}
         }
         if matches!(typ, LEFTMARGIN | RIGHTMARGIN | TOPMARGIN | BOTTOMMARGIN)
@@ -1165,23 +1759,54 @@ impl XlsPageSetup {
     }
 
     fn set_header(&mut self, data: &[u8], ctx: Ctx) {
-        if let Some(text) = read_xl_string(data, 0, ctx).filter(|text| !text.is_empty()) {
-            self.setup.header = Some(text);
-            self.touched = true;
+        match read_xl_string(data, 0, ctx) {
+            Some(text) => {
+                self.print_metadata
+                    .set_header_footer(HeaderFooterKind::OddHeader, text.clone());
+                if !text.is_empty() {
+                    self.setup.header = Some(text);
+                    self.touched = true;
+                }
+            }
+            None if !data.is_empty() => self
+                .print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter),
+            None => self
+                .print_metadata
+                .set_header_footer(HeaderFooterKind::OddHeader, String::new()),
         }
     }
 
     fn set_footer(&mut self, data: &[u8], ctx: Ctx) {
-        if let Some(text) = read_xl_string(data, 0, ctx).filter(|text| !text.is_empty()) {
-            self.setup.footer = Some(text);
-            self.touched = true;
+        match read_xl_string(data, 0, ctx) {
+            Some(text) => {
+                self.print_metadata
+                    .set_header_footer(HeaderFooterKind::OddFooter, text.clone());
+                if !text.is_empty() {
+                    self.setup.footer = Some(text);
+                    self.touched = true;
+                }
+            }
+            None if !data.is_empty() => self
+                .print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter),
+            None => self
+                .print_metadata
+                .set_header_footer(HeaderFooterKind::OddFooter, String::new()),
         }
     }
 
     fn set_setup(&mut self, data: &[u8]) {
         let Some(flags) = u16le(data, 10) else {
+            self.print_metadata
+                .add_loss(PrintLossKind::UnsupportedProperty);
             return;
         };
+        self.print_metadata.set_page_order(if flags & 0x0001 != 0 {
+            PrintPageOrder::OverThenDown
+        } else {
+            PrintPageOrder::DownThenOver
+        });
         let no_printer_settings = flags & 0x0004 != 0;
         let no_orientation = flags & 0x0040 != 0;
         if !no_printer_settings {
@@ -1203,7 +1828,130 @@ impl XlsPageSetup {
         self.touched = true;
     }
 
-    fn into_page_setup(mut self) -> Option<PageSetup> {
+    fn set_page_breaks(&mut self, data: &[u8], rows: bool, ctx: Ctx) {
+        let Some(count) = u16le(data, 0).map(usize::from) else {
+            self.print_metadata
+                .add_loss(PrintLossKind::InvalidPageBreak);
+            return;
+        };
+        let stride = if ctx.biff8 { 6usize } else { 2usize };
+        let format_limit = if rows { 1_026usize } else { 255usize };
+        if count > format_limit {
+            self.print_metadata.add_loss(PrintLossKind::LimitExceeded);
+        }
+        for index in 0..count.min(format_limit) {
+            let Some(offset) = 2usize.checked_add(index.saturating_mul(stride)) else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::InvalidPageBreak);
+                break;
+            };
+            let Some(main) = u16le(data, offset) else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::InvalidPageBreak);
+                break;
+            };
+            if rows {
+                self.print_metadata.push_manual_row_break(u32::from(main));
+            } else if main <= 255 {
+                self.print_metadata.push_manual_col_break(main);
+            } else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::InvalidPageBreak);
+            }
+        }
+    }
+
+    fn set_extended_header_footer(&mut self, data: &[u8], ctx: Ctx) {
+        if !ctx.biff8 || data.len() < 38 {
+            self.print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+            return;
+        }
+        if u16le(data, 0) != Some(HEADERFOOTER) {
+            self.print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+        }
+        let Some(guid) = data.get(12..28) else {
+            self.print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+            return;
+        };
+        if guid.iter().any(|byte| *byte != 0) {
+            self.print_metadata
+                .add_loss(PrintLossKind::UnsupportedProperty);
+            return;
+        }
+        let Some(flags) = u16le(data, 28) else {
+            self.print_metadata
+                .add_loss(PrintLossKind::MalformedHeaderFooter);
+            return;
+        };
+        self.print_metadata.set_header_footer_flag(
+            Some(flags & 0x0001 != 0),
+            Some(flags & 0x0002 != 0),
+            Some(flags & 0x0004 != 0),
+            Some(flags & 0x0008 != 0),
+        );
+        let counts = [
+            u16le(data, 30),
+            u16le(data, 32),
+            u16le(data, 34),
+            u16le(data, 36),
+        ];
+        let kinds = [
+            HeaderFooterKind::EvenHeader,
+            HeaderFooterKind::EvenFooter,
+            HeaderFooterKind::FirstHeader,
+            HeaderFooterKind::FirstFooter,
+        ];
+        let enabled = [
+            flags & 0x0001 != 0,
+            flags & 0x0001 != 0,
+            flags & 0x0002 != 0,
+            flags & 0x0002 != 0,
+        ];
+        let mut offset = 38usize;
+        for ((count, kind), enabled) in counts.into_iter().zip(kinds).zip(enabled) {
+            let Some(count) = count else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+                return;
+            };
+            if count > 255 {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+                return;
+            }
+            if count == 0 {
+                if enabled {
+                    self.print_metadata.set_header_footer(kind, String::new());
+                }
+                continue;
+            }
+            if !enabled {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+            }
+            let Some((text, consumed)) = read_xl_unicode_string(data, offset, ctx) else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+                return;
+            };
+            if text.encode_utf16().count() != usize::from(count) {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+            }
+            self.print_metadata.set_header_footer(kind, text);
+            let Some(next) = offset.checked_add(consumed) else {
+                self.print_metadata
+                    .add_loss(PrintLossKind::MalformedHeaderFooter);
+                return;
+            };
+            offset = next;
+        }
+    }
+
+    fn take_page_setup(&mut self) -> Option<PageSetup> {
         if let (Some(left), Some(right), Some(top), Some(bottom), Some(header), Some(footer)) = (
             self.left_margin,
             self.right_margin,
@@ -1214,7 +1962,7 @@ impl XlsPageSetup {
         ) {
             self.setup.margins = Some((left, right, top, bottom, header, footer));
         }
-        self.touched.then_some(self.setup)
+        self.touched.then(|| std::mem::take(&mut self.setup))
     }
 }
 
@@ -1231,12 +1979,13 @@ fn read_margin_at(data: &[u8], offset: usize) -> Option<f64> {
 }
 
 fn apply_sheet_page_setups(sheets: &mut [Sheet], setups: Vec<XlsPageSetup>) {
-    for (sheet, setup) in sheets.iter_mut().zip(setups) {
+    for (sheet, mut setup) in sheets.iter_mut().zip(setups) {
         sheet.print_headings = setup.print_headings;
         sheet.print_gridlines = setup.print_gridlines;
-        if let Some(page_setup) = setup.into_page_setup() {
+        if let Some(page_setup) = setup.take_page_setup() {
             sheet.page_setup = Some(page_setup);
         }
+        sheet.print_metadata = setup.print_metadata;
     }
 }
 
@@ -1656,7 +2405,12 @@ fn apply_sheet_builtin_names(sheets: &mut [Sheet], names: Vec<SheetBuiltinName>)
         };
         match name.kind {
             SheetBuiltinKind::PrintArea => {
-                if let Some(range) = name.ranges.into_iter().next() {
+                let mut first = None;
+                for range in name.ranges {
+                    first.get_or_insert(range);
+                    sheet.print_metadata.push_print_area(range);
+                }
+                if let Some(range) = first {
                     sheet
                         .page_setup
                         .get_or_insert_with(PageSetup::default)
@@ -1911,7 +2665,8 @@ fn apply_formula_definition(
     sheet_idx: usize,
     definition: &FormulaDefinition,
     cells: &mut [CellEntry],
-    last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
+    last_formula: &mut Option<PendingFormula>,
+    budget: &mut usize,
     ctx: Ctx,
     sheet_names: &[String],
     extern_sheets: &[crate::ptg::ExternSheet],
@@ -1935,7 +2690,7 @@ fn apply_formula_definition(
     if formula.is_empty() {
         return;
     }
-    if let Some((si, row, col, source)) = last_formula.as_mut() {
+    if let Some((si, row, col, _ixfe, source)) = last_formula.as_mut() {
         if (*si, *row, *col) == (sheet_idx, definition.anchor.0, definition.anchor.1) {
             *source = Some(formula.clone());
         }
@@ -1948,12 +2703,37 @@ fn apply_formula_definition(
         match &mut cell.value {
             Cell::Formula {
                 formula: source, ..
-            } => *source = formula,
+            } => {
+                // A late ARRAY/SHRFMLA record can replace a formula source
+                // after the cached cell was already retained. Charge any
+                // growth before mutating so an exhausted budget leaves the
+                // existing typed value and source intact.
+                let growth = formula.capacity().saturating_sub(source.capacity());
+                if growth > *budget {
+                    *budget = 0;
+                } else {
+                    *budget -= growth;
+                    *source = formula;
+                }
+            }
             cached => {
-                cell.value = Cell::Formula {
-                    formula,
-                    cached: Box::new(cached.clone()),
-                };
+                // Moving the existing cached value into the Box avoids a
+                // transient clone. Its heap payload was charged when the cell
+                // was first retained, so only the formula source and Box<Cell>
+                // allocation are additional retained storage.
+                let growth = formula
+                    .capacity()
+                    .saturating_add(std::mem::size_of::<Cell>());
+                if growth > *budget {
+                    *budget = 0;
+                } else {
+                    *budget -= growth;
+                    let cached = std::mem::replace(cached, Cell::Bool(false));
+                    cell.value = Cell::Formula {
+                        formula,
+                        cached: Box::new(cached),
+                    };
+                }
             }
         }
     }
@@ -1966,9 +2746,11 @@ fn decode_cell(
     sst: &[String],
     sheet_idx: usize,
     cells: &mut Vec<CellEntry>,
-    last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
+    last_formula: &mut Option<PendingFormula>,
     formats: &Formats,
     budget: &mut usize,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
     sheet_names: &[String],
     extern_sheets: &[crate::ptg::ExternSheet],
     external_names: &[Vec<String>],
@@ -1989,7 +2771,17 @@ fn decode_cell(
         LABELSST => {
             if let Some(isst) = u32le(data, 6) {
                 if let Some(s) = sst.get(isst as usize) {
-                    push_text(cells, row, col, s.clone(), budget);
+                    push_text(
+                        cells,
+                        row,
+                        col,
+                        s.clone(),
+                        ixfe,
+                        formats,
+                        styles,
+                        style_budget,
+                        budget,
+                    );
                 }
             }
         }
@@ -1999,12 +2791,32 @@ fn decode_cell(
         NUMBER => {
             if let Some(b) = data.get(6..14) {
                 let f = f64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
-                push_number(cells, row, col, f, ixfe, formats, budget);
+                push_number(
+                    cells,
+                    row,
+                    col,
+                    f,
+                    ixfe,
+                    formats,
+                    styles,
+                    style_budget,
+                    budget,
+                );
             }
         }
         RK => {
             if let Some(rk) = u32le(data, 6) {
-                push_number(cells, row, col, rk_to_f64(rk), ixfe, formats, budget);
+                push_number(
+                    cells,
+                    row,
+                    col,
+                    rk_to_f64(rk),
+                    ixfe,
+                    formats,
+                    styles,
+                    style_budget,
+                    budget,
+                );
             }
         }
         MULRK => {
@@ -2024,6 +2836,8 @@ fn decode_cell(
                         rk_to_f64(rk),
                         cell_ixfe,
                         formats,
+                        styles,
+                        style_budget,
                         budget,
                     );
                 }
@@ -2035,10 +2849,30 @@ fn decode_cell(
                 if is_err == 0 {
                     let b = v != 0;
                     let text = if b { "TRUE" } else { "FALSE" }.to_string();
-                    push_cell(cells, row, col, Cell::Bool(b), text, budget);
+                    push_cell(
+                        cells,
+                        row,
+                        col,
+                        Cell::Bool(b),
+                        text,
+                        ixfe,
+                        styles,
+                        style_budget,
+                        budget,
+                    );
                 } else {
                     let code = error_code(v).to_string();
-                    push_cell(cells, row, col, Cell::Error(code.clone()), code, budget);
+                    push_cell(
+                        cells,
+                        row,
+                        col,
+                        Cell::Error(code.clone()),
+                        code,
+                        ixfe,
+                        styles,
+                        style_budget,
+                        budget,
+                    );
                 }
             }
         }
@@ -2067,7 +2901,7 @@ fn decode_cell(
             if let Some(res) = data.get(6..14) {
                 if res[6] == 0xFF && res[7] == 0xFF {
                     match res[0] {
-                        0x00 => *last_formula = Some((sheet_idx, row, col, formula)),
+                        0x00 => *last_formula = Some((sheet_idx, row, col, ixfe, formula)),
                         0x01 => {
                             let b = res[2] != 0;
                             let text = if b { "TRUE" } else { "FALSE" }.to_string();
@@ -2077,34 +2911,47 @@ fn decode_cell(
                                 col,
                                 wrap_formula(&formula, Cell::Bool(b)),
                                 text,
+                                ixfe,
+                                styles,
+                                style_budget,
                                 budget,
                             );
                         }
                         0x02 => {
                             let code = error_code(res[2]).to_string();
                             let cell = wrap_formula(&formula, Cell::Error(code.clone()));
-                            push_cell(cells, row, col, cell, code, budget);
+                            push_cell(
+                                cells,
+                                row,
+                                col,
+                                cell,
+                                code,
+                                ixfe,
+                                styles,
+                                style_budget,
+                                budget,
+                            );
                         }
                         _ => {
                             // 0x03 empty cached result. Surface formula identity
-                            // when rgce decompiled. Pushed directly because
-                            // `push_cell` skips empty-text cells; gated on the text
-                            // budget so a flood of blank-result formulas can't grow
-                            // the cell vector past the global allocation bound.
-                            if let (Some(fs), true) = (formula, *budget > 0) {
-                                let cost = fs.len().min(*budget);
-                                *budget -= cost;
-                                cells.push(CellEntry {
+                            // when rgce decompiled. `push_cell` charges an
+                            // allocation budget even though the display text is
+                            // empty.
+                            if let Some(fs) = formula {
+                                push_cell(
+                                    cells,
                                     row,
                                     col,
-                                    value: Cell::Formula {
+                                    Cell::Formula {
                                         formula: fs,
                                         cached: Box::new(Cell::Text(String::new())),
                                     },
-                                    text: String::new(),
-                                    style: None,
-                                    hyperlink: None,
-                                });
+                                    String::new(),
+                                    ixfe,
+                                    styles,
+                                    style_budget,
+                                    budget,
+                                );
                             }
                         }
                     }
@@ -2122,9 +2969,29 @@ fn decode_cell(
                                 formula: fs,
                                 cached: Box::new(cached),
                             };
-                            push_cell(cells, row, col, cell, text, budget);
+                            push_cell(
+                                cells,
+                                row,
+                                col,
+                                cell,
+                                text,
+                                ixfe,
+                                styles,
+                                style_budget,
+                                budget,
+                            );
                         }
-                        None => push_number(cells, row, col, f, ixfe, formats, budget),
+                        None => push_number(
+                            cells,
+                            row,
+                            col,
+                            f,
+                            ixfe,
+                            formats,
+                            styles,
+                            style_budget,
+                            budget,
+                        ),
                     }
                 }
             }
@@ -2145,6 +3012,48 @@ fn wrap_formula(formula: &Option<String>, cached: Cell) -> Cell {
     }
 }
 
+fn retain_blank_cell_styles(
+    typ: u16,
+    data: &[u8],
+    blank_styles: &mut BTreeMap<(u32, u16), CellStyle>,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
+) {
+    let (Some(row), Some(first_col)) = (u16le(data, 0), u16le(data, 2)) else {
+        return;
+    };
+    let row = u32::from(row);
+    match typ {
+        BLANK => {
+            if let Some(style) = u16le(data, 4).and_then(|ixfe| styles.clone_xf(ixfe, style_budget))
+            {
+                blank_styles.insert((row, first_col), style);
+            }
+        }
+        MULBLANK => {
+            // row, colFirst, rgixfe[2 bytes each], colLast. BIFF5/8 has at
+            // most 256 columns; clamp both the declared range and body count.
+            let Some(last_col) = u16le(data, data.len().wrapping_sub(2)) else {
+                return;
+            };
+            if first_col > last_col || first_col > 255 {
+                return;
+            }
+            let count = usize::from(last_col.min(255) - first_col + 1)
+                .min(data.len().saturating_sub(6) / 2);
+            for offset in 0..count {
+                let Some(ixfe) = u16le(data, 4 + offset * 2) else {
+                    break;
+                };
+                if let Some(style) = styles.clone_xf(ixfe, style_budget) {
+                    blank_styles.insert((row, first_col + offset as u16), style);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Decode a `LABEL` / `RSTRING` / `STRING` cell whose text may span CONTINUE
 /// records. `chunks[0]` is the record body; `chunks[1..]` are the CONTINUE
 /// bodies. This replaces the single-record arms once in `decode_cell`: the
@@ -2156,9 +3065,12 @@ fn decode_string_cell(
     sheet_idx: usize,
     cells: &mut Vec<CellEntry>,
     rich: &mut BTreeMap<(u32, u16), Vec<crate::TextRun>>,
-    last_formula: &mut Option<(usize, u32, u16, Option<String>)>,
+    last_formula: &mut Option<PendingFormula>,
     ctx: Ctx,
     budget: &mut usize,
+    formats: &Formats,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
 ) {
     if *budget == 0 {
         return;
@@ -2180,30 +3092,61 @@ fn decode_string_cell(
             };
             if let Some(s) = decoded {
                 if typ == RSTRING {
-                    let runs = parse_rstring_runs(first, 6, ctx, &s);
+                    let runs = parse_rstring_runs(first, 6, ctx, &s, styles);
                     if !runs.is_empty() {
                         rich.insert((u32::from(row), col), runs);
                     }
                 }
-                push_text(cells, u32::from(row), col, s, budget);
+                push_text(
+                    cells,
+                    u32::from(row),
+                    col,
+                    s,
+                    u16le(first, 4).unwrap_or(0),
+                    formats,
+                    styles,
+                    style_budget,
+                    budget,
+                );
             }
         }
         // STRING is the cached string result of the preceding FORMULA.
         STRING => {
-            if let Some((si, r, c, fs)) = last_formula.take() {
+            if let Some((si, r, c, ixfe, fs)) = last_formula.take() {
                 if si == sheet_idx {
                     if let Some(s) = read_continued_xl_string(chunks, 0, ctx) {
                         match fs {
                             // Preserve formula identity: a string-result formula
                             // becomes `Cell::Formula { cached: Text }`, not bare text.
                             Some(fstr) => {
+                                let display = formats.render_text(&s, ixfe);
                                 let cell = Cell::Formula {
                                     formula: fstr,
-                                    cached: Box::new(Cell::Text(s.clone())),
+                                    cached: Box::new(Cell::Text(s)),
                                 };
-                                push_cell(cells, r, c, cell, s, budget);
+                                push_cell(
+                                    cells,
+                                    r,
+                                    c,
+                                    cell,
+                                    display,
+                                    ixfe,
+                                    styles,
+                                    style_budget,
+                                    budget,
+                                );
                             }
-                            None => push_text(cells, r, c, s, budget),
+                            None => push_text(
+                                cells,
+                                r,
+                                c,
+                                s,
+                                ixfe,
+                                formats,
+                                styles,
+                                style_budget,
+                                budget,
+                            ),
                         }
                     }
                 }
@@ -2213,7 +3156,13 @@ fn decode_string_cell(
     }
 }
 
-fn parse_rstring_runs(data: &[u8], off: usize, ctx: Ctx, text: &str) -> Vec<crate::TextRun> {
+fn parse_rstring_runs(
+    data: &[u8],
+    off: usize,
+    ctx: Ctx,
+    text: &str,
+    styles: &XlsStyles,
+) -> Vec<crate::TextRun> {
     if !ctx.biff8 {
         return Vec::new();
     }
@@ -2238,22 +3187,25 @@ fn parse_rstring_runs(data: &[u8], off: usize, ctx: Ctx, text: &str) -> Vec<crat
     let available = data.len().saturating_sub(pos) / 4;
     let mut starts = Vec::with_capacity(run_count.min(available));
     for index in 0..run_count.min(available) {
-        if let Some(start) = u16le(data, pos + index * 4) {
-            starts.push(usize::from(start));
+        if let (Some(start), Some(font_index)) = (
+            u16le(data, pos + index * 4),
+            u16le(data, pos + index * 4 + 2),
+        ) {
+            starts.push((usize::from(start), font_index));
         }
     }
-    starts.sort_unstable();
-    starts.dedup();
+    starts.sort_unstable_by_key(|&(start, _)| start);
+    starts.dedup_by_key(|entry| entry.0);
 
     let text_units = text.encode_utf16().count();
     let mut runs = Vec::with_capacity(starts.len());
-    for (index, start) in starts.iter().copied().enumerate() {
+    for (index, (start, font_index)) in starts.iter().copied().enumerate() {
         if start >= text_units {
             continue;
         }
         let end = starts
             .get(index + 1)
-            .copied()
+            .map(|&(next, _)| next)
             .unwrap_or(text_units)
             .min(text_units);
         let mut unit = 0usize;
@@ -2266,7 +3218,10 @@ fn parse_rstring_runs(data: &[u8], off: usize, ctx: Ctx, text: &str) -> Vec<crat
             })
             .collect::<String>();
         if !fragment.is_empty() {
-            runs.push(crate::TextRun::new(fragment, crate::Font::default()));
+            runs.push(crate::TextRun::new(
+                fragment,
+                styles.font(font_index).unwrap_or_default(),
+            ));
         }
     }
     runs
@@ -2355,7 +3310,7 @@ fn parse_pane_freeze(data: &[u8]) -> Option<(u32, u16)> {
     }
 }
 
-fn apply_row_outline(data: &[u8], sheet: &mut Sheet) {
+fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_budget: &mut usize) {
     let (Some(row), Some(height_twips), Some(options)) =
         (u16le(data, 0), u16le(data, 6), u32le(data, 12))
     else {
@@ -2377,22 +3332,32 @@ fn apply_row_outline(data: &[u8], sheet: &mut Sheet) {
     if options & 0x10 != 0 {
         sheet.collapsed_rows.insert(row);
     }
+    // `fGhostDirty` signals that the 12-bit row XF index is meaningful.
+    if options & 0x80 != 0 {
+        let ixfe = ((options >> 16) & 0x0FFF) as u16;
+        if let Some(style) = styles.clone_xf(ixfe, style_budget) {
+            sheet.row_formats.insert(row, style);
+        }
+    }
 }
 
-fn apply_col_outline(data: &[u8], sheet: &mut Sheet) {
-    let (Some(first), Some(last), Some(width_256), Some(options)) = (
+fn apply_col_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_budget: &mut usize) {
+    let (Some(first), Some(last), Some(width_256), Some(ixfe), Some(options)) = (
         u16le(data, 0),
         u16le(data, 2),
         u16le(data, 4),
+        u16le(data, 6),
         u16le(data, 8),
     ) else {
         return;
     };
-    if first > last {
+    // BIFF5/8 worksheets have exactly 256 columns. Clamp hostile or malformed
+    // ranges before iterating or retaining per-column style clones.
+    if first > last || first > 255 {
         return;
     }
     let level = ((options >> 8) & 0x07) as u8;
-    for col in first..=last {
+    for col in first..=last.min(255) {
         if width_256 > 0 {
             sheet.col_widths.insert(col, f32::from(width_256) / 256.0);
         }
@@ -2401,6 +3366,9 @@ fn apply_col_outline(data: &[u8], sheet: &mut Sheet) {
         }
         if level > 0 {
             sheet.col_outline.insert(col, level);
+        }
+        if let Some(style) = styles.clone_xf(ixfe, style_budget) {
+            sheet.col_formats.insert(col, style);
         }
     }
 }
@@ -2511,10 +3479,33 @@ fn is_external_hlink_url(url: &str) -> bool {
         || lower.starts_with("mailto:")
 }
 
-fn push_text(cells: &mut Vec<CellEntry>, row: u32, col: u16, s: String, budget: &mut usize) {
-    push_cell(cells, row, col, Cell::Text(s.clone()), s, budget);
+#[allow(clippy::too_many_arguments)]
+fn push_text(
+    cells: &mut Vec<CellEntry>,
+    row: u32,
+    col: u16,
+    s: String,
+    ixfe: u16,
+    formats: &Formats,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
+    budget: &mut usize,
+) {
+    let text = formats.render_text(&s, ixfe);
+    push_cell(
+        cells,
+        row,
+        col,
+        Cell::Text(s),
+        text,
+        ixfe,
+        styles,
+        style_budget,
+        budget,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_number(
     cells: &mut Vec<CellEntry>,
     row: u32,
@@ -2522,6 +3513,8 @@ fn push_number(
     value: f64,
     ixfe: u16,
     formats: &Formats,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
     budget: &mut usize,
 ) {
     let text = formats.render(value, ixfe);
@@ -2530,34 +3523,79 @@ fn push_number(
     } else {
         Cell::Number(value)
     };
-    push_cell(cells, row, col, cell, text, budget);
+    push_cell(
+        cells,
+        row,
+        col,
+        cell,
+        text,
+        ixfe,
+        styles,
+        style_budget,
+        budget,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_cell(
     cells: &mut Vec<CellEntry>,
     row: u32,
     col: u16,
     value: Cell,
     text: String,
+    ixfe: u16,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
     budget: &mut usize,
 ) {
-    if !text.is_empty() {
-        // Bound total accumulated text so shared-string reference amplification
-        // (cloning one large pooled string into very many cells) cannot exhaust
-        // memory; once the budget is spent, further cells are dropped.
-        if text.len() > *budget {
-            *budget = 0;
-            return;
+    // Empty source text is not a value cell. Numeric, boolean, date, error, and
+    // formula records remain semantically present even when their number format
+    // deliberately renders no display text (for example zero under `# ?/?`).
+    if matches!(&value, Cell::Text(source) if source.is_empty()) {
+        return;
+    }
+
+    // Account for every retained allocation, independently of display text.
+    // LABELSST can clone one pooled string into many cells, and a fourth number-
+    // format section can hide every clone; charging only rendered bytes would
+    // therefore turn a small SST into unbounded retained heap growth.
+    let cost = retained_cell_cost(&value, &text);
+    if cost > *budget {
+        *budget = 0;
+        return;
+    }
+    *budget -= cost;
+    cells.push(CellEntry {
+        row,
+        col,
+        value,
+        text,
+        style: styles.clone_xf(ixfe, style_budget),
+        hyperlink: None,
+    });
+}
+
+fn retained_cell_cost(value: &Cell, text: &String) -> usize {
+    std::mem::size_of::<CellEntry>()
+        .saturating_add(text.capacity())
+        .saturating_add(retained_cell_value_heap_bytes(value))
+}
+
+fn retained_cell_value_heap_bytes(mut value: &Cell) -> usize {
+    let mut bytes = 0usize;
+    loop {
+        match value {
+            Cell::Text(source) | Cell::Error(source) => {
+                return bytes.saturating_add(source.capacity());
+            }
+            Cell::Formula { formula, cached } => {
+                bytes = bytes
+                    .saturating_add(formula.capacity())
+                    .saturating_add(std::mem::size_of::<Cell>());
+                value = cached;
+            }
+            Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => return bytes,
         }
-        *budget -= text.len();
-        cells.push(CellEntry {
-            row,
-            col,
-            value,
-            text,
-            style: None,
-            hyperlink: None,
-        });
     }
 }
 
@@ -2645,6 +3683,24 @@ mod tests {
         }
         comp.flush().unwrap();
         comp.into_inner().into_inner()
+    }
+
+    fn cfb_directory_entry_offset(bytes: &[u8], name: &str) -> usize {
+        let directory_sector = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
+        let sector_shift = u16::from_le_bytes(bytes[30..32].try_into().unwrap()) as usize;
+        let sector_size = 1usize << sector_shift;
+        let directory_offset = (directory_sector + 1) * sector_size;
+        let encoded = name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let relative = bytes[directory_offset..directory_offset + sector_size]
+            .windows(encoded.len())
+            .position(|window| window == encoded)
+            .expect("CFB directory entry");
+        let offset = directory_offset + relative;
+        assert_eq!((offset - directory_offset) % 128, 0);
+        offset
     }
 
     #[derive(Clone, Copy)]
@@ -3075,7 +4131,10 @@ mod tests {
         bs.extend_from_slice(b"S1");
         stream.extend_from_slice(&rec(BOUNDSHEET, &bs));
         stream.extend_from_slice(&rec(0x0018, &builtin_name(0x0D, 1, &area3d(0, 0, 4, 2))));
-        stream.extend_from_slice(&rec(0x0018, &builtin_name(0x06, 1, &area3d(1, 1, 5, 3))));
+        let mut print_areas = area3d(1, 1, 5, 3);
+        print_areas.extend_from_slice(&area3d(9, 4, 11, 6));
+        print_areas.push(0x10); // PtgUnion
+        stream.extend_from_slice(&rec(0x0018, &builtin_name(0x06, 1, &print_areas)));
         stream.extend_from_slice(&rec(EOF, &[]));
 
         let mut s_bof = vec![0x00, 0x06, 0x10, 0x00];
@@ -3089,6 +4148,10 @@ mod tests {
         assert_eq!(
             wb.sheets[0].page_setup().and_then(|ps| ps.print_area),
             Some((1, 1, 5, 3))
+        );
+        assert_eq!(
+            wb.sheets[0].print_metadata().print_areas(),
+            &[(1, 1, 5, 3), (9, 4, 11, 6)]
         );
         assert!(wb.defined_names().is_empty());
     }
@@ -3180,13 +4243,39 @@ mod tests {
         stream.extend_from_slice(&rec(0x0083, &1u16.to_le_bytes()));
         stream.extend_from_slice(&rec(0x0084, &1u16.to_le_bytes()));
 
+        let mut row_breaks = 2u16.to_le_bytes().to_vec();
+        for row in [10u16, 4u16] {
+            row_breaks.extend_from_slice(&row.to_le_bytes());
+            row_breaks.extend_from_slice(&0u16.to_le_bytes());
+            row_breaks.extend_from_slice(&255u16.to_le_bytes());
+        }
+        stream.extend_from_slice(&rec(HORIZONTALPAGEBREAKS, &row_breaks));
+        let mut col_breaks = 2u16.to_le_bytes().to_vec();
+        for col in [7u16, 2u16] {
+            col_breaks.extend_from_slice(&col.to_le_bytes());
+            col_breaks.extend_from_slice(&0u16.to_le_bytes());
+            col_breaks.extend_from_slice(&u16::MAX.to_le_bytes());
+        }
+        stream.extend_from_slice(&rec(VERTICALPAGEBREAKS, &col_breaks));
+
+        let extended_strings = ["&LEven", "&REvenF", "&LFirst", "&RFirstF"];
+        let mut header_footer = vec![0u8; 38];
+        header_footer[0..2].copy_from_slice(&HEADERFOOTER.to_le_bytes());
+        header_footer[28..30].copy_from_slice(&0x000Fu16.to_le_bytes());
+        for (index, text) in extended_strings.iter().enumerate() {
+            let offset = 30 + index * 2;
+            header_footer[offset..offset + 2].copy_from_slice(&(text.len() as u16).to_le_bytes());
+            header_footer.extend_from_slice(&xl_string(text));
+        }
+        stream.extend_from_slice(&rec(HEADERFOOTER, &header_footer));
+
         let mut setup = Vec::new();
         setup.extend_from_slice(&9u16.to_le_bytes()); // A4
         setup.extend_from_slice(&80u16.to_le_bytes()); // 80%
         setup.extend_from_slice(&3i16.to_le_bytes()); // first page number
         setup.extend_from_slice(&1u16.to_le_bytes()); // fit width
         setup.extend_from_slice(&2u16.to_le_bytes()); // fit height
-        setup.extend_from_slice(&0x0080u16.to_le_bytes()); // fUsePage, landscape
+        setup.extend_from_slice(&0x0081u16.to_le_bytes()); // fUsePage + left-to-right
         setup.extend_from_slice(&300u16.to_le_bytes()); // horizontal DPI
         setup.extend_from_slice(&300u16.to_le_bytes()); // vertical DPI
         setup.extend_from_slice(&0.2f64.to_le_bytes()); // header margin
@@ -3211,6 +4300,48 @@ mod tests {
         assert!(wb.sheets[0].print_headings());
         assert!(wb.sheets[0].print_gridlines());
         assert_eq!(ps.margins, Some((0.5, 0.6, 0.7, 0.8, 0.2, 0.25)));
+        let metadata = wb.sheets[0].print_metadata();
+        assert_eq!(metadata.fidelity(), crate::PrintFidelity::Retained);
+        assert_eq!(metadata.manual_row_breaks(), &[4, 10]);
+        assert_eq!(metadata.manual_col_breaks(), &[2, 7]);
+        assert_eq!(metadata.page_order(), Some(PrintPageOrder::OverThenDown));
+        assert_eq!(metadata.print_headings(), Some(true));
+        assert_eq!(metadata.print_gridlines(), Some(true));
+        assert_eq!(metadata.center_horizontally(), Some(true));
+        assert_eq!(metadata.center_vertically(), Some(true));
+        assert_eq!(
+            metadata.header_footer().odd_header(),
+            Some("&CQuarterly report")
+        );
+        assert_eq!(metadata.header_footer().odd_footer(), Some("&CPage &P"));
+        assert_eq!(metadata.header_footer().even_header(), Some("&LEven"));
+        assert_eq!(metadata.header_footer().even_footer(), Some("&REvenF"));
+        assert_eq!(metadata.header_footer().first_header(), Some("&LFirst"));
+        assert_eq!(metadata.header_footer().first_footer(), Some("&RFirstF"));
+        assert_eq!(metadata.header_footer().different_odd_even(), Some(true));
+        assert_eq!(metadata.header_footer().different_first(), Some(true));
+    }
+
+    #[test]
+    fn malformed_biff_print_records_report_typed_losses() {
+        let mut setup = XlsPageSetup::default();
+        setup.apply_record(HORIZONTALPAGEBREAKS, &[2, 0, 4, 0], ctx8());
+        setup.apply_record(HEADERFOOTER, &[0; 12], ctx8());
+
+        assert_eq!(
+            setup.print_metadata.fidelity(),
+            crate::PrintFidelity::Partial
+        );
+        assert!(setup
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::InvalidPageBreak));
+        assert!(setup
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::MalformedHeaderFooter));
     }
 
     #[test]
@@ -3690,6 +4821,9 @@ mod tests {
         let mut rich = BTreeMap::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
+        let formats = Formats::default();
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
         decode_string_cell(
             RSTRING,
             &[&data],
@@ -3699,6 +4833,9 @@ mod tests {
             &mut lf,
             ctx8(),
             &mut budget,
+            &formats,
+            &styles,
+            &mut style_budget,
         );
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].value, Cell::Text("Hi".to_string()));
@@ -3945,11 +5082,52 @@ mod tests {
     }
 
     #[test]
+    fn biff8_custom_number_format_drives_display_text() {
+        let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &global_bof);
+
+        let code = "[$₩-412]#,##0.00;[Red](#,##0.00);0;\"값: \"@";
+        let encoded: Vec<u16> = code.encode_utf16().collect();
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(encoded.len() as u16).to_le_bytes());
+        format.push(1); // uncompressed UTF-16
+        for unit in encoded {
+            format.extend_from_slice(&unit.to_le_bytes());
+        }
+        stream.extend_from_slice(&rec(FORMAT, &format));
+
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        stream.extend_from_slice(&rec(XF, &xf));
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, 2, 0x00];
+        boundsheet.extend_from_slice(b"S1");
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 12]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let mut number = vec![0, 0, 0, 0, 0, 0];
+        number.extend_from_slice(&1_234.5f64.to_le_bytes());
+        stream.extend_from_slice(&rec(NUMBER, &number));
+        stream.extend_from_slice(&rec(LABEL, &label8(1, 0, 0, "abc")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        assert_eq!(workbook.sheets[0].cell(0, 0), Some(&Cell::Number(1_234.5)));
+        assert_eq!(workbook.sheets[0].formatted(0, 0), Some("₩1,234.50"));
+        assert_eq!(workbook.sheets[0].formatted(1, 0), Some("값: abc"));
+    }
+
+    #[test]
     fn boolerr_and_formula_results() {
         let f = &Formats::default();
         let mut cells = Vec::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
         // BOOLERR error cell: bBoolErr=0x07 (#DIV/0!), fError=1.
         decode_cell(
             BOOLERR,
@@ -3960,6 +5138,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -3977,6 +5157,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -3996,6 +5178,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -4015,6 +5199,8 @@ mod tests {
         let mut cells = Vec::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
         let mut p = vec![0, 0, 0, 0, 0, 0]; // row, col, ixfe
         p.extend_from_slice(&30.0f64.to_le_bytes()); // cached result (numeric)
         p.extend_from_slice(&[0, 0]); // grbit
@@ -4032,6 +5218,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -4104,6 +5292,8 @@ mod tests {
         let mut cells = Vec::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
         let mut p = vec![3, 0, 0, 0, 0, 0]; // row 3, col 0, ixfe 0
         p.extend_from_slice(&3.0f64.to_le_bytes()); // cached result (numeric)
         p.extend_from_slice(&[0, 0]); // grbit
@@ -4121,6 +5311,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -4288,6 +5480,8 @@ mod tests {
         let mut cells = Vec::new();
         let mut lf = None;
         let mut budget = MAX_TEXT_BYTES;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
         let mut p = vec![0, 0, 0, 0, 0, 0]; // row, col, ixfe
         p.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF]); // blank cached result
         p.extend_from_slice(&[0, 0]); // grbit
@@ -4304,6 +5498,8 @@ mod tests {
             &mut lf,
             f,
             &mut budget,
+            &styles,
+            &mut style_budget,
             &[],
             &[],
             &[],
@@ -4318,6 +5514,984 @@ mod tests {
                 assert_eq!(**cached, Cell::Text(String::new()));
             }
             other => panic!("expected a formula cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn biff8_empty_display_formula_retains_its_typed_cached_value() {
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+
+        let code = r#"##;##;"""#;
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0); // compressed BIFF8 characters
+        format.extend_from_slice(code.as_bytes());
+        stream.extend_from_slice(&rec(FORMAT, &format));
+
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        stream.extend_from_slice(&rec(XF, &xf));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Hidden zero")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        let rgce = [0x1E, 0, 0]; // PtgInt(0)
+        stream.extend_from_slice(&rec(FORMULA, &numeric_formula_body(0, 0, 0.0, &rgce)));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some(""));
+        assert_eq!(sheet.display_cells().count(), 1);
+        assert_eq!(
+            sheet.cell(0, 0),
+            Some(&Cell::Formula {
+                formula: "0".to_string(),
+                cached: Box::new(Cell::Number(0.0)),
+            })
+        );
+    }
+
+    #[test]
+    fn empty_display_value_cells_remain_typed_and_bounded() {
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let values = vec![
+            Cell::Number(0.0),
+            Cell::Date(0.0),
+            Cell::Formula {
+                formula: "A1".to_string(),
+                cached: Box::new(Cell::Number(0.0)),
+            },
+            Cell::Bool(false),
+            Cell::Error("#N/A".to_string()),
+        ];
+        let empty = String::new();
+        let mut budget = values
+            .iter()
+            .map(|value| retained_cell_cost(value, &empty))
+            .sum();
+        let starting_budget = budget;
+        let mut cells = Vec::new();
+
+        push_cell(
+            &mut cells,
+            0,
+            0,
+            Cell::Text(String::new()),
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert!(cells.is_empty());
+        assert_eq!(budget, starting_budget);
+
+        for (col, value) in values.into_iter().enumerate() {
+            push_cell(
+                &mut cells,
+                0,
+                col as u16,
+                value,
+                String::new(),
+                0,
+                &styles,
+                &mut style_budget,
+                &mut budget,
+            );
+        }
+        assert_eq!(cells.len(), 5);
+        assert_eq!(budget, 0);
+
+        push_cell(
+            &mut cells,
+            0,
+            6,
+            Cell::Number(1.0),
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 5, "zero budget must bound retained cells");
+    }
+
+    #[test]
+    fn hidden_formula_strings_charge_source_cache_and_box_storage() {
+        let code = r#"0;0;0;"""#;
+        let mut formats = Formats::default();
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0);
+        format.extend_from_slice(code.as_bytes());
+        formats.push_format(&format, || Some(code.to_string()));
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        formats.push_xf(&xf);
+
+        // Keep capacities deliberately larger than lengths: retained bytes,
+        // rather than visible bytes, are the security boundary.
+        let mut formula = String::with_capacity(4 << 10);
+        formula.push_str("A1");
+        let mut cached = String::with_capacity(8 << 10);
+        cached.push_str("secret");
+        let display = formats.render_text(&cached, 0);
+        assert!(display.is_empty());
+        let formula_capacity = formula.capacity();
+        let cached_capacity = cached.capacity();
+        let display_capacity = display.capacity();
+        let value = Cell::Formula {
+            formula,
+            cached: Box::new(Cell::Text(cached)),
+        };
+        let expected = std::mem::size_of::<CellEntry>()
+            .saturating_add(display_capacity)
+            .saturating_add(formula_capacity)
+            .saturating_add(std::mem::size_of::<Cell>())
+            .saturating_add(cached_capacity);
+        assert_eq!(retained_cell_cost(&value, &display), expected);
+
+        let mut cells = Vec::new();
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let mut budget = expected;
+        push_cell(
+            &mut cells,
+            0,
+            0,
+            value,
+            display,
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 1);
+        assert_eq!(budget, 0);
+        let Cell::Formula { formula, cached } = &cells[0].value else {
+            panic!("hidden formula must remain typed");
+        };
+        assert_eq!(formula.capacity(), formula_capacity);
+        let Cell::Text(cached) = cached.as_ref() else {
+            panic!("formula cache must remain text");
+        };
+        assert_eq!(cached.capacity(), cached_capacity);
+
+        push_cell(
+            &mut cells,
+            0,
+            1,
+            Cell::Formula {
+                formula: "B1".to_string(),
+                cached: Box::new(Cell::Text("another secret".to_string())),
+            },
+            String::new(),
+            0,
+            &styles,
+            &mut style_budget,
+            &mut budget,
+        );
+        assert_eq!(cells.len(), 1, "zero budget must reject another formula");
+    }
+
+    #[test]
+    fn late_formula_definition_growth_is_charged_and_atomic() {
+        fn entry(value: Cell) -> CellEntry {
+            CellEntry {
+                row: 0,
+                col: 0,
+                value,
+                text: "cached".to_string(),
+                style: None,
+                hyperlink: None,
+            }
+        }
+
+        let definition = FormulaDefinition {
+            anchor: (0, 0),
+            range: (0, 0, 0, 0),
+            rgce: vec![0x1E, 42, 0], // PtgInt(42)
+            rgb_extra: Vec::new(),
+            is_array: false,
+        };
+
+        let mut cells = vec![entry(Cell::Error("cached".to_string()))];
+        let mut last_formula = None;
+        let starting_budget = 4096;
+        let mut budget = starting_budget;
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let Cell::Formula { formula, cached } = &cells[0].value else {
+            panic!("definition must wrap the cached scalar");
+        };
+        assert_eq!(formula, "42");
+        assert_eq!(cached.as_ref(), &Cell::Error("cached".to_string()));
+        let growth = formula
+            .capacity()
+            .saturating_add(std::mem::size_of::<Cell>());
+        assert_eq!(budget, starting_budget - growth);
+
+        let original = Cell::Error("cached".to_string());
+        let mut cells = vec![entry(original.clone())];
+        let mut last_formula = None;
+        let mut budget = std::mem::size_of::<Cell>().saturating_sub(1);
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(cells[0].value, original);
+        assert_eq!(budget, 0);
+
+        let original = Cell::Formula {
+            formula: String::new(),
+            cached: Box::new(Cell::Number(42.0)),
+        };
+        let mut cells = vec![entry(original.clone())];
+        let mut last_formula = None;
+        let mut budget = 0;
+        apply_formula_definition(
+            0,
+            &definition,
+            &mut cells,
+            &mut last_formula,
+            &mut budget,
+            ctx8(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(cells[0].value, original);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn repeated_hidden_labelsst_clones_exhaust_the_retained_cell_budget() {
+        let code = r#"0;0;0;"""#;
+        let mut formats = Formats::default();
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        format.push(0);
+        format.extend_from_slice(code.as_bytes());
+        formats.push_format(&format, || Some(code.to_string()));
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        formats.push_xf(&xf);
+
+        let sst = vec!["x".repeat(64 << 10)];
+        let hidden = formats.render_text(&sst[0], 0);
+        assert!(hidden.is_empty());
+        let mut budget = retained_cell_cost(&Cell::Text(sst[0].clone()), &hidden);
+        let mut cells = Vec::new();
+        let mut last_formula = None;
+        let styles = XlsStyles::default();
+        let mut style_budget = MAX_XLS_RETAINED_STYLE_BYTES;
+        let definitions = FormulaDefinitions::new();
+
+        for row in 0..2u16 {
+            let mut labelsst = Vec::with_capacity(10);
+            labelsst.extend_from_slice(&row.to_le_bytes());
+            labelsst.extend_from_slice(&0u16.to_le_bytes());
+            labelsst.extend_from_slice(&0u16.to_le_bytes());
+            labelsst.extend_from_slice(&0u32.to_le_bytes());
+            decode_cell(
+                LABELSST,
+                &labelsst,
+                &sst,
+                0,
+                &mut cells,
+                &mut last_formula,
+                &formats,
+                &mut budget,
+                &styles,
+                &mut style_budget,
+                &[],
+                &[],
+                &[],
+                &[],
+                ctx8(),
+                &definitions,
+            );
+        }
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].text, "");
+        assert_eq!(cells[0].value, Cell::Text(sst[0].clone()));
+        assert_eq!(budget, 0);
+    }
+
+    fn biff8_bof(substream_type: u16) -> Vec<u8> {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&0x0600u16.to_le_bytes());
+        body.extend_from_slice(&substream_type.to_le_bytes());
+        body.extend_from_slice(&[0; 12]);
+        body
+    }
+
+    fn biff5_bof(substream_type: u16) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&0x0500u16.to_le_bytes());
+        body.extend_from_slice(&substream_type.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body
+    }
+
+    fn test_palette(colors: &[[u8; 3]]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(2 + colors.len() * 4);
+        body.extend_from_slice(&(colors.len() as u16).to_le_bytes());
+        for color in colors {
+            body.extend_from_slice(color);
+            body.push(0);
+        }
+        body
+    }
+
+    fn boundsheet8(name: &str) -> Vec<u8> {
+        let mut body = vec![0, 0, 0, 0, 0, 0, name.len() as u8, 0];
+        body.extend_from_slice(name.as_bytes());
+        body
+    }
+
+    fn label8(row: u16, col: u16, ixfe: u16, text: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&row.to_le_bytes());
+        body.extend_from_slice(&col.to_le_bytes());
+        body.extend_from_slice(&ixfe.to_le_bytes());
+        body.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        body.push(0); // compressed BIFF8 characters
+        body.extend_from_slice(text.as_bytes());
+        body
+    }
+
+    fn workbook_with_geometry_records(biff8: bool, records: &[(u16, Vec<u8>)]) -> Workbook {
+        let (global_bof, sheet_bof, boundsheet, stream_name) = if biff8 {
+            (
+                biff8_bof(0x0005),
+                biff8_bof(0x0010),
+                boundsheet8("Geometry"),
+                "/Workbook",
+            )
+        } else {
+            let mut boundsheet = vec![0, 0, 0, 0, 0, 0, 8];
+            boundsheet.extend_from_slice(b"Geometry");
+            (biff5_bof(0x0005), biff5_bof(0x0010), boundsheet, "/Book")
+        };
+        let mut stream = rec(BOF, &global_bof);
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        for (typ, body) in records {
+            stream.extend_from_slice(&rec(*typ, body));
+        }
+        stream.extend_from_slice(&rec(EOF, &[]));
+        Workbook::open(&wrap_xls(&stream, stream_name)).expect("synthetic geometry workbook")
+    }
+
+    fn test_colinfo(first: u16, last: u16, width_256: u16) -> Vec<u8> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&first.to_le_bytes());
+        body.extend_from_slice(&last.to_le_bytes());
+        body.extend_from_slice(&width_256.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // default XF
+        body.extend_from_slice(&0u16.to_le_bytes()); // flags
+        body.extend_from_slice(&0u16.to_le_bytes()); // unused
+        body
+    }
+
+    fn test_row(row: u16, height_twips: u16) -> Vec<u8> {
+        let mut body = vec![0; 16];
+        body[0..2].copy_from_slice(&row.to_le_bytes());
+        body[6..8].copy_from_slice(&height_twips.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn biff8_retains_default_geometry_with_standard_width_precedence() {
+        let default_row_height = [0x0D, 0x00, 0x2C, 0x01].to_vec(); // flags, 300 twips
+        let records = vec![
+            (STANDARDWIDTH, 2432u16.to_le_bytes().to_vec()), // 9.5 characters
+            (DEFAULTCOLWIDTH, 8u16.to_le_bytes().to_vec()),
+            (DEFAULTROWHEIGHT, default_row_height),
+            (COLINFO, test_colinfo(2, 2, 3072)), // 12 characters
+            (ROW, test_row(3, 360)),             // 18 points
+        ];
+        let workbook = workbook_with_geometry_records(true, &records);
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(sheet.default_column_width(), Some(9.5));
+        assert_eq!(sheet.default_row_height(), Some(15.0));
+        assert_eq!(sheet.column_widths().get(&2), Some(&12.0));
+        assert_eq!(sheet.row_heights().get(&3), Some(&18.0));
+        assert_eq!(sheet.column_widths().len(), 1);
+        assert_eq!(sheet.row_heights().len(), 1);
+    }
+
+    #[test]
+    fn biff5_retains_defcolwidth_instead_of_promoting_gcw_standard_width() {
+        let records = vec![
+            (STANDARDWIDTH, 2432u16.to_le_bytes().to_vec()),
+            (DEFAULTCOLWIDTH, 10u16.to_le_bytes().to_vec()),
+            (
+                DEFAULTROWHEIGHT,
+                [0x02, 0x00, 0xFF, 0x00].to_vec(), // fDyZero, 255 unhidden twips
+            ),
+        ];
+        let workbook = workbook_with_geometry_records(false, &records);
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(sheet.default_column_width(), Some(10.0));
+        assert_eq!(sheet.default_row_height(), Some(12.75));
+        assert!(sheet.column_widths().is_empty());
+        assert!(sheet.row_heights().is_empty());
+    }
+
+    #[test]
+    fn biff_default_geometry_ignores_malformed_and_nonpositive_records() {
+        let malformed = vec![
+            (DEFAULTCOLWIDTH, vec![8]),
+            (STANDARDWIDTH, vec![0, 9, 0]),
+            (DEFAULTROWHEIGHT, 300u16.to_le_bytes().to_vec()),
+        ];
+        let workbook = workbook_with_geometry_records(true, &malformed);
+        assert_eq!(workbook.sheets[0].default_column_width(), None);
+        assert_eq!(workbook.sheets[0].default_row_height(), None);
+
+        let invalid = vec![
+            (DEFAULTCOLWIDTH, 0u16.to_le_bytes().to_vec()),
+            (STANDARDWIDTH, 0u16.to_le_bytes().to_vec()),
+            (DEFAULTROWHEIGHT, [0x00, 0x00, 0x00, 0x00].to_vec()),
+            (DEFAULTROWHEIGHT, [0x00, 0x00, 0xFF, 0xFF].to_vec()),
+        ];
+        let workbook = workbook_with_geometry_records(false, &invalid);
+        assert_eq!(workbook.sheets[0].default_column_width(), None);
+        assert_eq!(workbook.sheets[0].default_row_height(), None);
+
+        let bounded = vec![
+            (DEFAULTCOLWIDTH, 256u16.to_le_bytes().to_vec()),
+            (
+                DEFAULTROWHEIGHT,
+                [0x00, 0x00, 0xF4, 0x1F].to_vec(), // 8180 twips
+            ),
+        ];
+        let workbook = workbook_with_geometry_records(true, &bounded);
+        assert_eq!(workbook.sheets[0].default_column_width(), None);
+        assert_eq!(workbook.sheets[0].default_row_height(), None);
+    }
+
+    #[test]
+    fn malformed_duplicate_geometry_records_do_not_erase_valid_values() {
+        let records = vec![
+            (DEFAULTCOLWIDTH, 8u16.to_le_bytes().to_vec()),
+            (DEFAULTCOLWIDTH, vec![8]),
+            (STANDARDWIDTH, 2304u16.to_le_bytes().to_vec()),
+            (STANDARDWIDTH, 0u16.to_le_bytes().to_vec()),
+            (
+                DEFAULTROWHEIGHT,
+                [0x01, 0x00, 0x04, 0x01].to_vec(), // fUnsynced, 260 twips
+            ),
+            (DEFAULTROWHEIGHT, vec![0, 0, 4]),
+        ];
+        let workbook = workbook_with_geometry_records(true, &records);
+        assert_eq!(workbook.sheets[0].default_column_width(), Some(9.0));
+        assert_eq!(workbook.sheets[0].default_row_height(), Some(13.0));
+    }
+
+    #[test]
+    fn biff8_retains_cell_font_fill_border_alignment_number_format_and_protection() {
+        let colors = [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+            [13, 14, 15],
+            [16, 17, 18],
+            [19, 20, 21],
+        ];
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+        stream.extend_from_slice(&rec(CODEPAGE, &1200u16.to_le_bytes()));
+        stream.extend_from_slice(&rec(PALETTE, &test_palette(&colors)));
+
+        let font_name = "맑은 고딕";
+        let mut font = Vec::new();
+        font.extend_from_slice(&240u16.to_le_bytes()); // 12 pt
+        font.extend_from_slice(&0x000Au16.to_le_bytes()); // italic + strikeout
+        font.extend_from_slice(&8u16.to_le_bytes()); // first custom palette color
+        font.extend_from_slice(&700u16.to_le_bytes()); // bold
+        font.extend_from_slice(&1u16.to_le_bytes()); // superscript
+        font.extend_from_slice(&[1, 0, 0x81, 0]); // underline, family, charset, unused
+        font.push(font_name.encode_utf16().count() as u8);
+        font.push(1); // uncompressed UTF-16
+        for unit in font_name.encode_utf16() {
+            font.extend_from_slice(&unit.to_le_bytes());
+        }
+        stream.extend_from_slice(&rec(FONT, &font));
+
+        let format_code = "0.000";
+        let mut format = 164u16.to_le_bytes().to_vec();
+        format.extend_from_slice(&(format_code.len() as u16).to_le_bytes());
+        format.push(0); // compressed BIFF8 characters
+        format.extend_from_slice(format_code.as_bytes());
+        stream.extend_from_slice(&rec(FORMAT, &format));
+
+        let mut xf = vec![0u8; 20];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        xf[4..6].copy_from_slice(&0xFFF3u16.to_le_bytes()); // locked, hidden, no parent
+        xf[6] = 2 | 0x08 | (1 << 4); // centered, wrapped, vertically centered
+        xf[7] = 135; // -45 degrees
+        xf[8] = 3 | 0x10; // indent 3, shrink-to-fit
+        xf[9] = 0xFC; // all six cell attributes are local
+        let border1 = 1u32 | (2 << 4) | (5 << 8) | (6 << 12) | (9 << 16) | (10 << 23);
+        let border2 = 11u32 | (12 << 7) | (1 << 26);
+        xf[10..14].copy_from_slice(&border1.to_le_bytes());
+        xf[14..18].copy_from_slice(&border2.to_le_bytes());
+        xf[18..20].copy_from_slice(&(13u16 | (14 << 7)).to_le_bytes());
+        stream.extend_from_slice(&rec(XF, &xf));
+        stream.extend_from_slice(&rec(STYLE, &[0x00, 0x80, 0x00, 0x00]));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Styled")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        stream.extend_from_slice(&rec(LABEL, &label8(0, 0, 0, "Styled text")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Partial);
+        assert_eq!(sheet.formatted(0, 0), Some("Styled text"));
+        let style = sheet.cell_style(0, 0).expect("retained BIFF8 XF");
+        assert_eq!(sheet.default_cell_style(), Some(style));
+
+        let retained_font = style.font.as_ref().expect("retained BIFF8 FONT");
+        assert_eq!(retained_font.name.as_deref(), Some(font_name));
+        assert_eq!(retained_font.size_pt, Some(12));
+        assert_eq!(retained_font.color, Some(Color::from(colors[0])));
+        assert!(retained_font.bold);
+        assert!(retained_font.italic);
+        assert!(retained_font.underline);
+        assert!(retained_font.strikethrough);
+        assert_eq!(retained_font.script, FormatScript::Superscript);
+
+        assert_eq!(style.num_fmt.as_deref(), Some(format_code));
+        assert_eq!(style.fill, Some(Color::from(colors[5])));
+        assert_eq!(
+            style.pattern_fill,
+            Some(Fill {
+                pattern: FormatPattern::Solid,
+                foreground: Some(Color::from(colors[5])),
+                background: Some(Color::from(colors[6])),
+            })
+        );
+        let border = style.border.as_ref().expect("retained BIFF8 borders");
+        assert_eq!(border.left, BorderStyle::Thin);
+        assert_eq!(border.right, BorderStyle::Medium);
+        assert_eq!(border.top, BorderStyle::Thick);
+        assert_eq!(border.bottom, BorderStyle::Double);
+        assert_eq!(border.left_color, Some(Color::from(colors[1])));
+        assert_eq!(border.right_color, Some(Color::from(colors[2])));
+        assert_eq!(border.top_color, Some(Color::from(colors[3])));
+        assert_eq!(border.bottom_color, Some(Color::from(colors[4])));
+        assert_eq!(
+            style.align,
+            Some(Alignment {
+                horizontal: Some(HAlign::Center),
+                vertical: Some(VAlign::Middle),
+                wrap: true,
+                rotation: -45,
+                indent: 3,
+                shrink_to_fit: true,
+            })
+        );
+        assert_eq!(
+            style.protection,
+            Some(CellProtection {
+                locked: Some(true),
+                hidden: true,
+            })
+        );
+    }
+
+    #[test]
+    fn biff5_retains_codepage_font_and_xf_style() {
+        let colors = [
+            [21, 22, 23],
+            [24, 25, 26],
+            [27, 28, 29],
+            [30, 31, 32],
+            [33, 34, 35],
+            [36, 37, 38],
+        ];
+        let mut stream = rec(BOF, &biff5_bof(0x0005));
+        stream.extend_from_slice(&rec(CODEPAGE, &949u16.to_le_bytes()));
+        stream.extend_from_slice(&rec(PALETTE, &test_palette(&colors)));
+
+        let font_name = "굴림";
+        let encoded_font = encode_legacy_text(EUC_KR, font_name);
+        let mut font = Vec::new();
+        font.extend_from_slice(&200u16.to_le_bytes()); // 10 pt
+        font.extend_from_slice(&0x0002u16.to_le_bytes()); // italic
+        font.extend_from_slice(&8u16.to_le_bytes());
+        font.extend_from_slice(&400u16.to_le_bytes());
+        font.extend_from_slice(&2u16.to_le_bytes()); // subscript
+        font.extend_from_slice(&[0, 0, 0x81, 0]);
+        font.push(encoded_font.len() as u8);
+        font.extend_from_slice(&encoded_font);
+        stream.extend_from_slice(&rec(FONT, &font));
+
+        let mut xf = vec![0u8; 16];
+        xf[2..4].copy_from_slice(&2u16.to_le_bytes()); // built-in 0.00
+        xf[4..6].copy_from_slice(&0xFFF1u16.to_le_bytes());
+        xf[6] = 3 | 0x08 | (2 << 4); // right, wrap, bottom
+        xf[7] = 0xFC | 2; // all local attributes + 90-degree orientation
+        let border_fill1 = 9u32 | (10 << 7) | (1 << 16) | (6 << 22) | (10 << 25);
+        let border2 = 1u32 | (2 << 3) | (5 << 6) | (11 << 9) | (12 << 16) | (13 << 23);
+        xf[8..12].copy_from_slice(&border_fill1.to_le_bytes());
+        xf[12..16].copy_from_slice(&border2.to_le_bytes());
+        stream.extend_from_slice(&rec(XF, &xf));
+        stream.extend_from_slice(&rec(STYLE, &[0x00, 0x80, 0x00, 0x00]));
+
+        let sheet_name = encode_legacy_text(EUC_KR, "서식");
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, sheet_name.len() as u8];
+        boundsheet.extend_from_slice(&sheet_name);
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff5_bof(0x0010)));
+        let label = encode_legacy_text(EUC_KR, "스타일");
+        let mut label_record = vec![0, 0, 0, 0, 0, 0];
+        label_record.extend_from_slice(&(label.len() as u16).to_le_bytes());
+        label_record.extend_from_slice(&label);
+        stream.extend_from_slice(&rec(LABEL, &label_record));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Book")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.name, "서식");
+        assert_eq!(sheet.formatted(0, 0), Some("스타일"));
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Partial);
+        let style = sheet.cell_style(0, 0).expect("retained BIFF5 XF");
+        let retained_font = style.font.as_ref().expect("retained BIFF5 FONT");
+        assert_eq!(retained_font.name.as_deref(), Some(font_name));
+        assert_eq!(retained_font.size_pt, Some(10));
+        assert_eq!(retained_font.color, Some(Color::from(colors[0])));
+        assert!(!retained_font.bold);
+        assert!(retained_font.italic);
+        assert!(!retained_font.underline);
+        assert_eq!(retained_font.script, FormatScript::Subscript);
+        assert_eq!(style.num_fmt.as_deref(), Some("0.00"));
+        assert_eq!(style.fill, Some(Color::from(colors[1])));
+        let fill = style.pattern_fill.expect("retained BIFF5 fill");
+        assert_eq!(fill.pattern, FormatPattern::Solid);
+        assert_eq!(fill.foreground, Some(Color::from(colors[1])));
+        assert_eq!(fill.background, Some(Color::from(colors[2])));
+        let border = style.border.as_ref().expect("retained BIFF5 border");
+        assert_eq!(border.left, BorderStyle::Medium);
+        assert_eq!(border.right, BorderStyle::Thick);
+        assert_eq!(border.top, BorderStyle::Thin);
+        assert_eq!(border.bottom, BorderStyle::Double);
+        assert_eq!(border.left_color, Some(Color::from(colors[4])));
+        assert_eq!(border.right_color, Some(Color::from(colors[5])));
+        assert_eq!(border.top_color, Some(Color::from(colors[3])));
+        assert_eq!(border.bottom_color, Some(Color::from(colors[2])));
+        assert_eq!(
+            style.align,
+            Some(Alignment {
+                horizontal: Some(HAlign::Right),
+                vertical: Some(VAlign::Bottom),
+                wrap: true,
+                rotation: 90,
+                indent: 0,
+                shrink_to_fit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn biff8_retained_number_format_matches_the_raw_cell_xf() {
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+
+        let mut parent = vec![0u8; 20];
+        parent[4..6].copy_from_slice(&0xFFF4u16.to_le_bytes()); // parentless style XF
+        stream.extend_from_slice(&rec(XF, &parent));
+
+        let mut cell_xf = vec![0u8; 20];
+        cell_xf[2..4].copy_from_slice(&10u16.to_le_bytes()); // built-in 0.00%
+        cell_xf[4..6].copy_from_slice(&0u16.to_le_bytes()); // cell XF, parent 0
+        cell_xf[9] = 0; // fAtrNum clear: future parent ifmt edits propagate
+        stream.extend_from_slice(&rec(XF, &cell_xf));
+        stream.extend_from_slice(&rec(STYLE, &[0x00, 0x80, 0x00, 0x00]));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Percent")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        let mut number = Vec::new();
+        number.extend_from_slice(&0u16.to_le_bytes());
+        number.extend_from_slice(&0u16.to_le_bytes());
+        number.extend_from_slice(&1u16.to_le_bytes());
+        number.extend_from_slice(&0.0042f64.to_le_bytes());
+        stream.extend_from_slice(&rec(NUMBER, &number));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("0.42%"));
+        assert_eq!(
+            sheet
+                .cell_style(0, 0)
+                .and_then(|style| style.num_fmt.as_deref()),
+            Some("0.00%")
+        );
+    }
+
+    #[test]
+    fn biff8_cell_xf_keeps_all_raw_components_when_fatr_bits_are_clear() {
+        let font_record = |name: &str, height_twips: u16, weight: u16| {
+            let mut font = Vec::new();
+            font.extend_from_slice(&height_twips.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&8u16.to_le_bytes());
+            font.extend_from_slice(&weight.to_le_bytes());
+            font.extend_from_slice(&0u16.to_le_bytes());
+            font.extend_from_slice(&[0, 0, 0, 0]);
+            font.push(name.len() as u8);
+            font.push(0);
+            font.extend_from_slice(name.as_bytes());
+            font
+        };
+
+        let mut styles = XlsStyles::default();
+        styles.push_font(&font_record("Parent", 200, 400));
+        styles.push_font(&font_record("Child", 240, 700));
+
+        let mut parent = vec![0u8; 20];
+        parent[4..6].copy_from_slice(&0xFFF7u16.to_le_bytes());
+        styles.push_xf(&parent);
+
+        let mut child = vec![0u8; 20];
+        child[0..2].copy_from_slice(&1u16.to_le_bytes());
+        child[2..4].copy_from_slice(&10u16.to_le_bytes());
+        child[4..6].copy_from_slice(&0u16.to_le_bytes());
+        child[6] = 3 | 0x08 | (2 << 4);
+        child[7] = 45;
+        child[8] = 2 | 0x10;
+        child[9] = 0; // all fAtr* clear: future style edits may update the child
+        child[10..14].copy_from_slice(&1u32.to_le_bytes());
+        child[14..18].copy_from_slice(&(1u32 << 26).to_le_bytes());
+        child[18..20].copy_from_slice(&(10u16 | (11 << 7)).to_le_bytes());
+        styles.push_xf(&child);
+
+        styles.compile(ctx8(), &Formats::default(), &BIFF_DEFAULT_PALETTE);
+        let style = styles.xfs[1].as_ref().expect("compiled child XF");
+
+        let font = style.font.as_ref().expect("child font");
+        assert_eq!(font.name.as_deref(), Some("Child"));
+        assert_eq!(font.size_pt, Some(12));
+        assert!(font.bold);
+        assert_eq!(style.num_fmt.as_deref(), Some("0.00%"));
+        assert_eq!(
+            style.align,
+            Some(Alignment {
+                horizontal: Some(HAlign::Right),
+                vertical: Some(VAlign::Bottom),
+                wrap: true,
+                rotation: 45,
+                indent: 2,
+                shrink_to_fit: true,
+            })
+        );
+        assert_eq!(
+            style.border.as_ref().map(|border| border.left),
+            Some(BorderStyle::Thin)
+        );
+        assert_eq!(
+            style.pattern_fill.as_ref().map(|fill| fill.pattern),
+            Some(FormatPattern::Solid)
+        );
+        assert_eq!(
+            style.protection,
+            Some(CellProtection {
+                locked: Some(false),
+                hidden: false,
+            })
+        );
+    }
+
+    fn solid_biff8_xf(color_index: u16) -> Vec<u8> {
+        let mut xf = vec![0u8; 20];
+        xf[4..6].copy_from_slice(&0xFFF1u16.to_le_bytes());
+        xf[9] = 0xFC;
+        xf[14..18].copy_from_slice(&(1u32 << 26).to_le_bytes());
+        xf[18..20].copy_from_slice(&(color_index | (65 << 7)).to_le_bytes());
+        xf
+    }
+
+    #[test]
+    fn biff8_retains_default_column_row_and_explicit_style_precedence() {
+        let mut stream = rec(BOF, &biff8_bof(0x0005));
+        for index in 0..16 {
+            let color = match index {
+                0 => 4,  // blue column default
+                1 => 3,  // green row default
+                15 => 2, // red worksheet/default-cell XF
+                _ => 0,
+            };
+            stream.extend_from_slice(&rec(XF, &solid_biff8_xf(color)));
+        }
+        stream.extend_from_slice(&rec(STYLE, &[0x00, 0x80, 0x00, 0x00]));
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet8("Inheritance")));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        stream.extend_from_slice(&rec(BOF, &biff8_bof(0x0010)));
+        let mut colinfo = Vec::new();
+        colinfo.extend_from_slice(&0u16.to_le_bytes());
+        colinfo.extend_from_slice(&0u16.to_le_bytes());
+        colinfo.extend_from_slice(&2048u16.to_le_bytes());
+        colinfo.extend_from_slice(&0u16.to_le_bytes());
+        colinfo.extend_from_slice(&0u16.to_le_bytes());
+        colinfo.extend_from_slice(&0u16.to_le_bytes());
+        stream.extend_from_slice(&rec(COLINFO, &colinfo));
+
+        let mut row = vec![0u8; 16];
+        row[0..2].copy_from_slice(&1u16.to_le_bytes());
+        row[6..8].copy_from_slice(&300u16.to_le_bytes());
+        row[12..16].copy_from_slice(&(0x80u32 | (1 << 16)).to_le_bytes());
+        stream.extend_from_slice(&rec(ROW, &row));
+        stream.extend_from_slice(&rec(LABEL, &label8(2, 0, 15, "Explicit")));
+        let mut blank = Vec::new();
+        blank.extend_from_slice(&4u16.to_le_bytes());
+        blank.extend_from_slice(&4u16.to_le_bytes());
+        blank.extend_from_slice(&1u16.to_le_bytes());
+        stream.extend_from_slice(&rec(BLANK, &blank));
+        let mut mulblank = Vec::new();
+        mulblank.extend_from_slice(&5u16.to_le_bytes());
+        mulblank.extend_from_slice(&2u16.to_le_bytes());
+        mulblank.extend_from_slice(&0u16.to_le_bytes());
+        mulblank.extend_from_slice(&1u16.to_le_bytes());
+        mulblank.extend_from_slice(&3u16.to_le_bytes());
+        stream.extend_from_slice(&rec(MULBLANK, &mulblank));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let workbook = Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap();
+        let sheet = &workbook.sheets[0];
+        let red = Color::rgb(255, 0, 0);
+        let green = Color::rgb(0, 255, 0);
+        let blue = Color::rgb(0, 0, 255);
+        assert_eq!(
+            sheet.default_cell_style().and_then(|style| style.fill),
+            Some(red)
+        );
+        assert_eq!(sheet.column_styles()[&0].fill, Some(blue));
+        assert_eq!(sheet.row_styles()[&1].fill, Some(green));
+        assert_eq!(sheet.blank_cell_styles().len(), 3);
+        assert_eq!(sheet.blank_cell_styles()[&(4, 4)].fill, Some(green));
+        assert_eq!(sheet.blank_cell_styles()[&(5, 2)].fill, Some(blue));
+        assert_eq!(sheet.blank_cell_styles()[&(5, 3)].fill, Some(green));
+        assert_eq!(
+            sheet.resolved_cell_style(0, 0).and_then(|style| style.fill),
+            Some(blue)
+        );
+        assert_eq!(
+            sheet.resolved_cell_style(1, 0).and_then(|style| style.fill),
+            Some(green)
+        );
+        assert_eq!(
+            sheet.resolved_cell_style(0, 1).and_then(|style| style.fill),
+            Some(red)
+        );
+        assert_eq!(
+            sheet.resolved_cell_style(2, 0).and_then(|style| style.fill),
+            Some(red)
+        );
+        assert_eq!(sheet.visual_dimensions(), Some((2, 0, 5, 4)));
+    }
+
+    #[test]
+    fn xls_style_tables_are_bounded_and_unknown_values_are_not_invented() {
+        let hostile = vec![0xFF; u16::MAX as usize];
+        let mut styles = XlsStyles::default();
+        for _ in 0..MAX_XLS_STYLE_RECORDS + 16 {
+            styles.push_font(&hostile);
+            styles.push_xf(&hostile);
+        }
+        assert_eq!(styles.font_records.len(), MAX_XLS_STYLE_RECORDS);
+        assert_eq!(styles.xf_records.len(), MAX_XLS_STYLE_RECORDS);
+        assert!(styles
+            .font_records
+            .iter()
+            .flatten()
+            .all(|record| record.len() <= MAX_BIFF_FONT_RECORD_BYTES));
+        assert!(styles
+            .xf_records
+            .iter()
+            .all(|record| record.len() <= MAX_BIFF_XF_RECORD_BYTES));
+        styles.compile(ctx8(), &Formats::default(), &BIFF_DEFAULT_PALETTE);
+        let hostile_font = styles.fonts[0].as_ref().expect("bounded FONT decode");
+        assert_eq!(hostile_font.name, None);
+        assert_eq!(hostile_font.size_pt, None);
+        assert_eq!(hostile_font.color, None);
+        assert!(!hostile_font.bold);
+        assert!(!hostile_font.underline);
+
+        let mut unknown = vec![0u8; 20];
+        unknown[4..6].copy_from_slice(&0xFFF1u16.to_le_bytes());
+        unknown[6] = 0x77; // unsupported horizontal/vertical values
+        unknown[7] = 0xFF; // stacked text cannot be represented by Alignment
+        unknown[8] = 0xE0; // reserved bits only
+        unknown[9] = 0xFC;
+        unknown[10..14].copy_from_slice(&u32::MAX.to_le_bytes());
+        unknown[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        unknown[18..20].copy_from_slice(&u16::MAX.to_le_bytes());
+        let parsed = parse_biff_xf(
+            &unknown,
+            true,
+            &[],
+            &Formats::default(),
+            &BIFF_DEFAULT_PALETTE,
+        )
+        .expect("fixed-width XF remains structurally valid")
+        .components
+        .into_cell_style();
+        assert_eq!(parsed.align, Some(Alignment::default()));
+        assert_eq!(parsed.border, Some(Border::default()));
+        assert_eq!(parsed.pattern_fill, Some(Fill::default()));
+        assert_eq!(parsed.fill, None);
+    }
+
+    #[test]
+    fn libreoffice_biff8_fixture_exposes_retained_styles() {
+        let workbook = Workbook::open(include_bytes!(
+            "../tests/fixtures/formula/biff8/formula-source.xls"
+        ))
+        .unwrap();
+        assert!(!workbook.sheets.is_empty());
+        for sheet in &workbook.sheets {
+            assert_eq!(sheet.style_fidelity(), StyleFidelity::Partial);
+            let display_cells = sheet.display_cells().collect::<Vec<_>>();
+            let styled = display_cells
+                .iter()
+                .filter(|cell| cell.explicit_style.is_some())
+                .count();
+            assert_eq!(styled, display_cells.len(), "sheet {:?}", sheet.name);
+            assert!(sheet.default_cell_style().is_some());
         }
     }
 
@@ -4490,6 +6664,75 @@ mod tests {
     }
 
     #[test]
+    fn truncated_korean_cp949_label_recovers_bounded_replacement_without_panicking() {
+        let sheet_name = encode_legacy_text(EUC_KR, "오류");
+        let mut global_bof = vec![0x00, 0x05, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 4]);
+        let mut stream = rec(BOF, &global_bof);
+        stream.extend_from_slice(&rec(CODEPAGE, &949u16.to_le_bytes()));
+        let mut boundsheet = vec![0, 0, 0, 0, 0, 0, sheet_name.len() as u8];
+        boundsheet.extend_from_slice(&sheet_name);
+        stream.extend_from_slice(&rec(BOUNDSHEET, &boundsheet));
+        stream.extend_from_slice(&rec(EOF, &[]));
+
+        let mut sheet_bof = vec![0x00, 0x05, 0x10, 0x00];
+        sheet_bof.extend_from_slice(&[0u8; 4]);
+        stream.extend_from_slice(&rec(BOF, &sheet_bof));
+        let mut label = vec![0, 0, 0, 0, 0, 0];
+        label.extend_from_slice(&1u16.to_le_bytes());
+        label.push(0xB0); // Truncated lead byte of CP949 "가" (B0 A1).
+        stream.extend_from_slice(&rec(LABEL, &label));
+        stream.extend_from_slice(&rec(EOF, &[]));
+        let bytes = wrap_xls(&stream, "/Book");
+
+        let opened = std::panic::catch_unwind(|| Workbook::open(&bytes));
+        let workbook = opened
+            .expect("malformed CP949 input must not panic")
+            .unwrap();
+        assert_eq!(workbook.sheets[0].name, "오류");
+        assert_eq!(
+            workbook.sheets[0].cell(0, 0),
+            Some(&Cell::Text("�".to_string()))
+        );
+        assert_eq!(workbook.sheets[0].cells().count(), 1);
+    }
+
+    #[test]
+    fn invalid_cfb_directory_entry_uses_typed_bounded_recovery_after_success() {
+        let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+        global_bof.extend_from_slice(&[0u8; 12]);
+        let mut stream = rec(BOF, &global_bof);
+        stream.extend_from_slice(&rec(EOF, &[]));
+        let mut bytes = wrap_xls(&stream, "/Workbook");
+        let workbook_entry = cfb_directory_entry_offset(&bytes, "Workbook");
+        // [MS-CFB] permits only red (0) and black (1). An out-of-range color
+        // invalidates the primary directory-tree reader while leaving the
+        // stream bytes and bounded linear directory scan intact.
+        bytes[workbook_entry + 67] = 2;
+
+        assert!(cfb::CompoundFile::open(Cursor::new(bytes.clone())).is_err());
+        let workbook = Workbook::open(&bytes).expect("bounded CFB recovery");
+        let provenance = workbook.parse_provenance();
+        assert_eq!(
+            provenance.container,
+            crate::ContainerParseMode::TolerantCfbDirectoryWalk
+        );
+        assert_eq!(
+            provenance.recoveries(),
+            &[crate::RecoveryCode::TolerantCfbDirectoryWalk]
+        );
+        assert!(!provenance.recoveries_truncated());
+        assert!(!provenance.partial);
+        assert!(provenance.is_recovered());
+        assert_eq!(
+            crate::WorkbookReport::from_workbook("xls", &workbook)
+                .provenance
+                .recoveries(),
+            &[crate::RecoveryCode::TolerantCfbDirectoryWalk]
+        );
+    }
+
+    #[test]
     fn biff5_custom_format_record_uses_short_string_length() {
         // BIFF5 FORMAT stores ifmt:u16, cch:u8, then raw codepage bytes. The
         // percent format must feed the same XF rendering path used by BIFF8.
@@ -4522,7 +6765,7 @@ mod tests {
 
         let bytes = wrap_xls(&stream, "/Book");
         let text = extract_text(&bytes).unwrap();
-        assert!(text.contains("100%"), "{text:?}");
+        assert!(text.contains("100.00%"), "{text:?}");
     }
 
     #[test]

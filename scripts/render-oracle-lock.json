@@ -1,0 +1,53 @@
+{
+  "default_profile": "macos-arm64-lo-26.2.3.2",
+  "profiles": [
+    {
+      "configuration": {
+        "dpi": 96,
+        "locale": "C.UTF-8",
+        "pdf_filter": "pdf:calc_pdf_Export:{\"SinglePageSheets\":{\"type\":\"boolean\",\"value\":\"true\"}}",
+        "profile_sha256": "14531ee278caed3e6b63195ad13295bc72a033de7d7b07dbc2f111a7aebddc46",
+        "timezone": "UTC"
+      },
+      "font_pack_sha256": "ee367f523759b60294f38b8ed3c9c08738b9dea6c412605020eafdede4cfaeaa",
+      "libreoffice": {
+        "executable_sha256": "3c060ee1bcf719c12f7e0a83f9ea34a2eb5cfccec292134d5d15e4e36febdbb3",
+        "version": "LibreOffice 26.2.3.2 70e089b17412e4cb7773e41413306b17a2328c34"
+      },
+      "name": "macos-arm64-lo-26.2.3.2",
+      "pdf_rasterizer": {
+        "kind": "poppler",
+        "pdffonts_sha256": "b364370b9f1f5faa9d598ebbb56d3c9a064a9964ec10b6e8f7ee8d709c3a15db",
+        "pdffonts_version": "pdffonts version 26.05.0",
+        "pdfinfo_sha256": "fee70ade670fb025343aca2b5c3a2aacacb8ed9edce1b716b233b5de924b6bf5",
+        "pdfinfo_version": "pdfinfo version 26.05.0",
+        "pdftoppm_sha256": "de772e88ab9977ccde25def9b403bf42675d75f5dd82b19fbd7d8123ad183159",
+        "pdftoppm_version": "pdftoppm version 26.05.0",
+        "pdftotext_sha256": "facaa63884cd1071d5062476443613a9cadc4f0489cfd28da2e4e64c2f8dd4cb",
+        "pdftotext_version": "pdftotext version 26.05.0"
+      },
+      "platform": {
+        "machine": "arm64",
+        "system": "darwin"
+      },
+      "python": {
+        "executable_sha256": "02a8df1726463faedb3adef289b3d1bdeabb7785c837fd8c174023aeeeb4d312",
+        "implementation": "cpython",
+        "numpy_version": "2.4.4",
+        "pillow_version": "12.2.0",
+        "version": "3.14.4"
+      },
+      "source": {
+        "artifact_bytes": 295006554,
+        "artifact_sha256": "8ea6bdf67dbffc9c47104f73a3c98ed145ff26c00dde44c43633f5b3d741479f",
+        "artifact_url": "https://download.documentfoundation.org/libreoffice/stable/26.2.3/mac/aarch64/LibreOffice_26.2.3_MacOS_aarch64.dmg"
+      },
+      "svg_rasterizer": {
+        "distribution": "CairoSVG",
+        "kind": "cairosvg",
+        "version": "2.9.0"
+      }
+    }
+  ],
+  "schema": "rxls.render-oracle-lock.v1"
+}
