@@ -6,7 +6,7 @@
     "reference": "docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e"
   },
   "built_image": {
-    "expected_id": null,
+    "expected_id": "sha256:b3717f7083549f874129090013918d03280af5e4d312a2199fdd2df6763c0b01",
     "identity_kind": "oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_runtime_image_id_plus_exact_build_contract_and_labels"
