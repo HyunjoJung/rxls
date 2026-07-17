@@ -231,7 +231,8 @@ def render_notice(
         "The npm package has no npm runtime dependencies. This notice conservatively",
         "covers every third-party crate reachable through normal Cargo edges used to",
         "produce the WebAssembly artifact, including proc-macro support. Legal-file",
-        "text is reproduced and deduplicated by raw SHA-256; framing and terminal",
+        "text is identified and deduplicated by raw SHA-256. Embedded legal text is",
+        "normalized from CRLF or CR to LF for deterministic display; framing and",
         "line-break normalization are not part of the referenced legal-file bytes.",
         "",
     ]
@@ -275,7 +276,7 @@ def render_notice(
                 "----- BEGIN LEGAL TEXT -----",
             ]
         )
-        text = payload.decode("utf-8")
+        text = payload.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         lines.append(text.rstrip("\n"))
         lines.extend(["----- END LEGAL TEXT -----", ""])
     rendered = "\n".join(lines).rstrip() + "\n"

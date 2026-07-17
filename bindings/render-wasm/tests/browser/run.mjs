@@ -5,6 +5,20 @@ import { tmpdir } from "node:os";
 import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  OperationTimeoutError,
+  closeServer,
+  createCdpClient,
+  terminateChild,
+  waitForWebSocketOpen,
+  withTimeout
+} from "./lifecycle.mjs";
+
+const CDP_HTTP_TIMEOUT_MS = 2_000;
+const CDP_COMMAND_TIMEOUT_MS = 5_000;
+const BROWSER_RUN_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 5_000;
+
 const packageRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const installedPackageRoot = process.env.RXLS_RENDER_INSTALLED_PACKAGE_ROOT
   ? resolve(process.env.RXLS_RENDER_INSTALLED_PACKAGE_ROOT)
@@ -125,9 +139,10 @@ try {
   if (!page?.id) {
     throw new Error("browser smoke page did not expose a DevTools endpoint");
   }
-  const browserMetadata = await (
-    await fetch(`http://127.0.0.1:${port}/json/version`)
-  ).json();
+  const browserMetadata = await fetchJson(
+    `http://127.0.0.1:${port}/json/version`,
+    "Chromium DevTools browser metadata"
+  );
   if (!browserMetadata?.webSocketDebuggerUrl) {
     throw new Error("Chromium did not expose a browser DevTools endpoint");
   }
@@ -136,10 +151,13 @@ try {
     page.id
   );
 } finally {
-  child.kill("SIGTERM");
-  await new Promise((resolveExit) => child.once("close", resolveExit));
-  await new Promise((resolveClose) => server.close(resolveClose));
-  await rm(profile, { recursive: true, force: true });
+  await terminateChild(child);
+  await closeServer(server);
+  await withTimeout(
+    rm(profile, { recursive: true, force: true }),
+    CLEANUP_TIMEOUT_MS,
+    "Chromium profile cleanup"
+  );
 }
 if (!browserResult.message.startsWith("PASS ")) {
   console.error(`requests: ${requestedPaths.join(", ")}`);
@@ -171,10 +189,14 @@ async function waitForFile(path) {
 }
 
 async function waitForPages(port) {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/list`);
-      const pages = await response.json();
+      const pages = await fetchJson(
+        `http://127.0.0.1:${port}/json/list`,
+        "Chromium DevTools page targets",
+        Math.max(1, Math.min(CDP_HTTP_TIMEOUT_MS, deadline - Date.now()))
+      );
       if (pages.length > 0) {
         return pages;
       }
@@ -188,46 +210,31 @@ async function waitForPages(port) {
 
 async function waitForBrowserResult(webSocketUrl, pageTargetId) {
   const socket = new WebSocket(webSocketUrl);
-  await new Promise((resolveOpen, rejectOpen) => {
-    socket.addEventListener("open", resolveOpen, { once: true });
-    socket.addEventListener("error", rejectOpen, { once: true });
-  });
-  let nextId = 1;
-  const pending = new Map();
+  await waitForWebSocketOpen(socket, CDP_COMMAND_TIMEOUT_MS);
   const attachedTargets = [];
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (message.id && pending.has(message.id)) {
-      pending.get(message.id)(message);
-      pending.delete(message.id);
-    } else if (message.method === "Target.attachedToTarget") {
-      attachedTargets.push(message.params);
+  const client = createCdpClient(socket, {
+    commandTimeoutMs: CDP_COMMAND_TIMEOUT_MS,
+    onEvent(message) {
+      if (message.method === "Target.attachedToTarget") {
+        attachedTargets.push(message.params);
+      }
     }
   });
-  const command = (method, params = {}, sessionId = undefined) =>
-    new Promise((resolveCommand, rejectCommand) => {
-      const id = nextId++;
-      pending.set(id, (message) => {
-        if (message.error) {
-          rejectCommand(new Error(`${method}: ${message.error.message}`));
-        } else {
-          resolveCommand(message.result ?? {});
-        }
-      });
-      const message = { id, method, params };
-      if (sessionId !== undefined) {
-        message.sessionId = sessionId;
-      }
-      socket.send(JSON.stringify(message));
-    });
+  const command = client.command;
+  const browserDeadline = setTimeout(() => {
+    client.abort(
+      new OperationTimeoutError("Chromium DevTools browser smoke", BROWSER_RUN_TIMEOUT_MS)
+    );
+    socket.close();
+  }, BROWSER_RUN_TIMEOUT_MS);
   const attach = async (targetId) =>
     (await command("Target.attachToTarget", { targetId, flatten: true })).sessionId;
-  const pageSession = await attach(pageTargetId);
-  const evaluate = (expression) =>
-    command("Runtime.evaluate", { expression, returnByValue: true }, pageSession);
   const sampleHeap = async (sessionId) =>
     normalizeHeap(await command("Runtime.getHeapUsage", {}, sessionId));
   try {
+    const pageSession = await attach(pageTargetId);
+    const evaluate = (expression) =>
+      command("Runtime.evaluate", { expression, returnByValue: true }, pageSession);
     await command("Target.setDiscoverTargets", { discover: true });
     await command("Runtime.enable", {}, pageSession);
     await command("HeapProfiler.enable", {}, pageSession);
@@ -289,8 +296,24 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId) {
       heap: null
     };
   } finally {
+    clearTimeout(browserDeadline);
+    client.dispose();
     socket.close();
   }
+}
+
+async function fetchJson(url, label, timeoutMs = CDP_HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const response = await withTimeout(
+    fetch(url, { signal: controller.signal }),
+    timeoutMs,
+    label,
+    () => controller.abort()
+  );
+  if (!response.ok) {
+    throw new Error(`${label} returned HTTP ${response.status}`);
+  }
+  return withTimeout(response.json(), timeoutMs, `${label} JSON`, () => controller.abort());
 }
 
 async function waitForWorkerTarget(attachedTargets) {

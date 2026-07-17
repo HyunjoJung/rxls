@@ -53,6 +53,7 @@ MAX_FONT_PACK_BYTES = 128 * 1024 * 1024
 MAX_FONT_PACK_FILES = 128
 MAX_EVIDENCE_FILES = 16
 MAX_ENGINE_DIAGNOSTIC_BYTES = 1024 * 1024
+MAX_BUILD_DIAGNOSTIC_BYTES = 64 * 1024
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -268,6 +269,42 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def build_failure_diagnostic(result: CommandResult) -> str:
+    """Return a bounded, path-neutral Docker/Podman build failure tail."""
+    header = (
+        "render_oracle_build_diagnostic "
+        f"status={result.status} returncode={result.returncode} "
+        f"stdout_sha256={sha256_bytes(result.stdout)} "
+        f"stderr_sha256={sha256_bytes(result.stderr)}"
+    )
+    replacements = {
+        str(ROOT): "<repo>",
+        str(ROOT.resolve(strict=False)): "<repo>",
+        str(Path.home()): "<home>",
+        tempfile.gettempdir(): "<tmp>",
+    }
+    sections = [header]
+    for label, payload in (("stderr", result.stderr), ("stdout", result.stdout)):
+        if not payload:
+            continue
+        tail = payload[-MAX_BUILD_DIAGNOSTIC_BYTES:]
+        text = tail.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        text = "".join(
+            character
+            if character in {"\n", "\t"} or (character.isprintable() and character != "\x7f")
+            else "\ufffd"
+            for character in text
+        )
+        for source, replacement in sorted(
+            replacements.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if source:
+                text = text.replace(source, replacement)
+        sections.extend((f"--- {label} tail ---", text.rstrip("\n")))
+    return "\n".join(sections).rstrip() + "\n"
 
 
 def sha256_file(path: Path, limit: int) -> str:
@@ -1272,6 +1309,7 @@ def execute_build(
         output_limit_bytes=16 * 1024 * 1024,
     )
     if result.status != "ok":
+        print(build_failure_diagnostic(result), file=sys.stderr, end="")
         raise OracleContainerError(f"image_build_{result.status}")
     return inspect_image(
         runner, engine, image, lock_sha256, expected_image_id

@@ -118,6 +118,36 @@ class RenderSupplyChainTests(unittest.TestCase):
         self.assertNotIn(temporary, notice)
         self.assertEqual(notice.count("LEGAL TEXT SHA-256:"), 1)
 
+    def test_notice_normalizes_display_line_endings_but_keeps_raw_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            metadata, lock = self._fixture(Path(temporary))
+            payload = b"first\r\nsecond\rthird\n"
+
+            def legal_file_loader(_package):
+                return [("LICENSE", payload)]
+
+            notice, summary = self.supply.render_notice(
+                metadata,
+                lock,
+                "a" * 64,
+                legal_file_loader=legal_file_loader,
+            )
+            repeated, _ = self.supply.render_notice(
+                metadata,
+                lock,
+                "a" * 64,
+                legal_file_loader=legal_file_loader,
+            )
+
+        self.assertEqual(notice, repeated)
+        self.assertEqual(summary, {"packages": 2, "legal_texts": 1})
+        self.assertIn(
+            f"LEGAL TEXT SHA-256: {self.supply.sha256_bytes(payload)}",
+            notice,
+        )
+        self.assertIn("first\nsecond\nthird\n----- END LEGAL TEXT -----", notice)
+        self.assertNotIn("\r", notice)
+
     def test_sbom_is_path_neutral_and_records_exact_normal_dependency_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             metadata, lock = self._fixture(Path(temporary))
@@ -156,7 +186,9 @@ class RenderSupplyChainTests(unittest.TestCase):
         rendered, summary = self.supply.render_notice(metadata, lock, lock_sha256)
 
         checked = (ROOT / "bindings" / "render-wasm" / "THIRD_PARTY_NOTICES.txt")
-        self.assertEqual(checked.read_bytes(), rendered.encode("utf-8"))
+        checked_bytes = checked.read_bytes()
+        self.assertNotIn(b"\r", checked_bytes)
+        self.assertEqual(checked_bytes, rendered.encode("utf-8"))
         self.assertGreater(summary["packages"], 0)
         self.assertGreater(summary["legal_texts"], 0)
 

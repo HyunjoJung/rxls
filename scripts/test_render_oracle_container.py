@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+from contextlib import redirect_stderr
 import subprocess
 import sys
 import tarfile
@@ -294,6 +295,34 @@ class RenderOracleContainerTests(unittest.TestCase):
             f"SOURCE_DATE_EPOCH={lock['built_image']['source_date_epoch']}",
             command,
         )
+
+    def test_failed_image_build_emits_bounded_path_neutral_diagnostics(self) -> None:
+        stderr = (
+            f"\x1b[31mstep at {MODULE.ROOT}/private\r\n"
+            "curl: (1) Protocol http disabled\rtrailer\n"
+        ).encode()
+
+        class FailedBuildRunner:
+            def run(self, *_args, **_kwargs):
+                return MODULE.CommandResult("nonzero", 42, b"stdout detail\n", stderr)
+
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), self.assertRaisesRegex(
+            MODULE.OracleContainerError, "image_build_nonzero"
+        ):
+            MODULE.execute_build(
+                "docker",
+                "local/oracle:test",
+                "d" * 64,
+                runner=FailedBuildRunner(),
+            )
+
+        rendered = diagnostic.getvalue()
+        self.assertIn("status=nonzero returncode=42", rendered)
+        self.assertIn(f"stderr_sha256={sha256(stderr)}", rendered)
+        self.assertIn("<repo>/private\ncurl: (1) Protocol http disabled\ntrailer", rendered)
+        self.assertNotIn(str(MODULE.ROOT), rendered)
+        self.assertNotIn("\x1b", rendered)
 
     def test_container_and_host_profiles_split_active_content_policy(self) -> None:
         container_profile = CONTAINER_DIR / "profile" / "registrymodifications.xcu"

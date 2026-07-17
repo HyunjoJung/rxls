@@ -118,7 +118,8 @@ jobs:
             ../render-browser-evidence/rxls-render-worker-0.1.2.tgz
           node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v1") process.exit(1)'
           RXLS_RENDER_INSTALLED_PACKAGE_ROOT="$PWD/node_modules/@rxls/render-worker" \
-            node "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \
+            node --experimental-websocket \
+            "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \
             | tee ../render-browser-evidence/installed-package-chromium.log
           sha256sum ../render-browser-evidence/rxls-render-worker-0.1.2.tgz > ../render-browser-evidence/npm-pack.sha256
       - name: Upload browser-rendering evidence

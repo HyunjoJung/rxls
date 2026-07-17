@@ -916,6 +916,14 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
             "browser wasm-bindgen install step",
         )
     )
+    installed_browser_command = (
+        "node --experimental-websocket \\\n"
+        '            "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs"'
+    )
+    if worker_job.count(installed_browser_command) != 1:
+        errors.append(
+            f"{path}: installed Node 20 browser smoke must explicitly enable WebSocket"
+        )
     return errors
 
 

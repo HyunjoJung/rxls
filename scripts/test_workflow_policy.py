@@ -507,6 +507,11 @@ steps:
                 '          export PATH="$CARGO_HOME/bin:$PATH"\n'
                 "          npm run build:wasm",
             ),
+            "installed_browser_websocket_flag": original.replace(
+                "            node --experimental-websocket \\\n"
+                '            "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs"',
+                '            node "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs"',
+            ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
