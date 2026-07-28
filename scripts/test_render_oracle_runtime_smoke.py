@@ -363,6 +363,58 @@ class RuntimeSmokeTests(unittest.TestCase):
         self.assertEqual(stderr, "oracle_error:runtime_mount_not_writable\n")
         self.assertNotIn("private", stderr)
 
+    def test_entrypoint_phase_failures_are_reduced_without_echoing_logs(
+        self,
+    ) -> None:
+        diagnostics = {
+            (
+                b"cp: cannot open "
+                b"'/opt/rxls/profile/registrymodifications.xcu': error\n"
+                b"/private/source.xlsx"
+            ): "profile_setup_failed",
+            (
+                b"mkdir: cannot create directory "
+                b"'/oracle/runtime/runtime-smoke': Invalid argument\n"
+            ): "runtime_setup_failed",
+            (
+                b"find: '/oracle/evidence': Input/output error\n"
+            ): "evidence_preflight_failed",
+            (
+                b"wc: /oracle/source/input.xlsx: Input/output error\n"
+            ): "source_size_failed",
+            (
+                b"sha256sum: /oracle/source/input.xlsx: Input/output error\n"
+            ): "source_hash_failed",
+            (
+                b"mv: cannot move '/oracle/evidence/input.pdf': "
+                b"Invalid argument\n"
+            ): "evidence_finalize_failed",
+            (
+                b"cannot create /oracle/evidence/oracle-manifest.json: "
+                b"Invalid argument\n"
+            ): "evidence_manifest_failed",
+            (
+                b"chmod: changing permissions of "
+                b"'/oracle/evidence/oracle.pdf': Operation not permitted\n"
+            ): "evidence_permissions_failed",
+            (
+                b"tar: oracle.pdf: Cannot stat: Input/output error\n"
+            ): "evidence_archive_failed",
+        }
+        for diagnostic, expected in diagnostics.items():
+            with self.subTest(expected=expected):
+                with _fixture(
+                    start_status="nonzero",
+                    start_stderr=b"docker: start failed",
+                    diagnostic_logs=diagnostic,
+                ) as (inputs, runner, _):
+                    status, stdout, stderr = self._run(inputs, runner)
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, f"oracle_error:{expected}\n")
+                self.assertNotIn("private", stderr)
+                self.assertNotIn("source.xlsx", stderr)
+
     def test_unknown_exit_code_is_retained_as_a_bounded_integer(self) -> None:
         with _fixture(
             start_status="nonzero",

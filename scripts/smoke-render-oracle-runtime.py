@@ -233,6 +233,33 @@ def _container_log_code(payload: object) -> str | None:
         return "runtime_mount_full"
     if b"/oracle/evidence" in lowered and b"no space left on device" in lowered:
         return "evidence_mount_full"
+    if b"registrymodifications.xcu" in lowered and b"cp:" in lowered:
+        return "profile_setup_failed"
+    if b"/oracle/runtime" in lowered and (
+        b"mkdir:" in lowered or b"cp:" in lowered
+    ):
+        return "runtime_setup_failed"
+    if b"/oracle/evidence" in lowered and b"find:" in lowered:
+        return "evidence_preflight_failed"
+    if b"/oracle/source/input" in lowered and b"wc:" in lowered:
+        return "source_size_failed"
+    if b"/oracle/source/input" in lowered and b"sha256sum:" in lowered:
+        return "source_hash_failed"
+    if (
+        b"/oracle/evidence/input.pdf" in lowered
+        and b"mv:" in lowered
+    ):
+        return "evidence_finalize_failed"
+    if b"oracle-manifest.json" in lowered and (
+        b"cannot create" in lowered
+        or b"permission denied" in lowered
+        or b"read-only file system" in lowered
+    ):
+        return "evidence_manifest_failed"
+    if b"/oracle/evidence" in lowered and b"chmod:" in lowered:
+        return "evidence_permissions_failed"
+    if b"tar:" in lowered:
+        return "evidence_archive_failed"
     return None
 
 
