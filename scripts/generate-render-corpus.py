@@ -29,8 +29,9 @@ import shutil
 import struct
 import tempfile
 from typing import Callable, Iterable
+from xml.etree import ElementTree
 import zlib
-from zipfile import ZIP_STORED, ZipFile, ZipInfo
+from zipfile import ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,9 @@ MAX_PACKAGE_RELATIONSHIPS = 16
 MAX_IMAGE_BYTES = 64 * 1024
 MAX_DRAWING_OBJECTS = 4
 MAX_CHART_POINTS = 64
+CHART_SERIES_LINE_WIDTH_EMU = 38_100
+MIN_CHART_SERIES_LINE_WIDTH_EMU = 12_700
+CHART_SERIES_COLOR = "1565C0"
 PAIRWISE_PERIOD = 128
 
 DOS_EPOCH = (1980, 1, 1, 0, 0, 0)
@@ -695,6 +699,7 @@ def _xlsx_chart(spec: CaseSpec) -> str:
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
   <c:chart><c:autoTitleDeleted val="1"/><c:plotArea><c:layout/><c:lineChart><c:grouping val="standard"/><c:varyColors val="0"/>
     <c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>Render!$A$7</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Series {spec.index:04d}</c:v></c:pt></c:strCache></c:strRef></c:tx>
+      <c:spPr><a:ln w="{CHART_SERIES_LINE_WIDTH_EMU}"><a:solidFill><a:srgbClr val="{CHART_SERIES_COLOR}"/></a:solidFill></a:ln></c:spPr>
       <c:marker><c:symbol val="circle"/><c:size val="5"/></c:marker>
       <c:cat><c:strRef><c:f>Render!$B$6:$E$6</c:f><c:strCache><c:ptCount val="4"/><c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt><c:pt idx="2"><c:v>Q3</c:v></c:pt><c:pt idx="3"><c:v>Q4</c:v></c:pt></c:strCache></c:strRef></c:cat>
       <c:val><c:numRef><c:f>Render!$B$7:$E$7</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="4"/>{points}</c:numCache></c:numRef></c:val><c:smooth val="0"/></c:ser>
@@ -1467,6 +1472,63 @@ BUILDERS: dict[str, Callable[[CaseSpec], bytes]] = {
 }
 
 
+def _validate_chart_fixture_paint(spec: CaseSpec, payload: bytes) -> None:
+    """Fail closed when a chart-tagged fixture has no explicit visible series."""
+
+    if not _has(spec, "chart"):
+        return
+    if spec.format != "xlsx":
+        raise CorpusError(f"chart feature requires xlsx payload: {spec.case_id}")
+    try:
+        with ZipFile(io.BytesIO(payload)) as archive:
+            chart_xml = archive.read("xl/charts/chart1.xml")
+        chart = ElementTree.fromstring(chart_xml)
+    except (BadZipFile, KeyError, OSError, ElementTree.ParseError) as exc:
+        raise CorpusError(f"invalid chart fixture: {spec.case_id}") from exc
+
+    namespaces = {
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    }
+    series = chart.findall(".//c:ser", namespaces)
+    if not series:
+        raise CorpusError(
+            f"chart fixture lacks nontrivial explicit series paint: {spec.case_id}"
+        )
+    for item in series:
+        line = item.find("c:spPr/a:ln", namespaces)
+        color = (
+            line.find("a:solidFill/a:srgbClr", namespaces)
+            if line is not None
+            else None
+        )
+        rgb = ""
+        try:
+            width = int(line.attrib["w"]) if line is not None else 0
+            rgb = color.attrib["val"].upper() if color is not None else ""
+            channels = tuple(
+                int(rgb[offset : offset + 2], 16) for offset in range(0, 6, 2)
+            )
+        except (KeyError, TypeError, ValueError):
+            width = 0
+            channels = ()
+        alpha = color.find("a:alpha", namespaces) if color is not None else None
+        try:
+            opacity = int(alpha.attrib["val"]) if alpha is not None else 100_000
+        except (KeyError, ValueError):
+            opacity = 0
+        if (
+            width < MIN_CHART_SERIES_LINE_WIDTH_EMU
+            or len(rgb) != 6
+            or len(channels) != 3
+            or min(channels) > 0xCC
+            or opacity != 100_000
+        ):
+            raise CorpusError(
+                f"chart fixture lacks nontrivial explicit series paint: {spec.case_id}"
+            )
+
+
 def build_case(spec: CaseSpec) -> bytes:
     if spec.format not in FORMATS:
         raise CorpusError(f"unsupported case format: {spec.format}")
@@ -1480,6 +1542,7 @@ def build_case(spec: CaseSpec) -> bytes:
         raise CorpusError(
             f"case byte cap exceeded by {spec.case_id}: {len(payload)} > {MAX_CASE_BYTES}"
         )
+    _validate_chart_fixture_paint(spec, payload)
     return payload
 
 

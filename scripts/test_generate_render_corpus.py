@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from xml.etree import ElementTree
 from zipfile import ZipFile
 
@@ -199,7 +200,7 @@ class GenerateRenderCorpusTests(unittest.TestCase):
     def test_exact_bytes_are_reproducible_with_golden_hashes(self) -> None:
         expected = {
             "xls-0000": "1a3c7407c94dc7429db7fd12c2bce2f9cc49087034f0ef2e82f7f66a981fc062",
-            "xlsx-0000": "ab2560d3354591599b995e6571fde822109833bba4fc560c7fdb477f03d86131",
+            "xlsx-0000": "19e3c35c44ad71b5974721888b2234d29a3e39716f4d7f467e5c63b59ad2c62b",
             "xlsb-0000": "637c4c276da0dd387dc375ebe85c777c1a017f41c0560dc47a8ce1585b4d1708",
             "ods-0000": "bc590b68230ad1acd484b7925b53bfa7aeeb16e8423fc039003b7ccc70ef770e",
         }
@@ -852,6 +853,70 @@ class GenerateRenderCorpusTests(unittest.TestCase):
             self.assertNotIn(
                 b"<x14:sparklineGroups", archive.read("xl/worksheets/sheet1.xml")
             )
+
+    def test_chart_fixtures_require_explicit_nontrivial_series_paint(self) -> None:
+        chart_cases = [
+            case
+            for case in self.module.profile_specs("pilot")
+            if case.format == "xlsx" and "chart" in case.features
+        ]
+        self.assertEqual([case.index for case in chart_cases], [0, 2, 4, 6, 8])
+        namespaces = {
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        }
+        for spec in chart_cases:
+            with ZipFile(io.BytesIO(self.module.build_case(spec))) as archive:
+                chart = ElementTree.fromstring(
+                    archive.read("xl/charts/chart1.xml")
+                )
+            series = chart.findall(".//c:ser", namespaces)
+            with self.subTest(case=spec.case_id):
+                self.assertEqual(len(series), 1)
+                line = series[0].find("c:spPr/a:ln", namespaces)
+                self.assertIsNotNone(line)
+                self.assertEqual(
+                    line.attrib.get("w"),
+                    str(self.module.CHART_SERIES_LINE_WIDTH_EMU),
+                )
+                color = line.find("a:solidFill/a:srgbClr", namespaces)
+                self.assertIsNotNone(color)
+                self.assertEqual(
+                    color.attrib.get("val"),
+                    self.module.CHART_SERIES_COLOR,
+                )
+
+        spec = chart_cases[0]
+        original_chart = self.module._xlsx_chart(spec)
+        explicit_style = (
+            f'<c:spPr><a:ln w="{self.module.CHART_SERIES_LINE_WIDTH_EMU}">'
+            f'<a:solidFill><a:srgbClr val="{self.module.CHART_SERIES_COLOR}"/>'
+            "</a:solidFill></a:ln></c:spPr>"
+        )
+        self.assertIn(explicit_style, original_chart)
+        invalid_styles = {
+            "missing": "",
+            "zero-width": explicit_style.replace(
+                f'w="{self.module.CHART_SERIES_LINE_WIDTH_EMU}"',
+                'w="0"',
+            ),
+            "near-white": explicit_style.replace(
+                f'val="{self.module.CHART_SERIES_COLOR}"',
+                'val="FFFFFF"',
+            ),
+        }
+        for reason, replacement in invalid_styles.items():
+            invalid_chart = original_chart.replace(explicit_style, replacement, 1)
+            with self.subTest(invalid=reason), mock.patch.object(
+                self.module,
+                "_xlsx_chart",
+                return_value=invalid_chart,
+            ):
+                with self.assertRaisesRegex(
+                    self.module.CorpusError,
+                    "chart fixture lacks nontrivial explicit series paint",
+                ):
+                    self.module.build_case(spec)
 
     def test_every_conditional_format_case_satisfies_its_visible_rule(self) -> None:
         cases = [
