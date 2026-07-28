@@ -37,8 +37,9 @@ from check_render_oracle_release_evidence import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = ROOT / "bindings" / "render-wasm" / "toolchain-lock.json"
 DEFAULT_PACKAGE = ROOT / "bindings" / "render-wasm" / "package.json"
-SCHEMA = "rxls.render-browser-evidence.v3"
-PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v3"
+SCHEMA = "rxls.render-browser-evidence.v4"
+PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v4"
+BEHAVIOR_SCHEMA = "rxls.render-browser-behavior.v1"
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_RUNTIME_TEXT = b"PASS pinned Chromium runtime closure resolved\n"
 EXPECTED_NETWORK_ERROR = "net::ERR_INTERNET_DISCONNECTED"
@@ -53,6 +54,7 @@ MAX_LOG_BYTES = 1024 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 1024 * 1024
+MAX_BEHAVIOR_PROOF_BYTES = 32 * 1024
 MAX_INTEGER = (1 << 63) - 1
 SUMMARY_NAME = "browser-summary.json"
 EXPECTED_PACKAGE_FILES = {
@@ -76,7 +78,7 @@ MODE_DESCRIPTIONS = {
         "and hard-stop smoke"
     ),
     "installed": (
-        "installed package rich font/image, CSP, virtual tile/page "
+        "installed package rich font/image, CSP, limits, virtual tile/page "
         "and hard-stop smoke"
     ),
 }
@@ -183,6 +185,247 @@ def _canonical_payload(value: object) -> bytes:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_behavior_contract(document: object) -> dict[str, object]:
+    _require(
+        isinstance(document, dict)
+        and set(document)
+        == {
+            "schema",
+            "fixture",
+            "capabilitiesSha256",
+            "cancellation",
+            "progress",
+            "limits",
+            "tile",
+            "pages",
+            "hardStop",
+            "network",
+        }
+        and document.get("schema") == BEHAVIOR_SCHEMA,
+        "behavior_shape",
+    )
+    capabilities_sha256 = document.get("capabilitiesSha256")
+    _require(
+        isinstance(capabilities_sha256, str)
+        and SHA256_RE.fullmatch(capabilities_sha256) is not None,
+        "behavior_capabilities",
+    )
+    fixture = document.get("fixture")
+    _require(
+        isinstance(fixture, dict)
+        and set(fixture)
+        == {
+            "workbookBytes",
+            "workbookSha256",
+            "fontPackSha256",
+            "renderedImageBytes",
+            "renderedImageSha256",
+        }
+        and _positive_int(fixture.get("workbookBytes"), maximum=32 * 1024 * 1024)
+        and _positive_int(
+            fixture.get("renderedImageBytes"), maximum=16 * 1024 * 1024
+        )
+        and all(
+            isinstance(fixture.get(field), str)
+            and SHA256_RE.fullmatch(fixture[field]) is not None
+            for field in (
+                "workbookSha256",
+                "fontPackSha256",
+                "renderedImageSha256",
+            )
+        ),
+        "behavior_fixture",
+    )
+    _require(
+        document.get("cancellation")
+        == {
+            "abortSignal": "AbortError",
+            "activeOpen": "AbortError",
+            "reopenedDocument": True,
+        },
+        "behavior_cancellation",
+    )
+    _require(
+        document.get("progress")
+        == [
+            {"completed": 0, "total": 3, "stage": "accepted"},
+            {"completed": 1, "total": 3, "stage": "parsing"},
+            {"completed": 2, "total": 3, "stage": "finalizing"},
+            {"completed": 3, "total": 3, "stage": "complete"},
+        ],
+        "behavior_progress",
+    )
+    _require(
+        document.get("limits")
+        == {
+            "fontFiles": {"code": "limit_exceeded", "resource": "fontFiles"},
+            "hardPage": {"code": "limit_exceeded", "resource": "pages"},
+            "dpi": {"code": "dpi_out_of_range", "resource": None},
+            "outputBytes": {
+                "code": "limit_exceeded",
+                "resource": "output_bytes",
+            },
+            "imageCount": {"code": "limit_exceeded", "resource": "maxImages"},
+            "imageBytes": {
+                "code": "limit_exceeded",
+                "resource": "maxImageBytes",
+            },
+        },
+        "behavior_limits",
+    )
+    tile = document.get("tile")
+    _require(
+        isinstance(tile, dict)
+        and set(tile)
+        == {
+            "firstRow",
+            "firstCol",
+            "lastRow",
+            "lastCol",
+            "bytes",
+            "sha256",
+        }
+        and {
+            "firstRow": tile.get("firstRow"),
+            "firstCol": tile.get("firstCol"),
+            "lastRow": tile.get("lastRow"),
+            "lastCol": tile.get("lastCol"),
+        }
+        == {"firstRow": 0, "firstCol": 0, "lastRow": 63, "lastCol": 31}
+        and _positive_int(tile.get("bytes"), maximum=16 * 1024 * 1024)
+        and tile["bytes"] >= 250_000
+        and isinstance(tile.get("sha256"), str)
+        and SHA256_RE.fullmatch(tile["sha256"]) is not None,
+        "behavior_tile",
+    )
+    pages = document.get("pages")
+    _require(
+        isinstance(pages, dict)
+        and set(pages) == {"count", "paper", "first", "nonzero", "outOfRange"}
+        and _positive_int(pages.get("count"), maximum=512)
+        and pages["count"] >= 8,
+        "behavior_pages",
+    )
+    paper = pages.get("paper")
+    _require(
+        isinstance(paper, dict)
+        and set(paper) == {"widthRaw", "heightRaw"}
+        and _positive_int(paper.get("widthRaw"))
+        and _positive_int(paper.get("heightRaw")),
+        "behavior_paper",
+    )
+    _validate_behavior_svg_page(
+        pages.get("first"),
+        expected_index=0,
+        paper=paper,
+        require_png=False,
+    )
+    nonzero_index = pages["count"] - 1
+    _validate_behavior_svg_page(
+        pages.get("nonzero"),
+        expected_index=nonzero_index,
+        paper=paper,
+        require_png=True,
+    )
+    _require(
+        pages["first"]["svg"]["sha256"] != pages["nonzero"]["svg"]["sha256"],
+        "behavior_page_isolation",
+    )
+    _require(
+        pages.get("outOfRange")
+        == {
+            "pageIndex": pages["count"],
+            "code": "page_index_out_of_range",
+        },
+        "behavior_page_range",
+    )
+    _require(
+        document.get("hardStop")
+        == {"deadlineMs": HARD_STOP_DEADLINE_MS, "rejectedRequests": 2},
+        "behavior_hard_stop",
+    )
+    _require(
+        document.get("network")
+        == {
+            "cspNegativeControl": True,
+            "unexpectedExternalResources": 0,
+        },
+        "behavior_network",
+    )
+    _require(
+        len(_canonical_payload(document)) <= MAX_BEHAVIOR_PROOF_BYTES,
+        "behavior_size",
+    )
+    return document
+
+
+def _validate_behavior_svg_page(
+    page: object,
+    *,
+    expected_index: int,
+    paper: dict[str, object],
+    require_png: bool,
+) -> None:
+    expected_keys = {
+        "pageIndex",
+        "responsePageIndex",
+        "pageMapSha256",
+        "svg",
+    }
+    if require_png:
+        expected_keys.add("png")
+    _require(
+        isinstance(page, dict)
+        and set(page) == expected_keys
+        and page.get("pageIndex") == expected_index
+        and page.get("responsePageIndex") == expected_index
+        and isinstance(page.get("pageMapSha256"), str)
+        and SHA256_RE.fullmatch(page["pageMapSha256"]) is not None,
+        "behavior_page_identity",
+    )
+    svg = page.get("svg")
+    expected_svg_keys = {"bytes", "sha256", "widthRaw", "heightRaw"}
+    if require_png:
+        expected_svg_keys.add("repeatSha256")
+    _require(
+        isinstance(svg, dict)
+        and set(svg) == expected_svg_keys
+        and _positive_int(svg.get("bytes"), maximum=16 * 1024 * 1024)
+        and isinstance(svg.get("sha256"), str)
+        and SHA256_RE.fullmatch(svg["sha256"]) is not None
+        and svg.get("widthRaw") == paper["widthRaw"]
+        and svg.get("heightRaw") == paper["heightRaw"],
+        "behavior_page_svg",
+    )
+    if not require_png:
+        return
+    _require(
+        isinstance(svg.get("repeatSha256"), str)
+        and svg["repeatSha256"] == svg["sha256"],
+        "behavior_page_repeat",
+    )
+    png = page.get("png")
+    _require(
+        isinstance(png, dict)
+        and set(png) == {"bytes", "sha256", "width", "height", "dpi"}
+        and _positive_int(png.get("bytes"), maximum=16 * 1024 * 1024)
+        and isinstance(png.get("sha256"), str)
+        and SHA256_RE.fullmatch(png["sha256"]) is not None
+        and png.get("dpi") == 96
+        and png.get("width") == _raster_dimension(paper["widthRaw"], 96)
+        and png.get("height") == _raster_dimension(paper["heightRaw"], 96),
+        "behavior_page_png",
+    )
+
+
+def _raster_dimension(raw: object, dpi: int) -> int:
+    _require(_positive_int(raw) and _positive_int(dpi), "behavior_raster_dimension")
+    numerator = raw * dpi
+    denominator = 1024 * 96
+    _require(numerator <= MAX_INTEGER, "behavior_raster_dimension")
+    return (numerator + denominator - 1) // denominator
 
 
 def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
@@ -330,7 +573,7 @@ def _parse_mode_log(
     mode: str,
     contract: dict[str, object],
     limits: dict[str, int],
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[str, object]]:
     payload = _read_bytes(path, MAX_LOG_BYTES, f"{mode}_log")
     try:
         text = payload.decode("utf-8")
@@ -347,6 +590,28 @@ def _parse_mode_log(
         len(pass_lines) == 1 and nonblank[-1] == pass_lines[0],
         f"{mode}_pass_line",
     )
+    proof_lines = [line for line in nonblank if line.startswith("PROOF ")]
+    _require(
+        len(proof_lines) == 1
+        and len(nonblank) >= 2
+        and nonblank[-2] == proof_lines[0],
+        f"{mode}_behavior_line",
+    )
+    proof_payload = proof_lines[0].removeprefix("PROOF ").encode("utf-8")
+    _require(
+        0 < len(proof_payload) <= MAX_BEHAVIOR_PROOF_BYTES,
+        f"{mode}_behavior_size",
+    )
+    try:
+        behavior = json.loads(
+            proof_payload,
+            object_pairs_hook=_object_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BrowserEvidenceError(f"{mode}_behavior_json") from error
+    behavior = _validate_behavior_contract(behavior)
+    behavior_sha256 = _sha256(_canonical_payload(behavior))
     match = PASS_RE.fullmatch(pass_lines[0])
     _require(match is not None, f"{mode}_pass_line")
     values = match.groupdict()
@@ -425,6 +690,7 @@ def _parse_mode_log(
         f"{mode}_hard_stop",
     )
     return {
+        "behavior_sha256": behavior_sha256,
         "hard_stop": {
             "deadline_ms": deadline,
             "elapsed_ms": elapsed,
@@ -455,7 +721,7 @@ def _parse_mode_log(
             "retained_growth_bytes": rss_retained_growth,
         },
         "status": "pass",
-    }
+    }, behavior
 
 
 def _validate_pack(
@@ -575,7 +841,20 @@ def build_summary(
     _require(runtime_payload == EXPECTED_RUNTIME_TEXT, "runtime_evidence")
     contract = _load_contract(lock_path, package_path)
     limits = _platform_limits(contract, platform)
+    installed_mode, installed_behavior = _parse_mode_log(
+        installed_log, "installed", contract, limits
+    )
+    source_mode, source_behavior = _parse_mode_log(
+        source_log, "source", contract, limits
+    )
+    _require(source_behavior == installed_behavior, "behavior_parity")
+    behavior_sha256 = _sha256(_canonical_payload(source_behavior))
     return {
+        "behavior": {
+            "contract": source_behavior,
+            "sha256": behavior_sha256,
+            "source_installed_equal": True,
+        },
         "chromium": {
             "archive_sha256": contract["archive_sha256"],
             "archive_size_bytes": contract["archive_size_bytes"],
@@ -586,10 +865,8 @@ def build_summary(
         "head_sha": head_sha,
         "limits": limits,
         "modes": {
-            "installed": _parse_mode_log(
-                installed_log, "installed", contract, limits
-            ),
-            "source": _parse_mode_log(source_log, "source", contract, limits),
+            "installed": installed_mode,
+            "source": source_mode,
         },
         "package": _validate_pack(npm_pack, npm_archive, contract),
         "package_metadata_sha256": contract["package_metadata_sha256"],
@@ -619,6 +896,7 @@ def validate_summary(
     _require(
         set(document)
         == {
+            "behavior",
             "chromium",
             "head_sha",
             "limits",
@@ -672,6 +950,20 @@ def validate_summary(
         },
         "summary_chromium",
     )
+    behavior = document.get("behavior")
+    _require(
+        isinstance(behavior, dict)
+        and set(behavior) == {"contract", "sha256", "source_installed_equal"}
+        and behavior.get("source_installed_equal") is True
+        and isinstance(behavior.get("sha256"), str)
+        and SHA256_RE.fullmatch(behavior["sha256"]) is not None,
+        "summary_behavior",
+    )
+    behavior_contract = _validate_behavior_contract(behavior.get("contract"))
+    _require(
+        behavior["sha256"] == _sha256(_canonical_payload(behavior_contract)),
+        "summary_behavior_digest",
+    )
     modes = document.get("modes")
     _require(
         isinstance(modes, dict) and set(modes) == {"installed", "source"},
@@ -683,6 +975,7 @@ def validate_summary(
             isinstance(evidence, dict)
             and set(evidence)
             == {
+                "behavior_sha256",
                 "hard_stop",
                 "heap",
                 "log_sha256",
@@ -691,6 +984,7 @@ def validate_summary(
                 "status",
             }
             and evidence.get("status") == "pass"
+            and evidence.get("behavior_sha256") == behavior["sha256"]
             and isinstance(evidence.get("log_sha256"), str)
             and SHA256_RE.fullmatch(evidence["log_sha256"]) is not None,
             f"summary_{mode}",
@@ -929,6 +1223,7 @@ def validate_artifact(
         "artifact_name": artifact_name,
         "artifact_repository": repository,
         "artifact_size_bytes": artifact_size_bytes,
+        "behavior_sha256": summary["behavior"]["sha256"],
         "browser_evidence_sha256": _sha256(payload),
         "chromium": summary["chromium"],
         "head_sha": head_sha,

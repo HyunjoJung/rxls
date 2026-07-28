@@ -31,6 +31,7 @@ import {
   validateCspNetworkSilence,
   validateOfflineNetworkBlock
 } from "./network-evidence.mjs";
+import { validateBrowserBehaviorProof } from "./scenario.mjs";
 
 const CDP_HTTP_TIMEOUT_MS = 2_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
@@ -228,7 +229,9 @@ let browserResult = {
   heap: null,
   processMemory: null,
   hardStop: null,
-  csp: null
+  csp: null,
+  behavior: null,
+  behaviorJson: null
 };
 try {
   const portFile = join(profile, "DevToolsActivePort");
@@ -256,7 +259,9 @@ try {
     heap: null,
     processMemory: null,
     hardStop: null,
-    csp: null
+    csp: null,
+    behavior: null,
+    behaviorJson: null
   };
 } finally {
   await terminateChild(child);
@@ -284,11 +289,19 @@ if (!browserResult.message.startsWith("PASS ")) {
   console.error(stderr.text());
   process.exit(1);
 }
+if (
+  browserResult.behavior === null ||
+  typeof browserResult.behaviorJson !== "string"
+) {
+  console.error("browser returned no validated behavior proof");
+  process.exit(1);
+}
+console.log(`PROOF ${browserResult.behaviorJson}`);
 console.log(
   `PASS ${actualVersion} ${
     installedPackageRoot === null
       ? "worker/WASM rich font/image, CSP, limits, virtual tile/page and hard-stop smoke"
-      : "installed package rich font/image, CSP, virtual tile/page and hard-stop smoke"
+      : "installed package rich font/image, CSP, limits, virtual tile/page and hard-stop smoke"
   }; ` +
     `heap baseline=${browserResult.heap.baseline.accountedBytes} ` +
     `peak=${browserResult.heap.peak.accountedBytes} ` +
@@ -629,7 +642,9 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
           heap: null,
           processMemory: null,
           hardStop: null,
-          csp: null
+          csp: null,
+          behavior: null,
+          behaviorJson: null
         };
       }
       await sampleEvidence();
@@ -652,7 +667,15 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
           throw new Error("browser passed without nonce-bound hard-stop evidence");
         }
         let csp = null;
+        let behavior = null;
+        let behaviorJson = null;
         if (value.startsWith("PASS ")) {
+          behavior = await evaluateJson(
+            evaluate,
+            "JSON.stringify(globalThis.__rxlsBehaviorProof)",
+            "browser behavior proof"
+          );
+          behaviorJson = validateBrowserBehaviorProof(behavior);
           const cspProof = await evaluateJson(
             evaluate,
             "JSON.stringify(globalThis.__rxlsCspProof)",
@@ -725,7 +748,15 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
             csp
           };
         }
-        return { message: value, heap, processMemory, hardStop, csp };
+        return {
+          message: value,
+          heap,
+          processMemory,
+          hardStop,
+          csp,
+          behavior,
+          behaviorJson
+        };
       }
       await delay(50);
     }
@@ -738,7 +769,9 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
       heap: null,
       processMemory: null,
       hardStop: null,
-      csp: null
+      csp: null,
+      behavior: null,
+      behaviorJson: null
     };
   } finally {
     clearTimeout(browserDeadline);

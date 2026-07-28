@@ -311,6 +311,7 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           from pathlib import Path
 
           archive = Path(os.environ["ARCHIVE"]).read_bytes()
@@ -325,9 +326,14 @@ jobs:
           package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v3"
+              != "rxls.render-browser-release-prerequisites.v4"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("behavior_sha256", ""),
+              )
+              is None
               or package.get("name") != packed.get("name")
               or package.get("version") != packed.get("version")
               or package.get("archive_bytes") != len(archive)
@@ -498,7 +504,7 @@ jobs:
           browser_package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v3"
+              != "rxls.render-browser-release-prerequisites.v4"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
               or not isinstance(browser.get("workflow_run_id"), int)
@@ -524,6 +530,11 @@ jobs:
               or re.fullmatch(
                   r"[0-9a-f]{64}",
                   browser.get("browser_evidence_sha256", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("behavior_sha256", ""),
               )
               is None
               or browser_package.get("name") != packed.get("name")

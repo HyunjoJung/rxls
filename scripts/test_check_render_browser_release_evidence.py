@@ -109,6 +109,7 @@ class BrowserEvidenceTests(unittest.TestCase):
         deadline: int = MODULE.HARD_STOP_DEADLINE_MS,
         wasm_url: str | None = None,
         network_error: str = MODULE.EXPECTED_NETWORK_ERROR,
+        behavior: dict[str, object] | None = None,
     ) -> str:
         growth = max(0, retained - baseline)
         rss_peak_growth = max(0, rss_peak - rss_baseline)
@@ -116,7 +117,11 @@ class BrowserEvidenceTests(unittest.TestCase):
         if wasm_url is None:
             path = MODULE.EXPECTED_WASM_PATHS[mode]
             wasm_url = f"http://127.0.0.1:43210{path}"
+        if behavior is None:
+            behavior = self._behavior_proof()
+        proof = json.dumps(behavior, separators=(",", ":"), sort_keys=True)
         return (
+            f"PROOF {proof}\n"
             "PASS Google Chrome for Testing 150.0.7871.115 "
             f"{MODULE.MODE_DESCRIPTIONS[mode]}; "
             f"heap baseline={baseline} peak={peak} retained={retained} "
@@ -127,6 +132,109 @@ class BrowserEvidenceTests(unittest.TestCase):
             f"hard-stop target={elapsed}/{deadline}ms wasm={wasm_url}; "
             f"CSP Network={network_error}"
         )
+
+    def _behavior_proof(self) -> dict[str, object]:
+        width_raw = 1024 * 100
+        height_raw = 1024 * 200
+        return {
+            "schema": MODULE.BEHAVIOR_SCHEMA,
+            "fixture": {
+                "workbookBytes": 1_000,
+                "workbookSha256": "1" * 64,
+                "fontPackSha256": "2" * 64,
+                "renderedImageBytes": 100,
+                "renderedImageSha256": "3" * 64,
+            },
+            "capabilitiesSha256": "4" * 64,
+            "cancellation": {
+                "abortSignal": "AbortError",
+                "activeOpen": "AbortError",
+                "reopenedDocument": True,
+            },
+            "progress": [
+                {"completed": 0, "total": 3, "stage": "accepted"},
+                {"completed": 1, "total": 3, "stage": "parsing"},
+                {"completed": 2, "total": 3, "stage": "finalizing"},
+                {"completed": 3, "total": 3, "stage": "complete"},
+            ],
+            "limits": {
+                "fontFiles": {
+                    "code": "limit_exceeded",
+                    "resource": "fontFiles",
+                },
+                "hardPage": {"code": "limit_exceeded", "resource": "pages"},
+                "dpi": {"code": "dpi_out_of_range", "resource": None},
+                "outputBytes": {
+                    "code": "limit_exceeded",
+                    "resource": "output_bytes",
+                },
+                "imageCount": {
+                    "code": "limit_exceeded",
+                    "resource": "maxImages",
+                },
+                "imageBytes": {
+                    "code": "limit_exceeded",
+                    "resource": "maxImageBytes",
+                },
+            },
+            "tile": {
+                "firstRow": 0,
+                "firstCol": 0,
+                "lastRow": 63,
+                "lastCol": 31,
+                "bytes": 250_000,
+                "sha256": "5" * 64,
+            },
+            "pages": {
+                "count": 8,
+                "paper": {
+                    "widthRaw": width_raw,
+                    "heightRaw": height_raw,
+                },
+                "first": {
+                    "pageIndex": 0,
+                    "responsePageIndex": 0,
+                    "pageMapSha256": "6" * 64,
+                    "svg": {
+                        "bytes": 1_000,
+                        "sha256": "7" * 64,
+                        "widthRaw": width_raw,
+                        "heightRaw": height_raw,
+                    },
+                },
+                "nonzero": {
+                    "pageIndex": 7,
+                    "responsePageIndex": 7,
+                    "pageMapSha256": "8" * 64,
+                    "svg": {
+                        "bytes": 1_000,
+                        "sha256": "9" * 64,
+                        "repeatSha256": "9" * 64,
+                        "widthRaw": width_raw,
+                        "heightRaw": height_raw,
+                    },
+                    "png": {
+                        "bytes": 1_000,
+                        "sha256": "a" * 64,
+                        "width": 100,
+                        "height": 200,
+                        "dpi": 96,
+                    },
+                },
+                "outOfRange": {
+                    "pageIndex": 8,
+                    "code": "page_index_out_of_range",
+                },
+            },
+            "hardStop": {
+                "deadlineMs": MODULE.HARD_STOP_DEADLINE_MS,
+                "rejectedRequests": 2,
+            },
+            "network": {
+                "cspNegativeControl": True,
+                "unexpectedExternalResources": 0,
+            },
+        }
 
     def _summary(self, platform: str = "linux") -> dict[str, object]:
         return MODULE.build_summary(
@@ -147,6 +255,15 @@ class BrowserEvidenceTests(unittest.TestCase):
         self.assertEqual(summary["schema"], MODULE.SCHEMA)
         self.assertEqual(summary["head_sha"], HEAD_SHA)
         self.assertEqual(summary["package"]["entry_count"], 12)
+        self.assertTrue(summary["behavior"]["source_installed_equal"])
+        self.assertEqual(
+            summary["modes"]["source"]["behavior_sha256"],
+            summary["behavior"]["sha256"],
+        )
+        self.assertEqual(
+            summary["modes"]["installed"]["behavior_sha256"],
+            summary["behavior"]["sha256"],
+        )
         self.assertEqual(
             summary["modes"]["source"]["hard_stop"]["deadline_ms"],
             MODULE.HARD_STOP_DEADLINE_MS,
@@ -184,6 +301,23 @@ class BrowserEvidenceTests(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_log_failure"):
+            self._summary()
+
+    def test_source_and_installed_behavior_must_match_exactly(self) -> None:
+        behavior = self._behavior_proof()
+        behavior["capabilitiesSha256"] = "b" * 64
+        self.installed.write_text(
+            self._pass_line(
+                "installed",
+                baseline=2_500_000,
+                peak=25_000_000,
+                retained=8_500_000,
+                behavior=behavior,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "behavior_parity"):
             self._summary()
 
     def test_pass_must_be_unique_and_final(self) -> None:
@@ -401,6 +535,30 @@ class BrowserEvidenceTests(unittest.TestCase):
                 workflow_run_id=RUN_ID,
                 workflow_run_attempt=RUN_ATTEMPT,
             )
+        mutated = copy.deepcopy(summary)
+        mutated["behavior"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError, "summary_behavior_digest"
+        ):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
+        mutated = copy.deepcopy(summary)
+        mutated["modes"]["source"]["behavior_sha256"] = "0" * 64
+        with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "summary_source"):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
 
     def test_authenticated_single_file_artifact_is_release_bound(self) -> None:
         summary_payload = MODULE._canonical_payload(self._summary())
@@ -427,6 +585,10 @@ class BrowserEvidenceTests(unittest.TestCase):
         self.assertEqual(
             report["browser_evidence_sha256"],
             hashlib.sha256(summary_payload).hexdigest(),
+        )
+        self.assertEqual(
+            report["behavior_sha256"],
+            self._summary()["behavior"]["sha256"],
         )
 
     def test_release_workflow_consumes_current_prerequisite_schema(self) -> None:
