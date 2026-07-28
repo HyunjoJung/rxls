@@ -234,6 +234,24 @@ def _container_log_code(payload: object) -> str | None:
     if b"/oracle/evidence" in lowered and b"no space left on device" in lowered:
         return "evidence_mount_full"
     if b"registrymodifications.xcu" in lowered and b"cp:" in lowered:
+        if (
+            b"no such file or directory" in lowered
+            or b"not a directory" in lowered
+            or b"cannot stat" in lowered
+        ):
+            return "profile_path_missing"
+        if (
+            b"permission denied" in lowered
+            or b"read-only file system" in lowered
+            or b"operation not permitted" in lowered
+        ):
+            return "profile_copy_not_writable"
+        if b"no space left on device" in lowered:
+            return "profile_copy_no_space"
+        if b"invalid argument" in lowered:
+            return "profile_copy_invalid_argument"
+        if b"input/output error" in lowered:
+            return "profile_copy_io_error"
         return "profile_setup_failed"
     if b"/oracle/runtime" in lowered and (
         b"mkdir:" in lowered or b"cp:" in lowered

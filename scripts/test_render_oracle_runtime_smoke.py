@@ -415,6 +415,53 @@ class RuntimeSmokeTests(unittest.TestCase):
                 self.assertNotIn("private", stderr)
                 self.assertNotIn("source.xlsx", stderr)
 
+    def test_profile_copy_failure_is_classified_without_echoing_logs(
+        self,
+    ) -> None:
+        diagnostics = {
+            (
+                b"cp: cannot stat "
+                b"'/opt/rxls/profile/registrymodifications.xcu': "
+                b"No such file or directory\n"
+            ): "profile_path_missing",
+            (
+                b"cp: cannot create "
+                b"'/profile/user/registrymodifications.xcu': "
+                b"Operation not permitted\n"
+            ): "profile_copy_not_writable",
+            (
+                b"cp: cannot create "
+                b"'/profile/user/registrymodifications.xcu': "
+                b"No space left on device\n"
+            ): "profile_copy_no_space",
+            (
+                b"cp: cannot create "
+                b"'/profile/user/registrymodifications.xcu': "
+                b"Invalid argument\n"
+            ): "profile_copy_invalid_argument",
+            (
+                b"cp: error reading "
+                b"'/opt/rxls/profile/registrymodifications.xcu': "
+                b"Input/output error\n"
+            ): "profile_copy_io_error",
+            (
+                b"cp: unexpected "
+                b"'/opt/rxls/profile/registrymodifications.xcu' failure\n"
+            ): "profile_setup_failed",
+        }
+        for diagnostic, expected in diagnostics.items():
+            with self.subTest(expected=expected):
+                with _fixture(
+                    start_status="nonzero",
+                    start_stderr=b"docker: start failed",
+                    diagnostic_logs=diagnostic,
+                ) as (inputs, runner, _):
+                    status, stdout, stderr = self._run(inputs, runner)
+                self.assertEqual(status, 2)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, f"oracle_error:{expected}\n")
+                self.assertNotIn("opt/rxls", stderr)
+
     def test_unknown_exit_code_is_retained_as_a_bounded_integer(self) -> None:
         with _fixture(
             start_status="nonzero",
