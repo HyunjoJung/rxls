@@ -770,7 +770,12 @@ class RenderOracleContainerTests(unittest.TestCase):
             if hasattr(os, "mkfifo"):
                 fifo = root / "evidence.fifo"
                 os.mkfifo(fifo)
-                lock, payload, contract = MODULE.load_lock()
+                lock, _, _ = MODULE.load_lock()
+                lock["built_image"]["expected_id"] = None
+                lock["built_image"]["expected_manifest_digest"] = None
+                lock["built_image"]["bootstrap_receipt"] = None
+                payload = MODULE.canonical_json_bytes(lock)
+                contract = MODULE.build_contract_sha256(lock)
                 with self.assertRaisesRegex(
                     MODULE.OracleContainerError,
                     "bootstrap_build_type",
@@ -924,11 +929,15 @@ class RenderOracleContainerTests(unittest.TestCase):
             MODULE.validate_lock(pinned)
         mismatched_pair = json.loads(json.dumps(document))
         mismatched_pair["built_image"]["expected_id"] = "sha256:" + "a" * 64
+        mismatched_pair["built_image"]["expected_manifest_digest"] = None
+        mismatched_pair["built_image"]["bootstrap_receipt"] = None
         with self.assertRaisesRegex(
             MODULE.OracleContainerError, "lock_built_image_pin_pair"
         ):
             MODULE.validate_lock(mismatched_pair)
         receipt_without_pins = json.loads(json.dumps(document))
+        receipt_without_pins["built_image"]["expected_id"] = None
+        receipt_without_pins["built_image"]["expected_manifest_digest"] = None
         receipt_without_pins["built_image"]["bootstrap_receipt"] = (
             fake_bootstrap_receipt(
                 b"{}\n", fake_source_identity(document)
