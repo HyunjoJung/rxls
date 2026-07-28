@@ -739,7 +739,7 @@ fn prepare_print_area(
     // row/column bands across each relevant anchor without charging the dense
     // Cartesian rectangle between them.
     let (drawing_extents, has_absolute_drawings) =
-        prepared_drawing_geometry_extent(sheet, &render_ranges)?;
+        prepared_drawing_geometry_extent(sheet, &render_ranges, &source_options)?;
     let mut measurement_ranges = render_ranges.clone();
     for extent in drawing_extents {
         measurement_ranges.push(RenderRange::new(

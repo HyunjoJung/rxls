@@ -1148,7 +1148,7 @@ fn build_sheet_scene_inner(
     let used_extent = match options.selection {
         RenderSelection::Used => {
             style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-            Some(render_used_extent(sheet, &style_snapshot)?)
+            Some(render_used_extent(sheet, &style_snapshot, options)?)
         }
         RenderSelection::Range(_) => None,
     };
@@ -1701,10 +1701,12 @@ struct UsedRenderExtent {
 fn render_used_extent(
     sheet: &Sheet,
     style_snapshot: &RenderStyleSnapshot,
+    options: &RenderOptions,
 ) -> Result<UsedRenderExtent, RenderError> {
     let mut extent = UsedRenderExtent::default();
     let mut retained_cells = BTreeMap::<u32, BTreeSet<u16>>::new();
     let metadata_index = DrawingMetadataIndex::new(sheet);
+    let maximum_digit_width = drawing_extent_maximum_digit_width(sheet, style_snapshot, options)?;
 
     for (row, col, _) in sheet.cells() {
         include_render_coordinate(&mut extent.range, row, col);
@@ -1751,7 +1753,14 @@ fn render_used_extent(
             image.from.0.saturating_add(10),
             image.from.1.saturating_add(4),
         ));
-        let to = drawing_visible_to(image.from, to, metadata);
+        let to = drawing_used_to(
+            sheet,
+            image.from,
+            to,
+            metadata,
+            maximum_digit_width,
+            options,
+        )?;
         include_render_coordinate(
             &mut extent.range,
             to.0.min(MAX_WORKSHEET_ROW),
@@ -1773,7 +1782,14 @@ fn render_used_extent(
             chart.from.0.min(MAX_WORKSHEET_ROW),
             chart.from.1.min(MAX_WORKSHEET_COLUMN),
         );
-        let to = drawing_visible_to(chart.from, chart.to, metadata);
+        let to = drawing_used_to(
+            sheet,
+            chart.from,
+            chart.to,
+            metadata,
+            maximum_digit_width,
+            options,
+        )?;
         include_render_coordinate(
             &mut extent.range,
             to.0.min(MAX_WORKSHEET_ROW),
@@ -1793,14 +1809,19 @@ fn render_used_extent(
             from.0.min(MAX_WORKSHEET_ROW),
             from.1.min(MAX_WORKSHEET_COLUMN),
         );
-        if let Some(to) = metadata.to_cell {
-            let to = drawing_visible_to(from, to, Some(metadata));
-            include_render_coordinate(
-                &mut extent.range,
-                to.0.min(MAX_WORKSHEET_ROW),
-                to.1.min(MAX_WORKSHEET_COLUMN),
-            );
-        }
+        let to = drawing_used_to(
+            sheet,
+            from,
+            metadata.to_cell.unwrap_or(from),
+            Some(metadata),
+            maximum_digit_width,
+            options,
+        )?;
+        include_render_coordinate(
+            &mut extent.range,
+            to.0.min(MAX_WORKSHEET_ROW),
+            to.1.min(MAX_WORKSHEET_COLUMN),
+        );
     }
     for sparkline in sheet.sparklines() {
         include_render_coordinate(
@@ -1852,26 +1873,285 @@ fn add_empty_absolute_anchor_warnings(
     Ok(())
 }
 
-fn drawing_visible_to(
+fn drawing_used_to(
+    sheet: &Sheet,
     from: (u32, u16),
     to: (u32, u16),
     metadata: Option<&DrawingMetadata>,
-) -> (u32, u16) {
+    maximum_digit_width: Option<Fixed>,
+    options: &RenderOptions,
+) -> Result<(u32, u16), RenderError> {
+    if let Some((width, height)) = metadata
+        .filter(|metadata| {
+            metadata.behavior != DrawingAnchorBehavior::MoveAndSize && metadata.from_cell.is_some()
+        })
+        .and_then(|metadata| metadata.absolute_size_emu)
+    {
+        let maximum_digit_width = maximum_digit_width.ok_or(RenderError::CoordinateOverflow)?;
+        let (from_column_offset, from_row_offset) = metadata
+            .and_then(|metadata| metadata.from_offset_emu)
+            .unwrap_or((0, 0));
+        return Ok((
+            fixed_size_used_row(sheet, from.0, from_row_offset, height, options)?,
+            fixed_size_used_column(
+                sheet,
+                from.1,
+                from_column_offset,
+                width,
+                maximum_digit_width,
+                options,
+            )?,
+        ));
+    }
     let Some((column_offset, row_offset)) = metadata.and_then(|metadata| metadata.to_offset_emu)
     else {
-        return to;
+        return Ok(to);
     };
-    let row = if row_offset > 0 {
-        to.0
-    } else {
-        to.0.saturating_sub(1).max(from.0)
-    };
-    let column = if column_offset > 0 {
-        to.1
-    } else {
-        to.1.saturating_sub(1).max(from.1)
-    };
-    (row, column)
+    Ok((
+        terminal_used_row(sheet, from.0, to.0, row_offset, options),
+        terminal_used_column(sheet, from.1, to.1, column_offset, options),
+    ))
+}
+
+fn drawing_extent_maximum_digit_width(
+    sheet: &Sheet,
+    style_snapshot: &RenderStyleSnapshot,
+    options: &RenderOptions,
+) -> Result<Option<Fixed>, RenderError> {
+    if !sheet.drawing_metadata().iter().any(|metadata| {
+        metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+            && metadata.from_cell.is_some()
+            && metadata.absolute_size_emu.is_some()
+    }) {
+        return Ok(None);
+    }
+    let mut warnings = Warnings::default();
+    let mut typography = TypographyStats::default();
+    maximum_digit_width(style_snapshot, options, &mut warnings, &mut typography).map(Some)
+}
+
+fn fixed_size_used_column(
+    sheet: &Sheet,
+    from: u16,
+    from_offset_emu: i64,
+    width_emu: u64,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+) -> Result<u16, RenderError> {
+    let target = emu_to_fixed(from_offset_emu)?
+        .checked_add(emu_size_to_fixed(width_emu)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    if target <= Fixed::ZERO {
+        return Ok(from);
+    }
+    let mut boundary = Fixed::ZERO;
+    let mut candidate = from;
+    let mut last = from;
+    let mut warnings = Warnings::default();
+    while let Some(column) = next_visible_column(sheet, candidate, options) {
+        enforce(
+            LimitKind::Columns,
+            options.limits.max_columns,
+            u64::from(column) - u64::from(from) + 1,
+        )?;
+        if boundary >= target {
+            break;
+        }
+        last = column;
+        boundary = boundary
+            .checked_add(column_width(
+                sheet,
+                column,
+                maximum_digit_width,
+                options,
+                &mut warnings,
+            ))
+            .ok_or(RenderError::CoordinateOverflow)?;
+        if boundary >= target || column == MAX_WORKSHEET_COLUMN {
+            break;
+        }
+        candidate = column + 1;
+    }
+    Ok(last)
+}
+
+fn fixed_size_used_row(
+    sheet: &Sheet,
+    from: u32,
+    from_offset_emu: i64,
+    height_emu: u64,
+    options: &RenderOptions,
+) -> Result<u32, RenderError> {
+    let target = emu_to_fixed(from_offset_emu)?
+        .checked_add(emu_size_to_fixed(height_emu)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    if target <= Fixed::ZERO {
+        return Ok(from);
+    }
+    let mut boundary = Fixed::ZERO;
+    let mut candidate = from;
+    let mut last = from;
+    let mut warnings = Warnings::default();
+    while let Some(row) = next_visible_row(sheet, candidate, options) {
+        enforce(
+            LimitKind::Rows,
+            options.limits.max_rows,
+            u64::from(row) - u64::from(from) + 1,
+        )?;
+        if boundary >= target {
+            break;
+        }
+        last = row;
+        boundary = boundary
+            .checked_add(row_height(sheet, row, options, &mut warnings))
+            .ok_or(RenderError::CoordinateOverflow)?;
+        if boundary >= target || row == MAX_WORKSHEET_ROW {
+            break;
+        }
+        candidate = row + 1;
+    }
+    Ok(last)
+}
+
+fn terminal_used_column(
+    sheet: &Sheet,
+    from: u16,
+    to: u16,
+    offset_emu: i64,
+    options: &RenderOptions,
+) -> u16 {
+    if offset_emu > 0 {
+        return next_visible_column(sheet, to.max(from), options).unwrap_or_else(|| {
+            previous_visible_column(sheet, MAX_WORKSHEET_COLUMN, from, options).unwrap_or(from)
+        });
+    }
+    if to <= from {
+        return from;
+    }
+    previous_visible_column(sheet, to - 1, from, options).unwrap_or(from)
+}
+
+fn terminal_used_row(
+    sheet: &Sheet,
+    from: u32,
+    to: u32,
+    offset_emu: i64,
+    options: &RenderOptions,
+) -> u32 {
+    if offset_emu > 0 {
+        return next_visible_row(sheet, to.max(from), options).unwrap_or_else(|| {
+            previous_visible_row(sheet, MAX_WORKSHEET_ROW, from, options).unwrap_or(from)
+        });
+    }
+    if to <= from {
+        return from;
+    }
+    previous_visible_row(sheet, to - 1, from, options).unwrap_or(from)
+}
+
+fn next_visible_column(sheet: &Sheet, start: u16, options: &RenderOptions) -> Option<u16> {
+    if options.include_hidden {
+        return Some(start);
+    }
+    let mut candidate = start;
+    for &hidden in sheet.hidden_columns().range(start..) {
+        if hidden > candidate {
+            break;
+        }
+        if hidden == candidate {
+            if candidate == MAX_WORKSHEET_COLUMN {
+                return None;
+            }
+            candidate += 1;
+        }
+    }
+    Some(candidate)
+}
+
+fn previous_visible_column(
+    sheet: &Sheet,
+    start: u16,
+    minimum: u16,
+    options: &RenderOptions,
+) -> Option<u16> {
+    if start < minimum {
+        return None;
+    }
+    if options.include_hidden {
+        return Some(start);
+    }
+    let mut candidate = start;
+    for &hidden in sheet.hidden_columns().range(minimum..=start).rev() {
+        if hidden < candidate {
+            break;
+        }
+        if hidden == candidate {
+            if candidate == minimum {
+                return None;
+            }
+            candidate -= 1;
+        }
+    }
+    Some(candidate)
+}
+
+fn next_visible_row(sheet: &Sheet, start: u32, options: &RenderOptions) -> Option<u32> {
+    if options.include_hidden {
+        return Some(start);
+    }
+    if let Some(visible_rows) = sheet.default_hidden_row_exceptions() {
+        return visible_rows
+            .range(start..)
+            .copied()
+            .find(|row| !sheet.hidden_rows().contains(row));
+    }
+    let mut candidate = start;
+    for &hidden in sheet.hidden_rows().range(start..) {
+        if hidden > candidate {
+            break;
+        }
+        if hidden == candidate {
+            if candidate == MAX_WORKSHEET_ROW {
+                return None;
+            }
+            candidate += 1;
+        }
+    }
+    Some(candidate)
+}
+
+fn previous_visible_row(
+    sheet: &Sheet,
+    start: u32,
+    minimum: u32,
+    options: &RenderOptions,
+) -> Option<u32> {
+    if start < minimum {
+        return None;
+    }
+    if options.include_hidden {
+        return Some(start);
+    }
+    if let Some(visible_rows) = sheet.default_hidden_row_exceptions() {
+        return visible_rows
+            .range(minimum..=start)
+            .rev()
+            .copied()
+            .find(|row| !sheet.hidden_rows().contains(row));
+    }
+    let mut candidate = start;
+    for &hidden in sheet.hidden_rows().range(minimum..=start).rev() {
+        if hidden < candidate {
+            break;
+        }
+        if hidden == candidate {
+            if candidate == minimum {
+                return None;
+            }
+            candidate -= 1;
+        }
+    }
+    Some(candidate)
 }
 
 fn anchor_range_intersects_render_ranges(
@@ -1896,10 +2176,13 @@ fn anchor_range_intersects_render_ranges(
 pub(crate) fn prepared_drawing_geometry_extent(
     sheet: &Sheet,
     ranges: &[RenderRange],
+    options: &RenderOptions,
 ) -> Result<(Vec<RenderRange>, bool), RenderError> {
     let metadata_index = DrawingMetadataIndex::new(sheet);
     let mut extents = Vec::new();
     let mut has_absolute = false;
+    let style_snapshot = RenderStyleSnapshot::new(sheet);
+    let maximum_digit_width = drawing_extent_maximum_digit_width(sheet, &style_snapshot, options)?;
     let mut include = |from: (u32, u16), to: (u32, u16)| {
         extents.push(RenderRange::new(
             from.0.min(MAX_WORKSHEET_ROW),
@@ -1916,14 +2199,17 @@ pub(crate) fn prepared_drawing_geometry_extent(
                 .is_some_and(rect_intersects_positive_sheet);
             continue;
         }
-        let to = drawing_visible_to(
+        let to = drawing_used_to(
+            sheet,
             image.from,
             image.to.unwrap_or((
                 image.from.0.saturating_add(10),
                 image.from.1.saturating_add(4),
             )),
             metadata,
-        );
+            maximum_digit_width,
+            options,
+        )?;
         if anchor_range_intersects_render_ranges(image.from, to, ranges) {
             include(image.from, to);
         }
@@ -1935,7 +2221,14 @@ pub(crate) fn prepared_drawing_geometry_extent(
                 .is_some_and(rect_intersects_positive_sheet);
             continue;
         }
-        let to = drawing_visible_to(chart.from, chart.to, metadata);
+        let to = drawing_used_to(
+            sheet,
+            chart.from,
+            chart.to,
+            metadata,
+            maximum_digit_width,
+            options,
+        )?;
         if anchor_range_intersects_render_ranges(chart.from, to, ranges) {
             include(chart.from, to);
         }
@@ -1948,7 +2241,14 @@ pub(crate) fn prepared_drawing_geometry_extent(
         let Some(from) = metadata.from_cell else {
             continue;
         };
-        let to = drawing_visible_to(from, metadata.to_cell.unwrap_or(from), Some(metadata));
+        let to = drawing_used_to(
+            sheet,
+            from,
+            metadata.to_cell.unwrap_or(from),
+            Some(metadata),
+            maximum_digit_width,
+            options,
+        )?;
         if anchor_range_intersects_render_ranges(from, to, ranges) {
             include(from, to);
         }
@@ -2000,7 +2300,7 @@ pub(crate) fn render_used_scene_range(
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    Ok(render_used_extent(sheet, &style_snapshot)?
+    Ok(render_used_extent(sheet, &style_snapshot, options)?
         .range
         .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
@@ -2017,7 +2317,7 @@ pub(crate) fn render_used_print_range(
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    let mut range = render_used_extent(sheet, &style_snapshot)?
+    let mut range = render_used_extent(sheet, &style_snapshot, options)?
         .range
         .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0));
     let Some((absolute_right, absolute_bottom)) = absolute_drawing_positive_extent(sheet)? else {
@@ -10311,6 +10611,111 @@ mod tests {
         Workbook::open(&zip.finish().unwrap().into_inner()).expect("two-cell drawing workbook")
     }
 
+    fn imported_hidden_two_cell_drawing(
+        kind: DrawingObjectKind,
+        move_only: bool,
+        right_to_left: bool,
+    ) -> Workbook {
+        let edit_as = if move_only {
+            r#" editAs="oneCell""#
+        } else {
+            ""
+        };
+        let right_to_left = if right_to_left { "1" } else { "0" };
+        let worksheet = format!(
+            r#"<worksheet><sheetViews><sheetView rightToLeft="{right_to_left}"/></sheetViews><sheetFormatPr defaultColWidth="8.8571428571" defaultRowHeight="15"/><cols><col min="4" max="6" hidden="1"/></cols><sheetData><row r="6" hidden="1"/><row r="7" hidden="1"/><row r="8" hidden="1"/></sheetData><drawing r:id="rIdDrawing"/></worksheet>"#
+        );
+        let (drawing_object, object_relationship, object_part) = match kind {
+            DrawingObjectKind::Image => (
+                r#"<pic><nvPicPr><cNvPr id="1" name="Hidden-axis image"/></nvPicPr><blipFill><blip r:embed="rIdObject"/></blipFill><spPr><xfrm><ext cx="1619250" cy="666750"/></xfrm></spPr></pic>"#,
+                Some(r#"<Relationship Id="rIdObject" Target="../media/image1.png"/>"#),
+                Some(("xl/media/image1.png", b"\x89PNG\r\n\x1a\n".as_slice())),
+            ),
+            DrawingObjectKind::Chart => (
+                r#"<graphicFrame><nvGraphicFramePr><cNvPr id="1" name="Hidden-axis chart"/></nvGraphicFramePr><xfrm><ext cx="1619250" cy="666750"/></xfrm><graphic><graphicData><chart r:id="rIdObject"/></graphicData></graphic></graphicFrame>"#,
+                Some(r#"<Relationship Id="rIdObject" Target="../charts/chart1.xml"/>"#),
+                Some((
+                    "xl/charts/chart1.xml",
+                    br#"<chartSpace><chart><plotArea><lineChart/></plotArea></chart></chartSpace>"#
+                        .as_slice(),
+                )),
+            ),
+            DrawingObjectKind::Shape => (
+                r#"<sp><nvSpPr><cNvPr id="1" name="Hidden-axis callout"/></nvSpPr><spPr><xfrm><ext cx="1619250" cy="666750"/></xfrm></spPr></sp>"#,
+                None,
+                None,
+            ),
+            _ => panic!("unsupported drawing test kind"),
+        };
+        let drawing = format!(
+            r#"<wsDr><twoCellAnchor{edit_as}><from><col>2</col><colOff>0</colOff><row>3</row><rowOff>0</rowOff></from><to><col>5</col><colOff>0</colOff><row>7</row><rowOff>0</rowOff></to>{drawing_object}</twoCellAnchor></wsDr>"#
+        );
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Drawing" r:id="rId1"/></sheets></workbook>"#
+                    .as_slice(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#
+                    .as_slice(),
+            ),
+            ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                br#"<Relationships><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#
+                    .as_slice(),
+            ),
+            ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        if let Some(relationship) = object_relationship {
+            zip.start_file("xl/drawings/_rels/drawing1.xml.rels", options)
+                .unwrap();
+            zip.write_all(format!("<Relationships>{relationship}</Relationships>").as_bytes())
+                .unwrap();
+        }
+        if let Some((name, body)) = object_part {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        Workbook::open(&zip.finish().unwrap().into_inner())
+            .expect("hidden-axis two-cell drawing workbook")
+    }
+
+    fn fixed_drawing_outer_rect(nodes: &[SceneNode]) -> Rect {
+        for node in nodes {
+            match node {
+                SceneNode::Rect(RectNode { rect, .. })
+                    if rect.width == Fixed::from_pixels(170)
+                        && rect.height == Fixed::from_pixels(70) =>
+                {
+                    return *rect;
+                }
+                SceneNode::ClipGroup(group) => {
+                    if let Some(rect) = group.nodes.iter().find_map(|node| match node {
+                        SceneNode::Rect(RectNode { rect, .. })
+                            if rect.width == Fixed::from_pixels(170)
+                                && rect.height == Fixed::from_pixels(70) =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    }) {
+                        return rect;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fixed drawing outer frame")
+    }
+
     fn glyph_run<'a>(scene: &'a Scene, text: &str) -> &'a GlyphRunNode {
         scene
             .nodes
@@ -11428,9 +11833,9 @@ mod tests {
             .1;
             assert_eq!(hidden_origin, Fixed::from_pixels(60), "{kind:?}");
 
-            for (include_hidden, expected_height, expected_origin) in [
-                (false, Fixed::from_pixels(40), Fixed::from_pixels(60)),
-                (true, Fixed::from_pixels(80), Fixed::from_pixels(140)),
+            for (include_hidden, expected_last_row, expected_height, expected_origin) in [
+                (false, 5, Fixed::from_pixels(40), Fixed::from_pixels(60)),
+                (true, 6, Fixed::from_pixels(80), Fixed::from_pixels(140)),
             ] {
                 let options = RenderOptions {
                     gridlines: false,
@@ -11438,7 +11843,10 @@ mod tests {
                     ..RenderOptions::default()
                 };
                 let build = build_scene(&workbook, 0, &options).unwrap();
-                assert_eq!(build.report.range, RenderRange::new(3, 2, 6, 4));
+                assert_eq!(
+                    build.report.range,
+                    RenderRange::new(3, 2, expected_last_row, 4)
+                );
                 assert_eq!(build.scene.height, expected_height, "{kind:?}");
 
                 let mut origin_warnings = Warnings::default();
@@ -13125,6 +13533,107 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(build.report.range, expected, "{kind:?} at {offset:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_axes_keep_move_only_size_but_shrink_move_and_size_used_bounds() {
+        for kind in [
+            DrawingObjectKind::Image,
+            DrawingObjectKind::Chart,
+            DrawingObjectKind::Shape,
+        ] {
+            for right_to_left in [false, true] {
+                let move_and_size = imported_hidden_two_cell_drawing(kind, false, right_to_left);
+                let metadata = &move_and_size.sheets[0].drawing_metadata()[0];
+                assert_eq!(metadata.behavior, DrawingAnchorBehavior::MoveAndSize);
+                assert_eq!(metadata.to_offset_emu, Some((0, 0)));
+                assert_eq!(metadata.absolute_size_emu, None);
+                let resized = build_scene(
+                    &move_and_size,
+                    0,
+                    &RenderOptions {
+                        gridlines: false,
+                        ..RenderOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    resized.report.range,
+                    RenderRange::new(3, 2, 4, 2),
+                    "{kind:?} MoveAndSize rtl={right_to_left}"
+                );
+                assert_eq!(resized.scene.width, Fixed::from_pixels(64));
+                assert_eq!(resized.scene.height, Fixed::from_pixels(40));
+
+                let move_only = imported_hidden_two_cell_drawing(kind, true, right_to_left);
+                let metadata = &move_only.sheets[0].drawing_metadata()[0];
+                assert_eq!(metadata.behavior, DrawingAnchorBehavior::MoveOnly);
+                assert_eq!(metadata.to_offset_emu, Some((0, 0)));
+                assert_eq!(metadata.absolute_size_emu, Some((1_619_250, 666_750)));
+                let fixed = build_scene(
+                    &move_only,
+                    0,
+                    &RenderOptions {
+                        gridlines: false,
+                        ..RenderOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    fixed.report.range,
+                    RenderRange::new(3, 2, 9, 7),
+                    "{kind:?} MoveOnly rtl={right_to_left}"
+                );
+                assert_eq!(fixed.scene.width, Fixed::from_pixels(192));
+                assert_eq!(fixed.scene.height, Fixed::from_pixels(80));
+                assert_eq!(
+                    fixed_drawing_outer_rect(&fixed.scene.nodes),
+                    Rect {
+                        x: Fixed::from_pixels(if right_to_left { 22 } else { 0 }),
+                        y: Fixed::ZERO,
+                        width: Fixed::from_pixels(170),
+                        height: Fixed::from_pixels(70),
+                    }
+                );
+
+                let (drawing_extents, has_absolute) = prepared_drawing_geometry_extent(
+                    &move_only.sheets[0],
+                    &[RenderRange::new(8, 6, 9, 7)],
+                    &RenderOptions {
+                        gridlines: false,
+                        ..RenderOptions::default()
+                    },
+                )
+                .unwrap();
+                assert!(!has_absolute);
+                assert_eq!(
+                    drawing_extents,
+                    vec![RenderRange::new(3, 2, 9, 7)],
+                    "the print continuation after the raw F8 marker must retain full geometry"
+                );
+
+                let document = build_print_document(
+                    &move_only,
+                    0,
+                    &PrintOptions {
+                        single_page_sheets: true,
+                        render: RenderOptions {
+                            gridlines: false,
+                            ..RenderOptions::default()
+                        },
+                        ..PrintOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(document.report.source.range, RenderRange::new(3, 2, 9, 7));
+                assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(192));
+                assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(80));
+                assert_eq!(
+                    fixed_drawing_outer_rect(&document.pages[0].scene.nodes),
+                    fixed_drawing_outer_rect(&fixed.scene.nodes)
+                );
             }
         }
     }

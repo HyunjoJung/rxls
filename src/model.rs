@@ -5568,6 +5568,9 @@ pub struct DrawingMetadata {
     /// Top-left cell marker retained for every placeable drawing kind.
     pub from_cell: Option<(u32, u16)>,
     /// Bottom-right cell marker for a two-cell anchor, when present.
+    ///
+    /// The marker is a boundary: a zero offset leaves the marker cell itself
+    /// unoccupied.
     pub to_cell: Option<(u32, u16)>,
     /// Offset from the top-left anchor cell, in English Metric Units.
     pub from_offset_emu: Option<(i64, i64)>,
