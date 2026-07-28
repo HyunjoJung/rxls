@@ -18,7 +18,7 @@ use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
-use crate::model::OoxmlImplicitColumnWidth;
+use crate::model::{OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight};
 use crate::{
     format, rk_to_f64, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle,
     Chart, Color, Comment, DataValidation, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata,
@@ -280,7 +280,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         } else {
             Vec::new()
         };
-        let (cells, merges, read_hyperlinks, metadata) = if is_worksheet {
+        let (cells, merges, read_hyperlinks, mut metadata) = if is_worksheet {
             part(&mut zip, &path)
                 .map(|b| {
                     parse_sheet(
@@ -345,6 +345,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         } else {
             OoxmlImplicitColumnWidth::ApplicationDefault
         };
+        let ooxml_implicit_row_height = if is_worksheet && metadata.default_row_height.is_none() {
+            OoxmlImplicitRowHeight::ApplicationDefault
+        } else {
+            OoxmlImplicitRowHeight::None
+        };
+        let default_hidden_row_exceptions = (is_worksheet && metadata.default_rows_hidden)
+            .then_some(std::mem::take(&mut metadata.explicit_visible_rows));
         sheets.push(Sheet {
             name,
             is_worksheet,
@@ -381,10 +388,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline: metadata.col_outline,
             row_heights: metadata.row_heights,
             col_widths: metadata.col_widths,
+            default_row_height: metadata.default_row_height,
             default_col_width: metadata.default_col_width,
             ooxml_implicit_col_width,
+            ooxml_implicit_row_height,
             hidden_rows: metadata.hidden_rows,
             hidden_cols: metadata.hidden_cols,
+            default_hidden_row_exceptions,
             rich: metadata.rich,
             outline_summary_below: metadata.outline_summary_below.unwrap_or(true),
             outline_summary_right: metadata.outline_summary_right.unwrap_or(true),
@@ -1584,6 +1594,7 @@ struct SheetReadMetadata {
     collapsed_rows: BTreeSet<u32>,
     row_heights: BTreeMap<u32, f32>,
     col_widths: BTreeMap<u16, f32>,
+    default_row_height: Option<f32>,
     default_col_width: Option<f32>,
     ooxml_base_col_width: Option<f32>,
     row_formats: BTreeMap<u32, CellStyle>,
@@ -1592,6 +1603,8 @@ struct SheetReadMetadata {
     style_losses: Vec<StyleLoss>,
     hidden_rows: BTreeSet<u32>,
     hidden_cols: BTreeSet<u16>,
+    default_rows_hidden: bool,
+    explicit_visible_rows: BTreeSet<u32>,
     rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
 }
 
@@ -1964,6 +1977,10 @@ fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
     }
     if flags & (1 << 12) != 0 {
         metadata.hidden_rows.insert(row);
+        metadata.explicit_visible_rows.remove(&row);
+    } else {
+        metadata.hidden_rows.remove(&row);
+        metadata.explicit_visible_rows.insert(row);
     }
     let level = ((flags >> 8) & 0x07) as u8;
     if level > 0 {
@@ -2027,17 +2044,30 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
 }
 
 fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
-    let (Some(default_width_256), Some(base_characters)) = (u32le(p, 0), u16le(p, 4)) else {
+    let (
+        Some(default_width_256),
+        Some(base_characters),
+        Some(default_row_height_twips),
+        Some(flags),
+    ) = (u32le(p, 0), u16le(p, 4), u16le(p, 6), u16le(p, 8))
+    else {
         return;
     };
     metadata.default_col_width = None;
     metadata.ooxml_base_col_width = None;
+    metadata.default_row_height = None;
+    metadata.default_rows_hidden = flags & 0x0002 != 0;
     if default_width_256 == u32::MAX {
         if base_characters <= 255 {
             metadata.ooxml_base_col_width = Some(f32::from(base_characters));
         }
     } else if default_width_256 <= 65_535 {
         metadata.default_col_width = Some(default_width_256 as f32 / 256.0);
+    }
+    // [MS-XLSB] BrtWsFmtInfo: miyDefRwHeight is authoritative only when
+    // fUnsynced is set. Otherwise the application default remains in force.
+    if flags & 0x0001 != 0 && default_row_height_twips > 0 {
+        metadata.default_row_height = Some(f32::from(default_row_height_twips) / 20.0);
     }
 }
 
@@ -3664,6 +3694,8 @@ mod tests {
         assert_eq!(wb.sheets[0].cell(0, 1), Some(&Cell::Number(42.0)));
         assert_eq!(wb.sheets[0].default_column_width(), None);
         assert_eq!(wb.sheets[0].implicit_ooxml_column_width(), Some(None));
+        assert_eq!(wb.sheets[0].default_row_height(), None);
+        assert!(wb.sheets[0].has_implicit_ooxml_row_height());
         assert_eq!(
             wb.sheets[0]
                 .rich_text_runs(0, 0)
@@ -3972,13 +4004,14 @@ mod tests {
     }
 
     #[test]
-    fn xlsb_ws_format_info_distinguishes_default_and_base_column_widths() {
-        let parse = |default_width_256: u32, base_characters: u16| {
+    fn xlsb_ws_format_info_distinguishes_column_and_row_default_provenance() {
+        let parse = |default_width_256: u32, base_characters: u16, flags: u16| {
             let mut payload = Vec::new();
             payload.extend_from_slice(&default_width_256.to_le_bytes());
             payload.extend_from_slice(&base_characters.to_le_bytes());
             payload.extend_from_slice(&300u16.to_le_bytes());
-            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&flags.to_le_bytes());
+            payload.extend_from_slice(&[0, 0]); // row/column outline levels
             let mut budget = crate::MAX_TEXT_BYTES;
             parse_sheet(
                 &rec(BRT_WS_FMT_INFO, &payload),
@@ -3995,17 +4028,72 @@ mod tests {
             .3
         };
 
-        let explicit = parse(2_158, 42);
+        let explicit = parse(2_158, 42, 0);
         assert_eq!(explicit.default_col_width, Some(2_158.0 / 256.0));
         assert_eq!(explicit.ooxml_base_col_width, None);
+        assert_eq!(
+            explicit.default_row_height, None,
+            "miyDefRwHeight is ignored while fUnsynced is clear"
+        );
 
-        let base = parse(u32::MAX, 8);
+        let base = parse(u32::MAX, 8, 0);
         assert_eq!(base.default_col_width, None);
         assert_eq!(base.ooxml_base_col_width, Some(8.0));
 
-        let invalid_base = parse(u32::MAX, 256);
+        let invalid_base = parse(u32::MAX, 256, 0);
         assert_eq!(invalid_base.default_col_width, None);
         assert_eq!(invalid_base.ooxml_base_col_width, None);
+
+        let custom_row = parse(u32::MAX, 8, 0x0001);
+        assert_eq!(custom_row.default_row_height, Some(15.0));
+
+        let default_hidden = parse(u32::MAX, 8, 0x0002);
+        assert!(default_hidden.default_rows_hidden);
+
+        let mut ws_format = Vec::new();
+        ws_format.extend_from_slice(&u32::MAX.to_le_bytes());
+        ws_format.extend_from_slice(&8u16.to_le_bytes());
+        ws_format.extend_from_slice(&300u16.to_le_bytes());
+        ws_format.extend_from_slice(&0x0002u16.to_le_bytes());
+        ws_format.extend_from_slice(&[0, 0]);
+        let row_header = |row: u32, hidden: bool| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&row.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&300u16.to_le_bytes());
+            payload.extend_from_slice(&(if hidden { 1u16 << 12 } else { 0 }).to_le_bytes());
+            payload
+        };
+        let mut stream = rec(BRT_WS_FMT_INFO, &ws_format);
+        stream.extend_from_slice(&rec(BRT_ROW_HDR, &row_header(1, false)));
+        stream.extend_from_slice(&rec(BRT_ROW_HDR, &row_header(2, true)));
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let metadata = parse_sheet(
+            &stream,
+            &[],
+            &Styles::default(),
+            false,
+            &HashMap::new(),
+            &mut budget,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .3;
+        assert!(metadata.default_rows_hidden);
+        assert_eq!(
+            metadata
+                .explicit_visible_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            metadata.hidden_rows.iter().copied().collect::<Vec<_>>(),
+            [2]
+        );
     }
 
     #[test]
@@ -4862,6 +4950,13 @@ mod tests {
         ws_prop.extend_from_slice(&wstr("")); // code name
 
         let mut sheet = rec(BRT_WS_PROP, &ws_prop);
+        let mut ws_format = Vec::new();
+        ws_format.extend_from_slice(&u32::MAX.to_le_bytes());
+        ws_format.extend_from_slice(&8u16.to_le_bytes());
+        ws_format.extend_from_slice(&300u16.to_le_bytes());
+        ws_format.extend_from_slice(&0x0002u16.to_le_bytes()); // fDyZero
+        ws_format.extend_from_slice(&[0, 0]);
+        sheet.extend_from_slice(&rec(BRT_WS_FMT_INFO, &ws_format));
         sheet.extend_from_slice(&rec(BRT_COL_INFO, &col_info(1, 3, 3)));
         sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(2, 2, true)));
         sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(3, 2, false)));
@@ -4889,6 +4984,15 @@ mod tests {
         assert_eq!(sheet.col_outline_levels().get(&3), Some(&3));
         assert_eq!(sheet.row_heights().get(&2), Some(&20.0));
         assert!(sheet.hidden_rows().contains(&2));
+        assert_eq!(
+            sheet
+                .default_hidden_row_exceptions()
+                .expect("fDyZero provenance")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [3]
+        );
         assert_eq!(
             sheet.column_widths().get(&1),
             Some(&(0x08FF as f32 / 256.0))

@@ -39,6 +39,10 @@ const DEFAULT_COLUMN_PADDING_PIXELS: f64 = 5.0;
 /// Calc's application default when an OOXML worksheet omits sheet-format
 /// width metadata. Its import is byte-for-byte equivalent to an explicit 8.5.
 const OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS: f32 = 8.5;
+/// The pinned Calc oracle resolves an OOXML worksheet without an authoritative
+/// default row height to 0.5 cm (14.173228 points / 18.897638 CSS pixels).
+/// Fixed-point layout rounds that imported-only value to the nearest 1/1024 px.
+const OOXML_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(19_351);
 /// `baseColWidth` / XLSB `cchDefColWidth` exclude the four margin pixels and
 /// one gridline pixel included when deriving a default column width.
 const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: f64 = 5.0;
@@ -188,7 +192,9 @@ pub struct RenderOptions {
     pub background: Rgb,
     /// Fallback pixel width when the workbook has no width metadata or verified font.
     pub default_column_width: Fixed,
-    /// Fallback row height when the workbook has no height metadata.
+    /// Caller fallback row height for authored and non-OOXML sheets without
+    /// retained height metadata. Imported format-retained application defaults
+    /// take precedence.
     pub default_row_height: Fixed,
     /// Horizontal text padding inside a cell.
     pub horizontal_padding: Fixed,
@@ -867,7 +873,7 @@ fn measure_sheet_axes_inner(
 
     let mut row_sizes = BTreeMap::new();
     for row in range.first_row..=range.last_row {
-        if !options.include_hidden && sheet.hidden_rows().contains(&row) {
+        if !options.include_hidden && row_is_hidden(sheet, row) {
             continue;
         }
         row_sizes.insert(row, row_height(sheet, row, options, warnings));
@@ -2361,9 +2367,24 @@ fn row_height(sheet: &Sheet, row: u32, options: &RenderOptions, warnings: &mut W
                     Some(CellCoordinate { row, col: 0 }),
                 );
             }
-            options.default_row_height.max(Fixed::from_raw(1))
+            fallback_row_height(sheet, options)
         }
     }
+}
+
+fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
+    if sheet.has_implicit_ooxml_row_height() {
+        OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+    } else {
+        options.default_row_height.max(Fixed::from_raw(1))
+    }
+}
+
+fn row_is_hidden(sheet: &Sheet, row: u32) -> bool {
+    sheet.hidden_rows().contains(&row)
+        || sheet
+            .default_hidden_row_exceptions()
+            .is_some_and(|visible_rows| !visible_rows.contains(&row))
 }
 
 #[derive(Debug)]
@@ -5012,19 +5033,24 @@ fn sheet_grid_origin(
     // scanning up to Excel's million-row ceiling.
     let base_row_height = match sheet.default_row_height().and_then(points_to_fixed) {
         Some(height) => height,
-        None => options.default_row_height.max(Fixed::from_raw(1)),
+        None => fallback_row_height(sheet, options),
     };
-    let hidden_rows = if options.include_hidden {
-        0_u64
+    let visible_rows = if options.include_hidden {
+        u64::from(range.first_row)
+    } else if let Some(exceptions) = sheet.default_hidden_row_exceptions() {
+        exceptions
+            .range(..range.first_row)
+            .filter(|&&row| !sheet.hidden_rows().contains(&row))
+            .count() as u64
     } else {
-        sheet.hidden_rows().range(..range.first_row).count() as u64
+        u64::from(range.first_row)
+            .saturating_sub(sheet.hidden_rows().range(..range.first_row).count() as u64)
     };
-    let visible_rows = u64::from(range.first_row).saturating_sub(hidden_rows);
     let mut y_raw = i128::from(base_row_height.raw())
         .checked_mul(i128::from(visible_rows))
         .ok_or(RenderError::CoordinateOverflow)?;
     for (&row, _) in sheet.row_heights().range(..range.first_row) {
-        if !options.include_hidden && sheet.hidden_rows().contains(&row) {
+        if !options.include_hidden && row_is_hidden(sheet, row) {
             continue;
         }
         let height = row_height(sheet, row, options, warnings);
@@ -9947,6 +9973,18 @@ mod tests {
     }
 
     fn imported_two_cell_drawing(kind: DrawingObjectKind, to_offset: (i64, i64)) -> Workbook {
+        imported_two_cell_drawing_with_worksheet(
+            kind,
+            to_offset,
+            r#"<worksheet><sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#,
+        )
+    }
+
+    fn imported_two_cell_drawing_with_worksheet(
+        kind: DrawingObjectKind,
+        to_offset: (i64, i64),
+        worksheet: &str,
+    ) -> Workbook {
         let (drawing_object, object_relationship, object_part) = match kind {
             DrawingObjectKind::Image => (
                 r#"<pic><blipFill><blip r:embed="rIdObject"/></blipFill></pic>"#,
@@ -9984,7 +10022,7 @@ mod tests {
             ),
             (
                 "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#.as_slice(),
+                worksheet.as_bytes(),
             ),
             (
                 "xl/worksheets/_rels/sheet1.xml.rels",
@@ -10816,6 +10854,178 @@ mod tests {
             base_8_width.checked_sub(explicit_8_width),
             Some(Fixed::from_pixels(5))
         );
+    }
+
+    #[test]
+    fn ooxml_implicit_row_height_is_calc_specific_not_a_global_fallback() {
+        let imported = |sheet_format: &str| {
+            imported_xlsx(
+                "<styleSheet/>",
+                &format!(
+                    r#"<worksheet>{sheet_format}<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+                ),
+            )
+        };
+        let implicit = imported("");
+        let explicit = imported(r#"<sheetFormatPr defaultRowHeight="15"/>"#);
+        let mut overridden = imported("");
+        overridden.sheets[0].set_default_row_height(12.0);
+        let mut authored = Workbook::new();
+        authored.add_sheet("authored").write(0, 0, 1.0);
+
+        assert_eq!(implicit.sheets[0].default_row_height(), None);
+        assert!(implicit.sheets[0].has_implicit_ooxml_row_height());
+        assert_eq!(explicit.sheets[0].default_row_height(), Some(15.0));
+        assert!(!explicit.sheets[0].has_implicit_ooxml_row_height());
+        assert_eq!(overridden.sheets[0].default_row_height(), Some(12.0));
+        assert!(!overridden.sheets[0].has_implicit_ooxml_row_height());
+        assert!(!authored.sheets[0].has_implicit_ooxml_row_height());
+
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            gridlines: false,
+            default_row_height: Fixed::from_pixels(37),
+            ..RenderOptions::default()
+        };
+        let implicit_rows =
+            measure_sheet_axes(&implicit.sheets[0], RenderRange::new(0, 0, 0, 0), &options)
+                .unwrap()
+                .0;
+        let explicit_rows =
+            measure_sheet_axes(&explicit.sheets[0], RenderRange::new(0, 0, 0, 0), &options)
+                .unwrap()
+                .0;
+        let overridden_rows = measure_sheet_axes(
+            &overridden.sheets[0],
+            RenderRange::new(0, 0, 0, 0),
+            &options,
+        )
+        .unwrap()
+        .0;
+        let authored_rows =
+            measure_sheet_axes(&authored.sheets[0], RenderRange::new(0, 0, 0, 0), &options)
+                .unwrap()
+                .0;
+
+        assert_eq!(implicit_rows[0].size, OOXML_APPLICATION_DEFAULT_ROW_HEIGHT);
+        assert_eq!(implicit_rows[0].size.raw(), 19_351);
+        assert_eq!(explicit_rows[0].size, Fixed::from_pixels(20));
+        assert_eq!(overridden_rows[0].size, Fixed::from_pixels(16));
+        assert_eq!(authored_rows[0].size, Fixed::from_pixels(37));
+    }
+
+    #[test]
+    fn implicit_ooxml_row_height_drives_image_and_chart_anchor_geometry() {
+        for kind in [DrawingObjectKind::Image, DrawingObjectKind::Chart] {
+            let workbook = imported_two_cell_drawing(kind, (0, 0));
+            assert!(workbook.sheets[0].has_implicit_ooxml_row_height());
+
+            let build = build_scene(
+                &workbook,
+                0,
+                &RenderOptions {
+                    gridlines: false,
+                    default_row_height: Fixed::from_pixels(37),
+                    ..RenderOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(build.report.range, RenderRange::new(3, 2, 6, 4));
+            assert_eq!(
+                build.scene.height,
+                Fixed::from_raw(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT.raw() * 4),
+                "{kind:?}"
+            );
+            assert!(
+                build.scene.nodes.iter().any(|node| matches!(
+                    node,
+                    SceneNode::Rect(RectNode {
+                        rect: Rect {
+                            x: Fixed::ZERO,
+                            y: Fixed::ZERO,
+                            width,
+                            height,
+                        },
+                        ..
+                    }) if *width == build.scene.width && *height == build.scene.height
+                )),
+                "{kind:?} anchor did not retain the exact implicit-row rectangle"
+            );
+        }
+    }
+
+    #[test]
+    fn ooxml_default_hidden_rows_drive_selection_sparse_origin_and_drawing_geometry() {
+        let worksheet = r#"<worksheet><sheetFormatPr defaultRowHeight="15" zeroHeight="1"/><sheetData><row r="2"/><row r="4"/><row r="6"/></sheetData><drawing r:id="rIdDrawing"/></worksheet>"#;
+        for kind in [DrawingObjectKind::Image, DrawingObjectKind::Chart] {
+            let workbook = imported_two_cell_drawing_with_worksheet(kind, (0, 0), worksheet);
+            let sheet = &workbook.sheets[0];
+            assert_eq!(
+                sheet
+                    .default_hidden_row_exceptions()
+                    .expect("zeroHeight provenance")
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [1, 3, 5]
+            );
+
+            let mut warnings = Warnings::default();
+            let hidden_origin = sheet_grid_origin(
+                sheet,
+                RenderRange::new(7, 0, 7, 0),
+                Fixed::from_pixels(7),
+                &RenderOptions::default(),
+                &mut warnings,
+            )
+            .unwrap()
+            .1;
+            assert_eq!(hidden_origin, Fixed::from_pixels(60), "{kind:?}");
+
+            for (include_hidden, expected_height, expected_origin) in [
+                (false, Fixed::from_pixels(40), Fixed::from_pixels(60)),
+                (true, Fixed::from_pixels(80), Fixed::from_pixels(140)),
+            ] {
+                let options = RenderOptions {
+                    gridlines: false,
+                    include_hidden,
+                    ..RenderOptions::default()
+                };
+                let build = build_scene(&workbook, 0, &options).unwrap();
+                assert_eq!(build.report.range, RenderRange::new(3, 2, 6, 4));
+                assert_eq!(build.scene.height, expected_height, "{kind:?}");
+
+                let mut origin_warnings = Warnings::default();
+                assert_eq!(
+                    sheet_grid_origin(
+                        sheet,
+                        RenderRange::new(7, 0, 7, 0),
+                        Fixed::from_pixels(7),
+                        &options,
+                        &mut origin_warnings,
+                    )
+                    .unwrap()
+                    .1,
+                    expected_origin,
+                    "{kind:?}"
+                );
+                assert!(
+                    build.scene.nodes.iter().any(|node| matches!(
+                        node,
+                        SceneNode::Rect(RectNode {
+                            rect: Rect {
+                                x: Fixed::ZERO,
+                                y: Fixed::ZERO,
+                                width,
+                                height,
+                            },
+                            ..
+                        }) if *width == build.scene.width && *height == build.scene.height
+                    )),
+                    "{kind:?} anchor did not follow effective row visibility"
+                );
+            }
+        }
     }
 
     #[test]
@@ -11685,6 +11895,10 @@ mod tests {
             ..CellStyle::default()
         };
         let sheet = authored.add_sheet("snapshot");
+        // Pin geometry explicitly: a re-opened OOXML sheet with no
+        // sheetFormatPr intentionally carries Calc's imported application
+        // default, while a purely authored sheet retains the caller fallback.
+        sheet.set_default_row_height(15.0);
         sheet.write_styled(0, 0, 5, &style);
         sheet.add_conditional_format(CondFormat::new(
             (0, 0, 0, 0),

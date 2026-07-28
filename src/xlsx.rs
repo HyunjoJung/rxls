@@ -16,8 +16,8 @@ use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CellStyleOverlay, OoxmlImplicitColumnWidth, TableStyleApplication, TableStyleDefinition,
-    TableStyleRegion,
+    CellStyleOverlay, OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight, TableStyleApplication,
+    TableStyleDefinition, TableStyleRegion,
 };
 use crate::{
     format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
@@ -159,6 +159,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             row_formats,
             hidden_cols,
             hidden_rows,
+            default_rows_hidden,
+            explicit_visible_rows,
             default_row_height,
             default_col_width,
             base_col_width,
@@ -180,6 +182,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         } else {
             OoxmlImplicitColumnWidth::ApplicationDefault
         };
+        let ooxml_implicit_row_height = if is_worksheet && default_row_height.is_none() {
+            OoxmlImplicitRowHeight::ApplicationDefault
+        } else {
+            OoxmlImplicitRowHeight::None
+        };
+        let default_hidden_row_exceptions =
+            (is_worksheet && default_rows_hidden).then_some(explicit_visible_rows);
         if tab_selected && tab_selected_sheet.is_none() {
             tab_selected_sheet = Some(sheet_idx);
         }
@@ -309,9 +318,11 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_format: styles.cell_styles.first().cloned(),
             hidden_cols,
             hidden_rows,
+            default_hidden_row_exceptions,
             default_row_height,
             default_col_width,
             ooxml_implicit_col_width,
+            ooxml_implicit_row_height,
             collapsed_rows,
             outline_summary_below: outline_summary_below.unwrap_or(true),
             outline_summary_right: outline_summary_right.unwrap_or(true),
@@ -4625,6 +4636,8 @@ struct ParsedSheet {
     row_formats: BTreeMap<u32, CellStyle>,
     hidden_cols: BTreeSet<u16>,
     hidden_rows: BTreeSet<u32>,
+    default_rows_hidden: bool,
+    explicit_visible_rows: BTreeSet<u32>,
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
     base_col_width: Option<f32>,
@@ -4878,6 +4891,10 @@ fn parse_sheet(
                     }
                     if attr(&e, b"hidden").as_deref().is_some_and(attr_true) {
                         parsed.hidden_rows.insert(cur_row);
+                        parsed.explicit_visible_rows.remove(&cur_row);
+                    } else {
+                        parsed.hidden_rows.remove(&cur_row);
+                        parsed.explicit_visible_rows.insert(cur_row);
                     }
                     if let Some(style) = attr(&e, b"s")
                         .and_then(|value| value.parse::<usize>().ok())
@@ -4893,6 +4910,10 @@ fn parse_sheet(
                         attr(&e, b"defaultColWidth").and_then(|s| s.parse::<f32>().ok());
                     parsed.base_col_width =
                         attr(&e, b"baseColWidth").and_then(|s| s.parse::<f32>().ok());
+                    parsed.default_rows_hidden = attr(&e, b"zeroHeight")
+                        .as_deref()
+                        .and_then(parse_bool_attr)
+                        .unwrap_or(false);
                 }
                 b"outlinePr" => {
                     if let Some(value) = attr(&e, b"summaryBelow")
@@ -6931,6 +6952,8 @@ mod tests {
         assert!(s.to_text().contains("2024-03-15"));
         assert_eq!(s.default_column_width(), None);
         assert_eq!(s.implicit_ooxml_column_width(), Some(None));
+        assert_eq!(s.default_row_height(), None);
+        assert!(s.has_implicit_ooxml_row_height());
     }
 
     #[test]
@@ -6961,6 +6984,31 @@ mod tests {
         let base = parse(r#"<sheetFormatPr baseColWidth="10"/>"#);
         assert_eq!(base.default_col_width, None);
         assert_eq!(base.base_col_width, Some(10.0));
+    }
+
+    #[test]
+    fn sheet_format_zero_height_retains_explicit_visible_row_exceptions() {
+        let xml = r#"<worksheet><sheetFormatPr zeroHeight="1"/><sheetData><row r="2"/><row r="3" hidden="1"/><row r="5" hidden="0"/></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert!(parsed.default_rows_hidden);
+        assert_eq!(
+            parsed
+                .explicit_visible_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert_eq!(parsed.hidden_rows.iter().copied().collect::<Vec<_>>(), [2]);
     }
 
     #[test]

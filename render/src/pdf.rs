@@ -983,12 +983,20 @@ fn push_image(
         );
         push_rotation_mdeg(content, node.rotation_mdeg, pivot_x, pivot_y)?;
     }
+    let bottom = node
+        .rect
+        .y
+        .checked_add(node.rect.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let flipped_height = Fixed::ZERO
+        .checked_sub(node.rect.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
     content.push(&format!(
         "{} 0 0 {} {} {} cm\n/Im{} Do\nQ\n",
         format_fixed(node.rect.width),
-        format_fixed(node.rect.height),
+        format_fixed(flipped_height),
         format_fixed(node.rect.x),
-        format_fixed(node.rect.y),
+        format_fixed(bottom),
         image_index
     ))
 }
@@ -3146,6 +3154,46 @@ mod tests {
         Some(pages)
     }
 
+    fn poppler_raster(pdf: &[u8], kind: &str) -> Option<tiny_skia::Pixmap> {
+        let available = std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if std::env::var_os("RXLS_REQUIRE_POPPLER").is_some() {
+            assert!(available, "RXLS_REQUIRE_POPPLER requires pdftoppm");
+        }
+        if !available {
+            return None;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = poppler_temp_directory(kind, nonce);
+        std::fs::create_dir(&directory).unwrap();
+        let pdf_path = directory.join("fixture.pdf");
+        let raster_prefix = directory.join("fixture-raster");
+        std::fs::write(&pdf_path, pdf).unwrap();
+        let output = std::process::Command::new("pdftoppm")
+            .args(["-png", "-singlefile", "-r", "96"])
+            .arg(&pdf_path)
+            .arg(&raster_prefix)
+            .output()
+            .unwrap();
+        let raster_path = raster_prefix.with_extension("png");
+        let raster = output
+            .status
+            .success()
+            .then(|| std::fs::read(&raster_path).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(tiny_skia::Pixmap::decode_png(&raster.unwrap()).unwrap())
+    }
+
     fn poppler_temp_directory(kind: &str, nonce: u128) -> std::path::PathBuf {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -3429,6 +3477,61 @@ mod tests {
                     hyperlink: Some("https://example.com/render".to_string()),
                 }),
             ],
+        }
+    }
+
+    fn assert_raster_rgb(raster: &tiny_skia::Pixmap, x: u32, y: u32, expected: [u8; 3]) {
+        let pixel = raster
+            .pixel(x, y)
+            .unwrap_or_else(|| panic!("missing raster pixel ({x}, {y})"));
+        let actual = [pixel.red(), pixel.green(), pixel.blue()];
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 2),
+            "raster pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn native_pdf_image_rows_preserve_asymmetric_corners_with_rotation() {
+        const RED: [u8; 3] = [255, 0, 0];
+        const GREEN: [u8; 3] = [0, 255, 0];
+        const BLUE: [u8; 3] = [0, 0, 255];
+        const YELLOW: [u8; 3] = [255, 255, 0];
+        let samples = [(68, 40), (108, 40), (68, 80), (108, 80)];
+        for (rotation_mdeg, expected) in [
+            (0, [RED, GREEN, BLUE, YELLOW]),
+            (90_000, [BLUE, RED, YELLOW, GREEN]),
+        ] {
+            let document = document_with_nodes(
+                "asymmetric-image-corners",
+                vec![SceneNode::Image(ImageNode {
+                    rect: Rect {
+                        x: Fixed::from_pixels(48),
+                        y: Fixed::from_pixels(20),
+                        width: Fixed::from_pixels(80),
+                        height: Fixed::from_pixels(80),
+                    },
+                    pixel_width: 2,
+                    pixel_height: 2,
+                    rgba: std::sync::Arc::from([
+                        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+                    ]),
+                    rotation_mdeg,
+                    alt_text: Some("four asymmetric colored corners".to_string()),
+                })],
+            );
+            let pdf = render_print_document_pdf(&document).unwrap();
+            let Some(raster) = poppler_raster(&pdf, &format!("image-orientation-{rotation_mdeg}"))
+            else {
+                continue;
+            };
+            assert_eq!((raster.width(), raster.height()), (200, 120));
+            for ((x, y), expected) in samples.into_iter().zip(expected) {
+                assert_raster_rgb(&raster, x, y, expected);
+            }
         }
     }
 

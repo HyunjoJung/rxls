@@ -23,6 +23,36 @@ export function findNonceBoundWorker({ attachedTargets, primaryTargetId, proof }
   return candidates.size === 0 ? null : candidates.values().next().value;
 }
 
+export function hardStopObservationDeadlineEpochMs(proof, graceMs) {
+  validateCompletedProof(proof);
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0) {
+    throw new Error("hard-stop observation grace must be a non-negative integer");
+  }
+  const deadlineEpochMs = proof.startedEpochMs + proof.deadlineMs + graceMs;
+  if (!Number.isSafeInteger(deadlineEpochMs)) {
+    throw new Error("hard-stop observation deadline is outside the safe timestamp range");
+  }
+  return deadlineEpochMs;
+}
+
+export function decideHardStopObservation({
+  destructionRecorded,
+  nowEpochMs,
+  observationDeadlineEpochMs
+}) {
+  if (
+    typeof destructionRecorded !== "boolean" ||
+    !Number.isSafeInteger(nowEpochMs) ||
+    !Number.isSafeInteger(observationDeadlineEpochMs)
+  ) {
+    throw new Error("hard-stop observation state is invalid");
+  }
+  if (destructionRecorded) {
+    return "inspect";
+  }
+  return nowEpochMs <= observationDeadlineEpochMs ? "wait" : "expired";
+}
+
 export function correlateHardStopTarget({
   attachedTargets,
   primaryTargetId,
@@ -51,11 +81,14 @@ export function correlateHardStopTarget({
   }
   if (
     !Number.isFinite(destroyedAtEpochMs) ||
-    destroyedAtEpochMs < terminationCommandEpochMs
+    destroyedAtEpochMs < proof.startedEpochMs
   ) {
     throw new Error(`hard-stop worker ${targetId} was destroyed before termination`);
   }
-  const elapsedMs = Math.ceil(destroyedAtEpochMs - terminationCommandEpochMs);
+  if (proof.startedEpochMs < terminationCommandEpochMs) {
+    throw new Error("hard-stop page started termination before the controller command");
+  }
+  const elapsedMs = Math.ceil(destroyedAtEpochMs - proof.startedEpochMs);
   if (elapsedMs > proof.deadlineMs) {
     throw new Error(
       `hard-stop worker target ended after ${elapsedMs}ms, deadline ${proof.deadlineMs}ms`

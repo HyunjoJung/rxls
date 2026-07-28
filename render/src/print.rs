@@ -1382,7 +1382,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v4");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v6");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1406,8 +1406,10 @@ fn print_source_identity(
     update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
     update_debug(&mut digest, sheet.row_heights());
     update_debug(&mut digest, &sheet.default_row_height());
+    update_debug(&mut digest, &sheet.has_implicit_ooxml_row_height());
     update_debug(&mut digest, sheet.hidden_columns());
     update_debug(&mut digest, sheet.hidden_rows());
+    update_debug(&mut digest, &sheet.default_hidden_row_exceptions());
     update_debug(&mut digest, sheet.merged_ranges());
     update_debug(&mut digest, sheet.conditional_formats());
     update_debug(&mut digest, sheet.conditional_format_metadata());
@@ -3659,6 +3661,31 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn default_hidden_print_workbook(default_hidden: bool) -> Workbook {
+        let worksheet = format!(
+            r#"<worksheet><sheetFormatPr defaultRowHeight="15" zeroHeight="{}"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="5" hidden="1"><c r="A5"><v>5</v></c></row></sheetData></worksheet>"#,
+            u8::from(default_hidden)
+        );
+        let mut workbook = Workbook::open(&zip_parts(&[
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Rows" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+        ]))
+        .unwrap();
+        workbook.sheets[0].set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 4, 0))
+                .with_scale(100),
+        );
+        workbook
+    }
+
     fn solid_rgba_png() -> Vec<u8> {
         let mut output = Vec::new();
         {
@@ -3927,6 +3954,72 @@ mod tests {
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
         assert!(!has_gridline(&document.pages[0].scene.nodes));
+    }
+
+    #[test]
+    fn default_hidden_rows_drive_pagination_and_prepared_print_identity() {
+        fn prepared_rows(prepared: &PreparedPrintDocument) -> Vec<(u32, Fixed)> {
+            let PreparedPrintState::Paginated { areas, .. } = &prepared.state else {
+                panic!("expected paginated state");
+            };
+            areas[0]
+                .measured_rows
+                .iter()
+                .map(|row| (row.index, row.size))
+                .collect()
+        }
+
+        let hidden = default_hidden_print_workbook(true);
+        let visible = default_hidden_print_workbook(false);
+        let options = PrintOptions {
+            omit_sparse_pages: false,
+            render: RenderOptions {
+                gridlines: false,
+                font_pack: Some(crate::font::synthetic_test_pack()),
+                default_font_family: "Wide Sans".to_string(),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+
+        let prepared = prepare_print_document(&hidden, 0, &options).unwrap();
+        assert_eq!(
+            prepared_rows(&prepared),
+            [(0, Fixed::from_pixels(20)), (2, Fixed::from_pixels(20))]
+        );
+        build_sheet_print_page(&hidden.sheets[0], &prepared, 0).unwrap();
+
+        let visible_prepared = prepare_print_document(&visible, 0, &options).unwrap();
+        assert_eq!(
+            prepared_rows(&visible_prepared),
+            [
+                (0, Fixed::from_pixels(20)),
+                (1, Fixed::from_pixels(20)),
+                (2, Fixed::from_pixels(20)),
+                (3, Fixed::from_pixels(20))
+            ]
+        );
+        assert!(matches!(
+            build_sheet_print_page(&visible.sheets[0], &prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed"
+            })
+        ));
+
+        let include_hidden = PrintOptions {
+            render: RenderOptions {
+                include_hidden: true,
+                ..options.render.clone()
+            },
+            ..options
+        };
+        let include_hidden_prepared = prepare_print_document(&hidden, 0, &include_hidden).unwrap();
+        assert_eq!(
+            prepared_rows(&include_hidden_prepared),
+            (0..=4)
+                .map(|row| (row, Fixed::from_pixels(20)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

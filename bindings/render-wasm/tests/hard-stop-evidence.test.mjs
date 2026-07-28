@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   correlateHardStopTarget,
-  findNonceBoundWorker
+  decideHardStopObservation,
+  findNonceBoundWorker,
+  hardStopObservationDeadlineEpochMs
 } from "./browser/hard-stop-evidence.mjs";
 
 const nonce = "0123456789abcdef0123456789abcdef";
@@ -61,6 +63,68 @@ test("hard-stop lifecycle requires nonce, active WASM pause, destruction, and ab
       deadlineMs: 1_000,
       absentFromTargetInventory: true
     }
+  );
+});
+
+test("hard-stop deadline starts at the public termination call, not CDP delivery", () => {
+  const deliveredProof = {
+    ...proof,
+    startedEpochMs: 10_600,
+    completedEpochMs: 10_650,
+    deadlineMs: 2_000
+  };
+  const deliveredPause = {
+    ...wasmPause,
+    terminationCommandEpochMs: 10_000
+  };
+  const base = {
+    attachedTargets: [primary, hardStop],
+    primaryTargetId: "primary",
+    currentTargets: [],
+    pauseEvidence: deliveredPause,
+    proof: deliveredProof
+  };
+
+  assert.equal(hardStopObservationDeadlineEpochMs(deliveredProof, 500), 13_100);
+  assert.equal(
+    decideHardStopObservation({
+      destructionRecorded: true,
+      nowEpochMs: 13_101,
+      observationDeadlineEpochMs: 13_100
+    }),
+    "inspect"
+  );
+  assert.equal(
+    decideHardStopObservation({
+      destructionRecorded: false,
+      nowEpochMs: 13_101,
+      observationDeadlineEpochMs: 13_100
+    }),
+    "expired"
+  );
+  assert.equal(
+    correlateHardStopTarget({
+      ...base,
+      destroyedTargets: new Map([["hard-stop", 12_600]])
+    }).elapsedMs,
+    2_000
+  );
+  assert.throws(
+    () =>
+      correlateHardStopTarget({
+        ...base,
+        destroyedTargets: new Map([["hard-stop", 12_601]])
+      }),
+    /ended after 2001ms/
+  );
+  assert.throws(
+    () =>
+      correlateHardStopTarget({
+        ...base,
+        destroyedTargets: new Map([["hard-stop", 10_100]]),
+        proof: { ...deliveredProof, startedEpochMs: 9_999 }
+      }),
+    /before the controller command/
   );
 });
 

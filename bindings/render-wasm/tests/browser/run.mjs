@@ -16,7 +16,9 @@ import {
 } from "./lifecycle.mjs";
 import {
   correlateHardStopTarget,
-  findNonceBoundWorker
+  decideHardStopObservation,
+  findNonceBoundWorker,
+  hardStopObservationDeadlineEpochMs
 } from "./hard-stop-evidence.mjs";
 import {
   combineHeaps,
@@ -940,10 +942,17 @@ async function driveHardStop({
   if (completedProof.phase === "failed") {
     throw new Error(completedProof.failure ?? "hard-stop page proof failed");
   }
-  const observationDeadline =
-    pauseEvidence.terminationCommandEpochMs + completedProof.deadlineMs + 500;
-  while (Date.now() <= observationDeadline) {
-    if (destroyedTargets.has(target.targetInfo.targetId)) {
+  const observationDeadline = hardStopObservationDeadlineEpochMs(
+    completedProof,
+    500
+  );
+  while (true) {
+    const observation = decideHardStopObservation({
+      destructionRecorded: destroyedTargets.has(target.targetInfo.targetId),
+      nowEpochMs: Date.now(),
+      observationDeadlineEpochMs: observationDeadline
+    });
+    if (observation === "inspect") {
       const inventory = await command("Target.getTargets");
       const evidence = correlateHardStopTarget({
         attachedTargets,
@@ -956,6 +965,10 @@ async function driveHardStop({
       if (evidence !== null) {
         return evidence;
       }
+      throw new Error("recorded hard-stop destruction could not be correlated");
+    }
+    if (observation === "expired") {
+      break;
     }
     await delay(10);
   }

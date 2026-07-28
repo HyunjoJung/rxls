@@ -5613,6 +5613,14 @@ pub(crate) enum OoxmlImplicitColumnWidth {
     BaseCharacters(f32),
 }
 
+#[cfg_attr(not(any(feature = "xlsx", feature = "xlsb")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum OoxmlImplicitRowHeight {
+    #[default]
+    None,
+    ApplicationDefault,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DisplayCellIndexEntry {
     coordinate: u64,
@@ -5724,6 +5732,10 @@ pub struct Sheet {
     pub(crate) hidden_cols: BTreeSet<u16>,
     /// Explicitly hidden rows.
     pub(crate) hidden_rows: BTreeSet<u32>,
+    /// OOXML sheet-wide default-hidden-row provenance. `Some(exceptions)`
+    /// means unspecified rows are hidden and the bounded set contains rows
+    /// explicitly present as visible in the source worksheet.
+    pub(crate) default_hidden_row_exceptions: Option<BTreeSet<u32>>,
     /// Per-column default formats (authoring).
     pub(crate) col_formats: BTreeMap<u16, CellStyle>,
     /// Per-row default formats (authoring).
@@ -5739,6 +5751,9 @@ pub struct Sheet {
     /// OOXML-only provenance used to distinguish an absent application default
     /// from an explicit `defaultColWidth` and from `baseColWidth`.
     pub(crate) ooxml_implicit_col_width: OoxmlImplicitColumnWidth,
+    /// OOXML-only provenance used to distinguish an absent application default
+    /// from an explicit `defaultRowHeight` / XLSB `miyDefRwHeight`.
+    pub(crate) ooxml_implicit_row_height: OoxmlImplicitRowHeight,
     /// Merged ranges `(r0, c0, r1, c1)` set when **authoring** (via
     /// [`Sheet::merge`]). The writer emits these as `<mergeCells>` and omits
     /// cells under them for OOXML conformance.
@@ -6101,6 +6116,7 @@ impl Default for Sheet {
             row_heights: BTreeMap::default(),
             hidden_cols: BTreeSet::default(),
             hidden_rows: BTreeSet::default(),
+            default_hidden_row_exceptions: None,
             col_formats: BTreeMap::default(),
             row_formats: BTreeMap::default(),
             default_format: None,
@@ -6108,6 +6124,7 @@ impl Default for Sheet {
             default_row_height: None,
             default_col_width: None,
             ooxml_implicit_col_width: OoxmlImplicitColumnWidth::None,
+            ooxml_implicit_row_height: OoxmlImplicitRowHeight::None,
             merges: Vec::default(),
             read_merges: Vec::default(),
             read_hyperlinks: Vec::default(),
@@ -8250,6 +8267,16 @@ impl Sheet {
         self.default_row_height
     }
 
+    /// Whether an imported OOXML worksheet omitted an authoritative default row
+    /// height and therefore retains the spreadsheet application's default.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`. An authored
+    /// sheet and imported non-OOXML formats return `false`.
+    #[doc(hidden)]
+    pub fn has_implicit_ooxml_row_height(&self) -> bool {
+        self.ooxml_implicit_row_height == OoxmlImplicitRowHeight::ApplicationDefault
+    }
+
     /// Explicitly hidden columns, as 0-based indexes.
     pub fn hidden_columns(&self) -> &BTreeSet<u16> {
         &self.hidden_cols
@@ -8258,6 +8285,16 @@ impl Sheet {
     /// Explicitly hidden rows, as 0-based indexes.
     pub fn hidden_rows(&self) -> &BTreeSet<u32> {
         &self.hidden_rows
+    }
+
+    /// Return OOXML default-hidden-row provenance for the renderer.
+    ///
+    /// `None` means rows are visible by default. `Some(exceptions)` means
+    /// unspecified rows are hidden by default and `exceptions` contains the
+    /// rows explicitly retained as visible by the source format.
+    #[doc(hidden)]
+    pub fn default_hidden_row_exceptions(&self) -> Option<&BTreeSet<u32>> {
+        self.default_hidden_row_exceptions.as_ref()
     }
 
     /// Worksheet tab color, when the source workbook or authoring model set one.
@@ -10187,6 +10224,9 @@ impl Sheet {
     /// Hide a row by 0-based index.
     pub fn hide_row(&mut self, row: u32) {
         self.hidden_rows.insert(row);
+        if let Some(exceptions) = self.default_hidden_row_exceptions.as_mut() {
+            exceptions.remove(&row);
+        }
     }
     /// Set the default format for cells in a row.
     pub fn set_row_format(&mut self, row: u32, format: &Format) {
@@ -10221,6 +10261,7 @@ impl Sheet {
     /// Set the default row height (points) for rows without an explicit height.
     pub fn set_default_row_height(&mut self, points: f32) {
         self.default_row_height = Some(points);
+        self.ooxml_implicit_row_height = OoxmlImplicitRowHeight::None;
     }
     /// Set the default column width (character units) for columns without an
     /// explicit width.
@@ -11160,6 +11201,7 @@ mod tests {
         assert_eq!(font.color, Some(Color::rgb(4, 5, 6)));
         assert_eq!(style.fill, Some(Color::rgb(1, 2, 3)));
         assert_eq!(sheet.default_row_height(), Some(18.0));
+        assert!(!sheet.has_implicit_ooxml_row_height());
         assert_eq!(sheet.default_column_width(), Some(9.5));
         assert_eq!(sheet.visual_dimensions(), Some((3, 2, 11, 12)));
     }

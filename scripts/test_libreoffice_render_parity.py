@@ -3437,25 +3437,8 @@ Page    2 CropBox: 0 0 841.125 595.0625
         self.assertEqual(pages[0].words[1].tokens, ("B", "C"))
         self.assertEqual(pages[0].lines[0].tokens, ("A", "B", "C"))
 
-        bounded_overhang = payload.replace(b'xMin="10"', b'xMin="-5.9"').replace(
-            b'xMax="30"', b'xMax="205.9"'
-        )
-        clamped = MODULE.parse_pdftotext_bbox_pages(
-            bounded_overhang,
-            expected_pages=1,
-            max_bytes=4096,
-            max_codepoints=16,
-            max_tokens=4,
-        )
-        self.assertEqual(clamped[0].words[0].bbox_points[0], 0.0)
-        self.assertEqual(clamped[0].words[0].bbox_points[2], 200.0)
-
         invalid_payloads = (
-            payload.replace(b'xMax="30"', b'xMax="NaN"'),
-            payload.replace(b'xMax="30"', b'xMax="300"'),
             payload.replace(b'xMin="10"', b'xMin="40"'),
-            payload.replace(b'xMin="10"', b'xMin="-6.1"'),
-            payload.replace(b'xMax="30"', b'xMax="206.1"'),
             b'<!DOCTYPE html [<!ENTITY x "boom">]><html/>',
             b'<!DOCTYPE html SYSTEM "local.dtd"><html/>',
         )
@@ -3486,6 +3469,91 @@ Page    2 CropBox: 0 0 841.125 595.0625
                 max_codepoints=16,
                 max_tokens=4,
             )
+
+    def test_pdftotext_bbox_parser_clamps_overhang_larger_than_six_points(
+        self,
+    ) -> None:
+        payload = b"""<html><body><doc><page width="200" height="100">
+            <flow><block><line xMin="-125.5" yMin="-75.25"
+            xMax="325.5" yMax="175.25"><word xMin="-125.5"
+            yMin="-75.25" xMax="325.5" yMax="175.25">A</word>
+            </line></block></flow></page></doc></body></html>"""
+        pages = MODULE.parse_pdftotext_bbox_pages(
+            payload,
+            expected_pages=1,
+            max_bytes=4096,
+            max_codepoints=16,
+            max_tokens=4,
+        )
+        self.assertEqual(pages[0].words[0].bbox_points, (0.0, 0.0, 200.0, 100.0))
+        self.assertEqual(pages[0].lines[0].bbox_points, (0.0, 0.0, 200.0, 100.0))
+
+    def test_pdftotext_bbox_parser_rejects_fully_outside_boxes(self) -> None:
+        coordinates = (
+            ('xMin="-30" yMin="20" xMax="0" yMax="40"'),
+            ('xMin="200" yMin="20" xMax="230" yMax="40"'),
+            ('xMin="10" yMin="-30" xMax="30" yMax="0"'),
+            ('xMin="10" yMin="100" xMax="30" yMax="130"'),
+        )
+        for box in coordinates:
+            payload = (
+                '<html><body><doc><page width="200" height="100">'
+                f"<flow><block><line {box}><word {box}>A</word></line>"
+                "</block></flow></page></doc></body></html>"
+            ).encode()
+            with self.subTest(box=box), self.assertRaisesRegex(
+                MODULE.HarnessError, "semantic_bbox_word_geometry"
+            ):
+                MODULE.parse_pdftotext_bbox_pages(
+                    payload,
+                    expected_pages=1,
+                    max_bytes=4096,
+                    max_codepoints=16,
+                    max_tokens=4,
+                )
+
+    def test_pdftotext_bbox_parser_rejects_non_finite_coordinates(self) -> None:
+        for coordinate in ("NaN", "Inf", "-Inf"):
+            payload = (
+                '<html><body><doc><page width="200" height="100">'
+                '<flow><block><line xMin="10" yMin="20" xMax="30" yMax="40">'
+                f'<word xMin="10" yMin="20" xMax="{coordinate}" '
+                'yMax="40">A</word></line></block></flow></page></doc>'
+                "</body></html>"
+            ).encode()
+            with self.subTest(coordinate=coordinate), self.assertRaisesRegex(
+                MODULE.HarnessError, "semantic_bbox_word_geometry"
+            ):
+                MODULE.parse_pdftotext_bbox_pages(
+                    payload,
+                    expected_pages=1,
+                    max_bytes=4096,
+                    max_codepoints=16,
+                    max_tokens=4,
+                )
+
+    def test_pdftotext_bbox_parser_rejects_absurd_coordinates(self) -> None:
+        for x_min, x_max in (
+            ("-1000000.001", "30"),
+            ("10", "1000000.001"),
+        ):
+            payload = (
+                '<html><body><doc><page width="200" height="100">'
+                f'<flow><block><line xMin="{x_min}" yMin="20" '
+                f'xMax="{x_max}" yMax="40"><word xMin="{x_min}" '
+                f'yMin="20" xMax="{x_max}" yMax="40">A</word></line>'
+                "</block></flow></page></doc></body></html>"
+            ).encode()
+            with self.subTest(x_min=x_min, x_max=x_max), self.assertRaisesRegex(
+                MODULE.HarnessError, "semantic_bbox_word_geometry"
+            ):
+                MODULE.parse_pdftotext_bbox_pages(
+                    payload,
+                    expected_pages=1,
+                    max_bytes=4096,
+                    max_codepoints=16,
+                    max_tokens=4,
+                )
 
     def test_pdftotext_bbox_streaming_caps_elements_lines_and_words(self) -> None:
         empty_elements = (

@@ -129,11 +129,11 @@ SVG_CLIP_REFERENCE_RE = re.compile(
 SVG_PATH_COMMANDS = frozenset("MmLlHhVvCcSsQqTtZz")
 MAX_SVG_PATH_TOKENS = 2_000_000
 MAX_TEXT_BOX_MATCH_WORK = 25_000_000
-# Poppler can report glyph bounds outside a tightly cropped Calc page.  A
-# locked-font 40-workbook pilot measured valid chart/RTL crop overhangs up to
-# 5.923697 points; six points is the absolute clamp allowance and larger
-# escapes are malformed evidence.
-BBOX_COORDINATE_EPSILON_POINTS = 6.0
+# Keep Poppler geometry inside the same absolute safety envelope as accepted
+# PDF page dimensions.  Boxes may overhang a crop by any amount within this
+# envelope; validity depends on a positive-area intersection with the page,
+# not on a guessed fixed overhang allowance.
+MAX_BBOX_COORDINATE_MAGNITUDE_POINTS = 1_000_000
 PDFTOTEXT_XHTML_DOCTYPE = (
     b'<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" '
     b'"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">'
@@ -4228,24 +4228,26 @@ def parse_pdftotext_bbox_pages(
         y_min = _parse_finite_number(element.attrib.get("yMin"), code)
         x_max = _parse_finite_number(element.attrib.get("xMax"), code)
         y_max = _parse_finite_number(element.attrib.get("yMax"), code)
-        epsilon = BBOX_COORDINATE_EPSILON_POINTS
         width_float = float(width)
         height_float = float(height)
         if (
             x_max <= x_min
             or y_max <= y_min
-            or x_min < -epsilon
-            or y_min < -epsilon
-            or x_max > width_float + epsilon
-            or y_max > height_float + epsilon
+            or any(
+                abs(coordinate) > MAX_BBOX_COORDINATE_MAGNITUDE_POINTS
+                for coordinate in (x_min, y_min, x_max, y_max)
+            )
         ):
             raise HarnessError(code)
-        return (
+        clamped = (
             min(width_float, max(0.0, x_min)),
             min(height_float, max(0.0, y_min)),
             min(width_float, max(0.0, x_max)),
             min(height_float, max(0.0, y_max)),
         )
+        if clamped[2] <= clamped[0] or clamped[3] <= clamped[1]:
+            raise HarnessError(code)
+        return clamped
 
     def page_dimension(value: object) -> Fraction:
         if (
@@ -4254,7 +4256,7 @@ def parse_pdftotext_bbox_pages(
         ):
             raise HarnessError("semantic_bbox_page_geometry")
         result = Fraction(value)
-        if result <= 0 or result > 1_000_000:
+        if result <= 0 or result > MAX_BBOX_COORDINATE_MAGNITUDE_POINTS:
             raise HarnessError("semantic_bbox_page_geometry")
         return result
 
