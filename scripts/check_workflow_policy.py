@@ -97,12 +97,13 @@ ORACLE_RENDER_STEP_SHA256 = (
     "00f31f7b101fe7fb51bc806ff0f129179c530099a65bcf8741d379db35472a3d",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
-    "7a92d4c6f7fdff6941c46b753d6fd912c7f18e1aecf10d8a4b72607367648881",
+    "b0b95564d98d64e5771728e694291f18579e05adff2dfecfc3e183a2fc4d110f",
     "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
     "455b842e761235cf52cc695d818461372c5b1c99132d9c6df12224ca82af42bb",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
     "d4964276024870ab039eb6a725f03a1f6fbe244ad736f86846219dbc29c6fe06",
+    "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "e8023111e76759005c88ec8df8501e1ea29a50353b6f4293d93e0b342ec25e03",
     "ea232316be10caebe65ece1a648b9c695f2421a35848e8ff6e81fb31fae29f2a",
     "5968d6e76ec19932c896dc2f729202e47edffbe2a569e55ed615b9533bf564e6",
@@ -119,7 +120,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "282b2646732a427ba6936c9915055717d023bea5eb200bb3173bef11d7df18c4"
+    "745b85c9975a11c208d4f056786d2642b12b16ec8168f417333d0968140aa46b"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
@@ -2038,6 +2039,30 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ),
         "- name: Run the project-native Type3 PDF Poppler smoke": (
             "must run the project-owned native PDF Poppler smoke before campaigns"
+        ),
+        "- name: Smoke the locked oracle runtime": (
+            "must run one real locked runtime fixture before the 40-case campaign"
+        ),
+        (
+            "if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' "
+            "&& env.RXLS_ORACLE_CAMPAIGN == 'pilot' }}"
+        ): (
+            "runtime smoke must run only for normal 40-case pilot campaigns"
+        ),
+        "python3 scripts/smoke-render-oracle-runtime.py \\": (
+            "runtime smoke must use the reviewed bounded adapter preflight"
+        ),
+        "--lock scripts/render-oracle-container/lock.json \\": (
+            "runtime smoke must authenticate the locked wrapper contract"
+        ),
+        "--manifest local/render-corpus-generated/pilot/manifest.json \\": (
+            "runtime smoke must select from the generated project-owned pilot"
+        ),
+        "--font-pack local/render-fonts/pack \\": (
+            "runtime smoke must use the exact verified generated font pack"
+        ),
+        '--image "$IMAGE_ID"': (
+            "runtime smoke must execute the exact image identity produced above"
         ),
         "pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens": (
             "must attest Type3 path text and exact Poppler word boxes"

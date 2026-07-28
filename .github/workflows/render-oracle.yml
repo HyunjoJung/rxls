@@ -66,6 +66,7 @@ on:
       - "scripts/render-oracle-host-tools-lock.json"
       - "scripts/render-oracle-host-tools.py"
       - "scripts/run-render-oracle-container.py"
+      - "scripts/smoke-render-oracle-runtime.py"
       - "scripts/test_compare_render_parity_runs.py"
       - "scripts/test_check_authored_print_parity.py"
       - "scripts/test_check_render_fidelity_targets.py"
@@ -75,6 +76,7 @@ on:
       - "scripts/test_libreoffice_render_parity.py"
       - "scripts/test_merge_render_parity_reports.py"
       - "scripts/test_render_oracle_container.py"
+      - "scripts/test_render_oracle_runtime_smoke.py"
       - "scripts/test_render_oracle_host_tools.py"
       - "scripts/test_workflow_policy.py"
       - "scripts/render-oracle-container/**"
@@ -176,6 +178,7 @@ jobs:
           python3 scripts/test_compare_render_parity_runs.py
           python3 scripts/test_merge_render_parity_reports.py
           python3 scripts/test_render_oracle_container.py
+          python3 scripts/test_render_oracle_runtime_smoke.py
           python3 scripts/test_render_oracle_host_tools.py
           python3 scripts/test_fetch_render_fonts.py
           python3 scripts/test_generate_render_corpus.py
@@ -379,6 +382,17 @@ jobs:
               image_id + "\n", encoding="utf-8"
           )
           PY
+      - name: Smoke the locked oracle runtime
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' && env.RXLS_ORACLE_CAMPAIGN == 'pilot' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_ID="$(cat target/render-oracle-hosted/image-id.txt)"
+          python3 scripts/smoke-render-oracle-runtime.py \
+            --lock scripts/render-oracle-container/lock.json \
+            --manifest local/render-corpus-generated/pilot/manifest.json \
+            --font-pack local/render-fonts/pack \
+            --image "$IMAGE_ID"
       - name: Run the bounded four-format campaign through the container adapter
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         shell: bash

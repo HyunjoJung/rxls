@@ -744,6 +744,21 @@ steps:
                 "",
                 1,
             ),
+            "runtime_smoke_removed": original.replace(
+                "      - name: Smoke the locked oracle runtime\n",
+                "      - name: Unreviewed runtime step\n",
+                1,
+            ),
+            "runtime_smoke_scope": original.replace(
+                "env.RXLS_ORACLE_CAMPAIGN == 'pilot'",
+                "env.RXLS_ORACLE_CAMPAIGN == 'full'",
+                1,
+            ),
+            "runtime_smoke_fixture": original.replace(
+                "--manifest local/render-corpus-generated/pilot/manifest.json",
+                "--manifest local/unreviewed/manifest.json",
+                1,
+            ),
             "merge": original.replace(
                 "python3 scripts/merge-render-parity-reports.py",
                 "python3 scripts/unverified-merge.py",
