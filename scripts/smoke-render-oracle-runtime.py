@@ -207,6 +207,35 @@ def _entrypoint_code(stderr: object) -> str | None:
     return matches[0].decode("ascii")
 
 
+def _container_log_code(payload: object) -> str | None:
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) > MAX_CONTAINER_START_STDERR_BYTES
+    ):
+        return None
+    lowered = payload.lower()
+    not_writable = (
+        b"permission denied" in lowered
+        or b"read-only file system" in lowered
+    )
+    if b"/oracle/runtime" in lowered and not_writable:
+        return "runtime_mount_not_writable"
+    if b"/oracle/evidence" in lowered and not_writable:
+        return "evidence_mount_not_writable"
+    if b"/tmp" in lowered and not_writable:
+        return "temporary_mount_not_writable"
+    if (
+        b"file size limit exceeded" in lowered
+        or b"error setting limit" in lowered
+    ):
+        return "fsize_limit_failed"
+    if b"/oracle/runtime" in lowered and b"no space left on device" in lowered:
+        return "runtime_mount_full"
+    if b"/oracle/evidence" in lowered and b"no space left on device" in lowered:
+        return "evidence_mount_full"
+    return None
+
+
 def _container_state_code(payload: object) -> str | None:
     if not isinstance(payload, bytes) or len(payload) > MAX_CONTAINER_STATE_BYTES:
         return None
@@ -235,8 +264,8 @@ def _container_state_code(payload: object) -> str | None:
         return "entrypoint_not_found"
     if runtime_error:
         return "container_runtime_start_failed"
-    if exit_code != 0:
-        return "container_exit_nonzero"
+    if 0 < exit_code <= 255:
+        return f"container_exit_{exit_code}"
     return None
 
 
@@ -260,7 +289,11 @@ class RecordingRunner:
                 stderr_limit_bytes=MAX_CONTAINER_START_STDERR_BYTES,
             )
             if isinstance(logs, self.wrapper.CommandResult):
-                code = _entrypoint_code(logs.stdout + b"\n" + logs.stderr)
+                diagnostics = logs.stdout + b"\n" + logs.stderr
+                code = _entrypoint_code(diagnostics)
+                if code is not None:
+                    return code
+                code = _container_log_code(diagnostics)
                 if code is not None:
                     return code
             state = self.delegate.run(

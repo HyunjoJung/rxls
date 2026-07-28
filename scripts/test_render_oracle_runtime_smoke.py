@@ -346,6 +346,39 @@ class RuntimeSmokeTests(unittest.TestCase):
         self.assertEqual(stderr, "oracle_error:container_oom_killed\n")
         self.assertNotIn("private", stderr)
 
+    def test_known_mount_failure_is_reduced_without_echoing_logs(self) -> None:
+        with _fixture(
+            start_status="nonzero",
+            start_stderr=b"docker: start failed",
+            diagnostic_logs=(
+                b"mkdir: cannot create directory "
+                b"'/oracle/runtime/runtime-smoke': Permission denied\n"
+                b"/private/source.xlsx"
+            ),
+        ) as (inputs, runner, _):
+            status, stdout, stderr = self._run(inputs, runner)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "oracle_error:runtime_mount_not_writable\n")
+        self.assertNotIn("private", stderr)
+
+    def test_unknown_exit_code_is_retained_as_a_bounded_integer(self) -> None:
+        with _fixture(
+            start_status="nonzero",
+            start_stderr=b"docker: start failed",
+            diagnostic_state={
+                "Error": "",
+                "ExitCode": 17,
+                "OOMKilled": False,
+            },
+        ) as (inputs, runner, _):
+            status, stdout, stderr = self._run(inputs, runner)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "oracle_error:container_exit_17\n")
+
     def test_untrusted_start_stderr_collapses_to_the_typed_wrapper_code(
         self,
     ) -> None:
