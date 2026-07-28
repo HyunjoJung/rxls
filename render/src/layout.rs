@@ -8,7 +8,7 @@ use rxls::{
     Border, BorderStyle, Cell, CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint,
     ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell, DrawingAnchorBehavior,
     DrawingMetadata, DrawingObjectKind, DvOp, FormatPattern, FormatScript, HAlign, Sheet,
-    Sparkline, SparklineKind, StyleFidelity, VAlign, Workbook,
+    Sparkline, SparklineKind, StyleFidelity, VAlign, Workbook, XlsbDefaultColumnWidth,
 };
 
 use crate::error::{LimitKind, RenderError};
@@ -18,9 +18,9 @@ use crate::font::{
 };
 use crate::media::decode_image;
 use crate::scene::{
-    ClipGroupNode, Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, ImageNode, LineNode, PathCommand,
-    PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, TextStyle,
-    FIXED_UNITS_PER_PIXEL,
+    ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode, ImageNode,
+    LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
+    TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
 };
 use crate::typography::wrap_text_ranges;
 use unicode_bidi::{bidi_class, BidiClass};
@@ -43,9 +43,15 @@ const OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS: f32 = 8.5;
 /// default row height to 0.5 cm (14.173228 points / 18.897638 CSS pixels).
 /// Fixed-point layout rounds that imported-only value to the nearest 1/1024 px.
 const OOXML_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(19_351);
-/// `baseColWidth` / XLSB `cchDefColWidth` exclude the four margin pixels and
-/// one gridline pixel included when deriving a default column width.
+/// OOXML `baseColWidth` excludes the four margin pixels and one gridline pixel
+/// included when deriving a default column width.
 const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: f64 = 5.0;
+/// XLSB `coldx` and `dxGCol` store 256 units per standard-font digit.
+const XLSB_DIGIT_WIDTH_SCALE: u32 = 256;
+/// Calc converts XLSB digit widths through integer twips at 96 CSS pixels/inch.
+const TWIPS_PER_CSS_PIXEL: i128 = 15;
+/// `cchDefColWidth` excludes the four margins and one gridline screen pixel.
+const XLSB_BASE_COLUMN_SCREEN_PIXELS: u16 = 5;
 /// Calc leaves a small, DPI-stable vertical inset around optimally sized
 /// multiline cells. The pinned LibreOffice oracle rounds this to about two CSS
 /// pixels at 96 DPI; keeping it fixed avoids platform font or UI dependencies.
@@ -2265,12 +2271,44 @@ fn column_width(
             Some(CellCoordinate { row: 0, col }),
         );
     }
-    let explicit_chars = sheet
-        .column_widths()
-        .get(&col)
-        .copied()
-        .or_else(|| sheet.default_column_width());
-    let (measured, invalid_source_geometry) = match explicit_chars {
+    if let Some(width_256) = sheet.xlsb_column_widths_256().get(&col).copied() {
+        return resolve_column_width(
+            xlsb_digits_to_fixed(width_256, maximum_digit_width, 0),
+            true,
+            col,
+            options,
+            warnings,
+        );
+    }
+    if let Some(chars) = sheet.column_widths().get(&col).copied() {
+        return resolve_column_width(
+            column_chars_to_fixed(chars, maximum_digit_width, IMPORTED_COLUMN_PADDING_PIXELS),
+            true,
+            col,
+            options,
+            warnings,
+        );
+    }
+    if let Some(provenance) = sheet.xlsb_default_column_width() {
+        let (width_256, screen_pixels) = match provenance {
+            XlsbDefaultColumnWidth::ApplicationDefault => {
+                (XLSB_DIGIT_WIDTH_SCALE * 8 + XLSB_DIGIT_WIDTH_SCALE / 2, 0)
+            }
+            XlsbDefaultColumnWidth::Digits256(width_256) => (width_256, 0),
+            XlsbDefaultColumnWidth::BaseCharacters(characters) => (
+                u32::from(characters) * XLSB_DIGIT_WIDTH_SCALE,
+                XLSB_BASE_COLUMN_SCREEN_PIXELS,
+            ),
+        };
+        return resolve_column_width(
+            xlsb_digits_to_fixed(width_256, maximum_digit_width, screen_pixels),
+            true,
+            col,
+            options,
+            warnings,
+        );
+    }
+    let (measured, invalid_source_geometry) = match sheet.default_column_width() {
         Some(chars) => (
             column_chars_to_fixed(chars, maximum_digit_width, IMPORTED_COLUMN_PADDING_PIXELS),
             true,
@@ -2305,6 +2343,16 @@ fn column_width(
             Some(None) | None => (None, false),
         },
     };
+    resolve_column_width(measured, invalid_source_geometry, col, options, warnings)
+}
+
+fn resolve_column_width(
+    measured: Option<Fixed>,
+    invalid_source_geometry: bool,
+    col: u16,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Fixed {
     match measured {
         Some(width) => width,
         None => {
@@ -2328,6 +2376,20 @@ fn empty_used_column_width(
 ) -> Result<Fixed, RenderError> {
     if sheet.column_widths().len() == 256 {
         return Ok(Fixed::from_pixels(1));
+    }
+    if let Some(XlsbDefaultColumnWidth::Digits256(width_256)) = sheet.xlsb_default_column_width() {
+        let maximum_digit_width =
+            maximum_digit_width(style_snapshot, options, warnings, statistics)?;
+        return match xlsb_digits_to_fixed(width_256, maximum_digit_width, 0) {
+            Some(width) => Ok(width),
+            None => {
+                warnings.add(
+                    WarningCode::InvalidGeometryFallback,
+                    Some(CellCoordinate { row: 0, col: 0 }),
+                );
+                Ok(Fixed::from_pixels(1))
+            }
+        };
     }
     let Some(chars) = sheet.default_column_width() else {
         return Ok(Fixed::from_pixels(1));
@@ -2702,6 +2764,35 @@ fn column_chars_to_fixed(
         .floor()
         + padding_pixels;
     float_pixels_to_fixed(pixels)
+}
+
+fn xlsb_digits_to_fixed(
+    width_256: u32,
+    maximum_digit_width: Fixed,
+    extra_screen_pixels: u16,
+) -> Option<Fixed> {
+    if width_256 == 0 || maximum_digit_width.raw() <= 0 {
+        return None;
+    }
+    let digit_twips = i128::from(maximum_digit_width.raw())
+        .checked_mul(TWIPS_PER_CSS_PIXEL)?
+        .checked_div(i128::from(FIXED_UNITS_PER_PIXEL))?;
+    if digit_twips <= 0 {
+        return None;
+    }
+    let width_twips = i128::from(width_256)
+        .checked_mul(digit_twips)?
+        .checked_add(i128::from(XLSB_DIGIT_WIDTH_SCALE / 2))?
+        .checked_div(i128::from(XLSB_DIGIT_WIDTH_SCALE))?
+        .checked_add(i128::from(extra_screen_pixels) * TWIPS_PER_CSS_PIXEL)?;
+    let raw = width_twips
+        .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?
+        .checked_add(TWIPS_PER_CSS_PIXEL / 2)?
+        .checked_div(TWIPS_PER_CSS_PIXEL)?;
+    if raw <= 0 {
+        return None;
+    }
+    i64::try_from(raw).ok().map(Fixed::from_raw)
 }
 
 fn points_to_fixed(points: f32) -> Option<Fixed> {
@@ -8265,6 +8356,7 @@ fn build_glyph_run(
 
     let mut commands = Vec::new();
     let mut clusters = Vec::new();
+    let mut cluster_metrics = Vec::new();
     let mut paints = Vec::new();
     let mut decorations = Vec::new();
     let mut line_top = top;
@@ -8292,6 +8384,7 @@ fn build_glyph_run(
             stats,
             &mut commands,
             &mut clusters,
+            &mut cluster_metrics,
             &mut paints,
             &mut decorations,
         )?;
@@ -8305,6 +8398,7 @@ fn build_glyph_run(
         clip_bounds,
         commands,
         clusters,
+        cluster_metrics,
         paints,
         decorations,
         color: style.color,
@@ -8851,6 +8945,7 @@ fn append_styled_shaped_outlines(
     stats: &mut TypographyStats,
     output: &mut Vec<PathCommand>,
     clusters: &mut Vec<GlyphCluster>,
+    cluster_metrics: &mut Vec<GlyphClusterMetrics>,
     paints: &mut Vec<GlyphPaint>,
     decorations: &mut Vec<LineNode>,
 ) -> Result<(), RenderError> {
@@ -8861,6 +8956,26 @@ fn append_styled_shaped_outlines(
         })?;
         let metrics = pack.metrics(run.font_id).map_err(map_font_error)?;
         let font_size = styled_font_size(style, scale_numerator, scale_denominator)?;
+        let nominal_ascent = scale_font_units(
+            i64::from(metrics.ascent),
+            font_size,
+            metrics.units_per_em,
+            1,
+        )?;
+        let nominal_descent = scale_font_units(
+            i64::from(metrics.descent),
+            font_size,
+            metrics.units_per_em,
+            1,
+        )?;
+        if nominal_ascent <= Fixed::ZERO
+            || nominal_descent > Fixed::ZERO
+            || nominal_ascent <= nominal_descent
+        {
+            return Err(RenderError::Typography {
+                reason: "invalid_font_metrics",
+            });
+        }
         let run_baseline = baseline
             .checked_add(styled_script_shift(
                 style,
@@ -8921,6 +9036,7 @@ fn append_styled_shaped_outlines(
             {
                 group_end += 1;
             }
+            let cluster_origin_x = pen;
             let command_start = output.len() as u64;
             for glyph in &run.glyphs[glyph_index..group_end] {
                 let x_offset = scale_font_units(
@@ -9004,6 +9120,15 @@ fn append_styled_shaped_outlines(
                     .checked_add(advance)
                     .ok_or(RenderError::CoordinateOverflow)?;
             }
+            let metrics = GlyphClusterMetrics {
+                origin_x: cluster_origin_x,
+                advance_x: pen
+                    .checked_sub(cluster_origin_x)
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                baseline_y: run_baseline,
+                ascent: nominal_ascent,
+                descent: nominal_descent,
+            };
             let cluster_end = logical_cluster_ends.get(&cluster_start).copied().ok_or(
                 RenderError::Typography {
                     reason: "invalid_glyph_cluster",
@@ -9033,6 +9158,11 @@ fn append_styled_shaped_outlines(
                     && previous.command_end == command_start
                 {
                     previous.command_end = command_end;
+                    let previous_metrics =
+                        cluster_metrics.last_mut().ok_or(RenderError::Typography {
+                            reason: "invalid_glyph_metadata",
+                        })?;
+                    merge_cluster_metrics(previous_metrics, metrics)?;
                 } else {
                     clusters.push(GlyphCluster {
                         source_start: source_start as u64,
@@ -9040,6 +9170,7 @@ fn append_styled_shaped_outlines(
                         command_start,
                         command_end,
                     });
+                    cluster_metrics.push(metrics);
                 }
             } else {
                 clusters.push(GlyphCluster {
@@ -9048,6 +9179,7 @@ fn append_styled_shaped_outlines(
                     command_start,
                     command_end,
                 });
+                cluster_metrics.push(metrics);
             }
             glyph_index = group_end;
         }
@@ -9087,6 +9219,67 @@ fn append_styled_shaped_outlines(
             .checked_add(run_width)
             .ok_or(RenderError::CoordinateOverflow)?;
     }
+    Ok(())
+}
+
+fn merge_cluster_metrics(
+    previous: &mut GlyphClusterMetrics,
+    current: GlyphClusterMetrics,
+) -> Result<(), RenderError> {
+    let previous_end = previous
+        .origin_x
+        .checked_add(previous.advance_x)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let current_end = current
+        .origin_x
+        .checked_add(current.advance_x)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left = Fixed::from_raw(
+        previous
+            .origin_x
+            .raw()
+            .min(previous_end.raw())
+            .min(current.origin_x.raw())
+            .min(current_end.raw()),
+    );
+    let right = Fixed::from_raw(
+        previous
+            .origin_x
+            .raw()
+            .max(previous_end.raw())
+            .max(current.origin_x.raw())
+            .max(current_end.raw()),
+    );
+    let previous_top = previous
+        .baseline_y
+        .checked_sub(previous.ascent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let current_top = current
+        .baseline_y
+        .checked_sub(current.ascent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let previous_bottom = previous
+        .baseline_y
+        .checked_sub(previous.descent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let current_bottom = current
+        .baseline_y
+        .checked_sub(current.descent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let top = Fixed::from_raw(previous_top.raw().min(current_top.raw()));
+    let bottom = Fixed::from_raw(previous_bottom.raw().max(current_bottom.raw()));
+    previous.origin_x = left;
+    previous.advance_x = right
+        .checked_sub(left)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    previous.ascent = previous
+        .baseline_y
+        .checked_sub(top)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    previous.descent = previous
+        .baseline_y
+        .checked_sub(bottom)
+        .ok_or(RenderError::CoordinateOverflow)?;
     Ok(())
 }
 
@@ -9946,6 +10139,82 @@ mod tests {
         Workbook::open(&zip.finish().unwrap().into_inner()).expect("imported OOXML workbook")
     }
 
+    fn xlsb_record(record_type: u32, payload: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        if record_type < 0x80 {
+            output.push(record_type as u8);
+        } else {
+            output.push((record_type & 0x7f) as u8 | 0x80);
+            output.push(((record_type >> 7) & 0x7f) as u8);
+        }
+        let mut size = payload.len();
+        loop {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        output.extend_from_slice(payload);
+        output
+    }
+
+    fn xlsb_wide_string(value: &str) -> Vec<u8> {
+        let units = value.encode_utf16().collect::<Vec<_>>();
+        let mut output = (units.len() as u32).to_le_bytes().to_vec();
+        for unit in units {
+            output.extend_from_slice(&unit.to_le_bytes());
+        }
+        output
+    }
+
+    fn imported_width_xlsb(
+        sheet_default: Option<(u32, u16)>,
+        columns: &[(u16, u16, u32, bool)],
+    ) -> Workbook {
+        let mut bundle = vec![0_u8; 8];
+        bundle.extend_from_slice(&xlsb_wide_string("rId1"));
+        bundle.extend_from_slice(&xlsb_wide_string("Widths"));
+        let workbook = xlsb_record(156, &bundle);
+
+        let mut sheet = Vec::new();
+        if let Some((width_256, base_characters)) = sheet_default {
+            let mut format = Vec::new();
+            format.extend_from_slice(&width_256.to_le_bytes());
+            format.extend_from_slice(&base_characters.to_le_bytes());
+            format.extend_from_slice(&300_u16.to_le_bytes());
+            format.extend_from_slice(&0_u16.to_le_bytes());
+            format.extend_from_slice(&[0, 0]);
+            sheet.extend_from_slice(&xlsb_record(0x01E5, &format));
+        }
+        for &(first, last, width_256, hidden) in columns {
+            let mut column = Vec::new();
+            column.extend_from_slice(&u32::from(first).to_le_bytes());
+            column.extend_from_slice(&u32::from(last).to_le_bytes());
+            column.extend_from_slice(&width_256.to_le_bytes());
+            column.extend_from_slice(&0_u32.to_le_bytes());
+            column.extend_from_slice(&u16::from(hidden).to_le_bytes());
+            sheet.extend_from_slice(&xlsb_record(60, &column));
+        }
+
+        let relationships = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (path, body) in [
+            ("xl/workbook.bin", workbook.as_slice()),
+            ("xl/_rels/workbook.bin.rels", relationships.as_bytes()),
+            ("xl/worksheets/sheet1.bin", sheet.as_slice()),
+        ] {
+            zip.start_file(path, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        Workbook::open(&zip.finish().unwrap().into_inner()).expect("imported XLSB workbook")
+    }
+
     fn imported_table_xlsx(styles: &str, worksheet: &str, table: &str) -> Workbook {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default();
@@ -10443,6 +10712,7 @@ mod tests {
         let mut stats = TypographyStats::default();
         let mut commands = Vec::new();
         let mut clusters = Vec::new();
+        let mut cluster_metrics = Vec::new();
         let mut paints = Vec::new();
         let mut decorations = Vec::new();
         append_styled_shaped_outlines(
@@ -10459,6 +10729,7 @@ mod tests {
             &mut stats,
             &mut commands,
             &mut clusters,
+            &mut cluster_metrics,
             &mut paints,
             &mut decorations,
         )
@@ -10468,6 +10739,11 @@ mod tests {
         assert_eq!(clusters[0].source_end, 2);
         assert_eq!(clusters[0].command_start, 0);
         assert_eq!(clusters[0].command_end, commands.len() as u64);
+        assert_eq!(cluster_metrics.len(), 1);
+        assert_eq!(cluster_metrics[0].baseline_y, Fixed::from_pixels(16));
+        assert_eq!(cluster_metrics[0].ascent, Fixed::from_raw(13_107));
+        assert_eq!(cluster_metrics[0].descent, Fixed::from_raw(-3_277));
+        assert_eq!(cluster_metrics[0].advance_x, Fixed::from_raw(9_830));
 
         let mut limited = options;
         limited.limits.max_path_commands = commands.len() as u64 - 1;
@@ -10483,6 +10759,7 @@ mod tests {
             1,
             &limited,
             &mut TypographyStats::default(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -10853,6 +11130,175 @@ mod tests {
         assert_eq!(
             base_8_width.checked_sub(explicit_8_width),
             Some(Fixed::from_pixels(5))
+        );
+    }
+
+    #[test]
+    fn xlsb_digit_widths_match_calc_twips_for_explicit_defaults_hidden_and_font_mdw() {
+        const CARLITO_11_MDW: Fixed = Fixed::from_raw(7_612);
+        const CARLITO_EQUIVALENT_SYNTHETIC_SIZE: Fixed = Fixed::from_raw(12_687);
+        let from_twips = |twips: i64| {
+            Fixed::from_raw(
+                (twips * FIXED_UNITS_PER_PIXEL + i64::try_from(TWIPS_PER_CSS_PIXEL / 2).unwrap())
+                    / i64::try_from(TWIPS_PER_CSS_PIXEL).unwrap(),
+            )
+        };
+        let ceil_pixels =
+            |width: Fixed| (width.raw() + FIXED_UNITS_PER_PIXEL - 1) / FIXED_UNITS_PER_PIXEL;
+
+        assert_eq!(
+            xlsb_digits_to_fixed(18 * 256, CARLITO_11_MDW, 0),
+            Some(from_twips(1_998))
+        );
+        assert_eq!(
+            xlsb_digits_to_fixed(14 * 256, CARLITO_11_MDW, 0),
+            Some(from_twips(1_554))
+        );
+        assert_eq!(
+            xlsb_digits_to_fixed(8 * 256 + 128, CARLITO_11_MDW, 0),
+            Some(from_twips(944))
+        );
+        assert_eq!(
+            xlsb_digits_to_fixed(8 * 256, CARLITO_11_MDW, 5),
+            Some(from_twips(963))
+        );
+        assert_eq!(
+            xlsb_digits_to_fixed(18 * 256, Fixed::from_pixels(8), 0),
+            Some(Fixed::from_pixels(144))
+        );
+
+        let explicit =
+            imported_width_xlsb(None, &[(0, 0, 18 * 256, false), (1, 4, 14 * 256, false)]);
+        assert_eq!(
+            explicit.sheets[0].xlsb_column_widths_256().get(&0),
+            Some(&(18 * 256))
+        );
+        assert_eq!(
+            explicit.sheets[0].xlsb_column_widths_256().get(&4),
+            Some(&(14 * 256))
+        );
+        assert_eq!(
+            explicit.sheets[0].xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::ApplicationDefault)
+        );
+
+        let range = RenderRange::new(0, 0, 0, 4);
+        let pack = synthetic_test_pack();
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: pack.default_family().to_string(),
+            default_font_size: CARLITO_EQUIVALENT_SYNTHETIC_SIZE,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let (_, explicit_columns) =
+            measure_sheet_axes(&explicit.sheets[0], range, &options).unwrap();
+        assert_eq!(
+            explicit_columns
+                .iter()
+                .map(|column| column.size.raw())
+                .collect::<Vec<_>>(),
+            [136_397, 106_086, 106_086, 106_086, 106_086]
+        );
+        let explicit_total = explicit_columns
+            .iter()
+            .map(|column| column.size.raw())
+            .sum::<i64>();
+        assert_eq!(explicit_total, 560_741);
+        assert_eq!(ceil_pixels(Fixed::from_raw(explicit_total)), 548);
+
+        let implicit = imported_width_xlsb(None, &[]);
+        let (_, implicit_columns) =
+            measure_sheet_axes(&implicit.sheets[0], range, &options).unwrap();
+        assert!(implicit_columns
+            .iter()
+            .all(|column| column.size.raw() == 64_444));
+        let implicit_total = implicit_columns
+            .iter()
+            .map(|column| column.size.raw())
+            .sum::<i64>();
+        assert_eq!(implicit_total, 322_220);
+        assert_eq!(ceil_pixels(Fixed::from_raw(implicit_total)), 315);
+
+        let numeric_default = imported_width_xlsb(Some((14 * 256, 42)), &[]);
+        assert_eq!(
+            numeric_default.sheets[0].xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::Digits256(14 * 256))
+        );
+        let (_, default_columns) =
+            measure_sheet_axes(&numeric_default.sheets[0], range, &options).unwrap();
+        assert!(default_columns
+            .iter()
+            .all(|column| column.size.raw() == 106_086));
+        assert_eq!(
+            ceil_pixels(Fixed::from_raw(
+                default_columns.iter().map(|column| column.size.raw()).sum()
+            )),
+            518
+        );
+
+        let base_default = imported_width_xlsb(Some((u32::MAX, 8)), &[]);
+        assert_eq!(
+            base_default.sheets[0].xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::BaseCharacters(8))
+        );
+        let (_, base_columns) =
+            measure_sheet_axes(&base_default.sheets[0], range, &options).unwrap();
+        assert!(base_columns
+            .iter()
+            .all(|column| column.size.raw() == 65_741));
+
+        let hidden = imported_width_xlsb(
+            None,
+            &[
+                (0, 0, 18 * 256, false),
+                (1, 1, 14 * 256, true),
+                (2, 4, 14 * 256, false),
+            ],
+        );
+        let (_, visible_columns) = measure_sheet_axes(&hidden.sheets[0], range, &options).unwrap();
+        assert_eq!(
+            visible_columns
+                .iter()
+                .map(|column| column.index)
+                .collect::<Vec<_>>(),
+            [0, 2, 3, 4]
+        );
+        assert_eq!(
+            ceil_pixels(Fixed::from_raw(
+                visible_columns.iter().map(|column| column.size.raw()).sum()
+            )),
+            444
+        );
+        let mut include_hidden = options.clone();
+        include_hidden.include_hidden = true;
+        let (_, all_columns) =
+            measure_sheet_axes(&hidden.sheets[0], range, &include_hidden).unwrap();
+        assert_eq!(
+            all_columns
+                .iter()
+                .map(|column| column.size.raw())
+                .sum::<i64>(),
+            560_741
+        );
+
+        let mut wider_font = options.clone();
+        wider_font.default_font_size = Fixed::from_raw(13_653);
+        let (_, wider_columns) =
+            measure_sheet_axes(&explicit.sheets[0], range, &wider_font).unwrap();
+        assert_eq!(
+            wider_columns
+                .iter()
+                .map(|column| column.size)
+                .collect::<Vec<_>>(),
+            [
+                Fixed::from_pixels(144),
+                Fixed::from_pixels(112),
+                Fixed::from_pixels(112),
+                Fixed::from_pixels(112),
+                Fixed::from_pixels(112),
+            ]
         );
     }
 

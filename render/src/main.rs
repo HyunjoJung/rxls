@@ -833,6 +833,18 @@ fn scene_sha256_hex(scene: &Scene) -> String {
                         digest.update(value.to_le_bytes());
                     }
                 }
+                digest.update((node.cluster_metrics.len() as u64).to_le_bytes());
+                for metrics in &node.cluster_metrics {
+                    for value in [
+                        metrics.origin_x,
+                        metrics.advance_x,
+                        metrics.baseline_y,
+                        metrics.ascent,
+                        metrics.descent,
+                    ] {
+                        update_fixed(&mut digest, value.raw());
+                    }
+                }
                 digest.update((node.paints.len() as u64).to_le_bytes());
                 for paint in &node.paints {
                     digest.update(paint.command_start.to_le_bytes());

@@ -580,6 +580,7 @@ mod tests {
                 y: Fixed::ZERO,
             }],
             clusters: Vec::new(),
+            cluster_metrics: Vec::new(),
             paints: Vec::new(),
             decorations: Vec::new(),
             color: Rgb::BLACK,

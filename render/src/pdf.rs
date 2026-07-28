@@ -12,9 +12,9 @@ use crate::error::{LimitKind, RenderError};
 use crate::print::PrintDocument;
 use crate::scene::{
     backend_image_trace, backend_text_trace, format_fixed, BackendGeometryTrace,
-    BackendGlyphTraceBuilder, BackendNodeTrace, BackendPathTraceBuilder, Fixed, GlyphRunNode,
-    ImageNode, LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
-    TextBaseline, TextNode, FIXED_UNITS_PER_PIXEL,
+    BackendGlyphTraceBuilder, BackendNodeTrace, BackendPathTraceBuilder, Fixed,
+    GlyphClusterMetrics, GlyphRunNode, ImageNode, LineNode, PathCommand, PathNode, Rect, RectNode,
+    Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, FIXED_UNITS_PER_PIXEL,
 };
 
 const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
@@ -56,13 +56,16 @@ struct PdfGlyphReference {
     origin_x: Fixed,
     origin_y: Fixed,
     height: Fixed,
+    reverse_y: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PdfGlyphPlacement {
     origin_x: Fixed,
     origin_y: Fixed,
+    width: Fixed,
     height: Fixed,
+    reverse_y: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +228,16 @@ impl PdfFontRegistry {
                 Ok(glyph_bounds(commands))
             })
             .collect::<Result<Vec<_>, RenderError>>()?;
-        let fallback_placements = fallback_glyph_placements(node, &cluster_bounds)?;
+        let placements = if node.cluster_metrics.is_empty() {
+            fallback_glyph_placements(node, &cluster_bounds)?
+        } else {
+            node.cluster_metrics
+                .iter()
+                .copied()
+                .map(nominal_glyph_placement)
+                .map(|placement| placement.map(Some))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let mut paint_cursor = 0_usize;
         for (index, cluster) in node.clusters.iter().enumerate() {
             let source_start =
@@ -262,7 +274,7 @@ impl PdfFontRegistry {
                 cluster.command_start..cluster.command_end,
                 source,
                 paint_cursor..paint_end,
-                fallback_placements[index],
+                placements[index],
                 trace.as_deref_mut(),
             )?);
         }
@@ -275,7 +287,7 @@ impl PdfFontRegistry {
         command_range: std::ops::Range<u64>,
         source: &str,
         paint_range: std::ops::Range<usize>,
-        fallback: Option<PdfGlyphPlacement>,
+        placement: Option<PdfGlyphPlacement>,
         trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
     ) -> Result<PdfGlyphReference, RenderError> {
         let actual = self
@@ -294,8 +306,33 @@ impl PdfFontRegistry {
             reason: "invalid_glyph_metadata",
         })?;
         let bounds = glyph_bounds(commands);
-        let (origin_x, origin_y, width, height, local_bounds) = match bounds {
-            Some(bounds) => {
+        let (origin_x, origin_y, width, height, reverse_y, local_bounds) = match (placement, bounds)
+        {
+            (Some(placement), bounds) => {
+                let placement = placement_including_ink(placement, bounds)?;
+                (
+                    placement.origin_x,
+                    placement.origin_y,
+                    placement.width,
+                    placement.height,
+                    placement.reverse_y,
+                    Some(PdfGlyphBounds {
+                        min_x: Fixed::ZERO,
+                        min_y: if placement.reverse_y {
+                            Fixed::ZERO
+                        } else {
+                            Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE))
+                        },
+                        max_x: placement.width,
+                        max_y: if placement.reverse_y {
+                            Fixed::from_pixels(i64::from(TYPE3_TEXT_SCALE))
+                        } else {
+                            Fixed::ZERO
+                        },
+                    }),
+                )
+            }
+            (None, Some(bounds)) => {
                 let width = bounds
                     .max_x
                     .checked_sub(bounds.min_x)
@@ -309,6 +346,7 @@ impl PdfFontRegistry {
                     bounds.max_y,
                     width,
                     height,
+                    false,
                     Some(PdfGlyphBounds {
                         min_x: Fixed::ZERO,
                         min_y: Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE)),
@@ -317,15 +355,14 @@ impl PdfFontRegistry {
                     }),
                 )
             }
-            None => {
-                let placement = fallback.ok_or(RenderError::Backend {
-                    reason: "invalid_glyph_metadata",
-                })?;
+            (None, None) => {
+                let placement = default_glyph_placement(node)?;
                 (
                     placement.origin_x,
                     placement.origin_y,
-                    Fixed::from_pixels(1),
+                    placement.width,
                     placement.height,
+                    placement.reverse_y,
                     None,
                 )
             }
@@ -347,8 +384,13 @@ impl PdfFontRegistry {
             node,
             command_range,
             paint_range,
-            (origin_x, origin_y),
-            height,
+            PdfGlyphPlacement {
+                origin_x,
+                origin_y,
+                width,
+                height,
+                reverse_y,
+            },
             trace,
         )?;
         let content = content.finish();
@@ -391,6 +433,7 @@ impl PdfFontRegistry {
             origin_x,
             origin_y,
             height,
+            reverse_y,
         })
     }
 }
@@ -1113,7 +1156,7 @@ fn push_glyph_run(
                     "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
                     glyph.subset_index,
                     TYPE3_TEXT_SCALE,
-                    type3_height_scale(glyph.height),
+                    type3_height_scale(glyph.height, glyph.reverse_y),
                     format_fixed(glyph.origin_x),
                     format_fixed(glyph.origin_y),
                     glyph.code
@@ -1362,17 +1405,17 @@ fn push_glyph_program_paints(
     node: &GlyphRunNode,
     command_range: std::ops::Range<u64>,
     paint_range: std::ops::Range<usize>,
-    origin: (Fixed, Fixed),
-    height: Fixed,
+    placement: PdfGlyphPlacement,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
 ) -> Result<(), RenderError> {
     let command_start = command_range.start;
     let command_end = command_range.end;
-    let (origin_x, origin_y) = origin;
+    let origin_x = placement.origin_x;
+    let origin_y = placement.origin_y;
     if command_start != command_end {
         content.push(&format!(
             "q\n1 0 0 {} 0 0 cm\n",
-            type3_height_normalization(height)
+            type3_height_normalization(placement.height, placement.reverse_y)
         ))?;
     }
     let mut covered = command_start;
@@ -1568,6 +1611,72 @@ fn fallback_glyph_placements(
     Ok(placements)
 }
 
+fn nominal_glyph_placement(metrics: GlyphClusterMetrics) -> Result<PdfGlyphPlacement, RenderError> {
+    let advance_end = metrics
+        .origin_x
+        .checked_add(metrics.advance_x)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let origin_x = Fixed::from_raw(metrics.origin_x.raw().min(advance_end.raw()));
+    let right = Fixed::from_raw(metrics.origin_x.raw().max(advance_end.raw()));
+    let top = metrics
+        .baseline_y
+        .checked_sub(metrics.ascent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let origin_y = metrics
+        .baseline_y
+        .checked_sub(metrics.descent)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let width = right
+        .checked_sub(origin_x)
+        .ok_or(RenderError::CoordinateOverflow)?
+        .max(Fixed::from_raw(1));
+    let height = origin_y
+        .checked_sub(top)
+        .ok_or(RenderError::CoordinateOverflow)?
+        .max(Fixed::from_raw(1));
+    Ok(PdfGlyphPlacement {
+        origin_x,
+        origin_y,
+        width,
+        height,
+        reverse_y: true,
+    })
+}
+
+fn placement_including_ink(
+    placement: PdfGlyphPlacement,
+    ink: Option<PdfGlyphBounds>,
+) -> Result<PdfGlyphPlacement, RenderError> {
+    let Some(ink) = ink else {
+        return Ok(placement);
+    };
+    let nominal_right = placement
+        .origin_x
+        .checked_add(placement.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let nominal_top = placement
+        .origin_y
+        .checked_sub(placement.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let origin_x = Fixed::from_raw(placement.origin_x.raw().min(ink.min_x.raw()));
+    let right = Fixed::from_raw(nominal_right.raw().max(ink.max_x.raw()));
+    let top = Fixed::from_raw(nominal_top.raw().min(ink.min_y.raw()));
+    let origin_y = Fixed::from_raw(placement.origin_y.raw().max(ink.max_y.raw()));
+    Ok(PdfGlyphPlacement {
+        origin_x,
+        origin_y,
+        width: right
+            .checked_sub(origin_x)
+            .ok_or(RenderError::CoordinateOverflow)?
+            .max(Fixed::from_raw(1)),
+        height: origin_y
+            .checked_sub(top)
+            .ok_or(RenderError::CoordinateOverflow)?
+            .max(Fixed::from_raw(1)),
+        reverse_y: placement.reverse_y,
+    })
+}
+
 fn fallback_glyph_placement(
     node: &GlyphRunNode,
     previous: Option<PdfGlyphBounds>,
@@ -1589,7 +1698,9 @@ fn fallback_glyph_placement(
         return Ok(PdfGlyphPlacement {
             origin_x,
             origin_y: reference.max_y,
+            width: Fixed::from_pixels(1),
             height,
+            reverse_y: false,
         });
     }
 
@@ -1610,7 +1721,9 @@ fn default_glyph_placement(node: &GlyphRunNode) -> Result<PdfGlyphPlacement, Ren
             .y
             .checked_add(height)
             .ok_or(RenderError::CoordinateOverflow)?,
+        width: Fixed::from_pixels(1),
         height,
+        reverse_y: false,
     })
 }
 
@@ -2307,17 +2420,19 @@ fn fixed_to_pdf_points(value: Fixed) -> Result<String, RenderError> {
     Ok(format_rational(raw, denominator))
 }
 
-fn type3_height_scale(height: Fixed) -> String {
+fn type3_height_scale(height: Fixed, reverse_y: bool) -> String {
+    let numerator = i128::from(height.raw());
     format_rational_with_precision(
-        i128::from(height.raw()),
+        if reverse_y { -numerator } else { numerator },
         i128::from(FIXED_UNITS_PER_PIXEL) * i128::from(TYPE3_TEXT_SCALE),
         16,
     )
 }
 
-fn type3_height_normalization(height: Fixed) -> String {
+fn type3_height_normalization(height: Fixed, reverse_y: bool) -> String {
+    let numerator = i128::from(FIXED_UNITS_PER_PIXEL) * i128::from(TYPE3_TEXT_SCALE);
     format_rational_with_precision(
-        i128::from(FIXED_UNITS_PER_PIXEL) * i128::from(TYPE3_TEXT_SCALE),
+        if reverse_y { -numerator } else { numerator },
         i128::from(height.raw()),
         16,
     )
@@ -2771,6 +2886,7 @@ mod tests {
                 command_start: 0,
                 command_end: commands.len() as u64,
             }],
+            cluster_metrics: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: commands.len() as u64,
@@ -2847,6 +2963,7 @@ mod tests {
                         command_end: commands.len() as u64,
                     },
                 ],
+                cluster_metrics: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -2900,6 +3017,7 @@ mod tests {
                         command_end: commands.len() as u64,
                     },
                 ],
+                cluster_metrics: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -2962,6 +3080,7 @@ mod tests {
                         command_end: commands.len() as u64,
                     },
                 ],
+                cluster_metrics: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -3232,6 +3351,64 @@ mod tests {
         ]
     }
 
+    fn nominal_source_bbox_points(node: &GlyphRunNode, source: &str) -> [f64; 4] {
+        let source_start = node
+            .text
+            .find(source)
+            .unwrap_or_else(|| panic!("{source:?} is absent from {:?}", node.text));
+        let source_end = source_start + source.len();
+        assert_eq!(node.cluster_metrics.len(), node.clusters.len());
+        let transform = PdfTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
+        let mut bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut included = 0_usize;
+        for (cluster, metrics) in node.clusters.iter().zip(&node.cluster_metrics) {
+            let start = usize::try_from(cluster.source_start).unwrap();
+            let end = usize::try_from(cluster.source_end).unwrap();
+            if start < source_start || end > source_end {
+                continue;
+            }
+            let advance_end = metrics.origin_x.checked_add(metrics.advance_x).unwrap();
+            let left = Fixed::from_raw(metrics.origin_x.raw().min(advance_end.raw()));
+            let right = Fixed::from_raw(metrics.origin_x.raw().max(advance_end.raw()));
+            let top = metrics.baseline_y.checked_sub(metrics.ascent).unwrap();
+            let bottom = metrics.baseline_y.checked_sub(metrics.descent).unwrap();
+            for point in [
+                transform.point(left, top),
+                transform.point(right, top),
+                transform.point(right, bottom),
+                transform.point(left, bottom),
+            ] {
+                bounds[0] = bounds[0].min(point[0]);
+                bounds[1] = bounds[1].min(point[1]);
+                bounds[2] = bounds[2].max(point[0]);
+                bounds[3] = bounds[3].max(point[1]);
+            }
+            included += 1;
+        }
+        assert!(included > 0, "no cluster metrics cover {source:?}");
+        bounds.map(|value| {
+            value * PDF_POINTS_PER_CSS_PIXEL_NUMERATOR as f64
+                / PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR as f64
+        })
+    }
+
+    fn assert_poppler_bbox_close(actual: [f64; 4], expected: [f64; 4]) {
+        let actual_bbox = actual;
+        let expected_bbox = expected;
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 0.002,
+                "bbox coordinate {actual} differs from nominal {expected}: \
+                 actual={actual_bbox:?}, expected={expected_bbox:?}"
+            );
+        }
+    }
+
     fn poppler_words(xml: &str) -> Vec<&str> {
         let mut words = Vec::new();
         let mut remainder = xml;
@@ -3318,6 +3495,7 @@ mod tests {
                                 command_end: 10,
                             },
                         ],
+                        cluster_metrics: Vec::new(),
                         paints: vec![GlyphPaint {
                             command_start: 0,
                             command_end: 10,
@@ -3445,6 +3623,7 @@ mod tests {
                             command_end: 20,
                         },
                     ],
+                    cluster_metrics: Vec::new(),
                     paints: vec![
                         GlyphPaint {
                             command_start: 0,
@@ -3951,6 +4130,7 @@ mod tests {
                     command_end: 15,
                 },
             ],
+            cluster_metrics: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: 15,
@@ -4075,6 +4255,7 @@ mod tests {
             }],
             commands,
             clusters,
+            cluster_metrics: Vec::new(),
             decorations: Vec::new(),
             color: Rgb::BLACK,
             rotation_degrees: 0,
@@ -4695,6 +4876,88 @@ mod tests {
             assert!((alpha[1] - beta[1]).abs() < 0.01);
             assert!((beta[1] - gamma[1]).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn type3_poppler_boxes_use_nominal_metrics_for_latin_and_cjk() {
+        let node = font_pack_glyph_run("ACE 漢字");
+        assert_eq!(node.cluster_metrics.len(), node.clusters.len());
+        let latin_expected = nominal_source_bbox_points(&node, "ACE");
+        let cjk_expected = nominal_source_bbox_points(&node, "漢字");
+        assert!((latin_expected[3] - latin_expected[1] - 11.0).abs() <= 0.002);
+        assert!((cjk_expected[3] - cjk_expected[1] - 11.0).abs() <= 0.002);
+
+        let document =
+            document_with_nodes("type3-nominal-latin-cjk", vec![SceneNode::GlyphRun(node)]);
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["ACE", "漢字"]);
+            assert_poppler_bbox_close(poppler_word_bbox(&xml, "ACE"), latin_expected);
+            assert_poppler_bbox_close(poppler_word_bbox(&xml, "漢字"), cjk_expected);
+        }
+    }
+
+    #[test]
+    fn type3_poppler_box_uses_nominal_metrics_for_rotated_rtl() {
+        let mut node = font_pack_glyph_run("אב");
+        node.rotation_degrees = 90;
+        node.pivot_x = Fixed::from_pixels(50);
+        node.pivot_y = Fixed::from_pixels(50);
+        node.clip_bounds = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+        };
+        let expected = nominal_source_bbox_points(&node, "אב");
+        let unrotated_height = {
+            let mut unrotated = node.clone();
+            unrotated.rotation_degrees = 0;
+            let bounds = nominal_source_bbox_points(&unrotated, "אב");
+            bounds[3] - bounds[1]
+        };
+        assert!((expected[2] - expected[0] - unrotated_height).abs() <= 0.002);
+
+        let document =
+            document_with_nodes("type3-nominal-rotated-rtl", vec![SceneNode::GlyphRun(node)]);
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["אב"]);
+            assert_poppler_bbox_close(poppler_word_bbox(&xml, "אב"), expected);
+        }
+    }
+
+    #[test]
+    fn nominal_type3_placement_expands_to_retain_outline_overhangs() {
+        let nominal = nominal_glyph_placement(GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(10),
+            advance_x: Fixed::from_pixels(4),
+            baseline_y: Fixed::from_pixels(20),
+            ascent: Fixed::from_pixels(8),
+            descent: Fixed::from_pixels(-2),
+        })
+        .unwrap();
+        assert_eq!(nominal.origin_x, Fixed::from_pixels(10));
+        assert_eq!(nominal.origin_y, Fixed::from_pixels(22));
+        assert_eq!(nominal.width, Fixed::from_pixels(4));
+        assert_eq!(nominal.height, Fixed::from_pixels(10));
+
+        let expanded = placement_including_ink(
+            nominal,
+            Some(PdfGlyphBounds {
+                min_x: Fixed::from_pixels(8),
+                min_y: Fixed::from_pixels(10),
+                max_x: Fixed::from_pixels(16),
+                max_y: Fixed::from_pixels(25),
+            }),
+        )
+        .unwrap();
+        assert_eq!(expanded.origin_x, Fixed::from_pixels(8));
+        assert_eq!(expanded.origin_y, Fixed::from_pixels(25));
+        assert_eq!(expanded.width, Fixed::from_pixels(8));
+        assert_eq!(expanded.height, Fixed::from_pixels(15));
     }
 
     #[test]

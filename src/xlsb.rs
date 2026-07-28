@@ -18,7 +18,7 @@ use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
-use crate::model::{OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight};
+use crate::model::{OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight, XlsbDefaultColumnWidth};
 use crate::{
     format, rk_to_f64, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle,
     Chart, Color, Comment, DataValidation, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata,
@@ -340,10 +340,19 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         };
         let ooxml_implicit_col_width = if !is_worksheet || metadata.default_col_width.is_some() {
             OoxmlImplicitColumnWidth::None
-        } else if let Some(chars) = metadata.ooxml_base_col_width {
-            OoxmlImplicitColumnWidth::BaseCharacters(chars)
+        } else if let Some(characters) = metadata.ooxml_base_col_width {
+            OoxmlImplicitColumnWidth::BaseCharacters(f32::from(characters))
         } else {
             OoxmlImplicitColumnWidth::ApplicationDefault
+        };
+        let xlsb_default_col_width = if !is_worksheet {
+            None
+        } else if let Some(width_256) = metadata.default_col_width_256 {
+            Some(XlsbDefaultColumnWidth::Digits256(width_256))
+        } else if let Some(characters) = metadata.ooxml_base_col_width {
+            Some(XlsbDefaultColumnWidth::BaseCharacters(characters))
+        } else {
+            Some(XlsbDefaultColumnWidth::ApplicationDefault)
         };
         let ooxml_implicit_row_height = if is_worksheet && metadata.default_row_height.is_none() {
             OoxmlImplicitRowHeight::ApplicationDefault
@@ -388,6 +397,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline: metadata.col_outline,
             row_heights: metadata.row_heights,
             col_widths: metadata.col_widths,
+            xlsb_col_widths_256: metadata.col_widths_256,
+            xlsb_default_col_width,
             default_row_height: metadata.default_row_height,
             default_col_width: metadata.default_col_width,
             ooxml_implicit_col_width,
@@ -1594,9 +1605,11 @@ struct SheetReadMetadata {
     collapsed_rows: BTreeSet<u32>,
     row_heights: BTreeMap<u32, f32>,
     col_widths: BTreeMap<u16, f32>,
+    col_widths_256: BTreeMap<u16, u32>,
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
-    ooxml_base_col_width: Option<f32>,
+    default_col_width_256: Option<u32>,
+    ooxml_base_col_width: Option<u16>,
     row_formats: BTreeMap<u32, CellStyle>,
     col_formats: BTreeMap<u16, CellStyle>,
     blank_styles: BTreeMap<(u32, u16), CellStyle>,
@@ -2028,8 +2041,9 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
     }
     for col in first..=last.min(MAX_XLSB_COL_INDEX) {
         let col = col as u16;
-        if width_256 > 0 {
+        if (1..=65_535).contains(&width_256) {
             metadata.col_widths.insert(col, width_256 as f32 / 256.0);
+            metadata.col_widths_256.insert(col, width_256);
         }
         if flags & 0x01 != 0 {
             metadata.hidden_cols.insert(col);
@@ -2054,15 +2068,17 @@ fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
         return;
     };
     metadata.default_col_width = None;
+    metadata.default_col_width_256 = None;
     metadata.ooxml_base_col_width = None;
     metadata.default_row_height = None;
     metadata.default_rows_hidden = flags & 0x0002 != 0;
     if default_width_256 == u32::MAX {
         if base_characters <= 255 {
-            metadata.ooxml_base_col_width = Some(f32::from(base_characters));
+            metadata.ooxml_base_col_width = Some(base_characters);
         }
     } else if default_width_256 <= 65_535 {
         metadata.default_col_width = Some(default_width_256 as f32 / 256.0);
+        metadata.default_col_width_256 = Some(default_width_256);
     }
     // [MS-XLSB] BrtWsFmtInfo: miyDefRwHeight is authoritative only when
     // fUnsynced is set. Otherwise the application default remains in force.
@@ -3694,6 +3710,10 @@ mod tests {
         assert_eq!(wb.sheets[0].cell(0, 1), Some(&Cell::Number(42.0)));
         assert_eq!(wb.sheets[0].default_column_width(), None);
         assert_eq!(wb.sheets[0].implicit_ooxml_column_width(), Some(None));
+        assert_eq!(
+            wb.sheets[0].xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::ApplicationDefault)
+        );
         assert_eq!(wb.sheets[0].default_row_height(), None);
         assert!(wb.sheets[0].has_implicit_ooxml_row_height());
         assert_eq!(
@@ -3705,6 +3725,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["품", "목"]
         );
+    }
+
+    #[test]
+    fn xlsb_digit_column_widths_survive_parser_model_and_authored_overrides() {
+        let mut bundle = vec![0u8; 8];
+        bundle.extend_from_slice(&wstr("rId1"));
+        bundle.extend_from_slice(&wstr("Widths"));
+        let workbook = rec(BRT_BUNDLE_SH, &bundle);
+
+        let mut format = Vec::new();
+        format.extend_from_slice(&(14_u32 * 256).to_le_bytes());
+        format.extend_from_slice(&42_u16.to_le_bytes());
+        format.extend_from_slice(&300_u16.to_le_bytes());
+        format.extend_from_slice(&0_u16.to_le_bytes());
+        format.extend_from_slice(&[0, 0]);
+        let mut column = Vec::new();
+        column.extend_from_slice(&0_u32.to_le_bytes());
+        column.extend_from_slice(&0_u32.to_le_bytes());
+        column.extend_from_slice(&(18_u32 * 256).to_le_bytes());
+        column.extend_from_slice(&0_u32.to_le_bytes());
+        column.extend_from_slice(&1_u16.to_le_bytes());
+        let mut sheet = rec(BRT_WS_FMT_INFO, &format);
+        sheet.extend_from_slice(&rec(BRT_COL_INFO, &column));
+
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (path, body) in [
+            ("xl/workbook.bin", workbook.as_slice()),
+            ("xl/_rels/workbook.bin.rels", rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", sheet.as_slice()),
+        ] {
+            writer.start_file(path, options).unwrap();
+            writer.write_all(body).unwrap();
+        }
+
+        let mut workbook = Workbook::open(&writer.finish().unwrap().into_inner()).unwrap();
+        let sheet = &mut workbook.sheets[0];
+        assert_eq!(sheet.column_widths().get(&0), Some(&18.0));
+        assert_eq!(sheet.xlsb_column_widths_256().get(&0), Some(&(18 * 256)));
+        assert_eq!(sheet.default_column_width(), Some(14.0));
+        assert_eq!(
+            sheet.xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::Digits256(14 * 256))
+        );
+        assert!(sheet.hidden_columns().contains(&0));
+
+        sheet.set_col_width(0, 20.0);
+        assert!(sheet.xlsb_column_widths_256().get(&0).is_none());
+        assert_eq!(sheet.column_widths().get(&0), Some(&20.0));
+        sheet.set_default_col_width(12.0);
+        assert_eq!(sheet.xlsb_default_column_width(), None);
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        oversized.extend_from_slice(&65_536_u32.to_le_bytes());
+        oversized.extend_from_slice(&0_u32.to_le_bytes());
+        oversized.extend_from_slice(&0_u16.to_le_bytes());
+        let mut metadata = SheetReadMetadata::default();
+        apply_col_outline(&oversized, &mut metadata, &Styles::default());
+        assert!(metadata.col_widths.is_empty());
+        assert!(metadata.col_widths_256.is_empty());
     }
 
     #[test]
@@ -4030,6 +4113,7 @@ mod tests {
 
         let explicit = parse(2_158, 42, 0);
         assert_eq!(explicit.default_col_width, Some(2_158.0 / 256.0));
+        assert_eq!(explicit.default_col_width_256, Some(2_158));
         assert_eq!(explicit.ooxml_base_col_width, None);
         assert_eq!(
             explicit.default_row_height, None,
@@ -4038,7 +4122,8 @@ mod tests {
 
         let base = parse(u32::MAX, 8, 0);
         assert_eq!(base.default_col_width, None);
-        assert_eq!(base.ooxml_base_col_width, Some(8.0));
+        assert_eq!(base.default_col_width_256, None);
+        assert_eq!(base.ooxml_base_col_width, Some(8));
 
         let invalid_base = parse(u32::MAX, 256, 0);
         assert_eq!(invalid_base.default_col_width, None);
@@ -4996,6 +5081,11 @@ mod tests {
         assert_eq!(
             sheet.column_widths().get(&1),
             Some(&(0x08FF as f32 / 256.0))
+        );
+        assert_eq!(sheet.xlsb_column_widths_256().get(&1), Some(&0x08FF));
+        assert_eq!(
+            sheet.xlsb_default_column_width(),
+            Some(XlsbDefaultColumnWidth::BaseCharacters(8))
         );
         assert!(sheet.hidden_columns().contains(&1));
         assert!(!sheet.outline_summary_below());

@@ -291,6 +291,25 @@ pub struct GlyphCluster {
     pub command_end: u64,
 }
 
+/// Nominal font geometry retained for one shaped source cluster.
+///
+/// Unlike outline ink bounds, these metrics describe the shaped text cursor
+/// and the font's baseline-relative ascent and descent. PDF uses them for
+/// semantic text boxes while replaying the original outline commands exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlyphClusterMetrics {
+    /// Horizontal pen position before this cluster in scene coordinates.
+    pub origin_x: Fixed,
+    /// Signed horizontal cursor advance after this cluster.
+    pub advance_x: Fixed,
+    /// Alphabetic baseline in scene coordinates.
+    pub baseline_y: Fixed,
+    /// Positive distance from the baseline to the nominal font top.
+    pub ascent: Fixed,
+    /// Non-positive distance from the baseline to the nominal font bottom.
+    pub descent: Fixed,
+}
+
 /// One contiguous outline paint span in visual command order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphPaint {
@@ -313,6 +332,12 @@ pub struct GlyphRunNode {
     pub commands: Vec<PathCommand>,
     /// Bounded source-cluster mappings in visual paint order.
     pub clusters: Vec<GlyphCluster>,
+    /// Optional nominal metrics parallel to `clusters`.
+    ///
+    /// Layout-produced nodes always populate this vector. An empty vector
+    /// retains compatibility with caller-authored scenes, whose PDF semantic
+    /// geometry falls back to bounded outline placement.
+    pub cluster_metrics: Vec<GlyphClusterMetrics>,
     /// Contiguous color spans covering every glyph-outline command.
     pub paints: Vec<GlyphPaint>,
     /// Underline and strike-through segments derived from pinned font metrics.
@@ -336,7 +361,21 @@ impl GlyphRunNode {
         let command_len = self.commands.len() as u64;
         let text_len = self.text.len() as u64;
         let scalar_count = self.text.chars().count();
-        if self.clusters.len() > scalar_count || self.paints.len() > self.commands.len() {
+        if self.clusters.len() > scalar_count
+            || self.paints.len() > self.commands.len()
+            || (!self.cluster_metrics.is_empty()
+                && self.cluster_metrics.len() != self.clusters.len())
+        {
+            return false;
+        }
+        if self.cluster_metrics.iter().any(|metrics| {
+            metrics.ascent <= Fixed::ZERO
+                || metrics.descent > Fixed::ZERO
+                || metrics.ascent <= metrics.descent
+                || metrics.origin_x.checked_add(metrics.advance_x).is_none()
+                || metrics.baseline_y.checked_sub(metrics.ascent).is_none()
+                || metrics.baseline_y.checked_sub(metrics.descent).is_none()
+        }) {
             return false;
         }
 
@@ -761,6 +800,7 @@ mod tests {
                     command_end: 3,
                 },
             ],
+            cluster_metrics: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: 3,
@@ -783,5 +823,27 @@ mod tests {
         node.clusters[1].source_start = 3;
         node.paints[0].command_start = 1;
         assert!(!node.metadata_is_valid(), "paint gaps are rejected");
+
+        node.paints[0].command_start = 0;
+        let metrics = GlyphClusterMetrics {
+            origin_x: Fixed::ZERO,
+            advance_x: Fixed::from_pixels(1),
+            baseline_y: Fixed::from_pixels(8),
+            ascent: Fixed::from_pixels(7),
+            descent: Fixed::from_pixels(-2),
+        };
+        node.cluster_metrics = vec![metrics; node.clusters.len()];
+        assert!(node.metadata_is_valid());
+        node.cluster_metrics.pop();
+        assert!(
+            !node.metadata_is_valid(),
+            "nominal metrics must remain parallel to source clusters"
+        );
+        node.cluster_metrics.push(metrics);
+        node.cluster_metrics[0].origin_x = Fixed::from_raw(i64::MAX);
+        assert!(
+            !node.metadata_is_valid(),
+            "nominal metric extents must not overflow"
+        );
     }
 }

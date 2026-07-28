@@ -91,6 +91,7 @@ fuzz_target!(|data: &[u8]| {
                 clip_bounds: clip,
                 commands,
                 clusters: Vec::new(),
+                cluster_metrics: Vec::new(),
                 paints: Vec::new(),
                 decorations: vec![LineNode {
                     x1: Fixed::ZERO,

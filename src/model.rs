@@ -5613,6 +5613,22 @@ pub(crate) enum OoxmlImplicitColumnWidth {
     BaseCharacters(f32),
 }
 
+/// XLSB sheet-wide column-width provenance retained for deterministic rendering.
+///
+/// This is an internal cross-crate contract for `rxls-render`. XLSB stores
+/// widths in standard-digit units whose import conversion differs from XLSX's
+/// character-width projection.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XlsbDefaultColumnWidth {
+    /// The worksheet omitted an authoritative width, so 8.5 digits apply.
+    ApplicationDefault,
+    /// Raw `BrtWsFmtInfo.dxGCol` units, where 256 units equal one digit.
+    Digits256(u32),
+    /// `BrtWsFmtInfo.cchDefColWidth`, which also carries five screen pixels.
+    BaseCharacters(u16),
+}
+
 #[cfg_attr(not(any(feature = "xlsx", feature = "xlsb")), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum OoxmlImplicitRowHeight {
@@ -5722,6 +5738,10 @@ pub struct Sheet {
     pub(crate) display_cell_index: OnceLock<DisplayCellIndex>,
     /// Per-column widths in character units, populated by readers and authoring.
     pub(crate) col_widths: BTreeMap<u16, f32>,
+    /// Raw XLSB `BrtColInfo.coldx` widths parallel to imported `col_widths`.
+    pub(crate) xlsb_col_widths_256: BTreeMap<u16, u32>,
+    /// Applicable XLSB sheet-wide width provenance, absent for other formats.
+    pub(crate) xlsb_default_col_width: Option<XlsbDefaultColumnWidth>,
     /// Source column widths expressed in physical points when the format stores
     /// an absolute length (currently ODS). Renderers prefer these values over
     /// the compatibility character-unit projection in `col_widths`.
@@ -6112,6 +6132,8 @@ impl Default for Sheet {
             cells: Vec::default(),
             display_cell_index: OnceLock::new(),
             col_widths: BTreeMap::default(),
+            xlsb_col_widths_256: BTreeMap::default(),
+            xlsb_default_col_width: None,
             physical_col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
             hidden_cols: BTreeSet::default(),
@@ -8227,6 +8249,24 @@ impl Sheet {
         &self.col_widths
     }
 
+    /// Return raw XLSB per-column widths in 1/256 standard-digit units.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`. Other input
+    /// formats and authored widths leave this map empty.
+    #[doc(hidden)]
+    pub fn xlsb_column_widths_256(&self) -> &BTreeMap<u16, u32> {
+        &self.xlsb_col_widths_256
+    }
+
+    /// Return retained XLSB sheet-wide column-width provenance.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`. Explicit
+    /// entries in [`Sheet::xlsb_column_widths_256`] take precedence.
+    #[doc(hidden)]
+    pub fn xlsb_default_column_width(&self) -> Option<XlsbDefaultColumnWidth> {
+        self.xlsb_default_col_width
+    }
+
     /// Explicit absolute column widths in points, keyed by 0-based column.
     ///
     /// Formats such as ODS store physical lengths rather than Excel character
@@ -10212,6 +10252,7 @@ impl Sheet {
     /// Set a column width in character units.
     pub fn set_col_width(&mut self, col: u16, chars: f32) {
         self.col_widths.insert(col, chars);
+        self.xlsb_col_widths_256.remove(&col);
     }
     /// Set a row height in points.
     pub fn set_row_height(&mut self, row: u32, points: f32) {
@@ -10268,6 +10309,7 @@ impl Sheet {
     pub fn set_default_col_width(&mut self, chars: f32) {
         self.default_col_width = Some(chars);
         self.ooxml_implicit_col_width = OoxmlImplicitColumnWidth::None;
+        self.xlsb_default_col_width = None;
     }
     /// Freeze the panes above `row` and left of `col`.
     pub fn freeze_panes(&mut self, row: u32, col: u16) {

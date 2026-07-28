@@ -912,6 +912,7 @@ mod tests {
             },
             commands,
             clusters,
+            cluster_metrics: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end,

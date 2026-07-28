@@ -111,6 +111,7 @@ pub use model::{
     Range, RangeRow, RangeRowCells, RangeRowUsedCells, RangeRows, Reader, Series, Sheet,
     SheetMetadata, SheetType, SheetView, SheetVisible, Sparkline, SparklineKind, StyleFidelity,
     StyleLoss, StyleLossKind, Table, TextRun, VAlign, Workbook, WorkbookMetadata,
+    XlsbDefaultColumnWidth,
 };
 #[cfg(feature = "chrono")]
 pub use model::{excel_serial_to_duration, excel_serial_to_naive_datetime};
