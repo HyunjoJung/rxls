@@ -37,13 +37,22 @@ from check_render_oracle_release_evidence import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = ROOT / "bindings" / "render-wasm" / "toolchain-lock.json"
 DEFAULT_PACKAGE = ROOT / "bindings" / "render-wasm" / "package.json"
-SCHEMA = "rxls.render-browser-evidence.v4"
-PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v4"
-BEHAVIOR_SCHEMA = "rxls.render-browser-behavior.v1"
+SCHEMA = "rxls.render-browser-evidence.v5"
+PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v5"
+BEHAVIOR_SCHEMA = "rxls.render-browser-behavior.v2"
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_RUNTIME_TEXT = b"PASS pinned Chromium runtime closure resolved\n"
 EXPECTED_NETWORK_ERROR = "net::ERR_INTERNET_DISCONNECTED"
 HARD_STOP_DEADLINE_MS = 2000
+RSS_BOUNDARY_INTERVAL_MS = 10
+RSS_BOUNDARY_MAX_INTERVAL_MS = 25
+RSS_BOUNDARY_REQUIRED_SAMPLES = 5
+RSS_BOUNDARY_MAX_SAMPLES = 256
+RSS_BOUNDARY_MAX_DURATION_MS = 2000
+RSS_BOUNDARY_MAX_GAP_MS = 100
+RSS_BOUNDARY_MINIMUM_GROWTH_BYTES = 96 * 1024 * 1024
+NETWORK_PROOF_WORKERS = 2
+NETWORK_PROOF_REQUESTS = 19
 SUPPORTED_PLATFORMS = {"darwin", "linux"}
 HEAD_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -100,6 +109,23 @@ PASS_RE = re.compile(
     r"wasm=(?P<wasm>http://127\.0\.0\.1:[0-9]{1,5}/[A-Za-z0-9._/-]+); "
     r"CSP Network=(?P<network_error>[A-Za-z0-9:_-]+)$"
 )
+RSS_BOUNDARY_RE = re.compile(
+    r"^RSS_BOUNDARY interval=(?P<interval>[0-9]+)ms "
+    r"samples=(?P<samples>[0-9]+) "
+    r"required=(?P<required>[0-9]+) "
+    r"duration=(?P<duration>[0-9]+)ms "
+    r"max-gap=(?P<max_gap>[0-9]+)ms "
+    r"growth=(?P<growth>[0-9]+) "
+    r"minimum-growth=(?P<minimum_growth>[0-9]+) "
+    r"peak=(?P<peak>[0-9]+)$"
+)
+NETWORK_PROOF_RE = re.compile(
+    r"^NETWORK_PROOF route=(?P<route>[0-9a-f]{64}) "
+    r"csp=(?P<csp>[0-9a-f]{64}) "
+    r"workers=(?P<workers>[0-9]+) "
+    r"requests=(?P<requests>[0-9]+) "
+    r"pre-nav=(?P<pre_navigation>true|false)$"
+)
 WASM_URL_RE = re.compile(
     r"http://127\.0\.0\.1:(?P<port>[0-9]{1,5})(?P<path>/[A-Za-z0-9._/-]+)\Z"
 )
@@ -132,6 +158,17 @@ def _nonnegative_int(value: object, *, maximum: int = MAX_INTEGER) -> bool:
         and not isinstance(value, bool)
         and 0 <= value <= maximum
     )
+
+
+def _bounded_decimal(value: object, code: str) -> int:
+    _require(
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9]{1,19}", value) is not None,
+        code,
+    )
+    parsed = int(value)
+    _require(parsed <= MAX_INTEGER, code)
+    return parsed
 
 
 def _read_bytes(path: Path, maximum: int, code: str) -> bytes:
@@ -197,6 +234,7 @@ def _validate_behavior_contract(document: object) -> dict[str, object]:
             "capabilitiesSha256",
             "cancellation",
             "progress",
+            "pendingBoundary",
             "limits",
             "tile",
             "pages",
@@ -256,6 +294,25 @@ def _validate_behavior_contract(document: object) -> dict[str, object]:
             {"completed": 3, "total": 3, "stage": "complete"},
         ],
         "behavior_progress",
+    )
+    _require(
+        document.get("pendingBoundary")
+        == {
+            "inputBytes": 32 * 1024 * 1024,
+            "queuedRequests": 4,
+            "pendingResourceBytes": 128 * 1024 * 1024,
+            "overflowBytes": 1,
+            "overflowOutcome": {
+                "synchronous": True,
+                "code": "limit_exceeded",
+                "resource": "pendingResourceBytes",
+            },
+            "rejectedRequests": 4,
+            "rejectionCode": "client_closed",
+            "dispatchedRequests": 0,
+            "transportTerminated": True,
+        },
+        "behavior_pending_boundary",
     )
     _require(
         document.get("limits")
@@ -586,16 +643,30 @@ def _parse_mode_log(
     )
     nonblank = [line for line in text.splitlines() if line.strip()]
     pass_lines = [line for line in nonblank if line.startswith("PASS ")]
+    proof_lines = [line for line in nonblank if line.startswith("PROOF ")]
+    rss_boundary_lines = [
+        line for line in nonblank if line.startswith("RSS_BOUNDARY ")
+    ]
+    network_proof_lines = [
+        line for line in nonblank if line.startswith("NETWORK_PROOF ")
+    ]
     _require(
         len(pass_lines) == 1 and nonblank[-1] == pass_lines[0],
         f"{mode}_pass_line",
     )
-    proof_lines = [line for line in nonblank if line.startswith("PROOF ")]
     _require(
         len(proof_lines) == 1
-        and len(nonblank) >= 2
-        and nonblank[-2] == proof_lines[0],
-        f"{mode}_behavior_line",
+        and len(rss_boundary_lines) == 1
+        and len(network_proof_lines) == 1
+        and len(nonblank) >= 4
+        and nonblank[-4:]
+        == [
+            proof_lines[0],
+            rss_boundary_lines[0],
+            network_proof_lines[0],
+            pass_lines[0],
+        ],
+        f"{mode}_evidence_lines",
     )
     proof_payload = proof_lines[0].removeprefix("PROOF ").encode("utf-8")
     _require(
@@ -612,6 +683,58 @@ def _parse_mode_log(
         raise BrowserEvidenceError(f"{mode}_behavior_json") from error
     behavior = _validate_behavior_contract(behavior)
     behavior_sha256 = _sha256(_canonical_payload(behavior))
+    rss_boundary_match = RSS_BOUNDARY_RE.fullmatch(rss_boundary_lines[0])
+    _require(rss_boundary_match is not None, f"{mode}_rss_boundary_line")
+    rss_boundary_values = {
+        key: _bounded_decimal(value, f"{mode}_rss_boundary_integer")
+        for key, value in rss_boundary_match.groupdict().items()
+    }
+    interval = rss_boundary_values["interval"]
+    samples = rss_boundary_values["samples"]
+    required = rss_boundary_values["required"]
+    duration = rss_boundary_values["duration"]
+    max_gap = rss_boundary_values["max_gap"]
+    boundary_growth = rss_boundary_values["growth"]
+    minimum_growth = rss_boundary_values["minimum_growth"]
+    boundary_peak = rss_boundary_values["peak"]
+    _require(
+        all(
+            _positive_int(value)
+            for value in (
+                interval,
+                samples,
+                required,
+                duration,
+                max_gap,
+                boundary_growth,
+                minimum_growth,
+                boundary_peak,
+            )
+        )
+        and interval == RSS_BOUNDARY_INTERVAL_MS
+        and interval <= RSS_BOUNDARY_MAX_INTERVAL_MS
+        and required == RSS_BOUNDARY_REQUIRED_SAMPLES
+        and required <= samples <= RSS_BOUNDARY_MAX_SAMPLES
+        and duration <= RSS_BOUNDARY_MAX_DURATION_MS
+        and max_gap <= RSS_BOUNDARY_MAX_GAP_MS
+        and max_gap <= duration <= max_gap * (samples - 1),
+        f"{mode}_rss_boundary",
+    )
+    network_proof_match = NETWORK_PROOF_RE.fullmatch(network_proof_lines[0])
+    _require(network_proof_match is not None, f"{mode}_network_proof_line")
+    network_proof_values = network_proof_match.groupdict()
+    workers = _bounded_decimal(
+        network_proof_values["workers"], f"{mode}_network_proof_integer"
+    )
+    requests = _bounded_decimal(
+        network_proof_values["requests"], f"{mode}_network_proof_integer"
+    )
+    _require(
+        workers == NETWORK_PROOF_WORKERS
+        and requests == NETWORK_PROOF_REQUESTS
+        and network_proof_values["pre_navigation"] == "true",
+        f"{mode}_network_proof",
+    )
     match = PASS_RE.fullmatch(pass_lines[0])
     _require(match is not None, f"{mode}_pass_line")
     values = match.groupdict()
@@ -674,6 +797,14 @@ def _parse_mode_log(
         <= limits["max_process_tree_retained_growth_bytes"],
         f"{mode}_rss",
     )
+    _require(
+        minimum_growth == RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+        and boundary_peak >= rss_baseline
+        and boundary_growth == boundary_peak - rss_baseline
+        and boundary_growth >= minimum_growth,
+        f"{mode}_rss_boundary_materiality",
+    )
+    _require(boundary_peak <= rss_peak, f"{mode}_rss_boundary_peak")
     wasm = WASM_URL_RE.fullmatch(values["wasm"])
     _require(
         wasm is not None
@@ -713,12 +844,31 @@ def _parse_mode_log(
             "response_received": False,
             "sink_requests": 0,
         },
+        "network_proof": {
+            "csp_sha256": network_proof_values["csp"],
+            "pre_navigation": True,
+            "request_count": requests,
+            "route_sha256": network_proof_values["route"],
+            "worker_count": workers,
+        },
         "process_tree_rss": {
             "baseline_bytes": rss_baseline,
             "peak_bytes": rss_peak,
             "peak_growth_bytes": rss_peak_growth,
             "retained_bytes": rss_retained,
             "retained_growth_bytes": rss_retained_growth,
+        },
+        "rss_boundary": {
+            "baseline_bytes": rss_baseline,
+            "duration_ms": duration,
+            "growth_bytes": boundary_growth,
+            "interval_ms": interval,
+            "max_gap_ms": max_gap,
+            "minimum_growth_bytes": minimum_growth,
+            "peak_bytes": boundary_peak,
+            "process_peak_bound": True,
+            "required_samples": required,
+            "sample_count": samples,
         },
         "status": "pass",
     }, behavior
@@ -848,6 +998,13 @@ def build_summary(
         source_log, "source", contract, limits
     )
     _require(source_behavior == installed_behavior, "behavior_parity")
+    _require(
+        source_mode["network_proof"]["route_sha256"]
+        != installed_mode["network_proof"]["route_sha256"]
+        and source_mode["network_proof"]["csp_sha256"]
+        != installed_mode["network_proof"]["csp_sha256"],
+        "network_proof_distinct",
+    )
     behavior_sha256 = _sha256(_canonical_payload(source_behavior))
     return {
         "behavior": {
@@ -980,7 +1137,9 @@ def validate_summary(
                 "heap",
                 "log_sha256",
                 "network",
+                "network_proof",
                 "process_tree_rss",
+                "rss_boundary",
                 "status",
             }
             and evidence.get("status") == "pass"
@@ -992,7 +1151,9 @@ def validate_summary(
         heap = evidence.get("heap")
         hard_stop = evidence.get("hard_stop")
         network = evidence.get("network")
+        network_proof = evidence.get("network_proof")
         process_tree_rss = evidence.get("process_tree_rss")
+        rss_boundary = evidence.get("rss_boundary")
         _require(
             isinstance(heap, dict)
             and set(heap)
@@ -1068,6 +1229,61 @@ def validate_summary(
             f"summary_{mode}_rss",
         )
         _require(
+            isinstance(rss_boundary, dict)
+            and set(rss_boundary)
+            == {
+                "baseline_bytes",
+                "duration_ms",
+                "growth_bytes",
+                "interval_ms",
+                "max_gap_ms",
+                "minimum_growth_bytes",
+                "peak_bytes",
+                "process_peak_bound",
+                "required_samples",
+                "sample_count",
+            }
+            and rss_boundary.get("process_peak_bound") is True
+            and all(
+                _positive_int(rss_boundary.get(field))
+                for field in (
+                    "baseline_bytes",
+                    "duration_ms",
+                    "growth_bytes",
+                    "interval_ms",
+                    "max_gap_ms",
+                    "minimum_growth_bytes",
+                    "peak_bytes",
+                    "required_samples",
+                    "sample_count",
+                )
+            )
+            and rss_boundary["interval_ms"] == RSS_BOUNDARY_INTERVAL_MS
+            and rss_boundary["interval_ms"] <= RSS_BOUNDARY_MAX_INTERVAL_MS
+            and rss_boundary["required_samples"]
+            == RSS_BOUNDARY_REQUIRED_SAMPLES
+            and rss_boundary["required_samples"]
+            <= rss_boundary["sample_count"]
+            <= RSS_BOUNDARY_MAX_SAMPLES
+            and rss_boundary["duration_ms"] <= RSS_BOUNDARY_MAX_DURATION_MS
+            and rss_boundary["max_gap_ms"] <= RSS_BOUNDARY_MAX_GAP_MS
+            and rss_boundary["max_gap_ms"]
+            <= rss_boundary["duration_ms"]
+            <= rss_boundary["max_gap_ms"]
+            * (rss_boundary["sample_count"] - 1)
+            and rss_boundary["baseline_bytes"]
+            == process_tree_rss["baseline_bytes"]
+            and rss_boundary["minimum_growth_bytes"]
+            == RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+            and rss_boundary["peak_bytes"] >= rss_boundary["baseline_bytes"]
+            and rss_boundary["growth_bytes"]
+            == rss_boundary["peak_bytes"] - rss_boundary["baseline_bytes"]
+            and rss_boundary["growth_bytes"]
+            >= rss_boundary["minimum_growth_bytes"]
+            and rss_boundary["peak_bytes"] <= process_tree_rss["peak_bytes"],
+            f"summary_{mode}_rss_boundary",
+        )
+        _require(
             network
             == {
                 "csp_negative_control": True,
@@ -1078,6 +1294,32 @@ def validate_summary(
             },
             f"summary_{mode}_network",
         )
+        _require(
+            isinstance(network_proof, dict)
+            and set(network_proof)
+            == {
+                "csp_sha256",
+                "pre_navigation",
+                "request_count",
+                "route_sha256",
+                "worker_count",
+            }
+            and network_proof.get("pre_navigation") is True
+            and network_proof.get("worker_count") == NETWORK_PROOF_WORKERS
+            and network_proof.get("request_count") == NETWORK_PROOF_REQUESTS
+            and isinstance(network_proof.get("route_sha256"), str)
+            and SHA256_RE.fullmatch(network_proof["route_sha256"]) is not None
+            and isinstance(network_proof.get("csp_sha256"), str)
+            and SHA256_RE.fullmatch(network_proof["csp_sha256"]) is not None,
+            f"summary_{mode}_network_proof",
+        )
+    _require(
+        modes["source"]["network_proof"]["route_sha256"]
+        != modes["installed"]["network_proof"]["route_sha256"]
+        and modes["source"]["network_proof"]["csp_sha256"]
+        != modes["installed"]["network_proof"]["csp_sha256"],
+        "summary_network_proof_distinct",
+    )
     package = document.get("package")
     _require(
         isinstance(package, dict)
@@ -1217,18 +1459,38 @@ def validate_artifact(
         lock_path=lock_path,
         package_path=package_path,
     )
+    pending_boundary = summary["behavior"]["contract"]["pendingBoundary"]
+    mode_proofs = {
+        mode: {
+            "network_proof": summary["modes"][mode]["network_proof"],
+            "process_tree_baseline_bytes": summary["modes"][mode][
+                "process_tree_rss"
+            ]["baseline_bytes"],
+            "process_tree_peak_bytes": summary["modes"][mode][
+                "process_tree_rss"
+            ]["peak_bytes"],
+            "rss_boundary": summary["modes"][mode]["rss_boundary"],
+        }
+        for mode in ("installed", "source")
+    }
     return {
         "artifact_digest": artifact_digest,
         "artifact_id": artifact_id,
         "artifact_name": artifact_name,
         "artifact_repository": repository,
         "artifact_size_bytes": artifact_size_bytes,
+        "behavior_schema": BEHAVIOR_SCHEMA,
         "behavior_sha256": summary["behavior"]["sha256"],
         "browser_evidence_sha256": _sha256(payload),
         "chromium": summary["chromium"],
         "head_sha": head_sha,
+        "mode_proofs": mode_proofs,
         "package": summary["package"],
         "passed": True,
+        "pending_boundary": pending_boundary,
+        "pending_boundary_sha256": _sha256(
+            _canonical_payload(pending_boundary)
+        ),
         "platform": platform,
         "schema": PREREQUISITE_SCHEMA,
         "workflow_run_attempt": workflow_run_attempt,

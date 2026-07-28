@@ -110,18 +110,55 @@ class BrowserEvidenceTests(unittest.TestCase):
         wasm_url: str | None = None,
         network_error: str = MODULE.EXPECTED_NETWORK_ERROR,
         behavior: dict[str, object] | None = None,
+        rss_boundary_interval: int = MODULE.RSS_BOUNDARY_INTERVAL_MS,
+        rss_boundary_samples: int = MODULE.RSS_BOUNDARY_REQUIRED_SAMPLES,
+        rss_boundary_required: int = MODULE.RSS_BOUNDARY_REQUIRED_SAMPLES,
+        rss_boundary_duration: int = 40,
+        rss_boundary_max_gap: int = 10,
+        rss_boundary_growth: int | None = None,
+        rss_boundary_minimum_growth: int = (
+            MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+        ),
+        rss_boundary_peak: int | None = None,
+        route_sha256: str | None = None,
+        csp_sha256: str | None = None,
+        network_workers: int = MODULE.NETWORK_PROOF_WORKERS,
+        network_requests: int = MODULE.NETWORK_PROOF_REQUESTS,
+        pre_navigation: str = "true",
     ) -> str:
         growth = max(0, retained - baseline)
         rss_peak_growth = max(0, rss_peak - rss_baseline)
         rss_retained_growth = max(0, rss_retained - rss_baseline)
+        if rss_boundary_growth is None and rss_boundary_peak is None:
+            rss_boundary_growth = 128 * 1024 * 1024
+            rss_boundary_peak = rss_baseline + rss_boundary_growth
+        elif rss_boundary_growth is None:
+            rss_boundary_growth = rss_boundary_peak - rss_baseline
+        elif rss_boundary_peak is None:
+            rss_boundary_peak = rss_baseline + rss_boundary_growth
         if wasm_url is None:
             path = MODULE.EXPECTED_WASM_PATHS[mode]
             wasm_url = f"http://127.0.0.1:43210{path}"
         if behavior is None:
             behavior = self._behavior_proof()
+        if route_sha256 is None:
+            route_sha256 = ("b" if mode == "source" else "c") * 64
+        if csp_sha256 is None:
+            csp_sha256 = ("d" if mode == "source" else "e") * 64
         proof = json.dumps(behavior, separators=(",", ":"), sort_keys=True)
         return (
             f"PROOF {proof}\n"
+            f"RSS_BOUNDARY interval={rss_boundary_interval}ms "
+            f"samples={rss_boundary_samples} "
+            f"required={rss_boundary_required} "
+            f"duration={rss_boundary_duration}ms "
+            f"max-gap={rss_boundary_max_gap}ms "
+            f"growth={rss_boundary_growth} "
+            f"minimum-growth={rss_boundary_minimum_growth} "
+            f"peak={rss_boundary_peak}\n"
+            f"NETWORK_PROOF route={route_sha256} csp={csp_sha256} "
+            f"workers={network_workers} requests={network_requests} "
+            f"pre-nav={pre_navigation}\n"
             "PASS Google Chrome for Testing 150.0.7871.115 "
             f"{MODULE.MODE_DESCRIPTIONS[mode]}; "
             f"heap baseline={baseline} peak={peak} retained={retained} "
@@ -157,6 +194,21 @@ class BrowserEvidenceTests(unittest.TestCase):
                 {"completed": 2, "total": 3, "stage": "finalizing"},
                 {"completed": 3, "total": 3, "stage": "complete"},
             ],
+            "pendingBoundary": {
+                "inputBytes": 32 * 1024 * 1024,
+                "queuedRequests": 4,
+                "pendingResourceBytes": 128 * 1024 * 1024,
+                "overflowBytes": 1,
+                "overflowOutcome": {
+                    "synchronous": True,
+                    "code": "limit_exceeded",
+                    "resource": "pendingResourceBytes",
+                },
+                "rejectedRequests": 4,
+                "rejectionCode": "client_closed",
+                "dispatchedRequests": 0,
+                "transportTerminated": True,
+            },
             "limits": {
                 "fontFiles": {
                     "code": "limit_exceeded",
@@ -280,6 +332,37 @@ class BrowserEvidenceTests(unittest.TestCase):
             500_000_000,
         )
         self.assertEqual(
+            summary["modes"]["source"]["rss_boundary"],
+            {
+                "baseline_bytes": 100_000_000,
+                "duration_ms": 40,
+                "growth_bytes": 128 * 1024 * 1024,
+                "interval_ms": MODULE.RSS_BOUNDARY_INTERVAL_MS,
+                "max_gap_ms": 10,
+                "minimum_growth_bytes": (
+                    MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+                ),
+                "peak_bytes": 100_000_000 + (128 * 1024 * 1024),
+                "process_peak_bound": True,
+                "required_samples": MODULE.RSS_BOUNDARY_REQUIRED_SAMPLES,
+                "sample_count": MODULE.RSS_BOUNDARY_REQUIRED_SAMPLES,
+            },
+        )
+        self.assertEqual(
+            summary["modes"]["source"]["network_proof"],
+            {
+                "csp_sha256": "d" * 64,
+                "pre_navigation": True,
+                "request_count": MODULE.NETWORK_PROOF_REQUESTS,
+                "route_sha256": "b" * 64,
+                "worker_count": MODULE.NETWORK_PROOF_WORKERS,
+            },
+        )
+        self.assertNotEqual(
+            summary["modes"]["source"]["network_proof"],
+            summary["modes"]["installed"]["network_proof"],
+        )
+        self.assertEqual(
             MODULE.validate_summary(
                 summary,
                 head_sha=HEAD_SHA,
@@ -319,6 +402,314 @@ class BrowserEvidenceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "behavior_parity"):
             self._summary()
+
+    def test_source_and_installed_network_digests_must_be_distinct(self) -> None:
+        cases = (
+            {
+                "route_sha256": "b" * 64,
+                "csp_sha256": "e" * 64,
+            },
+            {
+                "route_sha256": "c" * 64,
+                "csp_sha256": "d" * 64,
+            },
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                self.installed.write_text(
+                    self._pass_line(
+                        "installed",
+                        baseline=2_500_000,
+                        peak=25_000_000,
+                        retained=8_500_000,
+                        **evidence,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "network_proof_distinct",
+                ):
+                    self._summary()
+
+    def test_summary_network_digests_must_be_distinct(self) -> None:
+        for field in ("route_sha256", "csp_sha256"):
+            with self.subTest(field=field):
+                summary = self._summary()
+                summary["modes"]["installed"]["network_proof"][field] = summary[
+                    "modes"
+                ]["source"]["network_proof"][field]
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "summary_network_proof_distinct",
+                ):
+                    MODULE.validate_summary(
+                        summary,
+                        head_sha=HEAD_SHA,
+                        platform="linux",
+                        repository=MODULE.EXPECTED_REPOSITORY,
+                        workflow_run_id=RUN_ID,
+                        workflow_run_attempt=RUN_ATTEMPT,
+                    )
+
+    def test_pending_boundary_contract_is_exact(self) -> None:
+        for field, value in (
+            ("pendingResourceBytes", (128 * 1024 * 1024) - 1),
+            ("queuedRequests", 3),
+            ("dispatchedRequests", 1),
+            ("transportTerminated", False),
+        ):
+            with self.subTest(field=field):
+                behavior = self._behavior_proof()
+                behavior["pendingBoundary"][field] = value
+                self.source.write_text(
+                    self._pass_line(
+                        "source",
+                        baseline=2_000_000,
+                        peak=62_000_000,
+                        retained=8_000_000,
+                        behavior=behavior,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "behavior_pending_boundary",
+                ):
+                    self._summary()
+
+    def test_evidence_lines_are_unique_and_ordered_before_final_pass(self) -> None:
+        line = self._pass_line(
+            "source", baseline=2_000_000, peak=62_000_000, retained=8_000_000
+        )
+        lines = line.splitlines()
+        variants = {
+            "reordered": [lines[0], lines[2], lines[1], lines[3]],
+            "duplicate_proof": [
+                lines[0],
+                lines[0],
+                lines[1],
+                lines[2],
+                lines[3],
+            ],
+            "duplicate_rss": [lines[0], lines[1], lines[1], lines[2], lines[3]],
+            "duplicate_network": [
+                lines[0],
+                lines[1],
+                lines[2],
+                lines[2],
+                lines[3],
+            ],
+        }
+        for label, variant in variants.items():
+            with self.subTest(label=label):
+                self.source.write_text("\n".join(variant) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "source_evidence_lines",
+                ):
+                    self._summary()
+
+    def test_rss_boundary_metrics_are_bounded_and_process_bound(self) -> None:
+        invalid_cases = (
+            ("interval", {"rss_boundary_interval": 26}),
+            ("samples", {"rss_boundary_samples": 4}),
+            ("required", {"rss_boundary_required": 6}),
+            ("duration", {"rss_boundary_duration": 2001}),
+            ("gap_101ms", {"rss_boundary_duration": 101, "rss_boundary_max_gap": 101}),
+            ("gap_relation", {"rss_boundary_duration": 5, "rss_boundary_max_gap": 10}),
+        )
+        for label, overrides in invalid_cases:
+            with self.subTest(label=label):
+                self.source.write_text(
+                    self._pass_line(
+                        "source",
+                        baseline=2_000_000,
+                        peak=62_000_000,
+                        retained=8_000_000,
+                        **overrides,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "source_rss_boundary",
+                ):
+                    self._summary()
+        materiality_cases = (
+            (
+                "minimum_drift",
+                {
+                    "rss_boundary_minimum_growth": (
+                        MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES - 1
+                    )
+                },
+            ),
+            (
+                "below_minimum",
+                {
+                    "rss_boundary_growth": (
+                        MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES - 1
+                    )
+                },
+            ),
+            (
+                "growth_drift",
+                {
+                    "rss_boundary_growth": (
+                        MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+                    ),
+                    "rss_boundary_peak": (
+                        100_000_000
+                        + MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES
+                        + 1
+                    ),
+                },
+            ),
+        )
+        for label, overrides in materiality_cases:
+            with self.subTest(label=label):
+                self.source.write_text(
+                    self._pass_line(
+                        "source",
+                        baseline=2_000_000,
+                        peak=62_000_000,
+                        retained=8_000_000,
+                        **overrides,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    "source_rss_boundary_materiality",
+                ):
+                    self._summary()
+        self.source.write_text(
+            self._pass_line(
+                "source",
+                baseline=2_000_000,
+                peak=62_000_000,
+                retained=8_000_000,
+                rss_boundary_peak=500_000_001,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "source_rss_boundary_peak",
+        ):
+            self._summary()
+        self.source.write_text(
+            self._pass_line(
+                "source",
+                baseline=2_000_000,
+                peak=62_000_000,
+                retained=8_000_000,
+                rss_boundary_samples=10**20,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "source_rss_boundary_integer",
+        ):
+            self._summary()
+        for label, overrides, error_code in (
+            (
+                "unbounded_growth",
+                {"rss_boundary_growth": 10**20},
+                "source_rss_boundary_integer",
+            ),
+            (
+                "zero_growth",
+                {"rss_boundary_growth": 0},
+                "source_rss_boundary",
+            ),
+            (
+                "unbounded_minimum",
+                {"rss_boundary_minimum_growth": 10**20},
+                "source_rss_boundary_integer",
+            ),
+        ):
+            with self.subTest(label=label):
+                self.source.write_text(
+                    self._pass_line(
+                        "source",
+                        baseline=2_000_000,
+                        peak=62_000_000,
+                        retained=8_000_000,
+                        **overrides,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    error_code,
+                ):
+                    self._summary()
+        ordered = self._pass_line(
+            "source",
+            baseline=2_000_000,
+            peak=62_000_000,
+            retained=8_000_000,
+        )
+        reordered = ordered.replace(
+            "growth=134217728 minimum-growth=100663296",
+            "minimum-growth=100663296 growth=134217728",
+        )
+        self.source.write_text(reordered + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "source_rss_boundary_line",
+        ):
+            self._summary()
+
+    def test_network_proof_identity_and_digests_fail_closed(self) -> None:
+        invalid_cases = (
+            ("workers", {"network_workers": 1}, "source_network_proof"),
+            ("requests", {"network_requests": 18}, "source_network_proof"),
+            (
+                "unbounded_workers",
+                {"network_workers": 10**20},
+                "source_network_proof_integer",
+            ),
+            ("pre_navigation", {"pre_navigation": "false"}, "source_network_proof"),
+            (
+                "route_digest",
+                {"route_sha256": "g" * 64},
+                "source_network_proof_line",
+            ),
+            (
+                "csp_digest",
+                {"csp_sha256": "A" * 64},
+                "source_network_proof_line",
+            ),
+        )
+        for label, overrides, error_code in invalid_cases:
+            with self.subTest(label=label):
+                self.source.write_text(
+                    self._pass_line(
+                        "source",
+                        baseline=2_000_000,
+                        peak=62_000_000,
+                        retained=8_000_000,
+                        **overrides,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    MODULE.BrowserEvidenceError,
+                    error_code,
+                ):
+                    self._summary()
 
     def test_pass_must_be_unique_and_final(self) -> None:
         line = self._pass_line(
@@ -523,6 +914,66 @@ class BrowserEvidenceTests(unittest.TestCase):
                 workflow_run_attempt=RUN_ATTEMPT,
             )
         mutated = copy.deepcopy(summary)
+        mutated["modes"]["source"]["rss_boundary"]["peak_bytes"] = (
+            mutated["modes"]["source"]["process_tree_rss"]["peak_bytes"] + 1
+        )
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "summary_source_rss_boundary",
+        ):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
+        mutated = copy.deepcopy(summary)
+        mutated["modes"]["source"]["rss_boundary"]["growth_bytes"] += 1
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "summary_source_rss_boundary",
+        ):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
+        mutated = copy.deepcopy(summary)
+        mutated["modes"]["source"]["rss_boundary"][
+            "minimum_growth_bytes"
+        ] -= 1
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "summary_source_rss_boundary",
+        ):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
+        mutated = copy.deepcopy(summary)
+        mutated["modes"]["source"]["network_proof"]["request_count"] = 18
+        with self.assertRaisesRegex(
+            MODULE.BrowserEvidenceError,
+            "summary_source_network_proof",
+        ):
+            MODULE.validate_summary(
+                mutated,
+                head_sha=HEAD_SHA,
+                platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY,
+                workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT,
+            )
+        mutated = copy.deepcopy(summary)
         mutated["modes"]["source"]["network"]["response_received"] = True
         with self.assertRaisesRegex(
             MODULE.BrowserEvidenceError, "summary_source_network"
@@ -590,6 +1041,44 @@ class BrowserEvidenceTests(unittest.TestCase):
             report["behavior_sha256"],
             self._summary()["behavior"]["sha256"],
         )
+        self.assertEqual(report["behavior_schema"], MODULE.BEHAVIOR_SCHEMA)
+        self.assertEqual(
+            report["pending_boundary"],
+            self._behavior_proof()["pendingBoundary"],
+        )
+        self.assertEqual(
+            report["pending_boundary_sha256"],
+            hashlib.sha256(
+                MODULE._canonical_payload(report["pending_boundary"])
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            report["mode_proofs"]["source"]["network_proof"]["route_sha256"],
+            "b" * 64,
+        )
+        self.assertLessEqual(
+            report["mode_proofs"]["source"]["rss_boundary"]["peak_bytes"],
+            report["mode_proofs"]["source"]["process_tree_peak_bytes"],
+        )
+        self.assertEqual(
+            report["mode_proofs"]["source"]["rss_boundary"][
+                "baseline_bytes"
+            ],
+            report["mode_proofs"]["source"]["process_tree_baseline_bytes"],
+        )
+        self.assertEqual(
+            report["mode_proofs"]["source"]["rss_boundary"]["growth_bytes"],
+            report["mode_proofs"]["source"]["rss_boundary"]["peak_bytes"]
+            - report["mode_proofs"]["source"]["rss_boundary"][
+                "baseline_bytes"
+            ],
+        )
+        self.assertEqual(
+            report["mode_proofs"]["source"]["rss_boundary"][
+                "minimum_growth_bytes"
+            ],
+            MODULE.RSS_BOUNDARY_MINIMUM_GROWTH_BYTES,
+        )
 
     def test_release_workflow_consumes_current_prerequisite_schema(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -600,6 +1089,38 @@ class BrowserEvidenceTests(unittest.TestCase):
         self.assertEqual(
             consumed_schemas,
             [MODULE.PREREQUISITE_SCHEMA, MODULE.PREREQUISITE_SCHEMA],
+        )
+        self.assertEqual(
+            workflow.count('"rxls.render-browser-behavior.v2"'),
+            2,
+        )
+        self.assertEqual(workflow.count('browser.get("mode_proofs")'), 2)
+        self.assertEqual(
+            workflow.count('browser.get("pending_boundary_sha256")'),
+            2,
+        )
+        self.assertEqual(
+            workflow.count('proof.get("process_tree_baseline_bytes")'),
+            2,
+        )
+        self.assertEqual(
+            workflow.count('rss.get("minimum_growth_bytes")'),
+            2,
+        )
+        self.assertEqual(workflow.count("minimum_growth != 100663296"), 2)
+        self.assertEqual(
+            workflow.count(
+                'source_network["route_sha256"]\n'
+                '                  == installed_network["route_sha256"]'
+            ),
+            2,
+        )
+        self.assertEqual(
+            workflow.count(
+                'source_network["csp_sha256"]\n'
+                '                  == installed_network["csp_sha256"]'
+            ),
+            2,
         )
 
     def test_artifact_rejects_extra_members_and_digest_drift(self) -> None:

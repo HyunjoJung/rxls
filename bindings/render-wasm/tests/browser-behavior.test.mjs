@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { RenderWorkerClient } from "../js/client.mjs";
 import {
   BROWSER_BEHAVIOR_PROOF_SCHEMA,
   validateBrowserBehaviorProof
 } from "./browser/scenario.mjs";
+import {
+  provePendingResourceBoundary,
+  validatePendingResourceBoundaryProof
+} from "./browser/proof.mjs";
 
 const sha256 = (character) => character.repeat(64);
 
@@ -31,6 +36,21 @@ function validProof() {
       { completed: 2, total: 3, stage: "finalizing" },
       { completed: 3, total: 3, stage: "complete" }
     ],
+    pendingBoundary: {
+      inputBytes: 32 * 1024 * 1024,
+      queuedRequests: 4,
+      pendingResourceBytes: 128 * 1024 * 1024,
+      overflowBytes: 1,
+      overflowOutcome: {
+        synchronous: true,
+        code: "limit_exceeded",
+        resource: "pendingResourceBytes"
+      },
+      rejectedRequests: 4,
+      rejectionCode: "client_closed",
+      dispatchedRequests: 0,
+      transportTerminated: true
+    },
     limits: {
       fontFiles: { code: "limit_exceeded", resource: "fontFiles" },
       hardPage: { code: "limit_exceeded", resource: "pages" },
@@ -119,5 +139,105 @@ test("browser behavior proof binds PNG geometry and deterministic SVG output", (
   assert.throws(
     () => validateBrowserBehaviorProof(invalidRepeat),
     /SVG repeat/
+  );
+});
+
+test("browser behavior proof binds the exact preclone pending-resource boundary", () => {
+  const invalidTotal = validProof();
+  invalidTotal.pendingBoundary.pendingResourceBytes -= 1;
+  assert.throws(
+    () => validateBrowserBehaviorProof(invalidTotal),
+    /pending-resource behavior proof/
+  );
+
+  const invalidOverflow = validProof();
+  invalidOverflow.pendingBoundary.overflowOutcome.resource = "inputBytes";
+  assert.throws(
+    () => validateBrowserBehaviorProof(invalidOverflow),
+    /pending-resource behavior proof/
+  );
+
+  const invalidTermination = validProof();
+  invalidTermination.pendingBoundary.rejectedRequests = 3;
+  assert.throws(
+    () => validateBrowserBehaviorProof(invalidTermination),
+    /pending-resource behavior proof/
+  );
+});
+
+test("pending-resource control proof binds held and terminated lifecycle phases", () => {
+  const held = {
+    schema: "rxls.pending-resource-boundary.v1",
+    phase: "held",
+    nonce: "a".repeat(32),
+    heldEpochMs: 1_000,
+    releaseEpochMs: null,
+    completedEpochMs: null,
+    inputBytes: 32 * 1024 * 1024,
+    queuedRequests: 4,
+    pendingResourceBytes: 128 * 1024 * 1024,
+    overflowBytes: 1,
+    overflowOutcome: {
+      synchronous: true,
+      code: "limit_exceeded",
+      resource: "pendingResourceBytes"
+    },
+    rejectedRequests: 0,
+    rejectionCode: null,
+    dispatchedRequests: 0,
+    transportTerminated: false
+  };
+  assert.equal(validatePendingResourceBoundaryProof(held, "held"), held);
+  const complete = {
+    ...held,
+    phase: "complete",
+    releaseEpochMs: 1_100,
+    completedEpochMs: 1_101,
+    rejectedRequests: 4,
+    rejectionCode: "client_closed",
+    transportTerminated: true
+  };
+  assert.equal(
+    validatePendingResourceBoundaryProof(complete, "complete"),
+    complete
+  );
+  assert.throws(
+    () =>
+      validatePendingResourceBoundaryProof(
+        { ...complete, rejectionCode: "worker_crashed" },
+        "complete"
+      ),
+    /lifecycle proof/
+  );
+});
+
+test("pending-resource proof materializes four distinct client clones", async () => {
+  const pending = provePendingResourceBoundary({ RenderWorkerClient });
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    const control = globalThis.__rxlsPendingBoundaryProof;
+    if (control?.phase === "held") {
+      globalThis.__rxlsPendingBoundaryRelease = control.nonce;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.deepEqual(await pending, validProof().pendingBoundary);
+});
+
+test("pending-resource proof rejects clone-before-overflow-capacity clients", async () => {
+  class CloneBeforeRejectClient extends RenderWorkerClient {
+    open(bytes, options) {
+      if (bytes.byteLength === 1) {
+        bytes.slice();
+      }
+      return super.open(bytes, options);
+    }
+  }
+
+  await assert.rejects(
+    provePendingResourceBoundary({
+      RenderWorkerClient: CloneBeforeRejectClient
+    }),
+    /overflow cloned bytes before capacity rejection/
   );
 });

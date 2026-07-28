@@ -314,6 +314,138 @@ jobs:
           import re
           from pathlib import Path
 
+          expected_pending_boundary = {
+              "inputBytes": 33554432,
+              "queuedRequests": 4,
+              "pendingResourceBytes": 134217728,
+              "overflowBytes": 1,
+              "overflowOutcome": {
+                  "synchronous": True,
+                  "code": "limit_exceeded",
+                  "resource": "pendingResourceBytes",
+              },
+              "rejectedRequests": 4,
+              "rejectionCode": "client_closed",
+              "dispatchedRequests": 0,
+              "transportTerminated": True,
+          }
+
+          def positive_int(value, maximum):
+              return type(value) is int and 0 < value <= maximum
+
+          def valid_browser_proofs(browser):
+              pending = browser.get("pending_boundary")
+              pending_payload = (
+                  json.dumps(pending, indent=2, sort_keys=True) + "\n"
+              ).encode("utf-8")
+              if (
+                  browser.get("behavior_schema")
+                  != "rxls.render-browser-behavior.v2"
+                  or pending != expected_pending_boundary
+                  or browser.get("pending_boundary_sha256")
+                  != hashlib.sha256(pending_payload).hexdigest()
+              ):
+                  return False
+              mode_proofs = browser.get("mode_proofs")
+              if not isinstance(mode_proofs, dict) or set(mode_proofs) != {
+                  "installed",
+                  "source",
+              }:
+                  return False
+              for mode in ("installed", "source"):
+                  proof = mode_proofs.get(mode)
+                  if not isinstance(proof, dict) or set(proof) != {
+                      "network_proof",
+                      "process_tree_baseline_bytes",
+                      "process_tree_peak_bytes",
+                      "rss_boundary",
+                  }:
+                      return False
+                  network = proof.get("network_proof")
+                  if (
+                      not isinstance(network, dict)
+                      or set(network)
+                      != {
+                          "csp_sha256",
+                          "pre_navigation",
+                          "request_count",
+                          "route_sha256",
+                          "worker_count",
+                      }
+                      or network.get("pre_navigation") is not True
+                      or network.get("worker_count") != 2
+                      or network.get("request_count") != 19
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("route_sha256", "")
+                      )
+                      is None
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("csp_sha256", "")
+                      )
+                      is None
+                  ):
+                      return False
+                  rss = proof.get("rss_boundary")
+                  if not isinstance(rss, dict) or set(rss) != {
+                      "baseline_bytes",
+                      "duration_ms",
+                      "growth_bytes",
+                      "interval_ms",
+                      "max_gap_ms",
+                      "minimum_growth_bytes",
+                      "peak_bytes",
+                      "process_peak_bound",
+                      "required_samples",
+                      "sample_count",
+                  }:
+                      return False
+                  baseline = rss.get("baseline_bytes")
+                  duration = rss.get("duration_ms")
+                  growth = rss.get("growth_bytes")
+                  interval = rss.get("interval_ms")
+                  max_gap = rss.get("max_gap_ms")
+                  minimum_growth = rss.get("minimum_growth_bytes")
+                  peak = rss.get("peak_bytes")
+                  required = rss.get("required_samples")
+                  samples = rss.get("sample_count")
+                  process_baseline = proof.get("process_tree_baseline_bytes")
+                  process_peak = proof.get("process_tree_peak_bytes")
+                  if (
+                      rss.get("process_peak_bound") is not True
+                      or not positive_int(interval, 25)
+                      or interval != 10
+                      or not positive_int(required, 5)
+                      or required != 5
+                      or not positive_int(samples, 256)
+                      or samples < required
+                      or not positive_int(duration, 2000)
+                      or not positive_int(max_gap, 100)
+                      or not max_gap <= duration <= max_gap * (samples - 1)
+                      or not positive_int(minimum_growth, (1 << 63) - 1)
+                      or minimum_growth != 100663296
+                      or not positive_int(baseline, (1 << 63) - 1)
+                      or not positive_int(growth, (1 << 63) - 1)
+                      or not positive_int(peak, (1 << 63) - 1)
+                      or not positive_int(process_baseline, (1 << 63) - 1)
+                      or not positive_int(process_peak, (1 << 63) - 1)
+                      or baseline != process_baseline
+                      or peak < baseline
+                      or growth != peak - baseline
+                      or growth < minimum_growth
+                      or peak > process_peak
+                  ):
+                      return False
+              source_network = mode_proofs["source"]["network_proof"]
+              installed_network = mode_proofs["installed"]["network_proof"]
+              if (
+                  source_network["route_sha256"]
+                  == installed_network["route_sha256"]
+                  or source_network["csp_sha256"]
+                  == installed_network["csp_sha256"]
+              ):
+                  return False
+              return True
+
           archive = Path(os.environ["ARCHIVE"]).read_bytes()
           [packed] = json.loads(
               Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
@@ -326,9 +458,10 @@ jobs:
           package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v4"
+              != "rxls.render-browser-release-prerequisites.v5"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not valid_browser_proofs(browser)
               or re.fullmatch(
                   r"[0-9a-f]{64}",
                   browser.get("behavior_sha256", ""),
@@ -431,6 +564,138 @@ jobs:
           from pathlib import Path
           import re
 
+          expected_pending_boundary = {
+              "inputBytes": 33554432,
+              "queuedRequests": 4,
+              "pendingResourceBytes": 134217728,
+              "overflowBytes": 1,
+              "overflowOutcome": {
+                  "synchronous": True,
+                  "code": "limit_exceeded",
+                  "resource": "pendingResourceBytes",
+              },
+              "rejectedRequests": 4,
+              "rejectionCode": "client_closed",
+              "dispatchedRequests": 0,
+              "transportTerminated": True,
+          }
+
+          def positive_int(value, maximum):
+              return type(value) is int and 0 < value <= maximum
+
+          def valid_browser_proofs(browser):
+              pending = browser.get("pending_boundary")
+              pending_payload = (
+                  json.dumps(pending, indent=2, sort_keys=True) + "\n"
+              ).encode("utf-8")
+              if (
+                  browser.get("behavior_schema")
+                  != "rxls.render-browser-behavior.v2"
+                  or pending != expected_pending_boundary
+                  or browser.get("pending_boundary_sha256")
+                  != hashlib.sha256(pending_payload).hexdigest()
+              ):
+                  return False
+              mode_proofs = browser.get("mode_proofs")
+              if not isinstance(mode_proofs, dict) or set(mode_proofs) != {
+                  "installed",
+                  "source",
+              }:
+                  return False
+              for mode in ("installed", "source"):
+                  proof = mode_proofs.get(mode)
+                  if not isinstance(proof, dict) or set(proof) != {
+                      "network_proof",
+                      "process_tree_baseline_bytes",
+                      "process_tree_peak_bytes",
+                      "rss_boundary",
+                  }:
+                      return False
+                  network = proof.get("network_proof")
+                  if (
+                      not isinstance(network, dict)
+                      or set(network)
+                      != {
+                          "csp_sha256",
+                          "pre_navigation",
+                          "request_count",
+                          "route_sha256",
+                          "worker_count",
+                      }
+                      or network.get("pre_navigation") is not True
+                      or network.get("worker_count") != 2
+                      or network.get("request_count") != 19
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("route_sha256", "")
+                      )
+                      is None
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("csp_sha256", "")
+                      )
+                      is None
+                  ):
+                      return False
+                  rss = proof.get("rss_boundary")
+                  if not isinstance(rss, dict) or set(rss) != {
+                      "baseline_bytes",
+                      "duration_ms",
+                      "growth_bytes",
+                      "interval_ms",
+                      "max_gap_ms",
+                      "minimum_growth_bytes",
+                      "peak_bytes",
+                      "process_peak_bound",
+                      "required_samples",
+                      "sample_count",
+                  }:
+                      return False
+                  baseline = rss.get("baseline_bytes")
+                  duration = rss.get("duration_ms")
+                  growth = rss.get("growth_bytes")
+                  interval = rss.get("interval_ms")
+                  max_gap = rss.get("max_gap_ms")
+                  minimum_growth = rss.get("minimum_growth_bytes")
+                  peak = rss.get("peak_bytes")
+                  required = rss.get("required_samples")
+                  samples = rss.get("sample_count")
+                  process_baseline = proof.get("process_tree_baseline_bytes")
+                  process_peak = proof.get("process_tree_peak_bytes")
+                  if (
+                      rss.get("process_peak_bound") is not True
+                      or not positive_int(interval, 25)
+                      or interval != 10
+                      or not positive_int(required, 5)
+                      or required != 5
+                      or not positive_int(samples, 256)
+                      or samples < required
+                      or not positive_int(duration, 2000)
+                      or not positive_int(max_gap, 100)
+                      or not max_gap <= duration <= max_gap * (samples - 1)
+                      or not positive_int(minimum_growth, (1 << 63) - 1)
+                      or minimum_growth != 100663296
+                      or not positive_int(baseline, (1 << 63) - 1)
+                      or not positive_int(growth, (1 << 63) - 1)
+                      or not positive_int(peak, (1 << 63) - 1)
+                      or not positive_int(process_baseline, (1 << 63) - 1)
+                      or not positive_int(process_peak, (1 << 63) - 1)
+                      or baseline != process_baseline
+                      or peak < baseline
+                      or growth != peak - baseline
+                      or growth < minimum_growth
+                      or peak > process_peak
+                  ):
+                      return False
+              source_network = mode_proofs["source"]["network_proof"]
+              installed_network = mode_proofs["installed"]["network_proof"]
+              if (
+                  source_network["route_sha256"]
+                  == installed_network["route_sha256"]
+                  or source_network["csp_sha256"]
+                  == installed_network["csp_sha256"]
+              ):
+                  return False
+              return True
+
           report = json.loads(
               Path("target/render-package/package-report.json").read_text(encoding="utf-8")
           )
@@ -504,9 +769,10 @@ jobs:
           browser_package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v4"
+              != "rxls.render-browser-release-prerequisites.v5"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not valid_browser_proofs(browser)
               or not isinstance(browser.get("workflow_run_id"), int)
               or browser["workflow_run_id"] < 1
               or not isinstance(browser.get("workflow_run_attempt"), int)

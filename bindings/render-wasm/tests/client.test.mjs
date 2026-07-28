@@ -83,6 +83,44 @@ test("client transfers copies, reports progress, and resolves typed results", as
   assert.deepEqual(progress, [{ completed: 1, total: 3, stage: "parsing" }]);
 });
 
+test("pre-ready open retains four byte-exact source-distinct clones", async () => {
+  const worker = new FakeWorker();
+  const client = new RenderWorkerClient(worker);
+  const source = Uint8Array.of(0x11, 0x22, 0x33, 0x44);
+  const expected = [...source];
+  const pending = Array.from({ length: 4 }, (_, index) =>
+    client.open(source, { documentId: `queued-clone-${index}` })
+  );
+  assert.equal(worker.sent.length, 0);
+  source.fill(0xff);
+
+  worker.emit({ protocol: PROTOCOL, type: "ready", capabilities: {} });
+  assert.equal(worker.sent.length, 4);
+  const workbooks = worker.sent.map(({ message, transfer }, index) => {
+    assert.equal(message.operation, "open");
+    assert.equal(message.payload.documentId, `queued-clone-${index}`);
+    assert.ok(message.payload.bytes instanceof Uint8Array);
+    assert.notEqual(message.payload.bytes, source);
+    assert.notEqual(message.payload.bytes.buffer, source.buffer);
+    assert.deepEqual([...message.payload.bytes], expected);
+    assert.equal(transfer.length, 1);
+    assert.equal(transfer[0], message.payload.bytes.buffer);
+    return message.payload.bytes;
+  });
+  assert.equal(new Set(workbooks).size, 4);
+  assert.equal(new Set(workbooks.map(({ buffer }) => buffer)).size, 4);
+
+  client.terminate();
+  const outcomes = await Promise.allSettled(pending);
+  assert.equal(
+    outcomes.filter(
+      ({ status, reason }) =>
+        status === "rejected" && reason.code === "client_closed"
+    ).length,
+    4
+  );
+});
+
 test("AbortSignal sends cancellation and rejects without waiting for wasm", async () => {
   const worker = new FakeWorker();
   const client = new RenderWorkerClient(worker);

@@ -62,6 +62,7 @@ export function captureCspViolation(event) {
     blockedURI: event.blockedURI,
     disposition: event.disposition,
     effectiveDirective: event.effectiveDirective,
+    isTrusted: event.isTrusted,
     statusCode: event.statusCode,
     violatedDirective: event.violatedDirective
   };
@@ -88,6 +89,7 @@ export async function proveCspNegativeControl(policyViolations) {
   for (let attempt = 0; attempt < 100 && policyViolations.length === 0; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  await new Promise((resolve) => setTimeout(resolve, 25));
   if (policyViolations.length !== 1) {
     throw new Error(
       `CSP negative control produced ${policyViolations.length} violations instead of one`
@@ -98,6 +100,7 @@ export async function proveCspNegativeControl(policyViolations) {
     blockedURI: CSP_NEGATIVE_URL,
     disposition: "enforce",
     effectiveDirective: "connect-src",
+    isTrusted: true,
     statusCode: 200,
     violatedDirective: "connect-src"
   };
@@ -106,7 +109,9 @@ export async function proveCspNegativeControl(policyViolations) {
     schema: "rxls.render-csp-negative.v1",
     url: CSP_NEGATIVE_URL,
     violation,
-    fetchRejected: true
+    fetchRejected: true,
+    rejectionName: rejection.name,
+    violationCount: policyViolations.length
   };
   globalThis.__rxlsCspProof = proof;
   return proof;

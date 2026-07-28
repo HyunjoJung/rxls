@@ -10,10 +10,11 @@ import {
   assertExternalSvgIsRejected,
   assertRichInspection,
   assertShapedSelfContainedSvg,
-  proveHardStop
+  proveHardStop,
+  provePendingResourceBoundary
 } from "./proof.mjs";
 
-export const BROWSER_BEHAVIOR_PROOF_SCHEMA = "rxls.render-browser-behavior.v1";
+export const BROWSER_BEHAVIOR_PROOF_SCHEMA = "rxls.render-browser-behavior.v2";
 export const MAX_BROWSER_BEHAVIOR_PROOF_BYTES = 32 * 1024;
 
 const MAX_RENDER_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -52,6 +53,8 @@ export async function runBrowserScenario({
   globalThis.__rxlsHeapProbeReady = false;
   globalThis.__rxlsHeapProbeRelease = false;
   globalThis.__rxlsHardStopProof = null;
+  globalThis.__rxlsPendingBoundaryProof = null;
+  globalThis.__rxlsPendingBoundaryRelease = null;
   globalThis.__rxlsCspProof = null;
   globalThis.__rxlsBehaviorProof = null;
 
@@ -75,6 +78,11 @@ export async function runBrowserScenario({
       maxImagePixels: fixture.metadata.imageWidth * fixture.metadata.imageHeight,
       maxDecodedMediaBytes: fixture.metadata.decodedImageBytes
     };
+
+    result.textContent = "STEP pending-resource boundary";
+    const pendingBoundary = await provePendingResourceBoundary({
+      RenderWorkerClient
+    });
 
     const fontFiles = captureSynchronousFailure(
       () =>
@@ -340,6 +348,7 @@ export async function runBrowserScenario({
         reopenedDocument: true
       },
       progress,
+      pendingBoundary,
       limits: {
         fontFiles,
         hardPage: limitProof(hardPageLimit),
@@ -408,6 +417,7 @@ export function validateBrowserBehaviorProof(proof) {
       "capabilitiesSha256",
       "cancellation",
       "progress",
+      "pendingBoundary",
       "limits",
       "tile",
       "pages",
@@ -466,6 +476,25 @@ export function validateBrowserBehaviorProof(proof) {
       { completed: 3, total: 3, stage: "complete" }
     ],
     "progress proof"
+  );
+  assertExactValue(
+    proof.pendingBoundary,
+    {
+      inputBytes: 32 * 1024 * 1024,
+      queuedRequests: 4,
+      pendingResourceBytes: 128 * 1024 * 1024,
+      overflowBytes: 1,
+      overflowOutcome: {
+        synchronous: true,
+        code: "limit_exceeded",
+        resource: "pendingResourceBytes"
+      },
+      rejectedRequests: 4,
+      rejectionCode: "client_closed",
+      dispatchedRequests: 0,
+      transportTerminated: true
+    },
+    "pending-resource behavior proof"
   );
   assertExactLimitProofs(proof.limits);
   assertObjectKeys(
