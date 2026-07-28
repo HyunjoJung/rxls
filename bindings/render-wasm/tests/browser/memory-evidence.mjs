@@ -138,7 +138,7 @@ export function resolveProcessMemoryGate(gate, platform) {
   const overrides = gate.platformOverrides;
   if (overrides === undefined) {
     return {
-      maxProcessTreeRssBytes: gate.maxProcessTreeRssBytes,
+      maxProcessTreePeakGrowthBytes: gate.maxProcessTreePeakGrowthBytes,
       maxProcessTreeRetainedGrowthBytes: gate.maxProcessTreeRetainedGrowthBytes
     };
   }
@@ -154,7 +154,7 @@ export function resolveProcessMemoryGate(gate, platform) {
       typeof override !== "object" ||
       Array.isArray(override) ||
       Object.keys(override).sort().join(",") !==
-        "maxProcessTreeRetainedGrowthBytes,maxProcessTreeRssBytes"
+        "maxProcessTreePeakGrowthBytes,maxProcessTreeRetainedGrowthBytes"
     ) {
       throw new Error(`process-memory ${overridePlatform} override is invalid`);
     }
@@ -162,7 +162,7 @@ export function resolveProcessMemoryGate(gate, platform) {
   }
   const resolved = overrides[platform] ?? gate;
   return {
-    maxProcessTreeRssBytes: resolved.maxProcessTreeRssBytes,
+    maxProcessTreePeakGrowthBytes: resolved.maxProcessTreePeakGrowthBytes,
     maxProcessTreeRetainedGrowthBytes: resolved.maxProcessTreeRetainedGrowthBytes
   };
 }
@@ -172,19 +172,40 @@ export function summarizeProcessMemory({ baseline, peak, retained }, gate) {
     if (
       sample === null ||
       typeof sample !== "object" ||
+      !Number.isSafeInteger(sample.rootPid) ||
+      sample.rootPid <= 0 ||
+      !Number.isSafeInteger(sample.processCount) ||
+      sample.processCount <= 0 ||
       !Number.isSafeInteger(sample.rssBytes) ||
       sample.rssBytes < 0
     ) {
       throw new Error(`${label} process-memory sample is invalid`);
     }
   }
+  if (
+    peak.rootPid !== baseline.rootPid ||
+    retained.rootPid !== baseline.rootPid ||
+    peak.rssBytes < baseline.rssBytes ||
+    peak.rssBytes < retained.rssBytes
+  ) {
+    throw new Error("process-memory samples are not one ordered browser tree");
+  }
   assertProcessMemoryGate(gate);
+  const peakGrowthBytes = peak.rssBytes - baseline.rssBytes;
   const retainedGrowthBytes = Math.max(0, retained.rssBytes - baseline.rssBytes);
-  const summary = { baseline, peak, retained, retainedGrowthBytes };
-  if (peak.rssBytes > gate.maxProcessTreeRssBytes) {
+  const summary = {
+    baseline,
+    peak,
+    retained,
+    peakGrowthBytes,
+    retainedGrowthBytes
+  };
+  if (peakGrowthBytes > gate.maxProcessTreePeakGrowthBytes) {
     throw new Error(
-      `process-tree RSS peak ${peak.rssBytes} exceeds ${gate.maxProcessTreeRssBytes} ` +
-      `(baseline=${baseline.rssBytes}, retained=${retained.rssBytes}, ` +
+      `process-tree RSS peak growth ${peakGrowthBytes} exceeds ` +
+      `${gate.maxProcessTreePeakGrowthBytes} ` +
+      `(baseline=${baseline.rssBytes}, peak=${peak.rssBytes}, ` +
+      `retained=${retained.rssBytes}, ` +
       `processes=${peak.processCount ?? "unknown"})`
     );
   }
@@ -198,11 +219,11 @@ export function summarizeProcessMemory({ baseline, peak, retained }, gate) {
 
 function assertProcessMemoryGate(gate) {
   if (
-    !Number.isSafeInteger(gate?.maxProcessTreeRssBytes) ||
-    gate.maxProcessTreeRssBytes <= 0 ||
+    !Number.isSafeInteger(gate?.maxProcessTreePeakGrowthBytes) ||
+    gate.maxProcessTreePeakGrowthBytes <= 0 ||
     !Number.isSafeInteger(gate?.maxProcessTreeRetainedGrowthBytes) ||
     gate.maxProcessTreeRetainedGrowthBytes <= 0 ||
-    gate.maxProcessTreeRetainedGrowthBytes > gate.maxProcessTreeRssBytes
+    gate.maxProcessTreeRetainedGrowthBytes > gate.maxProcessTreePeakGrowthBytes
   ) {
     throw new Error("process-memory gate is invalid");
   }

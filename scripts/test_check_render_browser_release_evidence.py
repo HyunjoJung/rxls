@@ -111,7 +111,8 @@ class BrowserEvidenceTests(unittest.TestCase):
         network_error: str = MODULE.EXPECTED_NETWORK_ERROR,
     ) -> str:
         growth = max(0, retained - baseline)
-        rss_growth = max(0, rss_retained - rss_baseline)
+        rss_peak_growth = max(0, rss_peak - rss_baseline)
+        rss_retained_growth = max(0, rss_retained - rss_baseline)
         if wasm_url is None:
             path = MODULE.EXPECTED_WASM_PATHS[mode]
             wasm_url = f"http://127.0.0.1:43210{path}"
@@ -121,7 +122,8 @@ class BrowserEvidenceTests(unittest.TestCase):
             f"heap baseline={baseline} peak={peak} retained={retained} "
             f"growth={growth} bytes; "
             f"rss baseline={rss_baseline} peak={rss_peak} "
-            f"retained={rss_retained} growth={rss_growth} bytes; "
+            f"peak-growth={rss_peak_growth} retained={rss_retained} "
+            f"retained-growth={rss_retained_growth} bytes; "
             f"hard-stop target={elapsed}/{deadline}ms wasm={wasm_url}; "
             f"CSP Network={network_error}"
         )
@@ -232,13 +234,15 @@ class BrowserEvidenceTests(unittest.TestCase):
             self._summary()
 
     def test_process_tree_rss_identity_and_bounds_fail_closed(self) -> None:
+        rss_baseline = 100_000_000
         self.source.write_text(
             self._pass_line(
                 "source",
                 baseline=2_000_000,
                 peak=3_000_000,
                 retained=2_100_000,
-                rss_peak=(1 << 30) + 1,
+                rss_baseline=rss_baseline,
+                rss_peak=rss_baseline + (1 << 30) + 1,
             )
             + "\n",
             encoding="utf-8",
@@ -246,16 +250,38 @@ class BrowserEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_rss"):
             self._summary()
 
+    def test_process_tree_peak_budget_excludes_the_pre_workload_browser_baseline(
+        self,
+    ) -> None:
+        self.source.write_text(
+            self._pass_line(
+                "source",
+                baseline=2_000_000,
+                peak=3_000_000,
+                retained=2_100_000,
+                rss_baseline=1_270_398_976,
+                rss_peak=1_688_551_424,
+                rss_retained=1_519_628_288,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        summary = self._summary()
+        process_tree = summary["modes"]["source"]["process_tree_rss"]
+        self.assertEqual(process_tree["peak_growth_bytes"], 418_152_448)
+        self.assertEqual(process_tree["retained_growth_bytes"], 249_229_312)
+
     def test_explicit_darwin_platform_uses_only_the_pinned_override(self) -> None:
         for mode, path in (("source", self.source), ("installed", self.installed)):
+            rss_baseline = 1_080_000_000
             path.write_text(
                 self._pass_line(
                     mode,
                     baseline=2_000_000,
                     peak=60_000_000,
                     retained=8_000_000,
-                    rss_baseline=1_080_000_000,
-                    rss_peak=1_600_000_000,
+                    rss_baseline=rss_baseline,
+                    rss_peak=rss_baseline + (3 << 29),
                     rss_retained=1_470_000_000,
                 )
                 + "\n",
@@ -263,7 +289,10 @@ class BrowserEvidenceTests(unittest.TestCase):
             )
         summary = self._summary("darwin")
         self.assertEqual(summary["platform"], "darwin")
-        self.assertEqual(summary["limits"]["max_process_tree_rss_bytes"], 2 << 30)
+        self.assertEqual(
+            summary["limits"]["max_process_tree_peak_growth_bytes"],
+            2 << 30,
+        )
         with self.assertRaisesRegex(
             MODULE.BrowserEvidenceError, "installed_rss"
         ):
@@ -348,7 +377,8 @@ class BrowserEvidenceTests(unittest.TestCase):
                 workflow_run_attempt=RUN_ATTEMPT,
             )
         mutated = copy.deepcopy(summary)
-        mutated["modes"]["source"]["process_tree_rss"]["peak_bytes"] = (1 << 30) + 1
+        process_tree = mutated["modes"]["source"]["process_tree_rss"]
+        process_tree["peak_growth_bytes"] += 1
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "summary_source_rss"):
             MODULE.validate_summary(
                 mutated,

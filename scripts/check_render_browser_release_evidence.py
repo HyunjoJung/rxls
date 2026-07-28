@@ -37,8 +37,8 @@ from check_render_oracle_release_evidence import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = ROOT / "bindings" / "render-wasm" / "toolchain-lock.json"
 DEFAULT_PACKAGE = ROOT / "bindings" / "render-wasm" / "package.json"
-SCHEMA = "rxls.render-browser-evidence.v2"
-PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v2"
+SCHEMA = "rxls.render-browser-evidence.v3"
+PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v3"
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_RUNTIME_TEXT = b"PASS pinned Chromium runtime closure resolved\n"
 EXPECTED_NETWORK_ERROR = "net::ERR_INTERNET_DISCONNECTED"
@@ -91,8 +91,9 @@ PASS_RE = re.compile(
     r"growth=(?P<heap_growth>[0-9]+) bytes; "
     r"rss baseline=(?P<rss_baseline>[0-9]+) "
     r"peak=(?P<rss_peak>[0-9]+) "
+    r"peak-growth=(?P<rss_peak_growth>[0-9]+) "
     r"retained=(?P<rss_retained>[0-9]+) "
-    r"growth=(?P<rss_growth>[0-9]+) bytes; "
+    r"retained-growth=(?P<rss_retained_growth>[0-9]+) bytes; "
     r"hard-stop target=(?P<elapsed>[0-9]+)/(?P<deadline>[0-9]+)ms "
     r"wasm=(?P<wasm>http://127\.0\.0\.1:[0-9]{1,5}/[A-Za-z0-9._/-]+); "
     r"CSP Network=(?P<network_error>[A-Za-z0-9:_-]+)$"
@@ -191,7 +192,7 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
     )
     _require(
         isinstance(lock, dict)
-        and lock.get("schema") == "rxls.render-browser-toolchain.v1",
+        and lock.get("schema") == "rxls.render-browser-toolchain.v2",
         "toolchain_lock",
     )
     chromium = lock.get("chromium")
@@ -222,8 +223,8 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
         isinstance(heap_gate, dict)
         and set(heap_gate) == {
             "maxAccountedBytes",
+            "maxProcessTreePeakGrowthBytes",
             "maxProcessTreeRetainedGrowthBytes",
-            "maxProcessTreeRssBytes",
             "maxRetainedGrowthBytes",
             "platformOverrides",
         }
@@ -232,23 +233,23 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
         and heap_gate["maxRetainedGrowthBytes"] <= heap_gate["maxAccountedBytes"],
         "toolchain_lock",
     )
-    process_rss = heap_gate.get("maxProcessTreeRssBytes")
+    process_peak_growth = heap_gate.get("maxProcessTreePeakGrowthBytes")
     process_retained_growth = heap_gate.get("maxProcessTreeRetainedGrowthBytes")
     platform_overrides = heap_gate.get("platformOverrides")
     _require(
-        _positive_int(process_rss)
+        _positive_int(process_peak_growth)
         and _positive_int(process_retained_growth)
-        and process_retained_growth <= process_rss
+        and process_retained_growth <= process_peak_growth
         and isinstance(platform_overrides, dict)
         and set(platform_overrides) == {"darwin"}
         and isinstance(platform_overrides.get("darwin"), dict)
         and set(platform_overrides["darwin"])
         == {
+            "maxProcessTreePeakGrowthBytes",
             "maxProcessTreeRetainedGrowthBytes",
-            "maxProcessTreeRssBytes",
         }
         and _positive_int(
-            platform_overrides["darwin"].get("maxProcessTreeRssBytes")
+            platform_overrides["darwin"].get("maxProcessTreePeakGrowthBytes")
         )
         and _positive_int(
             platform_overrides["darwin"].get(
@@ -256,7 +257,7 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
             )
         )
         and platform_overrides["darwin"]["maxProcessTreeRetainedGrowthBytes"]
-        <= platform_overrides["darwin"]["maxProcessTreeRssBytes"],
+        <= platform_overrides["darwin"]["maxProcessTreePeakGrowthBytes"],
         "toolchain_lock",
     )
     _require(
@@ -285,7 +286,9 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
             "max_process_tree_retained_growth_bytes": (
                 heap_gate["maxProcessTreeRetainedGrowthBytes"]
             ),
-            "max_process_tree_rss_bytes": heap_gate["maxProcessTreeRssBytes"],
+            "max_process_tree_peak_growth_bytes": (
+                heap_gate["maxProcessTreePeakGrowthBytes"]
+            ),
             "max_retained_growth_bytes": heap_gate["maxRetainedGrowthBytes"],
         },
         "platform_overrides": {
@@ -295,9 +298,11 @@ def _load_contract(lock_path: Path, package_path: Path) -> dict[str, object]:
                         "maxProcessTreeRetainedGrowthBytes"
                     ]
                 ),
-                "max_process_tree_rss_bytes": platform_overrides["darwin"][
-                    "maxProcessTreeRssBytes"
-                ],
+                "max_process_tree_peak_growth_bytes": (
+                    platform_overrides["darwin"][
+                        "maxProcessTreePeakGrowthBytes"
+                    ]
+                ),
             }
         },
         "package_name": package["name"],
@@ -357,8 +362,9 @@ def _parse_mode_log(
     heap_growth = int(values["heap_growth"])
     rss_baseline = int(values["rss_baseline"])
     rss_peak = int(values["rss_peak"])
+    rss_peak_growth = int(values["rss_peak_growth"])
     rss_retained = int(values["rss_retained"])
-    rss_growth = int(values["rss_growth"])
+    rss_retained_growth = int(values["rss_retained_growth"])
     elapsed = int(values["elapsed"])
     deadline = int(values["deadline"])
     _require(
@@ -384,14 +390,22 @@ def _parse_mode_log(
     _require(
         all(
             _nonnegative_int(value)
-            for value in (rss_baseline, rss_peak, rss_retained, rss_growth)
+            for value in (
+                rss_baseline,
+                rss_peak,
+                rss_peak_growth,
+                rss_retained,
+                rss_retained_growth,
+            )
         )
         and rss_baseline > 0
         and rss_retained > 0
         and rss_peak >= max(rss_baseline, rss_retained)
-        and rss_growth == max(0, rss_retained - rss_baseline)
-        and rss_peak <= limits["max_process_tree_rss_bytes"]
-        and rss_growth
+        and rss_peak_growth == rss_peak - rss_baseline
+        and rss_retained_growth == max(0, rss_retained - rss_baseline)
+        and rss_peak_growth
+        <= limits["max_process_tree_peak_growth_bytes"]
+        and rss_retained_growth
         <= limits["max_process_tree_retained_growth_bytes"],
         f"{mode}_rss",
     )
@@ -436,8 +450,9 @@ def _parse_mode_log(
         "process_tree_rss": {
             "baseline_bytes": rss_baseline,
             "peak_bytes": rss_peak,
+            "peak_growth_bytes": rss_peak_growth,
             "retained_bytes": rss_retained,
-            "retained_growth_bytes": rss_growth,
+            "retained_growth_bytes": rss_retained_growth,
         },
         "status": "pass",
     }
@@ -727,6 +742,7 @@ def validate_summary(
             == {
                 "baseline_bytes",
                 "peak_bytes",
+                "peak_growth_bytes",
                 "retained_bytes",
                 "retained_growth_bytes",
             }
@@ -740,14 +756,19 @@ def validate_summary(
                 process_tree_rss["baseline_bytes"],
                 process_tree_rss["retained_bytes"],
             )
+            and process_tree_rss["peak_growth_bytes"]
+            == (
+                process_tree_rss["peak_bytes"]
+                - process_tree_rss["baseline_bytes"]
+            )
             and process_tree_rss["retained_growth_bytes"]
             == max(
                 0,
                 process_tree_rss["retained_bytes"]
                 - process_tree_rss["baseline_bytes"],
             )
-            and process_tree_rss["peak_bytes"]
-            <= limits["max_process_tree_rss_bytes"]
+            and process_tree_rss["peak_growth_bytes"]
+            <= limits["max_process_tree_peak_growth_bytes"]
             and process_tree_rss["retained_growth_bytes"]
             <= limits["max_process_tree_retained_growth_bytes"],
             f"summary_{mode}_rss",

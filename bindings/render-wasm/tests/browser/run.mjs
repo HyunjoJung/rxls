@@ -97,11 +97,12 @@ if (
   !Number.isSafeInteger(heapGate?.maxRetainedGrowthBytes) ||
   heapGate.maxRetainedGrowthBytes <= 0 ||
   heapGate.maxRetainedGrowthBytes > heapGate.maxAccountedBytes ||
-  !Number.isSafeInteger(heapGate?.maxProcessTreeRssBytes) ||
-  heapGate.maxProcessTreeRssBytes <= 0 ||
+  !Number.isSafeInteger(heapGate?.maxProcessTreePeakGrowthBytes) ||
+  heapGate.maxProcessTreePeakGrowthBytes <= 0 ||
   !Number.isSafeInteger(heapGate?.maxProcessTreeRetainedGrowthBytes) ||
   heapGate.maxProcessTreeRetainedGrowthBytes <= 0 ||
-  heapGate.maxProcessTreeRetainedGrowthBytes > heapGate.maxProcessTreeRssBytes
+  heapGate.maxProcessTreeRetainedGrowthBytes >
+    heapGate.maxProcessTreePeakGrowthBytes
 ) {
   console.error("invalid Chromium heap gate in toolchain-lock.json");
   process.exit(2);
@@ -295,8 +296,9 @@ console.log(
     `growth=${browserResult.heap.retainedGrowthBytes} bytes; ` +
     `rss baseline=${browserResult.processMemory.baseline.rssBytes} ` +
     `peak=${browserResult.processMemory.peak.rssBytes} ` +
+    `peak-growth=${browserResult.processMemory.peakGrowthBytes} ` +
     `retained=${browserResult.processMemory.retained.rssBytes} ` +
-    `growth=${browserResult.processMemory.retainedGrowthBytes} bytes; ` +
+    `retained-growth=${browserResult.processMemory.retainedGrowthBytes} bytes; ` +
     `hard-stop target=${browserResult.hardStop.elapsedMs}/${browserResult.hardStop.deadlineMs}ms ` +
     `wasm=${browserResult.hardStop.wasmFrame.url}; ` +
     `CSP Network=${browserResult.csp.networkControl.errorText}`

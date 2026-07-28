@@ -1,5 +1,5 @@
 {
-  "schema": "rxls.render-browser-toolchain.v1",
+  "schema": "rxls.render-browser-toolchain.v2",
   "rust": "1.85.0",
   "wasmPack": {
     "version": "0.13.1"
@@ -21,11 +21,11 @@
     "heapGate": {
       "maxAccountedBytes": 268435456,
       "maxRetainedGrowthBytes": 67108864,
-      "maxProcessTreeRssBytes": 1073741824,
+      "maxProcessTreePeakGrowthBytes": 1073741824,
       "maxProcessTreeRetainedGrowthBytes": 536870912,
       "platformOverrides": {
         "darwin": {
-          "maxProcessTreeRssBytes": 2147483648,
+          "maxProcessTreePeakGrowthBytes": 2147483648,
           "maxProcessTreeRetainedGrowthBytes": 536870912
         }
       }

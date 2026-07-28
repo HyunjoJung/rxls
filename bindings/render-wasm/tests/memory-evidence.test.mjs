@@ -51,70 +51,95 @@ test("process-tree RSS parser includes descendants and rejects malformed evidenc
 
 test("process-memory high-water and retention gates pass and fail closed", () => {
   const gate = {
-    maxProcessTreeRssBytes: 1_000,
+    maxProcessTreePeakGrowthBytes: 1_000,
     maxProcessTreeRetainedGrowthBytes: 200
   };
-  assert.equal(
-    summarizeProcessMemory({
-      baseline: { rssBytes: 500 },
-      peak: { rssBytes: 900 },
-      retained: { rssBytes: 650 }
-    }, gate).retainedGrowthBytes,
-    150
+  const sample = (rssBytes, processCount = 4, rootPid = 100) => ({
+    rootPid,
+    processCount,
+    rssBytes
+  });
+  const summary = summarizeProcessMemory(
+    {
+      baseline: sample(1_500),
+      peak: sample(2_400, 6),
+      retained: sample(1_650, 5)
+    },
+    gate
   );
+  assert.equal(summary.peakGrowthBytes, 900);
+  assert.equal(summary.retainedGrowthBytes, 150);
   assert.throws(
     () =>
       summarizeProcessMemory({
-        baseline: { rssBytes: 500 },
-        peak: { rssBytes: 1_001 },
-        retained: { rssBytes: 650 }
+        baseline: sample(1_500),
+        peak: sample(2_501, 6),
+        retained: sample(1_650, 5)
       }, gate),
-    /RSS peak/
+    /RSS peak growth/
   );
   assert.throws(
     () =>
       summarizeProcessMemory({
-        baseline: { rssBytes: 500 },
-        peak: { rssBytes: 900 },
-        retained: { rssBytes: 701 }
+        baseline: sample(1_500),
+        peak: sample(2_400, 6),
+        retained: sample(1_701, 5)
       }, gate),
     /retained growth/
   );
   assert.throws(
     () =>
       summarizeProcessMemory({
-        baseline: { rssBytes: Number.NaN },
-        peak: { rssBytes: 900 },
-        retained: { rssBytes: 650 }
+        baseline: sample(Number.NaN),
+        peak: sample(2_400, 6),
+        retained: sample(1_650, 5)
       }, gate),
     /sample is invalid/
+  );
+  assert.throws(
+    () =>
+      summarizeProcessMemory({
+        baseline: sample(1_500),
+        peak: sample(2_400, 6, 101),
+        retained: sample(1_650, 5)
+      }, gate),
+    /one ordered browser tree/
+  );
+  assert.throws(
+    () =>
+      summarizeProcessMemory({
+        baseline: sample(1_500),
+        peak: sample(1_600, 6),
+        retained: sample(1_700, 5)
+      }, gate),
+    /one ordered browser tree/
   );
 });
 
 test("process-memory platform overrides preserve the stricter Linux release gate", () => {
   const gate = {
-    maxProcessTreeRssBytes: 1_000,
+    maxProcessTreePeakGrowthBytes: 1_000,
     maxProcessTreeRetainedGrowthBytes: 200,
     platformOverrides: {
       darwin: {
-        maxProcessTreeRssBytes: 2_000,
+        maxProcessTreePeakGrowthBytes: 2_000,
         maxProcessTreeRetainedGrowthBytes: 300
       }
     }
   };
   assert.deepEqual(resolveProcessMemoryGate(gate, "linux"), {
-    maxProcessTreeRssBytes: 1_000,
+    maxProcessTreePeakGrowthBytes: 1_000,
     maxProcessTreeRetainedGrowthBytes: 200
   });
   assert.deepEqual(resolveProcessMemoryGate(gate, "darwin"), {
-    maxProcessTreeRssBytes: 2_000,
+    maxProcessTreePeakGrowthBytes: 2_000,
     maxProcessTreeRetainedGrowthBytes: 300
   });
   assert.throws(
     () =>
       resolveProcessMemoryGate({
         ...gate,
-        platformOverrides: { darwin: { maxProcessTreeRssBytes: 2_000 } }
+        platformOverrides: { darwin: { maxProcessTreePeakGrowthBytes: 2_000 } }
       }, "darwin"),
     /override is invalid/
   );

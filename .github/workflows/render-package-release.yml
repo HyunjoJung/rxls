@@ -325,7 +325,7 @@ jobs:
           package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v2"
+              != "rxls.render-browser-release-prerequisites.v3"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
               or package.get("name") != packed.get("name")
@@ -498,7 +498,7 @@ jobs:
           browser_package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v2"
+              != "rxls.render-browser-release-prerequisites.v3"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
               or not isinstance(browser.get("workflow_run_id"), int)
