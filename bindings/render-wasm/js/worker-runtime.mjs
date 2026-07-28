@@ -14,13 +14,16 @@ import {
   PROTOCOL,
   RenderProtocolError,
   asBytes,
+  boundedIndex,
   encodeFontBundle,
-  fontPackByteLength,
   limitError,
   normalizeError,
   optionsJson,
   parseWorkerMessage,
+  positiveInteger,
+  preflightRequest,
   validateDocumentId,
+  validateRange,
   validateRequestId,
   validateSvgOutput
 } from "./protocol.mjs";
@@ -500,60 +503,6 @@ export function installRenderWorker({ wasm, scope = globalThis }) {
   return runtime;
 }
 
-function validateRange(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new RenderProtocolError("invalid_range", "range must be an object", "payload.range");
-  }
-  const range = {
-    firstRow: nonNegativeInteger(value.firstRow, "payload.range.firstRow"),
-    firstCol: nonNegativeInteger(value.firstCol, "payload.range.firstCol"),
-    lastRow: nonNegativeInteger(value.lastRow, "payload.range.lastRow"),
-    lastCol: nonNegativeInteger(value.lastCol, "payload.range.lastCol")
-  };
-  if (range.firstRow > range.lastRow || range.firstCol > range.lastCol) {
-    throw new RenderProtocolError("invalid_range", "range is reversed", "payload.range");
-  }
-  if (range.lastRow > 1_048_575 || range.lastCol > 16_383) {
-    throw new RenderProtocolError(
-      "range_outside_grid",
-      "range exceeds the spreadsheet grid",
-      "payload.range"
-    );
-  }
-  return range;
-}
-
-function nonNegativeInteger(value, location) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RenderProtocolError(
-      "invalid_integer",
-      `${location} must be a non-negative safe integer`,
-      location
-    );
-  }
-  return value;
-}
-
-function boundedIndex(value, location, countLimit, resource) {
-  const index = nonNegativeInteger(value, location);
-  if (index >= countLimit) {
-    throw limitError(resource, countLimit, index + 1, location);
-  }
-  return index;
-}
-
-function positiveInteger(value, location) {
-  const number = nonNegativeInteger(value, location);
-  if (number === 0) {
-    throw new RenderProtocolError(
-      "invalid_integer",
-      `${location} must be positive`,
-      location
-    );
-  }
-  return number;
-}
-
 function parseBoundedJson(json, description, maxBytes) {
   if (typeof json !== "string") {
     throw new RenderProtocolError(
@@ -614,90 +563,5 @@ function responseRequestId(rawMessage) {
     return validateRequestId(rawMessage?.requestId);
   } catch {
     return "invalid";
-  }
-}
-
-function preflightRequest({ operation, payload }) {
-  switch (operation) {
-    case "capabilities":
-      assertExactKeys(payload, [], "payload");
-      return 0;
-    case "open": {
-      assertExactKeys(payload, ["documentId", "bytes", "fontPack"], "payload");
-      validateDocumentId(payload.documentId);
-      const bytes = asBytes(payload.bytes, "payload.bytes");
-      if (bytes.byteLength > MAX_INPUT_BYTES) {
-        throw limitError("inputBytes", MAX_INPUT_BYTES, bytes.byteLength, "payload.bytes");
-      }
-      return bytes.byteLength + fontPackByteLength(payload.fontPack);
-    }
-    case "close":
-      assertExactKeys(payload, ["documentId"], "payload");
-      validateDocumentId(payload.documentId);
-      return 0;
-    case "prepare-pages":
-    case "render-sheet":
-      assertExactKeys(payload, ["documentId", "sheetIndex", "options"], "payload");
-      validateDocumentId(payload.documentId);
-      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
-      optionsJson(payload.options);
-      return 0;
-    case "render-tile":
-      assertExactKeys(
-        payload,
-        ["documentId", "sheetIndex", "range", "options"],
-        "payload"
-      );
-      validateDocumentId(payload.documentId);
-      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
-      validateRange(payload.range);
-      optionsJson(payload.options);
-      return 0;
-    case "render-page":
-      assertExactKeys(
-        payload,
-        ["documentId", "sheetIndex", "pageIndex", "options"],
-        "payload"
-      );
-      validateDocumentId(payload.documentId);
-      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
-      boundedIndex(payload.pageIndex, "payload.pageIndex", MAX_PAGES, "pages");
-      optionsJson(payload.options);
-      return 0;
-    case "render-page-png": {
-      assertExactKeys(
-        payload,
-        ["documentId", "sheetIndex", "pageIndex", "dpi", "options"],
-        "payload"
-      );
-      validateDocumentId(payload.documentId);
-      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
-      boundedIndex(payload.pageIndex, "payload.pageIndex", MAX_PAGES, "pages");
-      const dpi = positiveInteger(payload.dpi ?? 96, "payload.dpi");
-      if (dpi < MIN_DPI || dpi > MAX_DPI) {
-        throw new RenderProtocolError(
-          "dpi_out_of_range",
-          `dpi must be between ${MIN_DPI} and ${MAX_DPI}`,
-          "payload.dpi"
-        );
-      }
-      optionsJson(payload.options);
-      return 0;
-    }
-    default:
-      throw new RenderProtocolError("unknown_operation", "operation is not supported");
-  }
-}
-
-function assertExactKeys(value, allowed, location) {
-  const allow = new Set(allowed);
-  for (const key of Object.keys(value)) {
-    if (!allow.has(key)) {
-      throw new RenderProtocolError(
-        "invalid_payload",
-        `${location} contains an unknown field`,
-        location
-      );
-    }
   }
 }

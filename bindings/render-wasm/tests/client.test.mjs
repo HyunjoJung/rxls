@@ -167,22 +167,41 @@ test("client rejects oversized input before transfer and caps pre-ready work", a
 test("client accounts pending transferable bytes and releases them on cancellation", async () => {
   const worker = new FakeWorker();
   const client = new RenderWorkerClient(worker);
+  const source = new Uint8Array(MAX_INPUT_BYTES);
   const controller = new AbortController();
-  const first = client.request("capabilities", {}, {
-    signal: controller.signal,
-    resourceBytes: MAX_PENDING_RESOURCE_BYTES
-  });
+  const first = client.request(
+    "open",
+    { documentId: "pending-0", bytes: source },
+    { signal: controller.signal }
+  );
+  const retained = [1, 2, 3].map((index) =>
+    client.request("open", {
+      documentId: `pending-${index}`,
+      bytes: source
+    })
+  );
+  assert.equal(MAX_INPUT_BYTES * 4, MAX_PENDING_RESOURCE_BYTES);
   await assert.rejects(
-    client.request("capabilities", {}, { resourceBytes: 1 }),
+    client.request("open", {
+      documentId: "over-capacity",
+      bytes: Uint8Array.of(1)
+    }),
     (error) => error.code === "limit_exceeded" && error.resource === "pendingResourceBytes"
   );
   controller.abort();
   await assert.rejects(first, (error) => error.name === "AbortError");
-  const second = client.request("capabilities", {}, {
-    resourceBytes: MAX_PENDING_RESOURCE_BYTES
+  const replacement = client.request("open", {
+    documentId: "replacement",
+    bytes: source
   });
   client.terminate();
-  await assert.rejects(second, (error) => error.code === "client_closed");
+  const outcomes = await Promise.allSettled([...retained, replacement]);
+  assert.equal(
+    outcomes.filter(
+      ({ status, reason }) => status === "rejected" && reason.code === "client_closed"
+    ).length,
+    outcomes.length
+  );
 });
 
 test("postMessage failures reject and release pending capacity", async () => {
@@ -191,12 +210,16 @@ test("postMessage failures reject and release pending capacity", async () => {
   worker.emit({ protocol: PROTOCOL, type: "ready", capabilities: {} });
   worker.postError = new DOMException("not cloneable", "DataCloneError");
   await assert.rejects(
-    client.request("capabilities", {}, { resourceBytes: MAX_PENDING_RESOURCE_BYTES }),
+    client.request("open", {
+      documentId: "clone-failure",
+      bytes: Uint8Array.of(1)
+    }),
     (error) => error.code === "worker_message_error"
   );
   worker.postError = null;
-  const pending = client.request("capabilities", {}, {
-    resourceBytes: MAX_PENDING_RESOURCE_BYTES
+  const pending = client.request("open", {
+    documentId: "clone-recovery",
+    bytes: Uint8Array.of(1)
   });
   worker.emit({
     protocol: PROTOCOL,
@@ -207,4 +230,34 @@ test("postMessage failures reject and release pending capacity", async () => {
     error: null
   });
   assert.deepEqual(await pending, {});
+});
+
+test("generic requests are validated before postMessage and cannot declare accounting", async () => {
+  const worker = new FakeWorker();
+  const client = new RenderWorkerClient(worker);
+  worker.emit({ protocol: PROTOCOL, type: "ready", capabilities: {} });
+
+  await assert.rejects(
+    client.request("unsupported", {}),
+    (error) => error.code === "unknown_operation"
+  );
+  await assert.rejects(
+    client.request("render-page", {
+      documentId: "doc",
+      sheetIndex: 0,
+      pageIndex: 0,
+      options: {},
+      extra: Uint8Array.of(1)
+    }),
+    (error) => error.code === "invalid_payload"
+  );
+  await assert.rejects(
+    client.request("capabilities", {}, { resourceBytes: 1 }),
+    (error) => error.code === "invalid_client_options"
+  );
+  await assert.rejects(
+    client.request("capabilities", {}, { transfer: [] }),
+    (error) => error.code === "invalid_client_options"
+  );
+  assert.equal(worker.sent.length, 0);
 });

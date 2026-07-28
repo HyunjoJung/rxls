@@ -1,12 +1,12 @@
 import {
-  MAX_INPUT_BYTES,
   MAX_PENDING_REQUESTS,
   MAX_PENDING_RESOURCE_BYTES,
   PROTOCOL,
   RenderProtocolError,
   asBytes,
-  fontPackByteLength,
   limitError,
+  parseWorkerMessage,
+  preflightRequest,
   validateFontPack
 } from "./protocol.mjs";
 
@@ -53,14 +53,15 @@ export class RenderWorkerClient {
   open(bytes, { documentId, fontPack, ...requestOptions } = {}) {
     this.#assertAllocationCapacity(0);
     const input = asBytes(bytes, "bytes");
-    if (input.byteLength > MAX_INPUT_BYTES) {
-      throw limitError("inputBytes", MAX_INPUT_BYTES, input.byteLength, "bytes");
-    }
-    const resourceBytes = input.byteLength + fontPackByteLength(fontPack);
+    const id = documentId ?? `document-${this.#nextDocument++}`;
+    const resourceBytes = preflightRequest({
+      operation: "open",
+      payload: { documentId: id, bytes: input, fontPack }
+    });
     this.#assertAllocationCapacity(resourceBytes);
+    const localOptions = validateClientRequestOptions(requestOptions);
     const copiedFontPack = copyFontPack(fontPack);
     const workbook = input.slice();
-    const id = documentId ?? `document-${this.#nextDocument++}`;
     const transfer = [workbook.buffer];
     if (copiedFontPack) {
       transfer.push(copiedFontPack.manifest.buffer);
@@ -68,10 +69,11 @@ export class RenderWorkerClient {
         transfer.push(member.bytes.buffer);
       }
     }
-    return this.request(
+    return this.#request(
       "open",
       { documentId: id, bytes: workbook, fontPack: copiedFontPack },
-      { ...requestOptions, transfer, resourceBytes }
+      localOptions,
+      transfer
     );
   }
 
@@ -126,7 +128,17 @@ export class RenderWorkerClient {
     );
   }
 
-  request(operation, payload, { signal, onProgress, transfer = [], resourceBytes = 0 } = {}) {
+  request(operation, payload, options = {}) {
+    let localOptions;
+    try {
+      localOptions = validateClientRequestOptions(options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#request(operation, payload, localOptions);
+  }
+
+  #request(operation, payload, { signal, onProgress }, transfer = []) {
     if (this.#closed) {
       return Promise.reject(this.#closedError());
     }
@@ -140,7 +152,20 @@ export class RenderWorkerClient {
         )
       );
     }
-    validateResourceBytes(resourceBytes);
+    let message;
+    let resourceBytes;
+    try {
+      message = parseWorkerMessage({
+        protocol: PROTOCOL,
+        type: "request",
+        requestId: `request-${this.#nextRequest}`,
+        operation,
+        payload
+      });
+      resourceBytes = preflightRequest(message);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     if (this.#pendingResourceBytes + resourceBytes > MAX_PENDING_RESOURCE_BYTES) {
       return Promise.reject(
         limitError(
@@ -179,7 +204,7 @@ export class RenderWorkerClient {
         resourceBytes
       });
       const row = {
-        message: { protocol: PROTOCOL, type: "request", requestId, operation, payload },
+        message: { ...message, requestId },
         transfer
       };
       if (this.#ready) {
@@ -374,12 +399,49 @@ function abortError() {
   return error;
 }
 
-function validateResourceBytes(value) {
-  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_PENDING_RESOURCE_BYTES) {
+function validateClientRequestOptions(options) {
+  if (
+    options === null ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    (Object.getPrototypeOf(options) !== Object.prototype &&
+      Object.getPrototypeOf(options) !== null)
+  ) {
     throw new RenderProtocolError(
-      "invalid_resource_bytes",
-      "resourceBytes must be a non-negative safe integer within the pending byte limit",
+      "invalid_client_options",
+      "client request options must be a plain object",
       "client"
     );
   }
+  const allowed = new Set(["signal", "onProgress"]);
+  if (Object.keys(options).some((key) => !allowed.has(key))) {
+    throw new RenderProtocolError(
+      "invalid_client_options",
+      "client request options contain an unknown field",
+      "client"
+    );
+  }
+  const { signal, onProgress } = options;
+  if (
+    signal !== undefined &&
+    (signal === null ||
+      typeof signal !== "object" ||
+      typeof signal.addEventListener !== "function" ||
+      typeof signal.removeEventListener !== "function" ||
+      typeof signal.aborted !== "boolean")
+  ) {
+    throw new RenderProtocolError(
+      "invalid_client_options",
+      "signal must implement the AbortSignal contract",
+      "client"
+    );
+  }
+  if (onProgress !== undefined && typeof onProgress !== "function") {
+    throw new RenderProtocolError(
+      "invalid_client_options",
+      "onProgress must be a function",
+      "client"
+    );
+  }
+  return { signal, onProgress };
 }
