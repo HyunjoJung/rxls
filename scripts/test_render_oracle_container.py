@@ -1296,9 +1296,37 @@ class RenderOracleContainerTests(unittest.TestCase):
             )
 
         entrypoint = (CONTAINER_DIR / "oracle-entrypoint.sh").read_text()
+        containerfile = (CONTAINER_DIR / "Containerfile").read_text()
         self.assertIn("SinglePageSheets", entrypoint)
         self.assertIn("UserInstallation=file://", entrypoint)
+        self.assertIn(
+            'test -r "${profile_seed}" || fail profile_source_unreadable',
+            entrypoint,
+        )
+        self.assertIn(
+            'test -w "${profile}/user" || fail profile_target_not_writable',
+            entrypoint,
+        )
+        self.assertIn(
+            'cat "${profile_seed}" > "${profile_config}" '
+            "|| fail profile_copy_failed",
+            entrypoint,
+        )
+        self.assertIn(
+            'chmod 0600 "${profile_config}" '
+            "|| fail profile_permissions_failed",
+            entrypoint,
+        )
+        self.assertIn("|| fail evidence_archive_failed", entrypoint)
         self.assertNotIn("curl ", entrypoint)
+        self.assertIn(
+            "chmod 0555 /opt/rxls /opt/rxls/profile",
+            containerfile,
+        )
+        self.assertIn(
+            "RUN test -f /opt/rxls/profile/registrymodifications.xcu",
+            containerfile,
+        )
 
     def test_create_command_contains_every_isolation_and_resource_bound(self) -> None:
         limits = MODULE.ResourceLimits(

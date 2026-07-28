@@ -48,6 +48,8 @@ test "${#RXLS_FONT_PACK_SHA256}" -eq 64 || fail invalid_font_pack_sha256
 runtime="/oracle/runtime/${RXLS_RUN_ID}"
 home="${runtime}/home"
 profile="${runtime}/profile"
+profile_seed="/opt/rxls/profile/registrymodifications.xcu"
+profile_config="${profile}/user/registrymodifications.xcu"
 source="/oracle/source/input${RXLS_SOURCE_EXTENSION}"
 pdf="/oracle/evidence/oracle.pdf"
 
@@ -57,9 +59,12 @@ mkdir -p \
     "${runtime}/cache" \
     "${runtime}/config" \
     "${runtime}/data" \
-    "${runtime}/tmp"
-cp /opt/rxls/profile/registrymodifications.xcu \
-    "${profile}/user/registrymodifications.xcu"
+    "${runtime}/tmp" \
+    || fail runtime_setup_failed
+test -r "${profile_seed}" || fail profile_source_unreadable
+test -w "${profile}/user" || fail profile_target_not_writable
+cat "${profile_seed}" > "${profile_config}" || fail profile_copy_failed
+chmod 0600 "${profile_config}" || fail profile_permissions_failed
 
 export HOME="${home}"
 export XDG_CACHE_HOME="${runtime}/cache"
@@ -105,11 +110,17 @@ ulimit -f "${file_blocks}" || fail fsize_limit
 
 generated="/oracle/evidence/input.pdf"
 test -s "${generated}" || fail pdf_missing
-mv "${generated}" "${pdf}"
-pdf_bytes="$(wc -c < "${pdf}")"
-pdf_sha256="$(sha256sum "${pdf}" | cut -d ' ' -f 1)"
+mv "${generated}" "${pdf}" || fail evidence_finalize_failed
+pdf_bytes="$(wc -c < "${pdf}")" || fail evidence_measurement_failed
+pdf_sha256="$(sha256sum "${pdf}" | cut -d ' ' -f 1)" \
+    || fail evidence_measurement_failed
+case "${pdf_sha256}" in
+    *[!0-9a-f]*|'') fail evidence_hash_failed ;;
+esac
+test "${#pdf_sha256}" -eq 64 || fail evidence_hash_failed
 
-cat > /oracle/evidence/oracle-manifest.json <<EOF
+cat > /oracle/evidence/oracle-manifest.json <<EOF \
+    || fail evidence_manifest_failed
 {
   "artifact": {
     "bytes": ${pdf_bytes},
@@ -135,12 +146,14 @@ cat > /oracle/evidence/oracle-manifest.json <<EOF
   }
 }
 EOF
+test -s /oracle/evidence/oracle-manifest.json || fail evidence_manifest_failed
 
-chmod 0444 "${pdf}" /oracle/evidence/oracle-manifest.json
+chmod 0444 "${pdf}" /oracle/evidence/oracle-manifest.json \
+    || fail evidence_permissions_failed
 
 # Stream a deterministic archive before the evidence tmpfs is destroyed. No
 # diagnostic output is mixed into stdout.
-exec tar \
+tar \
     --create \
     --file=- \
     --directory=/oracle/evidence \
@@ -150,4 +163,5 @@ exec tar \
     --owner=0 \
     --group=0 \
     --numeric-owner \
-    oracle-manifest.json oracle.pdf
+    oracle-manifest.json oracle.pdf \
+    || fail evidence_archive_failed

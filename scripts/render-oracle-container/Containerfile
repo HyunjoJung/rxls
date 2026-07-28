@@ -96,6 +96,7 @@ COPY --chmod=0444 profile/registrymodifications.xcu /opt/rxls/profile/registrymo
 
 RUN set -eux; \
     mkdir -p /oracle/source /oracle/corpus /oracle/fonts /oracle/evidence /oracle/runtime; \
+    chmod 0555 /opt/rxls /opt/rxls/profile; \
     touch \
       /oracle/source/input.xls \
       /oracle/source/input.xlsx \
@@ -103,7 +104,10 @@ RUN set -eux; \
       /oracle/source/input.xlsb \
       /oracle/source/input.ods; \
     chmod 0444 /oracle/source/input.*; \
-    chmod 0555 /oracle /oracle/source /oracle/corpus /oracle/fonts /oracle/evidence /oracle/runtime
+    chmod 0555 /oracle /oracle/source /oracle/corpus /oracle/fonts /oracle/evidence /oracle/runtime; \
+    test "$(stat --format='%a:%u:%g' /opt/rxls)" = '555:0:0'; \
+    test "$(stat --format='%a:%u:%g' /opt/rxls/profile)" = '555:0:0'; \
+    test "$(stat --format='%a:%u:%g' /opt/rxls/profile/registrymodifications.xcu)" = '444:0:0'
 
 LABEL org.opencontainers.image.title="rxls LibreOffice render oracle" \
       org.opencontainers.image.version="26.2.3.2" \
@@ -112,5 +116,8 @@ LABEL org.opencontainers.image.title="rxls LibreOffice render oracle" \
       org.rxls.render-oracle.lock-sha256="${ORACLE_LOCK_SHA256}"
 
 USER 65534:65534
+RUN test -f /opt/rxls/profile/registrymodifications.xcu \
+    && test ! -L /opt/rxls/profile/registrymodifications.xcu \
+    && test -r /opt/rxls/profile/registrymodifications.xcu
 WORKDIR /oracle
 ENTRYPOINT ["/opt/rxls/oracle-entrypoint.sh"]
