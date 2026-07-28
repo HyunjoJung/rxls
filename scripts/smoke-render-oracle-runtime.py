@@ -24,10 +24,10 @@ PILOT_MANIFEST = (
 FONT_PACK = ROOT / "local" / "render-fonts" / "pack"
 RUN_ID = "runtime-smoke"
 MAX_MANIFEST_BYTES = 1024 * 1024
-MAX_ENTRYPOINT_STDERR_BYTES = 80
+MAX_CONTAINER_START_STDERR_BYTES = 1024 * 1024
 ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-ENTRYPOINT_ERROR_RE = re.compile(
-    rb"oracle_error:([a-z][a-z0-9_]{0,63})(?:\n)?\Z"
+ENTRYPOINT_ERROR_LINE_RE = re.compile(
+    rb"(?:\A|\n)oracle_error:([a-z][a-z0-9_]{0,63})(?=\n|\Z)"
 )
 FORMATS = ("ods", "xls", "xlsb", "xlsx")
 EXPECTED_PHASES = ("image_inspect", "create", "start", "remove")
@@ -195,10 +195,15 @@ def _select_pilot_fixture(path: Path, wrapper: Any) -> tuple[Path, dict[str, Any
 
 
 def _entrypoint_code(stderr: object) -> str | None:
-    if not isinstance(stderr, bytes) or len(stderr) > MAX_ENTRYPOINT_STDERR_BYTES:
+    if (
+        not isinstance(stderr, bytes)
+        or len(stderr) > MAX_CONTAINER_START_STDERR_BYTES
+    ):
         return None
-    match = ENTRYPOINT_ERROR_RE.fullmatch(stderr)
-    return match.group(1).decode("ascii") if match else None
+    matches = ENTRYPOINT_ERROR_LINE_RE.findall(stderr)
+    if len(matches) != 1:
+        return None
+    return matches[0].decode("ascii")
 
 
 class RecordingRunner:
@@ -255,7 +260,7 @@ class RecordingRunner:
             stdout_path=stdout_path,
             stdout_limit_bytes=stdout_limit_bytes,
             stderr_limit_bytes=(
-                MAX_ENTRYPOINT_STDERR_BYTES
+                MAX_CONTAINER_START_STDERR_BYTES
                 if phase == "start"
                 else stderr_limit_bytes
             ),

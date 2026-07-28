@@ -257,7 +257,7 @@ class RuntimeSmokeTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.start_stderr_limit,
-            SMOKE.MAX_ENTRYPOINT_STDERR_BYTES,
+            SMOKE.MAX_CONTAINER_START_STDERR_BYTES,
         )
         create = runner.commands[1]
         self.assertEqual(create[-1], inputs.image)
@@ -276,15 +276,33 @@ class RuntimeSmokeTests(unittest.TestCase):
         self.assertEqual(stderr, "oracle_error:libreoffice_failed\n")
         self.assertEqual(runner.commands[-1][1:3], ["rm", "--force"])
 
-    def test_arbitrary_start_stderr_collapses_to_the_typed_wrapper_code(
+    def test_entrypoint_error_survives_bounded_engine_diagnostics(self) -> None:
+        with _fixture(
+            start_status="nonzero",
+            start_stderr=(
+                b"docker: bounded engine diagnostic\n"
+                b"oracle_error:libreoffice_failed\n"
+            ),
+        ) as (inputs, runner, _):
+            status, stdout, stderr = self._run(inputs, runner)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "oracle_error:libreoffice_failed\n")
+
+    def test_untrusted_start_stderr_collapses_to_the_typed_wrapper_code(
         self,
     ) -> None:
         diagnostics = (
             b"/private/source.xlsx failed",
-            b"oracle_error:libreoffice_failed\n/private/source.xlsx\n",
             b" oracle_error:libreoffice_failed\n",
             b"oracle_error:UPPERCASE\n",
             b"oracle_error:" + b"a" * 65 + b"\n",
+            (
+                b"oracle_error:libreoffice_failed\n"
+                b"oracle_error:pdf_missing\n"
+            ),
+            b"x" * (SMOKE.MAX_CONTAINER_START_STDERR_BYTES + 1),
         )
         for diagnostic in diagnostics:
             with self.subTest(diagnostic=diagnostic):
