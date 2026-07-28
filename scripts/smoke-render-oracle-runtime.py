@@ -25,6 +25,7 @@ FONT_PACK = ROOT / "local" / "render-fonts" / "pack"
 RUN_ID = "runtime-smoke"
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_CONTAINER_START_STDERR_BYTES = 1024 * 1024
+MAX_CONTAINER_STATE_BYTES = 64 * 1024
 ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 ENTRYPOINT_ERROR_LINE_RE = re.compile(
     rb"(?:\A|\n)oracle_error:([a-z][a-z0-9_]{0,63})(?=\n|\Z)"
@@ -206,6 +207,39 @@ def _entrypoint_code(stderr: object) -> str | None:
     return matches[0].decode("ascii")
 
 
+def _container_state_code(payload: object) -> str | None:
+    if not isinstance(payload, bytes) or len(payload) > MAX_CONTAINER_STATE_BYTES:
+        return None
+    try:
+        state = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    exit_code = state.get("ExitCode")
+    oom_killed = state.get("OOMKilled")
+    runtime_error = state.get("Error")
+    if not isinstance(oom_killed, bool):
+        return None
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return None
+    if not isinstance(runtime_error, str):
+        return None
+    if oom_killed:
+        return "container_oom_killed"
+    if exit_code == 70:
+        return "entrypoint_failed"
+    if exit_code == 126:
+        return "entrypoint_not_executable"
+    if exit_code == 127:
+        return "entrypoint_not_found"
+    if runtime_error:
+        return "container_runtime_start_failed"
+    if exit_code != 0:
+        return "container_exit_nonzero"
+    return None
+
+
 class RecordingRunner:
     """Record phase names only and enforce the locked runtime call sequence."""
 
@@ -215,6 +249,38 @@ class RecordingRunner:
         self.image = image
         self.phases: list[str] = []
         self.entrypoint_error: str | None = None
+
+    def _diagnose_start_failure(self, name: str) -> str | None:
+        try:
+            logs = self.delegate.run(
+                ["docker", "logs", name],
+                timeout_seconds=10.0,
+                output_limit_bytes=MAX_CONTAINER_START_STDERR_BYTES,
+                stdout_limit_bytes=MAX_CONTAINER_START_STDERR_BYTES,
+                stderr_limit_bytes=MAX_CONTAINER_START_STDERR_BYTES,
+            )
+            if isinstance(logs, self.wrapper.CommandResult):
+                code = _entrypoint_code(logs.stdout + b"\n" + logs.stderr)
+                if code is not None:
+                    return code
+            state = self.delegate.run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{json .State}}",
+                    name,
+                ],
+                timeout_seconds=10.0,
+                output_limit_bytes=MAX_CONTAINER_STATE_BYTES,
+                stdout_limit_bytes=MAX_CONTAINER_STATE_BYTES,
+                stderr_limit_bytes=MAX_CONTAINER_STATE_BYTES,
+            )
+            if isinstance(state, self.wrapper.CommandResult):
+                return _container_state_code(state.stdout)
+        except Exception:
+            return None
+        return None
 
     def _phase(self, command: list[str]) -> str:
         name = f"rxls-lo-{RUN_ID}"
@@ -269,6 +335,10 @@ class RecordingRunner:
             raise RuntimeSmokeError("runtime_result_invalid")
         if phase == "start" and result.status == "nonzero":
             self.entrypoint_error = _entrypoint_code(result.stderr)
+            if self.entrypoint_error is None:
+                self.entrypoint_error = self._diagnose_start_failure(
+                    f"rxls-lo-{RUN_ID}"
+                )
         if phase == "remove" and result.status != "ok":
             raise RuntimeSmokeError("container_cleanup_failed")
         return result

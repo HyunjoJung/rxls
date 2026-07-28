@@ -106,12 +106,16 @@ class FixtureRunner:
         *,
         start_status: str = "ok",
         start_stderr: bytes = b"",
+        diagnostic_logs: bytes | None = None,
+        diagnostic_state: dict | None = None,
     ) -> None:
         self.lock_sha256 = lock_sha256
         self.image_id = image_id
         self.archive = archive
         self.start_status = start_status
         self.start_stderr = start_stderr
+        self.diagnostic_logs = diagnostic_logs
+        self.diagnostic_state = diagnostic_state
         self.commands: list[list[str]] = []
         self.start_stderr_limit: int | None = None
 
@@ -149,6 +153,22 @@ class FixtureRunner:
                 70 if self.start_status == "nonzero" else None,
                 stderr=self.start_stderr,
             )
+        if normalized[1] == "logs":
+            if self.diagnostic_logs is None:
+                return WRAPPER.CommandResult("nonzero", 1)
+            return WRAPPER.CommandResult(
+                "ok",
+                0,
+                stderr=self.diagnostic_logs,
+            )
+        if normalized[1] == "inspect" and normalized[2] == "--format":
+            if self.diagnostic_state is None:
+                return WRAPPER.CommandResult("nonzero", 1)
+            return WRAPPER.CommandResult(
+                "ok",
+                0,
+                json.dumps(self.diagnostic_state).encode("utf-8") + b"\n",
+            )
         if normalized[1] == "rm":
             return WRAPPER.CommandResult("ok", 0)
         raise AssertionError("unexpected fixture command")
@@ -164,6 +184,8 @@ def _fixture(
     *,
     start_status: str = "ok",
     start_stderr: bytes = b"",
+    diagnostic_logs: bytes | None = None,
+    diagnostic_state: dict | None = None,
 ):
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -195,6 +217,8 @@ def _fixture(
             archive,
             start_status=start_status,
             start_stderr=start_stderr,
+            diagnostic_logs=diagnostic_logs,
+            diagnostic_state=diagnostic_state,
         )
         inputs = SMOKE.SmokeInputs(
             lock=WRAPPER.DEFAULT_LOCK,
@@ -289,6 +313,38 @@ class RuntimeSmokeTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "oracle_error:libreoffice_failed\n")
+
+    def test_entrypoint_error_is_recovered_from_bounded_container_logs(
+        self,
+    ) -> None:
+        with _fixture(
+            start_status="nonzero",
+            start_stderr=b"docker: start failed\n",
+            diagnostic_logs=b"oracle_error:libreoffice_failed\n",
+        ) as (inputs, runner, _):
+            status, stdout, stderr = self._run(inputs, runner)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "oracle_error:libreoffice_failed\n")
+        self.assertEqual(runner.commands[-1][1:3], ["rm", "--force"])
+
+    def test_container_state_is_reduced_to_a_path_neutral_code(self) -> None:
+        with _fixture(
+            start_status="nonzero",
+            start_stderr=b"/private/runtime failed",
+            diagnostic_state={
+                "Error": "/private/runtime failed",
+                "ExitCode": 137,
+                "OOMKilled": True,
+            },
+        ) as (inputs, runner, _):
+            status, stdout, stderr = self._run(inputs, runner)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "oracle_error:container_oom_killed\n")
+        self.assertNotIn("private", stderr)
 
     def test_untrusted_start_stderr_collapses_to_the_typed_wrapper_code(
         self,
