@@ -35,6 +35,8 @@ const wasmPause = {
   sessionId: "session-hard-stop",
   activeObservedAtEpochMs: 9_750,
   observedAtEpochMs: 9_900,
+  resumedAtEpochMs: 9_950,
+  debuggerDisabledAtEpochMs: 9_975,
   terminationCommandEpochMs: 10_000,
   wasmFrame: {
     scriptId: "42",
@@ -255,6 +257,30 @@ test("ambiguous targets, missing WASM frames, and retained targets fail closed",
         proof
       }),
     /active WebAssembly frame/
+  );
+  assert.throws(
+    () =>
+      correlateHardStopTarget({
+        attachedTargets: [primary, hardStop],
+        primaryTargetId: "primary",
+        destroyedTargets: new Map([["hard-stop", 10_100]]),
+        currentTargets: [],
+        pauseEvidence: { ...wasmPause, resumedAtEpochMs: 10_001 },
+        proof
+      }),
+    /not resumed after/
+  );
+  assert.throws(
+    () =>
+      correlateHardStopTarget({
+        attachedTargets: [primary, hardStop],
+        primaryTargetId: "primary",
+        destroyedTargets: new Map([["hard-stop", 10_100]]),
+        currentTargets: [],
+        pauseEvidence: { ...wasmPause, debuggerDisabledAtEpochMs: 10_001 },
+        proof
+      }),
+    /debugger was not disabled/
   );
 });
 

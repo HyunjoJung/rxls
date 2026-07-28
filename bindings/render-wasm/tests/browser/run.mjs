@@ -353,6 +353,7 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
   const detachedTargets = new Map();
   const scriptsBySession = new Map();
   const pausesBySession = new Map();
+  const resumesBySession = new Map();
   const networkRequests = [];
   const networkFailures = [];
   const networkResponses = [];
@@ -454,6 +455,13 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
           message.sessionId,
           { ...message.params, observedAtEpochMs: Date.now() },
           "Debugger pause evidence"
+        );
+      } else if (message.method === "Debugger.resumed" && message.sessionId) {
+        boundedPushByKey(
+          resumesBySession,
+          message.sessionId,
+          { observedAtEpochMs: Date.now() },
+          "Debugger resume evidence"
         );
       } else if (message.method === "Network.requestWillBeSent") {
         boundedPush(
@@ -632,6 +640,7 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) 
           destroyedTargets,
           scriptsBySession,
           pausesBySession,
+          resumesBySession,
           proof: state.hardStop,
           sampleEvidence
         });
@@ -887,6 +896,7 @@ async function driveHardStop({
   destroyedTargets,
   scriptsBySession,
   pausesBySession,
+  resumesBySession,
   proof,
   sampleEvidence
 }) {
@@ -928,12 +938,24 @@ async function driveHardStop({
     activeObservedAtEpochMs,
     observedAtEpochMs: pause.observedAtEpochMs,
     wasmFrame,
+    resumedAtEpochMs: null,
+    debuggerDisabledAtEpochMs: null,
     terminationCommandEpochMs: null
   };
   if (!wasmFrame) {
     throw new Error(`Debugger pause had no WASM frame: ${JSON.stringify(frames.slice(0, 16))}`);
   }
   await sampleEvidence();
+  const priorResumeCount = resumesBySession.get(sessionId)?.length ?? 0;
+  await command("Debugger.resume", {}, sessionId);
+  const resume = await waitForDebuggerResume(
+    resumesBySession,
+    sessionId,
+    priorResumeCount
+  );
+  pauseEvidence.resumedAtEpochMs = resume.observedAtEpochMs;
+  await command("Debugger.disable", {}, sessionId);
+  pauseEvidence.debuggerDisabledAtEpochMs = Date.now();
   pauseEvidence.terminationCommandEpochMs = Date.now();
   await evaluate(
     `globalThis.__rxlsHardStopTerminate = ${JSON.stringify(proof.nonce)}`
@@ -1014,6 +1036,17 @@ async function waitForDebuggerPause(pausesBySession, sessionId) {
     await delay(5);
   }
   throw new Error("Debugger.pause did not pause the nonce-bound worker");
+}
+
+async function waitForDebuggerResume(resumesBySession, sessionId, priorResumeCount) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const resume = resumesBySession.get(sessionId)?.[priorResumeCount];
+    if (resume) {
+      return resume;
+    }
+    await delay(5);
+  }
+  throw new Error("Debugger.resume did not resume the nonce-bound worker");
 }
 
 async function evaluateJson(evaluate, expression, label) {

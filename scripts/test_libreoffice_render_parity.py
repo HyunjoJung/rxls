@@ -1240,6 +1240,23 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             MODULE.aggregate_container_oracle_identity(
                 [{"status": "compared"}], config=config
             )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            r"identity_missing:libreoffice_adapter_container_start_nonzero=2",
+        ):
+            MODULE.aggregate_container_oracle_identity(
+                [
+                    {
+                        "status": "error",
+                        "classification": "libreoffice_adapter_container_start_nonzero",
+                    },
+                    {
+                        "status": "error",
+                        "classification": "libreoffice_adapter_container_start_nonzero",
+                    },
+                ],
+                config=config,
+            )
 
         mixed = copy.deepcopy(adapter)
         mixed["lock_file_sha256"] = "d" * 64
@@ -1291,6 +1308,32 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 [{"status": "compared", "oracle_adapter": malicious}],
                 config=config,
             )
+
+    def test_adapter_failure_retains_only_a_bounded_typed_code(self) -> None:
+        result = MODULE.CommandResult(
+            "nonzero",
+            2,
+            b"",
+            b"render_oracle_error:container_start_nonzero\n",
+        )
+        self.assertEqual(
+            MODULE._libreoffice_command_failure(result, adapter_command=True),
+            "libreoffice_adapter_container_start_nonzero",
+        )
+        self.assertEqual(
+            MODULE._libreoffice_command_failure(result, adapter_command=False),
+            "libreoffice_failed",
+        )
+        pathful = MODULE.CommandResult(
+            "nonzero",
+            2,
+            b"",
+            b"render_oracle_error:/private/input.xlsx\n",
+        )
+        self.assertEqual(
+            MODULE._libreoffice_command_failure(pathful, adapter_command=True),
+            "libreoffice_failed",
+        )
 
     def test_bundle_validation_checks_hash_order_visibility_and_svg_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

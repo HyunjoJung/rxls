@@ -2831,6 +2831,24 @@ def aggregate_container_oracle_identity(
     if not normalized:
         if config.dry_run:
             return None
+        classifications: dict[str, int] = {}
+        for result in results:
+            classification = result.get("classification")
+            if (
+                isinstance(classification, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", classification)
+            ):
+                classifications[classification] = (
+                    classifications.get(classification, 0) + 1
+                )
+        if classifications:
+            summary = ",".join(
+                f"{classification}={count}"
+                for classification, count in sorted(classifications.items())[:8]
+            )
+            raise HarnessError(
+                f"libreoffice_adapter_identity_missing:{summary}"
+            )
         raise HarnessError("libreoffice_adapter_identity_missing")
     first = normalized[0]
     expected = _canonical_json_bytes(first)
@@ -2955,6 +2973,24 @@ def _command_failure(prefix: str, result: CommandResult) -> str | None:
         "nonzero": "failed",
     }.get(result.status, "failed")
     return f"{prefix}_{suffix}"
+
+
+def _libreoffice_command_failure(
+    result: CommandResult,
+    *,
+    adapter_command: bool,
+) -> str | None:
+    """Preserve a bounded adapter error code without retaining diagnostics."""
+    if result.status == "ok":
+        return None
+    if adapter_command and result.status == "nonzero":
+        match = re.fullmatch(
+            rb"render_oracle_error:([a-z][a-z0-9_]{0,63})\r?\n?",
+            result.stderr,
+        )
+        if match is not None:
+            return f"libreoffice_adapter_{match.group(1).decode('ascii')}"
+    return _command_failure("libreoffice", result)
 
 
 def _run_svg_rasterizer(
@@ -6568,7 +6604,10 @@ def evaluate_case(
             scenes=scene_evidence,
             commands=commands,
         )
-    lo_failure = _command_failure("libreoffice", lo_result)
+    lo_failure = _libreoffice_command_failure(
+        lo_result,
+        adapter_command=config.libreoffice_command is not None,
+    )
     if lo_failure:
         return _classified(base, "error", lo_failure, commands=commands)
     oracle_adapter_evidence: dict[str, object] | None = None

@@ -137,6 +137,20 @@ export function validateWasmPause(pauseEvidence, targetId) {
   ) {
     throw new Error("hard-stop worker was not paused in an active WebAssembly frame");
   }
+  if (
+    !Number.isFinite(pauseEvidence.resumedAtEpochMs) ||
+    pauseEvidence.resumedAtEpochMs < pauseEvidence.observedAtEpochMs ||
+    pauseEvidence.resumedAtEpochMs > pauseEvidence.terminationCommandEpochMs
+  ) {
+    throw new Error("hard-stop worker was not resumed after its WebAssembly pause");
+  }
+  if (
+    !Number.isFinite(pauseEvidence.debuggerDisabledAtEpochMs) ||
+    pauseEvidence.debuggerDisabledAtEpochMs < pauseEvidence.resumedAtEpochMs ||
+    pauseEvidence.debuggerDisabledAtEpochMs > pauseEvidence.terminationCommandEpochMs
+  ) {
+    throw new Error("hard-stop worker debugger was not disabled before termination");
+  }
 }
 
 export function validateRejectedOutcomes(proof) {
