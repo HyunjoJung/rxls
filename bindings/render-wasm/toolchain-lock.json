@@ -20,7 +20,15 @@
     },
     "heapGate": {
       "maxAccountedBytes": 268435456,
-      "maxRetainedGrowthBytes": 67108864
+      "maxRetainedGrowthBytes": 67108864,
+      "maxProcessTreeRssBytes": 1073741824,
+      "maxProcessTreeRetainedGrowthBytes": 536870912,
+      "platformOverrides": {
+        "darwin": {
+          "maxProcessTreeRssBytes": 2147483648,
+          "maxProcessTreeRetainedGrowthBytes": 536870912
+        }
+      }
     }
   }
 }

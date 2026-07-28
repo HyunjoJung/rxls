@@ -70,7 +70,7 @@ INTERNAL_TRACE_PATTERNS = (
     ("claude_project_trace", re.compile(r"[.]claude[/\\]projects", re.IGNORECASE)),
     ("private_workspace_trace", re.compile("cong" + "mo", re.IGNORECASE)),
     (
-        "internal_release_promotion_trace",
+        "reserved_status_trace",
         re.compile(
             r"\b(?:nearly|almost|de facto|effectively)\s+"
             r"(?:a\s+)?1[.]0\b|\b1[.]0\s+(?:release\s+)?"

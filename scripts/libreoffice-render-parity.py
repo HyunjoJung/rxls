@@ -3,18 +3,17 @@
 
 The harness treats a LibreOffice ``SinglePageSheets`` PDF export as the visual
 oracle for one workbook at a time.  It validates the deterministic
-``rxls-render bundle`` contract, rasterizes both sides when optional local
-dependencies are available, and emits path-neutral JSON evidence.
+``rxls-render bundle`` contract, compares the renderer's native print PDF with
+the LibreOffice PDF through the same Poppler toolchain, and emits path-neutral
+JSON evidence.
 
 No dependency is downloaded by this script.  Visual comparison requires
-Pillow, Poppler ``pdftotext``, either PyMuPDF (``fitz``) or Poppler
-(``pdfinfo`` + ``pdftoppm``), and either CairoSVG or an explicitly configured
-SVG rasterizer command.  Required font packs additionally use pinned Poppler
-``pdffonts`` to attest every LibreOffice PDF font object without retaining its
-name.  A bit-exact NumPy integer implementation accelerates
-the reference metric; unlocked runs fall back to the tested pure-Python
-implementation, while locked oracle profiles require the recorded NumPy
-version.
+Pillow and Poppler ``pdfinfo``, ``pdftoppm``, and ``pdftotext``.  Required font
+packs additionally use pinned Poppler ``pdffonts`` to attest every
+LibreOffice PDF font object without retaining its name.  A bit-exact NumPy
+integer implementation accelerates the reference metric; unlocked runs fall
+back to the tested pure-Python implementation, while locked oracle profiles
+require the recorded NumPy version.
 ``--dry-run`` is dependency-tolerant and performs corpus, tool, command, and
 limit preflight without executing either renderer.
 
@@ -54,6 +53,7 @@ from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 import hashlib
+import io
 import importlib.metadata
 import importlib.util
 import json
@@ -64,6 +64,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -74,12 +75,19 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows has no POSIX resource limits.
+    resource = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 # Direct host runs must disable active OLE/DDE content. The isolated container
 # owns a separate chart-enabled profile locked by render-oracle-container/lock.json.
 ORACLE_PROFILE_PATH = ROOT / "scripts" / "render-oracle-host-profile.xcu"
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
+MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
+METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 RENDER_MANIFEST_SCHEMA = "rxls.render.bundle.v1"
 CONTAINER_OUTPUT_SCHEMA = "rxls.render-oracle-container-output.v2"
 CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
@@ -87,6 +95,7 @@ CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
+HOST_TOOLS_LOCK_PATH = ROOT / "scripts" / "render-oracle-host-tools-lock.json"
 FIXED_UNITS_PER_PIXEL = 1024
 SUPPORTED_EXTENSIONS = {
     ".xls",
@@ -197,6 +206,9 @@ class Caps:
     max_metric_work_units: int = 25_600_000_000
     max_semantic_codepoints: int = 1_000_000
     max_semantic_tokens: int = 250_000
+    max_bbox_xml_elements: int = 1_000_000
+    max_bbox_lines: int = 250_000
+    max_bbox_words: int = 250_000
     timeout_seconds: float = 60.0
 
 
@@ -233,9 +245,22 @@ class SvgSemanticEvidence:
 class PdfTextPage:
     """One transient Poppler page; text never crosses the report boundary."""
 
-    width_points: float
-    height_points: float
+    width_points: Fraction
+    height_points: Fraction
     words: tuple[SemanticTextBox, ...]
+    lines: tuple[SemanticTextBox, ...] = ()
+
+
+@dataclass(frozen=True)
+class PdfPageGeometry:
+    """Exact decimal dimensions reported by pinned Poppler ``pdfinfo -box``."""
+
+    page_width_points: Fraction
+    page_height_points: Fraction
+    media_width_points: Fraction
+    media_height_points: Fraction
+    crop_width_points: Fraction
+    crop_height_points: Fraction
 
 
 @dataclass(frozen=True)
@@ -243,6 +268,7 @@ class PdfFontRecord:
     """One transient, validated row from pinned Poppler ``pdffonts``."""
 
     normalized_identity: str
+    font_type: str
     embedded: bool
     subset: bool
     unicode_map: bool
@@ -265,6 +291,9 @@ class CommandRunner(Protocol):
         env: dict[str, str],
         timeout_seconds: float,
         output_limit_bytes: int,
+        file_output_roots: Sequence[Path] = (),
+        file_output_limit_bytes: int | None = None,
+        file_output_count_limit: int | None = None,
     ) -> CommandResult: ...
 
 
@@ -279,9 +308,39 @@ class BoundedCommandRunner:
         env: dict[str, str],
         timeout_seconds: float,
         output_limit_bytes: int,
+        file_output_roots: Sequence[Path] = (),
+        file_output_limit_bytes: int | None = None,
+        file_output_count_limit: int | None = None,
     ) -> CommandResult:
         if not command:
             return CommandResult("not_found", None)
+        if (
+            file_output_limit_bytes is not None
+            and file_output_limit_bytes <= 0
+        ):
+            return CommandResult("file_output_limit", None)
+        if (
+            file_output_count_limit is not None
+            and file_output_count_limit <= 0
+        ):
+            return CommandResult("file_output_limit", None)
+
+        preexec_fn = None
+        if (
+            os.name == "posix"
+            and resource is not None
+            and file_output_limit_bytes is not None
+        ):
+            # Allow one byte past the policy limit so the parent can classify
+            # the violation deterministically as ``file_output_limit``.  A
+            # hard limit at the exact boundary can otherwise terminate the
+            # child first and surface only as an opaque nonzero exit.
+            file_limit = int(file_output_limit_bytes) + 1
+
+            def apply_file_limit() -> None:
+                resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+
+            preexec_fn = apply_file_limit
         try:
             process = subprocess.Popen(
                 list(command),
@@ -291,6 +350,7 @@ class BoundedCommandRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=(os.name != "nt"),
+                preexec_fn=preexec_fn,
             )
         except (FileNotFoundError, PermissionError, OSError):
             return CommandResult("not_found", None)
@@ -338,6 +398,26 @@ class BoundedCommandRunner:
                 status = "timeout"
                 _terminate_process(process)
                 break
+            if file_output_roots:
+                try:
+                    file_bytes, file_count = _live_output_usage(
+                        file_output_roots,
+                        count_limit=file_output_count_limit,
+                    )
+                except HarnessError:
+                    status = "file_output_limit"
+                    _terminate_process(process)
+                    break
+                if (
+                    file_output_limit_bytes is not None
+                    and file_bytes > file_output_limit_bytes
+                ) or (
+                    file_output_count_limit is not None
+                    and file_count > file_output_count_limit
+                ):
+                    status = "file_output_limit"
+                    _terminate_process(process)
+                    break
             time.sleep(0.01)
 
         try:
@@ -350,9 +430,69 @@ class BoundedCommandRunner:
 
         if status is None and over_limit.is_set():
             status = "output_limit"
+        if status is None and file_output_roots:
+            try:
+                file_bytes, file_count = _live_output_usage(
+                    file_output_roots,
+                    count_limit=file_output_count_limit,
+                )
+            except HarnessError:
+                status = "file_output_limit"
+            else:
+                if (
+                    file_output_limit_bytes is not None
+                    and file_bytes > file_output_limit_bytes
+                ) or (
+                    file_output_count_limit is not None
+                    and file_count > file_output_count_limit
+                ):
+                    status = "file_output_limit"
         if status is None:
             status = "ok" if returncode == 0 else "nonzero"
         return CommandResult(status, returncode, bytes(stdout), bytes(stderr))
+
+
+def _live_output_usage(
+    roots: Sequence[Path], *, count_limit: int | None
+) -> tuple[int, int]:
+    """Return regular-file bytes/count without following attacker-created links."""
+    total_bytes = 0
+    file_count = 0
+    pending = list(roots)
+    seen: set[tuple[int, int]] = set()
+    while pending:
+        path = pending.pop()
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise HarnessError("live_output_unreadable") from error
+        mode = metadata.st_mode
+        if stat.S_ISLNK(mode):
+            raise HarnessError("live_output_symlink")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in seen:
+            raise HarnessError("live_output_cycle")
+        seen.add(identity)
+        if stat.S_ISDIR(mode):
+            try:
+                pending.extend(path.iterdir())
+            except FileNotFoundError:
+                # Atomic bundle writers may rename or remove a temporary
+                # directory after the single lstat snapshot. The final scan
+                # still validates the complete retained output tree.
+                continue
+            except OSError as error:
+                raise HarnessError("live_output_unreadable") from error
+            continue
+        if not stat.S_ISREG(mode):
+            raise HarnessError("live_output_special_file")
+        file_count += 1
+        if count_limit is not None and file_count > count_limit:
+            return total_bytes, file_count
+        total_bytes += metadata.st_size
+    return total_bytes, file_count
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -404,12 +544,10 @@ class Backends:
         missing = []
         if not self.pillow:
             missing.append("pillow")
-        if not self.pymupdf and not (self.pdftoppm and self.pdfinfo):
-            missing.append("pymupdf_or_poppler")
-        if self.svg_command is None and not self.cairosvg:
-            missing.append("cairosvg_or_svg_command")
-        if self.svg_command and not executable_available(self.svg_command[0]):
-            missing.append("svg_command")
+        if not self.pdfinfo:
+            missing.append("pdfinfo")
+        if not self.pdftoppm:
+            missing.append("pdftoppm")
         if not self.pdftotext:
             missing.append("pdftotext")
         if require_pdffonts and not self.pdffonts:
@@ -433,10 +571,11 @@ class HarnessConfig:
     oracle_profile: "OracleProfile | None" = None
     renderer_identity: dict[str, object] | None = None
     libreoffice_command: tuple[str, ...] | None = None
-    pdffonts_identity: dict[str, object] | None = None
+    poppler_identity: dict[str, object] | None = None
     print_mode: str = PRINT_MODE_SINGLE_PAGE
     format_filter: tuple[str, ...] = ()
     required_feature_filter: tuple[str, ...] = ()
+    manifest_binding: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -483,9 +622,12 @@ class OracleProfile:
 
 @dataclass(frozen=True)
 class BundlePage:
-    index: int
+    source_sheet_index: int
     visibility: str
     svg_path: Path
+    pdf_path: Path | None
+    source_pdf_page_index: int | None
+    oracle_output_page_index: int | None
     width_pixels: int
     height_pixels: int
     scene_sha256: str
@@ -554,25 +696,106 @@ def renderer_binary_identity(
     return {"bytes": size, "sha256": digest}
 
 
-def pdffonts_binary_identity(
+def _locked_poppler_tool_contract() -> dict[str, dict[str, object]]:
+    """Return the exact hosted Poppler executable contract for this platform."""
+    document = _bounded_json_object(
+        HOST_TOOLS_LOCK_PATH,
+        schema="rxls.render-oracle-host-tools-lock.v1",
+    )
+    target = _exact_keys(
+        document.get("platform"), {"machine", "system"}, "poppler_lock_platform"
+    )
+    actual = {
+        "machine": platform.machine().lower(),
+        "system": platform.system().lower(),
+    }
+    if target != actual:
+        raise HarnessError("poppler_lock_platform_mismatch")
+    expected = document.get("expected_identity")
+    if not isinstance(expected, dict):
+        raise HarnessError("poppler_lock_identity")
+    poppler = expected.get("poppler")
+    if not isinstance(poppler, dict):
+        raise HarnessError("poppler_lock_identity")
+    rows = poppler.get("executables")
+    if not isinstance(rows, list) or len(rows) != 4:
+        raise HarnessError("poppler_lock_executables")
+    tools: dict[str, dict[str, object]] = {}
+    for value in rows:
+        row = _exact_keys(
+            value,
+            {
+                "bytes",
+                "name",
+                "package_name",
+                "package_version",
+                "sha256",
+                "version",
+            },
+            "poppler_lock_executable",
+        )
+        name = row.get("name")
+        size = row.get("bytes")
+        if (
+            name not in {"pdffonts", "pdfinfo", "pdftoppm", "pdftotext"}
+            or name in tools
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 < size <= 512 * 1024 * 1024
+        ):
+            raise HarnessError("poppler_lock_executable")
+        _locked_sha256(row.get("sha256"), "poppler_lock_executable")
+        _locked_text(row.get("version"), "poppler_lock_executable")
+        tools[name] = row
+    if set(tools) != {"pdffonts", "pdfinfo", "pdftoppm", "pdftotext"}:
+        raise HarnessError("poppler_lock_executables")
+    return tools
+
+
+def poppler_binary_identity(
     expected_sha256: str | None,
     *,
     required: bool,
 ) -> dict[str, object] | None:
-    """Hash the active PDF font inspector and bind it to an expected lock."""
+    """Bind every active PDF measurement executable to the hosted lock."""
     if expected_sha256 is not None and not SHA256_RE.fullmatch(expected_sha256):
         raise HarnessError("pdffonts_binary_sha256")
     if expected_sha256 is None and not required:
         return None
     if expected_sha256 is None:
         raise HarnessError("pdffonts_binary_identity_required")
-    path = _resolved_executable(
-        os.environ.get("PDFFONTS", "pdffonts"), "pdffonts_binary"
-    )
-    digest = _sha256_file(path, 512 * 1024 * 1024)
-    if digest != expected_sha256:
+    contract = _locked_poppler_tool_contract()
+    environment_names = {
+        "pdffonts": "PDFFONTS",
+        "pdfinfo": "PDFINFO",
+        "pdftoppm": "PDFTOPPM",
+        "pdftotext": "PDFTOTEXT",
+    }
+    identity: dict[str, object] = {"kind": "poppler"}
+    for name in ("pdffonts", "pdfinfo", "pdftoppm", "pdftotext"):
+        path = _resolved_executable(
+            os.environ.get(environment_names[name], name),
+            f"{name}_binary",
+        )
+        locked = contract[name]
+        if path.stat().st_size != locked["bytes"]:
+            raise HarnessError(f"{name}_binary_size")
+        digest = _sha256_file(path, 512 * 1024 * 1024)
+        if digest != locked["sha256"]:
+            raise HarnessError(f"{name}_binary_identity")
+        identity[f"{name}_sha256"] = digest
+    if identity["pdffonts_sha256"] != expected_sha256:
         raise HarnessError("pdffonts_binary_identity")
-    return {"kind": "poppler", "pdffonts_sha256": digest}
+    return identity
+
+
+def pdffonts_binary_identity(
+    expected_sha256: str | None,
+    *,
+    required: bool,
+) -> dict[str, object] | None:
+    """Compatibility alias for the complete Poppler toolchain identity."""
+    return poppler_binary_identity(expected_sha256, required=required)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -991,6 +1214,7 @@ def verify_oracle_profile(
     runner: CommandRunner,
 ) -> dict[str, object]:
     """Verify every active comparison tool before rendering any workbook."""
+    _require_supported_font_pack_activation(config)
     if config.print_mode != PRINT_MODE_SINGLE_PAGE:
         raise HarnessError("authored_print_requires_container_adapter")
     if config.libreoffice_command is not None:
@@ -1010,9 +1234,9 @@ def verify_oracle_profile(
         raise HarnessError("oracle_font_pack_mismatch")
     if _sha256_file(ORACLE_PROFILE_PATH, 64 * 1024) != profile.profile_sha256:
         raise HarnessError("oracle_profile_identity")
-    if config.svg_rasterizer_command is not None or not backends.cairosvg:
+    if config.svg_rasterizer_command is not None:
         raise HarnessError("oracle_svg_rasterizer_mismatch")
-    if backends.pymupdf or not (
+    if not (
         backends.pdfinfo
         and backends.pdftoppm
         and backends.pdftotext
@@ -1120,6 +1344,17 @@ def verify_oracle_profile(
         "source": profile.source_evidence,
         "svg_rasterizer": {"kind": "cairosvg", "version": cairosvg},
     }
+
+
+def _require_supported_font_pack_activation(config: HarnessConfig) -> None:
+    """Reject direct strict runs where LibreOffice ignores isolated Fontconfig."""
+    if (
+        config.require_font_pack
+        and not config.dry_run
+        and config.libreoffice_command is None
+        and not sys.platform.startswith("linux")
+    ):
+        raise HarnessError("font_pack_direct_activation_unsupported")
 
 
 def command_fact(result: CommandResult) -> dict[str, object]:
@@ -1427,6 +1662,75 @@ def filter_cases(
         and all(feature in case.features for feature in normalized_features)
     ]
     return selected, discovery
+
+
+def _manifest_case_mapping(
+    cases: Sequence[InputCase],
+) -> tuple[list[str], list[dict[str, object]]]:
+    """Return the exact path-neutral input and feature contracts for one lane."""
+    input_sha256: list[str] = []
+    feature_mapping: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for case in cases:
+        digest = case.expected_sha256
+        format_name = case.path.suffix.lower().lstrip(".")
+        if (
+            digest is None
+            or SHA256_RE.fullmatch(digest) is None
+            or digest in seen
+            or format_name not in {
+                suffix.lstrip(".") for suffix in SUPPORTED_EXTENSIONS
+            }
+            or tuple(sorted(set(case.features))) != case.features
+        ):
+            raise HarnessError("manifest_binding_identity")
+        seen.add(digest)
+        input_sha256.append(digest)
+        feature_mapping.append(
+            {
+                "features": list(case.features),
+                "format": format_name,
+                "sha256": digest,
+            }
+        )
+    input_sha256.sort()
+    feature_mapping.sort(
+        key=lambda row: (
+            str(row["sha256"]),
+            str(row["format"]),
+            tuple(row["features"]),
+        )
+    )
+    return input_sha256, feature_mapping
+
+
+def build_manifest_binding(
+    manifest: Path,
+    cases: Sequence[InputCase],
+    *,
+    max_manifest_bytes: int,
+) -> dict[str, object]:
+    """Bind a selected lane to the exact manifest bytes and feature mapping."""
+    try:
+        payload = manifest.read_bytes()
+    except OSError as error:
+        raise HarnessError("manifest_binding_unreadable") from error
+    if not 0 < len(payload) <= max_manifest_bytes:
+        raise HarnessError("manifest_binding_limit")
+    input_sha256, feature_mapping = _manifest_case_mapping(cases)
+    if not input_sha256:
+        raise HarnessError("manifest_binding_empty")
+    return {
+        "feature_map_sha256": hashlib.sha256(
+            _canonical_json_bytes(feature_mapping)
+        ).hexdigest(),
+        "input_set_sha256": hashlib.sha256(
+            _canonical_json_bytes(input_sha256)
+        ).hexdigest(),
+        "manifest_sha256": hashlib.sha256(payload).hexdigest(),
+        "schema": MANIFEST_BINDING_SCHEMA,
+        "selected_case_count": len(input_sha256),
+    }
 
 
 def _parse_svg_length(value: str, dpi: int) -> int:
@@ -1745,6 +2049,7 @@ def validate_bundle(
     pages = []
     expected_files = {"render-manifest.json"}
     total_pixels = 0
+    next_oracle_output_page_index = 0
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or row.get("index") != index:
             raise HarnessError("render_manifest_sheet_order")
@@ -1851,9 +2156,12 @@ def validate_bundle(
         if print_mode is None:
             pages.append(
                 BundlePage(
-                    len(pages),
+                    index,
                     visibility,
                     svg_path,
+                    None,
+                    None,
+                    None,
                     width,
                     height,
                     scene["sha256"],
@@ -1883,7 +2191,6 @@ def validate_bundle(
             or not isinstance(page_count, int)
             or isinstance(page_count, bool)
             or not 1 <= page_count <= caps.max_pages
-            or print_bundle.get("pdf") is not None
             or print_bundle.get("png_dpi") is not None
             or print_bundle.get("png_pages") != []
         ):
@@ -1898,6 +2205,23 @@ def validate_bundle(
             raise HarnessError("render_manifest_print")
         if len(pages) + page_count > caps.max_pages:
             raise HarnessError("renderer_page_limit")
+
+        pdf_filename = f"sheet-{index:04d}.pdf"
+        pdf_path = _validate_bundle_artifact(
+            print_bundle.get("pdf"),
+            expected_file=pdf_filename,
+            bundle_dir=bundle_dir,
+            files=files,
+            max_bytes=caps.max_artifact_bytes,
+            code="render_manifest_print_pdf",
+        )
+        expected_files.add(pdf_filename)
+        try:
+            with pdf_path.open("rb") as source:
+                if pdf_path.stat().st_size < 5 or source.read(5) != b"%PDF-":
+                    raise HarnessError("render_manifest_print_pdf")
+        except OSError as error:
+            raise HarnessError("render_manifest_print_pdf") from error
 
         report_filename = f"sheet-{index:04d}-pages.json"
         print_report_path = _validate_bundle_artifact(
@@ -1986,15 +2310,30 @@ def validate_bundle(
                 raise HarnessError("renderer_total_pixel_limit")
             pages.append(
                 BundlePage(
-                    len(pages),
+                    index,
                     visibility,
                     page_path,
+                    pdf_path,
+                    page_index,
+                    (
+                        next_oracle_output_page_index
+                        if (
+                            print_mode == PRINT_MODE_SINGLE_PAGE
+                            or visibility == "visible"
+                        )
+                        else None
+                    ),
                     page_width,
                     page_height,
                     page_scene["sha256"],
                     tuple((*warning_evidence, *print_warnings)),
                 )
             )
+            if (
+                print_mode == PRINT_MODE_SINGLE_PAGE
+                or visibility == "visible"
+            ):
+                next_oracle_output_page_index += 1
     actual_relative = {path.relative_to(bundle_dir).as_posix() for path in files}
     if actual_relative != expected_files:
         raise HarnessError("renderer_unexpected_artifact")
@@ -2016,7 +2355,8 @@ def build_rxls_command(
     if print_mode == PRINT_MODE_SINGLE_PAGE:
         command.append("--single-page-sheets")
     else:
-        command.extend(("--print-layout", "--print-backends", "svg"))
+        command.append("--print-layout")
+    command.extend(("--print-backends", "svg,pdf"))
     command.extend(("--output-dir", str(output_dir)))
     return command
 
@@ -2340,7 +2680,7 @@ def _container_identity_from_adapter(
     adapter: object,
     *,
     font_pack_sha256: str,
-    pdffonts_identity: object,
+    poppler_identity: object,
 ) -> dict[str, object]:
     """Normalize one validated adapter row into a path/content-neutral identity."""
     row = _exact_keys(
@@ -2399,15 +2739,35 @@ def _container_identity_from_adapter(
         or oracle.get("version") != "26.2.3.2"
     ):
         raise HarnessError("libreoffice_adapter_aggregate_oracle")
-    inspector = _exact_keys(
-        pdffonts_identity,
-        {"kind", "pdffonts_sha256"},
+    toolchain = _exact_keys(
+        poppler_identity,
+        {
+            "host_tools_identity_sha256",
+            "kind",
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        },
         "pdffonts_binary_identity_required",
     )
-    if inspector.get("kind") != "poppler":
+    if toolchain.get("kind") != "poppler":
         raise HarnessError("pdffonts_binary_identity")
-    pdffonts_sha256 = _locked_sha256(
-        inspector.get("pdffonts_sha256"), "pdffonts_binary_identity"
+    poppler_hashes = {
+        key: _locked_sha256(
+            toolchain.get(key),
+            "pdffonts_binary_identity",
+        )
+        for key in (
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        )
+    }
+    host_tools_identity_sha256 = _locked_sha256(
+        toolchain.get("host_tools_identity_sha256"),
+        "host_tools_identity",
     )
     runtime = row.get("runtime")
     if runtime not in {"docker", "podman"}:
@@ -2431,8 +2791,9 @@ def _container_identity_from_adapter(
             "libreoffice_adapter_aggregate_lock_file",
         ),
         "pdf_font_inspector": {
+            "host_tools_identity_sha256": host_tools_identity_sha256,
             "kind": "poppler",
-            "pdffonts_sha256": pdffonts_sha256,
+            **poppler_hashes,
         },
         "runtime": runtime,
         "schema": CONTAINER_IDENTITY_SCHEMA,
@@ -2464,7 +2825,7 @@ def aggregate_container_oracle_identity(
                 _container_identity_from_adapter(
                     adapter,
                     font_pack_sha256=font_pack_sha256,
-                    pdffonts_identity=config.pdffonts_identity,
+                    poppler_identity=config.poppler_identity,
                 )
             )
     if not normalized:
@@ -2590,6 +2951,7 @@ def _command_failure(prefix: str, result: CommandResult) -> str | None:
         "not_found": "not_found",
         "timeout": "timeout",
         "output_limit": "command_output_limit",
+        "file_output_limit": "file_output_limit",
         "nonzero": "failed",
     }.get(result.status, "failed")
     return f"{prefix}_{suffix}"
@@ -2630,6 +2992,9 @@ def _run_svg_rasterizer(
         env=env,
         timeout_seconds=config.caps.timeout_seconds,
         output_limit_bytes=config.caps.max_command_output_bytes,
+        file_output_roots=(output,),
+        file_output_limit_bytes=config.caps.max_artifact_bytes,
+        file_output_count_limit=1,
     )
 
 
@@ -2643,49 +3008,33 @@ def _run_pdf_rasterizer(
     cwd: Path,
     env: dict[str, str],
 ) -> tuple[CommandResult, dict[str, object] | None]:
-    if not backends.pymupdf and backends.pdftoppm and backends.pdfinfo:
-        return _run_poppler_pdf_rasterizer(
-            pdf,
-            output_dir,
-            config=config,
-            runner=runner,
-            cwd=cwd,
-            env=env,
-        )
-    command = [
-        sys.executable,
-        "-c",
-        PYMUPDF_WORKER,
-        str(pdf),
-        str(output_dir),
-        str(config.dpi),
-        str(config.caps.max_pages),
-        str(config.caps.max_page_pixels),
-        str(config.caps.max_total_pixels),
-        str(config.caps.max_artifact_bytes),
-    ]
-    result = runner.run(
-        command,
+    del backends
+    return _run_poppler_pdf_rasterizer(
+        pdf,
+        output_dir,
+        config=config,
+        runner=runner,
         cwd=cwd,
         env=env,
-        timeout_seconds=config.caps.timeout_seconds,
-        output_limit_bytes=config.caps.max_command_output_bytes,
     )
-    if result.status != "ok":
-        return result, None
-    try:
-        document = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return CommandResult("nonzero", 24, result.stdout, result.stderr), None
-    if not isinstance(document, dict) or not isinstance(document.get("pages"), list):
-        return CommandResult("nonzero", 24, result.stdout, result.stderr), None
-    return result, document
 
 
 PDFINFO_PAGES_RE = re.compile(r"^Pages:\s+(\d+)\s*$", re.MULTILINE)
+PDFINFO_DECIMAL = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
 PDFINFO_SIZE_RE = re.compile(
     r"^Page(?:\s+\d+)?\s+size:\s+"
-    r"([0-9]+(?:\.[0-9]+)?)\s+x\s+([0-9]+(?:\.[0-9]+)?)\s+pts\s*$",
+    rf"({PDFINFO_DECIMAL})\s+x\s+({PDFINFO_DECIMAL})\s+pts(?:[ \t]+[^\r\n]*)?$",
+    re.MULTILINE,
+)
+PDFINFO_GEOMETRY_SIZE_RE = re.compile(
+    rf"^Page(?:\s+([1-9][0-9]*))?\s+size:\s+"
+    rf"({PDFINFO_DECIMAL})\s+x\s+({PDFINFO_DECIMAL})\s+pts(?:[ \t]+[^\r\n]*)?$",
+    re.MULTILINE,
+)
+PDFINFO_BOX_RE = re.compile(
+    rf"^(?:Page\s+([1-9][0-9]*)\s+)?(MediaBox|CropBox):\s+"
+    rf"({PDFINFO_DECIMAL})\s+({PDFINFO_DECIMAL})\s+"
+    rf"({PDFINFO_DECIMAL})\s+({PDFINFO_DECIMAL})\s*$",
     re.MULTILINE,
 )
 
@@ -2703,9 +3052,317 @@ def parse_pdfinfo(
     ]
     if pages <= 0:
         raise HarnessError("pdfinfo_pages_invalid")
+    if any(width <= 0 or height <= 0 for width, height in sizes):
+        raise HarnessError("pdfinfo_page_sizes_invalid")
     if require_all_sizes and len(sizes) != pages:
         raise HarnessError("pdfinfo_page_sizes_missing")
     return pages, sizes
+
+
+def parse_pdfinfo_page_geometries(
+    text: str, *, expected_pages: int
+) -> tuple[PdfPageGeometry, ...]:
+    """Parse every exact Page size, MediaBox, and CropBox dimension."""
+    if expected_pages <= 0:
+        raise HarnessError("pdfinfo_pages_invalid")
+
+    def page_index(raw: str | None) -> int:
+        if raw is None:
+            if expected_pages != 1:
+                raise HarnessError("pdfinfo_page_index_missing")
+            return 0
+        index = int(raw) - 1
+        if not 0 <= index < expected_pages:
+            raise HarnessError("pdfinfo_page_index_invalid")
+        return index
+
+    sizes: dict[int, tuple[Fraction, Fraction]] = {}
+    boxes: dict[str, dict[int, tuple[Fraction, Fraction]]] = {
+        "MediaBox": {},
+        "CropBox": {},
+    }
+    for match in PDFINFO_GEOMETRY_SIZE_RE.finditer(text):
+        index = page_index(match.group(1))
+        if index in sizes:
+            raise HarnessError("pdfinfo_page_size_duplicate")
+        width = Fraction(match.group(2))
+        height = Fraction(match.group(3))
+        if width <= 0 or height <= 0:
+            raise HarnessError("pdfinfo_page_size_invalid")
+        sizes[index] = (width, height)
+    for match in PDFINFO_BOX_RE.finditer(text):
+        index = page_index(match.group(1))
+        kind = match.group(2)
+        if index in boxes[kind]:
+            raise HarnessError("pdfinfo_page_box_duplicate")
+        left, bottom, right, top = (
+            Fraction(match.group(offset)) for offset in range(3, 7)
+        )
+        width = right - left
+        height = top - bottom
+        if width <= 0 or height <= 0:
+            raise HarnessError("pdfinfo_page_box_invalid")
+        boxes[kind][index] = (width, height)
+    expected = set(range(expected_pages))
+    if (
+        set(sizes) != expected
+        or set(boxes["MediaBox"]) != expected
+        or set(boxes["CropBox"]) != expected
+    ):
+        raise HarnessError("pdfinfo_page_geometry_missing")
+    return tuple(
+        PdfPageGeometry(
+            page_width_points=sizes[index][0],
+            page_height_points=sizes[index][1],
+            media_width_points=boxes["MediaBox"][index][0],
+            media_height_points=boxes["MediaBox"][index][1],
+            crop_width_points=boxes["CropBox"][index][0],
+            crop_height_points=boxes["CropBox"][index][1],
+        )
+        for index in range(expected_pages)
+    )
+
+
+def _fraction_point(value: Fraction) -> str:
+    """Return one canonical, exact rational point value."""
+    return f"{value.numerator}/{value.denominator}"
+
+
+def _pdf_geometry_evidence(geometry: PdfPageGeometry) -> dict[str, object]:
+    return {
+        "page_size": {
+            "width_points": _fraction_point(geometry.page_width_points),
+            "height_points": _fraction_point(geometry.page_height_points),
+        },
+        "media_box": {
+            "width_points": _fraction_point(geometry.media_width_points),
+            "height_points": _fraction_point(geometry.media_height_points),
+        },
+        "crop_box": {
+            "width_points": _fraction_point(geometry.crop_width_points),
+            "height_points": _fraction_point(geometry.crop_height_points),
+        },
+    }
+
+
+def _point_dimension(
+    value: object, *, code: str
+) -> Fraction:
+    if not isinstance(value, str) or re.fullmatch(
+        r"-?[0-9]+/[1-9][0-9]*", value
+    ) is None:
+        raise HarnessError(code)
+    result = Fraction(value)
+    if result <= 0 or result > 1_000_000:
+        raise HarnessError(code)
+    return result
+
+
+def _point_geometry_dimensions(
+    value: object, *, code: str
+) -> dict[str, tuple[Fraction, Fraction]]:
+    if not isinstance(value, dict) or set(value) != {
+        "crop_box",
+        "media_box",
+        "page_size",
+    }:
+        raise HarnessError(code)
+    result: dict[str, tuple[Fraction, Fraction]] = {}
+    for name in ("page_size", "media_box", "crop_box"):
+        row = value.get(name)
+        if not isinstance(row, dict) or set(row) != {
+            "height_points",
+            "width_points",
+        }:
+            raise HarnessError(code)
+        result[name] = (
+            _point_dimension(row["width_points"], code=code),
+            _point_dimension(row["height_points"], code=code),
+        )
+    return result
+
+
+def pdf_point_geometry_metrics(
+    rxls_raster_row: object,
+    libreoffice_raster_row: object,
+    rxls_text_page: PdfTextPage,
+    libreoffice_text_page: PdfTextPage,
+) -> dict[str, object]:
+    """Return exact rational point boxes and deltas without raster conversion."""
+    if not isinstance(rxls_raster_row, dict) or not isinstance(
+        libreoffice_raster_row, dict
+    ):
+        raise HarnessError("pdf_point_geometry")
+    rxls_raw = rxls_raster_row.get("point_geometry")
+    libreoffice_raw = libreoffice_raster_row.get("point_geometry")
+    rxls = _point_geometry_dimensions(rxls_raw, code="pdf_point_geometry")
+    libreoffice = _point_geometry_dimensions(
+        libreoffice_raw, code="pdf_point_geometry"
+    )
+    xhtml = {
+        "rxls": (
+            rxls_text_page.width_points,
+            rxls_text_page.height_points,
+        ),
+        "libreoffice": (
+            libreoffice_text_page.width_points,
+            libreoffice_text_page.height_points,
+        ),
+    }
+    deltas: dict[str, str] = {}
+    for box in ("media_box", "crop_box"):
+        for offset, axis in enumerate(("width", "height")):
+            deltas[f"{box}_{axis}"] = _fraction_point(
+                rxls[box][offset] - libreoffice[box][offset]
+            )
+    for side in ("rxls", "libreoffice"):
+        for offset, axis in enumerate(("width", "height")):
+            deltas[f"{side}_xhtml_page_size_{axis}"] = _fraction_point(
+                xhtml[side][offset] - (
+                    rxls["page_size"][offset]
+                    if side == "rxls"
+                    else libreoffice["page_size"][offset]
+                )
+            )
+    for offset, axis in enumerate(("width", "height")):
+        deltas[f"xhtml_{axis}"] = _fraction_point(
+            xhtml["rxls"][offset] - xhtml["libreoffice"][offset]
+        )
+    return {
+        "pdf_point_geometry": {
+            "deltas_points": deltas,
+            "libreoffice": libreoffice_raw,
+            "rxls": rxls_raw,
+            "xhtml": {
+                "libreoffice": {
+                    "height_points": _fraction_point(xhtml["libreoffice"][1]),
+                    "width_points": _fraction_point(xhtml["libreoffice"][0]),
+                },
+                "rxls": {
+                    "height_points": _fraction_point(xhtml["rxls"][1]),
+                    "width_points": _fraction_point(xhtml["rxls"][0]),
+                },
+            },
+        }
+    }
+
+
+PDF_POINT_DELTA_KEYS = frozenset(
+    {
+        "crop_box_height",
+        "crop_box_width",
+        "libreoffice_xhtml_page_size_height",
+        "libreoffice_xhtml_page_size_width",
+        "media_box_height",
+        "media_box_width",
+        "rxls_xhtml_page_size_height",
+        "rxls_xhtml_page_size_width",
+        "xhtml_height",
+        "xhtml_width",
+    }
+)
+PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
+    {
+        "crop_box_height",
+        "crop_box_width",
+        "media_box_height",
+        "media_box_width",
+        "xhtml_height",
+        "xhtml_width",
+    }
+)
+PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
+    PDF_POINT_DELTA_KEYS - PDF_DIRECT_POINT_DELTA_KEYS
+)
+# ``pdfinfo`` reports Page size to at most three decimal places while
+# ``pdftotext -bbox-layout`` reports six.  Keep both exact decimal rationals,
+# then allow only the documented display-precision envelope for this internal
+# cross-check.  Cross-document MediaBox/CropBox/XHTML deltas remain exact zero.
+PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
+
+
+def _point_delta(value: object, *, code: str) -> Fraction:
+    if not isinstance(value, str) or re.fullmatch(
+        r"-?[0-9]+/[1-9][0-9]*", value
+    ) is None:
+        raise HarnessError(code)
+    return Fraction(value)
+
+
+def _aggregate_pdf_point_geometry(
+    pages: Sequence[dict[str, object]],
+) -> dict[str, int]:
+    mismatches = 0
+    max_delta_millipoints = 0
+    max_xhtml_crosscheck_delta_micropoints = 0
+    for page in pages:
+        evidence = page.get("pdf_point_geometry")
+        if not isinstance(evidence, dict) or set(evidence) != {
+            "deltas_points",
+            "libreoffice",
+            "rxls",
+            "xhtml",
+        }:
+            raise HarnessError("pdf_point_geometry")
+        _point_geometry_dimensions(evidence["rxls"], code="pdf_point_geometry")
+        _point_geometry_dimensions(
+            evidence["libreoffice"], code="pdf_point_geometry"
+        )
+        xhtml = evidence["xhtml"]
+        if not isinstance(xhtml, dict) or set(xhtml) != {
+            "libreoffice",
+            "rxls",
+        }:
+            raise HarnessError("pdf_point_geometry")
+        for side in ("rxls", "libreoffice"):
+            row = xhtml[side]
+            if not isinstance(row, dict) or set(row) != {
+                "height_points",
+                "width_points",
+            }:
+                raise HarnessError("pdf_point_geometry")
+            _point_dimension(row["width_points"], code="pdf_point_geometry")
+            _point_dimension(row["height_points"], code="pdf_point_geometry")
+        deltas = evidence["deltas_points"]
+        if not isinstance(deltas, dict) or set(deltas) != PDF_POINT_DELTA_KEYS:
+            raise HarnessError("pdf_point_geometry")
+        parsed = {
+            key: abs(_point_delta(value, code="pdf_point_geometry"))
+            for key, value in deltas.items()
+        }
+        direct_deltas = [
+            parsed[key] for key in PDF_DIRECT_POINT_DELTA_KEYS
+        ]
+        crosscheck_deltas = [
+            parsed[key] for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+        ]
+        page_mismatch = any(delta != 0 for delta in direct_deltas) or any(
+            delta > PDF_XHTML_CROSSCHECK_MAX_POINTS
+            for delta in crosscheck_deltas
+        )
+        for delta in direct_deltas:
+            millipoints = (
+                delta.numerator * 1000 + delta.denominator - 1
+            ) // delta.denominator
+            max_delta_millipoints = max(
+                max_delta_millipoints, millipoints
+            )
+        for delta in crosscheck_deltas:
+            micropoints = (
+                delta.numerator * 1_000_000 + delta.denominator - 1
+            ) // delta.denominator
+            max_xhtml_crosscheck_delta_micropoints = max(
+                max_xhtml_crosscheck_delta_micropoints,
+                micropoints,
+            )
+        mismatches += int(page_mismatch)
+    return {
+        "pdf_point_geometry_mismatches": mismatches,
+        "max_pdf_point_geometry_delta_millipoints": max_delta_millipoints,
+        "max_pdf_xhtml_crosscheck_delta_micropoints": (
+            max_xhtml_crosscheck_delta_micropoints
+        ),
+    }
 
 
 def normalize_semantic_tokens(
@@ -3403,6 +4060,7 @@ def parse_pdffonts_output(
         records.append(
             PdfFontRecord(
                 _normalized_pdf_font_identity(base_name, "pdffonts_font_name"),
+                font_type,
                 embedded == "yes",
                 subset == "yes",
                 unicode_map == "yes",
@@ -3437,6 +4095,43 @@ def attest_pdf_fonts(
         "matched_font_objects": matched,
         "normalized_identities_sha256": hashlib.sha256(identity_payload).hexdigest(),
         "subset_font_objects": subset,
+        "unicode_font_objects": unicode_maps,
+        "unique_font_identities": len(set(identities)),
+    }
+
+
+def attest_native_pdf_fonts(
+    records: Sequence[PdfFontRecord],
+) -> dict[str, object]:
+    """Attest project-owned path-text Type 3 subsets without exposing names."""
+    if not records:
+        raise HarnessError("renderer_pdf_font_missing")
+    identities = sorted(record.normalized_identity for record in records)
+    if any(
+        re.fullmatch(r"outlinedsubset[0-9]{4}", identity) is None
+        for identity in identities
+    ):
+        raise HarnessError("renderer_pdf_font_identity")
+    type3 = sum(record.font_type == "Type 3" for record in records)
+    embedded = sum(record.embedded for record in records)
+    subset = sum(record.subset for record in records)
+    unicode_maps = sum(record.unicode_map for record in records)
+    if (
+        type3 != len(records)
+        or embedded != len(records)
+        or subset != len(records)
+        or unicode_maps != len(records)
+    ):
+        raise HarnessError("renderer_pdf_font_attestation")
+    identity_payload = ("\n".join(identities) + "\n").encode("ascii")
+    return {
+        "embedded_font_objects": embedded,
+        "font_objects": len(records),
+        "normalized_identities_sha256": hashlib.sha256(
+            identity_payload
+        ).hexdigest(),
+        "subset_font_objects": subset,
+        "type3_font_objects": type3,
         "unicode_font_objects": unicode_maps,
         "unique_font_identities": len(set(identities)),
     }
@@ -3483,9 +4178,17 @@ def parse_pdftotext_bbox_pages(
     max_bytes: int,
     max_codepoints: int,
     max_tokens: int,
+    max_elements: int = 1_000_000,
+    max_lines: int = 250_000,
+    max_words: int = 250_000,
 ) -> tuple[PdfTextPage, ...]:
-    """Parse bounded Poppler ``-bbox-layout`` XHTML without retaining text."""
-    if not payload or len(payload) > max_bytes:
+    """Stream bounded Poppler XHTML without retaining its document tree or text."""
+    if (
+        not payload
+        or len(payload) > max_bytes
+        or expected_pages <= 0
+        or min(max_elements, max_lines, max_words) <= 0
+    ):
         raise HarnessError("semantic_bbox_output_limit")
     upper = payload.upper()
     if b"<!ENTITY" in upper:
@@ -3497,87 +4200,191 @@ def parse_pdftotext_bbox_pages(
         raise HarnessError("semantic_bbox_unsafe_markup")
     try:
         text_payload = payload.decode("utf-8", "strict")
-        if "\x00" in text_payload:
-            raise HarnessError("semantic_bbox_invalid_utf8")
-        root = ET.fromstring(text_payload)
     except UnicodeDecodeError as error:
         raise HarnessError("semantic_bbox_invalid_utf8") from error
-    except ET.ParseError as error:
-        raise HarnessError("semantic_bbox_invalid_xml") from error
-    page_elements = [
-        element for element in root.iter() if _xml_local_name(element.tag) == "page"
-    ]
-    if len(page_elements) != expected_pages:
-        raise HarnessError("semantic_bbox_page_count")
+    if "\x00" in text_payload:
+        raise HarnessError("semantic_bbox_invalid_utf8")
 
     pages: list[PdfTextPage] = []
     codepoints_used = 0
     tokens_used = 0
     raw_codepoints = 0
-    for page_element in page_elements:
-        width = _parse_finite_number(
-            page_element.attrib.get("width"), "semantic_bbox_page_geometry"
+    element_count = 0
+    line_count = 0
+    word_count = 0
+    stack: list[str] = []
+    current_page: dict[str, object] | None = None
+    current_line: dict[str, object] | None = None
+    active_word = False
+
+    def parse_box(
+        element: ET.Element,
+        *,
+        width: Fraction,
+        height: Fraction,
+        code: str,
+    ) -> tuple[float, float, float, float]:
+        x_min = _parse_finite_number(element.attrib.get("xMin"), code)
+        y_min = _parse_finite_number(element.attrib.get("yMin"), code)
+        x_max = _parse_finite_number(element.attrib.get("xMax"), code)
+        y_max = _parse_finite_number(element.attrib.get("yMax"), code)
+        epsilon = BBOX_COORDINATE_EPSILON_POINTS
+        width_float = float(width)
+        height_float = float(height)
+        if (
+            x_max <= x_min
+            or y_max <= y_min
+            or x_min < -epsilon
+            or y_min < -epsilon
+            or x_max > width_float + epsilon
+            or y_max > height_float + epsilon
+        ):
+            raise HarnessError(code)
+        return (
+            min(width_float, max(0.0, x_min)),
+            min(height_float, max(0.0, y_min)),
+            min(width_float, max(0.0, x_max)),
+            min(height_float, max(0.0, y_max)),
         )
-        height = _parse_finite_number(
-            page_element.attrib.get("height"), "semantic_bbox_page_geometry"
-        )
-        if width <= 0 or height <= 0:
+
+    def page_dimension(value: object) -> Fraction:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(PDFINFO_DECIMAL, value) is None
+        ):
             raise HarnessError("semantic_bbox_page_geometry")
-        if width > 1_000_000 or height > 1_000_000:
+        result = Fraction(value)
+        if result <= 0 or result > 1_000_000:
             raise HarnessError("semantic_bbox_page_geometry")
-        words: list[SemanticTextBox] = []
-        for element in page_element.iter():
-            if _xml_local_name(element.tag) != "word":
+        return result
+
+    try:
+        parser = ET.iterparse(io.BytesIO(payload), events=("start", "end"))
+        for event, element in parser:
+            name = _xml_local_name(element.tag)
+            if event == "start":
+                element_count += 1
+                if element_count > max_elements:
+                    raise HarnessError("semantic_bbox_element_limit")
+                parent = stack[-1] if stack else None
+                if active_word:
+                    raise HarnessError("semantic_bbox_word_markup")
+                if parent == "line" and name != "word":
+                    raise HarnessError("semantic_bbox_line_markup")
+                if name == "page":
+                    if current_page is not None:
+                        raise HarnessError("semantic_bbox_page_markup")
+                    width = page_dimension(element.attrib.get("width"))
+                    height = page_dimension(element.attrib.get("height"))
+                    current_page = {
+                        "width": width,
+                        "height": height,
+                        "words": [],
+                        "lines": [],
+                    }
+                elif name == "line":
+                    line_count += 1
+                    if (
+                        line_count > max_lines
+                        or current_page is None
+                        or current_line is not None
+                    ):
+                        raise HarnessError("semantic_bbox_line_limit")
+                    current_line = {"element": element, "tokens": []}
+                elif name == "word":
+                    word_count += 1
+                    if (
+                        word_count > max_words
+                        or current_page is None
+                        or current_line is None
+                        or parent != "line"
+                    ):
+                        raise HarnessError("semantic_bbox_word_limit")
+                    active_word = True
+                stack.append(name)
                 continue
-            if list(element):
-                raise HarnessError("semantic_bbox_word_markup")
-            text = "".join(element.itertext())
-            raw_codepoints += len(text)
-            if raw_codepoints > max_codepoints * 4:
-                raise HarnessError("semantic_raw_codepoint_limit")
-            tokens = normalize_semantic_tokens(
-                text,
-                max_codepoints=max_codepoints - codepoints_used,
-                max_tokens=max_tokens - tokens_used,
-            )
-            codepoints_used += sum(len(token) for token in tokens)
-            tokens_used += len(tokens)
-            if not tokens:
-                continue
-            x_min = _parse_finite_number(
-                element.attrib.get("xMin"), "semantic_bbox_word_geometry"
-            )
-            y_min = _parse_finite_number(
-                element.attrib.get("yMin"), "semantic_bbox_word_geometry"
-            )
-            x_max = _parse_finite_number(
-                element.attrib.get("xMax"), "semantic_bbox_word_geometry"
-            )
-            y_max = _parse_finite_number(
-                element.attrib.get("yMax"), "semantic_bbox_word_geometry"
-            )
-            epsilon = BBOX_COORDINATE_EPSILON_POINTS
-            if (
-                x_max <= x_min
-                or y_max <= y_min
-                or x_min < -epsilon
-                or y_min < -epsilon
-                or x_max > width + epsilon
-                or y_max > height + epsilon
-            ):
-                raise HarnessError("semantic_bbox_word_geometry")
-            words.append(
-                SemanticTextBox(
-                    tokens,
-                    (
-                        min(width, max(0.0, x_min)),
-                        min(height, max(0.0, y_min)),
-                        min(width, max(0.0, x_max)),
-                        min(height, max(0.0, y_max)),
-                    ),
+
+            if not stack or stack[-1] != name:
+                raise HarnessError("semantic_bbox_invalid_xml")
+            if name == "word":
+                if current_page is None or current_line is None or not active_word:
+                    raise HarnessError("semantic_bbox_word_markup")
+                text = "".join(element.itertext())
+                raw_codepoints += len(text)
+                if raw_codepoints > max_codepoints * 4:
+                    raise HarnessError("semantic_raw_codepoint_limit")
+                tokens = normalize_semantic_tokens(
+                    text,
+                    max_codepoints=max_codepoints - codepoints_used,
+                    max_tokens=max_tokens - tokens_used,
                 )
-            )
-        pages.append(PdfTextPage(width, height, tuple(words)))
+                codepoints_used += sum(len(token) for token in tokens)
+                tokens_used += len(tokens)
+                if tokens:
+                    word_box = parse_box(
+                        element,
+                        width=current_page["width"],
+                        height=current_page["height"],
+                        code="semantic_bbox_word_geometry",
+                    )
+                    words = current_page["words"]
+                    line_tokens = current_line["tokens"]
+                    assert isinstance(words, list) and isinstance(line_tokens, list)
+                    words.append(SemanticTextBox(tokens, word_box))
+                    line_tokens.extend(tokens)
+                active_word = False
+            elif name == "line":
+                if current_page is None or current_line is None:
+                    raise HarnessError("semantic_bbox_line_markup")
+                line_tokens = current_line["tokens"]
+                assert isinstance(line_tokens, list)
+                if line_tokens:
+                    line_element = current_line["element"]
+                    assert isinstance(line_element, ET.Element)
+                    lines = current_page["lines"]
+                    assert isinstance(lines, list)
+                    lines.append(
+                        SemanticTextBox(
+                            tuple(line_tokens),
+                            parse_box(
+                                line_element,
+                                width=current_page["width"],
+                                height=current_page["height"],
+                                code="semantic_bbox_line_geometry",
+                            ),
+                        )
+                    )
+                current_line = None
+            elif name == "page":
+                if current_page is None or current_line is not None or active_word:
+                    raise HarnessError("semantic_bbox_page_markup")
+                width = current_page["width"]
+                height = current_page["height"]
+                words = current_page["words"]
+                lines = current_page["lines"]
+                assert isinstance(width, Fraction) and isinstance(height, Fraction)
+                assert isinstance(words, list) and isinstance(lines, list)
+                pages.append(
+                    PdfTextPage(width, height, tuple(words), tuple(lines))
+                )
+                if len(pages) > expected_pages:
+                    raise HarnessError("semantic_bbox_page_count")
+                current_page = None
+            stack.pop()
+            element.clear()
+    except HarnessError:
+        raise
+    except ET.ParseError as error:
+        raise HarnessError("semantic_bbox_invalid_xml") from error
+
+    if (
+        len(pages) != expected_pages
+        or current_page is not None
+        or current_line is not None
+        or active_word
+        or stack
+    ):
+        raise HarnessError("semantic_bbox_page_count")
     return tuple(pages)
 
 
@@ -3597,49 +4404,87 @@ def _histogram_nearest_rank(
 
 
 def _text_box_numeric_evidence(
-    candidates: int,
+    rxls_items: int,
+    libreoffice_items: int,
     matched: int,
     ambiguous: int,
-    unmatched: int,
+    rxls_unmatched: int,
+    libreoffice_unmatched: int,
     histogram: Counter[int],
+    *,
+    prefix: str = "text_box",
 ) -> dict[str, object]:
+    if prefix not in {"text_box", "text_line_box"}:
+        raise HarnessError("text_box_prefix")
     if (
-        min(candidates, matched, ambiguous, unmatched) < 0
-        or candidates != matched + ambiguous + unmatched
+        min(
+            rxls_items,
+            libreoffice_items,
+            matched,
+            ambiguous,
+            rxls_unmatched,
+            libreoffice_unmatched,
+        )
+        < 0
+        or rxls_items != matched + ambiguous + rxls_unmatched
+        or libreoffice_items != matched + libreoffice_unmatched
         or sum(histogram.values()) != matched
         or any(error < 0 or count <= 0 for error, count in histogram.items())
     ):
         raise HarnessError("text_box_histogram")
+    both_empty = rxls_items == 0 and libreoffice_items == 0
+    precision = _ratio_ppm(
+        matched,
+        rxls_items,
+        empty=1_000_000 if both_empty else 0,
+    )
+    recall = _ratio_ppm(
+        matched,
+        libreoffice_items,
+        empty=1_000_000 if both_empty else 0,
+    )
+    f1 = _ratio_ppm(
+        2 * matched,
+        rxls_items + libreoffice_items,
+        empty=1_000_000,
+    )
     return {
-        "text_box_candidate_items": candidates,
-        "text_box_matched_items": matched,
-        "text_box_ambiguous_items": ambiguous,
-        "text_box_unmatched_items": unmatched,
-        "text_box_match_coverage_ppm": _ratio_ppm(
-            matched, candidates, empty=1_000_000
-        ),
-        "text_box_error_histogram_millipoints": [
+        # candidate/unmatched remain as compatibility aliases for the rxls side.
+        f"{prefix}_candidate_items": rxls_items,
+        f"{prefix}_rxls_items": rxls_items,
+        f"{prefix}_libreoffice_items": libreoffice_items,
+        f"{prefix}_matched_items": matched,
+        f"{prefix}_ambiguous_items": ambiguous,
+        f"{prefix}_unmatched_items": rxls_unmatched,
+        f"{prefix}_rxls_unmatched_items": rxls_unmatched,
+        f"{prefix}_libreoffice_unmatched_items": libreoffice_unmatched,
+        f"{prefix}_match_coverage_ppm": precision,
+        f"{prefix}_precision_ppm": precision,
+        f"{prefix}_recall_ppm": recall,
+        f"{prefix}_f1_ppm": f1,
+        f"{prefix}_error_histogram_millipoints": [
             {"error_millipoints": error, "count": count}
             for error, count in sorted(histogram.items())
         ],
-        "text_box_median_error_millipoints": _histogram_nearest_rank(
+        f"{prefix}_median_error_millipoints": _histogram_nearest_rank(
             histogram, 1, 2
         ),
-        "text_box_p95_error_millipoints": _histogram_nearest_rank(
+        f"{prefix}_p95_error_millipoints": _histogram_nearest_rank(
             histogram, 95, 100
         ),
     }
 
 
-def text_box_metrics(
-    rxls: SvgSemanticEvidence,
-    libreoffice: PdfTextPage,
+def _paired_text_box_metrics(
+    rxls_boxes: Sequence[SemanticTextBox],
+    libreoffice_boxes: Sequence[SemanticTextBox],
     *,
+    prefix: str,
     max_match_work: int = MAX_TEXT_BOX_MATCH_WORK,
 ) -> dict[str, object]:
-    """Match exact labels to unique nearest Poppler boxes and discard content."""
-    lo_tokens = [word.tokens for word in libreoffice.words]
-    lo_boxes = [word.bbox_points for word in libreoffice.words]
+    """Match one Poppler box level to the same level from the other PDF."""
+    lo_tokens = [box.tokens for box in libreoffice_boxes]
+    lo_boxes = [box.bbox_points for box in libreoffice_boxes]
     starts_by_token: dict[str, list[int]] = {}
     for index, tokens in enumerate(lo_tokens):
         starts_by_token.setdefault(tokens[0], []).append(index)
@@ -3647,34 +4492,22 @@ def text_box_metrics(
     used = [False] * len(lo_tokens)
     matched = 0
     ambiguous = 0
-    unmatched = rxls.unbounded_items
+    unmatched = 0
     histogram: Counter[int] = Counter()
     work = 0
-    for box in rxls.boxes:
+    for box in rxls_boxes:
         candidates: list[
-            tuple[float, int, int, tuple[float, float, float, float]]
+            tuple[float, int, tuple[float, float, float, float]]
         ] = []
         for start in starts_by_token.get(box.tokens[0], ()):
             if used[start]:
                 continue
-            accumulated: list[str] = []
-            end = start
-            while end < len(lo_tokens) and len(accumulated) < len(box.tokens):
-                work += 1
-                if work > max_match_work:
-                    raise HarnessError("text_box_match_work_limit")
-                if used[end]:
-                    break
-                accumulated.extend(lo_tokens[end])
-                end += 1
-            if tuple(accumulated) != box.tokens:
+            work += 1
+            if work > max_match_work:
+                raise HarnessError("text_box_match_work_limit")
+            if lo_tokens[start] != box.tokens:
                 continue
-            candidate_box = (
-                min(value[0] for value in lo_boxes[start:end]),
-                min(value[1] for value in lo_boxes[start:end]),
-                max(value[2] for value in lo_boxes[start:end]),
-                max(value[3] for value in lo_boxes[start:end]),
-            )
+            candidate_box = lo_boxes[start]
             rxls_center = (
                 (box.bbox_points[0] + box.bbox_points[2]) / 2.0,
                 (box.bbox_points[1] + box.bbox_points[3]) / 2.0,
@@ -3686,11 +4519,11 @@ def text_box_metrics(
             distance = (rxls_center[0] - lo_center[0]) ** 2 + (
                 rxls_center[1] - lo_center[1]
             ) ** 2
-            candidates.append((distance, start, end, candidate_box))
+            candidates.append((distance, start, candidate_box))
         if not candidates:
             unmatched += 1
             continue
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        candidates.sort(key=lambda item: (item[0], item[1]))
         if len(candidates) > 1 and math.isclose(
             candidates[0][0],
             candidates[1][0],
@@ -3699,8 +4532,8 @@ def text_box_metrics(
         ):
             ambiguous += 1
             continue
-        _, start, end, candidate_box = candidates[0]
-        used[start:end] = [True] * (end - start)
+        _, start, candidate_box = candidates[0]
+        used[start] = True
         error_points = max(
             abs(left - right)
             for left, right in zip(box.bbox_points, candidate_box)
@@ -3709,11 +4542,44 @@ def text_box_metrics(
         histogram[error_millipoints] += 1
         matched += 1
     return _text_box_numeric_evidence(
-        len(rxls.boxes) + rxls.unbounded_items,
+        len(rxls_boxes),
+        len(libreoffice_boxes),
         matched,
         ambiguous,
         unmatched,
+        len(libreoffice_boxes) - matched,
         histogram,
+        prefix=prefix,
+    )
+
+
+def text_box_metrics(
+    rxls: PdfTextPage,
+    libreoffice: PdfTextPage,
+    *,
+    max_match_work: int = MAX_TEXT_BOX_MATCH_WORK,
+) -> dict[str, object]:
+    """Compare nominal word boxes extracted by the same Poppler invocation."""
+    return _paired_text_box_metrics(
+        rxls.words,
+        libreoffice.words,
+        prefix="text_box",
+        max_match_work=max_match_work,
+    )
+
+
+def text_line_box_metrics(
+    rxls: PdfTextPage,
+    libreoffice: PdfTextPage,
+    *,
+    max_match_work: int = MAX_TEXT_BOX_MATCH_WORK,
+) -> dict[str, object]:
+    """Compare nominal line boxes extracted by the same Poppler invocation."""
+    return _paired_text_box_metrics(
+        rxls.lines,
+        libreoffice.lines,
+        prefix="text_line_box",
+        max_match_work=max_match_work,
     )
 
 
@@ -3883,6 +4749,9 @@ def _run_pdf_bbox_extractor(
         env=text_env,
         timeout_seconds=config.caps.timeout_seconds,
         output_limit_bytes=config.caps.max_command_output_bytes,
+        file_output_roots=(output,),
+        file_output_limit_bytes=config.caps.max_svg_bytes,
+        file_output_count_limit=1,
     )
 
 
@@ -3933,6 +4802,10 @@ def _run_poppler_pdf_rasterizer(
         detailed_pages, sizes = parse_pdfinfo(
             details.stdout.decode("utf-8", "replace"), require_all_sizes=True
         )
+        geometries = parse_pdfinfo_page_geometries(
+            details.stdout.decode("utf-8", "replace"),
+            expected_pages=pages,
+        )
     except HarnessError:
         return _poppler_failure(24, "pdfinfo_invalid")
     if detailed_pages != pages:
@@ -3955,6 +4828,9 @@ def _run_poppler_pdf_rasterizer(
         env=poppler_env,
         timeout_seconds=config.caps.timeout_seconds,
         output_limit_bytes=config.caps.max_command_output_bytes,
+        file_output_roots=(output_dir,),
+        file_output_limit_bytes=config.caps.max_artifact_bytes,
+        file_output_count_limit=config.caps.max_pages,
     )
     if result.status != "ok":
         return result, None
@@ -3974,7 +4850,12 @@ def _run_poppler_pdf_rasterizer(
         total_output += target.stat().st_size
         if total_output > config.caps.max_artifact_bytes:
             return _poppler_failure(23, "libreoffice_raster_output_limit")
-        rows.append({"file": target.name})
+        rows.append(
+            {
+                "file": target.name,
+                "point_geometry": _pdf_geometry_evidence(geometries[offset]),
+            }
+        )
     payload = json.dumps({"pages": rows}, sort_keys=True, separators=(",", ":")).encode()
     return CommandResult("ok", 0, payload, result.stderr), {"pages": rows}
 
@@ -5037,6 +5918,20 @@ def aggregate_page_metrics(
             "height": stacked_height,
         },
     }
+    point_geometry_presence = [
+        "pdf_point_geometry" in page for page in pages
+    ]
+    if any(point_geometry_presence) and not all(point_geometry_presence):
+        raise HarnessError("pdf_point_geometry_incomplete")
+    evidence.update(
+        _aggregate_pdf_point_geometry(pages)
+        if all(point_geometry_presence)
+        else {
+            "pdf_point_geometry_mismatches": 0,
+            "max_pdf_point_geometry_delta_millipoints": 0,
+            "max_pdf_xhtml_crosscheck_delta_micropoints": 0,
+        }
+    )
     for prefix, geometry in (
         ("foreground", True),
         ("edge", False),
@@ -5115,31 +6010,40 @@ def aggregate_page_metrics(
                 ),
             }
         )
-    text_box_presence = ["text_box_candidate_items" in page for page in pages]
-    if any(text_box_presence) and not all(text_box_presence):
-        raise HarnessError("text_box_metrics_incomplete")
-    if all(text_box_presence):
-        candidates = 0
+    for box_prefix in ("text_box", "text_line_box"):
+        box_presence = [
+            f"{box_prefix}_candidate_items" in page for page in pages
+        ]
+        if any(box_presence) and not all(box_presence):
+            raise HarnessError(f"{box_prefix}_metrics_incomplete")
+        if not all(box_presence):
+            continue
+        rxls_items = 0
+        libreoffice_items = 0
         matched = 0
         ambiguous = 0
-        unmatched = 0
+        rxls_unmatched = 0
+        libreoffice_unmatched = 0
         histogram: Counter[int] = Counter()
         for page in pages:
-            values = []
-            for key in (
-                "text_box_candidate_items",
-                "text_box_matched_items",
-                "text_box_ambiguous_items",
-                "text_box_unmatched_items",
+            values: dict[str, int] = {}
+            for suffix in (
+                "candidate_items",
+                "rxls_items",
+                "libreoffice_items",
+                "matched_items",
+                "ambiguous_items",
+                "unmatched_items",
+                "rxls_unmatched_items",
+                "libreoffice_unmatched_items",
             ):
-                value = page.get(key)
+                value = page.get(f"{box_prefix}_{suffix}")
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise HarnessError("text_box_metrics")
-                values.append(value)
-            page_candidates, page_matched, page_ambiguous, page_unmatched = values
-            rows = page.get("text_box_error_histogram_millipoints")
+                    raise HarnessError(f"{box_prefix}_metrics")
+                values[suffix] = value
+            rows = page.get(f"{box_prefix}_error_histogram_millipoints")
             if not isinstance(rows, list):
-                raise HarnessError("text_box_histogram")
+                raise HarnessError(f"{box_prefix}_histogram")
             page_histogram: Counter[int] = Counter()
             previous = -1
             for row in rows:
@@ -5147,7 +6051,7 @@ def aggregate_page_metrics(
                     "error_millipoints",
                     "count",
                 }:
-                    raise HarnessError("text_box_histogram")
+                    raise HarnessError(f"{box_prefix}_histogram")
                 error = row["error_millipoints"]
                 count = row["count"]
                 if (
@@ -5158,23 +6062,45 @@ def aggregate_page_metrics(
                     or not isinstance(count, int)
                     or count <= 0
                 ):
-                    raise HarnessError("text_box_histogram")
+                    raise HarnessError(f"{box_prefix}_histogram")
                 previous = error
                 page_histogram[error] = count
+            expected = _text_box_numeric_evidence(
+                values["rxls_items"],
+                values["libreoffice_items"],
+                values["matched_items"],
+                values["ambiguous_items"],
+                values["rxls_unmatched_items"],
+                values["libreoffice_unmatched_items"],
+                page_histogram,
+                prefix=box_prefix,
+            )
             if (
-                page_candidates
-                != page_matched + page_ambiguous + page_unmatched
-                or sum(page_histogram.values()) != page_matched
+                values["candidate_items"] != values["rxls_items"]
+                or values["unmatched_items"] != values["rxls_unmatched_items"]
+                or any(
+                    page.get(key) != expected_value
+                    for key, expected_value in expected.items()
+                )
             ):
-                raise HarnessError("text_box_metrics")
-            candidates += page_candidates
-            matched += page_matched
-            ambiguous += page_ambiguous
-            unmatched += page_unmatched
+                raise HarnessError(f"{box_prefix}_metrics")
+            rxls_items += values["rxls_items"]
+            libreoffice_items += values["libreoffice_items"]
+            matched += values["matched_items"]
+            ambiguous += values["ambiguous_items"]
+            rxls_unmatched += values["rxls_unmatched_items"]
+            libreoffice_unmatched += values["libreoffice_unmatched_items"]
             histogram.update(page_histogram)
         evidence.update(
             _text_box_numeric_evidence(
-                candidates, matched, ambiguous, unmatched, histogram
+                rxls_items,
+                libreoffice_items,
+                matched,
+                ambiguous,
+                rxls_unmatched,
+                libreoffice_unmatched,
+                histogram,
+                prefix=box_prefix,
             )
         )
     return evidence
@@ -5485,7 +6411,8 @@ def evaluate_case(
         if config.print_mode == PRINT_MODE_SINGLE_PAGE:
             planned_rxls.append("--single-page-sheets")
         else:
-            planned_rxls.extend(("--print-layout", "--print-backends", "svg"))
+            planned_rxls.append("--print-layout")
+        planned_rxls.extend(("--print-backends", "svg,pdf"))
         planned_rxls.extend(("--output-dir", "<output-dir>"))
         if config.libreoffice_command is not None:
             planned_lo = normalized_command(
@@ -5552,6 +6479,9 @@ def evaluate_case(
         env=env,
         timeout_seconds=config.caps.timeout_seconds,
         output_limit_bytes=config.caps.max_command_output_bytes,
+        file_output_roots=(bundle_dir,),
+        file_output_limit_bytes=config.caps.max_artifact_bytes,
+        file_output_count_limit=MAX_ARTIFACT_FILES,
     )
     rxls_fact = command_fact(rxls_result)
     rxls_failure = _command_failure("renderer", rxls_result)
@@ -5580,7 +6510,9 @@ def evaluate_case(
         )
     scene_evidence = [
         {
-            "sheet_index": page.index,
+            "source_sheet_index": page.source_sheet_index,
+            "source_pdf_page_index": page.source_pdf_page_index,
+            "oracle_output_page_index": page.oracle_output_page_index,
             "sha256": page.scene_sha256,
             "warnings": [
                 {
@@ -5619,6 +6551,9 @@ def evaluate_case(
         env=env,
         timeout_seconds=config.caps.timeout_seconds,
         output_limit_bytes=config.caps.max_command_output_bytes,
+        file_output_roots=(libreoffice_dir,),
+        file_output_limit_bytes=config.caps.max_artifact_bytes,
+        file_output_count_limit=MAX_ARTIFACT_FILES,
     )
     lo_fact = command_fact(lo_result)
     commands = {"rxls": rxls_fact, "libreoffice": lo_fact}
@@ -5709,7 +6644,7 @@ def evaluate_case(
         if font_attestation["matched_font_objects"] != font_attestation["font_objects"]:
             return _classified(
                 base,
-                "different",
+                "error",
                 "libreoffice_font_pack_mismatch",
                 renderer=bundle.renderer,
                 scenes=scene_evidence,
@@ -5751,7 +6686,9 @@ def evaluate_case(
         return _classified(base, "error", "authored_print_no_visible_pages")
     scene_evidence = [
         {
-            "sheet_index": output_index,
+            "source_sheet_index": page.source_sheet_index,
+            "source_pdf_page_index": page.source_pdf_page_index,
+            "oracle_output_page_index": page.oracle_output_page_index,
             "sha256": page.scene_sha256,
             "warnings": [
                 {
@@ -5762,35 +6699,324 @@ def evaluate_case(
                 for code, occurrences, first_cell in page.warnings
             ],
         }
-        for output_index, page in enumerate(comparison_pages)
+        for page in comparison_pages
     ]
-    rxls_pngs = []
-    raster_facts = []
+    rxls_pngs: list[Path | None] = [None] * len(comparison_pages)
+    rxls_raster_rows: list[dict[str, object] | None] = [None] * len(
+        comparison_pages
+    )
+    rxls_text_box_pages: list[PdfTextPage | None] = [None] * len(comparison_pages)
+    raster_facts: list[dict[str, object]] = []
+    rxls_bbox_facts: list[dict[str, object]] = []
+    native_font_facts: list[dict[str, object]] = []
+    native_attestations: list[dict[str, object]] = []
+    native_pdf_syntax = {
+        "actual_text_documents": 0,
+        "charprocs_documents": 0,
+        "type3_documents": 0,
+    }
+    pdf_groups: dict[Path, list[tuple[int, int]]] = {}
     for output_index, page in enumerate(comparison_pages):
-        output = rxls_raster_dir / f"page-{output_index:04d}.png"
-        result = _run_svg_rasterizer(
-            page,
-            output,
+        if (
+            page.pdf_path is None
+            or page.source_pdf_page_index is None
+            or page.oracle_output_page_index != output_index
+        ):
+            return _classified(
+                base,
+                "error",
+                "renderer_print_pdf_missing",
+                renderer=bundle.renderer,
+                commands=commands,
+            )
+        pdf_groups.setdefault(page.pdf_path, []).append(
+            (output_index, page.source_pdf_page_index)
+        )
+
+    rxls_bbox_codepoints = 0
+    rxls_bbox_tokens = 0
+    for document_index, (rxls_pdf, mappings) in enumerate(pdf_groups.items()):
+        local_indexes = [local_index for _, local_index in mappings]
+        expected_local_indexes = list(range(len(mappings)))
+        if local_indexes != expected_local_indexes:
+            return _classified(
+                base,
+                "error",
+                "renderer_print_pdf_page_map",
+                renderer=bundle.renderer,
+                commands=commands,
+            )
+        if config.require_font_pack:
+            native_font_result = _run_pdf_font_inspector(
+                rxls_pdf,
+                config=config,
+                runner=runner,
+                cwd=job,
+                env=env,
+            )
+            native_font_facts.append(
+                {
+                    **command_fact(native_font_result),
+                    "backend": "poppler_pdffonts",
+                    "source": "rxls_pdf",
+                }
+            )
+            native_font_failure = _command_failure(
+                "renderer_pdf_font_inspector", native_font_result
+            )
+            if native_font_failure:
+                return _classified(
+                    base,
+                    "error",
+                    native_font_failure,
+                    renderer=bundle.renderer,
+                    scenes=scene_evidence,
+                    commands=commands,
+                    native_pdf_font_commands=native_font_facts,
+                )
+            try:
+                records = parse_pdffonts_output(
+                    native_font_result.stdout,
+                    max_bytes=config.caps.max_command_output_bytes,
+                )
+                native_attestations.append(attest_native_pdf_fonts(records))
+                pdf_payload = rxls_pdf.read_bytes()
+                if len(pdf_payload) > config.caps.max_artifact_bytes:
+                    raise HarnessError("renderer_pdf_output_limit")
+                native_pdf_syntax["actual_text_documents"] += int(
+                    b"/ActualText" in pdf_payload
+                )
+                native_pdf_syntax["charprocs_documents"] += int(
+                    b"/CharProcs" in pdf_payload
+                )
+                native_pdf_syntax["type3_documents"] += int(
+                    b"/Subtype /Type3" in pdf_payload
+                )
+            except (OSError, HarnessError) as error:
+                classification = (
+                    str(error)
+                    if isinstance(error, HarnessError)
+                    else "renderer_pdf_unreadable"
+                )
+                return _classified(
+                    base,
+                    "error",
+                    classification,
+                    renderer=bundle.renderer,
+                    scenes=scene_evidence,
+                    commands=commands,
+                    native_pdf_font_commands=native_font_facts,
+                )
+        output_dir = rxls_raster_dir / f"document-{document_index:04d}"
+        output_dir.mkdir()
+        result, manifest = _run_pdf_rasterizer(
+            rxls_pdf,
+            output_dir,
             config=config,
             backends=backends,
             runner=runner,
             cwd=job,
             env=env,
         )
-        raster_facts.append(command_fact(result))
-        failure = _command_failure("svg_rasterizer", result)
-        if failure:
+        raster_facts.append(
+            {
+                **command_fact(result),
+                "backend": "poppler_pdftoppm",
+                "source": "rxls_pdf",
+            }
+        )
+        if result.status != "ok":
+            code_by_return = {
+                20: "renderer_pdf_page_limit",
+                21: "renderer_pdf_page_pixel_limit",
+                22: "renderer_pdf_total_pixel_limit",
+                23: "renderer_pdf_raster_output_limit",
+            }
+            classification = code_by_return.get(
+                result.returncode,
+                _command_failure("renderer_pdf_rasterizer", result)
+                or "renderer_pdf_rasterizer_failed",
+            )
             return _classified(
                 base,
                 "error",
-                failure,
+                classification,
                 renderer=bundle.renderer,
                 commands=commands,
                 raster_commands=raster_facts,
             )
-        if not output.is_file():
-            return _classified(base, "error", "svg_raster_missing", commands=commands)
-        rxls_pngs.append(output)
+        if (
+            manifest is None
+            or not isinstance(manifest.get("pages"), list)
+            or len(manifest["pages"]) != len(mappings)
+        ):
+            return _classified(
+                base,
+                "error",
+                "renderer_pdf_page_count",
+                renderer=bundle.renderer,
+                commands=commands,
+                raster_commands=raster_facts,
+            )
+        for local_index, row in enumerate(manifest["pages"]):
+            expected = f"page-{local_index:04d}.png"
+            path = output_dir / expected
+            if (
+                not isinstance(row, dict)
+                or row.get("file") != expected
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                return _classified(
+                    base,
+                    "error",
+                    "renderer_pdf_raster_manifest_invalid",
+                    renderer=bundle.renderer,
+                    commands=commands,
+                    raster_commands=raster_facts,
+                )
+            rxls_pngs[mappings[local_index][0]] = path
+            rxls_raster_rows[mappings[local_index][0]] = row
+
+        bbox_output = job / f"rxls-pdftotext-bbox-{document_index:04d}.xhtml"
+        bbox_result = _run_pdf_bbox_extractor(
+            rxls_pdf,
+            len(mappings),
+            bbox_output,
+            config=config,
+            runner=runner,
+            cwd=job,
+            env=env,
+        )
+        rxls_bbox_facts.append(
+            {
+                **command_fact(bbox_result),
+                "backend": "poppler_pdftotext_bbox_layout",
+                "source": "rxls_pdf",
+            }
+        )
+        bbox_failure = _command_failure("renderer_semantic_bbox", bbox_result)
+        if bbox_failure:
+            return _classified(
+                base,
+                "error",
+                bbox_failure,
+                renderer=bundle.renderer,
+                scenes=scene_evidence,
+                commands=commands,
+                raster_commands=raster_facts,
+                text_box_commands={"rxls": rxls_bbox_facts},
+            )
+        try:
+            if bbox_output.is_symlink() or not bbox_output.is_file():
+                raise HarnessError("renderer_semantic_bbox_output_missing")
+            bbox_payload = bbox_output.read_bytes()
+            parsed_pages = parse_pdftotext_bbox_pages(
+                bbox_payload,
+                expected_pages=len(mappings),
+                max_bytes=config.caps.max_svg_bytes,
+                max_codepoints=(
+                    config.caps.max_semantic_codepoints - rxls_bbox_codepoints
+                ),
+                max_tokens=config.caps.max_semantic_tokens - rxls_bbox_tokens,
+                max_elements=config.caps.max_bbox_xml_elements,
+                max_lines=config.caps.max_bbox_lines,
+                max_words=config.caps.max_bbox_words,
+            )
+            for local_index, parsed in enumerate(parsed_pages):
+                rxls_bbox_codepoints += sum(
+                    len(token) for word in parsed.words for token in word.tokens
+                )
+                rxls_bbox_tokens += sum(len(word.tokens) for word in parsed.words)
+                rxls_text_box_pages[mappings[local_index][0]] = parsed
+        except (OSError, HarnessError) as error:
+            classification = (
+                str(error)
+                if isinstance(error, HarnessError)
+                else "renderer_semantic_bbox_unreadable"
+            )
+            return _classified(
+                base,
+                "error",
+                classification,
+                renderer=bundle.renderer,
+                scenes=scene_evidence,
+                commands=commands,
+                raster_commands=raster_facts,
+                text_box_commands={"rxls": rxls_bbox_facts},
+            )
+
+    if (
+        any(path is None for path in rxls_pngs)
+        or any(row is None for row in rxls_raster_rows)
+        or any(
+        page is None for page in rxls_text_box_pages
+        )
+    ):
+        return _classified(
+            base,
+            "error",
+            "renderer_pdf_page_map",
+            renderer=bundle.renderer,
+            commands=commands,
+            raster_commands=raster_facts,
+            text_box_commands={"rxls": rxls_bbox_facts},
+        )
+    resolved_rxls_pngs = [path for path in rxls_pngs if path is not None]
+    resolved_rxls_raster_rows = [
+        row for row in rxls_raster_rows if row is not None
+    ]
+    resolved_rxls_text_box_pages = [
+        page for page in rxls_text_box_pages if page is not None
+    ]
+    native_pdf_attestation: dict[str, object] | None = None
+    if config.require_font_pack:
+        documents = len(pdf_groups)
+        if (
+            len(native_attestations) != documents
+            or any(value != documents for value in native_pdf_syntax.values())
+        ):
+            return _classified(
+                base,
+                "error",
+                "renderer_pdf_type3_path_text_missing",
+                renderer=bundle.renderer,
+                scenes=scene_evidence,
+                commands=commands,
+                native_pdf_font_commands=native_font_facts,
+            )
+        native_pdf_attestation = {
+            "actual_text_documents": native_pdf_syntax["actual_text_documents"],
+            "charprocs_documents": native_pdf_syntax["charprocs_documents"],
+            "documents": documents,
+            "embedded_font_objects": sum(
+                int(row["embedded_font_objects"]) for row in native_attestations
+            ),
+            "font_objects": sum(
+                int(row["font_objects"]) for row in native_attestations
+            ),
+            "identity_set_sha256": hashlib.sha256(
+                (
+                    "\n".join(
+                        sorted(
+                            str(row["normalized_identities_sha256"])
+                            for row in native_attestations
+                        )
+                    )
+                    + "\n"
+                ).encode("ascii")
+            ).hexdigest(),
+            "subset_font_objects": sum(
+                int(row["subset_font_objects"]) for row in native_attestations
+            ),
+            "type3_documents": native_pdf_syntax["type3_documents"],
+            "type3_font_objects": sum(
+                int(row["type3_font_objects"]) for row in native_attestations
+            ),
+            "unicode_font_objects": sum(
+                int(row["unicode_font_objects"]) for row in native_attestations
+            ),
+        }
 
     pdf_result, pdf_manifest = _run_pdf_rasterizer(
         pdf,
@@ -5801,7 +7027,13 @@ def evaluate_case(
         cwd=job,
         env=env,
     )
-    raster_facts.append(command_fact(pdf_result))
+    raster_facts.append(
+        {
+            **command_fact(pdf_result),
+            "backend": "poppler_pdftoppm",
+            "source": "libreoffice_pdf",
+        }
+    )
     if pdf_result.status != "ok":
         code_by_return = {
             20: "libreoffice_page_limit",
@@ -5867,7 +7099,11 @@ def evaluate_case(
         cwd=job,
         env=env,
     )
-    bbox_fact = command_fact(bbox_result)
+    bbox_fact = {
+        **command_fact(bbox_result),
+        "backend": "poppler_pdftotext_bbox_layout",
+        "source": "libreoffice_pdf",
+    }
     bbox_failure = _command_failure("semantic_bbox", bbox_result)
     if bbox_failure:
         return _classified(
@@ -5879,7 +7115,10 @@ def evaluate_case(
             commands=commands,
             raster_commands=raster_facts,
             semantic_command=text_fact,
-            text_box_command=bbox_fact,
+            text_box_commands={
+                "rxls": rxls_bbox_facts,
+                "libreoffice": bbox_fact,
+            },
         )
     try:
         if bbox_output.is_symlink() or not bbox_output.is_file():
@@ -5900,27 +7139,27 @@ def evaluate_case(
             max_bytes=config.caps.max_svg_bytes,
             max_codepoints=config.caps.max_semantic_codepoints,
             max_tokens=config.caps.max_semantic_tokens,
+            max_elements=config.caps.max_bbox_xml_elements,
+            max_lines=config.caps.max_bbox_lines,
+            max_words=config.caps.max_bbox_words,
         )
-        rxls_semantic_pages: list[SvgSemanticEvidence] = []
+        rxls_semantic_pages: list[tuple[str, ...]] = []
         rxls_codepoints_used = 0
         rxls_tokens_used = 0
-        rxls_path_tokens_used = 0
         for page in comparison_pages:
-            semantic_evidence = extract_svg_semantic_evidence(
+            semantic_tokens = extract_svg_semantic_tokens(
                 page.svg_path,
                 max_svg_bytes=config.caps.max_svg_bytes,
                 max_codepoints=(
                     config.caps.max_semantic_codepoints - rxls_codepoints_used
                 ),
                 max_tokens=config.caps.max_semantic_tokens - rxls_tokens_used,
-                max_path_tokens=MAX_SVG_PATH_TOKENS - rxls_path_tokens_used,
             )
             rxls_codepoints_used += sum(
-                len(token) for token in semantic_evidence.tokens
+                len(token) for token in semantic_tokens
             )
-            rxls_tokens_used += len(semantic_evidence.tokens)
-            rxls_path_tokens_used += semantic_evidence.path_tokens
-            rxls_semantic_pages.append(semantic_evidence)
+            rxls_tokens_used += len(semantic_tokens)
+            rxls_semantic_pages.append(semantic_tokens)
     except (OSError, HarnessError) as error:
         classification = (
             str(error) if isinstance(error, HarnessError) else "semantic_bbox_unreadable"
@@ -5934,7 +7173,10 @@ def evaluate_case(
             commands=commands,
             raster_commands=raster_facts,
             semantic_command=text_fact,
-            text_box_command=bbox_fact,
+            text_box_commands={
+                "rxls": rxls_bbox_facts,
+                "libreoffice": bbox_fact,
+            },
         )
 
     lo_pngs = []
@@ -5956,7 +7198,7 @@ def evaluate_case(
         total_pixels = 0
         total_metric_work_units = 0
         for page_offset, (page, rxls_png, lo_png) in enumerate(
-            zip(comparison_pages, rxls_pngs, lo_pngs)
+            zip(comparison_pages, resolved_rxls_pngs, lo_pngs)
         ):
             metrics = compare_pngs(
                 rxls_png,
@@ -5973,19 +7215,33 @@ def evaluate_case(
             if total_metric_work_units > config.caps.max_metric_work_units:
                 raise HarnessError("metric_work_limit")
             semantic = semantic_text_metrics(
-                rxls_semantic_pages[page_offset].tokens,
+                rxls_semantic_pages[page_offset],
                 libreoffice_semantic_pages[page_offset],
             )
             text_boxes = text_box_metrics(
-                rxls_semantic_pages[page_offset],
+                resolved_rxls_text_box_pages[page_offset],
+                libreoffice_text_box_pages[page_offset],
+            )
+            text_line_boxes = text_line_box_metrics(
+                resolved_rxls_text_box_pages[page_offset],
+                libreoffice_text_box_pages[page_offset],
+            )
+            point_geometry = pdf_point_geometry_metrics(
+                resolved_rxls_raster_rows[page_offset],
+                lo_rows[page_offset],
+                resolved_rxls_text_box_pages[page_offset],
                 libreoffice_text_box_pages[page_offset],
             )
             page_results.append(
                 {
-                    "sheet_index": page_offset,
+                    "source_sheet_index": page.source_sheet_index,
+                    "source_pdf_page_index": page.source_pdf_page_index,
+                    "oracle_output_page_index": page.oracle_output_page_index,
                     **metrics,
                     **semantic,
                     **text_boxes,
+                    **text_line_boxes,
+                    **point_geometry,
                 }
             )
         aggregate = aggregate_page_metrics(page_results)
@@ -6020,13 +7276,24 @@ def evaluate_case(
         metrics=aggregate,
         pages=page_results,
         artifacts={
-            "rxls_pages": len(rxls_pngs),
+            "rxls_pages": len(resolved_rxls_pngs),
             "libreoffice_pages": len(lo_pngs),
         },
         commands=commands,
         raster_commands=raster_facts,
         semantic_command=text_fact,
-        text_box_command=bbox_fact,
+        text_box_commands={
+            "rxls": rxls_bbox_facts,
+            "libreoffice": bbox_fact,
+        },
+        **(
+            {
+                "native_pdf_attestation": native_pdf_attestation,
+                "native_pdf_font_commands": native_font_facts,
+            }
+            if native_pdf_attestation is not None
+            else {}
+        ),
         **(
             {"font_attestation": font_attestation}
             if font_attestation is not None
@@ -6105,6 +7372,7 @@ def preflight(
                 "configured": False,
             }
         ),
+        "measurement_toolchain": config.poppler_identity,
         "oracle_lock": (
             {"configured": True, **oracle_evidence}
             if oracle_evidence is not None
@@ -6126,6 +7394,12 @@ SCORE_METRICS = (
     "semantic_codepoint_f1_ppm",
     "semantic_bigram_f1_ppm",
     "text_box_match_coverage_ppm",
+    "text_box_precision_ppm",
+    "text_box_recall_ppm",
+    "text_box_f1_ppm",
+    "text_line_box_precision_ppm",
+    "text_line_box_recall_ppm",
+    "text_line_box_f1_ppm",
     "edge_f1_ppm",
     "foreground_matched_color_similarity_ppm",
 )
@@ -6133,6 +7407,9 @@ DELTA_METRICS = (
     "page_dimension_mismatches",
     "max_page_width_delta_pixels",
     "max_page_height_delta_pixels",
+    "pdf_point_geometry_mismatches",
+    "max_pdf_point_geometry_delta_millipoints",
+    "max_pdf_xhtml_crosscheck_delta_micropoints",
     "foreground_bbox_alignment_max_delta_pixels",
     "foreground_centroid_distance_millipixels",
     "text_ink_bbox_alignment_max_delta_pixels",
@@ -6140,8 +7417,14 @@ DELTA_METRICS = (
     "semantic_page_mismatches",
     "text_box_ambiguous_items",
     "text_box_unmatched_items",
+    "text_box_libreoffice_unmatched_items",
     "text_box_median_error_millipoints",
     "text_box_p95_error_millipoints",
+    "text_line_box_ambiguous_items",
+    "text_line_box_unmatched_items",
+    "text_line_box_libreoffice_unmatched_items",
+    "text_line_box_median_error_millipoints",
+    "text_line_box_p95_error_millipoints",
 )
 
 
@@ -6258,8 +7541,11 @@ def run_harness(
 ) -> tuple[dict[str, object], int]:
     if config.print_mode not in PRINT_MODES:
         raise HarnessError("print_mode")
+    if config.svg_rasterizer_command is not None:
+        raise HarnessError("svg_rasterizer_command_retired")
     if config.print_mode == PRINT_MODE_AUTHORED and config.libreoffice_command is None:
         raise HarnessError("authored_print_requires_container_adapter")
+    _require_supported_font_pack_activation(config)
     backends = backends or Backends.detect(config.svg_rasterizer_command)
     runner = runner or BoundedCommandRunner()
     oracle_evidence = (
@@ -6275,7 +7561,6 @@ def run_harness(
     results = []
     total_input_bytes = 0
     with tempfile.TemporaryDirectory(prefix="rxls-render-parity-") as raw_work:
-        work_root = Path(raw_work)
         for index, case in enumerate(cases):
             size, _ = _safe_stat(case.path)
             if size is not None and total_input_bytes + size > config.caps.max_total_input_bytes:
@@ -6289,16 +7574,20 @@ def run_harness(
                 continue
             if size is not None:
                 total_input_bytes += size
-            results.append(
-                evaluate_case(
-                    case,
-                    index=index,
-                    work_root=work_root,
-                    config=config,
-                    backends=backends,
-                    runner=runner,
+            with tempfile.TemporaryDirectory(
+                prefix=f"case-{index:04d}-",
+                dir=raw_work,
+            ) as raw_case:
+                results.append(
+                    evaluate_case(
+                        case,
+                        index=index,
+                        work_root=Path(raw_case),
+                        config=config,
+                        backends=backends,
+                        runner=runner,
+                    )
                 )
-            )
 
     counts: dict[str, int] = {}
     classifications: dict[str, int] = {}
@@ -6349,6 +7638,7 @@ def run_harness(
                 "formats": list(config.format_filter),
                 "required_features": list(config.required_feature_filter),
             },
+            "manifest_binding": config.manifest_binding,
             "caps": {
                 "input_bytes": config.caps.max_input_bytes,
                 "total_input_bytes": config.caps.max_total_input_bytes,
@@ -6361,25 +7651,41 @@ def run_harness(
                 "metric_work_units": config.caps.max_metric_work_units,
                 "semantic_codepoints": config.caps.max_semantic_codepoints,
                 "semantic_tokens": config.caps.max_semantic_tokens,
+                "bbox_xml_elements": config.caps.max_bbox_xml_elements,
+                "bbox_lines": config.caps.max_bbox_lines,
+                "bbox_words": config.caps.max_bbox_words,
                 "timeout_milliseconds": int(config.caps.timeout_seconds * 1000),
             },
             "metric_policy": {
+                "contract_schema": METRIC_CONTRACT_SCHEMA,
+                "contract_version": 2,
                 "foreground_channel_threshold": FOREGROUND_CHANNEL_THRESHOLD,
                 "edge_luma_delta": EDGE_LUMA_DELTA,
                 "text_ink_max_luma": TEXT_INK_MAX_LUMA,
                 "mask_match_tolerance_pixels": 1,
                 "metric_work_units_per_pixel": METRIC_WORK_UNITS_PER_PIXEL,
                 "text_ink_is_ocr": False,
+                "text_ink_source": "thresholded_common_poppler_rasters",
+                "raster_source": (
+                    "rxls_native_print_pdf_vs_libreoffice_calc_pdf"
+                ),
+                "rasterizer": "same_locked_poppler_pdftoppm_both_sides",
                 "semantic_text_source": (
                     "svg_data-rxls-visible-label_vs_pdftotext_layout"
                 ),
                 "semantic_normalization": "unicode_nfc_whitespace_tokens",
                 "semantic_content_retained": False,
                 "semantic_ignored_codepoints": len(SEMANTIC_IGNORED_CODEPOINTS),
-                "text_box_source": "svg_clipped_glyph_bounds_vs_pdftotext_bbox_layout",
-                "text_box_matching": (
-                    "exact_svg_data-rxls-visible-label_nearest_unique_pdftotext_bbox_layout"
+                "text_box_source": (
+                    "pdftotext_bbox_layout_word_boxes_both_native_pdfs"
                 ),
+                "text_line_box_source": (
+                    "pdftotext_bbox_layout_line_boxes_both_native_pdfs"
+                ),
+                "text_box_matching": (
+                    "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
+                ),
+                "text_box_geometry": "nominal_poppler_layout_not_ink_bounds",
                 "text_box_error_units": "millipoints",
                 "text_box_content_retained": False,
                 "bounding_boxes_are_inclusive": True,
@@ -6391,6 +7697,21 @@ def run_harness(
             },
             "font_pack": (
                 config.font_pack.evidence if config.font_pack is not None else None
+            ),
+            "measurement_toolchain": (
+                config.poppler_identity
+                if config.poppler_identity is not None
+                else (
+                    {
+                        "kind": "poppler",
+                        "pdffonts_sha256": config.oracle_profile.pdffonts_sha256,
+                        "pdfinfo_sha256": config.oracle_profile.pdfinfo_sha256,
+                        "pdftoppm_sha256": config.oracle_profile.pdftoppm_sha256,
+                        "pdftotext_sha256": config.oracle_profile.pdftotext_sha256,
+                    }
+                    if config.oracle_profile is not None
+                    else None
+                )
             ),
             "oracle_lock": effective_oracle_evidence,
             "renderer_binary": config.renderer_identity,
@@ -6485,8 +7806,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--svg-rasterizer-command",
         help=(
-            "optional shell-like command template using {input}, {output}, "
-            "{width}, {height}, and/or {dpi}; defaults to local CairoSVG"
+            "retired compatibility option; custom SVG rasterization is rejected "
+            "because both sides must use the same Poppler PDF rasterizer"
         ),
     )
     parser.add_argument(
@@ -6510,6 +7831,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "expected SHA-256 of the active pdffonts executable; required for "
             "the offline container oracle adapter"
+        ),
+    )
+    parser.add_argument(
+        "--host-tools-identity-sha256",
+        help=(
+            "expected captured host-tools closure identity; required for the "
+            "offline container oracle adapter"
         ),
     )
     parser.add_argument(
@@ -6576,6 +7904,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-semantic-tokens", type=_positive_int, default=250_000
     )
+    parser.add_argument(
+        "--max-bbox-xml-elements", type=_positive_int, default=1_000_000
+    )
+    parser.add_argument("--max-bbox-lines", type=_positive_int, default=250_000)
+    parser.add_argument("--max-bbox-words", type=_positive_int, default=250_000)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--dpi", type=_positive_int, default=96)
     parser.add_argument("--locale", default="C.UTF-8")
@@ -6600,15 +7933,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.libreoffice_command
             else None
         )
-        svg_command = (
-            _command_tokens(args.svg_rasterizer_command, "svg_rasterizer_command")
-            if args.svg_rasterizer_command
-            else None
-        )
-        if svg_command and not any("{input}" in token for token in svg_command):
-            raise HarnessError("svg_rasterizer_command_requires_input")
-        if svg_command and not any("{output}" in token for token in svg_command):
-            raise HarnessError("svg_rasterizer_command_requires_output")
+        if args.svg_rasterizer_command:
+            raise HarnessError("svg_rasterizer_command_retired")
+        svg_command = None
         if args.require_font_pack and args.font_pack_manifest is None:
             raise HarnessError("font_pack_required")
         if args.require_oracle_lock and args.oracle_lock is None:
@@ -6619,8 +7946,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise HarnessError("libreoffice_command_uses_container_lock")
         if libreoffice_command is not None and args.pdffonts_binary_sha256 is None:
             raise HarnessError("pdffonts_binary_identity_required")
+        if (
+            libreoffice_command is not None
+            and args.host_tools_identity_sha256 is None
+        ):
+            raise HarnessError("host_tools_identity_required")
         if libreoffice_command is None and args.pdffonts_binary_sha256 is not None:
             raise HarnessError("pdffonts_binary_identity_adapter_only")
+        if (
+            libreoffice_command is None
+            and args.host_tools_identity_sha256 is not None
+        ):
+            raise HarnessError("host_tools_identity_adapter_only")
+        if (
+            args.host_tools_identity_sha256 is not None
+            and SHA256_RE.fullmatch(args.host_tools_identity_sha256) is None
+        ):
+            raise HarnessError("host_tools_identity")
         font_pack = (
             load_font_pack(args.font_pack_manifest)
             if args.font_pack_manifest is not None
@@ -6647,10 +7989,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.require_renderer_binary_identity or args.require_oracle_lock
             ),
         )
-        pdffonts_identity = pdffonts_binary_identity(
+        poppler_identity = poppler_binary_identity(
             args.pdffonts_binary_sha256,
             required=(libreoffice_command is not None),
         )
+        if poppler_identity is not None and libreoffice_command is not None:
+            poppler_identity = {
+                **poppler_identity,
+                "host_tools_identity_sha256": args.host_tools_identity_sha256,
+            }
         if args.corpus is not None:
             cases, discovery = discover_corpus(
                 args.corpus,
@@ -6669,6 +8016,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             discovery,
             formats=args.formats,
             required_features=args.required_feature,
+        )
+        manifest_binding = (
+            build_manifest_binding(
+                args.manifest,
+                cases,
+                max_manifest_bytes=args.max_manifest_bytes,
+            )
+            if args.manifest is not None
+            else None
         )
         cases, discovery = select_shard(
             cases,
@@ -6691,6 +8047,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_metric_work_units=args.max_metric_work_units,
             max_semantic_codepoints=args.max_semantic_codepoints,
             max_semantic_tokens=args.max_semantic_tokens,
+            max_bbox_xml_elements=args.max_bbox_xml_elements,
+            max_bbox_lines=args.max_bbox_lines,
+            max_bbox_words=args.max_bbox_words,
             timeout_seconds=args.timeout_seconds,
         )
         config = HarnessConfig(
@@ -6708,10 +8067,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             oracle_profile=oracle_profile,
             renderer_identity=renderer_identity,
             libreoffice_command=libreoffice_command,
-            pdffonts_identity=pdffonts_identity,
+            poppler_identity=poppler_identity,
             print_mode=args.print_mode,
             format_filter=tuple(sorted(set(args.formats))),
             required_feature_filter=tuple(sorted(set(args.required_feature))),
+            manifest_binding=manifest_binding,
         )
         evidence, exit_code = run_harness(cases, discovery=discovery, config=config)
         rendered = json.dumps(evidence, indent=2, sort_keys=True) + "\n"

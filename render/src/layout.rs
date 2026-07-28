@@ -247,6 +247,27 @@ pub struct CellCoordinate {
     pub col: u16,
 }
 
+/// Renderer-owned sparse coordinate index built from the frozen public
+/// `Sheet::display_cells` surface. One operation builds it once, then each
+/// rectangular query visits only requested rows and retained cells.
+pub(crate) struct SparseDisplayCellIndex<'a> {
+    sheet: &'a Sheet,
+}
+
+impl<'a> SparseDisplayCellIndex<'a> {
+    pub(crate) fn new(sheet: &'a Sheet) -> Self {
+        Self { sheet }
+    }
+
+    pub(crate) fn range(
+        &self,
+        range: (u32, u16, u32, u16),
+    ) -> impl Iterator<Item = DisplayCell<'a>> + '_ {
+        self.sheet
+            .display_cells_in_range(range.0, range.1, range.2, range.3)
+    }
+}
+
 /// Stable warning category for a deliberate rendering approximation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WarningCode {
@@ -538,6 +559,28 @@ type AxisSlot<I> = MeasuredAxisSlot<I>;
 
 pub(crate) type MeasuredAxes = (Vec<MeasuredAxisSlot<u32>>, Vec<MeasuredAxisSlot<u16>>);
 
+/// Prepared worksheet geometry reused while materializing paginated print
+/// tiles. The print planner measures the complete body/title union once; each
+/// tile must replay those exact axis sizes instead of deriving a smaller,
+/// tile-local automatic-row-height model. The complete axes also establish one
+/// stable sheet-space coordinate system for cell-anchored drawings: a print
+/// tile clips and translates that geometry instead of resizing the object to
+/// the tile-local anchor fragment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SheetGeometryOverride<'a> {
+    rows: &'a [MeasuredAxisSlot<u32>],
+    columns: &'a [MeasuredAxisSlot<u16>],
+}
+
+impl<'a> SheetGeometryOverride<'a> {
+    pub(crate) fn new(
+        rows: &'a [MeasuredAxisSlot<u32>],
+        columns: &'a [MeasuredAxisSlot<u16>],
+    ) -> Self {
+        Self { rows, columns }
+    }
+}
+
 struct AxisMeasurement {
     rows: Vec<MeasuredAxisSlot<u32>>,
     columns: Vec<MeasuredAxisSlot<u16>>,
@@ -686,21 +729,106 @@ impl RenderStyleSnapshot {
 /// Measure row and column geometry with exactly the same conversion rules used
 /// by worksheet layout. Print pagination consumes this instead of maintaining a
 /// second, subtly different width/height model.
+#[cfg(test)]
 pub(crate) fn measure_sheet_axes(
     sheet: &Sheet,
     range: RenderRange,
     options: &RenderOptions,
 ) -> Result<MeasuredAxes, RenderError> {
-    let range = range.validate()?;
-    let cells = (u64::from(range.last_row) - u64::from(range.first_row) + 1)
-        .checked_mul(u64::from(range.last_col) - u64::from(range.first_col) + 1)
-        .ok_or(RenderError::CoordinateOverflow)?;
-    enforce(LimitKind::Cells, options.limits.max_cells, cells)?;
-    let mut style_snapshot = RenderStyleSnapshot::new(sheet);
-    style_snapshot.capture_range(sheet, range, options)?;
-    let mut warnings = Warnings::default();
-    let measured = measure_sheet_axes_inner(sheet, range, &style_snapshot, options, &mut warnings)?;
-    Ok((measured.rows, measured.columns))
+    measure_sheet_axes_for_ranges(sheet, &[range], options)?
+        .pop()
+        .ok_or(RenderError::CoordinateOverflow)
+}
+
+/// Measure several disjoint print rectangles against one sparse display-cell
+/// candidate index. Body and title planning therefore never rebuilds or walks
+/// the complete worksheet cell set once per rectangle.
+pub(crate) fn measure_sheet_axes_for_ranges(
+    sheet: &Sheet,
+    ranges: &[RenderRange],
+    options: &RenderOptions,
+) -> Result<Vec<MeasuredAxes>, RenderError> {
+    let mut validated = Vec::with_capacity(ranges.len());
+    for &range in ranges {
+        let range = range.validate()?;
+        let cells = (u64::from(range.last_row) - u64::from(range.first_row) + 1)
+            .checked_mul(u64::from(range.last_col) - u64::from(range.first_col) + 1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(LimitKind::Cells, options.limits.max_cells, cells)?;
+        validated.push(range);
+    }
+
+    // Automatic row height is a worksheet-row property: content outside the
+    // painted columns can still establish the row's height. Merge the body and
+    // title row bands first so each retained candidate is indexed and filtered
+    // exactly once, rather than once per measurement rectangle.
+    let mut row_bands = validated
+        .iter()
+        .map(|range| (range.first_row, range.last_row))
+        .collect::<Vec<_>>();
+    row_bands.sort_unstable();
+    let mut merged_row_bands = Vec::<(u32, u32)>::new();
+    for (first, last) in row_bands {
+        if let Some((_, previous_last)) = merged_row_bands.last_mut() {
+            if first <= previous_last.saturating_add(1) {
+                *previous_last = (*previous_last).max(last);
+                continue;
+            }
+        }
+        merged_row_bands.push((first, last));
+    }
+    let display_cell_index = SparseDisplayCellIndex::new(sheet);
+    let mut candidates = BTreeMap::<CellCoordinate, DisplayCell<'_>>::new();
+    for (first_row, last_row) in merged_row_bands {
+        for cell in display_cell_index.range((first_row, 0, last_row, MAX_WORKSHEET_COLUMN)) {
+            candidates.insert(
+                CellCoordinate {
+                    row: cell.row,
+                    col: cell.col,
+                },
+                cell,
+            );
+            enforce(
+                LimitKind::Cells,
+                options.limits.max_cells,
+                candidates.len() as u64,
+            )?;
+        }
+    }
+    // A merge anchor may sit outside the clipped row/column rectangle while
+    // covered cells remain visible inside it. Add only intersecting anchors.
+    for &(r0, c0, r1, c1) in sheet.merged_ranges() {
+        if validated
+            .iter()
+            .any(|range| r0 <= r1 && c0 <= c1 && r0 <= range.last_row && r1 >= range.first_row)
+        {
+            for cell in display_cell_index.range((r0, c0, r0, c0)) {
+                candidates.insert(CellCoordinate { row: r0, col: c0 }, cell);
+                enforce(
+                    LimitKind::Cells,
+                    options.limits.max_cells,
+                    candidates.len() as u64,
+                )?;
+            }
+        }
+    }
+    let candidates = candidates.into_values().collect::<Vec<_>>();
+    let mut measurements = Vec::with_capacity(validated.len());
+    for range in validated {
+        let mut style_snapshot = RenderStyleSnapshot::new(sheet);
+        style_snapshot.capture_range(sheet, range, options)?;
+        let mut warnings = Warnings::default();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &style_snapshot,
+            options,
+            Some(&candidates),
+            &mut warnings,
+        )?;
+        measurements.push((measured.rows, measured.columns));
+    }
+    Ok(measurements)
 }
 
 fn measure_sheet_axes_inner(
@@ -708,6 +836,7 @@ fn measure_sheet_axes_inner(
     range: RenderRange,
     style_snapshot: &RenderStyleSnapshot,
     options: &RenderOptions,
+    automatic_candidates: Option<&[DisplayCell<'_>]>,
     warnings: &mut Warnings,
 ) -> Result<AxisMeasurement, RenderError> {
     let range = range.validate()?;
@@ -753,6 +882,7 @@ fn measure_sheet_axes_inner(
         &mut column_widths,
         &mut row_sizes,
         &mut typography,
+        automatic_candidates,
     )?;
 
     let mut rows = Vec::with_capacity(row_sizes.len());
@@ -983,13 +1113,23 @@ pub fn build_sheet_scene(
     sheet_index: usize,
     options: &RenderOptions,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options)
+    build_sheet_scene_inner(sheet, sheet_index, options, None)
+}
+
+pub(crate) fn build_sheet_scene_with_geometry(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    geometry: SheetGeometryOverride<'_>,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry))
 }
 
 fn build_sheet_scene_inner(
     sheet: &Sheet,
     sheet_index: usize,
     options: &RenderOptions,
+    geometry: Option<SheetGeometryOverride<'_>>,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
@@ -1137,9 +1277,14 @@ fn build_sheet_scene_inner(
             },
         });
     }
-    let measured = measure_sheet_axes_inner(sheet, range, &style_snapshot, options, &mut warnings)?;
+    let measured =
+        measure_sheet_axes_inner(sheet, range, &style_snapshot, options, None, &mut warnings)?;
     let mut row_slots = measured.rows;
     let mut col_slots = measured.columns;
+    if let Some(geometry) = geometry {
+        apply_axis_geometry(&mut row_slots, geometry.rows)?;
+        apply_axis_geometry(&mut col_slots, geometry.columns)?;
+    }
     let maximum_digit_width = measured.maximum_digit_width;
     let mut typography_stats = measured.typography;
     let hidden_rows_skipped = rows_considered.saturating_sub(row_slots.len() as u64);
@@ -1149,11 +1294,13 @@ fn build_sheet_scene_inner(
     let viewport = drawing_layout_viewport(
         sheet,
         range,
+        &row_slots,
         x,
         y,
         maximum_digit_width,
         used_selection,
         options,
+        geometry,
         &mut warnings,
     )?;
     offset_axis_slots(&mut col_slots, viewport.cell.x)?;
@@ -1254,8 +1401,14 @@ fn build_sheet_scene_inner(
         merge_layouts.push(layout);
     }
 
-    let display_cells = sheet
-        .display_cells()
+    let display_cell_index = SparseDisplayCellIndex::new(sheet);
+    let mut display_cells = display_cell_index
+        .range((
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        ))
         .map(|cell| {
             (
                 CellCoordinate {
@@ -1266,6 +1419,19 @@ fn build_sheet_scene_inner(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    for merge in &merge_layouts {
+        if display_cells.contains_key(&merge.anchor) {
+            continue;
+        }
+        for cell in display_cell_index.range((
+            merge.anchor.row,
+            merge.anchor.col,
+            merge.anchor.row,
+            merge.anchor.col,
+        )) {
+            display_cells.insert(merge.anchor, cell);
+        }
+    }
     let mut regions = Vec::new();
     for row in &row_slots {
         for col in visual_col_slots {
@@ -1386,21 +1552,30 @@ fn build_sheet_scene_inner(
     let row_regions = regions_by_visual_row(&regions)?;
     let show_gridlines = options.gridlines && !sheet.sheet_view().hide_gridlines;
     resolve_conditional_paints(sheet, &display_cells, &mut regions, options, &mut warnings)?;
+    let mut suppresses_gridlines = Vec::with_capacity(regions.len());
     for region in &regions {
         let fill = resolve_fill(region.style.as_ref(), region.source, &mut warnings);
-        if fill.is_some() || show_gridlines {
+        suppresses_gridlines.push(fill.is_some());
+        if fill.is_some() {
             push_node(
                 &mut nodes,
                 SceneNode::Rect(RectNode {
                     rect: region.rect,
                     fill,
-                    stroke: show_gridlines.then_some(Rgb::GRIDLINE),
-                    stroke_width: Fixed::from_pixels(1),
+                    stroke: None,
+                    stroke_width: Fixed::ZERO,
                 }),
                 options,
             )?;
         }
     }
+    let composed_edges = compose_edges(&regions, &suppresses_gridlines, show_gridlines, options)?;
+    push_composed_edges(
+        &mut nodes,
+        &composed_edges,
+        EdgeClaimKind::Gridline,
+        options,
+    )?;
     for region in &regions {
         if let Some(bar) = region.conditional.data_bar {
             push_data_bar(&mut nodes, region.rect, bar, options)?;
@@ -1434,27 +1609,18 @@ fn build_sheet_scene_inner(
         };
         push_node(&mut nodes, node, options)?;
     }
-    for region in &regions {
-        if let Some(border) = region
-            .style
-            .as_ref()
-            .and_then(|style| style.border.as_ref())
-        {
-            push_borders(
-                &mut nodes,
-                region.rect,
-                border,
-                region.source,
-                options,
-                &mut warnings,
-            )?;
-        }
-    }
+    push_composed_edges(
+        &mut nodes,
+        &composed_edges,
+        EdgeClaimKind::Explicit,
+        options,
+    )?;
     push_drawing_placeholders(
         &mut nodes,
         sheet,
         &row_slots,
         &col_slots,
+        geometry,
         viewport.cell,
         viewport.sheet,
         canvas_width,
@@ -1696,6 +1862,97 @@ fn drawing_visible_to(
     (row, column)
 }
 
+fn anchor_range_intersects_render_ranges(
+    from: (u32, u16),
+    to: (u32, u16),
+    ranges: &[RenderRange],
+) -> bool {
+    from.0 <= to.0
+        && from.1 <= to.1
+        && ranges.iter().any(|range| {
+            from.0 <= range.last_row
+                && to.0 >= range.first_row
+                && from.1 <= range.last_col
+                && to.1 >= range.first_col
+        })
+}
+
+/// Return the complete cell-anchor extent needed to paint drawings that touch
+/// any selected print rectangle. Sheet-absolute drawings are reported
+/// separately because their Y placement depends on every preceding prepared
+/// row, including content-derived automatic heights.
+pub(crate) fn prepared_drawing_geometry_extent(
+    sheet: &Sheet,
+    ranges: &[RenderRange],
+) -> Result<(Vec<RenderRange>, bool), RenderError> {
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    let mut extents = Vec::new();
+    let mut has_absolute = false;
+    let mut include = |from: (u32, u16), to: (u32, u16)| {
+        extents.push(RenderRange::new(
+            from.0.min(MAX_WORKSHEET_ROW),
+            from.1.min(MAX_WORKSHEET_COLUMN),
+            to.0.min(MAX_WORKSHEET_ROW),
+            to.1.min(MAX_WORKSHEET_COLUMN),
+        ));
+    };
+
+    for (index, image) in sheet.images().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Image, index);
+        if is_sheet_absolute_metadata(metadata) {
+            has_absolute |= absolute_drawing_paint_bounds(DrawingObjectKind::Image, metadata)?
+                .is_some_and(rect_intersects_positive_sheet);
+            continue;
+        }
+        let to = drawing_visible_to(
+            image.from,
+            image.to.unwrap_or((
+                image.from.0.saturating_add(10),
+                image.from.1.saturating_add(4),
+            )),
+            metadata,
+        );
+        if anchor_range_intersects_render_ranges(image.from, to, ranges) {
+            include(image.from, to);
+        }
+    }
+    for (index, chart) in sheet.charts().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
+        if is_sheet_absolute_metadata(metadata) {
+            has_absolute |= absolute_drawing_paint_bounds(DrawingObjectKind::Chart, metadata)?
+                .is_some_and(rect_intersects_positive_sheet);
+            continue;
+        }
+        let to = drawing_visible_to(chart.from, chart.to, metadata);
+        if anchor_range_intersects_render_ranges(chart.from, to, ranges) {
+            include(chart.from, to);
+        }
+    }
+    for metadata in sheet
+        .drawing_metadata()
+        .iter()
+        .filter(|metadata| metadata.kind == DrawingObjectKind::Shape)
+    {
+        let Some(from) = metadata.from_cell else {
+            continue;
+        };
+        let to = drawing_visible_to(from, metadata.to_cell.unwrap_or(from), Some(metadata));
+        if anchor_range_intersects_render_ranges(from, to, ranges) {
+            include(from, to);
+        }
+    }
+    extents.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    extents.dedup();
+    Ok((extents, has_absolute))
+}
+
 fn include_render_coordinate(range: &mut Option<RenderRange>, row: u32, col: u16) {
     *range = Some(match *range {
         Some(range) => RenderRange::new(
@@ -1708,7 +1965,7 @@ fn include_render_coordinate(range: &mut Option<RenderRange>, row: u32, col: u16
     });
 }
 
-fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
+pub(crate) fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
     let has_fill = match style.pattern_fill {
         Some(fill) if fill.pattern == FormatPattern::None => style.fill.is_some(),
         Some(fill) => {
@@ -1722,6 +1979,18 @@ fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
             .any(|edge| edge != BorderStyle::None)
     });
     has_fill || has_border
+}
+
+/// Resolve the exact used range recorded by a single expanded sheet scene.
+pub(crate) fn render_used_scene_range(
+    sheet: &Sheet,
+    options: &RenderOptions,
+) -> Result<RenderRange, RenderError> {
+    let mut style_snapshot = RenderStyleSnapshot::new(sheet);
+    style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
+    Ok(render_used_extent(sheet, &style_snapshot)?
+        .range
+        .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
 
 /// Resolve the cell range needed to paginate all used visual content.
@@ -1877,6 +2146,28 @@ fn axis_slots_end<I>(slots: &[MeasuredAxisSlot<I>]) -> Result<Fixed, RenderError
     last.offset
         .checked_add(last.size)
         .ok_or(RenderError::CoordinateOverflow)
+}
+
+fn apply_axis_geometry<I: Copy + Ord>(
+    slots: &mut [MeasuredAxisSlot<I>],
+    geometry: &[MeasuredAxisSlot<I>],
+) -> Result<(), RenderError> {
+    let mut offset = Fixed::ZERO;
+    for slot in slots {
+        let replacement = geometry
+            .binary_search_by(|candidate| candidate.index.cmp(&slot.index))
+            .ok()
+            .and_then(|index| geometry.get(index))
+            .ok_or(RenderError::Backend {
+                reason: "prepared_print_geometry_missing_axis_slot",
+            })?;
+        slot.offset = offset;
+        slot.size = replacement.size;
+        offset = offset
+            .checked_add(slot.size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(())
 }
 
 fn visual_column_slots<I: Copy>(
@@ -2093,6 +2384,7 @@ fn expand_automatic_row_heights(
     column_widths: &mut BTreeMap<u16, Fixed>,
     row_sizes: &mut BTreeMap<u32, Fixed>,
     typography: &mut TypographyStats,
+    automatic_candidates: Option<&[DisplayCell<'_>]>,
 ) -> Result<(), RenderError> {
     let Some(pack) = options.font_pack.as_ref() else {
         return Ok(());
@@ -2119,7 +2411,42 @@ fn expand_automatic_row_heights(
     let mut merged_requirements = Vec::<AutoMergeHeight>::new();
     let mut measured_cells = 0_u64;
 
-    for cell in sheet.display_cells() {
+    let local_candidates = if automatic_candidates.is_none() {
+        let display_cell_index = SparseDisplayCellIndex::new(sheet);
+        let mut candidates = BTreeMap::new();
+        for cell in
+            display_cell_index.range((range.first_row, 0, range.last_row, MAX_WORKSHEET_COLUMN))
+        {
+            candidates.insert((cell.row, cell.col), cell);
+            enforce(
+                LimitKind::Cells,
+                options.limits.max_cells,
+                candidates.len() as u64,
+            )?;
+        }
+        for coordinate in merge_anchors.keys() {
+            for cell in display_cell_index.range((
+                coordinate.row,
+                coordinate.col,
+                coordinate.row,
+                coordinate.col,
+            )) {
+                candidates.insert((cell.row, cell.col), cell);
+                enforce(
+                    LimitKind::Cells,
+                    options.limits.max_cells,
+                    candidates.len() as u64,
+                )?;
+            }
+        }
+        Some(candidates.into_values().collect::<Vec<_>>())
+    } else {
+        None
+    };
+    let candidates = automatic_candidates
+        .or(local_candidates.as_deref())
+        .unwrap_or(&[]);
+    for &cell in candidates {
         if cell.formatted.is_empty()
             || cell.row > MAX_WORKSHEET_ROW
             || cell.col > MAX_WORKSHEET_COLUMN
@@ -2131,6 +2458,9 @@ fn expand_automatic_row_heights(
             col: cell.col,
         };
         let merged = merge_anchors.get(&source).copied();
+        if merged.is_none() && (cell.row < range.first_row || cell.row > range.last_row) {
+            continue;
+        }
         let (visible_rows, adjustable_row, width, is_merged) =
             if let Some((r0, c0, r1, c1)) = merged {
                 let visible_rows = row_sizes
@@ -2175,7 +2505,9 @@ fn expand_automatic_row_heights(
                 (vec![cell.row], cell.row, width, false)
             };
 
-        let style = style_snapshot.owned_style(source);
+        let style = style_snapshot
+            .owned_style(source)
+            .or_else(|| sheet.resolved_cell_style(source.row, source.col));
         let alignment = style.as_ref().and_then(|style| style.align.as_ref());
         let font_size = style
             .as_ref()
@@ -3376,37 +3708,46 @@ fn resolve_conditional_operand(
     match operand {
         ConditionalOperand::Literal(value) => Some(*value),
         ConditionalOperand::Reference(reference) => {
-            if reference.sheet.as_deref().is_some_and(|name| {
-                name != sheet.name
-                    && !(name.is_ascii()
-                        && sheet.name.is_ascii()
-                        && name.eq_ignore_ascii_case(&sheet.name))
-            }) {
-                return None;
-            }
-            let row = if reference.row_absolute {
-                reference.row
-            } else {
-                offset_a1_axis(
-                    u64::from(target.row),
-                    u64::from(reference.row),
-                    u64::from(origin.0),
-                    u64::from(MAX_WORKSHEET_ROW),
-                )? as u32
-            };
-            let col = if reference.col_absolute {
-                reference.col
-            } else {
-                offset_a1_axis(
-                    u64::from(target.col),
-                    u64::from(reference.col),
-                    u64::from(origin.1),
-                    u64::from(MAX_WORKSHEET_COLUMN),
-                )? as u16
-            };
-            sheet.cell(row, col).and_then(numeric_cell_value)
+            conditional_reference_coordinate(reference, sheet, target, origin)
+                .and_then(|coordinate| sheet.cell(coordinate.row, coordinate.col))
+                .and_then(numeric_cell_value)
         }
     }
+}
+
+fn conditional_reference_coordinate(
+    reference: &A1Reference,
+    sheet: &Sheet,
+    target: CellCoordinate,
+    origin: (u32, u16, u32, u16),
+) -> Option<CellCoordinate> {
+    if reference.sheet.as_deref().is_some_and(|name| {
+        name != sheet.name
+            && !(name.is_ascii() && sheet.name.is_ascii() && name.eq_ignore_ascii_case(&sheet.name))
+    }) {
+        return None;
+    }
+    let row = if reference.row_absolute {
+        reference.row
+    } else {
+        offset_a1_axis(
+            u64::from(target.row),
+            u64::from(reference.row),
+            u64::from(origin.0),
+            u64::from(MAX_WORKSHEET_ROW),
+        )? as u32
+    };
+    let col = if reference.col_absolute {
+        reference.col
+    } else {
+        offset_a1_axis(
+            u64::from(target.col),
+            u64::from(reference.col),
+            u64::from(origin.1),
+            u64::from(MAX_WORKSHEET_COLUMN),
+        )? as u16
+    };
+    Some(CellCoordinate { row, col })
 }
 
 fn offset_a1_axis(target: u64, reference: u64, origin: u64, maximum: u64) -> Option<u64> {
@@ -3416,6 +3757,286 @@ fn offset_a1_axis(target: u64, reference: u64, origin: u64, maximum: u64) -> Opt
     (0..=i128::from(maximum))
         .contains(&value)
         .then_some(value as u64)
+}
+
+fn render_range_intersection(
+    left: RenderRange,
+    right: (u32, u16, u32, u16),
+) -> Option<RenderRange> {
+    let intersection = RenderRange::new(
+        left.first_row.max(right.0),
+        left.first_col.max(right.1),
+        left.last_row.min(right.2),
+        left.last_col.min(right.3),
+    );
+    (intersection.first_row <= intersection.last_row
+        && intersection.first_col <= intersection.last_col)
+        .then_some(intersection)
+}
+
+fn add_a1_dependency_range(
+    sheet: &Sheet,
+    source: &str,
+    chart_points: &mut u64,
+    dependencies: &mut BTreeSet<CellCoordinate>,
+    limits: &RenderLimits,
+    aggregate_limit: u64,
+) -> Result<(), RenderError> {
+    let Some(range) = parse_a1_range(source) else {
+        return Ok(());
+    };
+    if !range_belongs_to_sheet(&range, sheet)
+        || (range.first_row != range.last_row && range.first_col != range.last_col)
+    {
+        return Ok(());
+    }
+    let points = a1_range_points(&range).ok_or(RenderError::CoordinateOverflow)?;
+    let actual = chart_points
+        .checked_add(points)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    enforce(LimitKind::ChartPoints, limits.max_chart_points, actual)?;
+    *chart_points = actual;
+    for row in range.first_row..=range.last_row {
+        for col in range.first_col..=range.last_col {
+            dependencies.insert(CellCoordinate { row, col });
+            enforce(LimitKind::Cells, aggregate_limit, dependencies.len() as u64)?;
+        }
+    }
+    Ok(())
+}
+
+fn data_renderable_chart_indices(
+    sheet: &Sheet,
+    selected_ranges: &[RenderRange],
+    options: &RenderOptions,
+    geometry: Option<SheetGeometryOverride<'_>>,
+) -> Result<BTreeSet<usize>, RenderError> {
+    let mut ranges = selected_ranges.to_vec();
+    ranges.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    ranges.dedup();
+    if ranges.is_empty() || sheet.charts().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    // Reuse the exact axis, viewport, anchor, and minimum-size rules used by
+    // scene construction. Merely intersecting a chart anchor is insufficient:
+    // a clipped or tiny chart paints a placeholder without reading its source
+    // series and therefore must not consume the chart-point budget here.
+    let measurements = measure_sheet_axes_for_ranges(sheet, &ranges, options)?;
+    let style_snapshot = RenderStyleSnapshot::new(sheet);
+    let mut warnings = Warnings::default();
+    let mut typography = TypographyStats::default();
+    let maximum_digit_width =
+        maximum_digit_width(&style_snapshot, options, &mut warnings, &mut typography)?;
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    let right_to_left = sheet.sheet_view().right_to_left;
+    let used_selection = matches!(options.selection, RenderSelection::Used);
+    let mut renderable = BTreeSet::new();
+
+    for (range, (mut row_slots, mut col_slots)) in ranges.into_iter().zip(measurements) {
+        if let Some(geometry) = geometry {
+            apply_axis_geometry(&mut row_slots, geometry.rows)?;
+            apply_axis_geometry(&mut col_slots, geometry.columns)?;
+        }
+        let grid_width = axis_slots_end(&col_slots)?;
+        let grid_height = axis_slots_end(&row_slots)?;
+        let viewport = drawing_layout_viewport(
+            sheet,
+            range,
+            &row_slots,
+            grid_width,
+            grid_height,
+            maximum_digit_width,
+            used_selection,
+            options,
+            geometry,
+            &mut warnings,
+        )?;
+        offset_axis_slots(&mut col_slots, viewport.cell.x)?;
+        offset_axis_slots(&mut row_slots, viewport.cell.y)?;
+        let scene_width = viewport.sheet.width.max(Fixed::from_pixels(1));
+
+        for (chart_index, chart) in sheet.charts().iter().enumerate() {
+            if renderable.contains(&chart_index) {
+                continue;
+            }
+            let metadata = metadata_index.get(DrawingObjectKind::Chart, chart_index);
+            if chart.series.is_empty()
+                || metadata.is_some_and(|metadata| !metadata.chart_unsupported_reasons.is_empty())
+            {
+                continue;
+            }
+            if let DrawingPlacement::Placed(rect) = drawing_rect(
+                &row_slots,
+                &col_slots,
+                viewport.cell,
+                viewport.sheet,
+                scene_width,
+                DrawingObjectKind::Chart,
+                chart.from,
+                chart.to,
+                metadata,
+                right_to_left,
+                geometry,
+            )? {
+                if rect.width >= Fixed::from_pixels(120) && rect.height >= Fixed::from_pixels(80) {
+                    renderable.insert(chart_index);
+                }
+            }
+        }
+    }
+    Ok(renderable)
+}
+
+/// Resolve every same-sheet cell that can indirectly change a selected scene.
+///
+/// Prepared print documents fingerprint this bounded dependency closure so
+/// conditional expressions, charts, and sparklines cannot mutate behind a
+/// previously prepared page map.
+pub(crate) fn external_render_dependency_cells(
+    sheet: &Sheet,
+    selected_ranges: &[RenderRange],
+    options: &RenderOptions,
+    geometry: Option<SheetGeometryOverride<'_>>,
+) -> Result<Vec<CellCoordinate>, RenderError> {
+    let limits = &options.limits;
+    let conditional_limit = limits
+        .max_conditional_evaluations
+        .checked_mul(2)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let aggregate_limit = conditional_limit
+        .checked_add(limits.max_chart_points)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let mut dependencies = BTreeSet::new();
+    let mut conditional_targets = 0_u64;
+
+    for conditional in sheet.conditional_formats() {
+        let references = match &conditional.rule {
+            CfRule::CellIs {
+                formula1, formula2, ..
+            } => [Some(formula1.as_str()), formula2.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter_map(parse_conditional_operand)
+                .filter_map(|operand| match operand {
+                    ConditionalOperand::Reference(reference) => Some(reference),
+                    ConditionalOperand::Literal(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            CfRule::Expression { formula, .. } => parse_conditional_expression(formula)
+                .into_iter()
+                .flat_map(|expression| [expression.left, expression.right])
+                .filter_map(|operand| match operand {
+                    ConditionalOperand::Reference(reference) => Some(reference),
+                    ConditionalOperand::Literal(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if references.is_empty() {
+            continue;
+        }
+        let mut rule_targets = BTreeSet::new();
+        for &selected in selected_ranges {
+            let Some(targets) = render_range_intersection(selected, conditional.sqref) else {
+                continue;
+            };
+            for row in targets.first_row..=targets.last_row {
+                for col in targets.first_col..=targets.last_col {
+                    if rule_targets.insert(CellCoordinate { row, col }) {
+                        conditional_targets = conditional_targets
+                            .checked_add(1)
+                            .ok_or(RenderError::CoordinateOverflow)?;
+                        enforce(
+                            LimitKind::ConditionalEvaluations,
+                            limits.max_conditional_evaluations,
+                            conditional_targets,
+                        )?;
+                    }
+                }
+            }
+        }
+        for target in rule_targets {
+            for reference in &references {
+                if let Some(coordinate) =
+                    conditional_reference_coordinate(reference, sheet, target, conditional.sqref)
+                {
+                    dependencies.insert(coordinate);
+                    enforce(LimitKind::Cells, aggregate_limit, dependencies.len() as u64)?;
+                }
+            }
+        }
+    }
+
+    let mut chart_points = 0_u64;
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    let renderable_charts =
+        data_renderable_chart_indices(sheet, selected_ranges, options, geometry)?;
+    for (chart_index, chart) in sheet.charts().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Chart, chart_index);
+        if chart.series.is_empty()
+            || metadata.is_some_and(|metadata| !metadata.chart_unsupported_reasons.is_empty())
+            || !renderable_charts.contains(&chart_index)
+        {
+            continue;
+        }
+        for series in &chart.series {
+            add_a1_dependency_range(
+                sheet,
+                &series.values,
+                &mut chart_points,
+                &mut dependencies,
+                limits,
+                aggregate_limit,
+            )?;
+            if let Some(source) = series.categories.as_deref() {
+                add_a1_dependency_range(
+                    sheet,
+                    source,
+                    &mut chart_points,
+                    &mut dependencies,
+                    limits,
+                    aggregate_limit,
+                )?;
+            }
+            if let Some(source) = series.bubble_sizes.as_deref() {
+                add_a1_dependency_range(
+                    sheet,
+                    source,
+                    &mut chart_points,
+                    &mut dependencies,
+                    limits,
+                    aggregate_limit,
+                )?;
+            }
+        }
+    }
+    for sparkline in sheet.sparklines() {
+        if !selected_ranges.iter().any(|range| {
+            range.first_row <= sparkline.location.0
+                && sparkline.location.0 <= range.last_row
+                && range.first_col <= sparkline.location.1
+                && sparkline.location.1 <= range.last_col
+        }) {
+            continue;
+        }
+        add_a1_dependency_range(
+            sheet,
+            &sparkline.range,
+            &mut chart_points,
+            &mut dependencies,
+            limits,
+            aggregate_limit,
+        )?;
+    }
+    Ok(dependencies.into_iter().collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3702,6 +4323,7 @@ fn push_drawing_placeholders(
     sheet: &Sheet,
     row_slots: &[AxisSlot<u32>],
     col_slots: &[AxisSlot<u16>],
+    geometry: Option<SheetGeometryOverride<'_>>,
     cell_viewport: Rect,
     sheet_viewport: Rect,
     scene_width: Fixed,
@@ -3733,6 +4355,7 @@ fn push_drawing_placeholders(
             to,
             metadata,
             right_to_left,
+            geometry,
         )? {
             DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Image(index),
@@ -3745,12 +4368,15 @@ fn push_drawing_placeholders(
                     row: image.from.0,
                     col: image.from.1,
                 },
-                clip: is_sheet_absolute_metadata(metadata).then_some(Rect {
-                    x: Fixed::ZERO,
-                    y: Fixed::ZERO,
-                    width: scene_width,
-                    height: scene_height,
-                }),
+                clip: drawing_clip(
+                    DrawingObjectKind::Image,
+                    rect,
+                    metadata,
+                    geometry,
+                    cell_viewport,
+                    scene_width,
+                    scene_height,
+                )?,
             }),
             DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::DrawingAnchorUnavailable,
@@ -3776,6 +4402,7 @@ fn push_drawing_placeholders(
             chart.to,
             metadata,
             right_to_left,
+            geometry,
         )? {
             DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Chart(index, chart.kind),
@@ -3788,12 +4415,15 @@ fn push_drawing_placeholders(
                     row: chart.from.0,
                     col: chart.from.1,
                 },
-                clip: is_sheet_absolute_metadata(metadata).then_some(Rect {
-                    x: Fixed::ZERO,
-                    y: Fixed::ZERO,
-                    width: scene_width,
-                    height: scene_height,
-                }),
+                clip: drawing_clip(
+                    DrawingObjectKind::Chart,
+                    rect,
+                    metadata,
+                    geometry,
+                    cell_viewport,
+                    scene_width,
+                    scene_height,
+                )?,
             }),
             DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::DrawingAnchorUnavailable,
@@ -3827,6 +4457,7 @@ fn push_drawing_placeholders(
             to,
             Some(metadata),
             right_to_left,
+            geometry,
         )? {
             DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Shape,
@@ -3837,7 +4468,15 @@ fn push_drawing_placeholders(
                     row: from.0,
                     col: from.1,
                 },
-                clip: None,
+                clip: drawing_clip(
+                    DrawingObjectKind::Shape,
+                    rect,
+                    Some(metadata),
+                    geometry,
+                    cell_viewport,
+                    scene_width,
+                    scene_height,
+                )?,
             }),
             DrawingPlacement::Unavailable => warnings.add(
                 WarningCode::ShapeAnchorUnavailable,
@@ -4236,11 +4875,13 @@ fn rect_intersects_positive_sheet(rect: Rect) -> bool {
 fn drawing_layout_viewport(
     sheet: &Sheet,
     range: RenderRange,
+    row_slots: &[AxisSlot<u32>],
     grid_width: Fixed,
     grid_height: Fixed,
     maximum_digit_width: Fixed,
     used_selection: bool,
     options: &RenderOptions,
+    geometry: Option<SheetGeometryOverride<'_>>,
     warnings: &mut Warnings,
 ) -> Result<DrawingLayoutViewport, RenderError> {
     let absolute_extent = absolute_drawing_positive_extent(sheet)?;
@@ -4260,7 +4901,15 @@ fn drawing_layout_viewport(
             },
         });
     };
-    let (grid_x, grid_y) = sheet_grid_origin(sheet, range, maximum_digit_width, options, warnings)?;
+    let (grid_x, grid_y) = prepared_sheet_grid_origin(
+        sheet,
+        range,
+        row_slots,
+        maximum_digit_width,
+        options,
+        geometry,
+        warnings,
+    )?;
     if used_selection {
         let grid_right = grid_x
             .checked_add(grid_width)
@@ -4298,6 +4947,40 @@ fn drawing_layout_viewport(
             },
         })
     }
+}
+
+fn prepared_sheet_grid_origin(
+    sheet: &Sheet,
+    range: RenderRange,
+    row_slots: &[AxisSlot<u32>],
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    geometry: Option<SheetGeometryOverride<'_>>,
+    warnings: &mut Warnings,
+) -> Result<(Fixed, Fixed), RenderError> {
+    let (x, persisted_y) = sheet_grid_origin(sheet, range, maximum_digit_width, options, warnings)?;
+    let Some(geometry) = geometry else {
+        return Ok((x, persisted_y));
+    };
+    let Some(first_prepared_row) = geometry.rows.first().map(|slot| slot.index) else {
+        return Ok((x, persisted_y));
+    };
+    let (_, prepared_base_y) = sheet_grid_origin(
+        sheet,
+        RenderRange::new(
+            first_prepared_row,
+            range.first_col,
+            first_prepared_row,
+            range.first_col,
+        ),
+        maximum_digit_width,
+        options,
+        warnings,
+    )?;
+    let prepared_y = prepared_base_y
+        .checked_add(prepared_row_offset(geometry.rows, row_slots)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok((x, prepared_y))
 }
 
 fn sheet_grid_origin(
@@ -4369,14 +5052,142 @@ fn offset_axis_slots<I>(
     Ok(())
 }
 
+/// Test exact prepared sheet-space paint geometry for cell-anchored drawings
+/// against one print tile. Rotation is evaluated after the full unrotated
+/// destination rectangle is established, so a continuation beyond the final
+/// anchor cell remains eligible for sparse-page retention.
+pub(crate) fn cell_drawings_intersect_prepared_range(
+    sheet: &Sheet,
+    range: RenderRange,
+    geometry: SheetGeometryOverride<'_>,
+) -> Result<bool, RenderError> {
+    let range = range.validate()?;
+    let row_slots = geometry
+        .rows
+        .iter()
+        .copied()
+        .filter(|slot| slot.index >= range.first_row && slot.index <= range.last_row)
+        .collect::<Vec<_>>();
+    let col_slots = geometry
+        .columns
+        .iter()
+        .copied()
+        .filter(|slot| slot.index >= range.first_col && slot.index <= range.last_col)
+        .collect::<Vec<_>>();
+    if row_slots.is_empty() || col_slots.is_empty() {
+        return Ok(false);
+    }
+    let viewport = Rect {
+        x: Fixed::ZERO,
+        y: Fixed::ZERO,
+        width: sum_fixed(col_slots.iter().map(|slot| slot.size))?,
+        height: sum_fixed(row_slots.iter().map(|slot| slot.size))?,
+    };
+    let metadata_index = DrawingMetadataIndex::new(sheet);
+    let right_to_left = sheet.sheet_view().right_to_left;
+
+    for (index, image) in sheet.images().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Image, index);
+        if is_sheet_absolute_metadata(metadata) {
+            continue;
+        }
+        let to = image.to.unwrap_or((
+            image.from.0.saturating_add(10),
+            image.from.1.saturating_add(4),
+        ));
+        if matches!(
+            drawing_rect(
+                &row_slots,
+                &col_slots,
+                viewport,
+                viewport,
+                viewport.width,
+                DrawingObjectKind::Image,
+                image.from,
+                to,
+                metadata,
+                right_to_left,
+                Some(geometry),
+            )?,
+            DrawingPlacement::Placed(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    for (index, chart) in sheet.charts().iter().enumerate() {
+        let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
+        if is_sheet_absolute_metadata(metadata) {
+            continue;
+        }
+        if matches!(
+            drawing_rect(
+                &row_slots,
+                &col_slots,
+                viewport,
+                viewport,
+                viewport.width,
+                DrawingObjectKind::Chart,
+                chart.from,
+                chart.to,
+                metadata,
+                right_to_left,
+                Some(geometry),
+            )?,
+            DrawingPlacement::Placed(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    for metadata in sheet
+        .drawing_metadata()
+        .iter()
+        .filter(|metadata| metadata.kind == DrawingObjectKind::Shape)
+    {
+        let Some(from) = metadata.from_cell else {
+            continue;
+        };
+        let to = metadata.to_cell.unwrap_or(from);
+        if matches!(
+            drawing_rect(
+                &row_slots,
+                &col_slots,
+                viewport,
+                viewport,
+                viewport.width,
+                DrawingObjectKind::Shape,
+                from,
+                to,
+                Some(metadata),
+                right_to_left,
+                Some(geometry),
+            )?,
+            DrawingPlacement::Placed(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn absolute_drawings_intersect_range(
     sheet: &Sheet,
     range: RenderRange,
     width: Fixed,
     height: Fixed,
     options: &RenderOptions,
+    geometry: SheetGeometryOverride<'_>,
 ) -> Result<bool, RenderError> {
     if width <= Fixed::ZERO || height <= Fixed::ZERO {
+        return Ok(false);
+    }
+    let range = range.validate()?;
+    let row_slots = geometry
+        .rows
+        .iter()
+        .copied()
+        .filter(|slot| slot.index >= range.first_row && slot.index <= range.last_row)
+        .collect::<Vec<_>>();
+    if row_slots.is_empty() {
         return Ok(false);
     }
     let mut warnings = Warnings::default();
@@ -4384,11 +5195,13 @@ pub(crate) fn absolute_drawings_intersect_range(
     let style_snapshot = RenderStyleSnapshot::new(sheet);
     let maximum_digit_width =
         maximum_digit_width(&style_snapshot, options, &mut warnings, &mut typography)?;
-    let (x, y) = sheet_grid_origin(
+    let (x, y) = prepared_sheet_grid_origin(
         sheet,
-        range.validate()?,
+        range,
+        &row_slots,
         maximum_digit_width,
         options,
+        Some(geometry),
         &mut warnings,
     )?;
     let viewport = Rect {
@@ -6144,6 +6957,50 @@ fn pixels_as_fixed(value: f64) -> Result<Fixed, RenderError> {
     float_pixels_to_fixed(value).ok_or(RenderError::CoordinateOverflow)
 }
 
+fn drawing_clip(
+    kind: DrawingObjectKind,
+    rect: Rect,
+    metadata: Option<&DrawingMetadata>,
+    geometry: Option<SheetGeometryOverride<'_>>,
+    cell_viewport: Rect,
+    scene_width: Fixed,
+    scene_height: Fixed,
+) -> Result<Option<Rect>, RenderError> {
+    if is_sheet_absolute_metadata(metadata) {
+        return Ok(Some(Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: scene_width,
+            height: scene_height,
+        }));
+    }
+    if geometry.is_none() {
+        return Ok(None);
+    }
+    let paint_bounds = if kind == DrawingObjectKind::Image {
+        rotated_rect_bounds(
+            rect,
+            metadata
+                .and_then(|metadata| metadata.rotation_mdeg)
+                .unwrap_or(0),
+        )?
+    } else {
+        rect
+    };
+    Ok((!rect_contains(cell_viewport, paint_bounds)).then_some(cell_viewport))
+}
+
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    let outer_right = i128::from(outer.x.raw()) + i128::from(outer.width.raw());
+    let outer_bottom = i128::from(outer.y.raw()) + i128::from(outer.height.raw());
+    let inner_right = i128::from(inner.x.raw()) + i128::from(inner.width.raw());
+    let inner_bottom = i128::from(inner.y.raw()) + i128::from(inner.height.raw());
+    i128::from(inner.x.raw()) >= i128::from(outer.x.raw())
+        && i128::from(inner.y.raw()) >= i128::from(outer.y.raw())
+        && inner_right <= outer_right
+        && inner_bottom <= outer_bottom
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drawing_rect(
     row_slots: &[AxisSlot<u32>],
@@ -6156,6 +7013,7 @@ fn drawing_rect(
     to: (u32, u16),
     metadata: Option<&DrawingMetadata>,
     right_to_left: bool,
+    geometry: Option<SheetGeometryOverride<'_>>,
 ) -> Result<DrawingPlacement, RenderError> {
     if is_sheet_absolute_metadata(metadata) {
         let Some(mut rect) = absolute_drawing_bounds(metadata)? else {
@@ -6180,6 +7038,19 @@ fn drawing_rect(
         } else {
             rect
         }));
+    }
+    if let Some(geometry) = geometry {
+        return prepared_cell_drawing_rect(
+            row_slots,
+            col_slots,
+            cell_viewport,
+            kind,
+            from,
+            to,
+            metadata,
+            right_to_left,
+            geometry,
+        );
     }
     if row_slots.is_empty() || col_slots.is_empty() {
         return Ok(DrawingPlacement::Unavailable);
@@ -6265,6 +7136,178 @@ fn drawing_rect(
     } else {
         rect
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_cell_drawing_rect(
+    row_slots: &[AxisSlot<u32>],
+    col_slots: &[AxisSlot<u16>],
+    cell_viewport: Rect,
+    kind: DrawingObjectKind,
+    from: (u32, u16),
+    to: (u32, u16),
+    metadata: Option<&DrawingMetadata>,
+    right_to_left: bool,
+    geometry: SheetGeometryOverride<'_>,
+) -> Result<DrawingPlacement, RenderError> {
+    if row_slots.is_empty()
+        || col_slots.is_empty()
+        || geometry.rows.is_empty()
+        || geometry.columns.is_empty()
+    {
+        return Ok(DrawingPlacement::Unavailable);
+    }
+    let full_width = axis_slots_end(geometry.columns)?;
+    let full_height = axis_slots_end(geometry.rows)?;
+    let full_first_row = geometry.rows.first().map_or(0, |slot| slot.index);
+    let full_last_row = geometry.rows.last().map_or(0, |slot| slot.index);
+    let full_first_col = geometry.columns.first().map_or(0, |slot| slot.index);
+    let full_last_col = geometry.columns.last().map_or(0, |slot| slot.index);
+    let clipped_from_row = from.0 < full_first_row;
+    let clipped_from_col = from.1 < full_first_col;
+    let mut left = row_or_column_boundary_col(geometry.columns, from.1, full_width);
+    let mut top = row_or_column_boundary_row(geometry.rows, from.0, full_height);
+    if let Some((x, y)) = metadata.and_then(|metadata| metadata.from_offset_emu) {
+        if !clipped_from_col {
+            left = left
+                .checked_add(emu_to_fixed(x)?)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+        if !clipped_from_row {
+            top = top
+                .checked_add(emu_to_fixed(y)?)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+    }
+
+    let mut anchored_right = row_or_column_boundary_col(geometry.columns, to.1, full_width);
+    let mut anchored_bottom = row_or_column_boundary_row(geometry.rows, to.0, full_height);
+    if let Some((x, y)) = metadata.and_then(|metadata| metadata.to_offset_emu) {
+        if to.1 <= full_last_col {
+            anchored_right = anchored_right
+                .checked_add(emu_to_fixed(x)?)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+        if to.0 <= full_last_row {
+            anchored_bottom = anchored_bottom
+                .checked_add(emu_to_fixed(y)?)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+    }
+    let (right, bottom) =
+        if let Some((width, height)) = metadata.and_then(|metadata| metadata.absolute_size_emu) {
+            let right = if clipped_from_col {
+                anchored_right
+            } else {
+                left.checked_add(emu_size_to_fixed(width)?)
+                    .ok_or(RenderError::CoordinateOverflow)?
+            };
+            let bottom = if clipped_from_row {
+                anchored_bottom
+            } else {
+                top.checked_add(emu_size_to_fixed(height)?)
+                    .ok_or(RenderError::CoordinateOverflow)?
+            };
+            (right, bottom)
+        } else {
+            (anchored_right, anchored_bottom)
+        };
+    if right <= left || bottom <= top {
+        return Ok(DrawingPlacement::OutsideViewport);
+    }
+    let mut global_rect = Rect {
+        x: left,
+        y: top,
+        width: right
+            .checked_sub(left)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: bottom
+            .checked_sub(top)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    };
+    if right_to_left {
+        global_rect = reflect_rect_horizontally(global_rect, full_width)?;
+    }
+
+    let tile_y = prepared_row_offset(geometry.rows, row_slots)?;
+    let tile_x = prepared_column_offset(geometry.columns, col_slots, full_width, right_to_left)?;
+    let tile = Rect {
+        x: tile_x,
+        y: tile_y,
+        width: cell_viewport.width,
+        height: cell_viewport.height,
+    };
+    let paint_bounds = if kind == DrawingObjectKind::Image {
+        rotated_rect_bounds(
+            global_rect,
+            metadata
+                .and_then(|metadata| metadata.rotation_mdeg)
+                .unwrap_or(0),
+        )?
+    } else {
+        global_rect
+    };
+    if !rectangles_intersect(paint_bounds, tile) {
+        return Ok(DrawingPlacement::OutsideViewport);
+    }
+
+    global_rect.x = global_rect
+        .x
+        .checked_sub(tile_x)
+        .and_then(|value| value.checked_add(cell_viewport.x))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    global_rect.y = global_rect
+        .y
+        .checked_sub(tile_y)
+        .and_then(|value| value.checked_add(cell_viewport.y))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(DrawingPlacement::Placed(global_rect))
+}
+
+fn prepared_row_offset(
+    geometry: &[AxisSlot<u32>],
+    local: &[AxisSlot<u32>],
+) -> Result<Fixed, RenderError> {
+    let index = local
+        .first()
+        .map(|slot| slot.index)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    geometry
+        .binary_search_by_key(&index, |slot| slot.index)
+        .ok()
+        .and_then(|position| geometry.get(position))
+        .map(|slot| slot.offset)
+        .ok_or(RenderError::Backend {
+            reason: "prepared_print_geometry_missing_axis_slot",
+        })
+}
+
+fn prepared_column_offset(
+    geometry: &[AxisSlot<u16>],
+    local: &[AxisSlot<u16>],
+    full_width: Fixed,
+    right_to_left: bool,
+) -> Result<Fixed, RenderError> {
+    local
+        .iter()
+        .map(|local| {
+            let slot = geometry
+                .binary_search_by_key(&local.index, |slot| slot.index)
+                .ok()
+                .and_then(|position| geometry.get(position))
+                .ok_or(RenderError::Backend {
+                    reason: "prepared_print_geometry_missing_axis_slot",
+                })?;
+            if right_to_left {
+                reflected_x(slot.offset, slot.size, full_width)
+            } else {
+                Ok(slot.offset)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min()
+        .ok_or(RenderError::CoordinateOverflow)
 }
 
 fn row_or_column_boundary_row(slots: &[AxisSlot<u32>], index: u32, total: Fixed) -> Fixed {
@@ -7821,6 +8864,24 @@ fn append_styled_shaped_outlines(
             style.italic && !pack.is_italic(run.font_id).map_err(map_font_error)?;
         let synthetic_bold = style.bold && pack.weight(run.font_id).map_err(map_font_error)? < 600;
         let run_command_start = output.len() as u64;
+        let mut logical_cluster_starts = run
+            .glyphs
+            .iter()
+            .map(|glyph| {
+                usize::try_from(glyph.cluster).map_err(|_| RenderError::Typography {
+                    reason: "invalid_glyph_cluster",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        logical_cluster_starts.sort_unstable();
+        logical_cluster_starts.dedup();
+        let mut logical_cluster_ends = HashMap::with_capacity(logical_cluster_starts.len());
+        for pair in logical_cluster_starts.windows(2) {
+            logical_cluster_ends.insert(pair[0], pair[1]);
+        }
+        if let Some(&last) = logical_cluster_starts.last() {
+            logical_cluster_ends.insert(last, run.source.end);
+        }
         let mut glyph_index = 0_usize;
         while glyph_index < run.glyphs.len() {
             let cluster_start = usize::try_from(run.glyphs[glyph_index].cluster).map_err(|_| {
@@ -7917,13 +8978,11 @@ fn append_styled_shaped_outlines(
                     .checked_add(advance)
                     .ok_or(RenderError::CoordinateOverflow)?;
             }
-            let cluster_end = run
-                .glyphs
-                .iter()
-                .filter_map(|glyph| usize::try_from(glyph.cluster).ok())
-                .filter(|candidate| *candidate > cluster_start)
-                .min()
-                .unwrap_or(run.source.end);
+            let cluster_end = logical_cluster_ends.get(&cluster_start).copied().ok_or(
+                RenderError::Typography {
+                    reason: "invalid_glyph_cluster",
+                },
+            )?;
             let source_start = line_source_start
                 .checked_add(cluster_start)
                 .ok_or(RenderError::CoordinateOverflow)?;
@@ -8390,77 +9449,359 @@ fn overflow_blocked_by(region: &Region) -> bool {
     region.is_merged || !region.text.is_empty()
 }
 
-fn push_borders(
-    nodes: &mut Vec<SceneNode>,
-    rect: Rect,
-    border: &Border,
-    coordinate: CellCoordinate,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ComposedEdgeOrientation {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ComposedEdgeKey {
+    orientation: ComposedEdgeOrientation,
+    axis: Fixed,
+    start: Fixed,
+    end: Fixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CellEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeClaim {
+    kind: EdgeClaimKind,
+    style: BorderStyle,
+    color: Rgb,
+    owner: CellCoordinate,
+    side: CellEdge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EdgeClaimKind {
+    Gridline,
+    GridlineSuppression,
+    Explicit,
+}
+
+fn compose_edges(
+    regions: &[Region],
+    suppresses_gridlines: &[bool],
+    show_gridlines: bool,
     options: &RenderOptions,
-    warnings: &mut Warnings,
+) -> Result<Vec<(ComposedEdgeKey, EdgeClaim)>, RenderError> {
+    #[derive(Debug, Clone, Copy)]
+    struct RawEdgeClaim {
+        start: Fixed,
+        end: Fixed,
+        claim: EdgeClaim,
+    }
+
+    #[derive(Default)]
+    struct EdgeEvents {
+        starts: Vec<(usize, EdgeClaim)>,
+        ends: Vec<usize>,
+    }
+
+    // Four source-side claims are one bounded compositor work unit. This
+    // admits a coalesced 2x2 grid at its exact six-node output limit (16
+    // claims = four work units) while stopping large low-output grids from
+    // consuming unbounded intermediate memory.
+    const CLAIMS_PER_COMPOSITOR_WORK_UNIT: u64 = 4;
+    let mut claim_count = 0_u64;
+    let mut raw_claims = BTreeMap::<(ComposedEdgeOrientation, Fixed), Vec<RawEdgeClaim>>::new();
+    for (region_index, region) in regions.iter().enumerate() {
+        let right = region
+            .rect
+            .x
+            .checked_add(region.rect.width)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let bottom = region
+            .rect
+            .y
+            .checked_add(region.rect.height)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        for (side, orientation, axis, start, end) in [
+            (
+                CellEdge::Left,
+                ComposedEdgeOrientation::Vertical,
+                region.rect.x,
+                region.rect.y,
+                bottom,
+            ),
+            (
+                CellEdge::Right,
+                ComposedEdgeOrientation::Vertical,
+                right,
+                region.rect.y,
+                bottom,
+            ),
+            (
+                CellEdge::Top,
+                ComposedEdgeOrientation::Horizontal,
+                region.rect.y,
+                region.rect.x,
+                right,
+            ),
+            (
+                CellEdge::Bottom,
+                ComposedEdgeOrientation::Horizontal,
+                bottom,
+                region.rect.x,
+                right,
+            ),
+        ] {
+            let Some(claim) = region_edge_claim(
+                region,
+                side,
+                suppresses_gridlines
+                    .get(region_index)
+                    .copied()
+                    .unwrap_or(false),
+                show_gridlines,
+            ) else {
+                continue;
+            };
+            if start >= end {
+                continue;
+            }
+            claim_count = claim_count
+                .checked_add(1)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let work_units = claim_count
+                .checked_add(CLAIMS_PER_COMPOSITOR_WORK_UNIT - 1)
+                .ok_or(RenderError::CoordinateOverflow)?
+                / CLAIMS_PER_COMPOSITOR_WORK_UNIT;
+            enforce(
+                LimitKind::SceneNodes,
+                options.limits.max_scene_nodes,
+                work_units,
+            )?;
+            raw_claims
+                .entry((orientation, axis))
+                .or_default()
+                .push(RawEdgeClaim { start, end, claim });
+        }
+    }
+
+    // Resolve only claims sharing the same geometric axis. The event sweep is
+    // linear in retained claims and replaces global Cartesian segmentation.
+    let mut composed = BTreeMap::<ComposedEdgeKey, EdgeClaim>::new();
+    for ((orientation, axis), claims) in raw_claims {
+        let mut events = BTreeMap::<Fixed, EdgeEvents>::new();
+        for (claim_index, raw) in claims.into_iter().enumerate() {
+            events
+                .entry(raw.start)
+                .or_default()
+                .starts
+                .push((claim_index, raw.claim));
+            events.entry(raw.end).or_default().ends.push(claim_index);
+        }
+        let mut active = BTreeMap::<usize, EdgeClaim>::new();
+        let mut events = events.into_iter().peekable();
+        while let Some((start, event)) = events.next() {
+            for claim_index in event.ends {
+                active.remove(&claim_index);
+            }
+            for (claim_index, claim) in event.starts {
+                active.insert(claim_index, claim);
+            }
+            let Some((end, _)) = events.peek() else {
+                break;
+            };
+            let end = *end;
+            if start >= end {
+                continue;
+            }
+            let Some(winner) = active.values().copied().reduce(|current, candidate| {
+                if edge_claim_precedes(candidate, current) {
+                    candidate
+                } else {
+                    current
+                }
+            }) else {
+                continue;
+            };
+            composed.insert(
+                ComposedEdgeKey {
+                    orientation,
+                    axis,
+                    start,
+                    end,
+                },
+                winner,
+            );
+        }
+    }
+    Ok(coalesce_composed_edges(composed))
+}
+
+fn push_composed_edges(
+    nodes: &mut Vec<SceneNode>,
+    composed: &[(ComposedEdgeKey, EdgeClaim)],
+    layer: EdgeClaimKind,
+    options: &RenderOptions,
 ) -> Result<(), RenderError> {
-    let right = rect
-        .x
-        .checked_add(rect.width)
-        .ok_or(RenderError::CoordinateOverflow)?;
-    let bottom = rect
-        .y
-        .checked_add(rect.height)
-        .ok_or(RenderError::CoordinateOverflow)?;
-    let edges = [
-        (
-            border.left,
-            border.left_color.or(border.color),
-            rect.x,
-            rect.y,
-            rect.x,
-            bottom,
-        ),
-        (
-            border.right,
-            border.right_color.or(border.color),
-            right,
-            rect.y,
-            right,
-            bottom,
-        ),
-        (
-            border.top,
-            border.top_color.or(border.color),
-            rect.x,
-            rect.y,
-            right,
-            rect.y,
-        ),
-        (
-            border.bottom,
-            border.bottom_color.or(border.color),
-            rect.x,
-            bottom,
-            right,
-            bottom,
-        ),
-    ];
-    for (style, color, x1, y1, x2, y2) in edges {
-        let Some(width) = border_width(style) else {
+    debug_assert!(matches!(
+        layer,
+        EdgeClaimKind::Gridline | EdgeClaimKind::Explicit
+    ));
+    for &(key, claim) in composed {
+        if claim.kind != layer {
+            continue;
+        }
+        if claim.style == BorderStyle::Double {
+            push_double_edge(nodes, key, claim, options)?;
+            continue;
+        }
+        let Some(width) = border_width(claim.style) else {
             continue;
         };
-        if style == BorderStyle::Double {
-            warnings.add(WarningCode::DoubleBorderSimplified, Some(coordinate));
-        }
         push_node(
             nodes,
-            SceneNode::Line(LineNode {
-                x1,
-                y1,
-                x2,
-                y2,
-                color: color.map(rgb).unwrap_or(Rgb::BLACK),
-                width,
-            }),
+            SceneNode::Line(edge_line(key, Fixed::ZERO, claim.color, width)?),
             options,
         )?;
     }
     Ok(())
+}
+
+fn region_edge_claim(
+    region: &Region,
+    side: CellEdge,
+    suppresses_gridlines: bool,
+    show_gridlines: bool,
+) -> Option<EdgeClaim> {
+    let (style, color) = region
+        .style
+        .as_ref()
+        .and_then(|style| style.border.as_ref())
+        .map_or((BorderStyle::None, None), |border| {
+            border_edge_style_and_color(border, side)
+        });
+    if style != BorderStyle::None {
+        return Some(EdgeClaim {
+            kind: EdgeClaimKind::Explicit,
+            style,
+            color: color.map(rgb).unwrap_or(Rgb::BLACK),
+            owner: region.source,
+            side,
+        });
+    }
+    show_gridlines.then_some(EdgeClaim {
+        kind: if suppresses_gridlines {
+            EdgeClaimKind::GridlineSuppression
+        } else {
+            EdgeClaimKind::Gridline
+        },
+        style: BorderStyle::Thin,
+        color: Rgb::GRIDLINE,
+        owner: region.source,
+        side,
+    })
+}
+
+fn border_edge_style_and_color(border: &Border, side: CellEdge) -> (BorderStyle, Option<Color>) {
+    match side {
+        CellEdge::Left => (border.left, border.left_color.or(border.color)),
+        CellEdge::Right => (border.right, border.right_color.or(border.color)),
+        CellEdge::Top => (border.top, border.top_color.or(border.color)),
+        CellEdge::Bottom => (border.bottom, border.bottom_color.or(border.color)),
+    }
+}
+
+fn edge_claim_precedes(candidate: EdgeClaim, current: EdgeClaim) -> bool {
+    let candidate_strength = (candidate.kind, border_precedence(candidate.style));
+    let current_strength = (current.kind, border_precedence(current.style));
+    candidate_strength > current_strength
+        || (candidate_strength == current_strength
+            && (candidate.owner, candidate.side) < (current.owner, current.side))
+}
+
+fn border_precedence(style: BorderStyle) -> u8 {
+    match style {
+        BorderStyle::None => 0,
+        BorderStyle::Thin => 1,
+        BorderStyle::Medium => 2,
+        BorderStyle::Thick => 3,
+        BorderStyle::Double => 4,
+    }
+}
+
+fn coalesce_composed_edges(
+    composed: BTreeMap<ComposedEdgeKey, EdgeClaim>,
+) -> Vec<(ComposedEdgeKey, EdgeClaim)> {
+    let mut coalesced: Vec<(ComposedEdgeKey, EdgeClaim)> = Vec::new();
+    for (key, claim) in composed {
+        if let Some((previous_key, previous_claim)) = coalesced.last_mut() {
+            if previous_key.orientation == key.orientation
+                && previous_key.axis == key.axis
+                && previous_key.end == key.start
+                && claims_are_visually_identical(*previous_claim, claim)
+            {
+                previous_key.end = key.end;
+                continue;
+            }
+        }
+        coalesced.push((key, claim));
+    }
+    coalesced
+}
+
+fn claims_are_visually_identical(left: EdgeClaim, right: EdgeClaim) -> bool {
+    left.kind == right.kind && left.style == right.style && left.color == right.color
+}
+
+fn push_double_edge(
+    nodes: &mut Vec<SceneNode>,
+    key: ComposedEdgeKey,
+    claim: EdgeClaim,
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    // Calc centers a shared double rule on the geometric boundary. Symmetric
+    // placement makes equivalent A.right/B.left (and top/bottom) authorship
+    // identical, including after RTL reflection.
+    for offset in [Fixed::from_pixels(-1), Fixed::from_pixels(1)] {
+        push_node(
+            nodes,
+            SceneNode::Line(edge_line(key, offset, claim.color, Fixed::from_pixels(1))?),
+            options,
+        )?;
+    }
+    Ok(())
+}
+
+fn edge_line(
+    key: ComposedEdgeKey,
+    axis_offset: Fixed,
+    color: Rgb,
+    width: Fixed,
+) -> Result<LineNode, RenderError> {
+    let axis = key
+        .axis
+        .checked_add(axis_offset)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(match key.orientation {
+        ComposedEdgeOrientation::Vertical => LineNode {
+            x1: axis,
+            y1: key.start,
+            x2: axis,
+            y2: key.end,
+            color,
+            width,
+        },
+        ComposedEdgeOrientation::Horizontal => LineNode {
+            x1: key.start,
+            y1: axis,
+            x2: key.end,
+            y2: axis,
+            color,
+            width,
+        },
+    })
 }
 
 fn border_width(style: BorderStyle) -> Option<Fixed> {
@@ -9017,8 +10358,9 @@ mod tests {
                 assert!(extracted.contains(fragment), "{extracted:?}");
             }
             // Poppler wraps strong RTL text in directional controls and emits
-            // its visual glyph order; displaying this substring reads `אב`.
-            assert!(extracted.contains("\u{202b} בא\u{202c}"), "{extracted:?}");
+            // its visual glyph order without inventing a leading gap;
+            // displaying this substring reads `אב`.
+            assert!(extracted.contains("\u{202b}בא\u{202c}"), "{extracted:?}");
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -9175,6 +10517,70 @@ mod tests {
         assert_eq!(
             rows.last().map(|slot| (slot.index, slot.size.raw())),
             Some((4, 38_094))
+        );
+    }
+
+    #[test]
+    fn prepared_geometry_replays_nonlocal_wrapped_row_height_in_print_tiles() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("prepared-geometry");
+        sheet.set_col_width(0, 100.0);
+        sheet.set_col_width(1, 2.0);
+        sheet.write(0, 0, "plain");
+        sheet.write_styled(0, 1, "한글中文한글中文", &CellStyle::new().wrap());
+
+        let full_range = RenderRange::new(0, 0, 0, 1);
+        let full_options = outlined_options(full_range);
+        let (prepared_rows, prepared_columns) =
+            measure_sheet_axes(sheet, full_range, &full_options).unwrap();
+        let prepared_height = prepared_rows[0].size;
+
+        let tile_options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            ..full_options
+        };
+        let tile_local = build_sheet_scene(sheet, 0, &tile_options).unwrap();
+        assert_eq!(
+            tile_local.scene.height, prepared_height,
+            "automatic row height is sheet-row geometry even outside the tile columns"
+        );
+
+        let replayed = build_sheet_scene_with_geometry(
+            sheet,
+            0,
+            &tile_options,
+            SheetGeometryOverride::new(&prepared_rows, &prepared_columns),
+        )
+        .unwrap();
+        assert_eq!(replayed.scene.height, prepared_height);
+    }
+
+    #[test]
+    fn merged_auto_height_is_independent_of_selected_columns() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("merged-row-geometry");
+        sheet.set_col_width(0, 8.0);
+        for col in 1..=3 {
+            sheet.set_col_width(col, 2.0);
+        }
+        sheet.write_styled(
+            0,
+            1,
+            "merged wrapped text must use the complete B:D width",
+            &CellStyle::new().wrap(),
+        );
+        sheet.merge(0, 1, 0, 3);
+
+        let full_options = outlined_options(RenderRange::new(0, 0, 0, 3));
+        let tile_options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            ..full_options.clone()
+        };
+        let full = build_sheet_scene(&workbook.sheets[0], 0, &full_options).unwrap();
+        let tile = build_sheet_scene(&workbook.sheets[0], 0, &tile_options).unwrap();
+        assert_eq!(
+            tile.scene.height, full.scene.height,
+            "worksheet-global row height must use the full merged width outside the selected tile"
         );
     }
 
@@ -9429,13 +10835,346 @@ mod tests {
             .scene
             .nodes
             .iter()
-            .find_map(|node| match node {
-                SceneNode::Rect(node) if node.stroke.is_some() => Some(node),
+            .filter_map(|node| match node {
+                SceneNode::Line(node) if node.color == Rgb::GRIDLINE => Some(node),
                 _ => None,
             })
-            .expect("gridline rectangle");
-        assert_eq!(grid.stroke, Some(Rgb::new(217, 217, 217)));
-        assert_eq!(grid.stroke_width, Fixed::from_pixels(1));
+            .collect::<Vec<_>>();
+        assert_eq!(grid.len(), 4);
+        assert!(grid.iter().all(|line| line.width == Fixed::from_pixels(1)));
+    }
+
+    #[test]
+    fn shared_grid_edges_are_painted_once_and_coalesced_per_axis() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("grid").write(0, 0, "A");
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 1, 1)),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let grid = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(node) if node.color == Rgb::GRIDLINE => Some(node),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            grid.len(),
+            6,
+            "a 2x2 selection has three coalesced lines on each axis"
+        );
+        assert_eq!(
+            grid.iter()
+                .filter(|line| line.x1 == line.x2)
+                .map(|line| (line.y2.raw() - line.y1.raw()).abs())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(
+            grid.iter()
+                .filter(|line| line.y1 == line.y2)
+                .map(|line| (line.x2.raw() - line.x1.raw()).abs())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn two_by_two_grid_passes_at_its_exact_coalesced_scene_node_limit() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("bounded-grid");
+        let mut options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 1, 1)),
+            ..RenderOptions::default()
+        };
+        options.limits.max_scene_nodes = 6;
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        assert_eq!(build.report.scene_nodes, 6);
+        assert_eq!(
+            build
+                .scene
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, SceneNode::Line(_)))
+                .count(),
+            6
+        );
+
+        options.limits.max_scene_nodes = 5;
+        assert_eq!(
+            build_scene(&workbook, 0, &options),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::SceneNodes,
+                limit: 5,
+                actual: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn filled_and_conditionally_filled_cells_suppress_gridline_segments() {
+        let fill = Color::rgb(10, 20, 30);
+        let mut filled = Workbook::new();
+        filled.add_sheet("filled").write_styled(
+            0,
+            0,
+            "A",
+            &CellStyle {
+                fill: Some(fill),
+                pattern_fill: Some(rxls::Fill::solid(fill)),
+                ..CellStyle::default()
+            },
+        );
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            ..RenderOptions::default()
+        };
+        let filled_scene = build_scene(&filled, 0, &options).unwrap();
+        assert!(!filled_scene
+            .scene
+            .nodes
+            .iter()
+            .any(|node| matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE)));
+
+        let mut conditional = Workbook::new();
+        let sheet = conditional.add_sheet("conditional");
+        sheet.write_number(0, 0, 1);
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 0, 0),
+            CfRule::cell_is(DvOp::GreaterThan, "0", None::<&str>, fill),
+        ));
+        let conditional_scene = build_scene(&conditional, 0, &options).unwrap();
+        assert!(!conditional_scene
+            .scene
+            .nodes
+            .iter()
+            .any(|node| matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE)));
+    }
+
+    #[test]
+    fn explicit_shared_border_wins_once_over_neighbor_and_gridline() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("borders");
+        sheet.write_styled(
+            0,
+            0,
+            "left",
+            &CellStyle {
+                border: Some(
+                    Border::new()
+                        .with_right(BorderStyle::Thin)
+                        .with_right_color(Color::rgb(255, 0, 0)),
+                ),
+                ..CellStyle::default()
+            },
+        );
+        sheet.write_styled(
+            0,
+            1,
+            "right",
+            &CellStyle {
+                border: Some(
+                    Border::new()
+                        .with_left(BorderStyle::Thick)
+                        .with_left_color(Color::rgb(0, 0, 255)),
+                ),
+                ..CellStyle::default()
+            },
+        );
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 1)),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let explicit = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) if line.color != Rgb::GRIDLINE => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].color, Rgb::new(0, 0, 255));
+        assert_eq!(explicit[0].width, Fixed::from_pixels(3));
+        assert!(!build.scene.nodes.iter().any(|node| {
+            matches!(
+                node,
+                SceneNode::Line(line)
+                    if line.color == Rgb::GRIDLINE
+                        && line.x1 == explicit[0].x1
+                        && line.x2 == explicit[0].x2
+                        && line.y1 == explicit[0].y1
+                        && line.y2 == explicit[0].y2
+            )
+        }));
+    }
+
+    #[test]
+    fn gridlines_remain_below_text_while_explicit_borders_remain_above_it() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("edge-layers").write_styled(
+            0,
+            0,
+            "overflowing text",
+            &CellStyle {
+                border: Some(
+                    Border::new()
+                        .with_right(BorderStyle::Thin)
+                        .with_right_color(Color::rgb(255, 0, 0)),
+                ),
+                ..CellStyle::default()
+            },
+        );
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 1)),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+
+        let text_index = build
+            .scene
+            .nodes
+            .iter()
+            .position(|node| matches!(node, SceneNode::Text(_)))
+            .unwrap();
+        let last_gridline = build
+            .scene
+            .nodes
+            .iter()
+            .rposition(|node| matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE))
+            .unwrap();
+        let explicit_border = build
+            .scene
+            .nodes
+            .iter()
+            .position(
+                |node| matches!(node, SceneNode::Line(line) if line.color == Rgb::new(255, 0, 0)),
+            )
+            .unwrap();
+        assert!(last_gridline < text_index);
+        assert!(text_index < explicit_border);
+    }
+
+    #[test]
+    fn double_border_is_retained_as_two_parallel_single_pixel_lines() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("double").write_styled(
+            0,
+            0,
+            "A",
+            &CellStyle {
+                border: Some(
+                    Border::new()
+                        .with_top(BorderStyle::Double)
+                        .with_top_color(Color::rgb(1, 2, 3)),
+                ),
+                ..CellStyle::default()
+            },
+        );
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let lines = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.color == Rgb::new(1, 2, 3)
+            && line.width == Fixed::from_pixels(1)
+            && line.y1 == line.y2));
+        assert_eq!(
+            (lines[1].y1.raw() - lines[0].y1.raw()).abs(),
+            Fixed::from_pixels(2).raw()
+        );
+        assert!(!build
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::DoubleBorderSimplified));
+    }
+
+    #[test]
+    fn shared_double_border_geometry_does_not_depend_on_the_authoring_neighbor() {
+        fn shared_lines(author_on_left: bool) -> Vec<(i64, i64, i64, i64)> {
+            let mut workbook = Workbook::new();
+            let sheet = workbook.add_sheet("shared-double");
+            let (left, right) = if author_on_left {
+                (
+                    CellStyle {
+                        border: Some(Border::new().with_right(BorderStyle::Double)),
+                        ..CellStyle::default()
+                    },
+                    CellStyle::default(),
+                )
+            } else {
+                (
+                    CellStyle::default(),
+                    CellStyle {
+                        border: Some(Border::new().with_left(BorderStyle::Double)),
+                        ..CellStyle::default()
+                    },
+                )
+            };
+            sheet.write_styled(0, 0, "A", &left);
+            sheet.write_styled(0, 1, "B", &right);
+            build_scene(
+                &workbook,
+                0,
+                &RenderOptions {
+                    selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 1)),
+                    gridlines: false,
+                    ..RenderOptions::default()
+                },
+            )
+            .unwrap()
+            .scene
+            .nodes
+            .into_iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) => {
+                    Some((line.x1.raw(), line.y1.raw(), line.x2.raw(), line.y2.raw()))
+                }
+                _ => None,
+            })
+            .collect()
+        }
+
+        let left_authored = shared_lines(true);
+        let right_authored = shared_lines(false);
+        assert_eq!(left_authored, right_authored);
+        assert_eq!(left_authored.len(), 2);
     }
 
     #[test]
@@ -10162,6 +11901,22 @@ mod tests {
 
     #[test]
     fn drawings_continue_across_explicit_range_and_print_tile_boundaries() {
+        fn contains_placeholder(nodes: &[SceneNode]) -> bool {
+            nodes.iter().any(|node| match node {
+                SceneNode::ClipGroup(group) => contains_placeholder(&group.nodes),
+                SceneNode::Rect(RectNode {
+                    fill:
+                        Some(Rgb {
+                            red: 242,
+                            green: 242,
+                            blue: 242,
+                        }),
+                    ..
+                }) => true,
+                _ => false,
+            })
+        }
+
         let mut workbook = Workbook::new();
         let sheet = workbook.add_sheet("continued-drawing");
         sheet.add_image(Image::new([137, 80, 78, 71], ImageFmt::Png, (0, 0)).with_to((4, 4)));
@@ -10223,17 +11978,7 @@ mod tests {
             .pages
             .iter()
             .skip(1)
-            .any(|page| page.scene.nodes.iter().any(|node| matches!(
-                node,
-                SceneNode::Rect(RectNode {
-                    fill: Some(Rgb {
-                        red: 242,
-                        green: 242,
-                        blue: 242,
-                    }),
-                    ..
-                })
-            ))));
+            .any(|page| contains_placeholder(&page.scene.nodes)));
     }
 
     #[test]

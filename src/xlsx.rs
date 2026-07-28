@@ -5520,14 +5520,18 @@ fn parse_sheet(
                             row, col, &ctype, style_idx, cell_value, &resolved, shared, styles,
                             date1904,
                         ) {
-                            // Bound accumulated text so a small file that clones a
-                            // large shared string into many cells cannot exhaust
-                            // memory; stop the sheet once the budget is spent.
-                            if entry.text.len() > *budget {
+                            // Account for the complete retained cell rather than
+                            // only its rendered text. A custom number format can
+                            // deliberately render a real value as an empty string;
+                            // that value must remain available through the typed
+                            // API without giving empty-display cells a zero-cost
+                            // path around the workbook allocation budget.
+                            let retained_cost = retained_cell_cost(&entry);
+                            if retained_cost > *budget {
                                 *budget = 0;
                                 break;
                             }
-                            *budget -= entry.text.len();
+                            *budget -= retained_cost;
                             if ctype == "s" {
                                 if let Some(runs) = value
                                     .trim()
@@ -6225,11 +6229,6 @@ fn build_cell(
         ),
         (None, true) => return None,
     };
-    // Drop a value-only cell with no display text (keeps the grid sparse); a
-    // formula cell is always surfaced.
-    if text.is_empty() && formula.is_empty() {
-        return None;
-    }
     Some(CellEntry {
         row,
         col,
@@ -6237,6 +6236,57 @@ fn build_cell(
         text,
         style: styles.cell_style(style_idx).cloned(),
         hyperlink: None,
+    })
+}
+
+// Architecture-neutral retained-allocation charges. The record allowance is
+// deliberately 256 bytes: it exceeds the current 64-bit `CellEntry` layout and
+// still permits one million short numeric cells within the 256 MiB workbook
+// budget. The boxed-cell allowance likewise exceeds the current 64-bit `Cell`
+// layout plus allocator bookkeeping. Compile-time assertions keep future model
+// growth from silently invalidating those conservative bounds on any target.
+const RETAINED_CELL_RECORD_BYTES: usize = 256;
+const RETAINED_BOXED_CELL_BYTES: usize = 64;
+const _: () = assert!(std::mem::size_of::<CellEntry>() <= RETAINED_CELL_RECORD_BYTES);
+const _: () = assert!(std::mem::size_of::<Cell>() <= RETAINED_BOXED_CELL_BYTES);
+
+fn retained_cell_cost(entry: &CellEntry) -> usize {
+    RETAINED_CELL_RECORD_BYTES
+        .saturating_add(entry.text.len())
+        .saturating_add(retained_cell_value_heap_bytes(&entry.value))
+        // Direct OOXML formats are retained both on the cell and in the
+        // cell-XF overlay map. Charge both variable string copies; the fixed
+        // record allowance covers their non-allocating structures.
+        .saturating_add(retained_cell_style_heap_bytes(entry.style.as_ref()).saturating_mul(2))
+}
+
+fn retained_cell_value_heap_bytes(mut value: &Cell) -> usize {
+    let mut bytes = 0usize;
+    loop {
+        match value {
+            Cell::Text(source) | Cell::Error(source) => {
+                return bytes.saturating_add(source.len());
+            }
+            Cell::Formula { formula, cached } => {
+                bytes = bytes
+                    .saturating_add(formula.len())
+                    .saturating_add(RETAINED_BOXED_CELL_BYTES);
+                value = cached;
+            }
+            Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => return bytes,
+        }
+    }
+}
+
+fn retained_cell_style_heap_bytes(style: Option<&CellStyle>) -> usize {
+    style.map_or(0, |style| {
+        style
+            .font
+            .as_ref()
+            .and_then(|font| font.name.as_deref())
+            .map(str::len)
+            .unwrap_or(0)
+            .saturating_add(style.num_fmt.as_deref().map(str::len).unwrap_or(0))
     })
 }
 
@@ -6664,7 +6714,8 @@ mod tests {
     #[test]
     fn text_budget_caps_shared_string_amplification() {
         // The shared-string DoS: one large pooled string referenced by very many
-        // cells. Accumulated text must stay within the budget (here, a small one).
+        // cells. Retained values, display text, and cell records must stay within
+        // the budget (here, a deliberately small one).
         let shared = vec![SharedString {
             text: "X".repeat(100),
             runs: Vec::new(),
@@ -6674,7 +6725,8 @@ mod tests {
             xml.push_str("<c t=\"s\"><v>0</v></c>");
         }
         xml.push_str("</row></sheetData></worksheet>");
-        let mut budget = 250usize;
+        let initial_budget = 1_024usize;
+        let mut budget = initial_budget;
         let cells = parse_sheet(
             &xml,
             &shared,
@@ -6684,10 +6736,10 @@ mod tests {
             &mut budget,
         )
         .cells;
-        let total: usize = cells.iter().map(|c| c.text.len()).sum();
+        let total: usize = cells.iter().map(retained_cell_cost).sum();
         assert!(
-            total <= 250,
-            "accumulated {total} bytes exceeded the 250 budget"
+            total <= initial_budget,
+            "accumulated {total} bytes exceeded the {initial_budget} budget"
         );
         assert!(!cells.is_empty(), "should still extract up to the cap");
     }
@@ -6713,6 +6765,103 @@ mod tests {
 
         assert!(cells.is_empty());
         assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn empty_number_formats_retain_typed_values_under_a_structural_budget() {
+        // These are the two real-world cases that exposed the regression:
+        // `#` hides zero, while an explicitly empty format hides every number.
+        // Both cells remain semantically present even though their display text
+        // is empty.
+        let styles = parse_styles(
+            r##"<styleSheet><numFmts count="2"><numFmt numFmtId="0" formatCode=""/><numFmt numFmtId="1" formatCode="#"/></numFmts><cellXfs count="2"><xf numFmtId="1"/><xf numFmtId="0"/></cellXfs></styleSheet>"##,
+            &ThemeColors::default(),
+        );
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1" s="0" t="n"><v>0</v></c><c r="B1" s="1" t="n"><v>3</v></c></row></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let cells = parse_sheet(
+            xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        )
+        .cells;
+
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].value, Cell::Number(0.0));
+        assert_eq!(cells[1].value, Cell::Number(3.0));
+        assert_eq!(cells[0].text, "");
+        assert_eq!(cells[1].text, "");
+
+        let one_cell_xml = r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="n"><v>3</v></c></row></sheetData></worksheet>"#;
+        let exact_cost = retained_cell_cost(&cells[1]);
+        assert_eq!(
+            exact_cost, RETAINED_CELL_RECORD_BYTES,
+            "the explicitly empty format adds no variable bytes"
+        );
+
+        // The exact boundary admits the hidden value. One byte less rejects it
+        // and leaves the same explicit partial-extraction signal used by other
+        // text-budget exhaustion paths.
+        let mut budget = exact_cost;
+        let parsed = parse_sheet(
+            one_cell_xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        assert_eq!(parsed.cells.len(), 1);
+        assert_eq!(parsed.cells[0].value, Cell::Number(3.0));
+        assert_eq!(budget, 0);
+
+        let mut budget = exact_cost.saturating_sub(1);
+        let parsed = parse_sheet(
+            one_cell_xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        assert!(parsed.cells.is_empty());
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn retained_cell_budget_keeps_ordinary_high_cell_count_sheets_complete() {
+        const CELLS: usize = 65_536;
+        let row = "<row><c t=\"n\"><v>1</v></c></row>";
+        let mut xml = String::with_capacity(
+            "<worksheet><sheetData></sheetData></worksheet>".len() + row.len() * CELLS,
+        );
+        xml.push_str("<worksheet><sheetData>");
+        for _ in 0..CELLS {
+            xml.push_str(row);
+        }
+        xml.push_str("</sheetData></worksheet>");
+
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let cells = parse_sheet(
+            &xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        )
+        .cells;
+
+        assert_eq!(cells.len(), CELLS);
+        let charged = cells
+            .iter()
+            .map(retained_cell_cost)
+            .fold(0usize, usize::saturating_add);
+        assert_eq!(budget, crate::MAX_TEXT_BYTES - charged);
+        assert!(budget > 0);
     }
 
     /// Build a minimal `.xlsx` in memory and read it end-to-end.

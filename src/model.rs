@@ -7,6 +7,8 @@
 //! format dispatch and the `.xls` reader internals.
 
 use std::collections::{btree_map::Range as BTreeMapRange, BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::OnceLock;
 
 #[cfg(feature = "serde")]
 use serde::de::{IntoDeserializer, VariantAccess};
@@ -5611,6 +5613,85 @@ pub(crate) enum OoxmlImplicitColumnWidth {
     BaseCharacters(f32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayCellIndexEntry {
+    coordinate: u64,
+    source_index: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DisplayCellIndex {
+    cells: Vec<DisplayCellIndexEntry>,
+    read_hyperlinks: Vec<DisplayCellIndexEntry>,
+}
+
+impl DisplayCellIndex {
+    fn packed_coordinate(row: u32, col: u16) -> u64 {
+        (u64::from(row) << 16) | u64::from(col)
+    }
+
+    fn compact_last_by_coordinate(
+        mut entries: Vec<DisplayCellIndexEntry>,
+    ) -> Vec<DisplayCellIndexEntry> {
+        entries.sort_unstable_by_key(|entry| (entry.coordinate, entry.source_index));
+        let mut retained = 0_usize;
+        for read in 0..entries.len() {
+            let entry = entries[read];
+            if retained > 0 && entries[retained - 1].coordinate == entry.coordinate {
+                entries[retained - 1] = entry;
+            } else {
+                entries[retained] = entry;
+                retained += 1;
+            }
+        }
+        entries.truncate(retained);
+        entries.shrink_to_fit();
+        entries
+    }
+
+    fn source_index(&self, row: u32, col: u16) -> Option<usize> {
+        let coordinate = Self::packed_coordinate(row, col);
+        self.cells
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
+            .ok()
+            .map(|index| self.cells[index].source_index)
+    }
+
+    fn read_hyperlink_index(&self, row: u32, col: u16) -> Option<usize> {
+        let coordinate = Self::packed_coordinate(row, col);
+        self.read_hyperlinks
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
+            .ok()
+            .map(|index| self.read_hyperlinks[index].source_index)
+    }
+
+    fn source_indices_in_range(
+        &self,
+        first_row: u32,
+        first_col: u16,
+        last_row: u32,
+        last_col: u16,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let (start, end) = if first_row <= last_row && first_col <= last_col {
+            let first = Self::packed_coordinate(first_row, 0);
+            let last = Self::packed_coordinate(last_row, u16::MAX);
+            (
+                self.cells.partition_point(|entry| entry.coordinate < first),
+                self.cells.partition_point(|entry| entry.coordinate <= last),
+            )
+        } else {
+            (0, 0)
+        };
+        self.cells[start..end]
+            .iter()
+            .filter(move |entry| {
+                let col = entry.coordinate as u16;
+                col >= first_col && col <= last_col
+            })
+            .map(|entry| entry.source_index)
+    }
+}
+
 /// One worksheet: a name, its non-empty cells, and layout/structure (authoring).
 #[derive(Debug, Clone)]
 pub struct Sheet {
@@ -5626,6 +5707,11 @@ pub struct Sheet {
     /// Parsed sheet type for metadata when the source format exposes it.
     pub(crate) sheet_type: Option<SheetType>,
     pub(crate) cells: Vec<CellEntry>,
+    /// Lazily built compact last-write-wins coordinate index used by whole-sheet,
+    /// range, and point display access. Readers finish populating `cells` before
+    /// any public access; authoring writes invalidate this cache before appending
+    /// a new record.
+    pub(crate) display_cell_index: OnceLock<DisplayCellIndex>,
     /// Per-column widths in character units, populated by readers and authoring.
     pub(crate) col_widths: BTreeMap<u16, f32>,
     /// Source column widths expressed in physical points when the format stores
@@ -5766,6 +5852,240 @@ pub struct Sheet {
     pub(crate) collapsed_rows: BTreeSet<u32>,
 }
 
+struct RenderStyleSidecarIdentity<'a> {
+    sheet: &'a Sheet,
+    ranges: RenderStyleRangeIndex,
+}
+
+struct RelevantTableRegionFormats<'a> {
+    sheet: &'a Sheet,
+    ranges: &'a RenderStyleRangeIndex,
+}
+
+impl fmt::Debug for RelevantTableRegionFormats<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = formatter.debug_list();
+        for (table_index, table) in self.sheet.tables.iter().enumerate() {
+            let Some(application) = self.sheet.table_region_formats.get(&table.name) else {
+                continue;
+            };
+            if self.ranges.intersects(table.range) {
+                list.entry(&(table_index, &table.name, application));
+            }
+        }
+        list.finish()
+    }
+}
+
+struct RelevantDirectCellFormats<'a> {
+    sheet: &'a Sheet,
+    ranges: &'a RenderStyleRangeIndex,
+}
+
+impl fmt::Debug for RelevantDirectCellFormats<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = formatter.debug_list();
+        self.ranges.for_each_relevant_direct_cell_format(
+            &self.sheet.direct_cell_formats,
+            |row, col, overlay| {
+                list.entry(&(row, col, overlay));
+            },
+        );
+        list.finish()
+    }
+}
+
+impl fmt::Debug for RenderStyleSidecarIdentity<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenderStyleSidecarIdentity")
+            .field(
+                "table_region_formats",
+                &RelevantTableRegionFormats {
+                    sheet: self.sheet,
+                    ranges: &self.ranges,
+                },
+            )
+            .field(
+                "direct_cell_formats",
+                &RelevantDirectCellFormats {
+                    sheet: self.sheet,
+                    ranges: &self.ranges,
+                },
+            )
+            .finish()
+    }
+}
+
+type RenderStyleRange = (u32, u16, u32, u16);
+
+#[derive(Clone, Copy)]
+struct RenderStyleRowEvent {
+    row: u64,
+    first_col_index: usize,
+    after_last_col_index: usize,
+    delta: i32,
+}
+
+struct RenderStyleRangeIndex {
+    ranges: Vec<RenderStyleRange>,
+    row_events: Vec<RenderStyleRowEvent>,
+    column_boundaries: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RenderStyleTraversalStats {
+    direct_entries_visited: u64,
+    membership_queries: u64,
+    row_events_applied: u64,
+    selected_entries: u64,
+}
+
+struct ColumnCoverageTree {
+    values: Vec<i32>,
+}
+
+impl ColumnCoverageTree {
+    fn new(boundary_count: usize) -> Self {
+        Self {
+            values: vec![0; boundary_count.saturating_add(1)],
+        }
+    }
+
+    fn add(&mut self, boundary_index: usize, delta: i32) {
+        let mut index = boundary_index.saturating_add(1);
+        while index < self.values.len() {
+            self.values[index] += delta;
+            index = index.saturating_add(index & index.wrapping_neg());
+        }
+    }
+
+    fn prefix_sum(&self, mut boundary_count: usize) -> i32 {
+        let mut value = 0_i32;
+        while boundary_count > 0 {
+            value += self.values[boundary_count];
+            boundary_count &= boundary_count - 1;
+        }
+        value
+    }
+}
+
+impl RenderStyleRangeIndex {
+    fn new(ranges: &[RenderStyleRange]) -> Self {
+        let mut ranges = ranges
+            .iter()
+            .copied()
+            .filter(|range| range.0 <= range.2 && range.1 <= range.3)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        ranges.dedup();
+
+        let mut column_boundaries = Vec::with_capacity(ranges.len().saturating_mul(2));
+        let mut raw_events = Vec::with_capacity(ranges.len().saturating_mul(2));
+        for &(first_row, first_col, last_row, last_col) in &ranges {
+            let first_col = u32::from(first_col);
+            let after_last_col = u32::from(last_col) + 1;
+            column_boundaries.push(first_col);
+            column_boundaries.push(after_last_col);
+            raw_events.push((u64::from(first_row), first_col, after_last_col, 1_i32));
+            raw_events.push((u64::from(last_row) + 1, first_col, after_last_col, -1_i32));
+        }
+        column_boundaries.sort_unstable();
+        column_boundaries.dedup();
+        raw_events.sort_unstable_by_key(|event| (event.0, event.1, event.2, event.3));
+
+        let mut row_events = Vec::<RenderStyleRowEvent>::with_capacity(raw_events.len());
+        for (row, first_col, after_last_col, delta) in raw_events {
+            let first_col_index = column_boundaries
+                .binary_search(&first_col)
+                .expect("style range start is indexed");
+            let after_last_col_index = column_boundaries
+                .binary_search(&after_last_col)
+                .expect("style range end is indexed");
+            if let Some(previous) = row_events.last_mut() {
+                if previous.row == row
+                    && previous.first_col_index == first_col_index
+                    && previous.after_last_col_index == after_last_col_index
+                {
+                    previous.delta += delta;
+                    if previous.delta == 0 {
+                        row_events.pop();
+                    }
+                    continue;
+                }
+            }
+            row_events.push(RenderStyleRowEvent {
+                row,
+                first_col_index,
+                after_last_col_index,
+                delta,
+            });
+        }
+
+        Self {
+            ranges,
+            row_events,
+            column_boundaries,
+        }
+    }
+
+    fn intersects(&self, candidate: RenderStyleRange) -> bool {
+        let (first_row, first_col, last_row, last_col) = candidate;
+        first_row <= last_row
+            && first_col <= last_col
+            && self.ranges.iter().any(|range| {
+                first_row <= range.2
+                    && last_row >= range.0
+                    && first_col <= range.3
+                    && last_col >= range.1
+            })
+    }
+
+    fn for_each_relevant_direct_cell_format(
+        &self,
+        formats: &BTreeMap<(u32, u16), CellStyleOverlay>,
+        mut visit: impl FnMut(u32, u16, &CellStyleOverlay),
+    ) -> RenderStyleTraversalStats {
+        let mut stats = RenderStyleTraversalStats::default();
+        let mut coverage = ColumnCoverageTree::new(self.column_boundaries.len());
+        let mut event_index = 0_usize;
+
+        for (&(row, col), overlay) in formats {
+            stats.direct_entries_visited = stats.direct_entries_visited.saturating_add(1);
+            while let Some(event) = self
+                .row_events
+                .get(event_index)
+                .filter(|event| event.row <= u64::from(row))
+            {
+                coverage.add(event.first_col_index, event.delta);
+                coverage.add(event.after_last_col_index, -event.delta);
+                event_index += 1;
+                stats.row_events_applied = stats.row_events_applied.saturating_add(1);
+            }
+            stats.membership_queries = stats.membership_queries.saturating_add(1);
+            let boundary_count = self
+                .column_boundaries
+                .partition_point(|boundary| *boundary <= u32::from(col));
+            if coverage.prefix_sum(boundary_count) > 0 {
+                stats.selected_entries = stats.selected_entries.saturating_add(1);
+                visit(row, col, overlay);
+            }
+        }
+        stats
+    }
+
+    fn relevant_direct_cell_format_count(
+        &self,
+        formats: &BTreeMap<(u32, u16), CellStyleOverlay>,
+    ) -> (u64, RenderStyleTraversalStats) {
+        let mut count = 0_u64;
+        let stats = self.for_each_relevant_direct_cell_format(formats, |_, _, _| {
+            count = count.saturating_add(1);
+        });
+        (count, stats)
+    }
+}
+
 impl Default for Sheet {
     fn default() -> Self {
         Sheet {
@@ -5775,6 +6095,7 @@ impl Default for Sheet {
             display_date1904: false,
             sheet_type: None,
             cells: Vec::default(),
+            display_cell_index: OnceLock::new(),
             col_widths: BTreeMap::default(),
             physical_col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
@@ -7620,38 +7941,98 @@ impl Sheet {
     /// cell count so consumers do not need repeated linear lookups for formatted
     /// text, style, rich text, or hyperlinks.
     pub fn display_cells(&self) -> impl Iterator<Item = DisplayCell<'_>> {
-        let mut cells = BTreeMap::new();
-        for entry in &self.cells {
-            cells.insert((entry.row, entry.col), entry);
+        self.display_cell_index()
+            .cells
+            .iter()
+            .map(|entry| entry.source_index)
+            .map(move |source_index| self.display_cell_from_index(source_index))
+    }
+
+    /// Renderer-private rectangular traversal over the compact sorted display
+    /// index. The initial build is linear-memory plus one sort; subsequent point
+    /// and range queries use binary search and contiguous ordered traversal
+    /// rather than rescanning every retained worksheet record.
+    /// This is hidden from the supported public API surface; external consumers
+    /// should use [`Sheet::display_cells`].
+    #[doc(hidden)]
+    pub fn display_cells_in_range(
+        &self,
+        first_row: u32,
+        first_col: u16,
+        last_row: u32,
+        last_col: u16,
+    ) -> impl Iterator<Item = DisplayCell<'_>> {
+        self.display_cell_index()
+            .source_indices_in_range(first_row, first_col, last_row, last_col)
+            .map(move |source_index| self.display_cell_from_index(source_index))
+    }
+
+    fn display_cell_index(&self) -> &DisplayCellIndex {
+        self.display_cell_index.get_or_init(|| {
+            let mut cells = Vec::with_capacity(self.cells.len());
+            for (source_index, entry) in self.cells.iter().enumerate() {
+                cells.push(DisplayCellIndexEntry {
+                    coordinate: DisplayCellIndex::packed_coordinate(entry.row, entry.col),
+                    source_index,
+                });
+            }
+            let mut read_hyperlinks = Vec::with_capacity(self.read_hyperlinks.len());
+            for (source_index, (row, col, _)) in self.read_hyperlinks.iter().enumerate() {
+                read_hyperlinks.push(DisplayCellIndexEntry {
+                    coordinate: DisplayCellIndex::packed_coordinate(*row, *col),
+                    source_index,
+                });
+            }
+            DisplayCellIndex {
+                cells: DisplayCellIndex::compact_last_by_coordinate(cells),
+                read_hyperlinks: DisplayCellIndex::compact_last_by_coordinate(read_hyperlinks),
+            }
+        })
+    }
+
+    fn display_cell_from_index(&self, entry_index: usize) -> DisplayCell<'_> {
+        let entry = &self.cells[entry_index];
+        let coordinate = (entry.row, entry.col);
+        let read_hyperlink_index = self
+            .display_cell_index
+            .get()
+            .and_then(|index| index.read_hyperlink_index(coordinate.0, coordinate.1));
+        self.display_cell_from_index_with_read_hyperlink(entry_index, read_hyperlink_index)
+    }
+
+    fn display_cell_from_index_with_read_hyperlink(
+        &self,
+        entry_index: usize,
+        read_hyperlink_index: Option<usize>,
+    ) -> DisplayCell<'_> {
+        let entry = &self.cells[entry_index];
+        let coordinate = (entry.row, entry.col);
+        DisplayCell {
+            row: entry.row,
+            col: entry.col,
+            value: &entry.value,
+            formatted: &entry.text,
+            explicit_style: entry.style.as_ref(),
+            rich_text: self.rich.get(&coordinate).map(Vec::as_slice),
+            hyperlink: entry.hyperlink.as_deref().or_else(|| {
+                read_hyperlink_index
+                    .and_then(|index| self.read_hyperlinks.get(index))
+                    .map(|(_, _, target)| target.as_str())
+            }),
         }
-        let mut read_hyperlinks = BTreeMap::new();
-        for (row, col, target) in &self.read_hyperlinks {
-            read_hyperlinks.insert((*row, *col), target.as_str());
-        }
-        cells
-            .into_iter()
-            .map(move |((row, col), entry)| DisplayCell {
-                row,
-                col,
-                value: &entry.value,
-                formatted: &entry.text,
-                explicit_style: entry.style.as_ref(),
-                rich_text: self.rich.get(&(row, col)).map(Vec::as_slice),
-                hyperlink: entry
-                    .hyperlink
-                    .as_deref()
-                    .or_else(|| read_hyperlinks.get(&(row, col)).copied()),
-            })
+    }
+
+    fn effective_cell_entry(&self, row: u32, col: u16) -> Option<&CellEntry> {
+        self.display_cell_index()
+            .source_index(row, col)
+            .and_then(|source_index| self.cells.get(source_index))
     }
 
     /// The typed value at `(row, col)`, if that cell is non-empty. When a
     /// coordinate has multiple records the last one wins (Excel semantics).
     pub fn cell(&self, row: u32, col: u16) -> Option<&Cell> {
-        self.cells
-            .iter()
-            .rev()
-            .find(|c| c.row == row && c.col == col)
-            .map(|c| &c.value)
+        self.effective_cell_entry(row, col)
+            .map(|entry| &entry.value)
     }
 
     /// The rendered **display text** at `(row, col)` — the pre-formatted string
@@ -7662,21 +8043,15 @@ impl Sheet {
     /// wins per coordinate, matching [`Sheet::cell`]. Returns `None` when the
     /// cell is empty.
     pub fn formatted(&self, row: u32, col: u16) -> Option<&str> {
-        self.cells
-            .iter()
-            .rev()
-            .find(|c| c.row == row && c.col == col)
-            .map(|c| c.text.as_str())
+        self.effective_cell_entry(row, col)
+            .map(|entry| entry.text.as_str())
     }
 
     /// Effective cell style at `(row, col)`, when retained by the reader or set
     /// explicitly for authoring. A format-only blank cell is also surfaced.
     pub fn cell_style(&self, row: u32, col: u16) -> Option<&CellStyle> {
-        self.cells
-            .iter()
-            .rev()
-            .find(|cell| cell.row == row && cell.col == col)
-            .and_then(|cell| cell.style.as_ref())
+        self.effective_cell_entry(row, col)
+            .and_then(|entry| entry.style.as_ref())
             .or_else(|| self.blank_styles.get(&(row, col)))
     }
 
@@ -7788,6 +8163,40 @@ impl Sheet {
     /// Table-header style overrides keyed by authored table name.
     pub fn table_header_styles(&self) -> &BTreeMap<String, CellStyle> {
         &self.table_header_formats
+    }
+
+    /// Internal deterministic style sidecar consumed by `rxls-render`.
+    ///
+    /// Public style accessors cover worksheet, row, column, blank-cell,
+    /// conditional, and legacy table-header state. This opaque value adds the
+    /// complete read-side table-region cascade and sparse direct-cell overlays
+    /// without exposing their implementation types or materializing styled
+    /// blank-cell ranges.
+    #[doc(hidden)]
+    pub fn render_style_sidecar_identity<'a>(
+        &'a self,
+        ranges: &[(u32, u16, u32, u16)],
+    ) -> impl std::fmt::Debug + 'a {
+        RenderStyleSidecarIdentity {
+            sheet: self,
+            ranges: RenderStyleRangeIndex::new(ranges),
+        }
+    }
+
+    /// Number of bounded structural entries in
+    /// [`Sheet::render_style_sidecar_identity`].
+    #[doc(hidden)]
+    pub fn render_style_sidecar_entry_count(&self, ranges: &[(u32, u16, u32, u16)]) -> u64 {
+        let ranges = RenderStyleRangeIndex::new(ranges);
+        let table_entries = self
+            .tables
+            .iter()
+            .filter(|table| self.table_region_formats.contains_key(&table.name))
+            .filter(|table| ranges.intersects(table.range))
+            .count() as u64;
+        let (direct_entries, _) =
+            ranges.relevant_direct_cell_format_count(&self.direct_cell_formats);
+        table_entries.saturating_add(direct_entries)
     }
 
     /// Rich-text runs retained for a cell. Plain strings return `None`; the
@@ -9927,6 +10336,7 @@ impl Sheet {
         self.blank_styles.remove(&(row, col));
         let num_fmt = self.effective_authored_num_fmt(row, col, style.as_ref());
         let text = display_text_with_num_fmt(&value, num_fmt, self.display_date1904);
+        self.display_cell_index.take();
         self.cells.push(CellEntry {
             row,
             col,
@@ -10365,6 +10775,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn render_style_range_sweep_is_exact_deduplicated_and_coordinate_ordered() {
+        let mut sheet = Sheet::new("style identity");
+        for row in 0..128_u32 {
+            for col in 0..64_u16 {
+                sheet
+                    .direct_cell_formats
+                    .insert((row, col), CellStyleOverlay::default());
+            }
+        }
+        let mut ranges = Vec::<RenderStyleRange>::new();
+        for index in 0..1_024_u32 {
+            let first_row = index.wrapping_mul(37) % 120;
+            let first_col = (index.wrapping_mul(53) % 60) as u16;
+            ranges.push((
+                first_row,
+                first_col,
+                (first_row + index % 11).min(127),
+                (first_col + (index % 7) as u16).min(63),
+            ));
+        }
+        ranges.extend([(10, 10, 40, 40), (10, 10, 40, 40), (9, 2, 8, 3)]);
+
+        let expected = sheet
+            .direct_cell_formats
+            .keys()
+            .copied()
+            .filter(|&(row, col)| {
+                ranges.iter().any(|range| {
+                    range.0 <= range.2
+                        && range.1 <= range.3
+                        && row >= range.0
+                        && row <= range.2
+                        && col >= range.1
+                        && col <= range.3
+                })
+            })
+            .collect::<Vec<_>>();
+        let index = RenderStyleRangeIndex::new(&ranges);
+        let mut actual = Vec::new();
+        let stats = index
+            .for_each_relevant_direct_cell_format(&sheet.direct_cell_formats, |row, col, _| {
+                actual.push((row, col))
+            });
+
+        assert_eq!(actual, expected);
+        assert!(actual.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(stats.selected_entries, expected.len() as u64);
+        assert_eq!(
+            sheet.render_style_sidecar_entry_count(&ranges),
+            expected.len() as u64
+        );
+    }
+
+    #[test]
+    fn render_style_sidecar_v2_is_union_canonical_in_global_coordinate_order() {
+        let mut sheet = Sheet::new("canonical sidecar");
+        for row in 0..32_u32 {
+            for col in 0..40_u16 {
+                sheet.direct_cell_formats.insert(
+                    (row, col),
+                    CellStyleOverlay {
+                        style: CellStyle::new().background_color([
+                            row as u8,
+                            col as u8,
+                            row.wrapping_add(u32::from(col)) as u8,
+                        ]),
+                        replace_fill: true,
+                        ..CellStyleOverlay::default()
+                    },
+                );
+            }
+        }
+        let one_rectangle = [(10, 20, 19, 29)];
+        let permuted_overlapping_union = [
+            (12, 22, 17, 27),
+            (10, 25, 19, 29),
+            (10, 20, 19, 24),
+            (10, 20, 19, 24),
+        ];
+
+        assert_eq!(
+            sheet.render_style_sidecar_entry_count(&one_rectangle),
+            sheet.render_style_sidecar_entry_count(&permuted_overlapping_union)
+        );
+        assert_eq!(
+            format!("{:?}", sheet.render_style_sidecar_identity(&one_rectangle)),
+            format!(
+                "{:?}",
+                sheet.render_style_sidecar_identity(&permuted_overlapping_union)
+            ),
+            "v2 identity must depend on the selected coordinate union, not range order or overlap"
+        );
+    }
+
+    #[test]
+    fn render_style_range_sweep_visits_each_of_250k_overlays_once() {
+        const FORMAT_COUNT: u32 = 250_000;
+        const RANGE_COUNT: u32 = 1_024;
+
+        let mut formats = BTreeMap::new();
+        for row in 0..FORMAT_COUNT {
+            formats.insert((row, u16::MAX), CellStyleOverlay::default());
+        }
+        let ranges = (0..RANGE_COUNT)
+            .map(|index| {
+                let first_row = index.wrapping_mul(193) % 200_000;
+                (
+                    first_row,
+                    (index % 127) as u16,
+                    (first_row + 40_000 + index % 101).min(FORMAT_COUNT - 1),
+                    255,
+                )
+            })
+            .collect::<Vec<_>>();
+        let index = RenderStyleRangeIndex::new(&ranges);
+        let (selected, stats) = index.relevant_direct_cell_format_count(&formats);
+
+        assert_eq!(selected, 0);
+        assert_eq!(stats.direct_entries_visited, u64::from(FORMAT_COUNT));
+        assert_eq!(stats.membership_queries, u64::from(FORMAT_COUNT));
+        assert_eq!(stats.selected_entries, 0);
+        assert!(
+            stats.row_events_applied <= u64::from(RANGE_COUNT) * 2,
+            "row events must be processed once, not once per direct format"
+        );
+    }
+
+    #[test]
     fn formatted_returns_display_text_while_cell_returns_typed_value() {
         let mut s = Sheet::new("s");
         s.write(0, 0, "공고명");
@@ -10483,6 +11021,119 @@ mod tests {
             .and_then(|style| style.font.as_ref())
             .is_some_and(|font| font.bold));
         assert_eq!(cells[1].hyperlink, Some("https://example.com"));
+    }
+
+    #[test]
+    fn display_cell_views_preserve_lww_ordering_and_authoring_invalidation() {
+        let mut sheet = Sheet::new("indexed");
+        sheet.write(0, 9, "outside-left-row");
+        sheet.write(1, 1, "old");
+        sheet.write(1, 1, "inside");
+        sheet.write(1, 9, "outside-middle-row");
+        sheet.write(2, 2, "inside-too");
+        sheet.write(3, 0, "outside-right-row");
+
+        // Whole-sheet access initializes the lazy point/display index.
+        assert_eq!(sheet.display_cells().count(), 5);
+        assert!(sheet.display_cell_index.get().is_some());
+        let cells = sheet
+            .display_cells_in_range(1, 1, 2, 2)
+            .map(|cell| (cell.row, cell.col, cell.formatted.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells,
+            vec![
+                (1, 1, "inside".to_string()),
+                (2, 2, "inside-too".to_string())
+            ]
+        );
+        // A later write must invalidate the whole-sheet index, replace the
+        // effective coordinate, and introduce new coordinates.
+        sheet.write(1, 1, "new");
+        sheet.write(2, 1, "new-coordinate");
+        assert!(sheet.display_cell_index.get().is_none());
+        let cells = sheet
+            .display_cells_in_range(1, 1, 2, 2)
+            .map(|cell| (cell.row, cell.col, cell.formatted.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells,
+            vec![
+                (1, 1, "new".to_string()),
+                (2, 1, "new-coordinate".to_string()),
+                (2, 2, "inside-too".to_string())
+            ]
+        );
+        assert!(sheet.display_cells_in_range(2, 2, 1, 1).next().is_none());
+        assert_eq!(
+            sheet
+                .display_cells_in_range(1, 9, 1, 9)
+                .map(|cell| cell.formatted)
+                .collect::<Vec<_>>(),
+            ["outside-middle-row"]
+        );
+    }
+
+    #[test]
+    fn compact_display_index_bounds_large_sparse_range_and_point_queries() {
+        const UNRELATED_CELL_COUNT: u32 = 100_000;
+
+        let mut sheet = Sheet::new("bounded-range");
+        sheet.write(0, 0, "old");
+        sheet.write(0, 0, "selected");
+        sheet
+            .read_hyperlinks
+            .push((0, 0, "https://example.com/old".to_string()));
+        sheet
+            .read_hyperlinks
+            .push((0, 0, "https://example.com/selected".to_string()));
+        sheet.cells.reserve(UNRELATED_CELL_COUNT as usize);
+        for row in 1..=UNRELATED_CELL_COUNT {
+            sheet.cells.push(CellEntry {
+                row,
+                col: 1,
+                value: Cell::Number(f64::from(row)),
+                text: row.to_string(),
+                style: None,
+                hyperlink: None,
+            });
+        }
+
+        assert!(sheet.display_cell_index.get().is_none());
+        let selected = sheet.display_cells_in_range(0, 0, 0, 0).collect::<Vec<_>>();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].formatted, "selected");
+        assert_eq!(selected[0].hyperlink, Some("https://example.com/selected"));
+        assert_eq!(sheet.cell(0, 0), Some(&Cell::Text("selected".to_string())));
+
+        let index = sheet
+            .display_cell_index
+            .get()
+            .expect("range traversal initializes the compact shared index");
+        assert_eq!(index.cells.len(), UNRELATED_CELL_COUNT as usize + 1);
+        assert_eq!(index.cells.capacity(), index.cells.len());
+        assert_eq!(index.read_hyperlinks.len(), 1);
+        assert_eq!(
+            std::mem::size_of::<DisplayCellIndexEntry>(),
+            std::mem::size_of::<u64>() + std::mem::size_of::<usize>()
+        );
+        assert!(
+            std::mem::size_of_val(index.cells.as_slice())
+                <= (UNRELATED_CELL_COUNT as usize + 1) * 16
+        );
+
+        // Repeated point/range access now performs binary search over this
+        // compact vector rather than rescanning all unrelated source records.
+        for _ in 0..1_000 {
+            assert_eq!(
+                sheet
+                    .display_cells_in_range(0, 0, 0, 0)
+                    .map(|cell| cell.formatted)
+                    .collect::<Vec<_>>(),
+                ["selected"]
+            );
+            assert_eq!(sheet.formatted(0, 0), Some("selected"));
+        }
     }
 
     #[test]

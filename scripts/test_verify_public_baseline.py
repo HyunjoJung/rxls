@@ -50,7 +50,7 @@ by_ext: .xlsx files=413 opened=395 failed=18
 """
         reports = {
             "xls": "provenance: oracle_reader=xlrd oracle_version=2.0.2\nprovenance: input_manifest_sha256=" + "a" * 64 + "\nfiles: 448   rxls extracted: 422   xlrd-unreadable: 8   comparable: 414\nrxls vs xlrd: mean parity 100.000%   >=99%: 414/414\n",
-            "ooxml": "provenance: oracle_reader=openpyxl oracle_version=3.1.5\nprovenance: input_manifest_sha256=" + "a" * 64 + "\nfiles: 431   rxls extracted: 412   openpyxl-unreadable: 38   comparable: 388\nrxls vs openpyxl: mean parity 99.889%   >=99%: 387/388\n",
+            "ooxml": "provenance: oracle_reader=openpyxl oracle_version=3.1.5\nprovenance: input_manifest_sha256=" + "a" * 64 + "\nfiles: 431   rxls extracted: 412   openpyxl-unreadable: 38   comparable: 388\nrxls vs openpyxl: mean parity 100.000%   >=99%: 388/388\n",
             "xlsb": "provenance: oracle_reader=pyxlsb oracle_version=1.0.10\nprovenance: input_manifest_sha256=" + "a" * 64 + "\nfiles: 21   rxls extracted: 18   pyxlsb-unreadable: 3   comparable: 18\nrxls vs pyxlsb: mean parity 100.000% over 18 files\n",
             "ods": "provenance: oracle_reader=xml.etree.ElementTree oracle_version=python-3.14.4\nprovenance: input_manifest_sha256=" + "a" * 64 + "\nfiles: 16   rxls extracted: 14   oracle-skipped: 2   comparable: 14\nrxls vs ODS visible oracle: mean recall 100.000% over 14 files\n",
         }

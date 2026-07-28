@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.RENDER_MSRV }}
@@ -55,6 +56,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
           version=$(node -p 'require("./bindings/render-wasm/package.json").version')
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -80,6 +83,7 @@ jobs:
             local expected_event="$3"
             local label="$4"
             local selected=""
+            local selected_attempt=""
             local run_id
             local record
             local head_sha
@@ -87,6 +91,7 @@ jobs:
             local conclusion
             local status
             local run_path
+            local run_attempt
             mapfile -t run_ids < <(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow "$workflow" \
@@ -98,23 +103,29 @@ jobs:
             for run_id in "${run_ids[@]}"; do
               record=$(gh api \
                 "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
-                --jq '[.head_sha, .event, .conclusion, .status, .path] | @tsv')
-              IFS=$'\t' read -r head_sha event conclusion status run_path <<< "$record"
+                --jq '[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv')
+              IFS=$'\t' read -r head_sha event conclusion status run_path run_attempt <<< "$record"
               [[ "$head_sha" == "$GITHUB_SHA" \
                 && "$event" == "$expected_event" \
                 && "$conclusion" == "success" \
                 && "$status" == "completed" \
-                && "$run_path" == "$expected_path" ]] || continue
+                && "$run_path" == "$expected_path" \
+                && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || continue
               selected="$run_id"
+              selected_attempt="$run_attempt"
               break
             done
             test -n "$selected" || {
               echo "$label has no successful $expected_event run for exact SHA $GITHUB_SHA" >&2
               return 1
             }
+            SELECTED_RUN_ID="$selected"
+            SELECTED_RUN_ATTEMPT="$selected_attempt"
             echo "$label exact-SHA gate passed in run $selected"
           }
 
+          SELECTED_RUN_ID=""
+          SELECTED_RUN_ATTEMPT=""
           require_successful_run ci.yml .github/workflows/ci.yml push CI
           require_successful_run codeql.yml .github/workflows/codeql.yml push CodeQL
           require_successful_run \
@@ -127,17 +138,55 @@ jobs:
             .github/workflows/render-browser.yml \
             push \
             render-browser
+          browser_run_id="$SELECTED_RUN_ID"
+          browser_run_attempt="$SELECTED_RUN_ATTEMPT"
 
           mkdir -p target/render-package
+          browser_artifact_name="render-browser-${GITHUB_SHA}-${browser_run_id}-${browser_run_attempt}"
+          mapfile -t browser_artifacts < <(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$browser_run_id/artifacts" \
+            --jq '.artifacts[] | [.id, .name, .expired, .size_in_bytes, .digest] | @tsv')
+          matching_browser_artifacts=()
+          for artifact_row in "${browser_artifacts[@]}"; do
+            IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+              <<< "$artifact_row"
+            [[ "$name" == "$browser_artifact_name" ]] || continue
+            matching_browser_artifacts+=("$artifact_row")
+          done
+          test "${#matching_browser_artifacts[@]}" = "1"
+          IFS=$'\t' read -r browser_artifact_id name expired size_bytes digest \
+            <<< "${matching_browser_artifacts[0]}"
+          [[ "$browser_artifact_id" =~ ^[1-9][0-9]*$ \
+            && "$expired" == "false" \
+            && "$size_bytes" =~ ^[1-9][0-9]*$ \
+            && "$size_bytes" -le 1048576 \
+            && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          python3 scripts/check_render_browser_release_evidence.py download \
+            --repository "$GITHUB_REPOSITORY" \
+            --artifact-id "$browser_artifact_id" \
+            --artifact-name "$browser_artifact_name" \
+            --artifact-size-bytes "$size_bytes" \
+            --artifact-digest "$digest" \
+            --head-sha "$GITHUB_SHA" \
+            --platform linux \
+            --workflow-run-id "$browser_run_id" \
+            --workflow-run-attempt "$browser_run_attempt" \
+            --output target/render-package/browser-prerequisite.json
+          echo "Render Browser evidence passed in run $browser_run_id"
+
           selected_oracle=""
-          mapfile -t oracle_run_ids < <(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow render-oracle.yml \
-            --commit "$GITHUB_SHA" \
-            --status success \
-            --limit 100 \
-            --json databaseId \
-            --jq '.[].databaseId')
+          oracle_run_ids=()
+          for oracle_workflow in fuzz.yml render-oracle.yml; do
+            mapfile -t workflow_run_ids < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$oracle_workflow" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            oracle_run_ids+=("${workflow_run_ids[@]}")
+          done
           for run_id in "${oracle_run_ids[@]}"; do
             record=$(gh api \
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
@@ -147,9 +196,10 @@ jobs:
               && "$event" == "workflow_dispatch" \
               && "$conclusion" == "success" \
               && "$status" == "completed" \
-              && "$run_path" == ".github/workflows/render-oracle.yml" \
+              && ( "$run_path" == ".github/workflows/fuzz.yml" \
+                || "$run_path" == ".github/workflows/render-oracle.yml" ) \
               && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || continue
-            artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"
+            artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-verify"
 
             mapfile -t artifact_rows < <(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
@@ -175,6 +225,8 @@ jobs:
               --github-artifact-id "$artifact_id" \
               --artifact-name "$artifact_name" \
               --artifact-size-bytes "$size_bytes" \
+              --baseline-mode verify \
+              --campaign full \
               --head-sha "$GITHUB_SHA" \
               --reviewed-baseline scripts/render-parity-baseline-full.json \
               --workflow-run-id "$run_id" \
@@ -196,6 +248,7 @@ jobs:
           test "$(npm --version)" = "$NPM_VERSION"
           python3 scripts/check_workflow_policy.py
           python3 scripts/test_workflow_policy.py
+          python3 scripts/test_check_render_browser_release_evidence.py
           python3 scripts/test_check_render_package.py
           python3 scripts/test_render_supply_chain.py
           python3 scripts/test_check_render_oracle_release_evidence.py
@@ -254,6 +307,42 @@ jobs:
             --archive "$archive" \
             --git-rev "$GITHUB_SHA" \
             --write-report "$output/package-report.json"
+          ARCHIVE="$archive" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          archive = Path(os.environ["ARCHIVE"]).read_bytes()
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          browser = json.loads(
+              Path("target/render-package/browser-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          package = browser.get("package", {})
+          if (
+              browser.get("schema")
+              != "rxls.render-browser-release-prerequisites.v2"
+              or browser.get("passed") is not True
+              or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or package.get("name") != packed.get("name")
+              or package.get("version") != packed.get("version")
+              or package.get("archive_bytes") != len(archive)
+              or not archive
+              or package.get("archive_sha256")
+              != hashlib.sha256(archive).hexdigest()
+              or package.get("entry_count") != packed.get("entryCount")
+              or package.get("unpacked_bytes") != packed.get("unpackedSize")
+              or package.get("integrity") != packed.get("integrity")
+              or package.get("shasum") != packed.get("shasum")
+          ):
+              raise SystemExit(
+                  "browser-proven package differs from release candidate"
+              )
+          PY
           npm publish --dry-run --ignore-scripts --access public "$archive" \
             2>&1 | tee "$output/npm-publish-dry-run.txt"
           sha256sum "$archive" > "$archive.sha256"
@@ -296,6 +385,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -313,6 +403,8 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
           version=$(node -p 'require("./bindings/render-wasm/package.json").version')
           test "$GITHUB_REF_NAME" = "render-v$version"
           test "$(node --version)" = "v$NODE_VERSION"
@@ -337,11 +429,12 @@ jobs:
               Path("target/render-package/package-report.json").read_text(encoding="utf-8")
           )
           archive = Path(os.environ["ARCHIVE"])
+          archive_payload = archive.read_bytes()
           if report.get("schema") != "rxls.render-worker-package.v1":
               raise SystemExit("unexpected package-report schema")
           if report.get("passed") is not True or report.get("git_rev") != os.environ["GITHUB_SHA"]:
               raise SystemExit("package report is not bound to this exact commit")
-          if report.get("archive", {}).get("sha256") != hashlib.sha256(archive.read_bytes()).hexdigest():
+          if report.get("archive", {}).get("sha256") != hashlib.sha256(archive_payload).hexdigest():
               raise SystemExit("package report archive digest differs")
           notice = report.get("third_party_notice", {})
           notice_file = report.get("files", {}).get("THIRD_PARTY_NOTICES.txt", {})
@@ -363,6 +456,8 @@ jobs:
               != "rxls.render-worker-release-prerequisites.v1"
               or prerequisites.get("passed") is not True
               or prerequisites.get("head_sha") != os.environ["GITHUB_SHA"]
+              or prerequisites.get("campaign") != "full"
+              or prerequisites.get("baseline_mode") != "verify"
               or prerequisites.get("full_cases") != 800
               or prerequisites.get("ratchets") != 2
               or not isinstance(prerequisites.get("workflow_run_id"), int)
@@ -378,7 +473,7 @@ jobs:
               != (
                   f"render-oracle-{os.environ['GITHUB_SHA']}-"
                   f"{prerequisites['workflow_run_id']}-"
-                  f"{prerequisites['workflow_run_attempt']}-full"
+                  f"{prerequisites['workflow_run_attempt']}-full-verify"
               )
               or re.fullmatch(
                   r"sha256:[0-9a-f]{64}",
@@ -392,6 +487,57 @@ jobs:
               is None
           ):
               raise SystemExit("full Render Oracle prerequisite evidence differs")
+          browser = json.loads(
+              Path("target/render-package/browser-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          browser_package = browser.get("package", {})
+          if (
+              browser.get("schema")
+              != "rxls.render-browser-release-prerequisites.v2"
+              or browser.get("passed") is not True
+              or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not isinstance(browser.get("workflow_run_id"), int)
+              or browser["workflow_run_id"] < 1
+              or not isinstance(browser.get("workflow_run_attempt"), int)
+              or browser["workflow_run_attempt"] < 1
+              or not isinstance(browser.get("artifact_id"), int)
+              or browser["artifact_id"] < 1
+              or not isinstance(browser.get("artifact_size_bytes"), int)
+              or not 1 <= browser["artifact_size_bytes"] <= 1048576
+              or browser.get("artifact_repository") != "HyunjoJung/rxls"
+              or browser.get("artifact_name")
+              != (
+                  f"render-browser-{os.environ['GITHUB_SHA']}-"
+                  f"{browser['workflow_run_id']}-"
+                  f"{browser['workflow_run_attempt']}"
+              )
+              or re.fullmatch(
+                  r"sha256:[0-9a-f]{64}",
+                  browser.get("artifact_digest", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("browser_evidence_sha256", ""),
+              )
+              is None
+              or browser_package.get("name") != packed.get("name")
+              or browser_package.get("version") != packed.get("version")
+              or browser_package.get("archive_bytes") != len(archive_payload)
+              or browser_package.get("archive_sha256")
+              != hashlib.sha256(archive_payload).hexdigest()
+              or browser_package.get("entry_count") != packed.get("entryCount")
+              or browser_package.get("unpacked_bytes")
+              != packed.get("unpackedSize")
+              or browser_package.get("integrity") != packed.get("integrity")
+              or browser_package.get("shasum") != packed.get("shasum")
+          ):
+              raise SystemExit("Render Browser prerequisite evidence differs")
           PY
       - name: Publish exact package with provenance
         env:

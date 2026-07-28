@@ -55,10 +55,15 @@ GITHUB_API_VERSION = "2022-11-28"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ARTIFACT_EXTENSION_RE = re.compile(
+    r"\.(?:xls|xlsx|xlsb|xlsm|ods|fods|pdf|png|svg)\Z",
+    re.IGNORECASE,
+)
+PATH_TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
 BUILD_SCHEMA = "rxls.render-oracle-container-build.v3"
 LOCK_SCHEMA = "rxls.render-oracle-container-lock.v3"
 BOOTSTRAP_RECEIPT_SCHEMA = "rxls.render-oracle-bootstrap-receipt.v1"
-HOSTED_CAMPAIGN_SCHEMA = "rxls.render-oracle-hosted-campaign.v5"
+HOSTED_CAMPAIGN_SCHEMA = "rxls.render-oracle-hosted-campaign.v6"
 SOURCE_DATE_EPOCH = 1_783_900_800
 SOURCE_DATE_EPOCH_RFC3339 = "2026-07-13T00:00:00Z"
 DOCKER_V2_MANIFEST_MEDIA_TYPE = (
@@ -581,6 +586,8 @@ def extract_authenticated_artifact(
 def _validate_artifact_binding(
     *,
     head_sha: str,
+    campaign: str,
+    baseline_mode: str,
     workflow_run_id: int,
     workflow_run_attempt: int,
     artifact_id: int,
@@ -590,6 +597,8 @@ def _validate_artifact_binding(
     repository: str,
 ) -> None:
     _require(repository == EXPECTED_REPOSITORY, "artifact_repository")
+    _require(campaign == "full", "artifact_campaign")
+    _require(baseline_mode in {"candidate", "verify"}, "artifact_baseline_mode")
     _require(_positive_int(workflow_run_id), "workflow_run_id")
     _require(_positive_int(workflow_run_attempt), "workflow_run_attempt")
     _require(_positive_int(artifact_id), "artifact_id")
@@ -601,7 +610,7 @@ def _validate_artifact_binding(
         artifact_name
         == (
             f"render-oracle-{head_sha}-{workflow_run_id}-"
-            f"{workflow_run_attempt}-full"
+            f"{workflow_run_attempt}-{campaign}-{baseline_mode}"
         ),
         "artifact_name",
     )
@@ -651,8 +660,16 @@ def _canonical_sha256(value: object) -> str:
 
 def _path_neutral(value: object) -> None:
     if isinstance(value, dict):
-        _require("path" not in value, "path_bearing_key")
-        for item in value.values():
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+            _require(
+                not (
+                    normalized_key.startswith("path")
+                    or normalized_key.endswith("path")
+                    or normalized_key.endswith("paths")
+                ),
+                "path_bearing_key",
+            )
             _path_neutral(item)
     elif isinstance(value, list):
         for item in value:
@@ -662,7 +679,14 @@ def _path_neutral(value: object) -> None:
         _require(not value.startswith("/"), "absolute_path")
         _require(re.match(r"^[A-Za-z]:[\\/]", value) is None, "windows_path")
         _require(not lowered.startswith("file://"), "file_uri")
+        _require("\\" not in value, "backslash_path")
+        _require(PATH_TRAVERSAL_RE.search(value) is None, "path_traversal")
+        _require(
+            ARTIFACT_EXTENSION_RE.search(value) is None,
+            "relative_artifact_path",
+        )
         _require("local/render-corpus" not in lowered, "corpus_path")
+        _require("render-corpus-generated" not in lowered, "corpus_path")
         _require("payload/" not in lowered, "payload_path")
 
 
@@ -1114,6 +1138,34 @@ def _validate_baseline_gate(
     )
 
 
+def _validate_candidate_gate(
+    gate: dict[str, Any],
+    candidate: dict[str, Any],
+    candidate_payload: bytes,
+) -> None:
+    _require(
+        set(gate) == {"baseline_sha256", "created", "passed", "schema"},
+        "candidate_gate_keys",
+    )
+    _require(
+        gate.get("schema") == "rxls.render-parity-baseline-check.v1",
+        "candidate_gate_schema",
+    )
+    _require(
+        gate.get("created") is True and gate.get("passed") is True,
+        "candidate_gate_failed",
+    )
+    candidate_sha256 = _canonical_sha256(candidate)
+    _require(
+        gate.get("baseline_sha256") == candidate_sha256,
+        "candidate_gate_identity",
+    )
+    _require(
+        _sha256(candidate_payload) == candidate_sha256,
+        "candidate_encoding",
+    )
+
+
 def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     _require(candidate.get("schema") == "rxls.render-parity-baseline.v2", "candidate_schema")
     _require(candidate.get("input_files") == 800, "candidate_case_count")
@@ -1141,8 +1193,10 @@ def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
 def validate(
     artifact_dir: Path,
     head_sha: str,
-    reviewed_baseline: Path,
+    reviewed_baseline: Path | None,
     *,
+    campaign: str = "full",
+    baseline_mode: str = "verify",
     workflow_run_id: int | None = None,
     workflow_run_attempt: int | None = None,
     artifact_id: int | None = None,
@@ -1154,6 +1208,8 @@ def validate(
     oracle_wrapper: Path = DEFAULT_ORACLE_WRAPPER,
 ) -> dict[str, object]:
     _require(HEAD_SHA_RE.fullmatch(head_sha) is not None, "head_sha")
+    _require(campaign == "full", "campaign")
+    _require(baseline_mode in {"candidate", "verify"}, "baseline_mode")
     artifact_binding = (
         workflow_run_id,
         workflow_run_attempt,
@@ -1170,6 +1226,8 @@ def validate(
         )
         _validate_artifact_binding(
             head_sha=head_sha,
+            campaign=campaign,
+            baseline_mode=baseline_mode,
             workflow_run_id=workflow_run_id,
             workflow_run_attempt=workflow_run_attempt,
             artifact_id=artifact_id,
@@ -1203,27 +1261,44 @@ def validate(
         documents[name] = document
         payloads[name] = payload
 
-    reviewed, _ = _read_json(reviewed_baseline)
-    _require(reviewed.get("schema") == "rxls.render-parity-baseline.v2", "reviewed_schema")
-    reviewed_sha256 = _canonical_sha256(reviewed)
+    if baseline_mode == "verify":
+        _require(reviewed_baseline is not None, "reviewed_baseline_required")
+        reviewed, _ = _read_json(reviewed_baseline)
+        _require(
+            reviewed.get("schema") == "rxls.render-parity-baseline.v2",
+            "reviewed_schema",
+        )
+        reviewed_sha256: str | None = _canonical_sha256(reviewed)
+    else:
+        _require(reviewed_baseline is None, "candidate_reviewed_baseline_forbidden")
+        reviewed_sha256 = None
     contract = _release_contract(oracle_lock, oracle_wrapper)
 
     candidates = []
     gates = []
     for label in ("a", "b"):
         candidate = documents[f"baseline-candidate-{label}.json"]
-        campaign = _validate_candidate(candidate)
+        candidate_campaign = _validate_candidate(candidate)
         gate = documents[f"baseline-gate-{label}.json"]
-        _validate_baseline_gate(
-            gate,
-            candidate,
-            payloads[f"baseline-candidate-{label}.json"],
-            reviewed_sha256,
-        )
-        _require(
-            gate["campaign"]["manifest_sha256"] == campaign["manifest_sha256"],
-            "gate_campaign_identity",
-        )
+        if baseline_mode == "verify":
+            assert reviewed_sha256 is not None
+            _validate_baseline_gate(
+                gate,
+                candidate,
+                payloads[f"baseline-candidate-{label}.json"],
+                reviewed_sha256,
+            )
+            _require(
+                gate["campaign"]["manifest_sha256"]
+                == candidate_campaign["manifest_sha256"],
+                "gate_campaign_identity",
+            )
+        else:
+            _validate_candidate_gate(
+                gate,
+                candidate,
+                payloads[f"baseline-candidate-{label}.json"],
+            )
         candidates.append(candidate)
         gates.append(gate)
     _require(candidates[0]["campaign"] == candidates[1]["campaign"], "campaign_repeatability")
@@ -1277,18 +1352,44 @@ def validate(
     _require(_hash_matches(renderer.get("sha256")), "renderer_identity")
 
     summary = documents["hosted-summary.json"]
+    _require(
+        set(summary)
+        == {
+            "authored_print",
+            "baseline_mode",
+            "baseline_ratcheting",
+            "campaign",
+            "container",
+            "corpus",
+            "evidence_runs",
+            "fidelity",
+            "font_pack",
+            "head_sha",
+            "host_tools",
+            "metrics",
+            "renderer",
+            "repeatability",
+            "schema",
+            "summary",
+        },
+        "summary_keys",
+    )
     _require(summary.get("schema") == HOSTED_CAMPAIGN_SCHEMA, "summary_schema")
     _require(summary.get("head_sha") == head_sha, "summary_head_sha")
-    campaign = summary.get("campaign", {})
     _require(
-        campaign.get("mode") == "full"
-        and campaign.get("case_count") == 800
-        and campaign.get("repetitions") == 2
-        and campaign.get("shard_count") == 4
-        and campaign.get("parallel_shards") == 2,
+        summary.get("baseline_mode") == baseline_mode,
+        "summary_baseline_mode",
+    )
+    campaign_summary = summary.get("campaign", {})
+    _require(
+        campaign_summary.get("mode") == campaign
+        and campaign_summary.get("case_count") == 800
+        and campaign_summary.get("repetitions") == 2
+        and campaign_summary.get("shard_count") == 4
+        and campaign_summary.get("parallel_shards") == 2,
         "summary_campaign",
     )
-    shard_counts = campaign.get("shard_case_counts")
+    shard_counts = campaign_summary.get("shard_case_counts")
     _require(
         isinstance(shard_counts, list)
         and len(shard_counts) == 4
@@ -1348,13 +1449,36 @@ def validate(
     )
 
     baseline_summary = summary.get("baseline_ratcheting")
-    _require(isinstance(baseline_summary, dict), "summary_baseline")
     _require(
-        baseline_summary.get("applies") is True
-        and baseline_summary.get("passed") is True
-        and baseline_summary.get("reviewed_baseline_available") is True,
-        "summary_ratchet",
+        isinstance(baseline_summary, dict)
+        and set(baseline_summary)
+        == {
+            "applies",
+            "candidate_baselines",
+            "gates",
+            "mode",
+            "passed",
+            "reviewed_baseline_available",
+            "reviewed_warning_policy",
+        },
+        "summary_baseline",
     )
+    _require(baseline_summary.get("mode") == baseline_mode, "summary_ratchet_mode")
+    if baseline_mode == "verify":
+        _require(
+            baseline_summary.get("applies") is True
+            and baseline_summary.get("passed") is True
+            and baseline_summary.get("reviewed_baseline_available") is True,
+            "summary_ratchet",
+        )
+    else:
+        _require(
+            baseline_summary.get("applies") is False
+            and baseline_summary.get("passed") is True
+            and baseline_summary.get("reviewed_baseline_available") is False
+            and baseline_summary.get("reviewed_warning_policy") is None,
+            "summary_candidate",
+        )
     summary_gates = baseline_summary.get("gates")
     summary_candidates = baseline_summary.get("candidate_baselines")
     _require(
@@ -1367,14 +1491,24 @@ def validate(
     for index, label in enumerate(("a", "b")):
         gate = gates[index]
         candidate = candidates[index]
-        expected_gate_summary = {
-            "baseline_sha256": gate["baseline_sha256"],
-            "candidate_sha256": gate["candidate_sha256"],
-            "failures": gate["failures"],
-            "passed": gate["passed"],
-            "sha256": _sha256(payloads[f"baseline-gate-{label}.json"]),
-            "warning_policy": gate["warning_policy"],
-        }
+        if baseline_mode == "verify":
+            expected_gate_summary = {
+                "baseline_sha256": gate["baseline_sha256"],
+                "candidate_sha256": gate["candidate_sha256"],
+                "failures": gate["failures"],
+                "passed": gate["passed"],
+                "sha256": _sha256(payloads[f"baseline-gate-{label}.json"]),
+                "warning_policy": gate["warning_policy"],
+            }
+        else:
+            expected_gate_summary = {
+                "baseline_sha256": None,
+                "candidate_sha256": _canonical_sha256(candidate),
+                "failures": [],
+                "passed": True,
+                "sha256": _sha256(payloads[f"baseline-gate-{label}.json"]),
+                "warning_policy": None,
+            }
         _require(summary_gates[index] == expected_gate_summary, "summary_gate_identity")
         _require(
             summary_candidates[index].get("sha256")
@@ -1385,11 +1519,13 @@ def validate(
             == candidate["warning_counts"],
             "summary_candidate_identity",
         )
-    _require(
-        baseline_summary.get("reviewed_warning_policy") == gates[0]["warning_policy"]
-        == gates[1]["warning_policy"],
-        "summary_warning_policy",
-    )
+    if baseline_mode == "verify":
+        _require(
+            baseline_summary.get("reviewed_warning_policy")
+            == gates[0]["warning_policy"]
+            == gates[1]["warning_policy"],
+            "summary_warning_policy",
+        )
 
     evidence_runs = summary.get("evidence_runs")
     _require(isinstance(evidence_runs, list) and len(evidence_runs) == 2, "summary_evidence_runs")
@@ -1422,8 +1558,10 @@ def validate(
 
     report: dict[str, object] = {
         "schema": "rxls.render-worker-release-prerequisites.v1",
+        "baseline_mode": baseline_mode,
         "bootstrap_source_commit": contract["bootstrap_source_commit"],
         "build_contract_sha256": build["build_contract_sha256"],
+        "campaign": campaign,
         "head_sha": head_sha,
         "full_cases": 800,
         "lock_file_sha256": build["lock_file_sha256"],
@@ -1456,8 +1594,10 @@ def main() -> int:
     parser.add_argument("--github-artifact-id", type=int, required=True)
     parser.add_argument("--artifact-name", required=True)
     parser.add_argument("--artifact-size-bytes", type=int, required=True)
+    parser.add_argument("--baseline-mode", choices=("candidate", "verify"), required=True)
+    parser.add_argument("--campaign", choices=("full",), required=True)
     parser.add_argument("--head-sha", required=True)
-    parser.add_argument("--reviewed-baseline", type=Path, required=True)
+    parser.add_argument("--reviewed-baseline", type=Path)
     parser.add_argument("--workflow-run-id", type=int, required=True)
     parser.add_argument("--workflow-run-attempt", type=int, required=True)
     parser.add_argument("--artifact-digest", required=True)
@@ -1466,6 +1606,8 @@ def main() -> int:
     try:
         _validate_artifact_binding(
             head_sha=args.head_sha,
+            campaign=args.campaign,
+            baseline_mode=args.baseline_mode,
             workflow_run_id=args.workflow_run_id,
             workflow_run_attempt=args.workflow_run_attempt,
             artifact_id=args.github_artifact_id,
@@ -1497,6 +1639,8 @@ def main() -> int:
                 artifact_dir,
                 args.head_sha,
                 args.reviewed_baseline,
+                campaign=args.campaign,
+                baseline_mode=args.baseline_mode,
                 workflow_run_id=args.workflow_run_id,
                 workflow_run_attempt=args.workflow_run_attempt,
                 artifact_id=args.github_artifact_id,
@@ -1515,7 +1659,9 @@ def main() -> int:
         return 1
     print(
         "render release prerequisites: "
-        f"head_sha={report['head_sha']} full_cases=800 ratchets=2 passed=true"
+        f"head_sha={report['head_sha']} campaign={report['campaign']} "
+        f"baseline_mode={report['baseline_mode']} full_cases=800 "
+        "ratchets=2 passed=true"
     )
     return 0
 

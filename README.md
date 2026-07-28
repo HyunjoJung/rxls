@@ -219,7 +219,7 @@ parsing and virtual sheet/tile/page rendering inside a CSP-safe worker. See the
 limits, font isolation, pagination, and distribution gates.
 
 <!-- public-corpus-baseline:start -->
-**Current public-corpus gate (2026-07-15).** The pinned fetch recipe selects 916
+**Current public-corpus gate (2026-07-29).** The pinned fetch recipe selects 916
 files from Apache POI and calamine at immutable upstream commits: 448 `.xls`,
 413 `.xlsx`, 18 `.xlsm`, 21 `.xlsb`, and 16 `.ods`. `rxls corpus-report` opens
 869; the remaining 47 are explicit expected rejections for encrypted input,
@@ -229,7 +229,7 @@ The report records 0 unexpected failures and 0 unexpected accepts. Public visibl
 | Format | Comparable files | Result |
 |---|---:|---:|
 | `.xls` vs `xlrd` | 414 | 100.000% mean parity; 414/414 at least 99% |
-| `.xlsx`/`.xlsm` vs `openpyxl` | 388 | 99.889% mean parity; 387/388 at least 99% |
+| `.xlsx`/`.xlsm` vs `openpyxl` | 388 | 100.000% mean parity; 388/388 at least 99% |
 | `.xlsb` vs `pyxlsb` plus committed residual oracles | 18 | 100.000% mean parity |
 | `.ods` vs bounded ODF XML visible-text oracle | 14 | 100.000% mean recall |
 <!-- public-corpus-baseline:end -->

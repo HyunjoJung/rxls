@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use rxls::{Chart, ChartKind, Image, ImageFmt, PageSetup, Series, Workbook};
+use rxls::{
+    Border, BorderStyle, CellStyle, Chart, ChartKind, Image, ImageFmt, PageSetup, Series, Workbook,
+};
 use rxls_render::{
     build_print_document, build_scene, Fixed, PrintOptions, Rect, RenderOptions, RenderRange,
     RenderSelection, Rgb, Scene, SceneNode, TextAnchor, TextNode, WarningCode,
@@ -21,14 +23,15 @@ fn render_range(workbook: &Workbook, range: RenderRange) -> rxls_render::SceneBu
 }
 
 fn text_node<'a>(scene: &'a Scene, text: &str) -> &'a TextNode {
-    scene
-        .nodes
-        .iter()
-        .find_map(|node| match node {
+    fn find<'a>(nodes: &'a [SceneNode], text: &str) -> Option<&'a TextNode> {
+        nodes.iter().find_map(|node| match node {
             SceneNode::Text(node) if node.text == text => Some(node),
+            SceneNode::ClipGroup(group) => find(&group.nodes, text),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("missing text node {text:?}"))
+    }
+
+    find(&scene.nodes, text).unwrap_or_else(|| panic!("missing text node {text:?}"))
 }
 
 fn assert_horizontal_reflection(ltr: Rect, rtl: Rect, canvas_width: Fixed) {
@@ -39,6 +42,52 @@ fn assert_horizontal_reflection(ltr: Rect, rtl: Rect, canvas_width: Fixed) {
         rtl.x.raw(),
         canvas_width.raw() - ltr.x.raw() - ltr.width.raw()
     );
+}
+
+#[test]
+fn rtl_shared_double_border_is_neighbor_author_independent() {
+    fn shared_lines(author_on_visual_left: bool) -> Vec<(i64, i64, i64, i64)> {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("rtl-shared-double");
+        sheet.set_right_to_left(true);
+        // In RTL, logical B is visually left of logical A. The shared edge is
+        // therefore B.right/A.left.
+        let (a_style, b_style) = if author_on_visual_left {
+            (
+                CellStyle::default(),
+                CellStyle {
+                    border: Some(Border::new().with_right(BorderStyle::Double)),
+                    ..CellStyle::default()
+                },
+            )
+        } else {
+            (
+                CellStyle {
+                    border: Some(Border::new().with_left(BorderStyle::Double)),
+                    ..CellStyle::default()
+                },
+                CellStyle::default(),
+            )
+        };
+        sheet.write_styled(0, 0, "A", &a_style);
+        sheet.write_styled(0, 1, "B", &b_style);
+        render_range(&workbook, RenderRange::new(0, 0, 0, 1))
+            .scene
+            .nodes
+            .into_iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) => {
+                    Some((line.x1.raw(), line.y1.raw(), line.x2.raw(), line.y2.raw()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    let left_authored = shared_lines(true);
+    let right_authored = shared_lines(false);
+    assert_eq!(left_authored, right_authored);
+    assert_eq!(left_authored.len(), 2);
 }
 
 fn largest_rect_with_fill(scene: &Scene, fill: Rgb) -> Rect {

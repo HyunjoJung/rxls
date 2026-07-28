@@ -115,7 +115,13 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         payload = archive_path.read_bytes()
         return len(payload), "sha256:" + hashlib.sha256(payload).hexdigest()
 
-    def _fixture(self, root: Path) -> tuple[Path, Path, Path, Path]:
+    def _fixture(
+        self,
+        root: Path,
+        *,
+        baseline_mode: str = "verify",
+    ) -> tuple[Path, Path, Path, Path]:
+        self.assertIn(baseline_mode, {"candidate", "verify"})
         artifact = root / "artifact"
         artifact.mkdir()
         baseline = root / "reviewed-baseline.json"
@@ -221,20 +227,28 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             candidate_payload = self._write(
                 artifact / f"baseline-candidate-{label}.json", candidate
             )
-            gate = {
-                "schema": "rxls.render-parity-baseline-check.v1",
-                "passed": True,
-                "failures": [],
-                "baseline_sha256": reviewed_sha,
-                "candidate_sha256": self.checker._canonical_sha256(candidate),
-                "warning_policy": warning_policy,
-                "campaign": {
-                    "case_count": 800,
-                    "kind": "project_generated_hosted_full",
-                    "manifest_sha256": "b" * 64,
-                    "sha256": self.checker._canonical_sha256(campaign),
-                },
-            }
+            if baseline_mode == "verify":
+                gate = {
+                    "schema": "rxls.render-parity-baseline-check.v1",
+                    "passed": True,
+                    "failures": [],
+                    "baseline_sha256": reviewed_sha,
+                    "candidate_sha256": self.checker._canonical_sha256(candidate),
+                    "warning_policy": warning_policy,
+                    "campaign": {
+                        "case_count": 800,
+                        "kind": "project_generated_hosted_full",
+                        "manifest_sha256": "b" * 64,
+                        "sha256": self.checker._canonical_sha256(campaign),
+                    },
+                }
+            else:
+                gate = {
+                    "schema": "rxls.render-parity-baseline-check.v1",
+                    "baseline_sha256": self.checker._canonical_sha256(candidate),
+                    "created": True,
+                    "passed": True,
+                }
             gate_payload = self._write(
                 artifact / f"baseline-gate-{label}.json", gate
             )
@@ -411,12 +425,16 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             )
             baseline_gates.append(
                 {
-                    "baseline_sha256": reviewed_sha,
-                    "candidate_sha256": gate["candidate_sha256"],
+                    "baseline_sha256": (
+                        reviewed_sha if baseline_mode == "verify" else None
+                    ),
+                    "candidate_sha256": self.checker._canonical_sha256(candidate),
                     "failures": [],
                     "passed": True,
                     "sha256": self.checker._sha256(gate_payload),
-                    "warning_policy": warning_policy,
+                    "warning_policy": (
+                        warning_policy if baseline_mode == "verify" else None
+                    ),
                 }
             )
             evidence_runs.append(
@@ -442,8 +460,9 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         }
         repeatability_summary["sha256"] = self.checker._sha256(repeatability_payload)
         summary = {
-            "schema": "rxls.render-oracle-hosted-campaign.v5",
+            "schema": "rxls.render-oracle-hosted-campaign.v6",
             "head_sha": self.head_sha,
+            "baseline_mode": baseline_mode,
             "campaign": {
                 "mode": "full",
                 "case_count": 800,
@@ -460,7 +479,9 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "redistribution": "allowed",
             },
             "renderer": renderer,
+            "font_pack": {},
             "host_tools": host_tools,
+            "metrics": {},
             "container": {
                 "build_contract_sha256": build["build_contract_sha256"],
                 "identity_status": "pinned_match",
@@ -475,12 +496,15 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "wrapper_sha256": build["wrapper_sha256"],
             },
             "baseline_ratcheting": {
-                "applies": True,
+                "applies": baseline_mode == "verify",
                 "passed": True,
-                "reviewed_baseline_available": True,
+                "reviewed_baseline_available": baseline_mode == "verify",
                 "candidate_baselines": baseline_candidates,
                 "gates": baseline_gates,
-                "reviewed_warning_policy": warning_policy,
+                "mode": baseline_mode,
+                "reviewed_warning_policy": (
+                    warning_policy if baseline_mode == "verify" else None
+                ),
             },
             "evidence_runs": evidence_runs,
             "fidelity": fidelity_summaries,
@@ -508,6 +532,83 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         self.assertEqual(report["oracle_config_digest"], "sha256:" + "2" * 64)
         self.assertEqual(report["oracle_manifest_digest"], "sha256:" + "6" * 64)
         self.assertEqual(report["ratchets"], 2)
+        self.assertEqual(report["baseline_mode"], "verify")
+        self.assertEqual(report["campaign"], "full")
+
+    def test_accepts_full_candidate_without_a_reviewed_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+
+            report = self.checker.validate(
+                artifact,
+                self.head_sha,
+                None,
+                baseline_mode="candidate",
+                campaign="full",
+                workflow_run_id=101,
+                workflow_run_attempt=2,
+                artifact_id=303,
+                artifact_name=(
+                    f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                ),
+                artifact_size_bytes=4096,
+                artifact_digest="sha256:" + "a" * 64,
+                artifact_repository="HyunjoJung/rxls",
+                oracle_lock=lock,
+                oracle_wrapper=wrapper,
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["baseline_mode"], "candidate")
+        self.assertEqual(report["campaign"], "full")
+        self.assertIsNone(report["reviewed_baseline_sha256"])
+
+    def test_candidate_and_verify_modes_fail_closed_on_cross_mode_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_artifact, baseline, lock, wrapper = self._fixture(
+                root,
+                baseline_mode="candidate",
+            )
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "candidate_reviewed_baseline_forbidden",
+            ):
+                self.checker.validate(
+                    candidate_artifact,
+                    self.head_sha,
+                    baseline,
+                    baseline_mode="candidate",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+            with self.assertRaises(self.checker.EvidenceError):
+                self.checker.validate(
+                    candidate_artifact,
+                    self.head_sha,
+                    None,
+                    baseline_mode="verify",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(Path(temporary))
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "reviewed_baseline_required",
+            ):
+                self.checker.validate(
+                    artifact,
+                    self.head_sha,
+                    None,
+                    baseline_mode="verify",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
 
     def test_authenticates_extracts_and_reports_exact_artifact_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -531,7 +632,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 workflow_run_attempt=2,
                 artifact_id=303,
                 artifact_name=(
-                    f"render-oracle-{self.head_sha}-101-2-full"
+                    f"render-oracle-{self.head_sha}-101-2-full-verify"
                 ),
                 artifact_size_bytes=size,
                 artifact_digest=digest,
@@ -758,7 +859,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     workflow_run_attempt=2,
                     artifact_id=303,
                     artifact_name=(
-                        f"render-oracle-{self.head_sha}-102-2-full"
+                        f"render-oracle-{self.head_sha}-102-2-full-verify"
                     ),
                     artifact_size_bytes=4096,
                     artifact_digest="sha256:" + "a" * 64,
@@ -775,6 +876,8 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             '--github-artifact-id "$artifact_id"',
             '--artifact-name "$artifact_name"',
             '--artifact-size-bytes "$size_bytes"',
+            "--baseline-mode verify",
+            "--campaign full",
             '--workflow-run-id "$run_id"',
             '--workflow-run-attempt "$run_attempt"',
             '--artifact-digest "$digest"',
@@ -823,6 +926,39 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                         oracle_wrapper=wrapper,
                     )
 
+    def test_path_neutral_rejects_key_variants_traversal_and_artifact_names(
+        self,
+    ) -> None:
+        rejected = (
+            {"source_path": "redacted"},
+            {"host-path": "redacted"},
+            "../secret.xlsx",
+            "nested/../secret.xlsx",
+            r"private\secret.xlsx",
+            "secret.xlsx",
+            "secret.xls",
+            "secret.xlsb",
+            "secret.xlsm",
+            "secret.ods",
+            "secret.fods",
+            "secret.pdf",
+            "secret.png",
+            "secret.svg",
+        )
+        for value in rejected:
+            with self.subTest(value=value), self.assertRaises(
+                self.checker.EvidenceError
+            ):
+                self.checker._path_neutral(value)
+
+        self.checker._path_neutral(
+            {
+                "schema": "rxls.render-oracle-hosted-campaign.v6",
+                "sha256": "a" * 64,
+                "media_type": "application/pdf",
+            }
+        )
+
     def test_rejects_unauthenticated_v3_build_and_summary_vectors(self) -> None:
         mutations = (
             "schema_v2",
@@ -842,7 +978,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "fidelity_manifest_binding",
             "authored_manifest_binding",
             "summary_manifest",
-            "summary_v4",
+            "summary_v5",
             "summary_source",
             "summary_wrapper",
             "summary_contract",
@@ -930,8 +1066,8 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     self._write(authored_path, authored)
                 elif mutation == "summary_manifest":
                     del summary["container"]["manifest_digest"]
-                elif mutation == "summary_v4":
-                    summary["schema"] = "rxls.render-oracle-hosted-campaign.v4"
+                elif mutation == "summary_v5":
+                    summary["schema"] = "rxls.render-oracle-hosted-campaign.v5"
                 elif mutation == "summary_source":
                     summary["container"]["source_commit"] = "b" * 40
                 elif mutation == "summary_wrapper":

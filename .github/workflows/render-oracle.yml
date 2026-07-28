@@ -11,11 +11,37 @@ on:
         options:
           - pilot
           - full
+      baseline_mode:
+        description: Verify the tracked full baseline or bootstrap a hosted candidate
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - candidate
       bootstrap_identities:
         description: Capture the initially-null hosted and OCI identities without running parity
         required: true
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      campaign:
+        description: Run the pilot or full Render Oracle campaign
+        required: true
+        type: string
+      baseline_mode:
+        description: Verify the tracked baseline or bootstrap a hosted candidate
+        required: true
+        type: string
+      bootstrap_identities:
+        description: Capture initially-null identities without running parity
+        required: true
+        type: boolean
+      source_sha:
+        description: Exact caller commit to check out and bind into evidence
+        required: true
+        type: string
   push:
     branches: [main]
     paths:
@@ -54,6 +80,8 @@ on:
       - "scripts/render-oracle-container/**"
       - "src/**"
       - "tests/fixtures/xls/korean-unicode-biff8.xls"
+  pull_request:
+    types: [labeled]
   schedule:
     - cron: "17 4 * * 3"
 
@@ -66,8 +94,9 @@ concurrency:
 
 jobs:
   locked-linux-oracle:
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'labeled' && (github.event.label.name == 'rxls-render-oracle-pilot' || github.event.label.name == 'rxls-render-oracle-full') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'full' && 330 || 120 }}
+    timeout-minutes: ${{ ((github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-full') || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.campaign == 'full')) && 330 || 120 }}
     env:
       FULL_CASE_COUNT: "800"
       FULL_AUTHORED_PRINT_COUNT: "100"
@@ -80,18 +109,43 @@ jobs:
       PILOT_CASE_COUNT: "40"
       PILOT_AUTHORED_PRINT_COUNT: "4"
       PYTHONHASHSEED: "0"
-      RXLS_ORACLE_CAMPAIGN: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
-      RXLS_IDENTITY_BOOTSTRAP: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_identities && '1' || '0' }}
+      RXLS_BASELINE_MODE: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.baseline_mode || 'verify' }}
+      RXLS_ORACLE_CAMPAIGN: ${{ github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-full' && 'full' || github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-pilot' && 'pilot' || (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.campaign || 'pilot' }}
+      RXLS_IDENTITY_BOOTSTRAP: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.bootstrap_identities && '1' || '0' }}
       TZ: UTC
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Verify the exact checked-out commit
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
         shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+      - name: Validate the fail-closed campaign invocation
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          case "$RXLS_ORACLE_CAMPAIGN" in
+            pilot|full) ;;
+            *) exit 64 ;;
+          esac
+          case "$RXLS_BASELINE_MODE" in
+            verify) ;;
+            candidate)
+              test "$RXLS_ORACLE_CAMPAIGN" = "full"
+              test "$RXLS_IDENTITY_BOOTSTRAP" = "0"
+              ;;
+            *) exit 64 ;;
+          esac
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13.14"
@@ -241,10 +295,25 @@ jobs:
               json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
+      - name: Run the project-native Type3 PDF Poppler smoke
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v pdffonts
+          command -v pdfinfo
+          command -v pdftoppm
+          command -v pdftotext
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens \
+            -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact
       - name: Build and inspect the locked oracle image
         shell: bash
         env:
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
@@ -318,22 +387,27 @@ jobs:
           RENDERER="${{ github.workspace }}/render/target/release/rxls-render"
           RENDERER_SHA256="$(python3 -c 'import json; print(json.load(open("target/render-oracle-hosted/renderer.json"))["sha256"])')"
           IMAGE_ID="$(cat target/render-oracle-hosted/image-id.txt)"
-          PDFFONTS_SHA256="$(python3 - <<'PY'
+          readarray -t HOST_TOOL_IDENTITIES < <(python3 - <<'PY'
           import json
           import re
 
           evidence = json.load(open("target/render-oracle-hosted/host-tools.json", encoding="utf-8"))
-          rows = [
-              row
+          assert evidence["captured_identity_sha256"] == evidence["expected_identity_sha256"]
+          closure = evidence["captured_identity_sha256"]
+          assert re.fullmatch(r"[0-9a-f]{64}", closure)
+          rows = {
+              row.get("name"): row.get("sha256")
               for row in evidence["identity"]["poppler"]["executables"]
-              if row.get("name") == "pdffonts"
-          ]
-          assert len(rows) == 1
-          digest = rows[0].get("sha256", "")
-          assert re.fullmatch(r"[0-9a-f]{64}", digest)
-          print(digest)
+          }
+          assert set(rows) == {"pdffonts", "pdfinfo", "pdftoppm", "pdftotext"}
+          assert all(re.fullmatch(r"[0-9a-f]{64}", digest or "") for digest in rows.values())
+          print(rows["pdffonts"])
+          print(closure)
           PY
-          )"
+          )
+          test "${#HOST_TOOL_IDENTITIES[@]}" = "2"
+          PDFFONTS_SHA256="${HOST_TOOL_IDENTITIES[0]}"
+          HOST_TOOLS_IDENTITY_SHA256="${HOST_TOOL_IDENTITIES[1]}"
           ADAPTER="python3 ${{ github.workspace }}/scripts/run-render-oracle-container.py --lock ${{ github.workspace }}/scripts/render-oracle-container/lock.json render --engine docker --image ${IMAGE_ID} --source {input} --font-pack {font_pack} --evidence-dir {output_dir} --run-id {run_id} --timeout-seconds 180 --execute"
 
           run_parity() {
@@ -357,6 +431,7 @@ jobs:
               --font-pack-manifest local/render-fonts/pack/manifest.json \
               --require-font-pack \
               --pdffonts-binary-sha256 "$PDFFONTS_SHA256" \
+              --host-tools-identity-sha256 "$HOST_TOOLS_IDENTITY_SHA256" \
               --libreoffice-command "$ADAPTER" \
               --timeout-seconds 240 \
               --fail-on-incomparable \
@@ -426,6 +501,7 @@ jobs:
               --font-pack-manifest local/render-fonts/pack/manifest.json \
               --require-font-pack \
               --pdffonts-binary-sha256 "$PDFFONTS_SHA256" \
+              --host-tools-identity-sha256 "$HOST_TOOLS_IDENTITY_SHA256" \
               --libreoffice-command "$ADAPTER" \
               --timeout-seconds 240 \
               --fail-on-incomparable \
@@ -513,23 +589,57 @@ jobs:
           fi
           python3 scripts/check-render-fidelity-targets.py \
             target/render-oracle-hosted/parity-report-a.json \
-            > target/render-oracle-hosted/fidelity-a.json \
+            --campaign-manifest "local/render-corpus-generated/${RXLS_ORACLE_CAMPAIGN}/manifest.json" \
+            | tee target/render-oracle-hosted/fidelity-a.json \
             || STATUS=1
           if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
             python3 scripts/check-render-fidelity-targets.py \
               target/render-oracle-hosted/parity-report-b.json \
-              > target/render-oracle-hosted/fidelity-b.json \
+              --campaign-manifest "local/render-corpus-generated/${RXLS_ORACLE_CAMPAIGN}/manifest.json" \
+              | tee target/render-oracle-hosted/fidelity-b.json \
               || STATUS=1
-            for label in a b; do
-              python3 scripts/check-render-parity-baseline.py \
-                --evidence "target/render-oracle-hosted/parity-report-${label}.json" \
-                --baseline scripts/render-parity-baseline-full.json \
-                --campaign-manifest local/render-corpus-generated/full/manifest.json \
-                --candidate-baseline "target/render-oracle-hosted/baseline-candidate-${label}.json" \
-                --report "target/render-oracle-hosted/baseline-gate-${label}.json" \
-                --require-hosted-full-800 \
-                || STATUS=1
-            done
+            case "$RXLS_BASELINE_MODE" in
+              verify)
+                test -f scripts/render-parity-baseline-full.json || STATUS=1
+                test ! -L scripts/render-parity-baseline-full.json || STATUS=1
+                git ls-files --error-unmatch scripts/render-parity-baseline-full.json \
+                  >/dev/null || STATUS=1
+                for label in a b; do
+                  python3 scripts/check-render-parity-baseline.py \
+                    --evidence "target/render-oracle-hosted/parity-report-${label}.json" \
+                    --baseline scripts/render-parity-baseline-full.json \
+                    --campaign-manifest local/render-corpus-generated/full/manifest.json \
+                    --candidate-baseline "target/render-oracle-hosted/baseline-candidate-${label}.json" \
+                    --report "target/render-oracle-hosted/baseline-gate-${label}.json" \
+                    --require-hosted-full-800 \
+                    || STATUS=1
+                done
+                ;;
+              candidate)
+                test ! -e scripts/render-parity-baseline-full.json || STATUS=1
+                test ! -L scripts/render-parity-baseline-full.json || STATUS=1
+                for label in a b; do
+                  temporary_baseline="target/render-oracle-hosted/baseline-bootstrap-${label}.json"
+                  python3 scripts/check-render-parity-baseline.py \
+                    --evidence "target/render-oracle-hosted/parity-report-${label}.json" \
+                    --baseline "$temporary_baseline" \
+                    --campaign-manifest local/render-corpus-generated/full/manifest.json \
+                    --candidate-baseline "target/render-oracle-hosted/baseline-candidate-${label}.json" \
+                    --report "target/render-oracle-hosted/baseline-gate-${label}.json" \
+                    --require-hosted-full-800 \
+                    --create \
+                    || STATUS=1
+                  cmp --silent \
+                    "$temporary_baseline" \
+                    "target/render-oracle-hosted/baseline-candidate-${label}.json" \
+                    || STATUS=1
+                  rm -f -- "$temporary_baseline"
+                done
+                ;;
+              *)
+                STATUS=1
+                ;;
+            esac
           fi
           AUTHORED_PRINT_WORKBOOKS="$PILOT_AUTHORED_PRINT_COUNT"
           if [[ "$RXLS_ORACLE_CAMPAIGN" == "full" ]]; then
@@ -538,27 +648,297 @@ jobs:
           python3 scripts/check-authored-print-parity.py \
             target/render-oracle-hosted/authored-print-report.json \
             --expected-workbooks "$AUTHORED_PRINT_WORKBOOKS" \
-            > target/render-oracle-hosted/authored-print-gate.json \
+            --campaign-manifest "local/render-corpus-generated/${RXLS_ORACLE_CAMPAIGN}/manifest.json" \
+            | tee target/render-oracle-hosted/authored-print-gate.json \
             || STATUS=1
           printf '%s\n' "$STATUS" > target/render-oracle-hosted/gate-status.txt
+      - name: Stage validated bootstrap identity evidence
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP == '1' }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import shutil
+
+          artifact_extension = re.compile(
+              r"\.(?:xls|xlsx|xlsb|xlsm|ods|fods|pdf|png|svg)\Z",
+              re.IGNORECASE,
+          )
+          traversal = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
+
+          def reject_path_bearing_strings(value):
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+                      assert not (
+                          normalized_key.startswith("path")
+                          or normalized_key.endswith("path")
+                          or normalized_key.endswith("paths")
+                      )
+                      reject_path_bearing_strings(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      reject_path_bearing_strings(item)
+              elif isinstance(value, str):
+                  lowered = value.lower()
+                  assert not value.startswith("/")
+                  assert not re.match(r"[A-Za-z]:[\\/]", value)
+                  assert not lowered.startswith("file://")
+                  assert "\\" not in value
+                  assert traversal.search(value) is None
+                  assert artifact_extension.search(value) is None
+
+          root = pathlib.Path("target/render-oracle-hosted")
+          build = json.loads((root / "build.json").read_text(encoding="utf-8"))
+          host_tools = json.loads(
+              (root / "host-tools.json").read_text(encoding="utf-8")
+          )
+          assert build["image_identity_status"] == "bootstrap_capture_required"
+          assert build["expected_image_id"] is None
+          assert build["expected_manifest_digest"] is None
+          assert host_tools["identity_status"] == "bootstrap_capture_required"
+          assert host_tools["expected_identity_sha256"] is None
+          assert set(build) == {
+              "build_contract_sha256",
+              "built_image_id",
+              "built_manifest_digest",
+              "expected_image_id",
+              "expected_manifest_digest",
+              "image_identity_status",
+              "lock_file_sha256",
+              "platform",
+              "reproducibility",
+              "schema",
+              "source_commit",
+              "status",
+              "wrapper_sha256",
+          }
+          assert build["schema"] == "rxls.render-oracle-container-build.v3"
+          assert set(host_tools) == {
+              "captured_identity_sha256",
+              "expected_identity_sha256",
+              "identity",
+              "identity_status",
+              "lock_file_sha256",
+              "schema",
+              "scope",
+          }
+          assert (
+              host_tools["schema"]
+              == "rxls.render-oracle-host-tools-evidence.v1"
+          )
+          for document in (build, host_tools):
+              reject_path_bearing_strings(document)
+          upload_root = pathlib.Path("target/render-oracle-upload")
+          if upload_root.exists():
+              shutil.rmtree(upload_root)
+          upload_root.mkdir(parents=True)
+          for name in ("build.json", "host-tools.json"):
+              shutil.copyfile(root / name, upload_root / name)
+          PY
       - name: Verify and minimize aggregate-only hosted evidence
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         env:
-          EXPECTED_HEAD_SHA: ${{ github.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 - <<'PY'
           from collections import Counter
+          from fractions import Fraction
           import hashlib
           import json
           import os
           import pathlib
           import re
+          import shutil
 
           def load(path):
               return json.loads(path.read_text(encoding="utf-8"))
 
           def sha256(payload):
               return hashlib.sha256(payload).hexdigest()
+
+          def canonical_payload(value):
+              return (
+                  json.dumps(value, indent=2, sort_keys=True) + "\n"
+              ).encode("utf-8")
+
+          def feature_mapping(rows):
+              mapped = []
+              seen = set()
+              for row in rows:
+                  digest = row.get("sha256")
+                  format_name = row.get("format")
+                  features = row.get("features")
+                  assert re.fullmatch(r"[0-9a-f]{64}", digest or "")
+                  assert digest not in seen
+                  assert format_name in {"ods", "xls", "xlsb", "xlsx"}
+                  assert (
+                      isinstance(features, list)
+                      and features == sorted(set(features))
+                      and all(isinstance(feature, str) and feature for feature in features)
+                  )
+                  seen.add(digest)
+                  mapped.append(
+                      {
+                          "features": features,
+                          "format": format_name,
+                          "sha256": digest,
+                      }
+                  )
+              mapped.sort(
+                  key=lambda row: (
+                      row["sha256"],
+                      row["format"],
+                      tuple(row["features"]),
+                  )
+              )
+              return mapped
+
+          def manifest_binding(rows, manifest_sha256):
+              mapped = feature_mapping(rows)
+              input_set = sorted(row["sha256"] for row in mapped)
+              return {
+                  "feature_map_sha256": sha256(canonical_payload(mapped)),
+                  "input_set_sha256": sha256(canonical_payload(input_set)),
+                  "manifest_sha256": manifest_sha256,
+                  "schema": "rxls.render-parity-manifest-binding.v1",
+                  "selected_case_count": len(mapped),
+              }
+
+          native_pdf_keys = {
+              "actual_text_documents",
+              "charprocs_documents",
+              "documents",
+              "embedded_font_objects",
+              "font_objects",
+              "identity_set_sha256",
+              "subset_font_objects",
+              "type3_documents",
+              "type3_font_objects",
+              "unicode_font_objects",
+          }
+          point_delta_keys = {
+              "crop_box_height",
+              "crop_box_width",
+              "libreoffice_xhtml_page_size_height",
+              "libreoffice_xhtml_page_size_width",
+              "media_box_height",
+              "media_box_width",
+              "rxls_xhtml_page_size_height",
+              "rxls_xhtml_page_size_width",
+              "xhtml_height",
+              "xhtml_width",
+          }
+          direct_point_delta_keys = {
+              "crop_box_height",
+              "crop_box_width",
+              "media_box_height",
+              "media_box_width",
+              "xhtml_height",
+              "xhtml_width",
+          }
+          xhtml_crosscheck_delta_keys = (
+              point_delta_keys - direct_point_delta_keys
+          )
+
+          def validate_native_pdf_and_page_evidence(report):
+              for row in report["files"]:
+                  pages = row["pages"]
+                  scenes = row["scenes"]
+                  assert len(pages) == len(scenes) > 0
+                  page_mapping = [
+                      (
+                          page["source_sheet_index"],
+                          page["source_pdf_page_index"],
+                          page["oracle_output_page_index"],
+                      )
+                      for page in pages
+                  ]
+                  assert page_mapping == [
+                      (
+                          scene["source_sheet_index"],
+                          scene["source_pdf_page_index"],
+                          scene["oracle_output_page_index"],
+                      )
+                      for scene in scenes
+                  ]
+                  assert [mapping[2] for mapping in page_mapping] == list(
+                      range(len(page_mapping))
+                  )
+                  seen_sheets = set()
+                  current_sheet = None
+                  local_page = 0
+                  for source_sheet, source_pdf_page, _ in page_mapping:
+                      if source_sheet != current_sheet:
+                          assert source_sheet not in seen_sheets
+                          assert (
+                              current_sheet is None
+                              or source_sheet > current_sheet
+                          )
+                          seen_sheets.add(source_sheet)
+                          current_sheet = source_sheet
+                          local_page = 0
+                      assert source_pdf_page == local_page
+                      local_page += 1
+
+                  metrics = row["metrics"]
+                  assert metrics["pdf_point_geometry_mismatches"] == 0
+                  assert (
+                      metrics[
+                          "max_pdf_point_geometry_delta_millipoints"
+                      ]
+                      == 0
+                  )
+                  assert (
+                      metrics[
+                          "max_pdf_xhtml_crosscheck_delta_micropoints"
+                      ]
+                      <= 1_000
+                  )
+                  for page in pages:
+                      assert page["rxls_size"] == page["libreoffice_size"]
+                      point_geometry = page["pdf_point_geometry"]
+                      assert set(point_geometry) == {
+                          "deltas_points",
+                          "libreoffice",
+                          "rxls",
+                          "xhtml",
+                      }
+                      assert set(point_geometry["deltas_points"]) == point_delta_keys
+                      deltas = {
+                          key: Fraction(value)
+                          for key, value in point_geometry[
+                              "deltas_points"
+                          ].items()
+                      }
+                      assert all(
+                          deltas[key] == 0
+                          for key in direct_point_delta_keys
+                      )
+                      assert all(
+                          abs(deltas[key]) <= Fraction(1, 1000)
+                          for key in xhtml_crosscheck_delta_keys
+                      )
+
+                  native = row["native_pdf_attestation"]
+                  assert set(native) == native_pdf_keys
+                  documents = native["documents"]
+                  font_objects = native["font_objects"]
+                  assert documents == len(seen_sheets) > 0
+                  assert native["actual_text_documents"] == documents
+                  assert native["charprocs_documents"] == documents
+                  assert native["type3_documents"] == documents
+                  assert font_objects > 0
+                  assert native["embedded_font_objects"] == font_objects
+                  assert native["subset_font_objects"] == font_objects
+                  assert native["type3_font_objects"] == font_objects
+                  assert native["unicode_font_objects"] == font_objects
+                  assert re.fullmatch(
+                      r"[0-9a-f]{64}", native["identity_set_sha256"]
+                  )
+                  assert len(row["native_pdf_font_commands"]) == documents
 
           def warning_counts(report):
               counts = Counter()
@@ -575,6 +955,9 @@ jobs:
           root = pathlib.Path("target/render-oracle-hosted")
           profile = os.environ["RXLS_ORACLE_CAMPAIGN"]
           assert profile in {"pilot", "full"}
+          baseline_mode = os.environ["RXLS_BASELINE_MODE"]
+          assert baseline_mode in {"candidate", "verify"}
+          assert baseline_mode == "verify" or profile == "full"
           expected_cases = 40 if profile == "pilot" else 800
           expected_authored_print = 4 if profile == "pilot" else 100
           expected_per_format = 10 if profile == "pilot" else 200
@@ -619,14 +1002,38 @@ jobs:
           assert host_tools["identity_status"] == "pinned_match"
           assert host_tools["scope"] == "all"
           assert host_tools["captured_identity_sha256"] == host_tools["expected_identity_sha256"]
-          pdffonts_rows = [
-              row
+          poppler_sha256 = {
+              row.get("name"): row.get("sha256")
               for row in host_tools["identity"]["poppler"]["executables"]
-              if row.get("name") == "pdffonts"
-          ]
-          assert len(pdffonts_rows) == 1
-          pdffonts_sha256 = pdffonts_rows[0]["sha256"]
-          assert re.fullmatch(r"[0-9a-f]{64}", pdffonts_sha256)
+          }
+          assert set(poppler_sha256) == {
+              "pdffonts",
+              "pdfinfo",
+              "pdftoppm",
+              "pdftotext",
+          }
+          assert all(
+              re.fullmatch(r"[0-9a-f]{64}", digest or "")
+              for digest in poppler_sha256.values()
+          )
+          host_tools_identity_sha256 = host_tools["captured_identity_sha256"]
+          assert re.fullmatch(
+              r"[0-9a-f]{64}", host_tools_identity_sha256
+          )
+          expected_measurement_toolchain = {
+              "host_tools_identity_sha256": host_tools_identity_sha256,
+              "kind": "poppler",
+              **{
+                  f"{name}_sha256": digest
+                  for name, digest in sorted(poppler_sha256.items())
+              },
+          }
+          corpus_manifest_sha256 = sha256(corpus_payload)
+          corpus_binding = manifest_binding(
+              corpus["files"],
+              corpus_manifest_sha256,
+          )
+          corpus_mapping = feature_mapping(corpus["files"])
           assert corpus["profile"] == profile
           assert corpus["case_count"] == expected_cases
           assert corpus["format_counts"] == {
@@ -666,6 +1073,12 @@ jobs:
                   "xlsx": expected_per_format,
               }
               assert report["configuration"]["renderer_binary"] == renderer
+              assert (
+                  report["configuration"]["measurement_toolchain"]
+                  == expected_measurement_toolchain
+              )
+              assert report["configuration"]["manifest_binding"] == corpus_binding
+              assert feature_mapping(report["files"]) == corpus_mapping
               assert (
                   report["configuration"]["font_pack"]["pack_sha256"]
                   == font_manifest["pack_sha256"]
@@ -735,8 +1148,7 @@ jobs:
               assert oracle_lock["libreoffice"] == adapters[0]["oracle"]
               assert oracle_lock["runtime"] == "docker"
               assert oracle_lock["pdf_font_inspector"] == {
-                  "kind": "poppler",
-                  "pdffonts_sha256": pdffonts_sha256,
+                  **expected_measurement_toolchain
               }
 
               for row in report["files"]:
@@ -752,6 +1164,7 @@ jobs:
                       r"[0-9a-f]{64}",
                       attestation["normalized_identities_sha256"],
                   )
+              validate_native_pdf_and_page_evidence(report)
 
               report_sha256 = sha256(report_payload)
               gate_path = root / f"fidelity-{'ab'[index]}.json"
@@ -761,6 +1174,22 @@ jobs:
               assert gate["passed"] is True
               assert gate["failures"] == []
               assert gate["coverage"]["report_workbooks"] == expected_cases
+              assert gate["coverage"]["native_pdf_documents"] > 0
+              assert gate["coverage"]["native_pdf_font_objects"] > 0
+              assert gate["metrics"]["pdf_point_geometry_mismatches"] == 0
+              assert (
+                  gate["metrics"][
+                      "pdf_xhtml_crosscheck_max_micropoints"
+                  ]
+                  <= 1_000
+              )
+              assert gate["thresholds"]["pdf_point_geometry_exact"] is True
+              assert (
+                  gate["thresholds"][
+                      "pdf_xhtml_crosscheck_max_micropoints"
+                  ]
+                  == 1_000
+              )
               assert gate["evidence"]["sha256"] == report_sha256
               assert gate["evidence"]["renderer_sha256"] == renderer["sha256"]
               assert (
@@ -787,7 +1216,21 @@ jobs:
                   gate["evidence"]["oracle_libreoffice_artifact_sha256"]
                   == adapters[0]["oracle"]["artifact_sha256"]
               )
-              assert gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256
+              assert (
+                  gate["evidence"]["host_tools_identity_sha256"]
+                  == host_tools_identity_sha256
+              )
+              for name, digest in poppler_sha256.items():
+                  assert gate["evidence"][f"{name}_sha256"] == digest
+              assert gate["evidence"]["manifest_sha256"] == corpus_manifest_sha256
+              assert (
+                  gate["evidence"]["input_set_sha256"]
+                  == corpus_binding["input_set_sha256"]
+              )
+              assert (
+                  gate["evidence"]["feature_map_sha256"]
+                  == corpus_binding["feature_map_sha256"]
+              )
               evidence_runs.append(
                   {
                       "fidelity_gate_sha256": sha256(gate_payload),
@@ -814,6 +1257,26 @@ jobs:
               "print-settings" in row.get("features", [])
               for row in authored_report["files"]
           )
+          validate_native_pdf_and_page_evidence(authored_report)
+          authored_manifest_rows = [
+              row
+              for row in corpus["files"]
+              if row["format"] == "xlsx"
+              and "print-settings" in row["features"]
+          ]
+          authored_binding = manifest_binding(
+              authored_manifest_rows,
+              corpus_manifest_sha256,
+          )
+          assert (
+              authored_report["configuration"]["measurement_toolchain"]
+              == expected_measurement_toolchain
+          )
+          assert authored_report["configuration"]["manifest_binding"] == authored_binding
+          assert (
+              feature_mapping(authored_report["files"])
+              == feature_mapping(authored_manifest_rows)
+          )
           authored_gate_path = root / "authored-print-gate.json"
           authored_gate_payload = authored_gate_path.read_bytes()
           authored_gate = json.loads(authored_gate_payload)
@@ -822,6 +1285,24 @@ jobs:
           assert authored_gate["failures"] == []
           assert authored_gate["coverage"]["workbooks"] == expected_authored_print
           assert authored_gate["coverage"]["pages"] == expected_authored_print * 4
+          assert authored_gate["coverage"]["native_pdf_documents"] > 0
+          assert authored_gate["coverage"]["native_pdf_font_objects"] > 0
+          assert authored_gate["metrics"]["pdf_point_geometry_mismatches"] == 0
+          assert (
+              authored_gate["metrics"][
+                  "pdf_xhtml_crosscheck_max_micropoints"
+              ]
+              <= 1_000
+          )
+          assert (
+              authored_gate["thresholds"]["pdf_point_geometry_exact"] is True
+          )
+          assert (
+              authored_gate["thresholds"][
+                  "pdf_xhtml_crosscheck_max_micropoints"
+              ]
+              == 1_000
+          )
           assert set(authored_gate["coverage"]["by_scale_mode"]) == {"fit", "scale"}
           assert authored_gate["evidence"]["report_sha256"] == sha256(
               authored_report_payload
@@ -835,7 +1316,24 @@ jobs:
               authored_gate["evidence"]["oracle_libreoffice_artifact_sha256"]
               == adapters[0]["oracle"]["artifact_sha256"]
           )
-          assert authored_gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256
+          assert (
+              authored_gate["evidence"]["host_tools_identity_sha256"]
+              == host_tools_identity_sha256
+          )
+          for name, digest in poppler_sha256.items():
+              assert authored_gate["evidence"][f"{name}_sha256"] == digest
+          assert (
+              authored_gate["evidence"]["manifest_sha256"]
+              == corpus_manifest_sha256
+          )
+          assert (
+              authored_gate["evidence"]["input_set_sha256"]
+              == authored_binding["input_set_sha256"]
+          )
+          assert (
+              authored_gate["evidence"]["feature_map_sha256"]
+              == authored_binding["feature_map_sha256"]
+          )
           authored_print_summary = {
               "coverage": authored_gate["coverage"],
               "evidence": authored_gate["evidence"],
@@ -851,6 +1349,7 @@ jobs:
               "applies": False,
               "candidate_baselines": [],
               "gates": [],
+              "mode": baseline_mode,
               "passed": None,
               "reviewed_baseline_available": False,
               "reviewed_warning_policy": None,
@@ -911,8 +1410,9 @@ jobs:
                   gate_payload = gate_path.read_bytes()
                   gate = json.loads(gate_payload)
                   assert gate["schema"] == "rxls.render-parity-baseline-check.v1"
-                  assert gate["candidate_sha256"] == sha256(candidate_payload)
-                  if gate.get("passed") is True:
+                  if baseline_mode == "verify":
+                      assert gate["candidate_sha256"] == sha256(candidate_payload)
+                      assert gate["passed"] is True
                       assert gate["failures"] == []
                       assert gate["campaign"]["case_count"] == expected_cases
                       assert gate["campaign"]["kind"] == "project_generated_hosted_full"
@@ -920,16 +1420,33 @@ jobs:
                       warning_policy = gate["warning_policy"]
                       assert warning_policy["unclassified_codes"] == []
                       assert warning_policy["reviewed_code_count"] >= warning_policy["candidate_code_count"]
-                  baseline_gates.append(
-                      {
-                          "baseline_sha256": gate.get("baseline_sha256"),
+                      gate_summary = {
+                          "baseline_sha256": gate["baseline_sha256"],
                           "candidate_sha256": gate["candidate_sha256"],
                           "failures": gate["failures"],
                           "passed": gate["passed"],
                           "sha256": sha256(gate_payload),
-                          "warning_policy": gate.get("warning_policy"),
+                          "warning_policy": gate["warning_policy"],
                       }
-                  )
+                  else:
+                      assert set(gate) == {
+                          "baseline_sha256",
+                          "created",
+                          "passed",
+                          "schema",
+                      }
+                      assert gate["created"] is True
+                      assert gate["passed"] is True
+                      assert gate["baseline_sha256"] == sha256(candidate_payload)
+                      gate_summary = {
+                          "baseline_sha256": None,
+                          "candidate_sha256": sha256(candidate_payload),
+                          "failures": [],
+                          "passed": True,
+                          "sha256": sha256(gate_payload),
+                          "warning_policy": None,
+                      }
+                  baseline_gates.append(gate_summary)
 
               ratchets_passed = all(gate["passed"] for gate in baseline_gates)
               warning_policies = [
@@ -938,12 +1455,17 @@ jobs:
                   if gate["warning_policy"] is not None
               ]
               baseline_ratcheting = {
-                  "applies": True,
+                  "applies": baseline_mode == "verify",
                   "candidate_baselines": baseline_candidates,
                   "gates": baseline_gates,
+                  "mode": baseline_mode,
                   "passed": ratchets_passed,
-                  "reviewed_baseline_available": all(
-                      gate["baseline_sha256"] is not None for gate in baseline_gates
+                  "reviewed_baseline_available": (
+                      baseline_mode == "verify"
+                      and all(
+                          gate["baseline_sha256"] is not None
+                          for gate in baseline_gates
+                      )
                   ),
                   "reviewed_warning_policy": (
                       warning_policies[0]
@@ -964,6 +1486,7 @@ jobs:
           ]
           summary = {
               "authored_print": authored_print_summary,
+              "baseline_mode": baseline_mode,
               "baseline_ratcheting": baseline_ratcheting,
               "campaign": {
                   "case_count": expected_cases,
@@ -1023,7 +1546,7 @@ jobs:
               "metrics": report["summary"]["metric_cohorts"],
               "renderer": renderer,
               "repeatability": repeatability_summary,
-              "schema": "rxls.render-oracle-hosted-campaign.v5",
+              "schema": "rxls.render-oracle-hosted-campaign.v6",
               "summary": {
                   "by_classification": report["summary"]["by_classification"],
                   "by_status": report["summary"]["by_status"],
@@ -1039,8 +1562,13 @@ jobs:
 
           def reject_path_bearing_strings(value):
               if isinstance(value, dict):
-                  assert "path" not in value
-                  for item in value.values():
+                  for key, item in value.items():
+                      normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+                      assert not (
+                          normalized_key.startswith("path")
+                          or normalized_key.endswith("path")
+                          or normalized_key.endswith("paths")
+                      )
                       reject_path_bearing_strings(item)
               elif isinstance(value, list):
                   for item in value:
@@ -1050,49 +1578,231 @@ jobs:
                   assert not value.startswith("/")
                   assert not re.match(r"[A-Za-z]:[\\/]", value)
                   assert not lowered.startswith("file://")
+                  assert "\\" not in value
+                  assert traversal.search(value) is None
+                  assert artifact_extension.search(value) is None
                   assert "local/render-corpus" not in lowered
                   assert "render-corpus-generated" not in lowered
                   assert "payload/" not in lowered
 
-          for aggregate_path in [
-              root / "build.json",
-              root / "authored-print-gate.json",
-              root / "baseline-candidate-a.json",
-              root / "baseline-candidate-b.json",
-              root / "baseline-gate-a.json",
-              root / "baseline-gate-b.json",
-              root / "fidelity-a.json",
-              root / "fidelity-b.json",
-              root / "host-tools.json",
-              root / "repeatability.json",
-              root / "renderer.json",
-              summary_path,
-          ]:
+          baseline_gate_keys = (
+              {
+                  "baseline_sha256",
+                  "campaign",
+                  "candidate_sha256",
+                  "failures",
+                  "passed",
+                  "schema",
+                  "warning_policy",
+              }
+              if baseline_mode == "verify"
+              else {
+                  "baseline_sha256",
+                  "created",
+                  "passed",
+                  "schema",
+              }
+          )
+          aggregate_contracts = {
+              "authored-print-gate.json": (
+                  "rxls.authored-print-parity.v1",
+                  {
+                      "coverage",
+                      "evidence",
+                      "expected",
+                      "failures",
+                      "metrics",
+                      "passed",
+                      "schema",
+                      "thresholds",
+                  },
+              ),
+              "baseline-candidate-a.json": (
+                  "rxls.render-parity-baseline.v2",
+                  {
+                      "campaign",
+                      "classifications",
+                      "cohorts",
+                      "comparable_files",
+                      "configuration_sha256",
+                      "input_files",
+                      "input_set_sha256",
+                      "schema",
+                      "statuses",
+                      "warning_counts",
+                  },
+              ),
+              "baseline-candidate-b.json": (
+                  "rxls.render-parity-baseline.v2",
+                  {
+                      "campaign",
+                      "classifications",
+                      "cohorts",
+                      "comparable_files",
+                      "configuration_sha256",
+                      "input_files",
+                      "input_set_sha256",
+                      "schema",
+                      "statuses",
+                      "warning_counts",
+                  },
+              ),
+              "baseline-gate-a.json": (
+                  "rxls.render-parity-baseline-check.v1",
+                  baseline_gate_keys,
+              ),
+              "baseline-gate-b.json": (
+                  "rxls.render-parity-baseline-check.v1",
+                  baseline_gate_keys,
+              ),
+              "build.json": (
+                  "rxls.render-oracle-container-build.v3",
+                  {
+                      "build_contract_sha256",
+                      "built_image_id",
+                      "built_manifest_digest",
+                      "expected_image_id",
+                      "expected_manifest_digest",
+                      "image_identity_status",
+                      "lock_file_sha256",
+                      "platform",
+                      "reproducibility",
+                      "schema",
+                      "source_commit",
+                      "status",
+                      "wrapper_sha256",
+                  },
+              ),
+              "fidelity-a.json": (
+                  "rxls.render-fidelity-targets.v1",
+                  {
+                      "coverage",
+                      "evidence",
+                      "failures",
+                      "metrics",
+                      "passed",
+                      "schema",
+                      "thresholds",
+                  },
+              ),
+              "fidelity-b.json": (
+                  "rxls.render-fidelity-targets.v1",
+                  {
+                      "coverage",
+                      "evidence",
+                      "failures",
+                      "metrics",
+                      "passed",
+                      "schema",
+                      "thresholds",
+                  },
+              ),
+              "hosted-summary.json": (
+                  "rxls.render-oracle-hosted-campaign.v6",
+                  {
+                      "authored_print",
+                      "baseline_mode",
+                      "baseline_ratcheting",
+                      "campaign",
+                      "container",
+                      "corpus",
+                      "evidence_runs",
+                      "fidelity",
+                      "font_pack",
+                      "head_sha",
+                      "host_tools",
+                      "metrics",
+                      "renderer",
+                      "repeatability",
+                      "schema",
+                      "summary",
+                  },
+              ),
+              "host-tools.json": (
+                  "rxls.render-oracle-host-tools-evidence.v1",
+                  {
+                      "captured_identity_sha256",
+                      "expected_identity_sha256",
+                      "identity",
+                      "identity_status",
+                      "lock_file_sha256",
+                      "schema",
+                      "scope",
+                  },
+              ),
+              "repeatability.json": (
+                  "rxls.libreoffice-render-repeatability.v1",
+                  {
+                      "coverage",
+                      "drift",
+                      "failures",
+                      "identity",
+                      "metric_policy",
+                      "reports",
+                      "schema",
+                      "status",
+                      "thresholds_ppm",
+                  },
+              ),
+              "renderer.json": (None, {"bytes", "sha256"}),
+          }
+          approved_names = list(aggregate_contracts)
+          approved_paths = [root / name for name in approved_names]
+          for aggregate_path in approved_paths:
               if aggregate_path.exists():
-                  reject_path_bearing_strings(load(aggregate_path))
+                  document = load(aggregate_path)
+                  expected_schema, expected_keys = aggregate_contracts[
+                      aggregate_path.name
+                  ]
+                  assert set(document) == expected_keys
+                  if expected_schema is not None:
+                      assert document["schema"] == expected_schema
+                  reject_path_bearing_strings(document)
+          assert (root / "gate-status.txt").read_text(encoding="utf-8").strip() == "0"
           for report_path in report_paths:
               report_path.unlink()
           authored_report_path.unlink()
+          upload_root = pathlib.Path("target/render-oracle-upload")
+          if upload_root.exists():
+              shutil.rmtree(upload_root)
+          upload_root.mkdir(parents=True)
+          for aggregate_path in approved_paths:
+              if aggregate_path.exists():
+                  shutil.copyfile(
+                      aggregate_path,
+                      upload_root / aggregate_path.name,
+                  )
           PY
           test "$(cat target/render-oracle-hosted/gate-status.txt)" = "0"
+      - name: Verify evidence source remained exact and clean
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Upload path-neutral aggregate identities only
-        if: always()
+        if: ${{ success() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: render-oracle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
+          name: render-oracle-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-full' && 'full' || github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-pilot' && 'pilot' || (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.campaign || 'pilot' }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.baseline_mode || 'verify' }}
           path: |
-            target/render-oracle-hosted/authored-print-gate.json
-            target/render-oracle-hosted/baseline-candidate-a.json
-            target/render-oracle-hosted/baseline-candidate-b.json
-            target/render-oracle-hosted/baseline-gate-a.json
-            target/render-oracle-hosted/baseline-gate-b.json
-            target/render-oracle-hosted/build.json
-            target/render-oracle-hosted/fidelity-a.json
-            target/render-oracle-hosted/fidelity-b.json
-            target/render-oracle-hosted/hosted-summary.json
-            target/render-oracle-hosted/host-tools.json
-            target/render-oracle-hosted/repeatability.json
-            target/render-oracle-hosted/renderer.json
+            target/render-oracle-upload/authored-print-gate.json
+            target/render-oracle-upload/baseline-candidate-a.json
+            target/render-oracle-upload/baseline-candidate-b.json
+            target/render-oracle-upload/baseline-gate-a.json
+            target/render-oracle-upload/baseline-gate-b.json
+            target/render-oracle-upload/build.json
+            target/render-oracle-upload/fidelity-a.json
+            target/render-oracle-upload/fidelity-b.json
+            target/render-oracle-upload/hosted-summary.json
+            target/render-oracle-upload/host-tools.json
+            target/render-oracle-upload/repeatability.json
+            target/render-oracle-upload/renderer.json
           compression-level: 9
           if-no-files-found: error
           retention-days: 30

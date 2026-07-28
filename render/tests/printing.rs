@@ -4,12 +4,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rxls::{PageSetup, PrintFidelity, PrintPageOrder, Workbook};
+use rxls::{
+    CfRule, Chart, ChartKind, Color, CondFormat, Format, Image, ImageFmt, PageSetup, PrintFidelity,
+    PrintPageOrder, Series, Sparkline, Table, Workbook,
+};
 use rxls_render::{
-    build_print_document, build_print_page, build_scene, prepare_print_document,
-    render_print_document_pdf, Fixed, GlyphCluster, GlyphPaint, GlyphRunNode, LimitKind,
-    PathCommand, PrintLayoutOverride, PrintLimits, PrintOptions, PrintWarningCode, Rect,
-    RenderError, RenderOptions, RenderRange, RenderSelection, Rgb, Scene, SceneNode, WarningCode,
+    build_print_document, build_print_page, build_scene, build_sheet_print_page,
+    prepare_print_document, prepare_sheet_print_document, render_print_document_pdf, Fixed,
+    GlyphCluster, GlyphPaint, GlyphRunNode, LimitKind, PathCommand, PrintLayoutOverride,
+    PrintLimits, PrintOptions, PrintWarningCode, Rect, RenderError, RenderOptions, RenderRange,
+    RenderSelection, Rgb, Scene, SceneNode, WarningCode,
 };
 use zip::write::SimpleFileOptions;
 
@@ -31,6 +35,101 @@ fn zip_binary_parts(parts: &[(&str, &[u8])]) -> Vec<u8> {
         writer.write_all(body).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+
+fn blank_table_style_workbook(fill: &str) -> Workbook {
+    let styles = format!(
+        r#"<styleSheet><dxfs count="1"><dxf><fill><patternFill patternType="solid"><fgColor rgb="{fill}"/></patternFill></fill></dxf></dxfs><tableStyles count="1"><tableStyle name="CustomBlank" count="1"><tableStyleElement type="wholeTable" dxfId="0"/></tableStyle></tableStyles></styleSheet>"#
+    );
+    Workbook::open(&zip_text_parts(&[
+        (
+            "xl/workbook.xml",
+            r#"<workbook><sheets><sheet name="Identity" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'Identity'!$A$1:$A$2</definedName></definedNames></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+        ),
+        ("xl/styles.xml", &styles),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<worksheet><sheetData/><pageSetup paperSize="1" scale="100"/><tableParts count="1"><tablePart r:id="rIdTable"/></tableParts></worksheet>"#,
+        ),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            r#"<Relationships><Relationship Id="rIdTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/tables/table1.xml",
+            r#"<table id="1" name="T" displayName="T" ref="A1:A2" headerRowCount="0" totalsRowCount="0"><tableColumns count="1"><tableColumn id="1" name="C"/></tableColumns><tableStyleInfo name="CustomBlank" showFirstColumn="0" showLastColumn="0" showRowStripes="0" showColumnStripes="0"/></table>"#,
+        ),
+    ]))
+    .unwrap()
+}
+
+fn blank_table_style_with_offrange_overlays(
+    fill: &str,
+    overlay_font: &str,
+    overlay_count: usize,
+) -> Workbook {
+    let styles = format!(
+        r#"<styleSheet><fonts count="2"><font/><font>{overlay_font}</font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/></cellXfs><dxfs count="1"><dxf><fill><patternFill patternType="solid"><fgColor rgb="{fill}"/></patternFill></fill></dxf></dxfs><tableStyles count="1"><tableStyle name="CustomBlank" count="1"><tableStyleElement type="wholeTable" dxfId="0"/></tableStyle></tableStyles></styleSheet>"#
+    );
+    let mut rows = String::new();
+    for index in 0..overlay_count {
+        let row = index + 1_001;
+        std::fmt::Write::write_fmt(
+            &mut rows,
+            format_args!(r#"<row r="{row}"><c r="Z{row}" s="1"><v>{index}</v></c></row>"#),
+        )
+        .expect("writing XML into a String is infallible");
+    }
+    let worksheet = format!(
+        r#"<worksheet><sheetData>{rows}</sheetData><pageSetup paperSize="1" scale="100"/><tableParts count="1"><tablePart r:id="rIdTable"/></tableParts></worksheet>"#
+    );
+    Workbook::open(&zip_text_parts(&[
+        (
+            "xl/workbook.xml",
+            r#"<workbook><sheets><sheet name="Identity" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'Identity'!$A$1:$A$2</definedName></definedNames></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+        ),
+        ("xl/styles.xml", &styles),
+        ("xl/worksheets/sheet1.xml", &worksheet),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            r#"<Relationships><Relationship Id="rIdTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/tables/table1.xml",
+            r#"<table id="1" name="T" displayName="T" ref="A1:A2" headerRowCount="0" totalsRowCount="0"><tableColumns count="1"><tableColumn id="1" name="C"/></tableColumns><tableStyleInfo name="CustomBlank" showFirstColumn="0" showLastColumn="0" showRowStripes="0" showColumnStripes="0"/></table>"#,
+        ),
+    ]))
+    .unwrap()
+}
+
+fn scene_fills(nodes: &[SceneNode], output: &mut Vec<Rgb>) {
+    for node in nodes {
+        match node {
+            SceneNode::ClipGroup(group) => scene_fills(&group.nodes, output),
+            SceneNode::Rect(rect) => output.extend(rect.fill),
+            _ => {}
+        }
+    }
+}
+
+fn one_pixel_png(rgba: [u8; 4]) -> Vec<u8> {
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&rgba).unwrap();
+    }
+    output
 }
 
 fn xlsb_wide_string(value: &str) -> Vec<u8> {
@@ -221,6 +320,34 @@ fn scene_text(scene: &Scene) -> Vec<&str> {
         .collect()
 }
 
+fn retained_scene_nodes(nodes: &[SceneNode]) -> u64 {
+    nodes
+        .iter()
+        .map(|node| match node {
+            SceneNode::ClipGroup(group) => 1 + retained_scene_nodes(&group.nodes),
+            _ => 1,
+        })
+        .sum()
+}
+
+fn first_cell_bounds(nodes: &[SceneNode]) -> Option<Rect> {
+    nodes.iter().find_map(|node| match node {
+        SceneNode::ClipGroup(group) => first_cell_bounds(&group.nodes),
+        SceneNode::Rect(node) => Some(node.rect),
+        SceneNode::Text(node) => Some(node.bounds),
+        SceneNode::GlyphRun(node) => Some(node.clip_bounds),
+        _ => None,
+    })
+}
+
+fn scene_has_fill(nodes: &[SceneNode], color: Rgb) -> bool {
+    nodes.iter().any(|node| match node {
+        SceneNode::ClipGroup(group) => scene_has_fill(&group.nodes, color),
+        SceneNode::Rect(node) => node.fill == Some(color),
+        _ => false,
+    })
+}
+
 fn paginated_workbook() -> Workbook {
     let mut workbook = Workbook::new();
     let sheet = workbook.add_sheet("Print");
@@ -381,6 +508,509 @@ fn page_map_is_exact_merge_safe_and_repeat_aware() {
 }
 
 #[test]
+fn distant_titles_charge_only_the_disjoint_measurement_union() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Distant titles");
+    sheet.write(0, 0, "corner");
+    sheet.write(10_000, 100, "body");
+    for row in 20_000..21_024 {
+        sheet.write(row, 200, "unrelated");
+    }
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_print_area((10_000, 100, 10_000, 100))
+            .with_repeat_rows(0, 0)
+            .with_repeat_cols(0, 0),
+    );
+    let mut options = PrintOptions {
+        omit_sparse_pages: false,
+        ..PrintOptions::default()
+    };
+    options.render.limits.max_rows = 2;
+    options.render.limits.max_columns = 2;
+    options.render.limits.max_cells = 4;
+    let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+    assert_eq!(prepared.report.pages.len(), 1);
+    assert_eq!(prepared.report.pages[0].repeat_rows, Some((0, 0)));
+    assert_eq!(prepared.report.pages[0].repeat_cols, Some((0, 0)));
+
+    options.render.limits.max_cells = 3;
+    assert_eq!(
+        prepare_print_document(&workbook, 0, &options),
+        Err(RenderError::LimitExceeded {
+            kind: LimitKind::Cells,
+            limit: 3,
+            actual: 4,
+        })
+    );
+}
+
+#[test]
+fn prepared_print_pages_fail_closed_after_selected_source_geometry_changes() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Prepared identity");
+    sheet.write(0, 0, "selected");
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let options = PrintOptions {
+        omit_sparse_pages: false,
+        ..PrintOptions::default()
+    };
+    let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+    assert!(build_print_page(&workbook, &prepared, 0).is_ok());
+
+    // Unrelated cell content is outside the prepared source union and cannot
+    // affect its geometry.
+    workbook.sheets[0].write(50, 50, "outside");
+    assert!(build_print_page(&workbook, &prepared, 0).is_ok());
+
+    workbook.sheets[0].set_col_width(0, 42.0);
+    assert_eq!(
+        build_print_page(&workbook, &prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    let mut used_workbook = Workbook::new();
+    used_workbook.add_sheet("Used identity").write(0, 0, "A1");
+    let used_options = PrintOptions {
+        single_page_sheets: true,
+        ..PrintOptions::default()
+    };
+    let used_prepared = prepare_print_document(&used_workbook, 0, &used_options).unwrap();
+    used_workbook.sheets[0].write(50, 0, "expands-used-range");
+    assert_eq!(
+        build_print_page(&used_workbook, &used_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    fn image_workbook(image_data: Vec<u8>) -> Workbook {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Image identity");
+        sheet.write(0, 0, "image");
+        sheet.add_image(Image::new(image_data, ImageFmt::Png, (0, 0)));
+        sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+        workbook
+    }
+    let first_image = one_pixel_png([1, 2, 3, 255]);
+    let second_image = one_pixel_png([9, 8, 7, 255]);
+    assert_eq!(first_image.len(), second_image.len());
+    assert_ne!(first_image, second_image);
+    let image_source = image_workbook(first_image);
+    let image_prepared = prepare_print_document(&image_source, 0, &options).unwrap();
+    let replacement = image_workbook(second_image);
+    assert_eq!(
+        build_print_page(&replacement, &image_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    let mut styled_table = Workbook::new();
+    let sheet = styled_table.add_sheet("Table identity");
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let table_prepared = prepare_print_document(&styled_table, 0, &options).unwrap();
+    styled_table.sheets[0].add_table(Table::new((0, 0, 0, 0), "IdentityTable", ["Header"]));
+    styled_table.sheets[0]
+        .set_table_header_format("IdentityTable", &Format::new().fill(Color::rgb(12, 34, 56)));
+    assert_eq!(
+        build_print_page(&styled_table, &table_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    for formula in ["$A$2>0", "$A2>0"] {
+        let mut conditional = Workbook::new();
+        let sheet = conditional.add_sheet("Conditional identity");
+        sheet.write(1, 0, 0.0);
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 0, 0),
+            CfRule::expression(formula, Color::rgb(80, 90, 100)),
+        ));
+        sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+        let conditional_prepared =
+            prepare_print_document(&conditional, 0, &PrintOptions::default()).unwrap();
+        conditional.sheets[0].write(1, 0, 1.0);
+        assert_eq!(
+            build_print_page(&conditional, &conditional_prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed",
+            })
+        );
+    }
+
+    for source_column in 0..=2 {
+        let mut chart_source = Workbook::new();
+        let sheet = chart_source.add_sheet("Chart identity");
+        for row in 100..=102 {
+            sheet.write(row, 0, (row - 99) as f64);
+            sheet.write(row, 1, (row - 98) as f64);
+            sheet.write(row, 2, (row - 97) as f64);
+        }
+        sheet.add_chart(
+            Chart::new(ChartKind::Bubble, (0, 0), (5, 3)).add_series(
+                Series::new("$A$101:$A$103")
+                    .with_categories("$B$101:$B$103")
+                    .with_bubble_sizes("$C$101:$C$103"),
+            ),
+        );
+        sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 5, 3)));
+        let chart_prepared =
+            prepare_print_document(&chart_source, 0, &PrintOptions::default()).unwrap();
+        chart_source.sheets[0].write(100, source_column, 99.0);
+        assert_eq!(
+            build_print_page(&chart_source, &chart_prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed",
+            })
+        );
+    }
+
+    let mut sparkline_source = Workbook::new();
+    let sheet = sparkline_source.add_sheet("Sparkline identity");
+    for row in 100..=102 {
+        sheet.write(row, 0, (row - 99) as f64);
+    }
+    sheet.add_sparkline(Sparkline::new((0, 0), "$A$101:$A$103"));
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let sparkline_prepared =
+        prepare_print_document(&sparkline_source, 0, &PrintOptions::default()).unwrap();
+    sparkline_source.sheets[0].write(100, 0, 99.0);
+    assert_eq!(
+        build_print_page(&sparkline_source, &sparkline_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+}
+
+#[test]
+fn private_blank_table_style_sidecar_is_part_of_prepared_print_identity() {
+    let red = blank_table_style_workbook("FFFF0000");
+    let identical_red = blank_table_style_workbook("FFFF0000");
+    let blue = blank_table_style_workbook("FF0000FF");
+    assert!(red.sheets[0].display_cells().next().is_none());
+    assert_eq!(
+        red.sheets[0].resolved_cell_style(0, 0),
+        identical_red.sheets[0].resolved_cell_style(0, 0)
+    );
+    assert_ne!(
+        red.sheets[0].resolved_cell_style(0, 0),
+        blue.sheets[0].resolved_cell_style(0, 0)
+    );
+    let options = PrintOptions {
+        omit_sparse_pages: false,
+        ..PrintOptions::default()
+    };
+
+    let prepared = prepare_print_document(&red, 0, &options).unwrap();
+    assert!(build_print_page(&red, &prepared, 0).is_ok());
+    assert!(
+        build_print_page(&identical_red, &prepared, 0).is_ok(),
+        "independently parsed but structurally identical sidecars must match"
+    );
+    assert_eq!(
+        build_print_page(&blue, &prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    let prepared_sheet = prepare_sheet_print_document(&red.sheets[0], 0, &options).unwrap();
+    assert!(build_sheet_print_page(&identical_red.sheets[0], &prepared_sheet, 0).is_ok());
+    assert_eq!(
+        build_sheet_print_page(&blue.sheets[0], &prepared_sheet, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
+    let red_document = build_print_document(&red, 0, &options).unwrap();
+    let blue_document = build_print_document(&blue, 0, &options).unwrap();
+    let mut red_fills = Vec::new();
+    let mut blue_fills = Vec::new();
+    scene_fills(&red_document.pages[0].scene.nodes, &mut red_fills);
+    scene_fills(&blue_document.pages[0].scene.nodes, &mut blue_fills);
+    assert_eq!(red_fills, [Rgb::new(255, 0, 0), Rgb::new(255, 0, 0)]);
+    assert_eq!(blue_fills, [Rgb::new(0, 0, 255), Rgb::new(0, 0, 255)]);
+
+    let mut merged_red = blank_table_style_workbook("FFFF0000");
+    let mut merged_identical = blank_table_style_workbook("FFFF0000");
+    let mut merged_blue = blank_table_style_workbook("FF0000FF");
+    for workbook in [&mut merged_red, &mut merged_identical, &mut merged_blue] {
+        workbook.sheets[0].merge(0, 0, 0, 1);
+        workbook.sheets[0].set_page_setup(PageSetup::new().with_print_area((0, 1, 0, 1)));
+    }
+    let merged_prepared = prepare_print_document(&merged_red, 0, &PrintOptions::default()).unwrap();
+    assert!(build_print_page(&merged_identical, &merged_prepared, 0).is_ok());
+    assert_eq!(
+        build_print_page(&merged_blue, &merged_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        }),
+        "the off-range merge anchor supplies the selected blank cell's table style"
+    );
+}
+
+#[test]
+fn offrange_private_overlays_do_not_consume_selected_identity_budget() {
+    let bold = blank_table_style_with_offrange_overlays("FFFF0000", "<b/>", 4_096);
+    let italic = blank_table_style_with_offrange_overlays("FFFF0000", "<i/>", 4_096);
+    let options = PrintOptions {
+        omit_sparse_pages: false,
+        render: RenderOptions {
+            limits: rxls_render::RenderLimits {
+                max_rows: 2,
+                max_columns: 1,
+                max_cells: 2,
+                ..rxls_render::RenderLimits::default()
+            },
+            ..RenderOptions::default()
+        },
+        ..PrintOptions::default()
+    };
+    let prepared = prepare_print_document(&bold, 0, &options).unwrap();
+    assert_eq!(prepared.report.source.cells_considered, 2);
+    assert!(
+        build_print_page(&italic, &prepared, 0).is_ok(),
+        "4,096 unrelated private overlays must neither be hashed nor charged"
+    );
+}
+
+#[test]
+fn inherited_and_conditional_blank_style_structures_invalidate_prepared_pages() {
+    enum StyleLayer {
+        Default,
+        Row,
+        Column,
+        Conditional,
+    }
+
+    fn workbook(layer: &StyleLayer, fill: Color) -> Workbook {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Blank styles");
+        let format = Format::new().fill(fill);
+        match layer {
+            StyleLayer::Default => sheet.set_default_format(&format),
+            StyleLayer::Row => sheet.set_row_format(0, &format),
+            StyleLayer::Column => sheet.set_col_format(0, &format),
+            StyleLayer::Conditional => sheet.add_conditional_format(CondFormat::new(
+                (0, 0, 1, 0),
+                CfRule::expression("1=1", fill),
+            )),
+        }
+        sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 1, 0)));
+        workbook
+    }
+
+    for layer in [
+        StyleLayer::Default,
+        StyleLayer::Row,
+        StyleLayer::Column,
+        StyleLayer::Conditional,
+    ] {
+        let red = workbook(&layer, Color::rgb(255, 0, 0));
+        let identical = workbook(&layer, Color::rgb(255, 0, 0));
+        let blue = workbook(&layer, Color::rgb(0, 0, 255));
+        let prepared = prepare_print_document(&red, 0, &PrintOptions::default()).unwrap();
+        assert!(build_print_page(&identical, &prepared, 0).is_ok());
+        assert_eq!(
+            build_print_page(&blue, &prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed",
+            })
+        );
+    }
+}
+
+#[test]
+fn sparse_page_omission_retains_blank_cells_with_inherited_table_paint() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Styled sparse page");
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 200, 0)));
+    sheet.add_table(Table::new(
+        (150, 0, 150, 0),
+        "VisibleBlankTable",
+        ["Header"],
+    ));
+    sheet.set_table_header_format(
+        "VisibleBlankTable",
+        &Format::new().fill(Color::rgb(12, 34, 56)),
+    );
+
+    let document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+    assert!(document.report.logical_pages > 1);
+    assert_eq!(
+        document.report.sparse_pages_omitted,
+        document.report.logical_pages - document.pages.len() as u64
+    );
+    let painted_page = document
+        .pages
+        .iter()
+        .find(|page| page.map.body_range.first_row <= 150 && page.map.body_range.last_row >= 150)
+        .expect("page containing the styled blank table header");
+    assert!(scene_has_fill(
+        &painted_page.scene.nodes,
+        Rgb::new(12, 34, 56)
+    ));
+}
+
+#[test]
+fn sparse_page_omission_retains_conditional_format_only_paint() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Conditional sparse page");
+    sheet.write(0, 1, 1.0);
+    sheet.add_conditional_format(CondFormat::new(
+        (150, 0, 150, 0),
+        CfRule::expression("$B$1>0", Color::rgb(90, 80, 70)),
+    ));
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 200, 0)));
+
+    let document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+    let painted_page = document
+        .pages
+        .iter()
+        .find(|page| page.map.body_range.first_row <= 150 && page.map.body_range.last_row >= 150)
+        .expect("page containing the conditional-format-only paint");
+    assert!(scene_has_fill(
+        &painted_page.scene.nodes,
+        Rgb::new(90, 80, 70)
+    ));
+}
+
+#[test]
+fn off_range_chart_and_sparkline_sources_do_not_consume_selected_dependency_budget() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Scoped dependencies");
+    sheet.write(0, 0, "selected");
+    for row in 100..110 {
+        sheet.write(row, 0, (row - 99) as f64);
+    }
+    sheet.add_chart(
+        Chart::new(ChartKind::Line, (100, 2), (110, 8)).add_series(Series::new("$A$101:$A$110")),
+    );
+    sheet.add_sparkline(Sparkline::new((100, 9), "$A$101:$A$110"));
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let mut options = PrintOptions::default();
+    options.render.limits.max_chart_points = 5;
+
+    let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+    assert_eq!(prepared.report.pages.len(), 1);
+    assert!(build_print_page(&workbook, &prepared, 0).is_ok());
+}
+
+#[test]
+fn placeholder_chart_source_does_not_consume_selected_dependency_budget() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Placeholder dependency");
+    sheet.write(0, 0, "selected");
+    for row in 100..110 {
+        sheet.write(row, 0, (row - 99) as f64);
+    }
+    sheet.add_chart(
+        Chart::new(ChartKind::Line, (0, 0), (1, 1)).add_series(Series::new("$A$101:$A$110")),
+    );
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 1, 1)));
+    let mut options = PrintOptions::default();
+    options.render.limits.max_chart_points = 5;
+
+    let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+    assert_eq!(prepared.report.pages.len(), 1);
+    assert!(build_print_page(&workbook, &prepared, 0).is_ok());
+}
+
+#[test]
+fn overlapping_print_title_ranges_charge_conditional_targets_once() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Overlapping conditional targets");
+    sheet.write(0, 1, 1.0);
+    sheet.add_conditional_format(CondFormat::new(
+        (0, 0, 9, 0),
+        CfRule::expression("$B$1>0", Color::rgb(90, 80, 70)),
+    ));
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_print_area((0, 0, 9, 0))
+            .with_repeat_rows(0, 4),
+    );
+    let mut options = PrintOptions::default();
+    options.render.limits.max_conditional_evaluations = 12;
+
+    let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+    assert!(!prepared.report.pages.is_empty());
+    assert!(build_print_page(&workbook, &prepared, 0).is_ok());
+}
+
+#[test]
+fn empty_paginated_blocks_do_not_consume_scene_node_budget() {
+    let mut workbook = Workbook::new();
+    workbook
+        .add_sheet("Blank page")
+        .set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let mut options = PrintOptions {
+        omit_sparse_pages: false,
+        ..PrintOptions::default()
+    };
+    options.render.gridlines = false;
+    options.limits.max_total_scene_nodes = 0;
+    let document = build_print_document(&workbook, 0, &options).unwrap();
+    assert_eq!(document.pages.len(), 1);
+    assert!(document.pages[0].scene.nodes.is_empty());
+}
+
+#[test]
+fn overflowing_paginated_blocks_are_clipped_to_the_printable_content_rect() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Overflow clip");
+    sheet.write(0, 0, "wide");
+    sheet.set_col_width(0, 1_000.0);
+    sheet.set_row_height(0, 1_000.0);
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_print_area((0, 0, 0, 0))
+            .with_scale(100),
+    );
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(document.report.warnings.iter().any(|warning| {
+        warning.code == PrintWarningCode::PageContentOverflow && warning.occurrences >= 1
+    }));
+    let content = document.report.content_rect;
+    let clips = document.pages[0]
+        .scene
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            SceneNode::ClipGroup(group) => Some(group.clip),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!clips.is_empty());
+    for clip in clips {
+        assert!(clip.x >= content.x);
+        assert!(clip.y >= content.y);
+        assert!(
+            clip.x.raw() + clip.width.raw() <= content.x.raw() + content.width.raw(),
+            "clip extends into a horizontal margin: {clip:?} vs {content:?}"
+        );
+        assert!(
+            clip.y.raw() + clip.height.raw() <= content.y.raw() + content.height.raw(),
+            "clip extends into a vertical margin: {clip:?} vs {content:?}"
+        );
+    }
+}
+
+#[test]
 fn prepared_page_map_builds_exactly_the_requested_original_page() {
     let workbook = paginated_workbook();
     let options = PrintOptions {
@@ -418,14 +1048,14 @@ fn prepared_page_map_builds_exactly_the_requested_original_page() {
     let maximum_page_nodes = document
         .pages
         .iter()
-        .map(|page| page.scene.nodes.len() as u64)
+        .map(|page| retained_scene_nodes(&page.scene.nodes))
         .max()
         .unwrap();
     assert!(
         document
             .pages
             .iter()
-            .map(|page| page.scene.nodes.len() as u64)
+            .map(|page| retained_scene_nodes(&page.scene.nodes))
             .sum::<u64>()
             > maximum_page_nodes
     );
@@ -844,15 +1474,26 @@ fn paper_orientation_margins_scale_and_centering_are_fixed_point() {
     assert_eq!(document.report.content_rect.x.raw(), 96 * 1_024);
     assert_eq!(document.report.content_rect.y.raw(), 72 * 1_024);
     assert_eq!(document.report.scale_permille, 1_250);
-    let first_cell = document.pages[0]
+    let body_clip = document.pages[0]
         .scene
         .nodes
         .iter()
         .find_map(|node| match node {
-            rxls_render::SceneNode::Rect(node) => Some(node.rect),
+            SceneNode::ClipGroup(group) => Some(group.clip),
             _ => None,
         })
-        .unwrap();
+        .expect("paginated body clip");
+    assert!(body_clip.x >= document.report.content_rect.x);
+    assert!(body_clip.y >= document.report.content_rect.y);
+    assert!(
+        body_clip.x.raw() + body_clip.width.raw()
+            <= document.report.content_rect.x.raw() + document.report.content_rect.width.raw()
+    );
+    assert!(
+        body_clip.y.raw() + body_clip.height.raw()
+            <= document.report.content_rect.y.raw() + document.report.content_rect.height.raw()
+    );
+    let first_cell = first_cell_bounds(&document.pages[0].scene.nodes).unwrap();
     assert!(first_cell.x > document.report.content_rect.x);
     assert!(first_cell.y > document.report.content_rect.y);
 }

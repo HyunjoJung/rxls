@@ -19,6 +19,7 @@ use crate::scene::{
 
 const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
 const PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR: i64 = 4;
+const TYPE3_TEXT_SCALE: u16 = 1_000;
 const TYPE3_GLYPHS_PER_SUBSET: usize = 255;
 const MAX_TYPE3_GLYPH_PROGRAMS: u64 = 1_000_000;
 const MAX_CLIP_GROUP_DEPTH: usize = 64;
@@ -52,6 +53,22 @@ struct PdfLink {
 struct PdfGlyphReference {
     subset_index: usize,
     code: u8,
+    origin_x: Fixed,
+    origin_y: Fixed,
+    height: Fixed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PdfGlyphPlacement {
+    origin_x: Fixed,
+    origin_y: Fixed,
+    height: Fixed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfGlyphSemanticSpan {
+    source: std::ops::Range<usize>,
+    glyphs: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -69,6 +86,16 @@ struct PdfGlyphBounds {
     max_y: Fixed,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PdfTransform {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+}
+
 impl PdfGlyphBounds {
     fn include(&mut self, x: Fixed, y: Fixed) {
         self.min_x = Fixed::from_raw(self.min_x.raw().min(x.raw()));
@@ -80,6 +107,58 @@ impl PdfGlyphBounds {
     fn union(&mut self, other: Self) {
         self.include(other.min_x, other.min_y);
         self.include(other.max_x, other.max_y);
+    }
+}
+
+impl PdfTransform {
+    fn rotation(degrees: i16, pivot_x: Fixed, pivot_y: Fixed) -> Self {
+        if degrees.rem_euclid(360) == 0 {
+            return Self {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            };
+        }
+        let radians = f64::from(degrees).to_radians();
+        let cosine = radians.cos();
+        let sine = radians.sin();
+        let x = fixed_as_f64(pivot_x);
+        let y = fixed_as_f64(pivot_y);
+        Self {
+            a: pdf_decimal_value(cosine),
+            b: pdf_decimal_value(sine),
+            c: pdf_decimal_value(-sine),
+            d: pdf_decimal_value(cosine),
+            e: pdf_decimal_value(x - cosine * x + sine * y),
+            f: pdf_decimal_value(y - sine * x - cosine * y),
+        }
+    }
+
+    fn point(self, x: Fixed, y: Fixed) -> [f64; 2] {
+        self.point_f64(fixed_as_f64(x), fixed_as_f64(y))
+    }
+
+    fn point_f64(self, x: f64, y: f64) -> [f64; 2] {
+        [
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        ]
+    }
+
+    fn inverse_point(self, point: [f64; 2]) -> Option<[f64; 2]> {
+        let determinant = self.a * self.d - self.b * self.c;
+        if !determinant.is_finite() || determinant.abs() < f64::EPSILON {
+            return None;
+        }
+        let x = point[0] - self.e;
+        let y = point[1] - self.f;
+        Some([
+            (self.d * x - self.c * y) / determinant,
+            (-self.b * x + self.a * y) / determinant,
+        ])
     }
 }
 
@@ -119,15 +198,36 @@ impl PdfFontRegistry {
             if !node.text.is_empty() {
                 references.push(self.register_glyph(
                     node,
-                    0,
-                    0,
+                    0..0,
                     &node.text,
+                    0..0,
+                    Some(default_glyph_placement(node)?),
                     trace.as_deref_mut(),
                 )?);
             }
             return Ok(references);
         }
-        for cluster in &node.clusters {
+        let cluster_bounds = node
+            .clusters
+            .iter()
+            .map(|cluster| {
+                let start =
+                    usize::try_from(cluster.command_start).map_err(|_| RenderError::Backend {
+                        reason: "invalid_glyph_metadata",
+                    })?;
+                let end =
+                    usize::try_from(cluster.command_end).map_err(|_| RenderError::Backend {
+                        reason: "invalid_glyph_metadata",
+                    })?;
+                let commands = node.commands.get(start..end).ok_or(RenderError::Backend {
+                    reason: "invalid_glyph_metadata",
+                })?;
+                Ok(glyph_bounds(commands))
+            })
+            .collect::<Result<Vec<_>, RenderError>>()?;
+        let fallback_placements = fallback_glyph_placements(node, &cluster_bounds)?;
+        let mut paint_cursor = 0_usize;
+        for (index, cluster) in node.clusters.iter().enumerate() {
             let source_start =
                 usize::try_from(cluster.source_start).map_err(|_| RenderError::Backend {
                     reason: "invalid_glyph_metadata",
@@ -142,11 +242,27 @@ impl PdfFontRegistry {
                 .ok_or(RenderError::Backend {
                     reason: "invalid_glyph_metadata",
                 })?;
+            while node
+                .paints
+                .get(paint_cursor)
+                .is_some_and(|paint| paint.command_end <= cluster.command_start)
+            {
+                paint_cursor += 1;
+            }
+            let mut paint_end = paint_cursor;
+            while node
+                .paints
+                .get(paint_end)
+                .is_some_and(|paint| paint.command_start < cluster.command_end)
+            {
+                paint_end += 1;
+            }
             references.push(self.register_glyph(
                 node,
-                cluster.command_start,
-                cluster.command_end,
+                cluster.command_start..cluster.command_end,
                 source,
+                paint_cursor..paint_end,
+                fallback_placements[index],
                 trace.as_deref_mut(),
             )?);
         }
@@ -156,9 +272,10 @@ impl PdfFontRegistry {
     fn register_glyph(
         &mut self,
         node: &GlyphRunNode,
-        command_start: u64,
-        command_end: u64,
+        command_range: std::ops::Range<u64>,
         source: &str,
+        paint_range: std::ops::Range<usize>,
+        fallback: Option<PdfGlyphPlacement>,
         trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
     ) -> Result<PdfGlyphReference, RenderError> {
         let actual = self
@@ -167,23 +284,73 @@ impl PdfFontRegistry {
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce(LimitKind::BackendCommands, self.glyph_limit, actual)?;
 
-        let start = usize::try_from(command_start).map_err(|_| RenderError::Backend {
+        let start = usize::try_from(command_range.start).map_err(|_| RenderError::Backend {
             reason: "invalid_glyph_metadata",
         })?;
-        let end = usize::try_from(command_end).map_err(|_| RenderError::Backend {
+        let end = usize::try_from(command_range.end).map_err(|_| RenderError::Backend {
             reason: "invalid_glyph_metadata",
         })?;
         let commands = node.commands.get(start..end).ok_or(RenderError::Backend {
             reason: "invalid_glyph_metadata",
         })?;
         let bounds = glyph_bounds(commands);
-        let width = bounds
-            .and_then(|bounds| bounds.max_x.checked_sub(bounds.min_x))
-            .filter(|width| width.raw() > 0)
-            .unwrap_or_else(|| Fixed::from_pixels(1));
+        let (origin_x, origin_y, width, height, local_bounds) = match bounds {
+            Some(bounds) => {
+                let width = bounds
+                    .max_x
+                    .checked_sub(bounds.min_x)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                let height = bounds
+                    .max_y
+                    .checked_sub(bounds.min_y)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                (
+                    bounds.min_x,
+                    bounds.max_y,
+                    width,
+                    height,
+                    Some(PdfGlyphBounds {
+                        min_x: Fixed::ZERO,
+                        min_y: Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE)),
+                        max_x: width,
+                        max_y: Fixed::ZERO,
+                    }),
+                )
+            }
+            None => {
+                let placement = fallback.ok_or(RenderError::Backend {
+                    reason: "invalid_glyph_metadata",
+                })?;
+                (
+                    placement.origin_x,
+                    placement.origin_y,
+                    Fixed::from_pixels(1),
+                    placement.height,
+                    None,
+                )
+            }
+        };
+        let width = if width.raw() > 0 {
+            width
+        } else {
+            Fixed::from_pixels(1)
+        };
+        let height = if height.raw() > 0 {
+            height
+        } else {
+            Fixed::from_pixels(1)
+        };
         let mut content = BoundedContent::new(self.byte_limit);
         content.push(&format!("{} 0 d0\n", format_fixed(width)))?;
-        push_glyph_program_paints(&mut content, node, command_start, command_end, trace)?;
+        push_glyph_program_paints(
+            &mut content,
+            node,
+            command_range,
+            paint_range,
+            (origin_x, origin_y),
+            height,
+            trace,
+        )?;
         let content = content.finish();
         let unicode_hex = utf16be_hex(source);
         let retained = (content.len() as u64)
@@ -204,7 +371,7 @@ impl PdfFontRegistry {
         }
         let subset_index = self.subsets.len() - 1;
         let subset = &mut self.subsets[subset_index];
-        if let Some(bounds) = bounds {
+        if let Some(bounds) = local_bounds {
             match subset.bounds.as_mut() {
                 Some(combined) => combined.union(bounds),
                 None => subset.bounds = Some(bounds),
@@ -221,6 +388,9 @@ impl PdfFontRegistry {
             code: u8::try_from(subset.glyphs.len()).map_err(|_| RenderError::Backend {
                 reason: "pdf_type3_subset_overflow",
             })?,
+            origin_x,
+            origin_y,
+            height,
         })
     }
 }
@@ -482,7 +652,7 @@ fn render_print_document_pdf_impl(
         )?;
     }
     if let Some(id) = notdef_object {
-        write_pdf_stream_object(&mut output, &mut offsets, id, b"1 0 d0\n")?;
+        write_pdf_stream_object(&mut output, &mut offsets, id, b"500 0 d0\n")?;
     }
     for (subset_index, subset) in font_registry.subsets.iter().enumerate() {
         let ids = &subset_object_ids[subset_index];
@@ -669,19 +839,17 @@ fn push_scene_nodes(
                 }
             }
             SceneNode::Text(node) => {
-                *uses_standard_font = true;
-                push_text(content, node)?;
+                let effective_clip = match active_clip {
+                    Some(active_clip) => intersect_clip_rects(active_clip, node.clip_bounds)?,
+                    None => None,
+                };
+                let visible_text = push_text(content, node, effective_clip)?;
+                *uses_standard_font |= visible_text;
                 let mut accepted_link = None;
-                if let Some(target) = node.hyperlink.as_deref() {
+                if let Some(target) = node.hyperlink.as_deref().filter(|_| visible_text) {
                     if is_safe_hyperlink(target) {
                         accepted_link = Some(target);
-                        let link_rect = match active_clip {
-                            Some(active_clip) => {
-                                intersect_clip_rects(active_clip, node.clip_bounds)?
-                            }
-                            None => None,
-                        };
-                        if let Some(link_rect) = link_rect {
+                        if let Some(link_rect) = effective_clip {
                             links.push(pdf_link(link_rect, scene_height, target)?);
                         }
                     }
@@ -694,29 +862,26 @@ fn push_scene_nodes(
                 }
             }
             SceneNode::GlyphRun(node) => {
+                let effective_clip = match active_clip {
+                    Some(active_clip) => intersect_clip_rects(active_clip, node.clip_bounds)?,
+                    None => None,
+                };
                 let mut glyph_trace = trace.is_some().then(|| BackendGlyphTraceBuilder::new(node));
-                push_glyph_run(
+                let visible_glyph = push_glyph_run(
                     content,
                     node,
                     font_registry,
                     subset_fonts,
+                    effective_clip,
                     glyph_trace.as_mut(),
                 )?;
-                if let Some(target) = node.hyperlink.as_deref() {
+                if let Some(target) = node.hyperlink.as_deref().filter(|_| visible_glyph) {
                     if is_safe_hyperlink(target) {
-                        let link_rect = match active_clip {
-                            Some(active_clip) => {
-                                intersect_clip_rects(active_clip, node.clip_bounds)?
-                            }
-                            None => None,
-                        };
-                        if let Some(link_rect) = link_rect {
+                        if let Some(link_rect) = effective_clip {
                             links.push(pdf_link(link_rect, scene_height, target)?);
-                        }
-                        if let Some(trace) = glyph_trace.as_mut() {
-                            trace
-                                .record_link(node.clip_bounds, target)
-                                .map_err(trace_error)?;
+                            if let Some(trace) = glyph_trace.as_mut() {
+                                trace.record_link(link_rect, target).map_err(trace_error)?;
+                            }
                         }
                     }
                 }
@@ -874,8 +1039,9 @@ fn push_glyph_run(
     node: &GlyphRunNode,
     font_registry: &mut PdfFontRegistry,
     subset_fonts: &mut BTreeSet<usize>,
+    effective_clip: Option<Rect>,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
-) -> Result<(), RenderError> {
+) -> Result<bool, RenderError> {
     if !node.metadata_is_valid() {
         return Err(RenderError::Backend {
             reason: "invalid_glyph_metadata",
@@ -890,16 +1056,63 @@ fn push_glyph_run(
     if node.rotation_degrees != 0 {
         push_rotation(content, node.rotation_degrees, node.pivot_x, node.pivot_y)?;
     }
-    if !glyphs.is_empty() {
-        push_actual_text_begin(content, &node.text)?;
-        for glyph in glyphs {
-            subset_fonts.insert(glyph.subset_index);
-            content.push(&format!(
-                "BT /RG{} 1 Tf 1 0 0 1 0 0 Tm <{:02X}> Tj ET\n",
-                glyph.subset_index, glyph.code
-            ))?;
+    let spans = if glyphs.is_empty() {
+        Vec::new()
+    } else {
+        match effective_clip {
+            Some(effective_clip) => glyph_semantic_spans(node, glyphs.len(), effective_clip)?,
+            None => Vec::new(),
         }
-        content.push("EMC\n")?;
+    };
+    let visible_glyph = spans.iter().any(|span| !span.glyphs.is_empty());
+    if !spans.is_empty() {
+        for (span_index, span) in spans.iter().enumerate() {
+            let word_start = span.source.start;
+            let span_end = span.source.end;
+            let word = &node.text[word_start..span_end];
+            let semantic_end = if let Some(next_span) = spans.get(span_index + 1).filter(|_| {
+                word.chars().any(|character| {
+                    matches!(
+                        unicode_bidi::bidi_class(character),
+                        unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                    )
+                })
+            }) {
+                let next_start = next_span.source.start;
+                let gap = node.text.get(span_end..next_start).unwrap_or_default();
+                if !gap.is_empty()
+                    && gap.chars().all(char::is_whitespace)
+                    && glyph_spans_are_on_distinct_lines(span, next_span, &glyphs)
+                {
+                    next_start
+                } else {
+                    span_end
+                }
+            } else {
+                span_end
+            };
+            let semantic_text = &node.text[word_start..semantic_end];
+            let marked = !semantic_text.chars().all(char::is_whitespace);
+            if marked {
+                push_actual_text_begin(content, semantic_text)?;
+            } else {
+                content.push("/Artifact BMC\n")?;
+            }
+            for glyph_index in &span.glyphs {
+                let glyph = glyphs[*glyph_index];
+                subset_fonts.insert(glyph.subset_index);
+                content.push(&format!(
+                    "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                    glyph.subset_index,
+                    TYPE3_TEXT_SCALE,
+                    type3_height_scale(glyph.height),
+                    format_fixed(glyph.origin_x),
+                    format_fixed(glyph.origin_y),
+                    glyph.code
+                ))?;
+            }
+            content.push("EMC\n")?;
+        }
     }
     for decoration in &node.decorations {
         push_rgb_stroke(content, decoration.color)?;
@@ -915,18 +1128,250 @@ fn push_glyph_run(
             trace.record_decoration(decoration).map_err(trace_error)?;
         }
     }
-    content.push("Q\n")
+    content.push("Q\n")?;
+    Ok(visible_glyph)
+}
+
+fn glyph_spans_are_on_distinct_lines(
+    left: &PdfGlyphSemanticSpan,
+    right: &PdfGlyphSemanticSpan,
+    glyphs: &[PdfGlyphReference],
+) -> bool {
+    // Poppler moves neutral trailing whitespace outside an RTL embedding.
+    // Retain it in ActualText only across materially different baselines
+    // (wrapped/styled runs); same-line words rely on geometry so bbox tokens
+    // remain free of leading or trailing spaces. Ink centers are not a valid
+    // baseline proxy because glyphs from one shaped line can have very
+    // different ascender/descender heights. Treat spans as different lines
+    // only when their complete vertical ink intervals are disjoint.
+    let vertical_bounds = |span: &PdfGlyphSemanticSpan| {
+        span.glyphs
+            .iter()
+            .map(|index| {
+                let glyph = glyphs[*index];
+                (
+                    i128::from(glyph.origin_y.raw()) - i128::from(glyph.height.raw()),
+                    i128::from(glyph.origin_y.raw()),
+                )
+            })
+            .reduce(|combined, bounds| (combined.0.min(bounds.0), combined.1.max(bounds.1)))
+    };
+    match (vertical_bounds(left), vertical_bounds(right)) {
+        (Some(left), Some(right)) => {
+            let tolerance = i128::from(FIXED_UNITS_PER_PIXEL);
+            left.1 + tolerance < right.0 || right.1 + tolerance < left.0
+        }
+        _ => false,
+    }
+}
+
+fn glyph_semantic_spans(
+    node: &GlyphRunNode,
+    glyph_count: usize,
+    effective_clip: Rect,
+) -> Result<Vec<PdfGlyphSemanticSpan>, RenderError> {
+    if glyph_count == 0 {
+        return Ok(Vec::new());
+    }
+    let transform = PdfTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
+    let mut visible = vec![false; glyph_count];
+    if node.clusters.is_empty() {
+        visible[0] = glyph_bounds(&node.commands).is_some_and(|bounds| {
+            transformed_bounds_intersect_clip(bounds, effective_clip, transform)
+        });
+    } else {
+        if node.clusters.len() != glyph_count {
+            return Err(RenderError::Backend {
+                reason: "invalid_glyph_metadata",
+            });
+        }
+        for (index, cluster) in node.clusters.iter().enumerate() {
+            let start =
+                usize::try_from(cluster.command_start).map_err(|_| RenderError::Backend {
+                    reason: "invalid_glyph_metadata",
+                })?;
+            let end = usize::try_from(cluster.command_end).map_err(|_| RenderError::Backend {
+                reason: "invalid_glyph_metadata",
+            })?;
+            let commands = node.commands.get(start..end).ok_or(RenderError::Backend {
+                reason: "invalid_glyph_metadata",
+            })?;
+            visible[index] = glyph_bounds(commands).is_some_and(|bounds| {
+                transformed_bounds_intersect_clip(bounds, effective_clip, transform)
+            });
+        }
+    }
+    let visible_glyphs = || -> Vec<usize> {
+        visible
+            .iter()
+            .enumerate()
+            .filter_map(|(index, visible)| visible.then_some(index))
+            .collect::<Vec<_>>()
+    };
+    let whole_node = || {
+        let glyphs = visible_glyphs();
+        if glyphs.is_empty() {
+            Vec::new()
+        } else {
+            vec![PdfGlyphSemanticSpan {
+                source: 0..node.text.len(),
+                glyphs,
+            }]
+        }
+    };
+    if node.clusters.is_empty() {
+        return Ok(if visible[0] { whole_node() } else { Vec::new() });
+    }
+
+    let semantic_ranges = semantic_text_ranges(&node.text);
+    let mut source_order = Vec::with_capacity(node.clusters.len());
+    for (index, cluster) in node.clusters.iter().enumerate() {
+        let start = usize::try_from(cluster.source_start).map_err(|_| RenderError::Backend {
+            reason: "invalid_glyph_metadata",
+        })?;
+        let end = usize::try_from(cluster.source_end).map_err(|_| RenderError::Backend {
+            reason: "invalid_glyph_metadata",
+        })?;
+        source_order.push((start, end, index));
+    }
+    source_order.sort_unstable_by_key(|&(start, end, index)| (start, end, index));
+
+    // Shaped clusters normally form a complete source partition. Mandatory
+    // line terminators are the one intentional exception: shapers do not emit
+    // outlines for them, but their gaps must not collapse a multiline run into
+    // one page-sized ActualText span.
+    let mut covered = 0_usize;
+    for &(start, end, _) in &source_order {
+        if start < covered
+            || end <= start
+            || (start != covered
+                && !is_mandatory_line_terminator_gap(
+                    node.text.get(covered..start).unwrap_or_default(),
+                ))
+        {
+            return Ok(whole_node());
+        }
+        covered = end;
+    }
+    if covered != node.text.len()
+        && !is_mandatory_line_terminator_gap(
+            node.text.get(covered..node.text.len()).unwrap_or_default(),
+        )
+    {
+        return Ok(whole_node());
+    }
+
+    // Map source-sorted clusters to source-sorted semantic ranges with one
+    // forward cursor, then populate each span in visual glyph order. This is
+    // linear after the unavoidable source-order sort for bidirectional runs.
+    let mut spans = Vec::<PdfGlyphSemanticSpan>::with_capacity(semantic_ranges.len());
+    let mut cluster_span = vec![None; node.clusters.len()];
+    let mut semantic_index = 0_usize;
+    let mut previous_visible = None::<(usize, usize)>;
+    for &(start, end, cluster_index) in &source_order {
+        while semantic_ranges
+            .get(semantic_index)
+            .is_some_and(|range| range.end <= start)
+        {
+            semantic_index += 1;
+        }
+        let Some(semantic_range) = semantic_ranges.get(semantic_index) else {
+            return Ok(whole_node());
+        };
+        if start < semantic_range.start || semantic_range.end < end {
+            return Ok(whole_node());
+        }
+        if !visible[cluster_index] {
+            continue;
+        }
+        let continue_span = previous_visible.is_some_and(|(previous_semantic, previous_end)| {
+            previous_semantic == semantic_index && previous_end == start
+        });
+        let span_index = if continue_span {
+            let span_index = spans.len() - 1;
+            spans[span_index].source.end = end;
+            span_index
+        } else {
+            let span_index = spans.len();
+            spans.push(PdfGlyphSemanticSpan {
+                source: start..end,
+                glyphs: Vec::new(),
+            });
+            span_index
+        };
+        cluster_span[cluster_index] = Some(span_index);
+        previous_visible = Some((semantic_index, end));
+    }
+    for (cluster_index, span_index) in cluster_span.into_iter().enumerate() {
+        if let Some(span_index) = span_index {
+            spans[span_index].glyphs.push(cluster_index);
+        }
+    }
+    Ok(spans)
+}
+
+fn is_mandatory_line_terminator_gap(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+            }
+            '\n' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn semantic_text_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut current = None::<(usize, bool)>;
+    for (start, character) in text.char_indices() {
+        let whitespace = character.is_whitespace();
+        if let Some((range_start, range_whitespace)) = current {
+            if whitespace != range_whitespace {
+                ranges.push(range_start..start);
+                current = Some((start, whitespace));
+            }
+        } else {
+            current = Some((start, whitespace));
+        }
+    }
+    if let Some((start, _)) = current {
+        ranges.push(start..text.len());
+    }
+    ranges
 }
 
 fn push_glyph_program_paints(
     content: &mut BoundedContent,
     node: &GlyphRunNode,
-    command_start: u64,
-    command_end: u64,
+    command_range: std::ops::Range<u64>,
+    paint_range: std::ops::Range<usize>,
+    origin: (Fixed, Fixed),
+    height: Fixed,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
 ) -> Result<(), RenderError> {
+    let command_start = command_range.start;
+    let command_end = command_range.end;
+    let (origin_x, origin_y) = origin;
+    if command_start != command_end {
+        content.push(&format!(
+            "q\n1 0 0 {} 0 0 cm\n",
+            type3_height_normalization(height)
+        ))?;
+    }
     let mut covered = command_start;
-    for paint in &node.paints {
+    let paints = node.paints.get(paint_range).ok_or(RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    for paint in paints {
         let start = paint.command_start.max(command_start);
         let end = paint.command_end.min(command_end);
         if start >= end {
@@ -950,7 +1395,7 @@ fn push_glyph_program_paints(
                 reason: "invalid_glyph_metadata",
             })?;
         push_rgb_fill(content, paint.color)?;
-        push_path_with_trace(content, commands, |offset, command| {
+        push_path_with_trace_at(content, commands, origin_x, origin_y, |offset, command| {
             if let Some(trace) = trace.as_deref_mut() {
                 trace
                     .record_command(start as u64 + offset as u64, command, paint.color)
@@ -965,6 +1410,9 @@ fn push_glyph_program_paints(
         return Err(RenderError::Backend {
             reason: "invalid_glyph_metadata",
         });
+    }
+    if command_start != command_end {
+        content.push("Q\n")?;
     }
     Ok(())
 }
@@ -1012,9 +1460,391 @@ fn glyph_bounds(commands: &[PathCommand]) -> Option<PdfGlyphBounds> {
     bounds
 }
 
-fn push_text(content: &mut BoundedContent, node: &TextNode) -> Result<(), RenderError> {
+fn transformed_bounds_intersect_clip(
+    bounds: PdfGlyphBounds,
+    clip: Rect,
+    transform: PdfTransform,
+) -> bool {
+    if clip.width <= Fixed::ZERO || clip.height <= Fixed::ZERO {
+        return false;
+    }
+    let Some(right) = clip.x.checked_add(clip.width) else {
+        return false;
+    };
+    let Some(bottom) = clip.y.checked_add(clip.height) else {
+        return false;
+    };
+    let transformed = [
+        transform.point(bounds.min_x, bounds.min_y),
+        transform.point(bounds.max_x, bounds.min_y),
+        transform.point(bounds.max_x, bounds.max_y),
+        transform.point(bounds.min_x, bounds.max_y),
+    ];
+    let clip = [
+        [fixed_as_f64(clip.x), fixed_as_f64(clip.y)],
+        [fixed_as_f64(right), fixed_as_f64(clip.y)],
+        [fixed_as_f64(right), fixed_as_f64(bottom)],
+        [fixed_as_f64(clip.x), fixed_as_f64(bottom)],
+    ];
+    quadrilaterals_overlap(&transformed, &clip)
+}
+
+fn quadrilaterals_overlap(left: &[[f64; 2]; 4], right: &[[f64; 2]; 4]) -> bool {
+    let normal = |start: [f64; 2], end: [f64; 2]| {
+        let edge = [end[0] - start[0], end[1] - start[1]];
+        [-edge[1], edge[0]]
+    };
+    [
+        normal(left[0], left[1]),
+        normal(left[0], left[3]),
+        normal(right[0], right[1]),
+        normal(right[0], right[3]),
+    ]
+    .into_iter()
+    .filter(|axis| axis[0] != 0.0 || axis[1] != 0.0)
+    .all(|axis| projected_intervals_overlap(left, right, axis))
+}
+
+fn projected_intervals_overlap(
+    left: &[[f64; 2]; 4],
+    right: &[[f64; 2]; 4],
+    axis: [f64; 2],
+) -> bool {
+    let project = |point: [f64; 2]| point[0] * axis[0] + point[1] * axis[1];
+    let (left_min, left_max) = left
+        .iter()
+        .copied()
+        .map(project)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+            (min.min(value), max.max(value))
+        });
+    let (right_min, right_max) = right
+        .iter()
+        .copied()
+        .map(project)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+            (min.min(value), max.max(value))
+        });
+    left_max > right_min && right_max > left_min
+}
+
+fn fallback_glyph_placements(
+    node: &GlyphRunNode,
+    bounds: &[Option<PdfGlyphBounds>],
+) -> Result<Vec<Option<PdfGlyphPlacement>>, RenderError> {
+    let mut next_bounds = vec![None; bounds.len()];
+    let mut next = None;
+    for index in (0..bounds.len()).rev() {
+        next_bounds[index] = next;
+        if let Some(bounds) = bounds[index] {
+            next = Some(bounds);
+        }
+    }
+    let mut placements = Vec::with_capacity(bounds.len());
+    let mut previous = None;
+    for (index, bounds) in bounds.iter().copied().enumerate() {
+        let placement = if bounds.is_none() {
+            Some(fallback_glyph_placement(
+                node,
+                previous,
+                next_bounds[index],
+            )?)
+        } else {
+            None
+        };
+        placements.push(placement);
+        if bounds.is_some() {
+            previous = bounds;
+        }
+    }
+    Ok(placements)
+}
+
+fn fallback_glyph_placement(
+    node: &GlyphRunNode,
+    previous: Option<PdfGlyphBounds>,
+    next: Option<PdfGlyphBounds>,
+) -> Result<PdfGlyphPlacement, RenderError> {
+    if let Some(reference) = previous.or(next) {
+        let origin_x = match (previous, next) {
+            (Some(previous), Some(next)) if previous.max_x <= next.min_x => previous.max_x,
+            (Some(previous), Some(next)) if next.max_x <= previous.min_x => next.max_x,
+            (Some(previous), _) => previous.max_x,
+            (None, Some(next)) => next.min_x,
+            (None, None) => unreachable!(),
+        };
+        let height = reference
+            .max_y
+            .checked_sub(reference.min_y)
+            .filter(|height| height.raw() > 0)
+            .unwrap_or_else(|| Fixed::from_pixels(1));
+        return Ok(PdfGlyphPlacement {
+            origin_x,
+            origin_y: reference.max_y,
+            height,
+        });
+    }
+
+    default_glyph_placement(node)
+}
+
+fn default_glyph_placement(node: &GlyphRunNode) -> Result<PdfGlyphPlacement, RenderError> {
+    let height = Fixed::from_raw(
+        node.clip_bounds
+            .height
+            .raw()
+            .clamp(1, FIXED_UNITS_PER_PIXEL),
+    );
+    Ok(PdfGlyphPlacement {
+        origin_x: node.clip_bounds.x,
+        origin_y: node
+            .clip_bounds
+            .y
+            .checked_add(height)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfTextFragmentKind {
+    AdvanceOnly,
+    Artifact,
+    PaintOnly,
+    Semantic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfTextFragment {
+    source: std::ops::Range<usize>,
+    kind: PdfTextFragmentKind,
+    whitespace: bool,
+    advance_units: i64,
+}
+
+#[derive(Debug)]
+struct PdfTextFragmentPlan {
+    fragments: Vec<PdfTextFragment>,
+    visible_paint: bool,
+}
+
+fn pdf_text_fragment_plan(
+    node: &TextNode,
+    x: Fixed,
+    baseline_y: Fixed,
+    effective_clip: Rect,
+    transform: PdfTransform,
+) -> Result<PdfTextFragmentPlan, RenderError> {
+    let Some(local_clip) = inverse_transformed_clip(effective_clip, transform)? else {
+        return Ok(PdfTextFragmentPlan {
+            fragments: Vec::new(),
+            visible_paint: false,
+        });
+    };
+    let font_size = fixed_as_f64(node.style.size);
+    if font_size == 0.0 {
+        return Ok(PdfTextFragmentPlan {
+            fragments: Vec::new(),
+            visible_paint: false,
+        });
+    }
+    let baseline_y = fixed_as_f64(baseline_y);
+    // Standard Helvetica's fixed FontBBox is [-166 -225 1000 931].
+    // Include its complete vertical ink extent so a descender-only clip still
+    // counts as visible paint and can retain an interactive annotation.
+    let text_top = baseline_y - font_size * 931.0 / 1_000.0;
+    let text_bottom = baseline_y + font_size * 225.0 / 1_000.0;
+    let text_midpoint_y = (text_top + text_bottom) / 2.0;
+    let mut cursor_x = fixed_as_f64(x);
+    let mut fragments = Vec::<PdfTextFragment>::new();
+    let mut visible_paint = false;
+    let mut characters = node.text.char_indices().peekable();
+    while let Some((source_start, character)) = characters.next() {
+        let source_end = characters
+            .peek()
+            .map_or(node.text.len(), |(start, _)| *start);
+        let encoded = pdf_fallback_byte(character);
+        let advance_units = i64::from(helvetica_advance_units(encoded));
+        let next_x = cursor_x + font_size * advance_units as f64 / 1_000.0;
+        let min_x = cursor_x.min(next_x);
+        let max_x = cursor_x.max(next_x);
+        let min_y = text_top.min(text_bottom);
+        let max_y = text_top.max(text_bottom);
+        let advance_box = [
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+        ];
+        let has_ink = pdf_fallback_has_ink(encoded);
+        let paint_visible = has_ink && quadrilaterals_overlap(&advance_box, &local_clip);
+        visible_paint |= paint_visible;
+        let center = transform.point_f64((cursor_x + next_x) / 2.0, text_midpoint_y);
+        let semantic_owner = paint_visible && point_in_half_open_clip(center, effective_clip)?;
+        let whitespace = character.is_whitespace();
+        let kind = if !paint_visible {
+            PdfTextFragmentKind::AdvanceOnly
+        } else if !semantic_owner {
+            PdfTextFragmentKind::PaintOnly
+        } else if !whitespace || !character.is_ascii() {
+            PdfTextFragmentKind::Semantic
+        } else {
+            PdfTextFragmentKind::Artifact
+        };
+        append_pdf_text_fragment(
+            &mut fragments,
+            source_start..source_end,
+            kind,
+            whitespace,
+            advance_units,
+        )?;
+        cursor_x = next_x;
+    }
+    while fragments
+        .last()
+        .is_some_and(|fragment| fragment.kind == PdfTextFragmentKind::AdvanceOnly)
+    {
+        fragments.pop();
+    }
+    Ok(PdfTextFragmentPlan {
+        fragments,
+        visible_paint,
+    })
+}
+
+fn append_pdf_text_fragment(
+    fragments: &mut Vec<PdfTextFragment>,
+    source: std::ops::Range<usize>,
+    kind: PdfTextFragmentKind,
+    whitespace: bool,
+    advance_units: i64,
+) -> Result<(), RenderError> {
+    if let Some(previous) = fragments.last_mut().filter(|previous| {
+        previous.kind == kind
+            && previous.source.end == source.start
+            && (kind == PdfTextFragmentKind::AdvanceOnly || previous.whitespace == whitespace)
+    }) {
+        previous.source.end = source.end;
+        previous.advance_units = previous
+            .advance_units
+            .checked_add(advance_units)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        return Ok(());
+    }
+    fragments.push(PdfTextFragment {
+        source,
+        kind,
+        whitespace,
+        advance_units,
+    });
+    Ok(())
+}
+
+fn inverse_transformed_clip(
+    clip: Rect,
+    transform: PdfTransform,
+) -> Result<Option<[[f64; 2]; 4]>, RenderError> {
+    if clip.width <= Fixed::ZERO || clip.height <= Fixed::ZERO {
+        return Ok(None);
+    }
+    let right = clip
+        .x
+        .checked_add(clip.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bottom = clip
+        .y
+        .checked_add(clip.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let corners = [
+        [fixed_as_f64(clip.x), fixed_as_f64(clip.y)],
+        [fixed_as_f64(right), fixed_as_f64(clip.y)],
+        [fixed_as_f64(right), fixed_as_f64(bottom)],
+        [fixed_as_f64(clip.x), fixed_as_f64(bottom)],
+    ];
+    let Some(first) = transform.inverse_point(corners[0]) else {
+        return Ok(None);
+    };
+    let Some(second) = transform.inverse_point(corners[1]) else {
+        return Ok(None);
+    };
+    let Some(third) = transform.inverse_point(corners[2]) else {
+        return Ok(None);
+    };
+    let Some(fourth) = transform.inverse_point(corners[3]) else {
+        return Ok(None);
+    };
+    Ok(Some([first, second, third, fourth]))
+}
+
+fn point_in_half_open_clip(point: [f64; 2], clip: Rect) -> Result<bool, RenderError> {
+    if clip.width <= Fixed::ZERO || clip.height <= Fixed::ZERO {
+        return Ok(false);
+    }
+    let right = clip
+        .x
+        .checked_add(clip.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bottom = clip
+        .y
+        .checked_add(clip.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(point[0] >= fixed_as_f64(clip.x)
+        && point[0] < fixed_as_f64(right)
+        && point[1] >= fixed_as_f64(clip.y)
+        && point[1] < fixed_as_f64(bottom))
+}
+
+fn pdf_fallback_byte(character: char) -> u8 {
+    match character {
+        '\n' => b'\n',
+        '\r' => b'\r',
+        '\t' => b'\t',
+        character if character.is_ascii() && !character.is_ascii_control() => character as u8,
+        _ => b'?',
+    }
+}
+
+fn pdf_fallback_has_ink(encoded: u8) -> bool {
+    encoded.is_ascii_graphic()
+}
+
+fn helvetica_advance_units(encoded: u8) -> u16 {
+    match encoded {
+        b'\n' | b'\r' | b'\t' => 0,
+        b' ' | b'!' => 278,
+        b'"' => 355,
+        b'#' | b'$' | b'0'..=b'9' | b'?' => 556,
+        b'%' => 889,
+        b'&' | b'A' | b'B' | b'E' | b'K' | b'P' | b'S' | b'V' | b'X' | b'Y' => 667,
+        b'\'' => 191,
+        b'(' | b')' | b'-' | b'`' | b'r' => 333,
+        b'*' => 389,
+        b'+' | b'<' | b'=' | b'>' | b'~' => 584,
+        b',' | b'.' | b'/' | b':' | b';' | b'I' | b'[' | b'\\' | b']' | b'f' | b't' => 278,
+        b'@' => 1_015,
+        b'C' | b'D' | b'H' | b'N' | b'R' | b'U' => 722,
+        b'F' | b'T' | b'Z' => 611,
+        b'G' | b'O' | b'Q' => 778,
+        b'J' | b'c' | b'k' | b's' | b'v' | b'x' | b'y' | b'z' => 500,
+        b'L' | b'_' | b'a' | b'b' | b'd' | b'e' | b'g' | b'h' | b'n' | b'o' | b'p' | b'q'
+        | b'u' => 556,
+        b'M' | b'm' => 833,
+        b'W' => 944,
+        b'^' => 469,
+        b'i' | b'j' | b'l' => 222,
+        b'w' => 722,
+        b'{' | b'}' => 334,
+        b'|' => 260,
+        _ => 556,
+    }
+}
+
+fn push_text(
+    content: &mut BoundedContent,
+    node: &TextNode,
+    effective_clip: Option<Rect>,
+) -> Result<bool, RenderError> {
     let (anchor_x, y) = text_anchor_point(node)?;
-    let approximate = pdf_literal_escaped_ascii(&node.text);
     let approximate_width = Fixed::from_raw(
         node.style
             .size
@@ -1032,25 +1862,71 @@ fn push_text(content: &mut BoundedContent, node: &TextNode) -> Result<(), Render
             .checked_sub(approximate_width)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
+    let transform = PdfTransform::rotation(node.style.rotation_degrees, anchor_x, y);
+    let Some(effective_clip) = effective_clip else {
+        return Ok(false);
+    };
+    let plan = pdf_text_fragment_plan(node, x, y, effective_clip, transform)?;
+    if !plan.visible_paint {
+        return Ok(false);
+    }
     content.push("q\n")?;
     push_clip(content, node.clip_bounds)?;
     if node.style.rotation_degrees != 0 {
         push_rotation(content, node.style.rotation_degrees, anchor_x, y)?;
     }
-    push_actual_text_begin(content, &node.text)?;
     push_rgb_fill(content, node.style.color)?;
     content.push(&format!(
-        "BT /F0 {} Tf 1 0 0 -1 {} {} Tm ({}) Tj ET\nEMC\nQ\n",
+        "BT /F0 {} Tf 1 0 0 -1 {} {} Tm\n",
         format_fixed(node.style.size),
         format_fixed(x),
         format_fixed(y),
-        approximate
-    ))
+    ))?;
+    for fragment in plan.fragments {
+        let text = &node.text[fragment.source];
+        match fragment.kind {
+            PdfTextFragmentKind::AdvanceOnly => {
+                if fragment.advance_units != 0 {
+                    content.push(&format!("[-{}] TJ\n", fragment.advance_units))?;
+                }
+            }
+            PdfTextFragmentKind::Artifact => {
+                content.push("/Artifact BMC\n")?;
+                content.push(&format!("({}) Tj\n", pdf_literal_escaped_ascii(text)))?;
+                content.push("EMC\n")?;
+            }
+            PdfTextFragmentKind::PaintOnly => {
+                push_actual_text_begin(content, "")?;
+                content.push(&format!("({}) Tj\n", pdf_literal_escaped_ascii(text)))?;
+                content.push("EMC\n")?;
+            }
+            PdfTextFragmentKind::Semantic => {
+                push_actual_text_begin(content, text)?;
+                content.push(&format!("({}) Tj\n", pdf_literal_escaped_ascii(text)))?;
+                content.push("EMC\n")?;
+            }
+        }
+    }
+    content.push("ET\nQ\n")?;
+    Ok(true)
 }
 
 fn push_path_with_trace<F>(
     content: &mut BoundedContent,
     commands: &[PathCommand],
+    record: F,
+) -> Result<(), RenderError>
+where
+    F: FnMut(usize, PathCommand) -> Result<(), RenderError>,
+{
+    push_path_with_trace_at(content, commands, Fixed::ZERO, Fixed::ZERO, record)
+}
+
+fn push_path_with_trace_at<F>(
+    content: &mut BoundedContent,
+    commands: &[PathCommand],
+    origin_x: Fixed,
+    origin_y: Fixed,
     mut record: F,
 ) -> Result<(), RenderError>
 where
@@ -1058,7 +1934,8 @@ where
 {
     let mut current = None::<(Fixed, Fixed)>;
     for (index, command) in commands.iter().enumerate() {
-        match *command {
+        let local = translate_path_command(*command, origin_x, origin_y)?;
+        match local {
             PathCommand::MoveTo { x, y } => {
                 content.push(&format!("{} {} m\n", format_fixed(x), format_fixed(y)))?;
                 current = Some((x, y));
@@ -1115,6 +1992,66 @@ where
         record(index, *command)?;
     }
     Ok(())
+}
+
+fn translate_path_command(
+    command: PathCommand,
+    origin_x: Fixed,
+    origin_y: Fixed,
+) -> Result<PathCommand, RenderError> {
+    let x = |value: Fixed| {
+        value
+            .checked_sub(origin_x)
+            .ok_or(RenderError::CoordinateOverflow)
+    };
+    let y = |value: Fixed| {
+        value
+            .checked_sub(origin_y)
+            .ok_or(RenderError::CoordinateOverflow)
+    };
+    Ok(match command {
+        PathCommand::MoveTo {
+            x: command_x,
+            y: command_y,
+        } => PathCommand::MoveTo {
+            x: x(command_x)?,
+            y: y(command_y)?,
+        },
+        PathCommand::LineTo {
+            x: command_x,
+            y: command_y,
+        } => PathCommand::LineTo {
+            x: x(command_x)?,
+            y: y(command_y)?,
+        },
+        PathCommand::QuadraticTo {
+            control_x,
+            control_y,
+            x: command_x,
+            y: command_y,
+        } => PathCommand::QuadraticTo {
+            control_x: x(control_x)?,
+            control_y: y(control_y)?,
+            x: x(command_x)?,
+            y: y(command_y)?,
+        },
+        PathCommand::CubicTo {
+            control1_x,
+            control1_y,
+            control2_x,
+            control2_y,
+            x: command_x,
+            y: command_y,
+        } => PathCommand::CubicTo {
+            control1_x: x(control1_x)?,
+            control1_y: y(control1_y)?,
+            control2_x: x(control2_x)?,
+            control2_y: y(control2_y)?,
+            x: x(command_x)?,
+            y: y(command_y)?,
+        },
+        PathCommand::Close => PathCommand::Close,
+    })
 }
 
 fn trace_error(reason: &'static str) -> RenderError {
@@ -1362,7 +2299,28 @@ fn fixed_to_pdf_points(value: Fixed) -> Result<String, RenderError> {
     Ok(format_rational(raw, denominator))
 }
 
+fn type3_height_scale(height: Fixed) -> String {
+    format_rational_with_precision(
+        i128::from(height.raw()),
+        i128::from(FIXED_UNITS_PER_PIXEL) * i128::from(TYPE3_TEXT_SCALE),
+        16,
+    )
+}
+
+fn type3_height_normalization(height: Fixed) -> String {
+    format_rational_with_precision(
+        i128::from(FIXED_UNITS_PER_PIXEL) * i128::from(TYPE3_TEXT_SCALE),
+        i128::from(height.raw()),
+        16,
+    )
+}
+
 fn format_rational(numerator: i128, denominator: i128) -> String {
+    format_rational_with_precision(numerator, denominator, 8)
+}
+
+fn format_rational_with_precision(numerator: i128, denominator: i128, precision: usize) -> String {
+    debug_assert!(denominator > 0);
     let negative = numerator < 0;
     let magnitude = numerator.unsigned_abs();
     let denominator = denominator as u128;
@@ -1375,7 +2333,7 @@ fn format_rational(numerator: i128, denominator: i128) -> String {
     out.push_str(&whole.to_string());
     if remainder != 0 {
         out.push('.');
-        for _ in 0..8 {
+        for _ in 0..precision {
             remainder *= 10;
             out.push(char::from(b'0' + (remainder / denominator) as u8));
             remainder %= denominator;
@@ -1405,6 +2363,14 @@ fn format_decimal(value: f64) -> String {
         out.pop();
     }
     out
+}
+
+fn pdf_decimal_value(value: f64) -> f64 {
+    if value.abs() < 0.000_000_5 {
+        0.0
+    } else {
+        (value * 1_000_000.0).round() / 1_000_000.0
+    }
 }
 
 fn fixed_as_f64(value: Fixed) -> f64 {
@@ -1473,24 +2439,22 @@ fn type3_font_dictionary(
     }
     let bounds = subset.bounds.unwrap_or(PdfGlyphBounds {
         min_x: Fixed::ZERO,
-        min_y: Fixed::ZERO,
+        min_y: Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE)),
         max_x: Fixed::from_pixels(1),
-        max_y: Fixed::from_pixels(1),
+        max_y: Fixed::ZERO,
     });
-    let mut char_procs = format!("/.notdef {notdef_object} 0 R");
-    let mut differences = String::from("1");
-    let mut widths = String::new();
+    let mut char_procs = format!("/.notdef {notdef_object} 0 R /m {notdef_object} 0 R");
+    let mut differences = String::from("0 /m 1");
+    let mut widths = String::from("500");
     for (index, (glyph, id)) in subset.glyphs.iter().zip(&ids.glyphs).enumerate() {
         let code = index + 1;
         let _ = write!(&mut char_procs, " /g{code:03} {id} 0 R");
         let _ = write!(&mut differences, " /g{code:03}");
-        if !widths.is_empty() {
-            widths.push(' ');
-        }
+        widths.push(' ');
         widths.push_str(&format_fixed(glyph.width));
     }
     Ok(format!(
-        "<< /Type /Font /Subtype /Type3 /Name /RXLSRF+OutlinedSubset{subset_index:04} /FontBBox [{} {} {} {}] /FontMatrix [1 0 0 1 0 0] /CharProcs << {} >> /Encoding << /Type /Encoding /Differences [{}] >> /FirstChar 1 /LastChar {} /Widths [{}] /Resources << >> /ToUnicode {} 0 R >>",
+        "<< /Type /Font /Subtype /Type3 /Name /RXLSRF+OutlinedSubset{subset_index:04} /FontBBox [{} {} {} {}] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << {} >> /Encoding << /Type /Encoding /Differences [{}] >> /FirstChar 0 /LastChar {} /Widths [{}] /FontDescriptor << /Type /FontDescriptor /FontName /RXLSRF+OutlinedSubset{subset_index:04} /Flags 4 /FontBBox [{} {} {} {}] /ItalicAngle 0 /Ascent 1000 /Descent -0.000001 /CapHeight 1000 /StemV 80 >> /Resources << >> /ToUnicode {} 0 R >>",
         format_fixed(bounds.min_x),
         format_fixed(bounds.min_y),
         format_fixed(bounds.max_x),
@@ -1499,6 +2463,10 @@ fn type3_font_dictionary(
         differences,
         subset.glyphs.len(),
         widths,
+        format_fixed(bounds.min_x),
+        format_fixed(bounds.min_y),
+        format_fixed(bounds.max_x),
+        format_fixed(bounds.max_y),
         ids.to_unicode
     ))
 }
@@ -1716,12 +2684,16 @@ impl BoundedPdf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+    use crate::font::synthetic_test_pack;
+    use crate::layout::RenderOptions;
     use crate::png::render_print_page_png_with_trace;
     use crate::print::{build_print_document, PrintOptions};
     use crate::scene::{
         BackendCommandRangeTrace, BackendNodeTrace, ClipGroupNode, GlyphCluster, GlyphPaint,
-        ImageNode, LineNode, PathCommand, PathNode, RectNode,
+        ImageNode, LineNode, PathCommand, PathNode, RectNode, TextStyle,
     };
     use crate::svg::render_scene_svg_with_trace;
 
@@ -1745,6 +2717,585 @@ mod tests {
             },
             PathCommand::Close,
         ]
+    }
+
+    fn sized_rectangle_commands(left: i64, top: i64, width: i64, height: i64) -> Vec<PathCommand> {
+        vec![
+            PathCommand::MoveTo {
+                x: Fixed::from_pixels(left),
+                y: Fixed::from_pixels(top),
+            },
+            PathCommand::LineTo {
+                x: Fixed::from_pixels(left + width),
+                y: Fixed::from_pixels(top),
+            },
+            PathCommand::LineTo {
+                x: Fixed::from_pixels(left + width),
+                y: Fixed::from_pixels(top + height),
+            },
+            PathCommand::LineTo {
+                x: Fixed::from_pixels(left),
+                y: Fixed::from_pixels(top + height),
+            },
+            PathCommand::Close,
+        ]
+    }
+
+    fn positioned_outline(
+        text: &str,
+        left: i64,
+        top: i64,
+        width: i64,
+        height: i64,
+    ) -> GlyphRunNode {
+        let commands = sized_rectangle_commands(left, top, width, height);
+        GlyphRunNode {
+            text: text.to_string(),
+            clip_bounds: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(200),
+                height: Fixed::from_pixels(120),
+            },
+            clusters: vec![GlyphCluster {
+                source_start: 0,
+                source_end: text.len() as u64,
+                command_start: 0,
+                command_end: commands.len() as u64,
+            }],
+            paints: vec![GlyphPaint {
+                command_start: 0,
+                command_end: commands.len() as u64,
+                color: Rgb::BLACK,
+            }],
+            commands,
+            decorations: Vec::new(),
+            color: Rgb::BLACK,
+            rotation_degrees: 0,
+            pivot_x: Fixed::ZERO,
+            pivot_y: Fixed::ZERO,
+            hyperlink: None,
+        }
+    }
+
+    fn positioned_outline_document() -> PrintDocument {
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("bbox").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: "type3-bbox".to_string(),
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+            background: Rgb::WHITE,
+            nodes: vec![
+                SceneNode::GlyphRun(positioned_outline("LEFT", 24, 18, 32, 10)),
+                SceneNode::GlyphRun(positioned_outline("RIGHT", 136, 18, 40, 10)),
+                SceneNode::GlyphRun(positioned_outline("LOWER", 84, 82, 44, 12)),
+            ],
+        };
+        document
+    }
+
+    fn whitespace_outline_document() -> PrintDocument {
+        let text = "ALPHA  BETA";
+        let mut commands = sized_rectangle_commands(24, 18, 32, 10);
+        let second_command_start = commands.len() as u64;
+        commands.extend(sized_rectangle_commands(80, 18, 40, 10));
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("bbox").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: "type3-word-bbox".to_string(),
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: text.to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(200),
+                    height: Fixed::from_pixels(120),
+                },
+                clusters: vec![
+                    GlyphCluster {
+                        source_start: 0,
+                        source_end: 5,
+                        command_start: 0,
+                        command_end: second_command_start,
+                    },
+                    GlyphCluster {
+                        source_start: 5,
+                        source_end: 7,
+                        command_start: second_command_start,
+                        command_end: second_command_start,
+                    },
+                    GlyphCluster {
+                        source_start: 7,
+                        source_end: text.len() as u64,
+                        command_start: second_command_start,
+                        command_end: commands.len() as u64,
+                    },
+                ],
+                paints: vec![GlyphPaint {
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                    color: Rgb::BLACK,
+                }],
+                commands,
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+            })],
+        };
+        document
+    }
+
+    fn multiline_outline_document() -> PrintDocument {
+        let text = "TOP\nBOTTOM";
+        let mut commands = sized_rectangle_commands(24, 18, 32, 10);
+        let second_command_start = commands.len() as u64;
+        commands.extend(sized_rectangle_commands(24, 58, 48, 10));
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("bbox").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: "type3-multiline-bbox".to_string(),
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: text.to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(200),
+                    height: Fixed::from_pixels(120),
+                },
+                clusters: vec![
+                    GlyphCluster {
+                        source_start: 0,
+                        source_end: 3,
+                        command_start: 0,
+                        command_end: second_command_start,
+                    },
+                    GlyphCluster {
+                        source_start: 4,
+                        source_end: text.len() as u64,
+                        command_start: second_command_start,
+                        command_end: commands.len() as u64,
+                    },
+                ],
+                paints: vec![GlyphPaint {
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                    color: Rgb::BLACK,
+                }],
+                commands,
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+            })],
+        };
+        document
+    }
+
+    fn unequal_height_rtl_outline_document() -> PrintDocument {
+        let text = "אב גד";
+        // Both words share the same visual baseline/bottom edge, but their ink
+        // boxes have different heights. Center-based line inference would
+        // incorrectly attach the neutral gap to the first RTL ActualText span.
+        let mut commands = sized_rectangle_commands(80, 18, 24, 8);
+        let second_command_start = commands.len() as u64;
+        commands.extend(sized_rectangle_commands(40, 14, 24, 12));
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("rtl-bbox").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: "type3-rtl-unequal-height".to_string(),
+            width: Fixed::from_pixels(160),
+            height: Fixed::from_pixels(80),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: text.to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(160),
+                    height: Fixed::from_pixels(80),
+                },
+                clusters: vec![
+                    GlyphCluster {
+                        source_start: 0,
+                        source_end: 4,
+                        command_start: 0,
+                        command_end: second_command_start,
+                    },
+                    GlyphCluster {
+                        source_start: 4,
+                        source_end: 5,
+                        command_start: second_command_start,
+                        command_end: second_command_start,
+                    },
+                    GlyphCluster {
+                        source_start: 5,
+                        source_end: text.len() as u64,
+                        command_start: second_command_start,
+                        command_end: commands.len() as u64,
+                    },
+                ],
+                paints: vec![GlyphPaint {
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                    color: Rgb::BLACK,
+                }],
+                commands,
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+            })],
+        };
+        document
+    }
+
+    fn document_with_nodes(title: &str, nodes: Vec<SceneNode>) -> PrintDocument {
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet(title).write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: title.to_string(),
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+            background: Rgb::WHITE,
+            nodes,
+        };
+        document
+    }
+
+    fn document_with_clipped_text_pages(
+        title: &str,
+        text: TextNode,
+        width: i64,
+        height: i64,
+        clips: &[Rect],
+    ) -> PrintDocument {
+        let mut document = document_with_nodes(title, Vec::new());
+        let template = document.pages[0].clone();
+        document.pages = clips
+            .iter()
+            .enumerate()
+            .map(|(index, clip)| {
+                let mut page = template.clone();
+                page.scene = Scene {
+                    title: format!("{title}-{index}"),
+                    width: Fixed::from_pixels(width),
+                    height: Fixed::from_pixels(height),
+                    background: Rgb::WHITE,
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: *clip,
+                        nodes: vec![SceneNode::Text(text.clone())],
+                    })],
+                };
+                page
+            })
+            .collect();
+        document
+    }
+
+    fn font_pack_glyph_run(text: &str) -> GlyphRunNode {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("font-pack-clip");
+        sheet.set_col_width(0, 40.0);
+        sheet.write(0, 0, text);
+        let options = PrintOptions {
+            single_page_sheets: true,
+            render: RenderOptions {
+                gridlines: false,
+                default_font_family: pack.default_family().to_string(),
+                font_pack: Some(pack),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        first_glyph_run(&document.pages[0].scene.nodes)
+            .cloned()
+            .expect("font-pack layout must emit a GlyphRun")
+    }
+
+    fn fallback_text_node(text: &str) -> TextNode {
+        let bounds = Rect {
+            x: Fixed::from_pixels(20),
+            y: Fixed::from_pixels(20),
+            width: Fixed::from_pixels(120),
+            height: Fixed::from_pixels(24),
+        };
+        TextNode {
+            text: text.to_string(),
+            bounds,
+            clip_bounds: bounds,
+            horizontal_padding: Fixed::from_pixels(2),
+            style: crate::scene::TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(14),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 0,
+            },
+            hyperlink: None,
+        }
+    }
+
+    fn poppler_bbox_layout(pdf: &[u8]) -> Option<String> {
+        let available = std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if std::env::var_os("RXLS_REQUIRE_POPPLER").is_some() {
+            assert!(available, "RXLS_REQUIRE_POPPLER requires pdftotext");
+        }
+        if !available {
+            return None;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = poppler_temp_directory("bbox", nonce);
+        std::fs::create_dir(&directory).unwrap();
+        let pdf_path = directory.join("fixture.pdf");
+        std::fs::write(&pdf_path, pdf).unwrap();
+        let output = std::process::Command::new("pdftotext")
+            .args(["-bbox-layout", "-enc", "UTF-8"])
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8(output.stdout).unwrap())
+    }
+
+    fn poppler_text(pdf: &[u8]) -> Option<String> {
+        let available = std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if std::env::var_os("RXLS_REQUIRE_POPPLER").is_some() {
+            assert!(available, "RXLS_REQUIRE_POPPLER requires pdftotext");
+        }
+        if !available {
+            return None;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = poppler_temp_directory("text", nonce);
+        std::fs::create_dir(&directory).unwrap();
+        let pdf_path = directory.join("fixture.pdf");
+        std::fs::write(&pdf_path, pdf).unwrap();
+        let output = std::process::Command::new("pdftotext")
+            .args(["-layout", "-enc", "UTF-8"])
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8(output.stdout).unwrap())
+    }
+
+    fn poppler_text_pages(pdf: &[u8]) -> Option<Vec<String>> {
+        let text = poppler_text(pdf)?;
+        let mut pages = text
+            .split('\u{000C}')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if pages.last().is_some_and(String::is_empty) {
+            pages.pop();
+        }
+        Some(pages)
+    }
+
+    fn poppler_temp_directory(kind: &str, nonce: u128) -> std::path::PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "rxls-type3-{kind}-{}-{nonce}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn poppler_word_bbox(xml: &str, word: &str) -> [f64; 4] {
+        let end_marker = format!(">{word}</word>");
+        let word_end = xml
+            .find(&end_marker)
+            .unwrap_or_else(|| panic!("word {word:?} absent from Poppler bbox XML"));
+        let tag_start = xml[..word_end]
+            .rfind("<word ")
+            .expect("word start tag absent");
+        let tag = &xml[tag_start..word_end];
+        let attribute = |name: &str| {
+            let marker = format!("{name}=\"");
+            let start = tag
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{name} absent from {tag:?}"))
+                + marker.len();
+            let end = tag[start..]
+                .find('"')
+                .map(|offset| start + offset)
+                .expect("bbox attribute is unterminated");
+            tag[start..end].parse::<f64>().unwrap()
+        };
+        [
+            attribute("xMin"),
+            attribute("yMin"),
+            attribute("xMax"),
+            attribute("yMax"),
+        ]
+    }
+
+    fn poppler_words(xml: &str) -> Vec<&str> {
+        let mut words = Vec::new();
+        let mut remainder = xml;
+        while let Some(tag_offset) = remainder.find("<word ") {
+            remainder = &remainder[tag_offset..];
+            let Some(text_offset) = remainder.find('>') else {
+                break;
+            };
+            remainder = &remainder[text_offset + 1..];
+            let Some(end_offset) = remainder.find("</word>") else {
+                break;
+            };
+            words.push(&remainder[..end_offset]);
+            remainder = &remainder[end_offset + "</word>".len()..];
+        }
+        words
+    }
+
+    #[allow(clippy::collapsible_match)]
+    fn replace_first_text_with_test_outline(nodes: &mut [SceneNode]) -> bool {
+        for node in nodes {
+            match node {
+                SceneNode::ClipGroup(group) => {
+                    if replace_first_text_with_test_outline(&mut group.nodes) {
+                        return true;
+                    }
+                }
+                SceneNode::Text(text) => {
+                    *node = SceneNode::GlyphRun(GlyphRunNode {
+                        text: text.text.clone(),
+                        clip_bounds: Rect {
+                            x: Fixed::ZERO,
+                            y: Fixed::ZERO,
+                            width: Fixed::from_pixels(200),
+                            height: Fixed::from_pixels(120),
+                        },
+                        commands: vec![
+                            PathCommand::MoveTo {
+                                x: Fixed::from_pixels(70),
+                                y: Fixed::from_pixels(75),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(75),
+                                y: Fixed::from_pixels(75),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(75),
+                                y: Fixed::from_pixels(85),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(70),
+                                y: Fixed::from_pixels(85),
+                            },
+                            PathCommand::Close,
+                            PathCommand::MoveTo {
+                                x: Fixed::from_pixels(78),
+                                y: Fixed::from_pixels(75),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(83),
+                                y: Fixed::from_pixels(75),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(83),
+                                y: Fixed::from_pixels(85),
+                            },
+                            PathCommand::LineTo {
+                                x: Fixed::from_pixels(78),
+                                y: Fixed::from_pixels(85),
+                            },
+                            PathCommand::Close,
+                        ],
+                        clusters: vec![
+                            GlyphCluster {
+                                source_start: 0,
+                                source_end: 3,
+                                command_start: 0,
+                                command_end: 5,
+                            },
+                            GlyphCluster {
+                                source_start: 3,
+                                source_end: 4,
+                                command_start: 5,
+                                command_end: 10,
+                            },
+                        ],
+                        paints: vec![GlyphPaint {
+                            command_start: 0,
+                            command_end: 10,
+                            color: Rgb::new(12, 34, 56),
+                        }],
+                        decorations: Vec::new(),
+                        color: text.style.color,
+                        rotation_degrees: text.style.rotation_degrees,
+                        pivot_x: text.bounds.x,
+                        pivot_y: text.bounds.y,
+                        hyperlink: Some("javascript:alert(1)".to_string()),
+                    });
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn first_glyph_run(nodes: &[SceneNode]) -> Option<&GlyphRunNode> {
+        nodes.iter().find_map(|node| match node {
+            SceneNode::ClipGroup(group) => first_glyph_run(&group.nodes),
+            SceneNode::GlyphRun(node) => Some(node),
+            _ => None,
+        })
     }
 
     fn backend_equivalence_scene() -> Scene {
@@ -2056,6 +3607,133 @@ mod tests {
     }
 
     #[test]
+    fn fully_clipped_text_and_glyph_runs_do_not_emit_link_annotations() {
+        let outer_clip = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(20),
+            height: Fixed::from_pixels(20),
+        };
+        let full_page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+        };
+        let mut glyph = positioned_outline("HIDDEN", 100, 90, 30, 12);
+        glyph.hyperlink = Some("https://example.com/hidden-glyph".to_string());
+        let hidden_text = TextNode {
+            text: "HIDDEN".to_string(),
+            bounds: Rect {
+                x: Fixed::from_pixels(100),
+                y: Fixed::from_pixels(90),
+                width: Fixed::from_pixels(40),
+                height: Fixed::from_pixels(20),
+            },
+            clip_bounds: full_page,
+            horizontal_padding: Fixed::ZERO,
+            style: TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(12),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 0,
+            },
+            hyperlink: Some("https://example.com/hidden-text".to_string()),
+        };
+        let nested_disjoint = ClipGroupNode {
+            clip: Rect {
+                x: Fixed::from_pixels(80),
+                y: Fixed::from_pixels(80),
+                width: Fixed::from_pixels(20),
+                height: Fixed::from_pixels(20),
+            },
+            nodes: vec![SceneNode::Text(hidden_text.clone())],
+        };
+        let mut document = document_with_nodes(
+            "clipped-links",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: outer_clip,
+                nodes: vec![
+                    SceneNode::Text(hidden_text),
+                    SceneNode::GlyphRun(glyph),
+                    SceneNode::ClipGroup(nested_disjoint),
+                ],
+            })],
+        );
+        document.pages[0].scene.width = full_page.width;
+        document.pages[0].scene.height = full_page.height;
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains("/Subtype /Link"), "{source}");
+        assert!(!source.contains(&hex_bytes(b"https://example.com/hidden-text")));
+        assert!(!source.contains(&hex_bytes(b"https://example.com/hidden-glyph")));
+    }
+
+    #[test]
+    fn partially_clipped_rotated_text_and_glyph_links_remain_visible() {
+        let clip = Rect {
+            x: Fixed::from_pixels(20),
+            y: Fixed::from_pixels(20),
+            width: Fixed::from_pixels(40),
+            height: Fixed::from_pixels(40),
+        };
+        let mut glyph = positioned_outline("GLYPH", 25, 30, 24, 12);
+        glyph.rotation_degrees = 35;
+        glyph.pivot_x = Fixed::from_pixels(37);
+        glyph.pivot_y = Fixed::from_pixels(36);
+        glyph.hyperlink = Some("https://example.com/visible-glyph".to_string());
+        let text = TextNode {
+            text: "TEXT".to_string(),
+            bounds: Rect {
+                x: Fixed::from_pixels(16),
+                y: Fixed::from_pixels(16),
+                width: Fixed::from_pixels(48),
+                height: Fixed::from_pixels(24),
+            },
+            clip_bounds: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(200),
+                height: Fixed::from_pixels(120),
+            },
+            horizontal_padding: Fixed::ZERO,
+            style: TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(14),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 25,
+            },
+            hyperlink: Some("https://example.com/visible-text".to_string()),
+        };
+        let document = document_with_nodes(
+            "visible-clipped-links",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip,
+                nodes: vec![SceneNode::Text(text), SceneNode::GlyphRun(glyph)],
+            })],
+        );
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(source.matches("/Subtype /Link").count(), 2, "{source}");
+        assert!(source.contains(&hex_bytes(b"https://example.com/visible-text")));
+        assert!(source.contains(&hex_bytes(b"https://example.com/visible-glyph")));
+    }
+
+    #[test]
     fn rational_points_are_exact_and_path_free() {
         assert_eq!(fixed_to_pdf_points(Fixed::from_pixels(96)).unwrap(), "72");
         assert_eq!(fixed_to_pdf_points(Fixed::from_pixels(1)).unwrap(), "0.75");
@@ -2070,89 +3748,152 @@ mod tests {
     }
 
     #[test]
+    fn semantic_text_ranges_preserve_unicode_words_and_whitespace() {
+        let text = "alpha \t 한글  אב";
+        let ranges = semantic_text_ranges(text);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["alpha", " \t ", "한글", "  ", "אב"]
+        );
+    }
+
+    #[test]
+    fn mandatory_line_terminator_gaps_are_narrowly_allowlisted() {
+        for terminator in [
+            "\n", "\r", "\r\n", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}",
+        ] {
+            assert!(is_mandatory_line_terminator_gap(terminator));
+        }
+        for unsupported in ["", " ", "\t", "\n ", "x\n"] {
+            assert!(!is_mandatory_line_terminator_gap(unsupported));
+        }
+    }
+
+    #[test]
+    fn rotated_glyph_visibility_uses_the_serialized_pdf_transform() {
+        let bounds = PdfGlyphBounds {
+            min_x: Fixed::from_pixels(10),
+            min_y: Fixed::from_pixels(10),
+            max_x: Fixed::from_pixels(30),
+            max_y: Fixed::from_pixels(20),
+        };
+        let transform = PdfTransform::rotation(90, Fixed::from_pixels(50), Fixed::from_pixels(50));
+        assert!(transformed_bounds_intersect_clip(
+            bounds,
+            Rect {
+                x: Fixed::from_pixels(82),
+                y: Fixed::from_pixels(12),
+                width: Fixed::from_pixels(6),
+                height: Fixed::from_pixels(16),
+            },
+            transform,
+        ));
+        assert!(!transformed_bounds_intersect_clip(
+            bounds,
+            Rect {
+                x: Fixed::from_pixels(12),
+                y: Fixed::from_pixels(12),
+                width: Fixed::from_pixels(6),
+                height: Fixed::from_pixels(6),
+            },
+            transform,
+        ));
+    }
+
+    #[test]
+    fn glyph_semantic_spans_restore_logical_bidi_order_without_splitting_cjk() {
+        let mut commands = sized_rectangle_commands(100, 10, 12, 10);
+        commands.extend(sized_rectangle_commands(70, 10, 12, 10));
+        commands.extend(sized_rectangle_commands(10, 10, 24, 10));
+        let node = GlyphRunNode {
+            text: "漢字 אב גד".to_string(),
+            clip_bounds: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(200),
+                height: Fixed::from_pixels(120),
+            },
+            clusters: vec![
+                GlyphCluster {
+                    source_start: 12,
+                    source_end: 16,
+                    command_start: 0,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 11,
+                    source_end: 12,
+                    command_start: 5,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 7,
+                    source_end: 11,
+                    command_start: 5,
+                    command_end: 10,
+                },
+                GlyphCluster {
+                    source_start: 6,
+                    source_end: 7,
+                    command_start: 10,
+                    command_end: 10,
+                },
+                GlyphCluster {
+                    source_start: 0,
+                    source_end: 6,
+                    command_start: 10,
+                    command_end: 15,
+                },
+            ],
+            paints: vec![GlyphPaint {
+                command_start: 0,
+                command_end: 15,
+                color: Rgb::BLACK,
+            }],
+            commands,
+            decorations: Vec::new(),
+            color: Rgb::BLACK,
+            rotation_degrees: 0,
+            pivot_x: Fixed::ZERO,
+            pivot_y: Fixed::ZERO,
+            hyperlink: None,
+        };
+        assert!(node.metadata_is_valid());
+        let spans = glyph_semantic_spans(&node, node.clusters.len(), node.clip_bounds).unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &node.text[span.source.clone()])
+                .collect::<Vec<_>>(),
+            ["漢字", "אב", "גד"]
+        );
+    }
+
+    #[test]
     fn outlined_text_uses_real_bounded_type3_programs_and_cluster_maps() {
         let mut workbook = rxls::Workbook::new();
         workbook.add_sheet("Subset").write(0, 0, "한A");
         let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
-        for node in &mut document.pages[0].scene.nodes {
-            let SceneNode::Text(text) = node else {
-                continue;
-            };
-            *node = SceneNode::GlyphRun(GlyphRunNode {
-                text: text.text.clone(),
-                clip_bounds: text.clip_bounds,
-                commands: vec![
-                    PathCommand::MoveTo {
-                        x: Fixed::from_pixels(10),
-                        y: Fixed::from_pixels(10),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(15),
-                        y: Fixed::from_pixels(10),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(15),
-                        y: Fixed::from_pixels(20),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(10),
-                        y: Fixed::from_pixels(20),
-                    },
-                    PathCommand::Close,
-                    PathCommand::MoveTo {
-                        x: Fixed::from_pixels(18),
-                        y: Fixed::from_pixels(10),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(23),
-                        y: Fixed::from_pixels(10),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(23),
-                        y: Fixed::from_pixels(20),
-                    },
-                    PathCommand::LineTo {
-                        x: Fixed::from_pixels(18),
-                        y: Fixed::from_pixels(20),
-                    },
-                    PathCommand::Close,
-                ],
-                clusters: vec![
-                    crate::scene::GlyphCluster {
-                        source_start: 0,
-                        source_end: 3,
-                        command_start: 0,
-                        command_end: 5,
-                    },
-                    crate::scene::GlyphCluster {
-                        source_start: 3,
-                        source_end: 4,
-                        command_start: 5,
-                        command_end: 10,
-                    },
-                ],
-                paints: vec![crate::scene::GlyphPaint {
-                    command_start: 0,
-                    command_end: 10,
-                    color: Rgb::new(12, 34, 56),
-                }],
-                decorations: Vec::new(),
-                color: text.style.color,
-                rotation_degrees: text.style.rotation_degrees,
-                pivot_x: text.bounds.x,
-                pivot_y: text.bounds.y,
-                hyperlink: Some("javascript:alert(1)".to_string()),
-            });
-        }
+        assert!(replace_first_text_with_test_outline(
+            &mut document.pages[0].scene.nodes
+        ));
         let pdf = render_print_document_pdf(&document).unwrap();
         assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
         let source = String::from_utf8_lossy(&pdf);
         assert!(source.contains("/Subtype /Type3"));
         assert!(source.contains("/Name /RXLSRF+OutlinedSubset0000"));
         assert!(source.contains("/CharProcs"));
-        assert!(source.contains("/Widths [5 5]"));
+        assert!(source.contains("/Widths [500 5 5]"));
         assert!(source.matches("5 0 d0").count() >= 2);
-        assert!(source.contains("10 10 m"));
+        assert!(source.contains("/FontDescriptor"));
+        assert!(source.contains("/Ascent 1000 /Descent -0.000001"));
+        assert!(source.contains("1 0 0 100 0 0 cm"));
+        assert!(source.contains("0 -10 m"));
+        assert!(source.contains("1 0 0 0.01 70 85 Tm <01> Tj"));
+        assert!(source.contains("1 0 0 0.01 78 85 Tm <02> Tj"));
         assert!(source.contains("0.047059 0.133333 0.219608 rg"));
         assert!(source.contains("/ToUnicode"));
         assert!(source.contains("<01> <D55C>"));
@@ -2163,14 +3904,8 @@ mod tests {
         assert!(!source.contains("/Helvetica"));
         assert!(!source.contains("/Subtype /Link"));
 
-        let glyph_node = document.pages[0]
-            .scene
-            .nodes
-            .iter()
-            .find_map(|node| match node {
-                SceneNode::GlyphRun(node) => Some(node.clone()),
-                _ => None,
-            })
+        let glyph_node = first_glyph_run(&document.pages[0].scene.nodes)
+            .cloned()
             .unwrap();
         let mut registry = PdfFontRegistry::new(u64::MAX, u64::MAX);
         registry.glyph_count = MAX_TYPE3_GLYPH_PROGRAMS;
@@ -2254,5 +3989,676 @@ mod tests {
         assert_eq!(references[254].code, 255);
         assert_eq!(references[255].subset_index, 1);
         assert_eq!(references[255].code, 1);
+    }
+
+    #[test]
+    fn type3_poppler_bbox_layout_is_page_relative() {
+        let document = positioned_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("1 0 0 0.01 24 28 Tm <01> Tj"));
+        assert!(source.contains("1 0 0 0.01 136 28 Tm <02> Tj"));
+        assert!(source.contains("1 0 0 0.012 84 94 Tm <03> Tj"));
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_word_bbox(&xml, "LEFT"), [18.0, 13.5, 42.0, 21.0]);
+            assert_eq!(poppler_word_bbox(&xml, "RIGHT"), [102.0, 13.5, 132.0, 21.0]);
+            assert_eq!(poppler_word_bbox(&xml, "LOWER"), [63.0, 61.5, 96.0, 70.5]);
+        }
+    }
+
+    #[test]
+    fn type3_poppler_bbox_layout_splits_whitespace_delimited_actual_text() {
+        let document = whitespace_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/ActualText <FEFF0041004C005000480041>"));
+        assert!(!source.contains("/ActualText <FEFF00200020>"));
+        assert!(source.contains("/ActualText <FEFF0042004500540041>"));
+        assert!(!source.contains("/ActualText <FEFF0041004C005000480041002000200042004500540041>"));
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_word_bbox(&xml, "ALPHA"), [18.0, 13.5, 42.0, 21.0]);
+            assert_eq!(poppler_word_bbox(&xml, "BETA"), [60.0, 13.5, 90.0, 21.0]);
+            assert!(!xml.contains(">ALPHA  BETA</word>"));
+        }
+    }
+
+    #[test]
+    fn type3_poppler_multiline_actual_text_tolerates_unshaped_line_breaks() {
+        let document = multiline_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/ActualText <FEFF0054004F0050>"));
+        assert!(source.contains("/ActualText <FEFF0042004F00540054004F004D>"));
+        assert!(!source.contains("/ActualText <FEFF0054004F0050000A0042004F00540054004F004D>"));
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["TOP", "BOTTOM"]);
+            let top = poppler_word_bbox(&xml, "TOP");
+            let bottom = poppler_word_bbox(&xml, "BOTTOM");
+            assert!(top[1] < bottom[1], "{top:?} {bottom:?}");
+            assert!(top[3] < bottom[3], "{top:?} {bottom:?}");
+        }
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("TOP"), "{text:?}");
+            assert!(text.contains("BOTTOM"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn type3_rtl_actual_text_does_not_infer_lines_from_unequal_ink_heights() {
+        let document = unequal_height_rtl_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/ActualText <FEFF05D005D1>"));
+        assert!(!source.contains("/ActualText <FEFF05D005D10020>"));
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["אב", "גד"]);
+            assert!(!xml.contains(">אב </word>"), "{xml}");
+        }
+    }
+
+    #[test]
+    fn nested_partial_clip_retains_font_pack_glyph_semantics() {
+        let glyph = font_pack_glyph_run("FONTCLIP");
+        let bounds = glyph_bounds(&glyph.commands).expect("font-pack glyph bounds");
+        let middle_y =
+            Fixed::from_raw(bounds.min_y.raw() + (bounds.max_y.raw() - bounds.min_y.raw()) / 2);
+        let partial_clip = Rect {
+            x: bounds.min_x,
+            y: middle_y,
+            width: bounds.max_x.checked_sub(bounds.min_x).unwrap(),
+            height: bounds.max_y.checked_sub(middle_y).unwrap(),
+        };
+        let document = document_with_nodes(
+            "font-pack-partial-clip",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(200),
+                    height: Fixed::from_pixels(120),
+                },
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: partial_clip,
+                    nodes: vec![SceneNode::GlyphRun(glyph)],
+                })],
+            })],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("FONTCLIP"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["FONTCLIP"]);
+        }
+    }
+
+    #[test]
+    fn nested_disjoint_clip_suppresses_font_pack_glyph_semantics() {
+        let glyph = font_pack_glyph_run("HIDDENFONT");
+        let bounds = glyph_bounds(&glyph.commands).expect("font-pack glyph bounds");
+        let hidden_x = bounds
+            .max_x
+            .checked_add(Fixed::from_pixels(20))
+            .expect("hidden clip x");
+        let hidden_right = hidden_x
+            .checked_add(Fixed::from_pixels(4))
+            .expect("hidden clip right");
+        let node_right = glyph
+            .clip_bounds
+            .x
+            .checked_add(glyph.clip_bounds.width)
+            .expect("glyph clip right");
+        assert!(hidden_right < node_right);
+        assert!(hidden_right < Fixed::from_pixels(200));
+        let document = document_with_nodes(
+            "font-pack-disjoint-clip",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(200),
+                    height: Fixed::from_pixels(120),
+                },
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: Rect {
+                        x: hidden_x,
+                        y: bounds.min_y,
+                        width: Fixed::from_pixels(4),
+                        height: bounds.max_y.checked_sub(bounds.min_y).unwrap(),
+                    },
+                    nodes: vec![SceneNode::GlyphRun(glyph)],
+                })],
+            })],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains("/ActualText"));
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(!text.contains("HIDDENFONT"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert!(poppler_words(&xml).is_empty(), "{xml}");
+        }
+    }
+
+    #[test]
+    fn nested_partial_and_disjoint_clips_bound_fallback_text_semantics() {
+        let visible = fallback_text_node("FALLBACK");
+        let hidden = fallback_text_node("HIDDENTEXT");
+        let document = document_with_nodes(
+            "fallback-nested-clips",
+            vec![
+                SceneNode::ClipGroup(ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::ZERO,
+                        y: Fixed::ZERO,
+                        width: Fixed::from_pixels(200),
+                        height: Fixed::from_pixels(120),
+                    },
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: Rect {
+                            x: Fixed::from_pixels(24),
+                            y: Fixed::from_pixels(20),
+                            width: Fixed::from_pixels(24),
+                            height: Fixed::from_pixels(12),
+                        },
+                        nodes: vec![SceneNode::Text(visible)],
+                    })],
+                }),
+                SceneNode::ClipGroup(ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::from_pixels(130),
+                        y: Fixed::from_pixels(20),
+                        width: Fixed::from_pixels(8),
+                        height: Fixed::from_pixels(12),
+                    },
+                    nodes: vec![SceneNode::Text(hidden)],
+                }),
+            ],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(
+            source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex("FAL")))
+                .count(),
+            1
+        );
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("FALLBACK"))));
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("FAL"), "{text:?}");
+            assert!(!text.contains("FALLBACK"), "{text:?}");
+            assert!(!text.contains("HIDDENTEXT"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["FAL"]);
+        }
+    }
+
+    #[test]
+    fn rotated_glyph_actual_text_follows_transformed_clip_visibility() {
+        let mut visible = positioned_outline("ROTATED", 10, 10, 20, 10);
+        visible.rotation_degrees = 90;
+        visible.pivot_x = Fixed::from_pixels(50);
+        visible.pivot_y = Fixed::from_pixels(50);
+        let mut hidden = positioned_outline("HIDDEN", 10, 10, 20, 10);
+        hidden.rotation_degrees = 90;
+        hidden.pivot_x = Fixed::from_pixels(50);
+        hidden.pivot_y = Fixed::from_pixels(50);
+        let document = document_with_nodes(
+            "rotated-glyph-clips",
+            vec![
+                SceneNode::ClipGroup(ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::from_pixels(82),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(6),
+                        height: Fixed::from_pixels(16),
+                    },
+                    nodes: vec![SceneNode::GlyphRun(visible)],
+                }),
+                SceneNode::ClipGroup(ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::from_pixels(12),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(6),
+                        height: Fixed::from_pixels(6),
+                    },
+                    nodes: vec![SceneNode::GlyphRun(hidden)],
+                }),
+            ],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("ROTATED"), "{text:?}");
+            assert!(!text.contains("HIDDEN"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["ROTATED"]);
+        }
+    }
+
+    #[test]
+    fn fontless_ltr_page_seams_emit_ordered_fragments_once_and_gate_links() {
+        let text = "ALPHA BETA GAMMA";
+        let full_page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(240),
+            height: Fixed::from_pixels(100),
+        };
+        let node = TextNode {
+            text: text.to_string(),
+            bounds: Rect {
+                x: Fixed::from_pixels(10),
+                y: Fixed::from_pixels(20),
+                width: Fixed::from_pixels(220),
+                height: Fixed::from_pixels(30),
+            },
+            clip_bounds: full_page,
+            horizontal_padding: Fixed::ZERO,
+            style: TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(20),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 0,
+            },
+            hyperlink: Some("https://example.com/page-seam".to_string()),
+        };
+        let document = document_with_clipped_text_pages(
+            "fontless-ltr-seams",
+            node,
+            240,
+            100,
+            &[
+                Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(80),
+                    height: full_page.height,
+                },
+                Rect {
+                    x: Fixed::from_pixels(80),
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(65),
+                    height: full_page.height,
+                },
+                Rect {
+                    x: Fixed::from_pixels(145),
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(95),
+                    height: full_page.height,
+                },
+                Rect {
+                    x: Fixed::from_pixels(260),
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(10),
+                    height: full_page.height,
+                },
+            ],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(text))));
+        assert_eq!(source.matches("/Subtype /Link").count(), 3, "{source}");
+        assert_eq!(
+            source
+                .matches(&hex_bytes(b"https://example.com/page-seam"))
+                .count(),
+            3
+        );
+        if let Some(pages) = poppler_text_pages(&pdf) {
+            assert_eq!(pages.len(), 4, "{pages:?}");
+            assert_eq!(pages[0].trim(), "ALPHA", "{pages:?}");
+            assert_eq!(pages[1].trim(), "BETA", "{pages:?}");
+            assert_eq!(pages[2].trim(), "GAMMA", "{pages:?}");
+            assert!(pages[3].trim().is_empty(), "{pages:?}");
+            assert_eq!(
+                pages
+                    .iter()
+                    .flat_map(|page| page.split_whitespace())
+                    .collect::<Vec<_>>(),
+                ["ALPHA", "BETA", "GAMMA"]
+            );
+        }
+    }
+
+    #[test]
+    fn fontless_cjk_page_seams_preserve_original_source_fragments() {
+        let text = "漢字한글";
+        let full_page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(120),
+            height: Fixed::from_pixels(80),
+        };
+        let node = TextNode {
+            text: text.to_string(),
+            bounds: Rect {
+                x: Fixed::from_pixels(10),
+                y: Fixed::from_pixels(20),
+                width: Fixed::from_pixels(100),
+                height: Fixed::from_pixels(30),
+            },
+            clip_bounds: full_page,
+            horizontal_padding: Fixed::ZERO,
+            style: TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(20),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 0,
+            },
+            hyperlink: None,
+        };
+        let document = document_with_clipped_text_pages(
+            "fontless-cjk-seams",
+            node,
+            120,
+            80,
+            &[
+                Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(32),
+                    height: full_page.height,
+                },
+                Rect {
+                    x: Fixed::from_pixels(32),
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(88),
+                    height: full_page.height,
+                },
+            ],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(text))));
+        if let Some(pages) = poppler_text_pages(&pdf) {
+            assert_eq!(pages.len(), 2, "{pages:?}");
+            assert_eq!(pages[0].trim(), "漢字", "{pages:?}");
+            assert_eq!(pages[1].trim(), "한글", "{pages:?}");
+            assert_eq!(
+                pages.iter().map(|page| page.trim()).collect::<String>(),
+                text
+            );
+            assert!(!pages.iter().any(|page| page.contains('?')), "{pages:?}");
+        }
+    }
+
+    #[test]
+    fn rotated_fontless_page_seams_use_inverse_clip_geometry() {
+        let text = "ROTATEDSEAM";
+        let full_page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(140),
+        };
+        let node = TextNode {
+            text: text.to_string(),
+            bounds: Rect {
+                x: Fixed::from_pixels(20),
+                y: Fixed::from_pixels(50),
+                width: Fixed::from_pixels(160),
+                height: Fixed::from_pixels(30),
+            },
+            clip_bounds: full_page,
+            horizontal_padding: Fixed::ZERO,
+            style: TextStyle {
+                family: "sans-serif".to_string(),
+                size: Fixed::from_pixels(20),
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Start,
+                baseline: TextBaseline::Top,
+                rotation_degrees: 30,
+            },
+            hyperlink: None,
+        };
+        let document = document_with_clipped_text_pages(
+            "fontless-rotated-seams",
+            node,
+            200,
+            140,
+            &[
+                Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(80),
+                    height: full_page.height,
+                },
+                Rect {
+                    x: Fixed::from_pixels(80),
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(120),
+                    height: full_page.height,
+                },
+            ],
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        if let Some(pages) = poppler_text_pages(&pdf) {
+            assert_eq!(pages.len(), 2, "{pages:?}");
+            let fragments = pages
+                .iter()
+                .map(|page| page.split_whitespace().collect::<String>())
+                .collect::<Vec<_>>();
+            assert_eq!(fragments, ["ROTAT", "EDSEAM"], "{pages:?}");
+            assert_eq!(fragments.concat(), text);
+        }
+    }
+
+    #[test]
+    fn horizontal_chart_title_repro_emits_exact_page_local_poppler_fragments() {
+        const TITLE: &str =
+            "HORIZONTAL-SEMANTIC-SEAM-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
+        fn title_count(nodes: &[SceneNode]) -> usize {
+            nodes
+                .iter()
+                .map(|node| match node {
+                    SceneNode::ClipGroup(group) => title_count(&group.nodes),
+                    SceneNode::Text(text) if text.text == TITLE => 1,
+                    SceneNode::GlyphRun(run) if run.text == TITLE => 1,
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("Horizontal");
+        for row in 0..4 {
+            sheet.write_number(row, 2, f64::from(row + 1));
+            sheet.set_row_height(row, 120.0);
+        }
+        for column in 0..3 {
+            sheet.set_col_width(column, 85.0);
+        }
+        sheet.add_chart(
+            rxls::Chart::new(rxls::ChartKind::Line, (0, 0), (3, 2))
+                .with_title(TITLE)
+                .add_series(rxls::Series::new("Horizontal!$C$1:$C$4")),
+        );
+        sheet.set_page_setup(
+            rxls::PageSetup::new()
+                .with_print_area((0, 0, 3, 2))
+                .with_paper_size(1)
+                .with_scale(100),
+        );
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                omit_sparse_pages: false,
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(TITLE.chars().count(), 74);
+        assert_eq!(document.pages.len(), 3);
+        assert_eq!(
+            document
+                .pages
+                .iter()
+                .map(|page| title_count(&page.scene.nodes))
+                .collect::<Vec<_>>(),
+            [1, 1, 0]
+        );
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE))));
+        let first = "HORIZONTAL-SEMANTIC-SEAM-ABCD";
+        let second = "EFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
+        assert_eq!(
+            source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(first)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(second)))
+                .count(),
+            1
+        );
+        if let Some(pages) = poppler_text_pages(&pdf) {
+            assert_eq!(pages.len(), 3, "{pages:?}");
+            assert!(pages[0].contains(first), "{pages:?}");
+            assert!(!pages[0].contains(second), "{pages:?}");
+            assert!(pages[1].contains(second), "{pages:?}");
+            assert!(!pages[1].contains(first), "{pages:?}");
+            assert!(!pages[2].contains(first), "{pages:?}");
+            assert!(!pages[2].contains(second), "{pages:?}");
+            assert_eq!(format!("{first}{second}"), TITLE);
+            assert_eq!(pages.iter().filter(|page| page.contains(TITLE)).count(), 0);
+        }
+    }
+
+    #[test]
+    fn project_font_pack_pdf_exposes_exact_poppler_word_tokens() {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("words");
+        sheet.set_col_width(0, 40.0);
+        sheet.write(0, 0, "alpha beta gamma");
+        let options = PrintOptions {
+            single_page_sheets: true,
+            render: RenderOptions {
+                gridlines: false,
+                default_font_family: pack.default_family().to_string(),
+                font_pack: Some(pack),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["alpha", "beta", "gamma"]);
+            let alpha = poppler_word_bbox(&xml, "alpha");
+            let beta = poppler_word_bbox(&xml, "beta");
+            let gamma = poppler_word_bbox(&xml, "gamma");
+            for bounds in [alpha, beta, gamma] {
+                assert!(bounds[0] < bounds[2], "{bounds:?}");
+                assert!(bounds[1] < bounds[3], "{bounds:?}");
+            }
+            assert!(alpha[2] < beta[0], "{alpha:?} {beta:?}");
+            assert!(beta[2] < gamma[0], "{beta:?} {gamma:?}");
+            assert!((alpha[1] - beta[1]).abs() < 0.01);
+            assert!((beta[1] - gamma[1]).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn native_fallback_pdf_exposes_exact_poppler_word_tokens() {
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("words");
+        sheet.set_col_width(0, 40.0);
+        sheet.write(0, 0, "alpha beta gamma");
+        let options = PrintOptions {
+            single_page_sheets: true,
+            render: RenderOptions {
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/BaseFont /Helvetica"));
+        assert!(source.matches("[-278] TJ").count() >= 2);
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["alpha", "beta", "gamma"]);
+            let alpha = poppler_word_bbox(&xml, "alpha");
+            let beta = poppler_word_bbox(&xml, "beta");
+            let gamma = poppler_word_bbox(&xml, "gamma");
+            assert!(alpha[2] < beta[0], "{alpha:?} {beta:?}");
+            assert!(beta[2] < gamma[0], "{beta:?} {gamma:?}");
+        }
+    }
+
+    #[test]
+    fn project_font_pack_pdf_preserves_mixed_direction_semantics_and_geometry() {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("bidi");
+        sheet.set_col_width(0, 40.0);
+        sheet.write(0, 0, "left אב גד 漢字");
+        let options = PrintOptions {
+            single_page_sheets: true,
+            render: RenderOptions {
+                gridlines: false,
+                default_font_family: pack.default_family().to_string(),
+                font_pack: Some(pack),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/ActualText <FEFF05D005D1>"));
+        assert!(source.contains("/ActualText <FEFF05D205D3>"));
+        assert!(source.contains("/ActualText <FEFF6F225B57>"));
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains('\u{202b}'), "{text:?}");
+            assert!(text.contains('\u{202c}'), "{text:?}");
+            assert!(text.contains("漢字"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["left", "גד", "אב", "漢字"]);
+            let first_logical_rtl_word = poppler_word_bbox(&xml, "אב");
+            let second_logical_rtl_word = poppler_word_bbox(&xml, "גד");
+            assert!(
+                second_logical_rtl_word[0] < first_logical_rtl_word[0],
+                "{first_logical_rtl_word:?} {second_logical_rtl_word:?}"
+            );
+        }
     }
 }

@@ -557,12 +557,12 @@ class ReleaseToolTests(unittest.TestCase):
             kinds, {"openai_api_key", "windows_home_path", "internal_docs_trace"}
         )
 
-    def test_hygiene_rejects_internal_promotion_language(self) -> None:
-        module = _load("public_hygiene_audit_promotion", HYGIENE)
+    def test_hygiene_rejects_reserved_status_language(self) -> None:
+        module = _load("public_hygiene_audit_reserved_status", HYGIENE)
         text = "\n".join(
             [
-                "status=" + "1.0 " + "candidate",
-                "goal=" + "effectively " + "1.0",
+                "status=" + "1" + ".0 " + "candidate",
+                "goal=" + "effectively " + "1" + ".0",
             ]
         )
 
@@ -571,8 +571,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertEqual(
             [finding.kind for finding in findings],
             [
-                "internal_release_promotion_trace",
-                "internal_release_promotion_trace",
+                "reserved_status_trace",
+                "reserved_status_trace",
             ],
         )
 

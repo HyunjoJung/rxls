@@ -26,6 +26,50 @@ def load_module():
 MODULE = load_module()
 
 
+def point_geometry(
+    *,
+    rxls_width: str = "612/1",
+    libreoffice_width: str = "612/1",
+) -> dict[str, object]:
+    def side(width: str) -> dict[str, object]:
+        dimensions = {"height_points": "792/1", "width_points": width}
+        return {
+            "crop_box": dict(dimensions),
+            "media_box": dict(dimensions),
+            "page_size": dict(dimensions),
+        }
+
+    delta = MODULE._point(
+        rxls_width, "fixture", positive=True
+    ) - MODULE._point(libreoffice_width, "fixture", positive=True)
+    return {
+        "deltas_points": {
+            "crop_box_height": "0/1",
+            "crop_box_width": f"{delta.numerator}/{delta.denominator}",
+            "libreoffice_xhtml_page_size_height": "0/1",
+            "libreoffice_xhtml_page_size_width": "0/1",
+            "media_box_height": "0/1",
+            "media_box_width": f"{delta.numerator}/{delta.denominator}",
+            "rxls_xhtml_page_size_height": "0/1",
+            "rxls_xhtml_page_size_width": "0/1",
+            "xhtml_height": "0/1",
+            "xhtml_width": f"{delta.numerator}/{delta.denominator}",
+        },
+        "libreoffice": side(libreoffice_width),
+        "rxls": side(rxls_width),
+        "xhtml": {
+            "libreoffice": {
+                "height_points": "792/1",
+                "width_points": libreoffice_width,
+            },
+            "rxls": {
+                "height_points": "792/1",
+                "width_points": rxls_width,
+            },
+        },
+    }
+
+
 def report_document() -> dict[str, object]:
     image_id = "sha256:" + "1" * 64
     manifest_digest = "sha256:" + "4" * 64
@@ -46,7 +90,14 @@ def report_document() -> dict[str, object]:
             "version": "26.2.3.2",
         },
         "lock_file_sha256": "5" * 64,
-        "pdf_font_inspector": {"kind": "poppler", "pdffonts_sha256": "6" * 64},
+        "pdf_font_inspector": {
+            "host_tools_identity_sha256": "d" * 64,
+            "kind": "poppler",
+            "pdffonts_sha256": "6" * 64,
+            "pdfinfo_sha256": "a" * 64,
+            "pdftoppm_sha256": "b" * 64,
+            "pdftotext_sha256": "c" * 64,
+        },
         "runtime": "docker",
         "schema": MODULE.CONTAINER_IDENTITY_SCHEMA,
     }
@@ -70,7 +121,9 @@ def report_document() -> dict[str, object]:
     for workbook_index, scale_mode in enumerate(("scale", "fit")):
         pages = [
             {
-                "sheet_index": index,
+                "source_sheet_index": 0,
+                "source_pdf_page_index": index,
+                "oracle_output_page_index": index,
                 "rxls_size": {"width": 816, "height": 1056},
                 "libreoffice_size": {"width": 816, "height": 1056},
                 "pixels": 816 * 1056,
@@ -83,15 +136,40 @@ def report_document() -> dict[str, object]:
                 "semantic_codepoint_libreoffice_items": 10,
                 "semantic_codepoint_matched_items": 10,
                 "text_box_candidate_items": 2,
+                "text_box_rxls_items": 2,
+                "text_box_libreoffice_items": 2,
                 "text_box_matched_items": 2,
                 "text_box_ambiguous_items": 0,
                 "text_box_unmatched_items": 0,
+                "text_box_rxls_unmatched_items": 0,
+                "text_box_libreoffice_unmatched_items": 0,
                 "text_box_error_histogram_millipoints": [
                     {"error_millipoints": 0, "count": 2}
                 ],
                 "text_box_match_coverage_ppm": 1_000_000,
+                "text_box_precision_ppm": 1_000_000,
+                "text_box_recall_ppm": 1_000_000,
+                "text_box_f1_ppm": 1_000_000,
                 "text_box_median_error_millipoints": 0,
                 "text_box_p95_error_millipoints": 0,
+                "text_line_box_candidate_items": 1,
+                "text_line_box_rxls_items": 1,
+                "text_line_box_libreoffice_items": 1,
+                "text_line_box_matched_items": 1,
+                "text_line_box_ambiguous_items": 0,
+                "text_line_box_unmatched_items": 0,
+                "text_line_box_rxls_unmatched_items": 0,
+                "text_line_box_libreoffice_unmatched_items": 0,
+                "text_line_box_error_histogram_millipoints": [
+                    {"error_millipoints": 0, "count": 1}
+                ],
+                "text_line_box_match_coverage_ppm": 1_000_000,
+                "text_line_box_precision_ppm": 1_000_000,
+                "text_line_box_recall_ppm": 1_000_000,
+                "text_line_box_f1_ppm": 1_000_000,
+                "text_line_box_median_error_millipoints": 0,
+                "text_line_box_p95_error_millipoints": 0,
+                "pdf_point_geometry": point_geometry(),
             }
             for index in range(4)
         ]
@@ -116,9 +194,22 @@ def report_document() -> dict[str, object]:
                     "scale_mode": scale_mode,
                 },
                 "artifacts": {"rxls_pages": 4, "libreoffice_pages": 4},
-                "metrics": {"pages": 4, "similarity_ppm": 1_000_000},
+                "metrics": {
+                    "max_pdf_point_geometry_delta_millipoints": 0,
+                    "max_pdf_xhtml_crosscheck_delta_micropoints": 0,
+                    "pages": 4,
+                    "pdf_point_geometry_mismatches": 0,
+                    "similarity_ppm": 1_000_000,
+                },
                 "pages": pages,
-                "scenes": [{"sheet_index": index} for index in range(4)],
+                "scenes": [
+                    {
+                        "source_sheet_index": 0,
+                        "source_pdf_page_index": index,
+                        "oracle_output_page_index": index,
+                    }
+                    for index in range(4)
+                ],
                 "font_attestation": {
                     "font_objects": 2,
                     "embedded_font_objects": 2,
@@ -126,11 +217,24 @@ def report_document() -> dict[str, object]:
                     "subset_font_objects": 2,
                     "unicode_font_objects": 2,
                     "normalized_identities_sha256": "8" * 64,
+                    "unique_font_identities": 1,
+                },
+                "native_pdf_attestation": {
+                    "actual_text_documents": 1,
+                    "charprocs_documents": 1,
+                    "documents": 1,
+                    "embedded_font_objects": 1,
+                    "font_objects": 1,
+                    "identity_set_sha256": "f" * 64,
+                    "subset_font_objects": 1,
+                    "type3_documents": 1,
+                    "type3_font_objects": 1,
+                    "unicode_font_objects": 1,
                 },
                 "oracle_adapter": copy.deepcopy(adapter),
             }
         )
-    return {
+    report = {
         "schema": MODULE.EVIDENCE_SCHEMA,
         "mode": "compare",
         "configuration": {
@@ -141,25 +245,43 @@ def report_document() -> dict[str, object]:
                 "required_features": ["print-settings"],
             },
             "metric_policy": {
+                "contract_schema": MODULE.METRIC_CONTRACT_SCHEMA,
+                "contract_version": 2,
                 "mask_match_tolerance_pixels": 1,
                 "edge_luma_delta": 32,
                 "semantic_content_retained": False,
                 "semantic_text_source": (
                     "svg_data-rxls-visible-label_vs_pdftotext_layout"
                 ),
+                "raster_source": (
+                    "rxls_native_print_pdf_vs_libreoffice_calc_pdf"
+                ),
+                "rasterizer": "same_locked_poppler_pdftoppm_both_sides",
+                "text_ink_source": "thresholded_common_poppler_rasters",
                 "text_box_content_retained": False,
                 "text_box_error_units": "millipoints",
                 "text_box_source": (
-                    "svg_clipped_glyph_bounds_vs_pdftotext_bbox_layout"
+                    "pdftotext_bbox_layout_word_boxes_both_native_pdfs"
+                ),
+                "text_line_box_source": (
+                    "pdftotext_bbox_layout_line_boxes_both_native_pdfs"
                 ),
                 "text_box_matching": (
-                    "exact_svg_data-rxls-visible-label_nearest_unique_"
-                    "pdftotext_bbox_layout"
+                    "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
                 ),
+                "text_box_geometry": "nominal_poppler_layout_not_ink_bounds",
                 "implementation": {
                     "kind": "numpy_integer_exact_v1",
                     "version": "2.4.2",
                 },
+            },
+            "measurement_toolchain": {
+                "host_tools_identity_sha256": "d" * 64,
+                "kind": "poppler",
+                "pdffonts_sha256": "6" * 64,
+                "pdfinfo_sha256": "a" * 64,
+                "pdftoppm_sha256": "b" * 64,
+                "pdftotext_sha256": "c" * 64,
             },
             "renderer_binary": {"sha256": "9" * 64},
             "font_pack": {"pack_sha256": "3" * 64},
@@ -172,6 +294,11 @@ def report_document() -> dict[str, object]:
         },
         "files": files,
     }
+    report["configuration"]["manifest_binding"] = MODULE._mapping_binding(
+        files,
+        manifest_sha256="e" * 64,
+    )
+    return report
 
 
 class AuthoredPrintGateTests(unittest.TestCase):
@@ -198,6 +325,8 @@ class AuthoredPrintGateTests(unittest.TestCase):
                 "page_box_max_millipoints": 5_000,
                 "page_box_median_max_millipoints": 1_000,
                 "page_box_p95_max_millipoints": 2_500,
+                "pdf_point_geometry_exact": True,
+                "pdf_xhtml_crosscheck_max_micropoints": 1_000,
                 "semantic_codepoint_precision_min_ppm": 999_000,
                 "semantic_codepoint_recall_min_ppm": 999_000,
                 "similarity_mean_min_ppm": 950_000,
@@ -211,7 +340,15 @@ class AuthoredPrintGateTests(unittest.TestCase):
     def test_page_count_and_calibrated_page_box_thresholds_fail(self) -> None:
         report = report_document()
         report["files"][0]["artifacts"]["libreoffice_pages"] = 3
-        report["files"][0]["pages"][0]["libreoffice_size"]["width"] = 826
+        report["files"][0]["pages"][0]["pdf_point_geometry"] = point_geometry(
+            libreoffice_width="606/1"
+        )
+        report["files"][0]["metrics"][
+            "pdf_point_geometry_mismatches"
+        ] = 1
+        report["files"][0]["metrics"][
+            "max_pdf_point_geometry_delta_millipoints"
+        ] = 6_000
         result = MODULE.evaluate(
             report,
             report_sha256="a" * 64,
@@ -222,6 +359,40 @@ class AuthoredPrintGateTests(unittest.TestCase):
         self.assertIn("page_count_mismatch", result["failures"])
         self.assertIn("page_box_max_above_target", result["failures"])
 
+    def test_hidden_source_sheet_gap_with_authored_multipage_output_passes(self) -> None:
+        report = report_document()
+        for item in report["files"]:
+            for page, scene in zip(item["pages"], item["scenes"], strict=True):
+                page["source_sheet_index"] = 1
+                scene["source_sheet_index"] = 1
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertTrue(result["passed"])
+
+    def test_sub_raster_pdf_point_delta_fails_exact_geometry_gate(self) -> None:
+        report = report_document()
+        page = report["files"][0]["pages"][0]
+        page["pdf_point_geometry"] = point_geometry(
+            libreoffice_width="6119/10"
+        )
+        report["files"][0]["metrics"]["pdf_point_geometry_mismatches"] = 1
+        report["files"][0]["metrics"][
+            "max_pdf_point_geometry_delta_millipoints"
+        ] = 100
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertNotIn("raster_page_box_mismatch", result["failures"])
+
     def test_correct_page_count_cannot_hide_bad_visual_or_text_placement(self) -> None:
         report = report_document()
         page = report["files"][0]["pages"][0]
@@ -231,8 +402,13 @@ class AuthoredPrintGateTests(unittest.TestCase):
         page["semantic_codepoint_matched_items"] = 0
         page["text_box_matched_items"] = 0
         page["text_box_unmatched_items"] = 2
+        page["text_box_rxls_unmatched_items"] = 2
+        page["text_box_libreoffice_unmatched_items"] = 2
         page["text_box_error_histogram_millipoints"] = []
         page["text_box_match_coverage_ppm"] = 0
+        page["text_box_precision_ppm"] = 0
+        page["text_box_recall_ppm"] = 0
+        page["text_box_f1_ppm"] = 0
         page["text_box_median_error_millipoints"] = None
         page["text_box_p95_error_millipoints"] = None
         pixels = sum(item["pixels"] for item in report["files"][0]["pages"])
@@ -261,7 +437,107 @@ class AuthoredPrintGateTests(unittest.TestCase):
         self.assertIn("text_box_match_coverage_below_target", result["failures"])
         self.assertIn("text_box_mapping_unmatched", result["failures"])
 
+    def test_extra_reference_text_boxes_cannot_be_ignored(self) -> None:
+        report = report_document()
+        page = report["files"][0]["pages"][0]
+        page["text_box_libreoffice_items"] = 3
+        page["text_box_libreoffice_unmatched_items"] = 1
+        page["text_box_recall_ppm"] = 666_667
+        page["text_box_f1_ppm"] = 800_000
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["metrics"]["text_box_precision_ppm"], 1_000_000)
+        self.assertIn("text_box_recall_below_target", result["failures"])
+        self.assertIn("text_box_f1_below_target", result["failures"])
+        self.assertIn("text_box_reference_unmatched", result["failures"])
+
+    def test_extra_reference_line_boxes_cannot_be_ignored(self) -> None:
+        report = report_document()
+        page = report["files"][0]["pages"][0]
+        page["text_line_box_libreoffice_items"] = 2
+        page["text_line_box_libreoffice_unmatched_items"] = 1
+        page["text_line_box_recall_ppm"] = 500_000
+        page["text_line_box_f1_ppm"] = 666_667
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertIn("text_line_box_recall_below_target", result["failures"])
+        self.assertIn("text_line_box_f1_below_target", result["failures"])
+        self.assertIn("text_line_box_reference_unmatched", result["failures"])
+
+    def test_empty_semantic_and_edge_populations_are_not_perfect_evidence(self) -> None:
+        report = report_document()
+        for page in report["files"][0]["pages"]:
+            page["semantic_codepoint_rxls_items"] = 0
+            page["semantic_codepoint_libreoffice_items"] = 0
+            page["semantic_codepoint_matched_items"] = 0
+            page["edge_rxls_pixels"] = 0
+            page["edge_libreoffice_pixels"] = 0
+            page["edge_rxls_matched_1px"] = 0
+            page["edge_libreoffice_matched_1px"] = 0
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertEqual(result["metrics"]["edge_f1_ppm"], 1_000_000)
+        self.assertEqual(
+            result["metrics"]["semantic_codepoint_precision_ppm"],
+            1_000_000,
+        )
+        self.assertIn("semantic_population_empty", result["failures"])
+        self.assertIn("edge_population_empty", result["failures"])
+
+    def test_self_consistent_input_substitution_is_rejected_by_manifest_binding(
+        self,
+    ) -> None:
+        report = report_document()
+        expected = copy.deepcopy(report["configuration"]["manifest_binding"])
+        report["files"][0]["sha256"] = "f" * 64
+        report["configuration"]["manifest_binding"] = MODULE._mapping_binding(
+            report["files"],
+            manifest_sha256=expected["manifest_sha256"],
+        )
+        with self.assertRaisesRegex(MODULE.GateError, "manifest_binding"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+                expected_manifest_binding=expected,
+            )
+
     def test_unpinned_container_and_incomplete_source_attestation_are_rejected(self) -> None:
+        for key in (
+            "host_tools_identity_sha256",
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        ):
+            with self.subTest(key=key):
+                report = report_document()
+                report["configuration"]["measurement_toolchain"][key] = "0" * 64
+                with self.assertRaisesRegex(
+                    MODULE.GateError,
+                    "measurement_toolchain",
+                ):
+                    MODULE.evaluate(
+                        report,
+                        report_sha256="a" * 64,
+                        report_bytes=1234,
+                        expected_workbooks=2,
+                    )
+
         report = report_document()
         report["configuration"]["oracle_lock"]["image"]["expected_config_digest"] = None
         with self.assertRaisesRegex(MODULE.GateError, "oracle_image"):

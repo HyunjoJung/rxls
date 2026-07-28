@@ -1,5 +1,5 @@
 {
-  "as_of": "2026-07-15",
+  "as_of": "2026-07-29",
   "corpus": {
     "by_ext": {
       ".ods": {
@@ -45,10 +45,10 @@
       "rxls_extracted": 14
     },
     "ooxml": {
-      "at_least_99": 387,
+      "at_least_99": 388,
       "comparable": 388,
       "files": 431,
-      "mean_percent": 99.889,
+      "mean_percent": 100.0,
       "rxls_extracted": 412
     },
     "xls": {

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Gate repeat LibreOffice parity runs without publishing corpus paths.
 
-The two inputs must be complete ``rxls.libreoffice-render-parity.v1``
+The two inputs must be complete single-page ``rxls.libreoffice-render-parity.v1``
 campaign reports produced with exactly the same configuration, preflight, and
-renderer binary.  Input workbooks are paired only by their SHA-256 identity;
-host paths are deliberately ignored and never copied to the result.
+renderer binary.  Authored-print evidence has a separate page-map gate.  Input
+workbooks are paired only by their SHA-256 identity; host paths are deliberately
+ignored and never copied to the result.
 
 Everything owned by rxls (renderer metadata, scene hashes, page mapping,
 semantic counts, and page dimensions) must be exact.  The only tolerated
@@ -285,7 +286,12 @@ def _validate_renderer_metrics(metrics: dict[str, Any], code: str) -> None:
 def _validate_page(page: object) -> dict[str, Any]:
     if not isinstance(page, dict):
         raise MalformedReport("page_not_object")
-    _integer(page.get("sheet_index"), "page_mapping")
+    for key in (
+        "source_sheet_index",
+        "source_pdf_page_index",
+        "oracle_output_page_index",
+    ):
+        _integer(page.get(key), "page_mapping")
     for key in DRIFT_METRICS:
         _ppm(page.get(key), "page_visual_metric")
     for key in PAGE_DIMENSION_KEYS:
@@ -348,13 +354,47 @@ def _validate_comparable_row(row: dict[str, Any]) -> int:
         raise MalformedReport("artifact_page_count")
     if _integer(artifacts.get("rxls_pages"), "artifact_evidence") != len(pages):
         raise MalformedReport("artifact_page_count")
-    seen_sheets: set[int] = set()
+    page_mapping: list[tuple[int, int, int]] = []
     for raw_page in pages:
         page = _validate_page(raw_page)
-        sheet = int(page["sheet_index"])
-        if sheet in seen_sheets:
-            raise MalformedReport("duplicate_page_mapping")
-        seen_sheets.add(sheet)
+        page_mapping.append(
+            (
+                int(page["source_sheet_index"]),
+                int(page["source_pdf_page_index"]),
+                int(page["oracle_output_page_index"]),
+            )
+        )
+    scene_mapping = []
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            raise MalformedReport("scene_evidence")
+        scene_mapping.append(
+            (
+                _integer(scene.get("source_sheet_index"), "page_mapping"),
+                _integer(scene.get("source_pdf_page_index"), "page_mapping"),
+                _integer(scene.get("oracle_output_page_index"), "page_mapping"),
+            )
+        )
+    if (
+        scene_mapping != page_mapping
+        or [row[2] for row in page_mapping] != list(range(len(page_mapping)))
+    ):
+        raise MalformedReport("page_mapping")
+    seen_sheets: set[int] = set()
+    current_sheet: int | None = None
+    local_index = 0
+    for source_sheet, source_pdf_page, _ in page_mapping:
+        if source_sheet != current_sheet:
+            if source_sheet in seen_sheets or (
+                current_sheet is not None and source_sheet <= current_sheet
+            ):
+                raise MalformedReport("page_mapping")
+            seen_sheets.add(source_sheet)
+            current_sheet = source_sheet
+            local_index = 0
+        if source_pdf_page != local_index:
+            raise MalformedReport("page_mapping")
+        local_index += 1
     _validate_aggregate(row.get("metrics"), len(pages))
     return len(pages)
 
@@ -419,6 +459,7 @@ def validate_report(loaded: LoadedReport) -> ValidatedReport:
         raise MalformedReport("campaign_coverage")
 
     if set(summary) != {
+        "authored_print",
         "by_classification",
         "by_status",
         "files",
@@ -426,6 +467,11 @@ def validate_report(loaded: LoadedReport) -> ValidatedReport:
         "metric_cohorts",
     }:
         raise MalformedReport("summary_shape")
+    if (
+        configuration.get("print_mode") != "single-page-sheets"
+        or summary.get("authored_print") is not None
+    ):
+        raise MalformedReport("summary_authored_print")
     if _integer(summary.get("files"), "summary_file_count") != selected:
         raise MalformedReport("summary_file_count")
     _integer(summary.get("input_bytes_considered"), "summary_input_bytes")
@@ -614,7 +660,14 @@ def compare_reports(
             for left_page, right_page in zip(left_pages, right_pages):
                 if set(left_page) != set(right_page):
                     failures.add("page_metric_shape_mismatch")
-                if left_page.get("sheet_index") != right_page.get("sheet_index"):
+                if any(
+                    left_page.get(key) != right_page.get(key)
+                    for key in (
+                        "source_sheet_index",
+                        "source_pdf_page_index",
+                        "oracle_output_page_index",
+                    )
+                ):
                     failures.add("page_mapping_mismatch")
                 if _semantic_subset(left_page) != _semantic_subset(right_page):
                     failures.add("semantic_counts_mismatch")

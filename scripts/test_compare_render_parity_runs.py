@@ -81,7 +81,9 @@ def page_metrics(index: int) -> dict[str, object]:
         "metric_work_units": 2_560_000 + index,
         "pixels": 20_000 + index,
         "rxls_size": {"height": 100 + index, "width": 200 + index},
-        "sheet_index": index,
+        "source_sheet_index": index,
+        "source_pdf_page_index": 0,
+        "oracle_output_page_index": 0,
         "similarity_ppm": 900_000 - index,
         "text_ink_f1_ppm": 760_000 - index,
         **renderer_metrics(index),
@@ -130,7 +132,13 @@ def file_row(index: int, *, private_prefix: str = "/private/baseline") -> dict[s
         },
         "rights_tier": "S",
         "scenes": [
-            {"sha256": f"{index + 100:064x}", "sheet_index": index, "warnings": []}
+            {
+                "oracle_output_page_index": 0,
+                "sha256": f"{index + 100:064x}",
+                "source_pdf_page_index": 0,
+                "source_sheet_index": index,
+                "warnings": [],
+            }
         ],
         "semantic_command": {"returncode": 0, "status": "ok"},
         "sha256": f"{index + 1:064x}",
@@ -144,6 +152,7 @@ def report(*, private_prefix: str = "/private/baseline") -> dict[str, object]:
     return {
         "configuration": {
             "dpi": 96,
+            "print_mode": "single-page-sheets",
             "renderer_binary": identity,
             "secret_configuration_path": "/never/publish/configuration",
         },
@@ -167,6 +176,7 @@ def report(*, private_prefix: str = "/private/baseline") -> dict[str, object]:
         },
         "schema": MODULE.INPUT_SCHEMA,
         "summary": {
+            "authored_print": None,
             "by_classification": {"within_threshold": 2},
             "by_status": {"compared": 2},
             "files": 2,
@@ -240,6 +250,27 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         self.assertIn("preflight_mismatch", result["failures"])
         self.assertIn("renderer_binary_mismatch", result["failures"])
 
+    def test_authored_print_summary_contract_is_explicitly_separate(self) -> None:
+        missing = copy.deepcopy(self.baseline)
+        del missing["summary"]["authored_print"]
+        with self.assertRaisesRegex(MODULE.MalformedReport, "summary_shape"):
+            validated(missing)
+
+        structured = copy.deepcopy(self.baseline)
+        structured["configuration"]["print_mode"] = "authored"
+        structured["summary"]["authored_print"] = {"attested_workbooks": 2}
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "summary_authored_print"
+        ):
+            validated(structured)
+
+        non_null = copy.deepcopy(self.baseline)
+        non_null["summary"]["authored_print"] = {}
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "summary_authored_print"
+        ):
+            validated(non_null)
+
     def test_missing_partial_overlap_and_duplicate_inputs_fail_closed(self) -> None:
         missing = copy.deepcopy(self.candidate)
         missing["files"].pop()
@@ -275,8 +306,13 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         candidate = copy.deepcopy(self.candidate)
         row = candidate["files"][0]
         second_page = copy.deepcopy(row["pages"][0])
-        second_page["sheet_index"] = 99
+        second_page["source_pdf_page_index"] = 1
+        second_page["oracle_output_page_index"] = 1
         row["pages"].append(second_page)
+        second_scene = copy.deepcopy(row["scenes"][0])
+        second_scene["source_pdf_page_index"] = 1
+        second_scene["oracle_output_page_index"] = 1
+        row["scenes"].append(second_scene)
         row["metrics"]["pages"] = 2
         row["artifacts"] = {"libreoffice_pages": 2, "rxls_pages": 2}
         result = self.compare(candidate=candidate)
@@ -288,7 +324,8 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         row = candidate["files"][0]
         row["metrics"]["semantic_token_libreoffice_items"] += 1
         row["pages"][0]["libreoffice_size"]["width"] += 1
-        row["pages"][0]["sheet_index"] = 99
+        row["pages"][0]["source_sheet_index"] = 99
+        row["scenes"][0]["source_sheet_index"] = 99
         result = self.compare(candidate=candidate)
         self.assertIn("semantic_counts_mismatch", result["failures"])
         self.assertIn("page_dimensions_mismatch", result["failures"])

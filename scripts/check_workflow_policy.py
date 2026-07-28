@@ -33,6 +33,52 @@ RENDER_PACKAGE_NPM_VERSION = "11.16.0"
 RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST = "1.88.0"
 RENDER_PACKAGE_WASM_BINDGEN_VERSION = "0.2.126"
 ORACLE_BUILDX_VERSION = "v0.35.0"
+ORACLE_PR_PILOT_LABEL = "rxls-render-oracle-pilot"
+ORACLE_PR_FULL_LABEL = "rxls-render-oracle-full"
+PR_HEAD_EXPRESSION = "${{ github.event.pull_request.head.sha || github.sha }}"
+ORACLE_SOURCE_SHA_EXPRESSION = (
+    "${{ github.event_name == 'workflow_call' && inputs.source_sha || "
+    "github.event.pull_request.head.sha || github.sha }}"
+)
+ORACLE_HARDENED_SOURCE_VERIFIER = "\n".join(
+    (
+        "set -euo pipefail",
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+        "git diff --exit-code",
+        "git diff --cached --exit-code",
+    )
+)
+ORACLE_PR_JOB_CONDITION = (
+    "${{ github.event_name != 'pull_request' || "
+    "(github.event.action == 'labeled' && "
+    f"(github.event.label.name == '{ORACLE_PR_PILOT_LABEL}' || "
+    f"github.event.label.name == '{ORACLE_PR_FULL_LABEL}') && "
+    "github.event.pull_request.head.repo.full_name == github.repository) }}"
+)
+ORACLE_CAMPAIGN_EXPRESSION = (
+    "${{ github.event_name == 'pull_request' && "
+    f"github.event.label.name == '{ORACLE_PR_FULL_LABEL}' && 'full' || "
+    "github.event_name == 'pull_request' && "
+    f"github.event.label.name == '{ORACLE_PR_PILOT_LABEL}' && 'pilot' || "
+    "(github.event_name == 'workflow_dispatch' || "
+    "github.event_name == 'workflow_call') && inputs.campaign || 'pilot' }}"
+)
+ORACLE_BASELINE_MODE_EXPRESSION = (
+    "${{ (github.event_name == 'workflow_dispatch' || "
+    "github.event_name == 'workflow_call') && inputs.baseline_mode || 'verify' }}"
+)
+ORACLE_BOOTSTRAP_EXPRESSION = (
+    "${{ (github.event_name == 'workflow_dispatch' || "
+    "github.event_name == 'workflow_call') && "
+    "inputs.bootstrap_identities && '1' || '0' }}"
+)
+ORACLE_TIMEOUT_EXPRESSION = (
+    "${{ ((github.event_name == 'pull_request' && "
+    f"github.event.label.name == '{ORACLE_PR_FULL_LABEL}') || "
+    "((github.event_name == 'workflow_dispatch' || "
+    "github.event_name == 'workflow_call') && inputs.campaign == 'full')) "
+    "&& 330 || 120 }}"
+)
 ORACLE_BUILDX_ACTION = (
     "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
 )
@@ -46,19 +92,23 @@ ORACLE_UPLOAD_ARTIFACT_ACTION = (
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 )
 ORACLE_RENDER_STEP_SHA256 = (
-    "2749d6af5803d3c39cf6f3ac102f624270a1f890dc7d5de857e68d8dc9f52ffa",
-    "fd310c68a384cb3379a59a669357ba6d0106dc5c551d0194586f94ec6184a55a",
+    "2e617cd8715b2d0189e48636dee9f3844283ea1269acbfc6b9bb53c98cb81e1a",
+    "bb2ff7258a91fd630b1cb20e19c8276a625f295c6f52b38fe37fc4e2424e9933",
+    "00f31f7b101fe7fb51bc806ff0f129179c530099a65bcf8741d379db35472a3d",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "e68111b94d173e641656a08128f361c61c4521f9262bd5ab7644eff4e4c4ad52",
     "550ef35d2ed02fa5403ec22cf9526fe431a4908ba7bf6b8bcde23156fee79c66",
     "455b842e761235cf52cc695d818461372c5b1c99132d9c6df12224ca82af42bb",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
-    "11c3256a804cc01812f61ef29b4704e5386a7a20ad06a7986802885ed54be6aa",
-    "d57b5ea788b9602ed0e8dc38eda6a5ac2bc067b6167883ebdf55340681ac5547",
-    "13e889c1b3e254d53879c4a593f72f0d0c45f2962b9b7b1590717ca8a5820b38",
-    "1f3453b34f490f6ec86e9655d994b5af8fb7fb7c68c0da7b6016112e4b764202",
-    "3a68e719dd211780d0c0778445d63fc19cdbcadf80fc7068e132c623f38030ac",
+    "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
+    "d4964276024870ab039eb6a725f03a1f6fbe244ad736f86846219dbc29c6fe06",
+    "e8023111e76759005c88ec8df8501e1ea29a50353b6f4293d93e0b342ec25e03",
+    "ea232316be10caebe65ece1a648b9c695f2421a35848e8ff6e81fb31fae29f2a",
+    "5968d6e76ec19932c896dc2f729202e47edffbe2a569e55ed615b9533bf564e6",
+    "cfd190b74e56b641c4b323faee053ee93628ee4aca151609c88407c15677e836",
+    "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
+    "1935efa03e2e2dc9c56b935874953e10ff7e14565522937fd28e8ccb5f46a483",
 )
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "82dcaaf5e601cb509cf5312a5caf66a1f08e651165b53a3758e346938a32b7f4",
@@ -69,7 +119,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "d4d2791735de8376e7adf8b282c707ff43bba903cd333dabd9b23b1e1f208d04"
+    "bb16566db5e2b16a3255cbbc1290bb057ddfecbb4d74faaaed61a923535b9fde"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
@@ -1245,9 +1295,10 @@ def _workflow_job_step_sequences(
     """Return the single inline step sequence for every workflow job.
 
     This intentionally accepts only the block mapping form used by reviewed
-    workflows.  Flow mappings, duplicate ``jobs`` keys, reusable-workflow jobs,
-    and jobs whose steps cannot be scoped are rejected instead of being
-    silently omitted from the PR-head policy.
+    workflows. Flow mappings, duplicate ``jobs`` keys, and jobs whose execution
+    cannot be scoped are rejected instead of being silently omitted from the
+    PR-head policy. A job may contain either one inline ``steps`` sequence or
+    one repository-local reusable-workflow ``uses`` target.
     """
 
     lines = _without_commented_lines(text).splitlines()
@@ -1296,8 +1347,30 @@ def _workflow_job_step_sequences(
     errors: list[str] = []
     for position, (job_start, name) in enumerate(starts):
         job_end = starts[position + 1][0] if position + 1 < len(starts) else end
-        job_text = "\n".join(lines[job_start:job_end])
+        job_lines = lines[job_start:job_end]
+        job_text = "\n".join(job_lines)
         sequences = _workflow_step_sequences(job_text)
+        if len(sequences) == 0:
+            job_mapping_indent = job_indent + 2
+            uses = []
+            for line in job_lines[1:]:
+                if not line.strip():
+                    continue
+                indent = len(line) - len(line.lstrip(" "))
+                if indent != job_mapping_indent:
+                    continue
+                entry = _yaml_mapping_entry(
+                    _strip_yaml_inline_comment(line.lstrip(" "))
+                )
+                if entry is not None and entry[0] == "uses":
+                    uses.append(_yaml_unquote_scalar(entry[1]))
+            if (
+                len(uses) == 1
+                and uses[0].startswith("./.github/workflows/")
+                and not uses[0].endswith(("/", "\\"))
+            ):
+                jobs.append((name, []))
+                continue
         if len(sequences) != 1:
             errors.append(f"job {name!r} must contain exactly one inline steps sequence")
             continue
@@ -1508,9 +1581,25 @@ def _verifier_step_is_exact(
         return False
     if _step_values(entries, "shell") != ["bash"]:
         return False
-    if _step_values(entries, "run") != [
-        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"'
-    ]:
+    run_entries = [entry for entry in entries if entry[0] == "run"]
+    if len(run_entries) != 1:
+        return False
+    _, raw_run, line_index, parent_indent = run_entries[0]
+    scalar = _strip_yaml_inline_comment(raw_run).strip()
+    block_match = re.fullmatch(r"(?P<style>[|>])[-+0-9]*", scalar)
+    if block_match is None:
+        run_script = _yaml_unquote_scalar(scalar)
+    else:
+        run_script = _block_scalar_text(
+            block,
+            line_index,
+            parent_indent,
+            block_match.group("style"),
+        )
+    if run_script not in {
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+        ORACLE_HARDENED_SOURCE_VERIFIER,
+    }:
         return False
     env_entries = [entry for entry in entries if entry[0] == "env"]
     if len(env_entries) != 1 or _yaml_unquote_scalar(env_entries[0][1]) != "":
@@ -1536,10 +1625,16 @@ def audit_pr_head_checkouts(path: Path, text: str) -> list[str]:
         )
     if "pull_request" not in triggers:
         return errors
-    expected_expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+    expected_expression = (
+        ORACLE_SOURCE_SHA_EXPRESSION
+        if path.name == "render-oracle.yml"
+        else PR_HEAD_EXPRESSION
+    )
     jobs, job_errors = _workflow_job_step_sequences(active)
     errors.extend(f"{path}: {error}" for error in job_errors)
     for job_name, blocks in jobs:
+        if not blocks:
+            continue
         checkout_count = 0
         for index, (step_indent, block) in enumerate(blocks):
             entries = _step_mapping_entries(step_indent, block)
@@ -1662,9 +1757,61 @@ def audit_release_versions(path: Path, text: str) -> list[str]:
 def audit_fuzz_workflow(path: Path, text: str) -> list[str]:
     """Return violations for the standalone hosted fuzz workflow."""
 
-    return audit_fuzz_tools(
+    errors = audit_fuzz_tools(
         path, text, ("FUZZ_NIGHTLY_VERSION", "CARGO_FUZZ_VERSION")
     )
+    active = _without_commented_lines(text)
+    required = {
+        "      target:\n        description: Run the ordinary fuzz campaign or the branch-local Render Oracle workflow\n        required: true\n        default: fuzz\n        type: choice\n        options:\n          - fuzz\n          - render-oracle": (
+            "manual dispatch target must default to ordinary fuzz and explicitly "
+            "select the oracle bridge"
+        ),
+        "      baseline_mode:\n        description: Verify a tracked baseline or bootstrap a hosted full candidate\n        required: true\n        default: verify\n        type: choice\n        options:\n          - verify\n          - candidate": (
+            "oracle bridge must expose an exact candidate/verify choice"
+        ),
+        "    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'fuzz' }}": (
+            "ordinary fuzz must run unchanged for PR/schedule/default manual events"
+        ),
+        "    if: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'render-oracle' }}": (
+            "oracle bridge must run only after explicit manual selection"
+        ),
+        "    permissions:\n      contents: read\n    uses: ./.github/workflows/render-oracle.yml": (
+            "oracle bridge must use the same-commit local workflow with read-only contents"
+        ),
+        "      baseline_mode: ${{ inputs.baseline_mode }}": (
+            "oracle bridge must pass the selected baseline mode"
+        ),
+        "      bootstrap_identities: ${{ inputs.bootstrap_identities }}": (
+            "oracle bridge must pass the explicit identity bootstrap flag"
+        ),
+        "      campaign: ${{ inputs.campaign }}": (
+            "oracle bridge must pass the selected campaign"
+        ),
+        "      source_sha: ${{ github.sha }}": (
+            "oracle bridge must bind the exact dispatched branch commit"
+        ),
+    }
+    for snippet, message in required.items():
+        if active.count(snippet) != 1:
+            errors.append(f"{path}: {message}")
+    oracle_job = _single_yaml_block(
+        path,
+        active,
+        "render-oracle:",
+        2,
+        "render-oracle reusable job",
+        errors,
+    )
+    if (
+        "steps:" in oracle_job
+        or "secrets:" in oracle_job
+        or re.findall(r"^\s+uses:\s*(\S+)\s*$", oracle_job, re.MULTILINE)
+        != ["./.github/workflows/render-oracle.yml"]
+    ):
+        errors.append(
+            f"{path}: oracle bridge must contain only the reviewed local reusable call"
+        )
+    return errors
 
 
 def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
@@ -1784,24 +1931,122 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'assert host_tools["identity_status"] == "pinned_match"': (
             "normal campaigns must require the pinned host identity"
         ),
-        "if: always()": "must upload bootstrap or mismatch identity evidence",
-        'RXLS_ORACLE_CAMPAIGN: ${{ github.event_name == \'workflow_dispatch\' && inputs.campaign || \'pilot\' }}': (
-            "push and schedule runs must stay on the bounded pilot"
+        "- name: Stage validated bootstrap identity evidence": (
+            "must sanitize bootstrap identity evidence into the isolated upload stage"
         ),
-        'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"': (
-            "must verify the exact checked-out commit"
+        "target/render-oracle-upload": (
+            "must stage only already validated aggregate evidence for upload"
         ),
-        "timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'full' && 330 || 120 }}": (
-            "must keep the pilot at 120 minutes and bound explicit full campaigns at 330"
+        "if: ${{ success() }}": (
+            "must never upload aggregates after a failed validator or gate"
+        ),
+        'normalized_key.startswith("path")': (
+            "must structurally reject path-bearing key variants before staging"
+        ),
+        'normalized_key.endswith("path")': (
+            "must reject source_path, host_path, and equivalent key variants"
+        ),
+        'assert "\\\\" not in value': (
+            "must reject backslash-bearing path strings before staging"
+        ),
+        "traversal.search(value) is None": (
+            "must reject relative path traversal before staging"
+        ),
+        "artifact_extension.search(value) is None": (
+            "must reject relative workbook and render artifact names before staging"
+        ),
+        "aggregate_contracts = {": (
+            "must define an exact schema and top-level key contract for every aggregate"
+        ),
+        "assert set(document) == expected_keys": (
+            "must reject injected aggregate top-level fields before upload"
+        ),
+        "pull_request:\n    types: [labeled]": (
+            "must expose only the narrowly filtered pull-request label trigger"
+        ),
+        "  workflow_call:\n    inputs:": (
+            "must expose the exact branch-local reusable workflow entrypoint"
+        ),
+        "      source_sha:\n        description: Exact caller commit to check out and bind into evidence\n        required: true\n        type: string": (
+            "reusable workflow callers must provide an exact source SHA"
+        ),
+        f"    if: {ORACLE_PR_JOB_CONDITION}": (
+            "must reject fork heads and every pull-request label except the exact "
+            "pilot/full campaign labels before checkout"
+        ),
+        f"RXLS_ORACLE_CAMPAIGN: {ORACLE_CAMPAIGN_EXPRESSION}": (
+            "pull-request labels must select their exact pilot/full campaign while "
+            "push and schedule runs stay on pilot"
+        ),
+        f"RXLS_BASELINE_MODE: {ORACLE_BASELINE_MODE_EXPRESSION}": (
+            "baseline candidate/verify mode must be explicit only for manual or "
+            "reusable-workflow runs"
+        ),
+        f"RXLS_IDENTITY_BOOTSTRAP: {ORACLE_BOOTSTRAP_EXPRESSION}": (
+            "identity bootstrap must remain available only to explicit manual runs"
+        ),
+        f"          ref: {ORACLE_SOURCE_SHA_EXPRESSION}": (
+            "must check out the immutable pull-request head SHA"
+        ),
+        "          persist-credentials: false": (
+            "must disable persisted Git credentials in the oracle checkout"
+        ),
+        f"          EXPECTED_SHA: {ORACLE_SOURCE_SHA_EXPRESSION}": (
+            "must bind immediate source verification to the pull-request head SHA"
+        ),
+        (
+            "run: |\n"
+            "          set -euo pipefail\n"
+            '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n'
+            "          git diff --exit-code\n"
+            "          git diff --cached --exit-code"
+        ): (
+            "must verify the exact source revision and reject tracked or staged "
+            "checkout drift under strict Bash"
+        ),
+        f"timeout-minutes: {ORACLE_TIMEOUT_EXPRESSION}": (
+            "must keep pilots at 120 minutes and bound manual or pull-request full "
+            "campaigns at 330"
+        ),
+        f"EXPECTED_SOURCE_SHA: {ORACLE_SOURCE_SHA_EXPRESSION}": (
+            "must bind the reproducible image build to the pull-request head SHA"
+        ),
+        f"EXPECTED_HEAD_SHA: {ORACLE_SOURCE_SHA_EXPRESSION}": (
+            "must bind aggregate evidence to the pull-request head SHA"
+        ),
+        (
+            "name: render-oracle-"
+            f"{ORACLE_SOURCE_SHA_EXPRESSION}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}-"
+            f"{ORACLE_CAMPAIGN_EXPRESSION}-"
+            f"{ORACLE_BASELINE_MODE_EXPRESSION}"
+        ): (
+            "must bind the aggregate artifact name to the source SHA, run identity, "
+            "and selected campaign"
         ),
         '--profile "$RXLS_ORACLE_CAMPAIGN"': (
             "must generate and verify the selected deterministic profile"
         ),
-        'row.get("name") == "pdffonts"': (
-            "must select pdffonts from verified host identity evidence"
+        'assert set(rows) == {"pdffonts", "pdfinfo", "pdftoppm", "pdftotext"}': (
+            "must select the exact four-tool Poppler set from verified host evidence"
         ),
         '--pdffonts-binary-sha256 "$PDFFONTS_SHA256"': (
             "must bind PDF font inspection to the verified host binary"
+        ),
+        '--host-tools-identity-sha256 "$HOST_TOOLS_IDENTITY_SHA256"': (
+            "must bind reports to the complete verified host-tools closure"
+        ),
+        "- name: Run the project-native Type3 PDF Poppler smoke": (
+            "must run the project-owned native PDF Poppler smoke before campaigns"
+        ),
+        "pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens": (
+            "must attest Type3 path text and exact Poppler word boxes"
+        ),
+        "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text": (
+            "must attest project-native PDF page order and extractable text"
+        ),
+        "          command -v pdftoppm": (
+            "native PDF smoke must require the common Poppler raster backend"
         ),
         '--shard-count "$shard_count"': (
             "full campaigns must use the harness content-identity sharder"
@@ -1875,11 +2120,17 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'authored_gate["evidence"]["oracle_libreoffice_artifact_sha256"]': (
             "must bind authored-print evidence to the locked LibreOffice artifact"
         ),
-        'authored_gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256': (
-            "must bind authored-print text evidence to the pinned PDF inspector"
+        'for name, digest in poppler_sha256.items():': (
+            "must cross-bind every gate to all four exact Poppler executables"
         ),
-        '"schema": "rxls.render-oracle-hosted-campaign.v5"': (
+        'authored_gate["evidence"][f"{name}_sha256"] == digest': (
+            "must bind authored-print evidence to every pinned Poppler executable"
+        ),
+        '"schema": "rxls.render-oracle-hosted-campaign.v6"': (
             "must emit the aggregate-only hosted campaign contract"
+        ),
+        '"baseline_mode": baseline_mode': (
+            "aggregate evidence must bind candidate/verify baseline mode"
         ),
         '"acquired_corpus_included": False': (
             "must distinguish the 800-case hosted corpus from acquired-corpus evidence"
@@ -1890,8 +2141,17 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'assert warning_policy["unclassified_codes"] == []': (
             "must reject every warning code absent from the reviewed baseline"
         ),
-        '"reviewed_baseline_available": all(': (
+        '"reviewed_baseline_available": (': (
             "must distinguish a reviewed ratchet from a bootstrap candidate"
+        ),
+        'test ! -e scripts/render-parity-baseline-full.json || STATUS=1': (
+            "candidate mode must require the reviewed baseline to be absent"
+        ),
+        'git ls-files --error-unmatch scripts/render-parity-baseline-full.json': (
+            "verify mode must require a tracked reviewed baseline"
+        ),
+        'cmp --silent': (
+            "candidate bootstrap must authenticate the emitted review candidate"
         ),
         'gate["evidence"]["oracle_build_contract_sha256"]': (
             "must bind absolute-gate evidence to the exact container build"
@@ -1908,8 +2168,29 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '"wrapper_sha256": build["wrapper_sha256"]': (
             "aggregate evidence must preserve the authenticated wrapper identity"
         ),
-        'gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256': (
-            "must bind absolute-gate font inspection to the pinned host tool"
+        'gate["evidence"][f"{name}_sha256"] == digest': (
+            "must bind absolute-gate evidence to every pinned Poppler executable"
+        ),
+        'report["configuration"]["manifest_binding"] == corpus_binding': (
+            "must bind each full report to the exact generated corpus mapping"
+        ),
+        'authored_report["configuration"]["manifest_binding"] == authored_binding': (
+            "must bind authored-print reports to the deterministic manifest subset"
+        ),
+        'gate["evidence"]["host_tools_identity_sha256"]': (
+            "must preserve the complete host-tools closure through aggregate gates"
+        ),
+        "validate_native_pdf_and_page_evidence(report)": (
+            "must verify native Type3, page-order, bbox, and point geometry evidence"
+        ),
+        'gate["metrics"]["pdf_point_geometry_mismatches"] == 0': (
+            "must reject direct PDF point-geometry mismatches"
+        ),
+        "- name: Verify evidence source remained exact and clean": (
+            "must reverify the exact clean source immediately before upload"
+        ),
+        'test -z "$(git status --porcelain=v1 --untracked-files=all)"': (
+            "must reject late tracked or untracked source-tree drift"
         ),
         "compression-level: 9": "must bound aggregate artifact transfer size",
     }
@@ -1920,9 +2201,23 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         errors.append(f"{path}: mutable Python minor selectors are forbidden")
     if "runtime_verified_unpinned" in text or "runtime_verified" in text:
         errors.append(f"{path}: normal oracle gates must not accept unpinned identities")
-    if re.search(r"check-render-parity-baseline\.py(?s:.*?)--create", text):
+    candidate_branch = re.search(
+        r"(?ms)^\s{14}candidate\)\s*$"
+        r"(?P<body>.*?)"
+        r"^\s{16};;\s*$",
+        active,
+    )
+    if (
+        active.count("--create") != 1
+        or candidate_branch is None
+        or candidate_branch.group("body").count("--create") != 1
+        or "scripts/render-parity-baseline-full.json" not in candidate_branch.group(
+            "body"
+        )
+    ):
         errors.append(
-            f"{path}: hosted gates must not auto-approve their own reviewed baseline"
+            f"{path}: baseline creation must be isolated to the fail-closed "
+            "candidate branch"
         )
 
     exact_assignments = {
@@ -1941,7 +2236,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
 
     campaign_input = re.search(
         r"(?ms)^\s{6}campaign:\s*$"
-        r"(?P<body>.*?)(?=^\s{6}bootstrap_identities:\s*$)",
+        r"(?P<body>.*?)(?=^\s{6}baseline_mode:\s*$)",
         text,
     )
     if campaign_input is None:
@@ -1956,6 +2251,28 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ):
             errors.append(
                 f"{path}: workflow_dispatch campaign must be an exact pilot/full choice"
+            )
+    baseline_input = re.search(
+        r"(?ms)^\s{6}baseline_mode:\s*$"
+        r"(?P<body>.*?)(?=^\s{6}bootstrap_identities:\s*$)",
+        text,
+    )
+    if baseline_input is None:
+        errors.append(
+            f"{path}: missing workflow_dispatch candidate/verify baseline choice"
+        )
+    else:
+        body = baseline_input.group("body")
+        if (
+            "type: choice" not in body
+            or "default: verify" not in body
+            or len(re.findall(r"^\s+- verify\s*$", body, re.MULTILINE)) != 1
+            or len(re.findall(r"^\s+- candidate\s*$", body, re.MULTILINE))
+            != 1
+        ):
+            errors.append(
+                f"{path}: workflow_dispatch baseline mode must be an exact "
+                "candidate/verify choice"
             )
 
     if re.search(
@@ -1978,6 +2295,42 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         )
     ) != 2:
         errors.append(f"{path}: pilot/full evidence needs one absolute gate per campaign")
+    if text.count("| tee target/render-oracle-hosted/fidelity-") != 2:
+        errors.append(
+            f"{path}: absolute-gate aggregate diagnostics must remain visible on failure"
+        )
+    if (
+        text.count(
+            "| tee target/render-oracle-hosted/authored-print-gate.json"
+        )
+        != 1
+    ):
+        errors.append(
+            f"{path}: authored-print aggregate diagnostics must remain visible on failure"
+        )
+
+    late_clean_marker = "      - name: Verify evidence source remained exact and clean"
+    upload_marker = "      - name: Upload path-neutral aggregate identities only"
+    late_clean_index = active.find(late_clean_marker)
+    upload_index = active.find(upload_marker)
+    next_step = (
+        active.find("\n      - ", late_clean_index + len(late_clean_marker))
+        if late_clean_index >= 0
+        else -1
+    )
+    if (
+        active.count(late_clean_marker) != 1
+        or active.count(upload_marker) != 1
+        or upload_index < 0
+        or next_step != upload_index - 1
+    ):
+        errors.append(
+            f"{path}: the exact clean-source verifier must be the final step before upload"
+        )
+    if active.count("          persist-credentials: false") != 1:
+        errors.append(
+            f"{path}: oracle checkout must disable persisted credentials exactly once"
+        )
 
     upload = re.search(
         r"(?ms)^\s+- name: Upload path-neutral aggregate identities only\s*$"
@@ -1986,18 +2339,18 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         text,
     )
     allowed_artifacts = {
-        "target/render-oracle-hosted/authored-print-gate.json",
-        "target/render-oracle-hosted/baseline-candidate-a.json",
-        "target/render-oracle-hosted/baseline-candidate-b.json",
-        "target/render-oracle-hosted/baseline-gate-a.json",
-        "target/render-oracle-hosted/baseline-gate-b.json",
-        "target/render-oracle-hosted/build.json",
-        "target/render-oracle-hosted/fidelity-a.json",
-        "target/render-oracle-hosted/fidelity-b.json",
-        "target/render-oracle-hosted/hosted-summary.json",
-        "target/render-oracle-hosted/host-tools.json",
-        "target/render-oracle-hosted/repeatability.json",
-        "target/render-oracle-hosted/renderer.json",
+        "target/render-oracle-upload/authored-print-gate.json",
+        "target/render-oracle-upload/baseline-candidate-a.json",
+        "target/render-oracle-upload/baseline-candidate-b.json",
+        "target/render-oracle-upload/baseline-gate-a.json",
+        "target/render-oracle-upload/baseline-gate-b.json",
+        "target/render-oracle-upload/build.json",
+        "target/render-oracle-upload/fidelity-a.json",
+        "target/render-oracle-upload/fidelity-b.json",
+        "target/render-oracle-upload/hosted-summary.json",
+        "target/render-oracle-upload/host-tools.json",
+        "target/render-oracle-upload/repeatability.json",
+        "target/render-oracle-upload/renderer.json",
     }
     if upload is None:
         errors.append(f"{path}: aggregate-only artifact allowlist is missing")
@@ -2391,6 +2744,14 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
     worker_job = _single_yaml_block(
         path, active, "worker-wasm:", 2, "worker-wasm job", errors
     )
+    if re.findall(r"^\s{4}runs-on:\s*(\S+)\s*$", worker_job, re.MULTILINE) != [
+        "ubuntu-24.04"
+    ]:
+        errors.append(f"{path}: browser worker must pin ubuntu-24.04")
+    if worker_job.count("          persist-credentials: false") != 1:
+        errors.append(
+            f"{path}: browser checkout must disable persisted Git credentials"
+        )
     metadata_step = _single_yaml_block(
         path,
         worker_job,
@@ -2440,6 +2801,297 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: installed Node 20 browser smoke must explicitly enable WebSocket"
         )
+    chrome_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Install exact Chrome for Testing",
+        6,
+        "exact Chrome installation step",
+        errors,
+    )
+    for snippet, message in {
+        "        shell: bash": "Chrome installation must use explicit Bash",
+        "          set -euo pipefail": (
+            "Chrome installation must fail closed across every pipeline"
+        ),
+        'sudo chown root:root "$chrome_root/chrome_sandbox"': (
+            "Chrome sandbox must be owned by root"
+        ),
+        'sudo chmod 4755 "$chrome_root/chrome_sandbox"': (
+            "Chrome sandbox must retain setuid mode 4755"
+        ),
+        'test "$(stat --format=%u "$chrome_root/chrome_sandbox")" = "0"': (
+            "Chrome sandbox owner must be verified"
+        ),
+        'test "$(stat --format=%a "$chrome_root/chrome_sandbox")" = "4755"': (
+            "Chrome sandbox mode must be verified"
+        ),
+        'ldd "$chrome_root/chrome" | tee "$RUNNER_TEMP/rxls-chromium-ldd.txt"': (
+            "Chrome runtime dependencies must be inspected"
+        ),
+        'grep -Fq "not found" "$RUNNER_TEMP/rxls-chromium-ldd.txt"': (
+            "Chrome runtime inspection must fail on unresolved libraries"
+        ),
+        (
+            'printf \'%s\\n\' "PASS pinned Chromium runtime closure resolved" '
+            "\\\n            > target/render-browser-evidence/chromium-runtime.txt"
+        ): "Chrome runtime preflight must retain only path-neutral PASS evidence",
+        (
+            'echo "CHROME_DEVEL_SANDBOX=$GITHUB_WORKSPACE/target/render-chrome/'
+            'chrome-linux64/chrome_sandbox" >> "$GITHUB_ENV"'
+        ): "Chrome launch must export the exact verified sandbox",
+    }.items():
+        if snippet not in chrome_step:
+            errors.append(f"{path}: {message}")
+    for step_name, pipeline in (
+        (
+            "- name: Exercise worker under strict CSP in pinned Chromium",
+            (
+                "npm run test:browser 2>&1 | tee "
+                "../../target/render-browser-evidence/chromium.log"
+            ),
+        ),
+        (
+            "- name: Pack and consume the publishable artifact",
+            (
+                "2>&1 | tee "
+                "../render-browser-evidence/installed-package-chromium.log"
+            ),
+        ),
+    ):
+        step = _single_yaml_block(
+            path,
+            worker_job,
+            step_name,
+            6,
+            f"{step_name[8:]} step",
+            errors,
+        )
+        if "        shell: bash\n" not in step:
+            errors.append(f"{path}: {step_name[8:]} must use explicit Bash")
+        if "          set -euo pipefail\n" not in step:
+            errors.append(
+                f"{path}: {step_name[8:]} must fail closed across tee pipelines"
+            )
+        if pipeline not in step:
+            errors.append(
+                f"{path}: {step_name[8:]} must retain its authenticated pipeline"
+            )
+    final_source_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Verify evidence source remained exact and clean",
+        6,
+        "late browser source verifier",
+        errors,
+    )
+    for snippet, message in {
+        "        shell: bash": "late source verification must use explicit Bash",
+        f"          EXPECTED_SHA: {PR_HEAD_EXPRESSION}": (
+            "late source verification must bind the expected immutable HEAD"
+        ),
+        "          set -euo pipefail": (
+            "late source verification must use strict Bash"
+        ),
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"': (
+            "late source verification must re-check exact HEAD"
+        ),
+        "          git diff --exit-code": (
+            "late source verification must reject unstaged drift"
+        ),
+        "          git diff --cached --exit-code": (
+            "late source verification must reject staged drift"
+        ),
+    }.items():
+        if snippet not in final_source_step:
+            errors.append(f"{path}: {message}")
+    final_index = worker_job.find(
+        "- name: Verify evidence source remained exact and clean"
+    )
+    summary_name = "- name: Build path-neutral exact-SHA browser evidence"
+    summary_step = _single_yaml_block(
+        path,
+        worker_job,
+        summary_name,
+        6,
+        "path-neutral exact-SHA browser evidence step",
+        errors,
+    )
+    summary_top_keys = []
+    for line in summary_step.splitlines()[1:]:
+        if len(line) - len(line.lstrip(" ")) != 8:
+            continue
+        entry = _yaml_mapping_entry(
+            _strip_yaml_inline_comment(line.lstrip(" "))
+        )
+        if entry is not None:
+            summary_top_keys.append(entry[0])
+    if summary_top_keys != ["shell", "env", "run"]:
+        errors.append(
+            f"{path}: browser evidence build must use only exact shell, env, and run fields"
+        )
+    summary_requirements = {
+        "        shell: bash": (
+            "browser evidence build must run under explicit Bash"
+        ),
+        f"          EXPECTED_SHA: {PR_HEAD_EXPRESSION}": (
+            "browser evidence build must bind the immutable source SHA"
+        ),
+        "          set -euo pipefail": (
+            "browser evidence build must use strict Bash"
+        ),
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"': (
+            "browser evidence build must reverify immutable HEAD"
+        ),
+        "python3 scripts/check_render_browser_release_evidence.py build": (
+            "browser evidence must be built by the checked verifier"
+        ),
+        "--source-log target/render-browser-evidence/chromium.log": (
+            "browser evidence must bind the source-package browser log"
+        ),
+        (
+            "--installed-log target/render-browser-evidence/"
+            "installed-package-chromium.log"
+        ): "browser evidence must bind the installed-package browser log",
+        "--runtime-evidence target/render-browser-evidence/chromium-runtime.txt": (
+            "browser evidence must bind the pinned runtime preflight"
+        ),
+        "--npm-pack target/render-browser-evidence/npm-pack.json": (
+            "browser evidence must bind exact npm pack metadata"
+        ),
+        (
+            '--npm-archive "target/render-browser-evidence/'
+            'rxls-render-worker-${version}.tgz"'
+        ): "browser evidence must bind the packed archive bytes",
+        '--head-sha "$EXPECTED_SHA"': (
+            "browser evidence build and verify must bind exact HEAD"
+        ),
+        "--platform linux": (
+            "browser evidence build and verify must bind the hosted Linux gate"
+        ),
+        '--repository "$GITHUB_REPOSITORY"': (
+            "browser evidence build and verify must bind the repository"
+        ),
+        '--workflow-run-id "$GITHUB_RUN_ID"': (
+            "browser evidence build and verify must bind the run ID"
+        ),
+        '--workflow-run-attempt "$GITHUB_RUN_ATTEMPT"': (
+            "browser evidence build and verify must bind the run attempt"
+        ),
+        "--output target/render-browser-evidence/browser-summary.json": (
+            "browser evidence must emit only the path-neutral summary"
+        ),
+        "python3 scripts/check_render_browser_release_evidence.py verify": (
+            "browser evidence must be independently reverified before upload"
+        ),
+        "--summary target/render-browser-evidence/browser-summary.json": (
+            "browser evidence verifier must consume the exact staged summary"
+        ),
+        "          git diff --exit-code": (
+            "browser evidence build must reject late unstaged drift"
+        ),
+        "          git diff --cached --exit-code": (
+            "browser evidence build must reject late staged drift"
+        ),
+    }
+    for snippet, message in summary_requirements.items():
+        if snippet not in summary_step:
+            errors.append(f"{path}: {message}")
+    for repeated in (
+        '--head-sha "$EXPECTED_SHA"',
+        '--repository "$GITHUB_REPOSITORY"',
+        '--workflow-run-id "$GITHUB_RUN_ID"',
+        '--workflow-run-attempt "$GITHUB_RUN_ATTEMPT"',
+        "--platform linux",
+    ):
+        if summary_step.count(repeated) != 2:
+            errors.append(
+                f"{path}: browser evidence build and verify must each use {repeated}"
+            )
+    ordered_summary_commands = (
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+        "python3 scripts/check_render_browser_release_evidence.py build",
+        "python3 scripts/check_render_browser_release_evidence.py verify",
+        "git diff --exit-code",
+        "git diff --cached --exit-code",
+    )
+    summary_positions = [
+        summary_step.find(command) for command in ordered_summary_commands
+    ]
+    if any(index < 0 for index in summary_positions) or summary_positions != sorted(
+        summary_positions
+    ):
+        errors.append(
+            f"{path}: browser evidence must build, verify, and late-clean in exact order"
+        )
+
+    upload_name = "- name: Upload browser-rendering evidence"
+    upload_step = _single_yaml_block(
+        path,
+        worker_job,
+        upload_name,
+        6,
+        "browser summary upload step",
+        errors,
+    )
+    upload_requirements = {
+        "        if: ${{ success() }}": (
+            "browser summary upload must be success-only"
+        ),
+        f"        uses: {ORACLE_UPLOAD_ARTIFACT_ACTION}": (
+            "browser summary upload must use the pinned artifact action"
+        ),
+        (
+            "          name: render-browser-"
+            f"{PR_HEAD_EXPRESSION}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        ): "browser artifact name must bind SHA, run ID, and run attempt",
+        "          path: target/render-browser-evidence/browser-summary.json": (
+            "browser upload must contain only the path-neutral summary"
+        ),
+        "          if-no-files-found: error": (
+            "browser summary upload must fail when evidence is absent"
+        ),
+        "          retention-days: 14": (
+            "browser evidence retention must remain bounded"
+        ),
+        "          compression-level: 9": (
+            "browser summary transfer must retain bounded compression"
+        ),
+    }
+    for snippet, message in upload_requirements.items():
+        if snippet not in upload_step:
+            errors.append(f"{path}: {message}")
+    summary_index = worker_job.find(summary_name)
+    upload_index = worker_job.find(upload_name)
+    next_after_source = (
+        worker_job.find("\n      - ", final_index + len(
+            "- name: Verify evidence source remained exact and clean"
+        ))
+        if final_index >= 0
+        else -1
+    )
+    next_after_summary = (
+        worker_job.find("\n      - ", summary_index + len(summary_name))
+        if summary_index >= 0
+        else -1
+    )
+    if (
+        final_index < 0
+        or summary_index < 0
+        or next_after_source + 7 != summary_index
+    ):
+        errors.append(
+            f"{path}: late exact-source verification must immediately precede summary build"
+        )
+    if (
+        summary_index < 0
+        or upload_index < 0
+        or next_after_summary + 7 != upload_index
+    ):
+        errors.append(
+            f"{path}: verified browser summary build must immediately precede upload"
+        )
     return errors
 
 
@@ -2475,24 +3127,81 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ".github/workflows/render-browser.yml": (
             "must require the exact-SHA push render-browser path"
         ),
+        (
+            'browser_artifact_name="render-browser-${GITHUB_SHA}-'
+            '${browser_run_id}-${browser_run_attempt}"'
+        ): (
+            "must select the SHA-, run-, and attempt-bound browser summary artifact"
+        ),
+        "actions/runs/$browser_run_id/artifacts": (
+            "must inspect artifacts from the selected exact browser run"
+        ),
+        'test "${#matching_browser_artifacts[@]}" = "1"': (
+            "must require exactly one browser summary artifact"
+        ),
+        '"$browser_artifact_id" =~ ^[1-9][0-9]*$': (
+            "must require a positive immutable browser artifact ID"
+        ),
+        '&& "$expired" == "false"': (
+            "must reject expired hosted prerequisite artifacts"
+        ),
+        '&& "$size_bytes" -le 1048576': (
+            "must bound the browser summary archive size"
+        ),
+        "python3 scripts/check_render_browser_release_evidence.py download": (
+            "must authenticate, download, extract, and verify browser evidence"
+        ),
+        '--artifact-id "$browser_artifact_id"': (
+            "browser verifier must bind the exact artifact ID"
+        ),
+        '--artifact-name "$browser_artifact_name"': (
+            "browser verifier must bind the exact artifact name"
+        ),
+        '--artifact-size-bytes "$size_bytes"': (
+            "browser verifier must bind the hosted artifact size"
+        ),
+        '--artifact-digest "$digest"': (
+            "browser verifier must bind the immutable hosted artifact digest"
+        ),
+        '--head-sha "$GITHUB_SHA"': (
+            "browser verifier must bind the release candidate SHA"
+        ),
+        "--platform linux": (
+            "browser verifier must bind the hosted Linux evidence platform"
+        ),
+        '--workflow-run-id "$browser_run_id"': (
+            "browser verifier must bind the selected run ID"
+        ),
+        '--workflow-run-attempt "$browser_run_attempt"': (
+            "browser verifier must bind the selected run attempt"
+        ),
+        "--output target/render-package/browser-prerequisite.json": (
+            "must preserve the authenticated browser release receipt"
+        ),
         "'[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv'": (
             "must revalidate hosted run SHA, event, conclusion, status, path, "
             "and attempt"
         ),
-        "--workflow render-oracle.yml": (
-            "must require a successful exact-SHA Render Oracle run"
+        "for oracle_workflow in fuzz.yml render-oracle.yml; do": (
+            "must inspect only the registered branch bridge and direct oracle workflows"
+        ),
+        '--workflow "$oracle_workflow"': (
+            "must require a successful exact-SHA Render Oracle bridge run"
         ),
         '&& "$event" == "workflow_dispatch"': (
             "must accept full-oracle evidence only from deliberate dispatch"
         ),
-        '&& "$run_path" == ".github/workflows/render-oracle.yml"': (
-            "must validate the Render Oracle workflow path"
+        '( "$run_path" == ".github/workflows/fuzz.yml" \\': (
+            "must validate the registered Render Oracle bridge path"
+        ),
+        '|| "$run_path" == ".github/workflows/render-oracle.yml" )': (
+            "must validate the direct Render Oracle workflow path"
         ),
         '"$run_attempt" =~ ^[1-9][0-9]*$': (
             "must require a positive immutable hosted run attempt"
         ),
-        'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"': (
-            "must select only the exact-SHA, run-bound full-campaign artifact"
+        'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-verify"': (
+            "must select only the exact-SHA, run-bound full/verify artifact"
         ),
         'actions/runs/$run_id/artifacts': (
             "must inspect the selected run's artifact metadata"
@@ -2505,6 +3214,18 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         "--reviewed-baseline scripts/render-parity-baseline-full.json": (
             "must bind oracle ratchets to the checked reviewed baseline"
+        ),
+        "--baseline-mode verify": (
+            "release selection must reject candidate-mode oracle evidence"
+        ),
+        "--campaign full": (
+            "release selection must reject pilot oracle evidence"
+        ),
+        'prerequisites.get("baseline_mode") != "verify"': (
+            "release receipt must reverify baseline mode"
+        ),
+        'prerequisites.get("campaign") != "full"': (
+            "release receipt must reverify campaign scope"
         ),
         "oracle-prerequisite.json": (
             "must preserve and reverify aggregate oracle prerequisite evidence"
@@ -2545,6 +3266,15 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         "python3 scripts/test_check_render_oracle_release_evidence.py": (
             "must run the focused oracle-evidence tests"
+        ),
+        "python3 scripts/test_check_render_browser_release_evidence.py": (
+            "must run the focused browser-evidence tests"
+        ),
+        "browser-proven package differs from release candidate": (
+            "dry-run package must equal the browser-proven archive identity"
+        ),
+        "Render Browser prerequisite evidence differs": (
+            "publication must reverify the authenticated browser receipt"
         ),
         "npm publish --dry-run --ignore-scripts --access public": (
             "must execute the registry publication dry run"
@@ -2616,6 +3346,16 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: expected two deterministic SBOM generations and one exact validation"
         )
+    if (
+        text.count("browser-prerequisite.json") != 3
+        or text.count(
+            "scripts/check_render_browser_release_evidence.py download"
+        )
+        != 1
+    ):
+        errors.append(
+            f"{path}: browser evidence must produce one receipt and reverify it twice"
+        )
     hosted_gate_calls = re.findall(
         r"^\s*require_successful_run(?:\s|\\)", text, re.MULTILINE
     )
@@ -2629,6 +3369,141 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     verify_job = _single_yaml_block(
         path, active, "verify:", 2, "render package verify job", errors
     )
+    prerequisite_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Require exact-SHA hosted gates and reviewed full oracle evidence",
+        6,
+        "hosted prerequisite evidence step",
+        errors,
+    )
+    prerequisite_top_keys = []
+    for line in prerequisite_step.splitlines()[1:]:
+        if len(line) - len(line.lstrip(" ")) != 8:
+            continue
+        entry = _yaml_mapping_entry(
+            _strip_yaml_inline_comment(line.lstrip(" "))
+        )
+        if entry is not None:
+            prerequisite_top_keys.append(entry[0])
+    if prerequisite_top_keys != ["if", "env", "shell", "run"]:
+        errors.append(
+            f"{path}: hosted prerequisite step must use only exact if, env, shell, and run fields"
+        )
+    for snippet, message in {
+        "        if: github.event_name == 'push'": (
+            "hosted browser evidence must be required on tag publication"
+        ),
+        "          GH_TOKEN: ${{ github.token }}": (
+            "artifact authentication must use the scoped workflow token"
+        ),
+        "        shell: bash": (
+            "hosted prerequisite verification must use explicit Bash"
+        ),
+        "          set -euo pipefail": (
+            "hosted prerequisite verification must use strict Bash"
+        ),
+        (
+            'browser_artifact_name="render-browser-${GITHUB_SHA}-'
+            '${browser_run_id}-${browser_run_attempt}"'
+        ): "browser artifact lookup must bind exact SHA, run, and attempt",
+        (
+            '"repos/$GITHUB_REPOSITORY/actions/runs/'
+            '$browser_run_id/artifacts"'
+        ): "browser artifact lookup must remain scoped to the selected run",
+        (
+            "--jq '.artifacts[] | [.id, .name, .expired, "
+            ".size_in_bytes, .digest] | @tsv'"
+        ): "browser artifact lookup must retain all authenticated metadata",
+        'test "${#matching_browser_artifacts[@]}" = "1"': (
+            "browser artifact lookup must resolve exactly one summary"
+        ),
+        "python3 scripts/check_render_browser_release_evidence.py download": (
+            "browser summary must be downloaded through the checked verifier"
+        ),
+        '--repository "$GITHUB_REPOSITORY"': (
+            "browser download must bind the authenticated repository"
+        ),
+        '--artifact-id "$browser_artifact_id"': (
+            "browser download must bind the artifact ID"
+        ),
+        '--artifact-name "$browser_artifact_name"': (
+            "browser download must bind the exact artifact name"
+        ),
+        '--artifact-size-bytes "$size_bytes"': (
+            "browser download must bind the hosted byte count"
+        ),
+        '--artifact-digest "$digest"': (
+            "browser download must bind the immutable artifact digest"
+        ),
+        '--head-sha "$GITHUB_SHA"': (
+            "browser download must bind the release SHA"
+        ),
+        '--workflow-run-id "$browser_run_id"': (
+            "browser download must bind the selected run"
+        ),
+        '--workflow-run-attempt "$browser_run_attempt"': (
+            "browser download must bind the selected attempt"
+        ),
+        "--output target/render-package/browser-prerequisite.json": (
+            "browser verifier receipt must be preserved with the candidate"
+        ),
+    }.items():
+        if snippet not in prerequisite_step:
+            errors.append(f"{path}: {message}")
+    if prerequisite_step.count(
+        "python3 scripts/check_render_browser_release_evidence.py download"
+    ) != 1:
+        errors.append(
+            f"{path}: browser prerequisite artifact must be downloaded and verified exactly once"
+        )
+    prerequisite_commands = _normalized_active_commands(prerequisite_step)
+    exact_browser_artifact_guard = (
+        '[[ "$browser_artifact_id" =~ ^[1-9][0-9]*$ '
+        '&& "$expired" == "false" '
+        '&& "$size_bytes" =~ ^[1-9][0-9]*$ '
+        '&& "$size_bytes" -le 1048576 '
+        '&& "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]'
+    )
+    if prerequisite_commands.count(exact_browser_artifact_guard) != 1:
+        errors.append(
+            f"{path}: browser artifact metadata must pass the exact immutable bounded guard"
+        )
+    exact_browser_download = (
+        "python3 scripts/check_render_browser_release_evidence.py download "
+        '--repository "$GITHUB_REPOSITORY" '
+        '--artifact-id "$browser_artifact_id" '
+        '--artifact-name "$browser_artifact_name" '
+        '--artifact-size-bytes "$size_bytes" '
+        '--artifact-digest "$digest" '
+        '--head-sha "$GITHUB_SHA" '
+        "--platform linux "
+        '--workflow-run-id "$browser_run_id" '
+        '--workflow-run-attempt "$browser_run_attempt" '
+        "--output target/render-package/browser-prerequisite.json"
+    )
+    if prerequisite_commands.count(exact_browser_download) != 1:
+        errors.append(
+            f"{path}: browser evidence download must retain every exact hosted binding"
+        )
+    prerequisite_order = (
+        "render-browser.yml \\",
+        'browser_run_id="$SELECTED_RUN_ID"',
+        'browser_artifact_name="render-browser-',
+        "actions/runs/$browser_run_id/artifacts",
+        'test "${#matching_browser_artifacts[@]}" = "1"',
+        "python3 scripts/check_render_browser_release_evidence.py download",
+        "for oracle_workflow in fuzz.yml render-oracle.yml; do",
+    )
+    prerequisite_positions = [
+        prerequisite_step.find(value) for value in prerequisite_order
+    ]
+    if any(index < 0 for index in prerequisite_positions) or prerequisite_positions != sorted(
+        prerequisite_positions
+    ):
+        errors.append(
+            f"{path}: browser run, artifact, verifier, and oracle gates must retain exact order"
+        )
     build_step = _single_yaml_block(
         path,
         verify_job,

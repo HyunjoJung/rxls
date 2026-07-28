@@ -98,6 +98,9 @@ def write_bundle(
             sheet["report"]["font_pack_sha256"] = font_pack_sha256
             sheet["report"]["font_faces"] = list(font_faces or [])
         if print_pages:
+            pdf_filename = f"sheet-{index:04d}.pdf"
+            pdf_payload = b"%PDF-mocked"
+            (bundle_dir / pdf_filename).write_bytes(pdf_payload)
             page_filename = f"sheet-{index:04d}-pages/page-0001.svg"
             page_payload = (
                 '<svg xmlns="http://www.w3.org/2000/svg" width="816" '
@@ -142,7 +145,11 @@ def write_bundle(
                         "sha256": hashlib.sha256(page_payload).hexdigest(),
                     }
                 ],
-                "pdf": None,
+                "pdf": {
+                    "file": pdf_filename,
+                    "bytes": len(pdf_payload),
+                    "sha256": hashlib.sha256(pdf_payload).hexdigest(),
+                },
                 "png_dpi": None,
                 "png_pages": [],
             }
@@ -167,90 +174,101 @@ def write_bundle(
     )
 
 
-def write_authored_bundle(bundle_dir: Path, source: Path) -> None:
+def write_authored_bundle(
+    bundle_dir: Path,
+    source: Path,
+    *,
+    visibilities: tuple[str, ...] = ("visible",),
+) -> None:
     write_bundle(
         bundle_dir,
         source,
+        visibilities=visibilities,
         print_pages=True,
         print_schema_version=2,
     )
     manifest_path = bundle_dir / "render-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    print_bundle = manifest["sheets"][0]["print"]
-    del print_bundle["layout_override"]
-    print_bundle["page_count"] = 4
-    first_page = bundle_dir / print_bundle["svg_pages"][0]["file"]
-    page_payload = first_page.read_bytes()
-    page_artifacts = []
-    page_scenes = []
-    for index in range(4):
-        filename = f"sheet-0000-pages/page-{index + 1:04d}.svg"
-        path = bundle_dir / filename
-        if index:
-            path.write_bytes(page_payload)
-        page_artifacts.append(
-            {
-                "file": filename,
-                "bytes": len(page_payload),
-                "sha256": hashlib.sha256(page_payload).hexdigest(),
-            }
-        )
-        page_scenes.append(
-            {
-                "index": index,
-                "sha256": hashlib.sha256(f"authored scene {index}".encode()).hexdigest(),
-            }
-        )
-    print_bundle["svg_pages"] = page_artifacts
-    print_bundle["page_scenes"] = page_scenes
-    report_path = bundle_dir / print_bundle["report"]["file"]
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    del report["layout_override"]
-    report.update(
-        {
-            "paper": {"code": 1, "width_raw": 835584, "height_raw": 1081344},
-            "content_rect": {
-                "x_raw": 49152,
-                "y_raw": 73728,
-                "width_raw": 737280,
-                "height_raw": 933888,
-            },
-            "page_order": "over_then_down",
-            "manual_row_breaks": [8],
-            "manual_col_breaks": [3],
-            "scale_permille": 850,
-            "logical_pages": 4,
-            "sparse_pages_omitted": 0,
-            "pages": [
+    for sheet_index, sheet in enumerate(manifest["sheets"]):
+        print_bundle = sheet["print"]
+        del print_bundle["layout_override"]
+        print_bundle["page_count"] = 4
+        first_page = bundle_dir / print_bundle["svg_pages"][0]["file"]
+        page_payload = first_page.read_bytes()
+        page_artifacts = []
+        page_scenes = []
+        for page_index in range(4):
+            filename = (
+                f"sheet-{sheet_index:04d}-pages/page-{page_index + 1:04d}.svg"
+            )
+            path = bundle_dir / filename
+            if page_index:
+                path.write_bytes(page_payload)
+            page_artifacts.append(
                 {
-                    "output_index": index,
-                    "displayed_page_number": index + 1,
-                    "area_index": 0,
-                    "horizontal_index": index % 2,
-                    "vertical_index": index // 2,
-                    "manual_col_break_before": index % 2 == 1,
-                    "manual_row_break_before": index >= 2,
-                    "body_range": {
-                        "first_row": 1 if index < 2 else 8,
-                        "first_col": 0 if index % 2 == 0 else 3,
-                        "last_row": 7 if index < 2 else 17,
-                        "last_col": 2 if index % 2 == 0 else 5,
-                    },
-                    "repeat_rows": [0, 0],
-                    "repeat_cols": [5, 5],
-                    "scale_permille": 850,
+                    "file": filename,
+                    "bytes": len(page_payload),
+                    "sha256": hashlib.sha256(page_payload).hexdigest(),
                 }
-                for index in range(4)
-            ],
+            )
+            page_scenes.append(
+                {
+                    "index": page_index,
+                    "sha256": hashlib.sha256(
+                        f"authored scene {sheet_index}:{page_index}".encode()
+                    ).hexdigest(),
+                }
+            )
+        print_bundle["svg_pages"] = page_artifacts
+        print_bundle["page_scenes"] = page_scenes
+        report_path = bundle_dir / print_bundle["report"]["file"]
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        del report["layout_override"]
+        report.update(
+            {
+                "paper": {"code": 1, "width_raw": 835584, "height_raw": 1081344},
+                "content_rect": {
+                    "x_raw": 49152,
+                    "y_raw": 73728,
+                    "width_raw": 737280,
+                    "height_raw": 933888,
+                },
+                "page_order": "over_then_down",
+                "manual_row_breaks": [8],
+                "manual_col_breaks": [3],
+                "scale_permille": 850,
+                "logical_pages": 4,
+                "sparse_pages_omitted": 0,
+                "pages": [
+                    {
+                        "output_index": page_index,
+                        "displayed_page_number": page_index + 1,
+                        "area_index": 0,
+                        "horizontal_index": page_index % 2,
+                        "vertical_index": page_index // 2,
+                        "manual_col_break_before": page_index % 2 == 1,
+                        "manual_row_break_before": page_index >= 2,
+                        "body_range": {
+                            "first_row": 1 if page_index < 2 else 8,
+                            "first_col": 0 if page_index % 2 == 0 else 3,
+                            "last_row": 7 if page_index < 2 else 17,
+                            "last_col": 2 if page_index % 2 == 0 else 5,
+                        },
+                        "repeat_rows": [0, 0],
+                        "repeat_cols": [5, 5],
+                        "scale_permille": 850,
+                    }
+                    for page_index in range(4)
+                ],
+            }
+        )
+        report_payload = json.dumps(report, sort_keys=True).encode()
+        report_path.write_bytes(report_payload)
+        print_bundle["report"] = {
+            "file": report_path.name,
+            "bytes": len(report_payload),
+            "sha256": hashlib.sha256(report_payload).hexdigest(),
         }
-    )
-    report_payload = json.dumps(report, sort_keys=True).encode()
-    report_path.write_bytes(report_payload)
-    print_bundle["report"] = {
-        "file": report_path.name,
-        "bytes": len(report_payload),
-        "sha256": hashlib.sha256(report_payload).hexdigest(),
-    }
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
 
@@ -370,6 +388,17 @@ def pdffonts_payload(
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
+def poppler_identity(digest: str = "f") -> dict[str, str]:
+    return {
+        "host_tools_identity_sha256": "b" * 64,
+        "kind": "poppler",
+        "pdffonts_sha256": digest * 64,
+        "pdfinfo_sha256": "e" * 64,
+        "pdftoppm_sha256": "d" * 64,
+        "pdftotext_sha256": "c" * 64,
+    }
+
+
 def write_oracle_lock(
     root: Path,
     *,
@@ -470,6 +499,9 @@ class FakeRunner:
         env,
         timeout_seconds,
         output_limit_bytes,
+        file_output_roots=(),
+        file_output_limit_bytes=None,
+        file_output_count_limit=None,
     ):
         command = list(command)
         self.commands.append(command)
@@ -488,6 +520,56 @@ class FakeRunner:
             (output / f"{self.source.stem}.pdf").write_bytes(b"%PDF-mocked")
             return MODULE.CommandResult("ok", 0, b"convert ok\n", b"")
         raise AssertionError(f"unexpected command: {command!r}")
+
+
+class CommonPdfRunner(FakeRunner):
+    """Exercise both native PDFs through the same mocked Poppler commands."""
+
+    def run(self, command, **kwargs):
+        command = list(command)
+        if "bundle" in command:
+            self.commands.append(command)
+            output = Path(command[command.index("--output-dir") + 1])
+            write_bundle(output, self.source, print_pages=True)
+            return MODULE.CommandResult("ok", 0, b"bundle ok\n", b"")
+        name = Path(command[0]).name
+        if name == "pdfinfo":
+            self.commands.append(command)
+            return MODULE.CommandResult(
+                "ok",
+                0,
+                (
+                    b"Pages: 1\n"
+                    b"Page size: 72 x 36 pts\n"
+                    b"MediaBox: 0.00 0.00 72.00 36.00\n"
+                    b"CropBox: 0.00 0.00 72.00 36.00\n"
+                ),
+                b"",
+            )
+        if name == "pdftoppm":
+            from PIL import Image
+
+            self.commands.append(command)
+            prefix = Path(command[-1])
+            Image.new("RGB", (96, 48), "white").save(
+                prefix.with_name(prefix.name + "-1.png")
+            )
+            return MODULE.CommandResult("ok", 0, b"", b"")
+        if name == "pdftotext":
+            self.commands.append(command)
+            if "-bbox-layout" in command:
+                Path(command[-1]).write_text(
+                    """<html xmlns="http://www.w3.org/1999/xhtml"><body><doc>
+<page width="72" height="36"><flow><block>
+<line xMin="2" yMin="2" xMax="32" yMax="12">
+<word xMin="2" yMin="2" xMax="24" yMax="12">sheet</word>
+<word xMin="25" yMin="2" xMax="32" yMax="12">0</word>
+</line></block></flow></page></doc></body></html>""",
+                    encoding="utf-8",
+                )
+                return MODULE.CommandResult("ok", 0, b"", b"")
+            return MODULE.CommandResult("ok", 0, b"sheet 0\n", b"")
+        return super().run(command, **kwargs)
 
 
 class NoCallRunner:
@@ -699,28 +781,48 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.HarnessError, "direct_binary_required"):
             MODULE.renderer_binary_identity(("cargo", "run"), None, required=True)
 
-    def test_adapter_pdffonts_binary_identity_is_exact_and_path_neutral(self) -> None:
+    def test_adapter_poppler_binary_identity_is_exact_and_path_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "pdffonts-fixture"
-            path.write_bytes(b"locked pdffonts fixture")
-            path.chmod(0o755)
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            with mock.patch.dict(os.environ, {"PDFFONTS": str(path)}):
-                identity = MODULE.pdffonts_binary_identity(digest, required=True)
+            paths = {}
+            contract = {}
+            environment = {}
+            for index, name in enumerate(
+                ("pdffonts", "pdfinfo", "pdftoppm", "pdftotext")
+            ):
+                path = Path(raw) / f"{name}-fixture"
+                path.write_bytes(f"locked {name} fixture {index}".encode())
+                path.chmod(0o755)
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                paths[name] = path
+                contract[name] = {
+                    "bytes": path.stat().st_size,
+                    "sha256": digest,
+                }
+                environment[name.upper()] = str(path)
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(
+                    MODULE,
+                    "_locked_poppler_tool_contract",
+                    return_value=contract,
+                ),
+            ):
+                identity = MODULE.poppler_binary_identity(
+                    contract["pdffonts"]["sha256"], required=True
+                )
                 with self.assertRaisesRegex(
                     MODULE.HarnessError, "pdffonts_binary_identity$"
                 ):
-                    MODULE.pdffonts_binary_identity("0" * 64, required=True)
+                    MODULE.poppler_binary_identity("0" * 64, required=True)
 
-        self.assertEqual(
-            identity,
-            {"kind": "poppler", "pdffonts_sha256": digest},
-        )
+        self.assertEqual(identity["kind"], "poppler")
+        for name in ("pdffonts", "pdfinfo", "pdftoppm", "pdftotext"):
+            self.assertEqual(identity[f"{name}_sha256"], contract[name]["sha256"])
         self.assertNotIn(raw, json.dumps(identity, sort_keys=True))
         with self.assertRaisesRegex(
             MODULE.HarnessError, "pdffonts_binary_identity_required"
         ):
-            MODULE.pdffonts_binary_identity(None, required=True)
+            MODULE.poppler_binary_identity(None, required=True)
 
     def test_rxls_and_libreoffice_commands_match_exact_contract(self) -> None:
         input_path = Path("input.xlsx")
@@ -732,11 +834,13 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             output,
         )
         self.assertEqual(
-            rxls[-5:],
+            rxls[-7:],
             [
                 "bundle",
                 "input.xlsx",
                 "--single-page-sheets",
+                "--print-backends",
+                "svg,pdf",
                 "--output-dir",
                 "out",
             ],
@@ -746,13 +850,15 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             ["rxls-render"], input_path, output, Path("fonts/manifest.json")
         )
         self.assertEqual(
-            with_font_pack[-7:],
+            with_font_pack[-9:],
             [
                 "bundle",
                 "input.xlsx",
                 "--font-pack-manifest",
                 "fonts/manifest.json",
                 "--single-page-sheets",
+                "--print-backends",
+                "svg,pdf",
                 "--output-dir",
                 "out",
             ],
@@ -777,7 +883,8 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertNotIn("--single-page-sheets", authored_rxls)
         self.assertIn("--print-layout", authored_rxls)
         self.assertEqual(
-            authored_rxls[authored_rxls.index("--print-backends") + 1], "svg"
+            authored_rxls[authored_rxls.index("--print-backends") + 1],
+            "svg,pdf",
         )
         authored_lo = MODULE.build_libreoffice_command(
             "soffice",
@@ -856,10 +963,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                     "--run-id",
                     "{run_id}",
                 ),
-                pdffonts_identity={
-                    "kind": "poppler",
-                    "pdffonts_sha256": "f" * 64,
-                },
+                poppler_identity=poppler_identity(),
             )
             evidence, exit_code = MODULE.run_harness(
                 [MODULE.InputCase(source, "fixture.xlsx", 7)],
@@ -895,7 +999,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         )
         self.assertEqual(
             aggregate["pdf_font_inspector"],
-            {"kind": "poppler", "pdffonts_sha256": "f" * 64},
+            poppler_identity(),
         )
         self.assertEqual(runner.commands[1][0], "container-adapter")
         self.assertIn("--run-id", runner.commands[1])
@@ -935,10 +1039,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                     "--run-id",
                     "{run_id}",
                 ),
-                pdffonts_identity={
-                    "kind": "poppler",
-                    "pdffonts_sha256": "f" * 64,
-                },
+                poppler_identity=poppler_identity(),
                 print_mode=MODULE.PRINT_MODE_AUTHORED,
             )
             case = MODULE.InputCase(
@@ -1102,10 +1203,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             fail_on_incomparable=False,
             font_pack=font_pack,
             libreoffice_command=("adapter",),
-            pdffonts_identity={
-                "kind": "poppler",
-                "pdffonts_sha256": "f" * 64,
-            },
+            poppler_identity=poppler_identity(),
         )
         adapter = {
             "font_pack_sha256": pack_sha,
@@ -1213,7 +1311,10 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 dpi=96,
             )
 
-        self.assertEqual([page.index for page in bundle.pages], [0, 1, 2])
+            self.assertEqual(
+                [page.source_sheet_index for page in bundle.pages],
+                [0, 1, 2],
+            )
         self.assertEqual(
             [page.visibility for page in bundle.pages],
             ["visible", "hidden", "very_hidden"],
@@ -1458,6 +1559,49 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                     dpi=96,
                     print_mode=MODULE.PRINT_MODE_AUTHORED,
                 )
+
+    def test_authored_hidden_sheet_and_multipage_indices_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "fixture.xlsx"
+            source.write_bytes(b"fixture")
+            bundle_dir = root / "bundle"
+            write_authored_bundle(
+                bundle_dir,
+                source,
+                visibilities=("hidden", "visible"),
+            )
+
+            bundle = MODULE.validate_bundle(
+                bundle_dir,
+                input_sha256=hashlib.sha256(b"fixture").hexdigest(),
+                input_bytes=7,
+                caps=MODULE.Caps(),
+                dpi=96,
+                print_mode=MODULE.PRINT_MODE_AUTHORED,
+            )
+
+        self.assertEqual(len(bundle.pages), 8)
+        self.assertEqual(
+            [
+                (
+                    page.source_sheet_index,
+                    page.source_pdf_page_index,
+                    page.oracle_output_page_index,
+                )
+                for page in bundle.pages
+            ],
+            [
+                (0, 0, None),
+                (0, 1, None),
+                (0, 2, None),
+                (0, 3, None),
+                (1, 0, 0),
+                (1, 1, 1),
+                (1, 2, 2),
+                (1, 3, 3),
+            ],
+        )
 
     def test_bundle_retains_typed_warning_counts_without_workbook_content(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2082,6 +2226,100 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             )
         self.assertEqual(result.status, "timeout")
 
+    def test_bounded_command_runner_enforces_live_file_bytes_and_count(self) -> None:
+        runner = MODULE.BoundedCommandRunner()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "output"
+            output.mkdir()
+            result = runner.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path;"
+                        "Path('output/payload.bin').write_bytes(b'x'*4096)"
+                    ),
+                ],
+                cwd=root,
+                env=os.environ.copy(),
+                timeout_seconds=5,
+                output_limit_bytes=4096,
+                file_output_roots=(output,),
+                file_output_limit_bytes=1024,
+                file_output_count_limit=4,
+            )
+            self.assertEqual(result.status, "file_output_limit")
+            self.assertLessEqual((output / "payload.bin").stat().st_size, 1025)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "output"
+            output.mkdir()
+            result = runner.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path;"
+                        "root=Path('output');"
+                        "[(root / f'{i}.bin').write_bytes(b'x') for i in range(3)]"
+                    ),
+                ],
+                cwd=root,
+                env=os.environ.copy(),
+                timeout_seconds=5,
+                output_limit_bytes=4096,
+                file_output_roots=(output,),
+                file_output_limit_bytes=4096,
+                file_output_count_limit=2,
+            )
+            self.assertEqual(result.status, "file_output_limit")
+
+    def test_live_output_scan_uses_one_race_safe_lstat_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = root / "payload.bin"
+            payload.write_bytes(b"bounded")
+            with (
+                mock.patch.object(
+                    Path,
+                    "is_symlink",
+                    side_effect=AssertionError("must use lstat mode"),
+                ),
+                mock.patch.object(
+                    Path,
+                    "is_dir",
+                    side_effect=AssertionError("must use lstat mode"),
+                ),
+                mock.patch.object(
+                    Path,
+                    "is_file",
+                    side_effect=AssertionError("must use lstat mode"),
+                ),
+            ):
+                self.assertEqual(
+                    MODULE._live_output_usage((root,), count_limit=4),
+                    (len(b"bounded"), 1),
+                )
+
+            link = root / "payload-link"
+            link.symlink_to(payload)
+            with self.assertRaisesRegex(
+                MODULE.HarnessError, "live_output_symlink"
+            ):
+                MODULE._live_output_usage((link,), count_limit=4)
+
+            with mock.patch.object(
+                Path,
+                "iterdir",
+                side_effect=FileNotFoundError("atomic rename"),
+            ):
+                self.assertEqual(
+                    MODULE._live_output_usage((root,), count_limit=4),
+                    (0, 0),
+                )
+
     def test_dry_run_is_path_neutral_and_executes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2146,14 +2384,104 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertEqual(result["classification"], "visual_dependencies_missing")
         self.assertEqual(result["missing_dependencies"], [
             "pillow",
-            "pymupdf_or_poppler",
-            "cairosvg_or_svg_command",
+            "pdfinfo",
+            "pdftoppm",
             "pdftotext",
         ])
         self.assertEqual(len(runner.commands), 2)
         self.assertIn("bundle", runner.commands[0])
         self.assertIn("--single-page-sheets", runner.commands[0])
         self.assertIn(MODULE.PDF_FILTER, runner.commands[1])
+
+    def test_common_poppler_pipeline_measures_both_native_pdfs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "fixture.xlsx"
+            source.write_bytes(b"fixture")
+            runner = CommonPdfRunner(source)
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+            )
+            evidence, exit_code = MODULE.run_harness(
+                [MODULE.InputCase(source, "fixture.xlsx", 7)],
+                discovery={
+                    "candidate_count": 1,
+                    "selected_count": 1,
+                    "truncated": False,
+                },
+                config=config,
+                backends=MODULE.Backends(
+                    pillow=True,
+                    pymupdf=True,
+                    cairosvg=True,
+                    pdftoppm=True,
+                    pdfinfo=True,
+                    pdftotext=True,
+                ),
+                runner=runner,
+            )
+
+        self.assertEqual(exit_code, 0)
+        result = evidence["files"][0]
+        self.assertEqual(result["status"], "compared")
+        self.assertEqual(
+            [fact["source"] for fact in result["raster_commands"]],
+            ["rxls_pdf", "libreoffice_pdf"],
+        )
+        self.assertEqual(
+            {fact["backend"] for fact in result["raster_commands"]},
+            {"poppler_pdftoppm"},
+        )
+        self.assertEqual(result["metrics"]["text_box_match_coverage_ppm"], 1_000_000)
+        self.assertEqual(
+            result["metrics"]["text_line_box_match_coverage_ppm"],
+            1_000_000,
+        )
+        self.assertEqual(
+            len(
+                [
+                    command
+                    for command in runner.commands
+                    if Path(command[0]).name == "pdftoppm"
+                ]
+            ),
+            2,
+        )
+
+    def test_custom_svg_rasterizer_is_rejected_before_execution(self) -> None:
+        config = MODULE.HarnessConfig(
+            rxls_command=("rxls-render",),
+            libreoffice="soffice",
+            svg_rasterizer_command=("svg-tool", "{input}", "{output}"),
+            caps=MODULE.Caps(),
+            dpi=96,
+            locale="C.UTF-8",
+            dry_run=True,
+            min_similarity_ppm=None,
+            fail_on_incomparable=False,
+        )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "svg_rasterizer_command_retired",
+        ):
+            MODULE.run_harness(
+                [],
+                discovery={
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "truncated": False,
+                },
+                config=config,
+                runner=NoCallRunner(),
+            )
 
     def test_libreoffice_source_rejection_is_an_incomparable_skip_not_renderer_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2683,7 +3011,10 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 require_font_pack=True,
                 font_pack=font_pack,
             )
-            with mock.patch.dict(os.environ, {"PDFFONTS": "pdffonts"}):
+            with (
+                mock.patch.dict(os.environ, {"PDFFONTS": "pdffonts"}),
+                mock.patch.object(MODULE.sys, "platform", "linux"),
+            ):
                 evidence, exit_code = MODULE.run_harness(
                     [MODULE.InputCase(source, "fixture.xlsx", 7)],
                     discovery={
@@ -2701,12 +3032,51 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         result = evidence["files"][0]
-        self.assertEqual(result["status"], "different")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(result["classification"], "libreoffice_font_pack_mismatch")
         self.assertEqual(result["font_attestation"]["font_objects"], 1)
         self.assertEqual(result["font_attestation"]["matched_font_objects"], 0)
         self.assertNotIn("LiberationSans", rendered)
         self.assertNotIn(str(root), rendered)
+
+    def test_direct_non_linux_strict_font_activation_is_rejected_before_rendering(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "fixture.xlsx"
+            source.write_bytes(b"fixture")
+            manifest, _ = write_font_pack(root / "font-pack")
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+                require_font_pack=True,
+                font_pack=MODULE.load_font_pack(manifest),
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                self.assertRaisesRegex(
+                    MODULE.HarnessError,
+                    "font_pack_direct_activation_unsupported",
+                ),
+            ):
+                MODULE.run_harness(
+                    [MODULE.InputCase(source, "fixture.xlsx", 7)],
+                    discovery={
+                        "candidate_count": 1,
+                        "selected_count": 1,
+                        "truncated": False,
+                    },
+                    config=config,
+                    runner=NoCallRunner(),
+                )
 
     def test_oracle_lock_verifies_every_active_tool_and_remains_path_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2750,7 +3120,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             )
             backends = MODULE.Backends(
                 pillow=True,
-                pymupdf=False,
+                pymupdf=True,
                 cairosvg=True,
                 pdftoppm=True,
                 pdfinfo=True,
@@ -2887,6 +3257,92 @@ Page    2 size:  841.89 x 595.276 pts
                 require_all_sizes=True,
             )
 
+    def test_pdfinfo_preserves_exact_numbered_media_and_crop_boxes(self) -> None:
+        geometries = MODULE.parse_pdfinfo_page_geometries(
+            """Pages: 2
+Page    1 size:  612.125 x 792.25 pts
+Page    1 MediaBox: 10.5 20.25 622.625 812.5
+Page    1 CropBox: 11.125 21.5 621.375 811.75
+Page    2 size:  841.89 x 595.276 pts
+Page    2 MediaBox: -1.11 -2.222 840.78 593.054
+Page    2 CropBox: 0 0 841.125 595.0625
+""",
+            expected_pages=2,
+        )
+        self.assertEqual(
+            geometries[0],
+            MODULE.PdfPageGeometry(
+                MODULE.Fraction("612.125"),
+                MODULE.Fraction("792.25"),
+                MODULE.Fraction("612.125"),
+                MODULE.Fraction("792.25"),
+                MODULE.Fraction("610.25"),
+                MODULE.Fraction("790.25"),
+            ),
+        )
+        self.assertEqual(
+            geometries[1],
+            MODULE.PdfPageGeometry(
+                MODULE.Fraction("841.89"),
+                MODULE.Fraction("595.276"),
+                MODULE.Fraction("841.89"),
+                MODULE.Fraction("595.276"),
+                MODULE.Fraction("841.125"),
+                MODULE.Fraction("595.0625"),
+            ),
+        )
+
+    def test_pdf_point_crosscheck_allows_only_poppler_display_precision(self) -> None:
+        geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.276"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+        )
+        row = {"point_geometry": MODULE._pdf_geometry_evidence(geometry)}
+        text_page = MODULE.PdfTextPage(
+            MODULE.Fraction("841.889648"),
+            MODULE.Fraction("595.275879"),
+            (),
+            (),
+        )
+        page = MODULE.pdf_point_geometry_metrics(
+            row,
+            row,
+            text_page,
+            text_page,
+        )
+        aggregate = MODULE._aggregate_pdf_point_geometry([page])
+        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 0)
+        self.assertEqual(
+            aggregate["max_pdf_point_geometry_delta_millipoints"], 0
+        )
+        self.assertEqual(
+            aggregate["max_pdf_xhtml_crosscheck_delta_micropoints"],
+            352,
+        )
+
+        outside_precision = MODULE.PdfTextPage(
+            MODULE.Fraction("841.888"),
+            MODULE.Fraction("595.276"),
+            (),
+            (),
+        )
+        page = MODULE.pdf_point_geometry_metrics(
+            row,
+            row,
+            outside_precision,
+            outside_precision,
+        )
+        self.assertEqual(
+            MODULE._aggregate_pdf_point_geometry([page])[
+                "pdf_point_geometry_mismatches"
+            ],
+            1,
+        )
+
     def test_svg_glyph_path_bounds_include_exact_curve_extrema(self) -> None:
         line, _ = MODULE._svg_path_bounds("M0 0 L10 0 L10 10 Z")
         quadratic, _ = MODULE._svg_path_bounds("M0 0 Q10 20 20 0")
@@ -2923,22 +3379,6 @@ Page    2 size:  841.89 x 595.276 pts
             evidence.boxes[0].bbox_points,
             (7.5, 7.5, 37.5, 22.5),
         )
-        page = MODULE.PdfTextPage(
-            150.0,
-            75.0,
-            (
-                MODULE.SemanticTextBox(
-                    ("private",), (7.5, 7.5, 20.0, 22.5)
-                ),
-                MODULE.SemanticTextBox(
-                    ("label",), (20.0, 7.5, 37.5, 22.5)
-                ),
-            ),
-        )
-        metrics = MODULE.text_box_metrics(evidence, page)
-        self.assertEqual(metrics["text_box_matched_items"], 1)
-        self.assertEqual(metrics["text_box_median_error_millipoints"], 0)
-        self.assertNotIn("private", json.dumps(metrics, sort_keys=True))
 
     def test_svg_semantic_box_parser_rejects_unsafe_or_unbounded_grammar(self) -> None:
         with self.assertRaisesRegex(MODULE.HarnessError, "path_command"):
@@ -2981,7 +3421,8 @@ Page    2 size:  841.89 x 595.276 pts
 
     def test_pdftotext_bbox_parser_is_bounded_and_fail_closed(self) -> None:
         payload = b"""<html xmlns="http://www.w3.org/1999/xhtml"><body><doc>
-            <page width="200" height="100"><flow><block><line>
+            <page width="200" height="100"><flow><block>
+            <line xMin="10" yMin="20" xMax="60" yMax="40">
             <word xMin="10" yMin="20" xMax="30" yMax="40">A</word>
             <word xMin="31" yMin="20" xMax="60" yMax="40">B C</word>
             </line></block></flow></page></doc></body></html>"""
@@ -2994,6 +3435,7 @@ Page    2 size:  841.89 x 595.276 pts
         )
         self.assertEqual(pages[0].width_points, 200.0)
         self.assertEqual(pages[0].words[1].tokens, ("B", "C"))
+        self.assertEqual(pages[0].lines[0].tokens, ("A", "B", "C"))
 
         bounded_overhang = payload.replace(b'xMin="10"', b'xMin="-5.9"').replace(
             b'xMax="30"', b'xMax="205.9"'
@@ -3045,6 +3487,57 @@ Page    2 size:  841.89 x 595.276 pts
                 max_tokens=4,
             )
 
+    def test_pdftotext_bbox_streaming_caps_elements_lines_and_words(self) -> None:
+        empty_elements = (
+            b'<html><body><doc><page width="10" height="10">'
+            + b"<empty/>" * 8
+            + b"</page></doc></body></html>"
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "element_limit"):
+            MODULE.parse_pdftotext_bbox_pages(
+                empty_elements,
+                expected_pages=1,
+                max_bytes=4096,
+                max_codepoints=64,
+                max_tokens=16,
+                max_elements=6,
+                max_lines=16,
+                max_words=16,
+            )
+
+        lines = b"""<html><body><page width="10" height="10">
+            <line xMin="0" yMin="0" xMax="1" yMax="1"></line>
+            <line xMin="1" yMin="1" xMax="2" yMax="2"></line>
+            </page></body></html>"""
+        with self.assertRaisesRegex(MODULE.HarnessError, "line_limit"):
+            MODULE.parse_pdftotext_bbox_pages(
+                lines,
+                expected_pages=1,
+                max_bytes=4096,
+                max_codepoints=64,
+                max_tokens=16,
+                max_elements=64,
+                max_lines=1,
+                max_words=16,
+            )
+
+        words = b"""<html><body><page width="10" height="10">
+            <line xMin="0" yMin="0" xMax="4" yMax="2">
+            <word xMin="0" yMin="0" xMax="1" yMax="1">A</word>
+            <word xMin="1" yMin="0" xMax="2" yMax="1">B</word>
+            </line></page></body></html>"""
+        with self.assertRaisesRegex(MODULE.HarnessError, "word_limit"):
+            MODULE.parse_pdftotext_bbox_pages(
+                words,
+                expected_pages=1,
+                max_bytes=4096,
+                max_codepoints=64,
+                max_tokens=16,
+                max_elements=64,
+                max_lines=4,
+                max_words=1,
+            )
+
     def test_text_box_matching_is_exact_unique_and_ambiguity_closed(self) -> None:
         libreoffice = MODULE.PdfTextPage(
             200.0,
@@ -3054,22 +3547,63 @@ Page    2 size:  841.89 x 595.276 pts
                 MODULE.SemanticTextBox(("A",), (100.0, 0.0, 110.0, 10.0)),
             ),
         )
-        exact = MODULE.SvgSemanticEvidence(
-            ("A", "A"),
+        exact = MODULE.PdfTextPage(
+            200.0,
+            100.0,
             (
                 MODULE.SemanticTextBox(("A",), (100.0, 0.0, 110.0, 10.0)),
                 MODULE.SemanticTextBox(("A",), (0.0, 0.0, 10.0, 10.0)),
             ),
-            0,
         )
         exact_metrics = MODULE.text_box_metrics(exact, libreoffice)
         self.assertEqual(exact_metrics["text_box_matched_items"], 2)
         self.assertEqual(exact_metrics["text_box_match_coverage_ppm"], 1_000_000)
-
-        ambiguous = MODULE.SvgSemanticEvidence(
-            ("A",),
-            (MODULE.SemanticTextBox(("A",), (50.0, 0.0, 60.0, 10.0)),),
+        extra_reference = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                *libreoffice.words,
+                MODULE.SemanticTextBox(("B",), (20.0, 0.0, 30.0, 10.0)),
+            ),
+        )
+        extra_metrics = MODULE.text_box_metrics(exact, extra_reference)
+        self.assertEqual(extra_metrics["text_box_precision_ppm"], 1_000_000)
+        self.assertEqual(extra_metrics["text_box_recall_ppm"], 666_667)
+        self.assertEqual(extra_metrics["text_box_f1_ppm"], 800_000)
+        self.assertEqual(
+            extra_metrics["text_box_libreoffice_unmatched_items"],
             1,
+        )
+
+        split = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                MODULE.SemanticTextBox(("A",), (0.0, 0.0, 10.0, 10.0)),
+                MODULE.SemanticTextBox(("B",), (11.0, 0.0, 20.0, 10.0)),
+            ),
+        )
+        joined = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                MODULE.SemanticTextBox(
+                    ("A", "B"),
+                    (0.0, 0.0, 20.0, 10.0),
+                ),
+            ),
+        )
+        split_metrics = MODULE.text_box_metrics(joined, split)
+        self.assertEqual(split_metrics["text_box_matched_items"], 0)
+        self.assertEqual(split_metrics["text_box_unmatched_items"], 1)
+
+        ambiguous = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                MODULE.SemanticTextBox(("A",), (50.0, 0.0, 60.0, 10.0)),
+                MODULE.SemanticTextBox(("B",), (50.0, 20.0, 60.0, 30.0)),
+            ),
         )
         ambiguous_metrics = MODULE.text_box_metrics(ambiguous, libreoffice)
         self.assertEqual(ambiguous_metrics["text_box_ambiguous_items"], 1)
@@ -3077,6 +3611,26 @@ Page    2 size:  841.89 x 595.276 pts
         self.assertEqual(ambiguous_metrics["text_box_matched_items"], 0)
         with self.assertRaisesRegex(MODULE.HarnessError, "work_limit"):
             MODULE.text_box_metrics(exact, libreoffice, max_match_work=1)
+
+        rxls_lines = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (),
+            (MODULE.SemanticTextBox(("A",), (0.0, 0.0, 10.0, 10.0)),),
+        )
+        libreoffice_lines = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (),
+            (MODULE.SemanticTextBox(("A",), (0.0, 0.0, 10.0, 10.0)),),
+        )
+        line_metrics = MODULE.text_line_box_metrics(
+            rxls_lines, libreoffice_lines
+        )
+        self.assertEqual(
+            line_metrics["text_line_box_match_coverage_ppm"],
+            1_000_000,
+        )
 
     def test_aggregate_text_box_histogram_derives_exact_quantiles(self) -> None:
         pages = []
@@ -3089,7 +3643,13 @@ Page    2 size:  841.89 x 595.276 pts
                     "squared_error_sum": 0,
                     "max_channel_delta": 0,
                     **MODULE._text_box_numeric_evidence(
-                        1, 1, 0, 0, MODULE.Counter({error: 1})
+                        1,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        MODULE.Counter({error: 1}),
                     ),
                 }
             )
@@ -3097,6 +3657,114 @@ Page    2 size:  841.89 x 595.276 pts
         self.assertEqual(aggregate["text_box_candidate_items"], 2)
         self.assertEqual(aggregate["text_box_median_error_millipoints"], 100)
         self.assertEqual(aggregate["text_box_p95_error_millipoints"], 2000)
+
+    def test_manifest_binding_is_exact_for_input_set_and_feature_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = root / "manifest.json"
+            manifest.write_text('{"files":[]}\n', encoding="utf-8")
+            cases = [
+                MODULE.InputCase(
+                    root / "a.xlsx",
+                    "a.xlsx",
+                    1,
+                    "1" * 64,
+                    1,
+                    features=("basic",),
+                ),
+                MODULE.InputCase(
+                    root / "b.ods",
+                    "b.ods",
+                    1,
+                    "2" * 64,
+                    1,
+                    features=("wrapped-text",),
+                ),
+            ]
+            binding = MODULE.build_manifest_binding(
+                manifest,
+                cases,
+                max_manifest_bytes=1024,
+            )
+            altered = MODULE.build_manifest_binding(
+                manifest,
+                [
+                    cases[0],
+                    MODULE.InputCase(
+                        root / "b.ods",
+                        "b.ods",
+                        1,
+                        "2" * 64,
+                        1,
+                        features=("chart",),
+                    ),
+                ],
+                max_manifest_bytes=1024,
+            )
+        self.assertEqual(binding["selected_case_count"], 2)
+        self.assertNotEqual(
+            binding["feature_map_sha256"],
+            altered["feature_map_sha256"],
+        )
+        self.assertEqual(
+            binding["input_set_sha256"],
+            altered["input_set_sha256"],
+        )
+
+    def test_each_case_workspace_is_removed_before_the_next_case(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            sources = []
+            for index in range(3):
+                source = root / f"{index}.xlsx"
+                source.write_bytes(b"x")
+                sources.append(MODULE.InputCase(source, source.name, 1))
+            observed: list[Path] = []
+
+            def fake_evaluate(
+                case,
+                *,
+                index,
+                work_root,
+                config,
+                backends,
+                runner,
+            ):
+                self.assertTrue(work_root.is_dir())
+                self.assertTrue(all(not path.exists() for path in observed))
+                (work_root / "bounded-artifact").write_bytes(b"x")
+                observed.append(work_root)
+                return {
+                    "classification": "within_threshold",
+                    "format": "xlsx",
+                    "path": case.label,
+                    "status": "compared",
+                }
+
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+            )
+            with mock.patch.object(MODULE, "evaluate_case", side_effect=fake_evaluate):
+                MODULE.run_harness(
+                    sources,
+                    discovery={
+                        "candidate_count": 3,
+                        "selected_count": 3,
+                        "truncated": False,
+                    },
+                    config=config,
+                    backends=MODULE.Backends(False, False, False),
+                    runner=NoCallRunner(),
+                )
+            self.assertTrue(all(not path.exists() for path in observed))
 
 
 if __name__ == "__main__":

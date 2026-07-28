@@ -1,38 +1,50 @@
 import { RenderWorkerClient } from "../../js/client.mjs";
-import { MAX_FONT_FILES } from "../../js/protocol.mjs";
+import { MAX_FONT_FILES, validateSvgOutput } from "../../js/protocol.mjs";
+import {
+  assertExactEmbeddedPng,
+  assertFullCapabilities,
+  assertNoUnexpectedExternalResources,
+  captureCspViolation,
+  proveCspNegativeControl
+} from "./contract.mjs";
+import { createBrowserFixture, FIXTURE_TILE } from "./fixture.mjs";
+import {
+  assertExternalSvgIsRejected,
+  assertRichInspection,
+  assertShapedSelfContainedSvg,
+  proveHardStop
+} from "./proof.mjs";
 
 const result = document.querySelector("#result");
 const viewer = document.querySelector("#viewer");
 const policyViolations = [];
 addEventListener("securitypolicyviolation", (event) => {
-  policyViolations.push(`${event.violatedDirective}:${event.blockedURI}`);
+  policyViolations.push(captureCspViolation(event));
 });
 const client = new RenderWorkerClient(new URL("../../js/worker.mjs", import.meta.url));
 globalThis.__rxlsWorkerReadyForHeapProbe = false;
 globalThis.__rxlsHeapProbeReady = false;
 globalThis.__rxlsHeapProbeRelease = false;
+globalThis.__rxlsHardStopProof = null;
+globalThis.__rxlsCspProof = null;
 
 try {
-  result.textContent = "STEP loading fixture";
-  const encoded = (await (await fetch("/fixture.b64")).text()).trim();
-  const binary = atob(encoded);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
   result.textContent = "STEP waiting for worker";
   const capabilities = await timed(client.capabilities(), "worker ready");
-  if (
-    capabilities.protocol !== "rxls.render-worker.v1" ||
-    capabilities.limits.maxInputBytes !== 32 * 1024 * 1024 ||
-    capabilities.limits.maxSheets !== 255 ||
-    capabilities.limits.maxPages !== 512 ||
-    capabilities.limits.maxOutputBytes !== 16 * 1024 * 1024
-  ) {
-    throw new Error("worker capability limits changed");
-  }
+  assertFullCapabilities(capabilities);
   globalThis.__rxlsWorkerReadyForHeapProbe = true;
   await waitForHeapProbe("__rxlsHeapProbeReady", "heap probe ready");
+  result.textContent = "STEP generating rich fixture";
+  let fixture = await createBrowserFixture();
+  let bytes = fixture.workbook;
+  const imageLimits = {
+    maxImages: 1,
+    maxImageBytes: fixture.metadata.imageBytes,
+    maxMediaBytes: fixture.metadata.imageBytes,
+    maxImageDimension: fixture.metadata.imageWidth,
+    maxImagePixels: fixture.metadata.imageWidth * fixture.metadata.imageHeight,
+    maxDecodedMediaBytes: fixture.metadata.decodedImageBytes
+  };
   expectSynchronousFailure(
     () =>
       client.open(bytes, {
@@ -74,6 +86,7 @@ try {
   const opened = await timed(
     client.open(bytes, {
       documentId: "browser-smoke",
+      fontPack: fixture.fontPack,
       onProgress: (update) => {
         progress.push(update);
         result.textContent = `STEP open ${update.stage}`;
@@ -81,9 +94,7 @@ try {
     }),
     "open workbook"
   );
-  if (opened.workbook.sheetCount !== 1) {
-    throw new Error("unexpected sheet count");
-  }
+  assertRichInspection(opened, fixture.metadata);
   if (
     progress.length !== 4 ||
     progress.some(({ completed, total }, index) => completed !== index || total !== 3) ||
@@ -93,39 +104,43 @@ try {
   }
   result.textContent = "STEP pagination";
   const pagination = await timed(client.preparePages("browser-smoke", 0), "pagination");
-  if (pagination.manifest.pages.length < 1) {
-    throw new Error("no print pages");
+  if (pagination.manifest.pages.length < 8) {
+    throw new Error(
+      `rich fixture pagination was not material: ${pagination.manifest.pages.length} pages`
+    );
   }
-  result.textContent = "STEP tile";
-  let tile = await timed(client.renderTile(
-    "browser-smoke",
-    0,
-    { firstRow: 0, firstCol: 0, lastRow: 4, lastCol: 4 },
-    { limits: { maxCells: 25 } }
-  ), "tile");
-  if (!tile.svg.includes("<svg")) {
-    throw new Error("tile SVG output missing");
+  result.textContent = "STEP 2048-cell tile";
+  let tile = await timed(
+    client.renderTile("browser-smoke", 0, FIXTURE_TILE, {
+      limits: { maxCells: fixture.metadata.tileMeasuredCells, ...imageLimits }
+    }),
+    "2048-cell tile"
+  );
+  assertShapedSelfContainedSvg(tile.svg);
+  await assertExactEmbeddedPng(tile.svg, fixture.metadata);
+  validateSvgOutput(tile.svg);
+  if (new TextEncoder().encode(tile.svg).byteLength < 250_000) {
+    throw new Error("2048-cell tile did not produce a material SVG workload");
   }
   mountSvg(tile.svg);
   tile = null;
   await new Promise((resolve) => requestAnimationFrame(resolve));
-  result.textContent = "STEP page";
+  result.textContent = "STEP rich page";
   let page = await timed(
     client.renderPage("browser-smoke", 0, 0, {
-      limits: { maxFontBytes: 0, maxImages: 0, maxImageBytes: 0 }
+      limits: { maxCells: fixture.metadata.cells, ...imageLimits }
     }),
     "page"
   );
-  if (!page.svg.includes("<svg")) {
-    throw new Error("page SVG output missing");
-  }
+  assertShapedSelfContainedSvg(page.svg);
+  await assertExactEmbeddedPng(page.svg, fixture.metadata);
+  validateSvgOutput(page.svg);
   mountSvg(page.svg);
   page = null;
   let png = await timed(
     client.renderPagePng("browser-smoke", 0, 0, 96, {
-      range: { firstRow: 100, firstCol: 100, lastRow: 100, lastCol: 100 },
       gridlines: false,
-      limits: { maxFontBytes: 0, maxImages: 0, maxImageBytes: 0 }
+      limits: { maxCells: fixture.metadata.cells, ...imageLimits }
     }),
     "PNG page"
   );
@@ -163,19 +178,27 @@ try {
     (error) => error.code === "limit_exceeded" && error.resource === "maxImageBytes",
     "image byte limit"
   );
+  assertExternalSvgIsRejected(validateSvgOutput);
+  result.textContent = "STEP active hard stop";
+  const hardStop = await proveHardStop({
+    RenderWorkerClient,
+    workerUrl: new URL("../../js/worker.mjs", import.meta.url),
+    fixture,
+    timed
+  });
+  if (hardStop.rejectedRequests !== 2 || hardStop.elapsedMs > hardStop.deadlineMs) {
+    throw new Error(`hard-stop proof changed: ${JSON.stringify(hardStop)}`);
+  }
+  result.textContent = "STEP CSP negative control";
+  await proveCspNegativeControl(policyViolations);
   await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  if (policyViolations.length !== 0) {
-    throw new Error(`CSP violation: ${policyViolations.join(",")}`);
-  }
-  const externalResources = performance
-    .getEntriesByType("resource")
-    .map(({ name }) => new URL(name, location.href))
-    .filter((url) => url.protocol !== "data:" && url.origin !== location.origin);
-  if (externalResources.length !== 0) {
-    throw new Error(`external resource requested: ${externalResources[0].href}`);
-  }
+  assertNoUnexpectedExternalResources();
   await client.closeDocument("browser-smoke");
-  result.textContent = "PASS rxls-render-worker CSP, limits, cancellation, progress, tile and page smoke";
+  viewer.replaceChildren();
+  bytes = null;
+  fixture = null;
+  result.textContent =
+    "PASS rxls-render-worker rich font/image CSP, 2048-cell tile, virtual pages, PNG, limits and hard stop";
   result.id = "pass";
   await waitForHeapProbe("__rxlsHeapProbeRelease", "heap probe release");
 } catch (error) {

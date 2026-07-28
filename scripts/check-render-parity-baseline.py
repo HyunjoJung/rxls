@@ -429,8 +429,10 @@ def derive_baseline(
         "dpi": configuration.get("dpi"),
         "font_pack": configuration.get("font_pack"),
         "locale": configuration.get("locale"),
+        "measurement_toolchain": configuration.get("measurement_toolchain"),
         "metric_policy": configuration.get("metric_policy"),
         "oracle_lock": configuration.get("oracle_lock"),
+        "renderer_binary": configuration.get("renderer_binary"),
     }
     baseline = {
         "classifications": classifications,

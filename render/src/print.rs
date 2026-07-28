@@ -1,22 +1,24 @@
 //! Deterministic worksheet print pagination over the backend-neutral scene.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
-use rxls::{
-    DrawingAnchorBehavior, DrawingObjectKind, PageSetup, PrintLossKind, PrintPageOrder, Sheet,
-    Workbook,
-};
+use rxls::{PageSetup, PrintLossKind, PrintPageOrder, Sheet, Workbook};
+use sha2::{Digest, Sha256};
 
 use crate::error::{LimitKind, RenderError};
 use crate::layout::{
     absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene,
-    measure_sheet_axes, render_used_print_range, MeasuredAxisSlot, RenderLimits, RenderOptions,
-    RenderRange, RenderReport, RenderSelection, WarningCode, MAX_WORKSHEET_COLUMN,
-    MAX_WORKSHEET_ROW,
+    build_sheet_scene_with_geometry, cell_drawings_intersect_prepared_range,
+    cell_style_has_visible_blank_paint, external_render_dependency_cells,
+    measure_sheet_axes_for_ranges, prepared_drawing_geometry_extent, render_used_print_range,
+    render_used_scene_range, CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions,
+    RenderRange, RenderReport, RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex,
+    WarningCode, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
 use crate::scene::{
-    Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextStyle,
-    FIXED_UNITS_PER_PIXEL,
+    ClipGroupNode, Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
+    TextBaseline, TextStyle, FIXED_UNITS_PER_PIXEL,
 };
 
 const DEFAULT_LEFT_RIGHT_INCHES: f64 = 0.7;
@@ -390,6 +392,9 @@ pub struct PreparedPrintDocument {
     /// Backend safety limits captured with the plan.
     pub limits: PrintLimits,
     render_limits: RenderLimits,
+    source_identity: [u8; 32],
+    source_dependencies: Vec<CellCoordinate>,
+    tracks_used_extent: bool,
     state: PreparedPrintState,
 }
 
@@ -448,13 +453,20 @@ impl DecodedMediaBudget {
         sheet: &Sheet,
         sheet_index: usize,
         base_options: &RenderOptions,
+        geometry: Option<SheetGeometryOverride<'_>>,
     ) -> Result<Scene, RenderError> {
         let mut options = base_options.clone();
         options.limits.max_decoded_media_bytes = self
             .limit
             .checked_sub(self.retained)
             .ok_or(RenderError::CoordinateOverflow)?;
-        let build = match build_sheet_scene(sheet, sheet_index, &options) {
+        let build = match geometry {
+            Some(geometry) => {
+                build_sheet_scene_with_geometry(sheet, sheet_index, &options, geometry)
+            }
+            None => build_sheet_scene(sheet, sheet_index, &options),
+        };
+        let build = match build {
             Ok(build) => build,
             Err(RenderError::LimitExceeded {
                 kind: LimitKind::DecodedMediaBytes,
@@ -555,6 +567,10 @@ struct PreparedArea {
     area_index: usize,
     source_options: RenderOptions,
     source: RenderReport,
+    measured_rows: Vec<MeasuredAxisSlot<u32>>,
+    measured_columns: Vec<MeasuredAxisSlot<u16>>,
+    render_ranges: Vec<RenderRange>,
+    measurement_ranges: Vec<RenderRange>,
     repeat_rows: Option<(u32, u32)>,
     repeat_cols: Option<(u16, u16)>,
     repeated_height: Fixed,
@@ -666,10 +682,6 @@ fn prepare_print_area(
     let mut source_options = options.render.clone();
     source_options.selection = RenderSelection::Range(range);
     source_options.gridlines &= behavior.gridlines;
-    let mut source = build_sheet_scene(sheet, sheet_index, &source_options)?.report;
-    source
-        .warnings
-        .retain(|warning| warning.code != WarningCode::PaginationDeferred);
 
     let mut body_first_row = range.first_row;
     let mut body_first_col = range.first_col;
@@ -688,36 +700,120 @@ fn prepare_print_area(
         }
     }
 
-    let body_rows = if body_first_row <= range.last_row {
-        measure_rows(
-            sheet,
-            body_first_row,
-            range.last_row,
+    // Capture the exact disjoint body/title rectangles and reconcile their
+    // axes. A Cartesian bounding box can charge millions of cells between a
+    // distant print area and title band even though those cells are never
+    // rendered.
+    let mut render_ranges = vec![range];
+    if let Some((first, last)) = repeat_rows {
+        render_ranges.push(RenderRange::new(
+            first,
             range.first_col,
-            &source_options,
-        )?
+            last,
+            range.last_col,
+        ));
+    }
+    if let Some((first, last)) = repeat_cols {
+        render_ranges.push(RenderRange::new(
+            range.first_row,
+            first,
+            range.last_row,
+            last,
+        ));
+    }
+    if let (Some((first_row, last_row)), Some((first_col, last_col))) = (repeat_rows, repeat_cols) {
+        render_ranges.push(RenderRange::new(first_row, first_col, last_row, last_col));
+    }
+    render_ranges.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    render_ranges.dedup();
+
+    // Cell-anchored drawings retain one sheet-space destination rectangle even
+    // when a print area selects only its middle or one edge. Measure sparse
+    // row/column bands across each relevant anchor without charging the dense
+    // Cartesian rectangle between them.
+    let (drawing_extents, has_absolute_drawings) =
+        prepared_drawing_geometry_extent(sheet, &render_ranges)?;
+    let mut measurement_ranges = render_ranges.clone();
+    for extent in drawing_extents {
+        measurement_ranges.push(RenderRange::new(
+            extent.first_row,
+            extent.first_col,
+            extent.last_row,
+            extent.first_col,
+        ));
+        measurement_ranges.push(RenderRange::new(
+            extent.first_row,
+            extent.first_col,
+            extent.first_row,
+            extent.last_col,
+        ));
+    }
+    if has_absolute_drawings {
+        let last_row = render_ranges
+            .iter()
+            .map(|range| range.last_row)
+            .max()
+            .unwrap_or(range.last_row);
+        measurement_ranges.push(RenderRange::new(
+            0,
+            range.first_col,
+            last_row,
+            range.first_col,
+        ));
+    }
+    measurement_ranges.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    measurement_ranges.dedup();
+    enforce_measurement_union_limits(&measurement_ranges, &source_options.limits)?;
+    let mut row_sizes = BTreeMap::new();
+    let mut column_sizes = BTreeMap::new();
+    for (rows, columns) in
+        measure_sheet_axes_for_ranges(sheet, &measurement_ranges, &source_options)?
+    {
+        merge_measured_axis(&mut row_sizes, &rows);
+        merge_measured_axis(&mut column_sizes, &columns);
+    }
+    let measured_rows = measured_axis_slots(row_sizes)?;
+    let measured_columns = measured_axis_slots(column_sizes)?;
+    let mut source = build_sheet_scene_with_geometry(
+        sheet,
+        sheet_index,
+        &source_options,
+        SheetGeometryOverride::new(&measured_rows, &measured_columns),
+    )?
+    .report;
+    source
+        .warnings
+        .retain(|warning| warning.code != WarningCode::PaginationDeferred);
+    let body_rows = if body_first_row <= range.last_row {
+        measured_axis_range(&measured_rows, body_first_row, range.last_row)
     } else {
         Vec::new()
     };
     let body_columns = if body_first_col <= range.last_col {
-        measure_columns(
-            sheet,
-            body_first_col,
-            range.last_col,
-            range.first_row,
-            &source_options,
-        )?
+        measured_axis_range(&measured_columns, body_first_col, range.last_col)
     } else {
         Vec::new()
     };
     let repeated_rows = match repeat_rows {
-        Some((first, last)) => measure_rows(sheet, first, last, range.first_col, &source_options)?,
+        Some((first, last)) => measured_axis_range(&measured_rows, first, last),
         None => Vec::new(),
     };
     let repeated_columns = match repeat_cols {
-        Some((first, last)) => {
-            measure_columns(sheet, first, last, range.first_row, &source_options)?
-        }
+        Some((first, last)) => measured_axis_range(&measured_columns, first, last),
         None => Vec::new(),
     };
     let repeated_height = axis_total(&repeated_rows)?;
@@ -827,7 +923,13 @@ fn prepare_print_area(
                         columns,
                     };
                     if !options.omit_sparse_pages
-                        || page_has_content(sheet, slot, range, &source_options)?
+                        || page_has_content(
+                            sheet,
+                            slot,
+                            range,
+                            &source_options,
+                            SheetGeometryOverride::new(&measured_rows, &measured_columns),
+                        )?
                     {
                         slots.push(slot);
                     }
@@ -844,7 +946,13 @@ fn prepare_print_area(
                         columns,
                     };
                     if !options.omit_sparse_pages
-                        || page_has_content(sheet, slot, range, &source_options)?
+                        || page_has_content(
+                            sheet,
+                            slot,
+                            range,
+                            &source_options,
+                            SheetGeometryOverride::new(&measured_rows, &measured_columns),
+                        )?
                     {
                         slots.push(slot);
                     }
@@ -872,6 +980,10 @@ fn prepare_print_area(
         area_index,
         source_options,
         source,
+        measured_rows,
+        measured_columns,
+        render_ranges,
+        measurement_ranges,
         repeat_rows,
         repeat_cols,
         repeated_height,
@@ -965,10 +1077,23 @@ fn prepare_single_page_sheet_document(
         pages: vec![map.clone()],
         warnings: Vec::new(),
     };
+    let source_dependencies =
+        external_render_dependency_cells(sheet, &[report.source.range], &render_options, None)?;
+    let source_identity = print_source_identity(
+        sheet,
+        sheet_index,
+        &[report.source.range],
+        &[report.source.range],
+        &options.render.limits,
+        &source_dependencies,
+    )?;
     Ok(PreparedPrintDocument {
         report,
         limits: options.limits.clone(),
         render_limits: options.render.limits.clone(),
+        source_identity,
+        source_dependencies,
+        tracks_used_extent: matches!(options.render.selection, RenderSelection::Used),
         state: PreparedPrintState::SinglePage { render_options },
     })
 }
@@ -1015,6 +1140,9 @@ pub fn prepare_sheet_print_document(
         normalize_repeat_cols(setup.repeat_cols, &mut warnings),
         &mut warnings,
     );
+    let tracks_used_extent = matches!(options.render.selection, RenderSelection::Used)
+        && sheet.print_metadata().print_areas().is_empty()
+        && setup.print_area.is_none();
 
     let ranges = choose_print_ranges(sheet, &setup, &options.render)?;
     let mut areas = Vec::with_capacity(ranges.len());
@@ -1128,10 +1256,42 @@ pub fn prepare_sheet_print_document(
         pages: page_map,
         warnings: warnings.finish(),
     };
+    let identity_ranges = areas
+        .iter()
+        .flat_map(|area| area.measurement_ranges.iter().copied())
+        .collect::<Vec<_>>();
+    let style_identity_ranges = areas
+        .iter()
+        .flat_map(|area| area.render_ranges.iter().copied())
+        .collect::<Vec<_>>();
+    let mut source_dependencies = BTreeSet::new();
+    for area in &areas {
+        source_dependencies.extend(external_render_dependency_cells(
+            sheet,
+            &area.render_ranges,
+            &area.source_options,
+            Some(SheetGeometryOverride::new(
+                &area.measured_rows,
+                &area.measured_columns,
+            )),
+        )?);
+    }
+    let source_dependencies = source_dependencies.into_iter().collect::<Vec<_>>();
+    let source_identity = print_source_identity(
+        sheet,
+        sheet_index,
+        &identity_ranges,
+        &style_identity_ranges,
+        &options.render.limits,
+        &source_dependencies,
+    )?;
     Ok(PreparedPrintDocument {
         report,
         limits: options.limits.clone(),
         render_limits: options.render.limits.clone(),
+        source_identity,
+        source_dependencies,
+        tracks_used_extent,
         state: PreparedPrintState::Paginated {
             behavior,
             paper,
@@ -1160,6 +1320,236 @@ fn collect_running_text_warnings(
     }
 }
 
+struct Sha256DebugWriter<'a> {
+    digest: &'a mut Sha256,
+}
+
+impl fmt::Write for Sha256DebugWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.digest.update(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn update_debug_streaming<T: fmt::Debug + ?Sized>(digest: &mut Sha256, value: &T) {
+    {
+        let mut writer = Sha256DebugWriter { digest };
+        fmt::write(&mut writer, format_args!("{value:?}"))
+            .expect("SHA-256 debug writer is infallible");
+    }
+    // Rust Debug output is UTF-8, so 0xff is an unambiguous structural record
+    // terminator without buffering the complete sidecar.
+    digest.update([0xff]);
+}
+
+fn merged_identity_row_bands(ranges: &[RenderRange]) -> Vec<(u32, u32)> {
+    let mut bands = ranges
+        .iter()
+        .map(|range| (range.first_row, range.last_row))
+        .collect::<Vec<_>>();
+    bands.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::with_capacity(bands.len());
+    for (first_row, last_row) in bands {
+        if first_row > last_row {
+            continue;
+        }
+        if let Some((_, previous_last_row)) = merged.last_mut() {
+            if first_row <= previous_last_row.saturating_add(1) {
+                *previous_last_row = (*previous_last_row).max(last_row);
+                continue;
+            }
+        }
+        merged.push((first_row, last_row));
+    }
+    merged
+}
+
+fn print_source_identity(
+    sheet: &Sheet,
+    sheet_index: usize,
+    ranges: &[RenderRange],
+    style_ranges: &[RenderRange],
+    limits: &RenderLimits,
+    source_dependencies: &[CellCoordinate],
+) -> Result<[u8; 32], RenderError> {
+    fn update_bytes(digest: &mut Sha256, bytes: &[u8]) {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+
+    fn update_debug<T: fmt::Debug + ?Sized>(digest: &mut Sha256, value: &T) {
+        update_bytes(digest, format!("{value:?}").as_bytes());
+    }
+
+    let mut digest = Sha256::new();
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v4");
+    digest.update((sheet_index as u64).to_le_bytes());
+    update_bytes(&mut digest, sheet.name.as_bytes());
+
+    // Geometry and print metadata are all ordered maps/sets or stable typed
+    // values, so their Debug representations are deterministic within this
+    // private identity version. Image payloads are streamed separately.
+    update_debug(&mut digest, &sheet.sheet_view());
+    update_debug(&mut digest, &sheet.page_setup());
+    update_debug(&mut digest, sheet.print_metadata());
+    update_debug(&mut digest, &sheet.default_cell_style());
+    update_debug(&mut digest, &sheet.style_fidelity());
+    update_debug(&mut digest, sheet.style_losses());
+    update_debug(&mut digest, sheet.column_styles());
+    update_debug(&mut digest, sheet.row_styles());
+    update_debug(&mut digest, sheet.blank_cell_styles());
+    update_debug(&mut digest, sheet.tables());
+    update_debug(&mut digest, sheet.table_header_styles());
+    update_debug(&mut digest, sheet.column_widths());
+    update_debug(&mut digest, sheet.physical_column_widths());
+    update_debug(&mut digest, &sheet.default_column_width());
+    update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
+    update_debug(&mut digest, sheet.row_heights());
+    update_debug(&mut digest, &sheet.default_row_height());
+    update_debug(&mut digest, sheet.hidden_columns());
+    update_debug(&mut digest, sheet.hidden_rows());
+    update_debug(&mut digest, sheet.merged_ranges());
+    update_debug(&mut digest, sheet.conditional_formats());
+    update_debug(&mut digest, sheet.conditional_format_metadata());
+    let mut style_ranges = style_ranges.to_vec();
+    for &(first_row, first_col, last_row, last_col) in sheet.merged_ranges() {
+        if first_row <= last_row
+            && first_col <= last_col
+            && style_ranges.iter().any(|range| {
+                first_row <= range.last_row
+                    && last_row >= range.first_row
+                    && first_col <= range.last_col
+                    && last_col >= range.first_col
+            })
+        {
+            style_ranges.push(RenderRange::new(first_row, first_col, first_row, first_col));
+        }
+    }
+    style_ranges.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    style_ranges.dedup();
+    update_debug(&mut digest, &style_ranges);
+    let style_ranges = style_ranges
+        .iter()
+        .map(|range| {
+            (
+                range.first_row,
+                range.first_col,
+                range.last_row,
+                range.last_col,
+            )
+        })
+        .collect::<Vec<_>>();
+    let style_sidecar_entries = sheet.render_style_sidecar_entry_count(&style_ranges);
+    if style_sidecar_entries > limits.max_cells {
+        return Err(RenderError::LimitExceeded {
+            kind: LimitKind::Cells,
+            limit: limits.max_cells,
+            actual: style_sidecar_entries,
+        });
+    }
+    update_bytes(&mut digest, b"rxls.render-style-sidecar.v2");
+    update_debug_streaming(
+        &mut digest,
+        &sheet.render_style_sidecar_identity(&style_ranges),
+    );
+    update_debug(&mut digest, sheet.charts());
+    update_debug(&mut digest, sheet.sparklines());
+    update_debug(&mut digest, sheet.drawing_metadata());
+    let mut media_bytes = 0_u64;
+    for image in sheet.images() {
+        update_debug(&mut digest, &image.format);
+        update_debug(&mut digest, &image.from);
+        update_debug(&mut digest, &image.to);
+        media_bytes = media_bytes
+            .checked_add(image.data.len() as u64)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        if media_bytes > limits.max_media_bytes {
+            return Err(RenderError::LimitExceeded {
+                kind: LimitKind::MediaBytes,
+                limit: limits.max_media_bytes,
+                actual: media_bytes,
+            });
+        }
+        update_bytes(&mut digest, &image.data);
+    }
+
+    let mut ranges = ranges.to_vec();
+    ranges.sort_by_key(|range| {
+        (
+            range.first_row,
+            range.first_col,
+            range.last_row,
+            range.last_col,
+        )
+    });
+    ranges.dedup();
+    update_debug(&mut digest, &ranges);
+
+    let display_cell_index = SparseDisplayCellIndex::new(sheet);
+    let mut selected_cells = BTreeMap::new();
+    for (first_row, last_row) in merged_identity_row_bands(&ranges) {
+        for cell in display_cell_index.range((first_row, 0, last_row, MAX_WORKSHEET_COLUMN)) {
+            selected_cells.insert((cell.row, cell.col), cell);
+            if selected_cells.len() as u64 > limits.max_cells {
+                return Err(RenderError::LimitExceeded {
+                    kind: LimitKind::Cells,
+                    limit: limits.max_cells,
+                    actual: selected_cells.len() as u64,
+                });
+            }
+        }
+    }
+    for &(r0, c0, r1, c1) in sheet.merged_ranges() {
+        if ranges.iter().any(|range| {
+            r0 <= r1
+                && c0 <= c1
+                && r0 <= range.last_row
+                && r1 >= range.first_row
+                && c0 <= range.last_col
+                && c1 >= range.first_col
+        }) {
+            for cell in display_cell_index.range((r0, c0, r0, c0)) {
+                selected_cells.insert((r0, c0), cell);
+                if selected_cells.len() as u64 > limits.max_cells {
+                    return Err(RenderError::LimitExceeded {
+                        kind: LimitKind::Cells,
+                        limit: limits.max_cells,
+                        actual: selected_cells.len() as u64,
+                    });
+                }
+            }
+        }
+    }
+    for ((row, col), cell) in selected_cells {
+        digest.update(row.to_le_bytes());
+        digest.update(col.to_le_bytes());
+        update_debug(&mut digest, cell.value);
+        update_bytes(&mut digest, cell.formatted.as_bytes());
+        update_debug(&mut digest, &cell.explicit_style);
+        update_debug(&mut digest, &cell.rich_text);
+        update_debug(&mut digest, &cell.hyperlink);
+        update_debug(&mut digest, &sheet.resolved_cell_style(row, col));
+    }
+    update_bytes(&mut digest, b"rxls.indirect-scene-dependencies.v1");
+    for coordinate in source_dependencies {
+        digest.update(coordinate.row.to_le_bytes());
+        digest.update(coordinate.col.to_le_bytes());
+        update_debug(&mut digest, &sheet.cell(coordinate.row, coordinate.col));
+        update_debug(
+            &mut digest,
+            &sheet.formatted(coordinate.row, coordinate.col),
+        );
+    }
+    Ok(digest.finalize().into())
+}
+
 /// Materialize exactly one requested page from a prepared page map.
 pub fn build_print_page(
     workbook: &Workbook,
@@ -1175,7 +1565,7 @@ pub fn build_print_page(
             sheet_count: workbook.sheets.len(),
         })?;
     let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
-    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget)
+    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget, true)
 }
 
 /// Materialize exactly one requested page without an owning workbook.
@@ -1185,7 +1575,7 @@ pub fn build_sheet_print_page(
     page_index: usize,
 ) -> Result<PrintPage, RenderError> {
     let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
-    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget)
+    build_sheet_print_page_with_budget(sheet, prepared, page_index, &mut media_budget, true)
 }
 
 fn build_sheet_print_page_with_budget(
@@ -1193,7 +1583,58 @@ fn build_sheet_print_page_with_budget(
     prepared: &PreparedPrintDocument,
     page_index: usize,
     media_budget: &mut DecodedMediaBudget,
+    verify_source: bool,
 ) -> Result<PrintPage, RenderError> {
+    if verify_source {
+        if prepared.tracks_used_extent {
+            let mut options = match &prepared.state {
+                PreparedPrintState::SinglePage { render_options } => render_options.clone(),
+                PreparedPrintState::Paginated { areas, .. } => areas
+                    .first()
+                    .map(|area| area.source_options.clone())
+                    .ok_or(RenderError::Backend {
+                        reason: "prepared_print_state_invalid",
+                    })?,
+            };
+            options.selection = RenderSelection::Used;
+            let current_range = match &prepared.state {
+                PreparedPrintState::SinglePage { .. } => render_used_scene_range(sheet, &options)?,
+                PreparedPrintState::Paginated { .. } => render_used_print_range(sheet, &options)?,
+            };
+            if current_range != prepared.report.source.range {
+                return Err(RenderError::Backend {
+                    reason: "prepared_print_source_changed",
+                });
+            }
+        }
+        let identity_ranges = match &prepared.state {
+            PreparedPrintState::SinglePage { .. } => vec![prepared.report.source.range],
+            PreparedPrintState::Paginated { areas, .. } => areas
+                .iter()
+                .flat_map(|area| area.measurement_ranges.iter().copied())
+                .collect(),
+        };
+        let style_identity_ranges = match &prepared.state {
+            PreparedPrintState::SinglePage { .. } => vec![prepared.report.source.range],
+            PreparedPrintState::Paginated { areas, .. } => areas
+                .iter()
+                .flat_map(|area| area.render_ranges.iter().copied())
+                .collect(),
+        };
+        if print_source_identity(
+            sheet,
+            prepared.report.source.sheet_index,
+            &identity_ranges,
+            &style_identity_ranges,
+            &prepared.render_limits,
+            &prepared.source_dependencies,
+        )? != prepared.source_identity
+        {
+            return Err(RenderError::Backend {
+                reason: "prepared_print_source_changed",
+            });
+        }
+    }
     let map = prepared
         .report
         .pages
@@ -1206,7 +1647,7 @@ fn build_sheet_print_page_with_budget(
     let sheet_index = prepared.report.source.sheet_index;
     let scene = match &prepared.state {
         PreparedPrintState::SinglePage { render_options } => {
-            let scene = media_budget.build_sheet_scene(sheet, sheet_index, render_options)?;
+            let scene = media_budget.build_sheet_scene(sheet, sheet_index, render_options, None)?;
             let scene_nodes = scene_node_count(&scene.nodes)?;
             enforce_print_limit(
                 LimitKind::PageSceneNodes,
@@ -1266,6 +1707,8 @@ fn build_sheet_print_page_with_budget(
                 sheet,
                 sheet_index,
                 &area.source_options,
+                &area.measured_rows,
+                &area.measured_columns,
                 behavior,
                 running_text,
                 *paper,
@@ -1310,8 +1753,13 @@ pub fn build_print_document(
     let mut total_scene_nodes = 0_u64;
     let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
     for page_index in 0..prepared.report.pages.len() {
-        let page =
-            build_sheet_print_page_with_budget(sheet, &prepared, page_index, &mut media_budget)?;
+        let page = build_sheet_print_page_with_budget(
+            sheet,
+            &prepared,
+            page_index,
+            &mut media_budget,
+            false,
+        )?;
         total_scene_nodes = total_scene_nodes
             .checked_add(scene_node_count(&page.scene.nodes)?)
             .ok_or(RenderError::CoordinateOverflow)?;
@@ -1340,8 +1788,13 @@ pub fn build_sheet_print_document(
     let mut total_scene_nodes = 0_u64;
     let mut media_budget = DecodedMediaBudget::new(prepared.render_limits.max_decoded_media_bytes);
     for page_index in 0..prepared.report.pages.len() {
-        let page =
-            build_sheet_print_page_with_budget(sheet, &prepared, page_index, &mut media_budget)?;
+        let page = build_sheet_print_page_with_budget(
+            sheet,
+            &prepared,
+            page_index,
+            &mut media_budget,
+            false,
+        )?;
         total_scene_nodes = total_scene_nodes
             .checked_add(scene_node_count(&page.scene.nodes)?)
             .ok_or(RenderError::CoordinateOverflow)?;
@@ -1364,6 +1817,8 @@ fn build_page_scene(
     sheet: &Sheet,
     sheet_index: usize,
     source_options: &RenderOptions,
+    measured_rows: &[MeasuredAxisSlot<u32>],
+    measured_columns: &[MeasuredAxisSlot<u16>],
     behavior: &PrintBehavior,
     running_text: RunningText<'_>,
     paper: PaperGeometry,
@@ -1420,6 +1875,8 @@ fn build_page_scene(
             &mut nodes,
             sheet,
             source_options,
+            measured_rows,
+            measured_columns,
             slot,
             repeat_rows,
             repeat_cols,
@@ -1473,6 +1930,8 @@ fn build_page_scene(
             sheet,
             sheet_index,
             source_options,
+            measured_rows,
+            measured_columns,
             RenderRange::new(
                 slot.rows.first,
                 slot.columns.first,
@@ -1481,6 +1940,9 @@ fn build_page_scene(
             ),
             body_x,
             body_y,
+            slot.columns.size,
+            slot.rows.size,
+            content_rect,
             scale_permille,
             limits,
             media_budget,
@@ -1492,9 +1954,14 @@ fn build_page_scene(
             sheet,
             sheet_index,
             source_options,
+            measured_rows,
+            measured_columns,
             RenderRange::new(first_row, slot.columns.first, last_row, slot.columns.last),
             body_x,
             repeat_y,
+            slot.columns.size,
+            repeated_height,
+            content_rect,
             scale_permille,
             limits,
             media_budget,
@@ -1506,9 +1973,14 @@ fn build_page_scene(
             sheet,
             sheet_index,
             source_options,
+            measured_rows,
+            measured_columns,
             RenderRange::new(slot.rows.first, first_col, slot.rows.last, last_col),
             repeat_x,
             body_y,
+            repeated_width,
+            slot.rows.size,
+            content_rect,
             scale_permille,
             limits,
             media_budget,
@@ -1520,9 +1992,14 @@ fn build_page_scene(
             sheet,
             sheet_index,
             source_options,
+            measured_rows,
+            measured_columns,
             RenderRange::new(first_row, first_col, last_row, last_col),
             repeat_x,
             repeat_y,
+            repeated_width,
+            repeated_height,
+            content_rect,
             scale_permille,
             limits,
             media_budget,
@@ -1649,26 +2126,86 @@ fn append_block(
     sheet: &Sheet,
     sheet_index: usize,
     base_options: &RenderOptions,
+    measured_rows: &[MeasuredAxisSlot<u32>],
+    measured_columns: &[MeasuredAxisSlot<u16>],
     range: RenderRange,
     x: Fixed,
     y: Fixed,
+    width: Fixed,
+    height: Fixed,
+    content_rect: Rect,
     scale_permille: u16,
     limits: &PrintLimits,
     media_budget: &mut DecodedMediaBudget,
 ) -> Result<(), RenderError> {
+    let block_clip = Rect {
+        x,
+        y,
+        width: scale_fixed(width, scale_permille)?,
+        height: scale_fixed(height, scale_permille)?,
+    };
+    let Some(clip) = intersect_rect(block_clip, content_rect)? else {
+        return Ok(());
+    };
     let mut options = base_options.clone();
     options.selection = RenderSelection::Range(range);
-    let scene = media_budget.build_sheet_scene(sheet, sheet_index, &options)?;
+    let scene = media_budget.build_sheet_scene(
+        sheet,
+        sheet_index,
+        &options,
+        Some(SheetGeometryOverride::new(measured_rows, measured_columns)),
+    )?;
+    let mut nodes = Vec::with_capacity(scene.nodes.len());
     for node in scene.nodes {
         let transformed = transform_node(node, x, y, scale_permille)?;
-        output.push(transformed);
-        enforce_print_limit(
-            LimitKind::PageSceneNodes,
-            limits.max_total_scene_nodes.min(u64::from(u32::MAX)),
-            scene_node_count(output)?,
-        )?;
+        nodes.push(transformed);
     }
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    output.push(SceneNode::ClipGroup(ClipGroupNode { clip, nodes }));
+    enforce_print_limit(
+        LimitKind::PageSceneNodes,
+        limits.max_total_scene_nodes.min(u64::from(u32::MAX)),
+        scene_node_count(output)?,
+    )?;
     Ok(())
+}
+
+fn intersect_rect(left: Rect, right: Rect) -> Result<Option<Rect>, RenderError> {
+    let left_right = left
+        .x
+        .checked_add(left.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left_bottom = left
+        .y
+        .checked_add(left.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_right = right
+        .x
+        .checked_add(right.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_bottom = right
+        .y
+        .checked_add(right.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let end_x = left_right.min(right_right);
+    let end_y = left_bottom.min(right_bottom);
+    if end_x <= x || end_y <= y {
+        return Ok(None);
+    }
+    Ok(Some(Rect {
+        x,
+        y,
+        width: end_x
+            .checked_sub(x)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: end_y
+            .checked_sub(y)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1676,6 +2213,8 @@ fn append_headings(
     output: &mut Vec<SceneNode>,
     sheet: &Sheet,
     options: &RenderOptions,
+    measured_rows: &[MeasuredAxisSlot<u32>],
+    measured_columns: &[MeasuredAxisSlot<u16>],
     slot: PageSlot,
     repeat_rows: Option<(u32, u32)>,
     repeat_cols: Option<(u16, u16)>,
@@ -1714,33 +2253,21 @@ fn append_headings(
         limits,
     )?;
     let body_rows = if slot.rows.size.raw() > 0 {
-        measure_rows(
-            sheet,
-            slot.rows.first,
-            slot.rows.last,
-            slot.columns.first,
-            options,
-        )?
+        measured_axis_range(measured_rows, slot.rows.first, slot.rows.last)
     } else {
         Vec::new()
     };
     let body_columns = if slot.columns.size.raw() > 0 {
-        measure_columns(
-            sheet,
-            slot.columns.first,
-            slot.columns.last,
-            slot.rows.first,
-            options,
-        )?
+        measured_axis_range(measured_columns, slot.columns.first, slot.columns.last)
     } else {
         Vec::new()
     };
     let title_rows = match repeat_rows {
-        Some((first, last)) => measure_rows(sheet, first, last, slot.columns.first, options)?,
+        Some((first, last)) => measured_axis_range(measured_rows, first, last),
         None => Vec::new(),
     };
     let title_columns = match repeat_cols {
-        Some((first, last)) => measure_columns(sheet, first, last, slot.rows.first, options)?,
+        Some((first, last)) => measured_axis_range(measured_columns, first, last),
         None => Vec::new(),
     };
     let mut x = if right_to_left {
@@ -2496,7 +3023,12 @@ fn page_has_content(
     slot: PageSlot,
     print_range: RenderRange,
     options: &RenderOptions,
+    geometry: SheetGeometryOverride<'_>,
 ) -> Result<bool, RenderError> {
+    let first_row = slot.rows.first.max(print_range.first_row);
+    let last_row = slot.rows.last.min(print_range.last_row);
+    let first_col = slot.columns.first.max(print_range.first_col);
+    let last_col = slot.columns.last.min(print_range.last_col);
     let contains = |row: u32, col: u16| {
         row >= slot.rows.first
             && row <= slot.rows.last
@@ -2507,15 +3039,50 @@ fn page_has_content(
             && col >= print_range.first_col
             && col <= print_range.last_col
     };
-    if sheet
-        .display_cells()
-        .any(|cell| contains(cell.row, cell.col))
-        || sheet
-            .blank_cell_styles()
-            .keys()
-            .any(|&(row, col)| contains(row, col))
-    {
-        return Ok(true);
+    if first_row <= last_row && first_col <= last_col {
+        if sheet
+            .display_cells_in_range(first_row, first_col, last_row, last_col)
+            .next()
+            .is_some()
+            || sheet
+                .blank_cell_styles()
+                .range((first_row, 0)..=(last_row, MAX_WORKSHEET_COLUMN))
+                .any(|(&(row, col), _)| contains(row, col))
+        {
+            return Ok(true);
+        }
+        if sheet
+            .default_cell_style()
+            .is_some_and(cell_style_has_visible_blank_paint)
+            || sheet
+                .row_styles()
+                .range(first_row..=last_row)
+                .any(|(_, style)| cell_style_has_visible_blank_paint(style))
+            || sheet
+                .column_styles()
+                .range(first_col..=last_col)
+                .any(|(_, style)| cell_style_has_visible_blank_paint(style))
+            || sheet.tables().iter().any(|table| {
+                let (r0, c0, r1, c1) = table.range;
+                r0 <= r1
+                    && c0 <= c1
+                    && r0 <= last_row
+                    && r1 >= first_row
+                    && c0 <= last_col
+                    && c1 >= first_col
+            })
+            || sheet.conditional_formats().iter().any(|conditional| {
+                let (r0, c0, r1, c1) = conditional.sqref;
+                r0 <= r1
+                    && c0 <= c1
+                    && r0 <= last_row
+                    && r1 >= first_row
+                    && c0 <= last_col
+                    && c1 >= first_col
+            })
+        {
+            return Ok(true);
+        }
     }
     if sheet.merged_ranges().iter().any(|&(r0, c0, r1, c1)| {
         r0 <= slot.rows.last
@@ -2526,53 +3093,17 @@ fn page_has_content(
         return Ok(true);
     }
 
-    let intersects = |r0: u32, c0: u16, r1: u32, c1: u16| {
-        r0 <= slot.rows.last
-            && r1 >= slot.rows.first
-            && c0 <= slot.columns.last
-            && c1 >= slot.columns.first
-            && r0 <= print_range.last_row
-            && r1 >= print_range.first_row
-            && c0 <= print_range.last_col
-            && c1 >= print_range.first_col
-    };
-    let mut image_metadata = vec![None; sheet.images().len()];
-    let mut chart_metadata = vec![None; sheet.charts().len()];
-    for metadata in sheet.drawing_metadata() {
-        let slot = match metadata.kind {
-            DrawingObjectKind::Image => image_metadata.get_mut(metadata.object_index),
-            DrawingObjectKind::Chart => chart_metadata.get_mut(metadata.object_index),
-            _ => None,
-        };
-        if let Some(slot) = slot.filter(|slot| slot.is_none()) {
-            *slot = Some(metadata);
-        }
-    }
-    for (index, image) in sheet.images().iter().enumerate() {
-        let metadata = image_metadata[index];
-        if metadata.is_some_and(|metadata| {
-            metadata.behavior == DrawingAnchorBehavior::Absolute && metadata.from_cell.is_none()
-        }) {
-            continue;
-        }
-        let to = image.to.unwrap_or((
-            image.from.0.saturating_add(10),
-            image.from.1.saturating_add(4),
-        ));
-        if intersects(image.from.0, image.from.1, to.0, to.1) {
-            return Ok(true);
-        }
-    }
-    for (index, chart) in sheet.charts().iter().enumerate() {
-        let metadata = chart_metadata[index];
-        if metadata.is_some_and(|metadata| {
-            metadata.behavior == DrawingAnchorBehavior::Absolute && metadata.from_cell.is_none()
-        }) {
-            continue;
-        }
-        if intersects(chart.from.0, chart.from.1, chart.to.0, chart.to.1) {
-            return Ok(true);
-        }
+    if cell_drawings_intersect_prepared_range(
+        sheet,
+        RenderRange::new(
+            slot.rows.first,
+            slot.columns.first,
+            slot.rows.last,
+            slot.columns.last,
+        ),
+        geometry,
+    )? {
+        return Ok(true);
     }
     if sheet
         .sparklines()
@@ -2581,19 +3112,6 @@ fn page_has_content(
     {
         return Ok(true);
     }
-    if sheet.drawing_metadata().iter().any(|metadata| {
-        if metadata.kind != DrawingObjectKind::Shape {
-            return false;
-        }
-        let Some(from) = metadata.from_cell else {
-            return false;
-        };
-        let to = metadata.to_cell.unwrap_or(from);
-        intersects(from.0, from.1, to.0, to.1)
-    }) {
-        return Ok(true);
-    }
-
     absolute_drawings_intersect_range(
         sheet,
         RenderRange::new(
@@ -2605,6 +3123,7 @@ fn page_has_content(
         slot.columns.size,
         slot.rows.size,
         options,
+        geometry,
     )
 }
 
@@ -2634,34 +3153,143 @@ fn merge_intervals_columns(sheet: &Sheet, first: u16, last: u16) -> Vec<(u16, u1
     values.into_iter().collect()
 }
 
-fn measure_rows(
-    sheet: &Sheet,
-    first: u32,
-    last: u32,
-    sample_col: u16,
-    options: &RenderOptions,
-) -> Result<Vec<MeasuredAxisSlot<u32>>, RenderError> {
-    let (rows, _) = measure_sheet_axes(
-        sheet,
-        RenderRange::new(first, sample_col, last, sample_col),
-        options,
-    )?;
-    Ok(rows)
+fn measured_axis_range<I>(
+    slots: &[MeasuredAxisSlot<I>],
+    first: I,
+    last: I,
+) -> Vec<MeasuredAxisSlot<I>>
+where
+    I: Copy + Ord,
+{
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| slot.index >= first && slot.index <= last)
+        .collect()
 }
 
-fn measure_columns(
-    sheet: &Sheet,
-    first: u16,
-    last: u16,
-    sample_row: u32,
-    options: &RenderOptions,
-) -> Result<Vec<MeasuredAxisSlot<u16>>, RenderError> {
-    let (_, columns) = measure_sheet_axes(
-        sheet,
-        RenderRange::new(sample_row, first, sample_row, last),
-        options,
+fn merge_measured_axis<I>(sizes: &mut BTreeMap<I, Fixed>, slots: &[MeasuredAxisSlot<I>])
+where
+    I: Copy + Ord,
+{
+    for slot in slots {
+        sizes
+            .entry(slot.index)
+            .and_modify(|size| *size = (*size).max(slot.size))
+            .or_insert(slot.size);
+    }
+}
+
+fn measured_axis_slots<I>(
+    sizes: BTreeMap<I, Fixed>,
+) -> Result<Vec<MeasuredAxisSlot<I>>, RenderError>
+where
+    I: Copy + Ord,
+{
+    let mut offset = Fixed::ZERO;
+    let mut slots = Vec::with_capacity(sizes.len());
+    for (index, size) in sizes {
+        slots.push(MeasuredAxisSlot {
+            index,
+            offset,
+            size,
+        });
+        offset = offset
+            .checked_add(size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(slots)
+}
+
+fn enforce_measurement_union_limits(
+    ranges: &[RenderRange],
+    limits: &RenderLimits,
+) -> Result<(), RenderError> {
+    let rows = interval_union_count(
+        ranges
+            .iter()
+            .map(|range| (u64::from(range.first_row), u64::from(range.last_row) + 1)),
     )?;
-    Ok(columns)
+    let columns = interval_union_count(
+        ranges
+            .iter()
+            .map(|range| (u64::from(range.first_col), u64::from(range.last_col) + 1)),
+    )?;
+    let cells = rectangle_union_count(ranges)?;
+    for (kind, limit, actual) in [
+        (LimitKind::Rows, limits.max_rows, rows),
+        (LimitKind::Columns, limits.max_columns, columns),
+        (LimitKind::Cells, limits.max_cells, cells),
+    ] {
+        if actual > limit {
+            return Err(RenderError::LimitExceeded {
+                kind,
+                limit,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn interval_union_count(
+    intervals: impl IntoIterator<Item = (u64, u64)>,
+) -> Result<u64, RenderError> {
+    let mut intervals = intervals.into_iter().collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut total = 0_u64;
+    let mut current: Option<(u64, u64)> = None;
+    for (start, end) in intervals {
+        if start >= end {
+            continue;
+        }
+        match current {
+            Some((current_start, current_end)) if start <= current_end => {
+                current = Some((current_start, current_end.max(end)));
+            }
+            Some((current_start, current_end)) => {
+                total = total
+                    .checked_add(current_end - current_start)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = current {
+        total = total
+            .checked_add(end - start)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(total)
+}
+
+fn rectangle_union_count(ranges: &[RenderRange]) -> Result<u64, RenderError> {
+    let mut row_boundaries = ranges
+        .iter()
+        .flat_map(|range| [u64::from(range.first_row), u64::from(range.last_row) + 1])
+        .collect::<Vec<_>>();
+    row_boundaries.sort_unstable();
+    row_boundaries.dedup();
+    let mut total = 0_u64;
+    for band in row_boundaries.windows(2) {
+        let first = band[0];
+        let last = band[1];
+        let columns = interval_union_count(ranges.iter().filter_map(|range| {
+            let range_first = u64::from(range.first_row);
+            let range_last = u64::from(range.last_row) + 1;
+            (range_first < last && range_last > first)
+                .then_some((u64::from(range.first_col), u64::from(range.last_col) + 1))
+        }))?;
+        total = total
+            .checked_add(
+                (last - first)
+                    .checked_mul(columns)
+                    .ok_or(RenderError::CoordinateOverflow)?,
+            )
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(total)
 }
 
 fn axis_total<I>(slots: &[MeasuredAxisSlot<I>]) -> Result<Fixed, RenderError> {
@@ -2997,9 +3625,124 @@ fn push_json_escaped(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use rxls::{PageSetup, Workbook};
+    use std::io::Write as _;
+
+    use rxls::{CellStyle, Chart, ChartKind, Color, PageSetup, Workbook};
+    use zip::write::SimpleFileOptions;
 
     use super::*;
+
+    #[test]
+    fn prepared_identity_merges_256_column_area_row_scans_once() {
+        let ranges = (0..256_u16)
+            .map(|column| RenderRange::new(0, column, 249_999, column))
+            .collect::<Vec<_>>();
+        assert_eq!(merged_identity_row_bands(&ranges), [(0, 249_999)]);
+
+        let disjoint = [
+            RenderRange::new(0, 0, 9, 0),
+            RenderRange::new(5, 10, 20, 10),
+            RenderRange::new(30, 20, 39, 20),
+            RenderRange::new(40, 30, 49, 30),
+        ];
+        assert_eq!(merged_identity_row_bands(&disjoint), [(0, 20), (30, 49)]);
+    }
+
+    fn zip_parts(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for &(path, body) in parts {
+            writer
+                .start_file(path, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn solid_rgba_png() -> Vec<u8> {
+        let mut output = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut output, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[17, 89, 143, 255]).unwrap();
+        }
+        output
+    }
+
+    fn absolute_image_workbook(right_to_left: bool) -> Workbook {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:spreadsheet><table:table table:name="Absolute"><table:shapes><draw:frame draw:name="absolute" text:anchor-type="page" svg:x="0in" svg:y="0.2604166666667in" svg:width="0.1041666666667in" svg:height="0.1041666666667in"><draw:image xlink:href="Pictures/page.png"/></draw:frame></table:shapes><table:table-row><table:table-cell/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let image = solid_rgba_png();
+        let mut workbook = Workbook::open(&zip_parts(&[
+            (
+                "mimetype",
+                b"application/vnd.oasis.opendocument.spreadsheet",
+            ),
+            ("content.xml", content.as_bytes()),
+            ("Pictures/page.png", &image),
+        ]))
+        .unwrap();
+        workbook.sheets[0].set_right_to_left(right_to_left);
+        workbook
+    }
+
+    fn absolute_print_options(omit_sparse_pages: bool) -> PrintOptions {
+        PrintOptions {
+            omit_sparse_pages,
+            render: RenderOptions {
+                font_pack: Some(crate::font::synthetic_test_pack()),
+                default_font_family: "Wide Sans".to_string(),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        }
+    }
+
+    fn image_rects(nodes: &[SceneNode], output: &mut Vec<Rect>) {
+        for node in nodes {
+            match node {
+                SceneNode::ClipGroup(group) => image_rects(&group.nodes, output),
+                SceneNode::Image(image) => output.push(image.rect),
+                _ => {}
+            }
+        }
+    }
+
+    fn page_image_rects(page: &PrintPage) -> Vec<Rect> {
+        let mut output = Vec::new();
+        image_rects(&page.scene.nodes, &mut output);
+        output
+    }
+
+    fn assert_full_and_streamed_absolute_images(
+        workbook: &Workbook,
+        options: &PrintOptions,
+        expected_body_rows: &[(u32, u32)],
+        expected_image_counts: &[usize],
+    ) {
+        let prepared = prepare_print_document(workbook, 0, options).unwrap();
+        assert_eq!(prepared.report.pages.len(), expected_body_rows.len());
+        let streamed = (0..prepared.report.pages.len())
+            .map(|index| build_print_page(workbook, &prepared, index).unwrap())
+            .collect::<Vec<_>>();
+        let full = build_print_document(workbook, 0, options).unwrap();
+        assert_eq!(full.report.pages, prepared.report.pages);
+        assert_eq!(
+            full.pages
+                .iter()
+                .map(|page| { (page.map.body_range.first_row, page.map.body_range.last_row,) })
+                .collect::<Vec<_>>(),
+            expected_body_rows
+        );
+        for ((full_page, streamed_page), &expected_count) in
+            full.pages.iter().zip(&streamed).zip(expected_image_counts)
+        {
+            let full_rects = page_image_rects(full_page);
+            assert_eq!(full_rects.len(), expected_count, "{:?}", full_page.map);
+            assert_eq!(page_image_rects(streamed_page), full_rects);
+        }
+    }
 
     #[test]
     fn column_labels_cover_excel_boundaries() {
@@ -3155,6 +3898,14 @@ mod tests {
 
     #[test]
     fn single_page_sheets_honors_source_print_gridlines_and_caller_disable() {
+        fn has_gridline(nodes: &[SceneNode]) -> bool {
+            nodes.iter().any(|node| match node {
+                SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
+                SceneNode::ClipGroup(group) => has_gridline(&group.nodes),
+                _ => false,
+            })
+        }
+
         let mut workbook = Workbook::new();
         let sheet = workbook.add_sheet("gridlines");
         sheet.write(0, 0, "A");
@@ -3170,22 +3921,210 @@ mod tests {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &options).unwrap();
-        assert!(document.pages[0].scene.nodes.iter().any(|node| {
-            matches!(
-                node,
-                SceneNode::Rect(rect) if rect.stroke == Some(Rgb::GRIDLINE)
-            )
-        }));
+        assert!(has_gridline(&document.pages[0].scene.nodes));
 
         let mut disabled = options;
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
-        assert!(!document.pages[0].scene.nodes.iter().any(|node| {
-            matches!(
-                node,
-                SceneNode::Rect(rect) if rect.stroke == Some(Rgb::GRIDLINE)
-            )
-        }));
+        assert!(!has_gridline(&document.pages[0].scene.nodes));
+    }
+
+    #[test]
+    fn paginated_body_replays_prepared_nonlocal_auto_row_geometry() {
+        fn filled_rect(nodes: &[SceneNode], color: Rgb) -> Option<Rect> {
+            nodes.iter().find_map(|node| match node {
+                SceneNode::ClipGroup(group) => filled_rect(&group.nodes, color),
+                SceneNode::Rect(node) if node.fill == Some(color) => Some(node.rect),
+                _ => None,
+            })
+        }
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("prepared-print-geometry");
+        sheet.set_col_width(0, 100.0);
+        sheet.set_col_width(1, 2.0);
+        sheet.write_styled(
+            0,
+            0,
+            "plain",
+            &CellStyle::new().fill(Color::rgb(17, 34, 51)),
+        );
+        sheet.write_styled(0, 1, "한글中文한글中文", &CellStyle::new().wrap());
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 0, 1))
+                .with_scale(100),
+        );
+        let options = PrintOptions {
+            omit_sparse_pages: false,
+            render: RenderOptions {
+                font_pack: Some(crate::font::synthetic_test_pack()),
+                default_font_family: "Wide Sans".to_string(),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        assert!(document.pages.len() >= 2);
+        let first_body = document.pages[0]
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::ClipGroup(group)
+                    if filled_rect(&group.nodes, Rgb::new(17, 34, 51)).is_some() =>
+                {
+                    Some((
+                        group.clip,
+                        filled_rect(&group.nodes, Rgb::new(17, 34, 51)).unwrap(),
+                    ))
+                }
+                _ => None,
+            })
+            .expect("first paginated body clip and filled cell");
+        assert_eq!(first_body.1.height, first_body.0.height);
+    }
+
+    #[test]
+    fn absolute_drawing_uses_prepared_auto_height_origins_in_full_and_streamed_pages() {
+        for right_to_left in [false, true] {
+            for omit_sparse_pages in [false, true] {
+                let mut workbook = absolute_image_workbook(right_to_left);
+                let sheet = &mut workbook.sheets[0];
+                sheet.write(
+                    0,
+                    0,
+                    (0..30)
+                        .map(|index| format!("line-{index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                sheet.write(1, 0, "row-two");
+                sheet.set_page_setup(
+                    PageSetup::new()
+                        .with_print_area((0, 0, 1, 0))
+                        .with_paper_size(1)
+                        .with_scale(400),
+                );
+                let options = absolute_print_options(omit_sparse_pages);
+                assert_full_and_streamed_absolute_images(
+                    &workbook,
+                    &options,
+                    &[(0, 0), (1, 1)],
+                    &[1, 0],
+                );
+
+                let document = build_print_document(&workbook, 0, &options).unwrap();
+                let rect = page_image_rects(&document.pages[0])[0];
+                assert_eq!(
+                    rect.y.raw() - document.report.content_rect.y.raw(),
+                    Fixed::from_pixels(100).raw()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_drawing_respects_explicit_and_hidden_preceding_row_geometry() {
+        for right_to_left in [false, true] {
+            for omit_sparse_pages in [false, true] {
+                let options = absolute_print_options(omit_sparse_pages);
+
+                let mut explicit = absolute_image_workbook(right_to_left);
+                let sheet = &mut explicit.sheets[0];
+                sheet.write(0, 0, "explicit-height");
+                sheet.write(1, 0, "row-two");
+                sheet.set_row_height(0, 300.0);
+                sheet.set_page_setup(
+                    PageSetup::new()
+                        .with_print_area((0, 0, 1, 0))
+                        .with_paper_size(1)
+                        .with_scale(400),
+                );
+                assert_full_and_streamed_absolute_images(
+                    &explicit,
+                    &options,
+                    &[(0, 0), (1, 1)],
+                    &[1, 0],
+                );
+
+                let mut hidden = absolute_image_workbook(right_to_left);
+                let sheet = &mut hidden.sheets[0];
+                sheet.write(0, 0, "hidden-row");
+                sheet.write(1, 0, "visible-row");
+                sheet.hide_row(0);
+                sheet.set_row_height(1, 75.0);
+                sheet.set_page_setup(
+                    PageSetup::new()
+                        .with_print_area((0, 0, 1, 0))
+                        .with_paper_size(1)
+                        .with_scale(400),
+                );
+                assert_full_and_streamed_absolute_images(&hidden, &options, &[(1, 1)], &[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_anchor_identity_covers_off_area_content_derived_row_height() {
+        fn prepared_row_zero_height(prepared: &PreparedPrintDocument) -> Fixed {
+            let PreparedPrintState::Paginated { areas, .. } = &prepared.state else {
+                panic!("expected paginated state");
+            };
+            areas[0]
+                .measured_rows
+                .iter()
+                .find(|row| row.index == 0)
+                .map(|row| row.size)
+                .expect("off-area anchor row geometry")
+        }
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Identity");
+        sheet.set_col_width(5, 2.0);
+        sheet.write_styled(0, 5, "short", &CellStyle::new().wrap());
+        sheet.write(1, 1, "printed");
+        sheet.add_chart(Chart::new(ChartKind::Line, (0, 0), (2, 2)));
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((1, 1, 1, 1))
+                .with_paper_size(1)
+                .with_scale(100),
+        );
+        let options = PrintOptions {
+            render: RenderOptions {
+                font_pack: Some(crate::font::synthetic_test_pack()),
+                default_font_family: "Wide Sans".to_string(),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+
+        let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+        let original_height = prepared_row_zero_height(&prepared);
+        build_print_page(&workbook, &prepared, 0).unwrap();
+
+        workbook.sheets[0].write_styled(
+            0,
+            5,
+            (0..20)
+                .map(|index| format!("mandatory-line-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &CellStyle::new().wrap(),
+        );
+        let changed = prepare_print_document(&workbook, 0, &options).unwrap();
+        assert!(
+            prepared_row_zero_height(&changed) > original_height,
+            "off-area content must expand the row used by the partial anchor"
+        );
+        assert!(matches!(
+            build_print_page(&workbook, &prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed"
+            })
+        ));
     }
 
     #[test]

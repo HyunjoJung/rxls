@@ -3,6 +3,36 @@ name: fuzz
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Run the ordinary fuzz campaign or the branch-local Render Oracle workflow
+        required: true
+        default: fuzz
+        type: choice
+        options:
+          - fuzz
+          - render-oracle
+      campaign:
+        description: Render Oracle campaign size (ignored for ordinary fuzz runs)
+        required: true
+        default: pilot
+        type: choice
+        options:
+          - pilot
+          - full
+      baseline_mode:
+        description: Verify a tracked baseline or bootstrap a hosted full candidate
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - candidate
+      bootstrap_identities:
+        description: Capture initially-null Render Oracle identities without parity
+        required: true
+        default: false
+        type: boolean
   schedule:
     - cron: "0 4 * * 1"
 
@@ -15,6 +45,7 @@ env:
 
 jobs:
   fuzz:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'fuzz' }}
     runs-on: ubuntu-latest
     env:
       # PRs receive a bounded smoke gate; scheduled/manual runs retain the
@@ -92,3 +123,14 @@ jobs:
             fuzz/artifacts/**
           if-no-files-found: warn
           retention-days: 14
+
+  render-oracle:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'render-oracle' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/render-oracle.yml
+    with:
+      baseline_mode: ${{ inputs.baseline_mode }}
+      bootstrap_identities: ${{ inputs.bootstrap_identities }}
+      campaign: ${{ inputs.campaign }}
+      source_sha: ${{ github.sha }}

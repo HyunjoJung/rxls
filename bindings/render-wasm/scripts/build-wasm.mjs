@@ -2,6 +2,14 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+const PROBE_TIMEOUT_MS = 5_000;
+const MAX_PROBE_OUTPUT_BYTES = 16 * 1024;
+const probeOptions = {
+  encoding: "utf8",
+  timeout: PROBE_TIMEOUT_MS,
+  maxBuffer: MAX_PROBE_OUTPUT_BYTES,
+  killSignal: "SIGKILL"
+};
 const root = fileURLToPath(new URL("..", import.meta.url));
 const lock = JSON.parse(await readFile(new URL("../toolchain-lock.json", import.meta.url), "utf8"));
 const cargoPath = rustupBinary("cargo", lock.rust);
@@ -12,12 +20,12 @@ const buildEnvironment = {
   RUSTC: rustcPath,
   RUSTUP_TOOLCHAIN: lock.rust
 };
-const probe = spawnSync("wasm-pack", ["--version"], { encoding: "utf8" });
+const probe = spawnSync("wasm-pack", ["--version"], probeOptions);
 if (probe.error?.code === "ENOENT") {
-  const bindgen = spawnSync("wasm-bindgen", ["--version"], { encoding: "utf8" });
+  const bindgen = spawnSync("wasm-bindgen", ["--version"], probeOptions);
   if (
     bindgen.status !== 0 ||
-    bindgen.stdout.trim() !== `wasm-bindgen ${lock.wasmBindgen.version}`
+    (bindgen.stdout ?? "").trim() !== `wasm-bindgen ${lock.wasmBindgen.version}`
   ) {
     console.error(
       `expected wasm-pack ${lock.wasmPack.version} or wasm-bindgen ${lock.wasmBindgen.version}`
@@ -49,8 +57,13 @@ if (probe.error?.code === "ENOENT") {
   );
   process.exit(generated.status ?? 1);
 }
-if (probe.status !== 0 || probe.stdout.trim() !== `wasm-pack ${lock.wasmPack.version}`) {
-  console.error(`expected wasm-pack ${lock.wasmPack.version}; got ${probe.stdout.trim() || "unknown"}`);
+if (
+  probe.status !== 0 ||
+  (probe.stdout ?? "").trim() !== `wasm-pack ${lock.wasmPack.version}`
+) {
+  console.error(
+    `expected wasm-pack ${lock.wasmPack.version}; got ${(probe.stdout ?? "").trim() || "unknown"}`
+  );
   process.exit(2);
 }
 await rm(new URL("../pkg", import.meta.url), { recursive: true, force: true });
@@ -65,9 +78,9 @@ function rustupBinary(name, toolchain) {
   const located = spawnSync(
     "rustup",
     ["which", name, "--toolchain", toolchain],
-    { encoding: "utf8" }
+    probeOptions
   );
-  if (located.status !== 0 || located.stdout.trim() === "") {
+  if (located.status !== 0 || (located.stdout ?? "").trim() === "") {
     console.error(`Rust ${toolchain} ${name} is unavailable`);
     process.exit(2);
   }

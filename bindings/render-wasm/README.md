@@ -39,10 +39,14 @@ faces without filesystem or host-font discovery. PNG text output requires this
 verified pack; SVG remains available without one.
 
 Cancellation uses `AbortSignal` or `client.cancel(requestId)`. Queued work is
-removed before entering WASM. A synchronous render already executing in the
-dedicated worker cannot receive another worker message until it returns, but
-its output is discarded; `client.terminate()` is the hard-stop boundary and
-invalidates open document sessions.
+removed before entering WASM. Rendering inside WASM is synchronous and is not
+cooperatively cancellable: once that call is executing, the worker cannot
+receive a soft-cancel message until the call returns. A soft-cancel still
+rejects the local promise and discards any eventual output, but it does not
+promise to stop active CPU work. `client.terminate()` is the active-work
+hard-stop boundary. It destroys the dedicated worker, rejects every active and
+queued request with `client_closed`, releases their transferable buffers, and
+invalidates all open document sessions.
 
 The package never creates blob workers, uses `eval`, injects scripts, or
 discovers local paths. Applications must serve `js/worker.mjs`, generated WASM,
@@ -54,13 +58,24 @@ handlers, external paint resources, or non-embedded image data.
 Run focused gates from this directory:
 
 ```sh
-cargo +1.85.0 test --locked
-cargo +1.85.0 check --target wasm32-unknown-unknown --locked
+RUST_185_BIN="$(dirname "$(rustup which cargo --toolchain 1.85.0)")"
+PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" test --locked
+PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" clippy --locked --all-targets -- -D warnings
+PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" check \
+  --target wasm32-unknown-unknown --locked
+PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.85.0 RUSTDOCFLAGS="-D warnings" \
+  "$RUST_185_BIN/cargo" doc --locked --no-deps
 npm test
 rustup toolchain install 1.88.0 --profile minimal
 WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.126.XXXXXX")"
-cargo +1.88.0 install wasm-bindgen-cli --version 0.2.126 --locked \
-  --root "$WASM_BINDGEN_TOOL_ROOT"
+RUST_188_BIN="$(dirname "$(rustup which cargo --toolchain 1.88.0)")"
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" install wasm-bindgen-cli \
+  --version 0.2.126 --locked --root "$WASM_BINDGEN_TOOL_ROOT"
 PATH="$WASM_BINDGEN_TOOL_ROOT/bin:$PATH" npm run build:wasm
 npm run test:browser
 ```
@@ -68,11 +83,40 @@ npm run test:browser
 `toolchain-lock.json` pins the Rust 1.85 source MSRV, the separate Rust 1.88
 host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
 isolated tool root, wasm-pack/wasm-bindgen, the exact Chrome for Testing archive
-identity, and browser heap/retention ceilings. The real worker smoke attaches
-separately to the page and dedicated worker targets, samples their combined V8,
-embedder, and backing-store memory through the DevTools protocol, synchronizes
-garbage collection before baseline/retained samples, and fails above those
-ceilings. The Node protocol tests have no third-party npm dependencies.
+identity, and browser heap/retention ceilings. The release-runner Linux
+process-tree RSS ceiling remains 1 GiB. macOS uses a separate 2 GiB absolute
+ceiling because its summed per-process RSS includes shared Chromium pages in
+each helper; both platforms retain the same 512 MiB post-baseline growth
+ceiling.
+
+The real worker smoke attaches separately to the page and every live dedicated
+worker target. It fails closed if any DevTools heap field is absent, samples
+combined V8, embedder, and backing-store memory, records bounded process-tree
+RSS high-water evidence, and synchronizes garbage collection before baseline
+and retained samples. Baseline collection completes before each uncached
+fixture generation. The fixture is a project-owned deterministic 8,192-cell
+OOXML workbook with a generated 64x64 PNG and verified generated OpenType font
+pack. The browser renders a 2,048-cell virtual tile while budgeting the 4,096
+same-row measurement candidates used by automatic row height, then renders one
+print-page SVG and PNG. It pins the embedded PNG byte identity, dimensions,
+color format, browser decode, and decoded RGBA SHA-256.
+
+The CSP negative control requires one exact enforced `connect-src` violation
+and proves that the blocked URL never enters the DevTools Network pipeline.
+A second isolated, CSP-free DevTools target attempts a loopback off-origin
+request; Fetch interception stops it before transport, Network must report the
+same request identity with `net::ERR_INTERNET_DISCONNECTED`, no response may
+arrive, and a bounded local sink must receive zero requests. The hard-stop
+control binds a random nonce to a unique worker URL and request, pauses the
+active worker on a confirmed WebAssembly frame, and requires
+`Target.targetDestroyed` plus absence from `Target.getTargets` within two
+seconds. Detachment, natural completion, ambiguous or wrong-nonce targets, and
+JavaScript-only pauses cannot satisfy the proof. The post-GC retained-heap gate
+covers the surviving page and every live render worker, so the terminated
+worker cannot retain workbook, font, image, or output buffers. Fixture
+provenance and exact SHA-256/size identities live beside the browser tests;
+those test-only files are excluded by the package's explicit `files` allowlist.
+The Node protocol tests have no third-party npm dependencies.
 
 `THIRD_PARTY_NOTICES.txt` records the exact Cargo normal-dependency closure used
 to build the WebAssembly artifact for `wasm32-unknown-unknown`, including

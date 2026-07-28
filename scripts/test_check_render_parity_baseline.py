@@ -81,8 +81,17 @@ def evidence() -> dict[str, object]:
             "dpi": 96,
             "font_pack": {"pack_sha256": "f" * 64},
             "locale": "C.UTF-8",
+            "measurement_toolchain": {
+                "host_tools_identity_sha256": "0" * 64,
+                "kind": "poppler",
+                "pdffonts_sha256": "1" * 64,
+                "pdfinfo_sha256": "2" * 64,
+                "pdftoppm_sha256": "3" * 64,
+                "pdftotext_sha256": "4" * 64,
+            },
             "metric_policy": {"edge_luma_delta": 32},
             "oracle_lock": {"profile": "locked"},
+            "renderer_binary": {"bytes": 1_234_567, "sha256": "5" * 64},
         },
         "files": files,
         "mode": "compare",
@@ -188,6 +197,32 @@ class RenderParityBaselineTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("identity_mismatch:input_set_sha256", report["failures"])
         self.assertIn("identity_mismatch:configuration_sha256", report["failures"])
+
+    def test_measurement_toolchain_and_renderer_are_baseline_identities(self) -> None:
+        source = evidence()
+        baseline = MODULE.derive_baseline(source)
+
+        for key in (
+            "host_tools_identity_sha256",
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        ):
+            changed = copy.deepcopy(source)
+            changed["configuration"]["measurement_toolchain"][key] = "9" * 64
+            self.assertNotEqual(
+                MODULE.derive_baseline(changed)["configuration_sha256"],
+                baseline["configuration_sha256"],
+                key,
+            )
+
+        changed = copy.deepcopy(source)
+        changed["configuration"]["renderer_binary"]["sha256"] = "8" * 64
+        self.assertNotEqual(
+            MODULE.derive_baseline(changed)["configuration_sha256"],
+            baseline["configuration_sha256"],
+        )
 
     def test_scoped_campaign_binds_generated_manifest_and_rejects_legacy_baseline(
         self,

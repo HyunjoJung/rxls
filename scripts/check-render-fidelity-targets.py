@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from fractions import Fraction
 import hashlib
 import json
 from pathlib import Path
@@ -26,6 +27,8 @@ from typing import Any, Sequence
 
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
 OUTPUT_SCHEMA = "rxls.render-fidelity-targets.v1"
+MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
+METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
@@ -49,6 +52,15 @@ CORE_EXCLUDED_FEATURES = frozenset(
         "wrapped-text",
     }
 )
+HARD_FEATURE_COHORTS = {
+    "chart": frozenset({"chart"}),
+    "conditional_format": frozenset({"conditional-format"}),
+    "image_drawing": frozenset({"image-drawing"}),
+    "print_settings": frozenset({"print-settings"}),
+    "rtl": frozenset({"right-to-left-layout", "rtl-text"}),
+    "sparkline": frozenset({"sparkline"}),
+    "wrapped_text": frozenset({"wrapped-text"}),
+}
 
 # Absolute release-quality thresholds.  PPM scores are higher-is-better;
 # geometry is retained in thousandths of a PostScript point and is
@@ -66,6 +78,36 @@ TEXT_BOX_MATCH_MIN_PPM = 999_000
 MIN_CORE_WORKBOOKS = 10
 MIN_BROAD_WORKBOOKS = 40
 MIN_CORE_TEXT_BOXES = 100
+MIN_HARD_FEATURE_WORKBOOKS = 1
+PDF_POINT_DELTA_KEYS = frozenset(
+    {
+        "crop_box_height",
+        "crop_box_width",
+        "libreoffice_xhtml_page_size_height",
+        "libreoffice_xhtml_page_size_width",
+        "media_box_height",
+        "media_box_width",
+        "rxls_xhtml_page_size_height",
+        "rxls_xhtml_page_size_width",
+        "xhtml_height",
+        "xhtml_width",
+    }
+)
+PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
+    {
+        "crop_box_height",
+        "crop_box_width",
+        "media_box_height",
+        "media_box_width",
+        "xhtml_height",
+        "xhtml_width",
+    }
+)
+PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
+    PDF_POINT_DELTA_KEYS - PDF_DIRECT_POINT_DELTA_KEYS
+)
+PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
+PDF_XHTML_CROSSCHECK_MAX_MICROPOINTS = 1_000
 
 
 class GateError(RuntimeError):
@@ -113,6 +155,155 @@ def _ppm(value: object, code: str) -> int:
     return _integer(value, code, maximum=1_000_000)
 
 
+def _point(value: object, code: str, *, positive: bool) -> Fraction:
+    if not isinstance(value, str) or re.fullmatch(
+        r"-?[0-9]+/[1-9][0-9]*", value
+    ) is None:
+        raise GateError(code)
+    result = Fraction(value)
+    if positive and not 0 < result <= 1_000_000:
+        raise GateError(code)
+    return result
+
+
+def _point_side(value: object, code: str) -> dict[str, tuple[Fraction, Fraction]]:
+    row = _exact_object(
+        value,
+        {"crop_box", "media_box", "page_size"},
+        code,
+    )
+    result: dict[str, tuple[Fraction, Fraction]] = {}
+    for name in ("page_size", "media_box", "crop_box"):
+        dimensions = _exact_object(
+            row[name],
+            {"height_points", "width_points"},
+            code,
+        )
+        result[name] = (
+            _point(dimensions["width_points"], code, positive=True),
+            _point(dimensions["height_points"], code, positive=True),
+        )
+    return result
+
+
+def _page_point_geometry(page: dict[str, Any]) -> tuple[int, int, bool]:
+    evidence = _exact_object(
+        page.get("pdf_point_geometry"),
+        {"deltas_points", "libreoffice", "rxls", "xhtml"},
+        "page_point_geometry",
+    )
+    rxls = _point_side(evidence["rxls"], "page_point_geometry")
+    libreoffice = _point_side(
+        evidence["libreoffice"], "page_point_geometry"
+    )
+    xhtml = _exact_object(
+        evidence["xhtml"], {"libreoffice", "rxls"}, "page_point_geometry"
+    )
+    xhtml_values: dict[str, tuple[Fraction, Fraction]] = {}
+    for side in ("rxls", "libreoffice"):
+        dimensions = _exact_object(
+            xhtml[side],
+            {"height_points", "width_points"},
+            "page_point_geometry",
+        )
+        xhtml_values[side] = (
+            _point(
+                dimensions["width_points"], "page_point_geometry", positive=True
+            ),
+            _point(
+                dimensions["height_points"], "page_point_geometry", positive=True
+            ),
+        )
+    expected: dict[str, Fraction] = {}
+    for box in ("media_box", "crop_box"):
+        for offset, axis in enumerate(("width", "height")):
+            expected[f"{box}_{axis}"] = (
+                rxls[box][offset] - libreoffice[box][offset]
+            )
+    for side in ("rxls", "libreoffice"):
+        geometry = rxls if side == "rxls" else libreoffice
+        for offset, axis in enumerate(("width", "height")):
+            expected[f"{side}_xhtml_page_size_{axis}"] = (
+                xhtml_values[side][offset] - geometry["page_size"][offset]
+            )
+    for offset, axis in enumerate(("width", "height")):
+        expected[f"xhtml_{axis}"] = (
+            xhtml_values["rxls"][offset] - xhtml_values["libreoffice"][offset]
+        )
+    deltas = _exact_object(
+        evidence["deltas_points"],
+        set(PDF_POINT_DELTA_KEYS),
+        "page_point_geometry",
+    )
+    parsed = {
+        key: _point(value, "page_point_geometry", positive=False)
+        for key, value in deltas.items()
+    }
+    if parsed != expected:
+        raise GateError("page_point_geometry_delta")
+    max_direct_delta = max(
+        (abs(parsed[key]) for key in PDF_DIRECT_POINT_DELTA_KEYS),
+        default=Fraction(),
+    )
+    max_crosscheck_delta = max(
+        (abs(parsed[key]) for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS),
+        default=Fraction(),
+    )
+    millipoints = (
+        max_direct_delta.numerator * 1000
+        + max_direct_delta.denominator
+        - 1
+    ) // max_direct_delta.denominator
+    crosscheck_micropoints = (
+        max_crosscheck_delta.numerator * 1_000_000
+        + max_crosscheck_delta.denominator
+        - 1
+    ) // max_crosscheck_delta.denominator
+    return (
+        millipoints,
+        crosscheck_micropoints,
+        max_direct_delta == 0
+        and max_crosscheck_delta <= PDF_XHTML_CROSSCHECK_MAX_POINTS,
+    )
+
+
+def _mapping_tuple(row: object) -> tuple[int, int, int]:
+    if not isinstance(row, dict):
+        raise GateError("page_mapping")
+    return (
+        _integer(row.get("source_sheet_index"), "page_mapping"),
+        _integer(row.get("source_pdf_page_index"), "page_mapping"),
+        _integer(row.get("oracle_output_page_index"), "page_mapping"),
+    )
+
+
+def _validate_page_mapping(
+    pages: Sequence[object], scenes: Sequence[object]
+) -> bool:
+    page_mapping = [_mapping_tuple(row) for row in pages]
+    scene_mapping = [_mapping_tuple(row) for row in scenes]
+    if scene_mapping != page_mapping or [
+        row[2] for row in page_mapping
+    ] != list(range(len(page_mapping))):
+        return False
+    seen_sheets: set[int] = set()
+    current_sheet: int | None = None
+    next_local = 0
+    for source_sheet, source_pdf_page, _ in page_mapping:
+        if source_sheet != current_sheet:
+            if source_sheet in seen_sheets:
+                return False
+            if current_sheet is not None and source_sheet <= current_sheet:
+                return False
+            seen_sheets.add(source_sheet)
+            current_sheet = source_sheet
+            next_local = 0
+        if source_pdf_page != next_local:
+            return False
+        next_local += 1
+    return True
+
+
 def _sha256(value: object, code: str) -> str:
     if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
         raise GateError(code)
@@ -129,6 +320,106 @@ def _ratio_ppm(numerator: int, denominator: int, *, empty: int = 0) -> int:
     if denominator == 0:
         return empty
     return (numerator * 1_000_000 + denominator // 2) // denominator
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _mapping_binding(
+    rows: Sequence[dict[str, Any]],
+    *,
+    manifest_sha256: str,
+) -> dict[str, object]:
+    input_sha256: list[str] = []
+    feature_mapping: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for row in rows:
+        digest = _sha256(row.get("sha256"), "manifest_binding")
+        format_name = row.get("format")
+        features = row.get("features")
+        if (
+            digest in seen
+            or format_name not in ORACLE_FORMATS
+            or not isinstance(features, list)
+            or features != sorted(set(features))
+            or any(not isinstance(feature, str) or not feature for feature in features)
+        ):
+            raise GateError("manifest_binding")
+        seen.add(digest)
+        input_sha256.append(digest)
+        feature_mapping.append(
+            {
+                "features": list(features),
+                "format": format_name,
+                "sha256": digest,
+            }
+        )
+    input_sha256.sort()
+    feature_mapping.sort(
+        key=lambda row: (
+            str(row["sha256"]),
+            str(row["format"]),
+            tuple(row["features"]),
+        )
+    )
+    return {
+        "feature_map_sha256": hashlib.sha256(
+            _canonical_json_bytes(feature_mapping)
+        ).hexdigest(),
+        "input_set_sha256": hashlib.sha256(
+            _canonical_json_bytes(input_sha256)
+        ).hexdigest(),
+        "manifest_sha256": _sha256(manifest_sha256, "manifest_binding"),
+        "schema": MANIFEST_BINDING_SCHEMA,
+        "selected_case_count": len(rows),
+    }
+
+
+def _configuration_manifest_binding(
+    configuration: dict[str, Any],
+    files: Sequence[dict[str, Any]],
+    *,
+    expected: dict[str, object] | None,
+) -> dict[str, object]:
+    binding = configuration.get("manifest_binding")
+    if not isinstance(binding, dict) or set(binding) != {
+        "feature_map_sha256",
+        "input_set_sha256",
+        "manifest_sha256",
+        "schema",
+        "selected_case_count",
+    }:
+        raise GateError("manifest_binding")
+    for key in ("feature_map_sha256", "input_set_sha256", "manifest_sha256"):
+        _sha256(binding.get(key), "manifest_binding")
+    if (
+        binding.get("schema") != MANIFEST_BINDING_SCHEMA
+        or binding.get("selected_case_count") != len(files)
+    ):
+        raise GateError("manifest_binding")
+    derived = _mapping_binding(
+        files,
+        manifest_sha256=str(binding["manifest_sha256"]),
+    )
+    if binding != derived or (expected is not None and binding != expected):
+        raise GateError("manifest_binding")
+    return binding
+
+
+def _campaign_manifest_binding(path: Path) -> dict[str, object]:
+    document, digest, _ = _read_report(path)
+    rows = document.get("files")
+    if not isinstance(rows, list):
+        raise GateError("campaign_manifest")
+    selected = [
+        row
+        for row in rows
+        if isinstance(row, dict) and row.get("format") in ORACLE_FORMATS
+    ]
+    if len(selected) != len(rows) or not selected:
+        raise GateError("campaign_manifest")
+    return _mapping_binding(selected, manifest_sha256=digest)
 
 
 def _mean(values: Sequence[int]) -> int:
@@ -174,53 +465,104 @@ def _features(value: object) -> tuple[str, ...] | None:
 
 
 def _text_box_histogram(
-    page: dict[str, Any]
-) -> tuple[int, int, int, int, Counter[int]]:
+    page: dict[str, Any],
+    *,
+    prefix: str = "text_box",
+) -> tuple[int, int, int, int, int, int, Counter[int]]:
+    if prefix not in {"text_box", "text_line_box"}:
+        raise GateError("text_box_prefix")
+    code = prefix
+    rxls_items = _integer(
+        page.get(f"{prefix}_rxls_items"),
+        code,
+        maximum=1_000_000,
+    )
     candidates = _integer(
-        page.get("text_box_candidate_items"),
-        "text_box_candidate_items",
+        page.get(f"{prefix}_candidate_items"),
+        code,
+        maximum=1_000_000,
+    )
+    libreoffice_items = _integer(
+        page.get(f"{prefix}_libreoffice_items"),
+        code,
         maximum=1_000_000,
     )
     matched = _integer(
-        page.get("text_box_matched_items"),
-        "text_box_matched_items",
+        page.get(f"{prefix}_matched_items"),
+        code,
         maximum=candidates,
     )
     ambiguous = _integer(
-        page.get("text_box_ambiguous_items"),
-        "text_box_ambiguous_items",
+        page.get(f"{prefix}_ambiguous_items"),
+        code,
+        maximum=candidates,
+    )
+    rxls_unmatched = _integer(
+        page.get(f"{prefix}_rxls_unmatched_items"),
+        code,
         maximum=candidates,
     )
     unmatched = _integer(
-        page.get("text_box_unmatched_items"),
-        "text_box_unmatched_items",
+        page.get(f"{prefix}_unmatched_items"),
+        code,
         maximum=candidates,
     )
-    if candidates != matched + ambiguous + unmatched:
-        raise GateError("text_box_partition")
-    rows = page.get("text_box_error_histogram_millipoints")
+    libreoffice_unmatched = _integer(
+        page.get(f"{prefix}_libreoffice_unmatched_items"),
+        code,
+        maximum=libreoffice_items,
+    )
+    if (
+        candidates != rxls_items
+        or unmatched != rxls_unmatched
+        or rxls_items != matched + ambiguous + rxls_unmatched
+        or libreoffice_items != matched + libreoffice_unmatched
+    ):
+        raise GateError(f"{prefix}_partition")
+    rows = page.get(f"{prefix}_error_histogram_millipoints")
     if not isinstance(rows, list) or len(rows) > MAX_HISTOGRAM_BUCKETS:
-        raise GateError("text_box_histogram")
+        raise GateError(f"{prefix}_histogram")
     histogram: Counter[int] = Counter()
     previous = -1
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"count", "error_millipoints"}:
-            raise GateError("text_box_histogram")
+            raise GateError(f"{prefix}_histogram")
         error = _integer(
             row["error_millipoints"],
-            "text_box_histogram",
+            f"{prefix}_histogram",
             maximum=1_000_000_000,
         )
-        count = _integer(row["count"], "text_box_histogram", minimum=1, maximum=1_000_000)
+        count = _integer(
+            row["count"],
+            f"{prefix}_histogram",
+            minimum=1,
+            maximum=1_000_000,
+        )
         if error <= previous:
-            raise GateError("text_box_histogram_order")
+            raise GateError(f"{prefix}_histogram_order")
         previous = error
         histogram[error] = count
     if sum(histogram.values()) != matched:
-        raise GateError("text_box_histogram_count")
-    coverage = _ppm(page.get("text_box_match_coverage_ppm"), "text_box_coverage")
-    if coverage != _ratio_ppm(matched, candidates, empty=1_000_000):
-        raise GateError("text_box_coverage_inconsistent")
+        raise GateError(f"{prefix}_histogram_count")
+    both_empty = rxls_items == 0 and libreoffice_items == 0
+    precision = _ratio_ppm(
+        matched, rxls_items, empty=1_000_000 if both_empty else 0
+    )
+    recall = _ratio_ppm(
+        matched, libreoffice_items, empty=1_000_000 if both_empty else 0
+    )
+    f1 = _ratio_ppm(
+        2 * matched, rxls_items + libreoffice_items, empty=1_000_000
+    )
+    if (
+        _ppm(page.get(f"{prefix}_match_coverage_ppm"), code)
+        != precision
+        or _ppm(page.get(f"{prefix}_precision_ppm"), code)
+        != precision
+        or _ppm(page.get(f"{prefix}_recall_ppm"), code) != recall
+        or _ppm(page.get(f"{prefix}_f1_ppm"), code) != f1
+    ):
+        raise GateError(f"{prefix}_coverage_inconsistent")
     expected_median = (
         _histogram_quantile(histogram, 1, 2) if histogram else None
     )
@@ -228,14 +570,22 @@ def _text_box_histogram(
         _histogram_quantile(histogram, 95, 100) if histogram else None
     )
     if (
-        page.get("text_box_median_error_millipoints") != expected_median
-        or page.get("text_box_p95_error_millipoints") != expected_p95
+        page.get(f"{prefix}_median_error_millipoints") != expected_median
+        or page.get(f"{prefix}_p95_error_millipoints") != expected_p95
     ):
-        raise GateError("text_box_quantile_inconsistent")
-    return candidates, matched, ambiguous, unmatched, histogram
+        raise GateError(f"{prefix}_quantile_inconsistent")
+    return (
+        rxls_items,
+        libreoffice_items,
+        matched,
+        ambiguous,
+        rxls_unmatched,
+        libreoffice_unmatched,
+        histogram,
+    )
 
 
-def _edge_f1(rows: Sequence[dict[str, Any]]) -> int:
+def _edge_f1(rows: Sequence[dict[str, Any]]) -> tuple[int, int, int]:
     rxls_pixels = sum(
         _integer(row.get("edge_rxls_pixels"), "edge_metric") for row in rows
     )
@@ -253,13 +603,19 @@ def _edge_f1(rows: Sequence[dict[str, Any]]) -> int:
     both_empty = rxls_pixels == 0 and lo_pixels == 0
     denominator = rxls_matched * lo_pixels + lo_matched * rxls_pixels
     if both_empty:
-        return 1_000_000
+        return 1_000_000, rxls_pixels, lo_pixels
     if denominator == 0:
-        return 0
-    return _ratio_ppm(2 * rxls_matched * lo_matched, denominator)
+        return 0, rxls_pixels, lo_pixels
+    return (
+        _ratio_ppm(2 * rxls_matched * lo_matched, denominator),
+        rxls_pixels,
+        lo_pixels,
+    )
 
 
-def _semantic_codepoint(rows: Sequence[dict[str, Any]]) -> tuple[int, int]:
+def _semantic_codepoint(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[int, int, int, int]:
     rxls = sum(
         _integer(row.get("semantic_codepoint_rxls_items"), "semantic_metric")
         for row in rows
@@ -278,7 +634,95 @@ def _semantic_codepoint(rows: Sequence[dict[str, Any]]) -> tuple[int, int]:
     return (
         _ratio_ppm(matched, rxls, empty=1_000_000 if both_empty else 0),
         _ratio_ppm(matched, libreoffice, empty=1_000_000 if both_empty else 0),
+        rxls,
+        libreoffice,
     )
+
+
+def _aggregate_text_boxes(
+    rows: Sequence[dict[str, Any]],
+    *,
+    prefix: str = "text_box",
+) -> dict[str, object]:
+    rxls_items = 0
+    libreoffice_items = 0
+    matched = 0
+    ambiguous = 0
+    rxls_unmatched = 0
+    libreoffice_unmatched = 0
+    histogram: Counter[int] = Counter()
+    for page in rows:
+        (
+            page_rxls,
+            page_libreoffice,
+            page_matched,
+            page_ambiguous,
+            page_rxls_unmatched,
+            page_libreoffice_unmatched,
+            page_histogram,
+        ) = _text_box_histogram(page, prefix=prefix)
+        rxls_items += page_rxls
+        libreoffice_items += page_libreoffice
+        matched += page_matched
+        ambiguous += page_ambiguous
+        rxls_unmatched += page_rxls_unmatched
+        libreoffice_unmatched += page_libreoffice_unmatched
+        histogram.update(page_histogram)
+    both_empty = rxls_items == 0 and libreoffice_items == 0
+    return {
+        "ambiguous": ambiguous,
+        "f1_ppm": _ratio_ppm(
+            2 * matched,
+            rxls_items + libreoffice_items,
+            empty=1_000_000,
+        ),
+        "libreoffice_items": libreoffice_items,
+        "libreoffice_unmatched": libreoffice_unmatched,
+        "matched": matched,
+        "median_error_millipoints": (
+            _histogram_quantile(histogram, 1, 2) if histogram else None
+        ),
+        "p95_error_millipoints": (
+            _histogram_quantile(histogram, 95, 100) if histogram else None
+        ),
+        "precision_ppm": _ratio_ppm(
+            matched,
+            rxls_items,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "recall_ppm": _ratio_ppm(
+            matched,
+            libreoffice_items,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "rxls_items": rxls_items,
+        "rxls_unmatched": rxls_unmatched,
+    }
+
+
+def _absolute_cohort_metrics(
+    rows: Sequence[dict[str, Any]],
+    similarities: Sequence[int],
+) -> dict[str, object]:
+    semantic_precision, semantic_recall, semantic_rxls, semantic_libreoffice = (
+        _semantic_codepoint(rows)
+    )
+    edge_f1, edge_rxls, edge_libreoffice = _edge_f1(rows)
+    return {
+        "edge_f1_ppm": edge_f1,
+        "edge_libreoffice_pixels": edge_libreoffice,
+        "edge_rxls_pixels": edge_rxls,
+        "semantic_codepoint_libreoffice_items": semantic_libreoffice,
+        "semantic_codepoint_precision_ppm": semantic_precision,
+        "semantic_codepoint_recall_ppm": semantic_recall,
+        "semantic_codepoint_rxls_items": semantic_rxls,
+        "similarity_mean_ppm": _mean(similarities),
+        "text_box": _aggregate_text_boxes(rows),
+        "text_line_box": _aggregate_text_boxes(
+            rows,
+            prefix="text_line_box",
+        ),
+    }
 
 
 def _file_similarity(rows: Sequence[dict[str, Any]]) -> int:
@@ -361,12 +805,26 @@ def _container_oracle_identity(
         raise GateError("configuration_container_libreoffice")
     inspector = _exact_object(
         row.get("pdf_font_inspector"),
-        {"kind", "pdffonts_sha256"},
+        {
+            "host_tools_identity_sha256",
+            "kind",
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        },
         "configuration_container_pdffonts",
     )
     if inspector.get("kind") != "poppler":
         raise GateError("configuration_container_pdffonts")
-    _sha256(inspector.get("pdffonts_sha256"), "configuration_container_pdffonts")
+    for key in (
+        "host_tools_identity_sha256",
+        "pdffonts_sha256",
+        "pdfinfo_sha256",
+        "pdftoppm_sha256",
+        "pdftotext_sha256",
+    ):
+        _sha256(inspector.get(key), "configuration_container_pdffonts")
     _sha256(row.get("build_contract_sha256"), "configuration_container_identity")
     _sha256(row.get("lock_file_sha256"), "configuration_container_identity")
     if row.get("runtime") not in {"docker", "podman"}:
@@ -468,18 +926,105 @@ def _font_attestation(value: object) -> int:
     return objects
 
 
+def _native_pdf_attestation(value: object) -> tuple[int, int]:
+    row = _exact_object(
+        value,
+        {
+            "actual_text_documents",
+            "charprocs_documents",
+            "documents",
+            "embedded_font_objects",
+            "font_objects",
+            "identity_set_sha256",
+            "subset_font_objects",
+            "type3_documents",
+            "type3_font_objects",
+            "unicode_font_objects",
+        },
+        "native_pdf_attestation",
+    )
+    documents = _integer(
+        row["documents"],
+        "native_pdf_attestation",
+        minimum=1,
+        maximum=MAX_PAGES,
+    )
+    objects = _integer(
+        row["font_objects"],
+        "native_pdf_attestation",
+        minimum=1,
+        maximum=1_000_000,
+    )
+    for key in (
+        "actual_text_documents",
+        "charprocs_documents",
+        "type3_documents",
+    ):
+        if _integer(
+            row[key], "native_pdf_attestation", maximum=documents
+        ) != documents:
+            raise GateError("native_pdf_attestation")
+    for key in (
+        "embedded_font_objects",
+        "subset_font_objects",
+        "type3_font_objects",
+        "unicode_font_objects",
+    ):
+        if _integer(
+            row[key], "native_pdf_attestation", maximum=objects
+        ) != objects:
+            raise GateError("native_pdf_attestation")
+    _sha256(row["identity_set_sha256"], "native_pdf_attestation")
+    return documents, objects
+
+
 def _configuration(
     report: dict[str, Any],
 ) -> tuple[int, dict[str, str], str, dict[str, Any] | None]:
     configuration = report.get("configuration")
     if not isinstance(configuration, dict):
         raise GateError("configuration")
+    if configuration.get("lane_filter") != {
+        "formats": [],
+        "required_features": [],
+    }:
+        raise GateError("configuration_lane_filter")
     dpi = _integer(configuration.get("dpi"), "configuration_dpi", minimum=36, maximum=1200)
     font_pack = configuration.get("font_pack")
     oracle_lock = configuration.get("oracle_lock")
     renderer = configuration.get("renderer_binary")
+    measurement_toolchain = configuration.get("measurement_toolchain")
     if not isinstance(font_pack, dict) or not isinstance(oracle_lock, dict) or not isinstance(renderer, dict):
         raise GateError("configuration_identity")
+    measurement_keys = {
+        "kind",
+        "pdffonts_sha256",
+        "pdfinfo_sha256",
+        "pdftoppm_sha256",
+        "pdftotext_sha256",
+    }
+    if not isinstance(measurement_toolchain, dict) or (
+        frozenset(measurement_toolchain)
+        not in {
+            frozenset(measurement_keys),
+            frozenset({*measurement_keys, "host_tools_identity_sha256"}),
+        }
+    ) or measurement_toolchain.get("kind") != "poppler":
+        raise GateError("configuration_measurement_toolchain")
+    measurement_hashes = {
+        key: measurement_toolchain.get(key)
+        for key in (
+            "pdffonts_sha256",
+            "pdfinfo_sha256",
+            "pdftoppm_sha256",
+            "pdftotext_sha256",
+        )
+    }
+    if not all(
+        isinstance(value, str) and SHA256_RE.fullmatch(value)
+        for value in measurement_hashes.values()
+    ):
+        raise GateError("configuration_measurement_toolchain")
     identities = {
         "font_pack_sha256": font_pack.get("pack_sha256"),
         "renderer_sha256": renderer.get("sha256"),
@@ -511,12 +1056,21 @@ def _configuration(
                 "oracle_image_manifest_digest": container_identity["image"]["manifest_digest"],
                 "oracle_lock_file_sha256": container_identity["lock_file_sha256"],
                 "oracle_libreoffice_artifact_sha256": container_identity["libreoffice"]["artifact_sha256"],
-                "pdffonts_sha256": container_identity["pdf_font_inspector"]["pdffonts_sha256"],
             }
+        )
+        inspector = container_identity["pdf_font_inspector"]
+        if measurement_toolchain != inspector:
+            raise GateError("configuration_measurement_toolchain")
+        identities.update(measurement_hashes)
+        identities["host_tools_identity_sha256"] = _sha256(
+            measurement_toolchain.get("host_tools_identity_sha256"),
+            "configuration_measurement_toolchain",
         )
         python_identity = None
     else:
         oracle_mode = "direct"
+        if set(measurement_toolchain) != measurement_keys:
+            raise GateError("configuration_measurement_toolchain")
         profile = oracle_lock.get("profile")
         if not isinstance(profile, str) or not profile or len(profile) > 256:
             raise GateError("configuration_identity")
@@ -549,22 +1103,39 @@ def _configuration(
             for value in locked_hashes.values()
         ):
             raise GateError("configuration_identity")
+        if any(
+            measurement_hashes[key] != locked_hashes[key]
+            for key in measurement_hashes
+        ):
+            raise GateError("configuration_measurement_toolchain")
         identities.update(locked_hashes)
     policy = configuration.get("metric_policy")
     implementation = policy.get("implementation") if isinstance(policy, dict) else None
     if (
         not isinstance(policy, dict)
+        or policy.get("contract_schema") != METRIC_CONTRACT_SCHEMA
+        or policy.get("contract_version") != 2
         or policy.get("mask_match_tolerance_pixels") != 1
         or policy.get("edge_luma_delta") != 32
         or policy.get("semantic_content_retained") is not False
         or policy.get("semantic_text_source")
         != "svg_data-rxls-visible-label_vs_pdftotext_layout"
+        or policy.get("raster_source")
+        != "rxls_native_print_pdf_vs_libreoffice_calc_pdf"
+        or policy.get("rasterizer")
+        != "same_locked_poppler_pdftoppm_both_sides"
+        or policy.get("text_ink_source")
+        != "thresholded_common_poppler_rasters"
         or policy.get("text_box_content_retained") is not False
         or policy.get("text_box_error_units") != "millipoints"
         or policy.get("text_box_source")
-        != "svg_clipped_glyph_bounds_vs_pdftotext_bbox_layout"
+        != "pdftotext_bbox_layout_word_boxes_both_native_pdfs"
+        or policy.get("text_line_box_source")
+        != "pdftotext_bbox_layout_line_boxes_both_native_pdfs"
         or policy.get("text_box_matching")
-        != "exact_svg_data-rxls-visible-label_nearest_unique_pdftotext_bbox_layout"
+        != "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
+        or policy.get("text_box_geometry")
+        != "nominal_poppler_layout_not_ink_bounds"
         or not isinstance(implementation, dict)
         or implementation.get("kind") != "numpy_integer_exact_v1"
         or (
@@ -584,7 +1155,12 @@ def _configuration(
     return dpi, identities, oracle_mode, container_identity
 
 
-def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) -> dict[str, Any]:
+def evaluate(
+    report: dict[str, Any],
+    evidence_sha256: str,
+    evidence_bytes: int,
+    expected_manifest_binding: dict[str, object] | None = None,
+) -> dict[str, Any]:
     if (
         not isinstance(evidence_sha256, str)
         or SHA256_RE.fullmatch(evidence_sha256) is None
@@ -602,6 +1178,11 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
     summary = report.get("summary")
     if not isinstance(summary, dict) or summary.get("files") != len(files):
         raise GateError("summary_files")
+    manifest_binding = _configuration_manifest_binding(
+        report["configuration"],
+        files,
+        expected=expected_manifest_binding,
+    )
 
     broad_rows: list[dict[str, Any]] = []
     core_rows: list[dict[str, Any]] = []
@@ -609,16 +1190,24 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
     core_similarities: list[int] = []
     broad_files: list[dict[str, Any]] = []
     core_files: list[dict[str, Any]] = []
+    hard_rows: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in HARD_FEATURE_COHORTS
+    }
+    hard_similarities: dict[str, list[int]] = {
+        name: [] for name in HARD_FEATURE_COHORTS
+    }
+    hard_files: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in HARD_FEATURE_COHORTS
+    }
     format_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
     page_errors_millipoints: list[int] = []
-    text_box_histogram: Counter[int] = Counter()
-    text_box_candidates = 0
-    text_box_matched = 0
-    text_box_ambiguous = 0
-    text_box_unmatched = 0
     total_pages = 0
     font_objects = 0
+    native_pdf_documents = 0
+    native_pdf_font_objects = 0
+    point_geometry_mismatches = 0
+    xhtml_crosscheck_max_micropoints = 0
     failures: set[str] = set()
 
     for item in files:
@@ -637,6 +1226,11 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
             failures.add("broad_coverage_incomplete")
             continue
         font_objects += _font_attestation(item.get("font_attestation"))
+        native_documents, native_objects = _native_pdf_attestation(
+            item.get("native_pdf_attestation")
+        )
+        native_pdf_documents += native_documents
+        native_pdf_font_objects += native_objects
         if oracle_mode == "container":
             if container_identity is None:
                 raise GateError("configuration_container_identity")
@@ -670,59 +1264,101 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
         libreoffice_pages = _integer(
             artifacts.get("libreoffice_pages"), "page_mapping"
         )
-        page_indices = []
-        for page in pages:
-            if not isinstance(page, dict):
-                raise GateError("page_row")
-            page_indices.append(_integer(page.get("sheet_index"), "page_mapping"))
-        scene_indices = []
-        for scene in scenes:
-            if not isinstance(scene, dict):
-                raise GateError("scene_row")
-            scene_indices.append(_integer(scene.get("sheet_index"), "page_mapping"))
         if (
             page_count == 0
             or rxls_pages != page_count
             or libreoffice_pages != page_count
-            or page_indices != list(range(page_count))
-            or scene_indices != page_indices
+            or not _validate_page_mapping(pages, scenes)
         ):
             failures.add("sheet_page_mapping_not_exact")
+        file_point_mismatches = 0
+        file_point_max = 0
+        file_crosscheck_max = 0
         for page in pages:
+            if not isinstance(page, dict):
+                raise GateError("page_row")
             rxls_size = page.get("rxls_size")
             libreoffice_size = page.get("libreoffice_size")
             if not isinstance(rxls_size, dict) or not isinstance(libreoffice_size, dict):
                 raise GateError("page_geometry")
-            width_delta = abs(
-                _integer(rxls_size.get("width"), "page_geometry", minimum=1)
-                - _integer(libreoffice_size.get("width"), "page_geometry", minimum=1)
+            rxls_width = _integer(
+                rxls_size.get("width"), "page_geometry", minimum=1
             )
-            height_delta = abs(
-                _integer(rxls_size.get("height"), "page_geometry", minimum=1)
-                - _integer(libreoffice_size.get("height"), "page_geometry", minimum=1)
+            rxls_height = _integer(
+                rxls_size.get("height"), "page_geometry", minimum=1
             )
-            pixels = max(width_delta, height_delta)
-            page_errors_millipoints.append(
-                (pixels * 72_000 + dpi // 2) // dpi
+            libreoffice_width = _integer(
+                libreoffice_size.get("width"), "page_geometry", minimum=1
             )
+            libreoffice_height = _integer(
+                libreoffice_size.get("height"), "page_geometry", minimum=1
+            )
+            if (rxls_width, rxls_height) != (
+                libreoffice_width,
+                libreoffice_height,
+            ):
+                failures.add("raster_page_box_mismatch")
+            (
+                point_error,
+                crosscheck_error,
+                exact_point_geometry,
+            ) = _page_point_geometry(page)
+            page_errors_millipoints.append(point_error)
+            file_point_max = max(file_point_max, point_error)
+            file_crosscheck_max = max(
+                file_crosscheck_max, crosscheck_error
+            )
+            file_point_mismatches += int(not exact_point_geometry)
+            if not exact_point_geometry:
+                failures.add("pdf_point_geometry_mismatch")
+        point_geometry_mismatches += file_point_mismatches
+        xhtml_crosscheck_max_micropoints = max(
+            xhtml_crosscheck_max_micropoints,
+            file_crosscheck_max,
+        )
+        if (
+            _integer(
+                metrics.get("pdf_point_geometry_mismatches"),
+                "page_point_geometry_aggregate",
+                maximum=page_count,
+            )
+            != file_point_mismatches
+            or _integer(
+                metrics.get("max_pdf_point_geometry_delta_millipoints"),
+                "page_point_geometry_aggregate",
+            )
+            != file_point_max
+            or _integer(
+                metrics.get(
+                    "max_pdf_xhtml_crosscheck_delta_micropoints"
+                ),
+                "page_point_geometry_aggregate",
+            )
+            != file_crosscheck_max
+        ):
+            raise GateError("page_point_geometry_aggregate")
 
         broad_rows.extend(pages)
         broad_similarities.append(file_similarity)
         broad_files.append(item)
         features = _features(item.get("features"))
+        if features is None:
+            raise GateError("file_features")
+        _, _, semantic_rxls, semantic_libreoffice = _semantic_codepoint(pages)
+        _, edge_rxls, edge_libreoffice = _edge_f1(pages)
+        if semantic_rxls == 0 or semantic_libreoffice == 0:
+            failures.add("semantic_population_empty")
+        if edge_rxls == 0 or edge_libreoffice == 0:
+            failures.add("edge_population_empty")
         if features is not None and not CORE_EXCLUDED_FEATURES.intersection(features):
             core_rows.extend(pages)
             core_similarities.append(file_similarity)
             core_files.append(item)
-            for page in pages:
-                candidates, matched, ambiguous, unmatched, histogram = (
-                    _text_box_histogram(page)
-                )
-                text_box_candidates += candidates
-                text_box_matched += matched
-                text_box_ambiguous += ambiguous
-                text_box_unmatched += unmatched
-                text_box_histogram.update(histogram)
+        for name, cohort_features in HARD_FEATURE_COHORTS.items():
+            if cohort_features.intersection(features):
+                hard_rows[name].extend(pages)
+                hard_similarities[name].append(file_similarity)
+                hard_files[name].append(item)
 
     by_status = summary.get("by_status")
     if (
@@ -750,27 +1386,23 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
     if not core_rows:
         raise GateError("empty_core_cohort")
 
-    core_precision, core_recall = _semantic_codepoint(core_rows)
-    core_edge_f1 = _edge_f1(core_rows)
-    core_similarity = _mean(core_similarities)
+    core_metrics = _absolute_cohort_metrics(core_rows, core_similarities)
+    core_precision = int(core_metrics["semantic_codepoint_precision_ppm"])
+    core_recall = int(core_metrics["semantic_codepoint_recall_ppm"])
+    core_edge_f1 = int(core_metrics["edge_f1_ppm"])
+    core_similarity = int(core_metrics["similarity_mean_ppm"])
+    core_text_box = core_metrics["text_box"]
+    core_line_box = core_metrics["text_line_box"]
+    if not isinstance(core_text_box, dict) or not isinstance(core_line_box, dict):
+        raise GateError("text_box_metric")
     broad_similarity = _mean(broad_similarities)
-    text_box_coverage = _ratio_ppm(
-        text_box_matched,
-        text_box_candidates,
-        empty=1_000_000,
-    )
-    if text_box_matched < MIN_CORE_TEXT_BOXES:
+    if int(core_text_box["matched"]) < MIN_CORE_TEXT_BOXES:
         failures.add("text_box_coverage_below_minimum")
-    if sum(text_box_histogram.values()) != text_box_matched:
-        raise GateError("text_box_histogram_count")
-    text_box_median = (
-        _histogram_quantile(text_box_histogram, 1, 2) if text_box_histogram else None
-    )
-    text_box_p95 = (
-        _histogram_quantile(text_box_histogram, 95, 100)
-        if text_box_histogram
-        else None
-    )
+    text_box_precision = int(core_text_box["precision_ppm"])
+    text_box_recall = int(core_text_box["recall_ppm"])
+    text_box_f1 = int(core_text_box["f1_ppm"])
+    text_box_median = core_text_box["median_error_millipoints"]
+    text_box_p95 = core_text_box["p95_error_millipoints"]
     page_median = _nearest_rank(page_errors_millipoints, 1, 2)
     page_p95 = _nearest_rank(page_errors_millipoints, 95, 100)
     page_max = max(page_errors_millipoints)
@@ -785,22 +1417,154 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
         failures.add("core_similarity_below_target")
     if broad_similarity < BROAD_SIMILARITY_MIN_PPM:
         failures.add("broad_similarity_below_target")
-    if text_box_coverage < TEXT_BOX_MATCH_MIN_PPM:
+    if text_box_precision < TEXT_BOX_MATCH_MIN_PPM:
         failures.add("text_box_match_coverage_below_target")
-    if text_box_ambiguous != 0:
+        failures.add("text_box_precision_below_target")
+    if text_box_recall < TEXT_BOX_MATCH_MIN_PPM:
+        failures.add("text_box_recall_below_target")
+    if text_box_f1 < TEXT_BOX_MATCH_MIN_PPM:
+        failures.add("text_box_f1_below_target")
+    if int(core_text_box["ambiguous"]) != 0:
         failures.add("text_box_mapping_ambiguous")
-    if text_box_unmatched != 0:
+    if int(core_text_box["rxls_unmatched"]) != 0:
         failures.add("text_box_mapping_unmatched")
+    if int(core_text_box["libreoffice_unmatched"]) != 0:
+        failures.add("text_box_reference_unmatched")
     if text_box_median is None or text_box_median > TEXT_BOX_MEDIAN_MAX_MILLIPOINTS:
         failures.add("text_box_median_error_above_target")
     if text_box_p95 is None or text_box_p95 > TEXT_BOX_P95_MAX_MILLIPOINTS:
         failures.add("text_box_p95_error_above_target")
+    if int(core_line_box["matched"]) <= 0:
+        failures.add("text_line_box_coverage_below_minimum")
+    if int(core_line_box["precision_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+        failures.add("text_line_box_precision_below_target")
+    if int(core_line_box["recall_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+        failures.add("text_line_box_recall_below_target")
+    if int(core_line_box["f1_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+        failures.add("text_line_box_f1_below_target")
+    if int(core_line_box["ambiguous"]) != 0:
+        failures.add("text_line_box_mapping_ambiguous")
+    if int(core_line_box["rxls_unmatched"]) != 0:
+        failures.add("text_line_box_mapping_unmatched")
+    if int(core_line_box["libreoffice_unmatched"]) != 0:
+        failures.add("text_line_box_reference_unmatched")
+    if (
+        core_line_box["median_error_millipoints"] is None
+        or int(core_line_box["median_error_millipoints"])
+        > TEXT_BOX_MEDIAN_MAX_MILLIPOINTS
+    ):
+        failures.add("text_line_box_median_error_above_target")
+    if (
+        core_line_box["p95_error_millipoints"] is None
+        or int(core_line_box["p95_error_millipoints"])
+        > TEXT_BOX_P95_MAX_MILLIPOINTS
+    ):
+        failures.add("text_line_box_p95_error_above_target")
     if page_median > PAGE_BOX_MEDIAN_MAX_MILLIPOINTS:
         failures.add("page_box_median_error_above_target")
     if page_p95 > PAGE_BOX_P95_MAX_MILLIPOINTS:
         failures.add("page_box_p95_error_above_target")
     if page_max > PAGE_BOX_MAX_MILLIPOINTS:
         failures.add("page_box_max_error_above_target")
+
+    hard_feature_metrics: dict[str, dict[str, object]] = {}
+    for name in sorted(HARD_FEATURE_COHORTS):
+        workbook_count = len(hard_files[name])
+        if workbook_count < MIN_HARD_FEATURE_WORKBOOKS:
+            failures.add(f"hard_feature_coverage_below_minimum:{name}")
+        if not hard_rows[name]:
+            hard_feature_metrics[name] = {"workbooks": workbook_count}
+            continue
+        metrics = _absolute_cohort_metrics(
+            hard_rows[name],
+            hard_similarities[name],
+        )
+        text_box = metrics.get("text_box")
+        line_box = metrics.get("text_line_box")
+        if not isinstance(text_box, dict) or not isinstance(line_box, dict):
+            raise GateError("hard_feature_text_box")
+        hard_feature_metrics[name] = {
+            "workbooks": workbook_count,
+            **metrics,
+        }
+        if (
+            int(metrics["semantic_codepoint_rxls_items"]) == 0
+            or int(metrics["semantic_codepoint_libreoffice_items"]) == 0
+        ):
+            failures.add(f"hard_feature_semantic_population_empty:{name}")
+        if (
+            int(metrics["edge_rxls_pixels"]) == 0
+            or int(metrics["edge_libreoffice_pixels"]) == 0
+        ):
+            failures.add(f"hard_feature_edge_population_empty:{name}")
+        if int(metrics["semantic_codepoint_precision_ppm"]) < SEMANTIC_CODEPOINT_MIN_PPM:
+            failures.add(f"hard_feature_semantic_precision_below_target:{name}")
+        if int(metrics["semantic_codepoint_recall_ppm"]) < SEMANTIC_CODEPOINT_MIN_PPM:
+            failures.add(f"hard_feature_semantic_recall_below_target:{name}")
+        if int(metrics["edge_f1_ppm"]) < EDGE_F1_MIN_PPM:
+            failures.add(f"hard_feature_edge_f1_below_target:{name}")
+        if int(metrics["similarity_mean_ppm"]) < BROAD_SIMILARITY_MIN_PPM:
+            failures.add(f"hard_feature_similarity_below_target:{name}")
+        if int(text_box["matched"]) <= 0:
+            failures.add(f"hard_feature_text_box_coverage_empty:{name}")
+        if int(text_box["precision_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(f"hard_feature_text_box_precision_below_target:{name}")
+        if int(text_box["recall_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(f"hard_feature_text_box_recall_below_target:{name}")
+        if int(text_box["f1_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(f"hard_feature_text_box_f1_below_target:{name}")
+        if int(text_box["ambiguous"]) != 0:
+            failures.add(f"hard_feature_text_box_ambiguous:{name}")
+        if int(text_box["rxls_unmatched"]) != 0:
+            failures.add(f"hard_feature_text_box_rxls_unmatched:{name}")
+        if int(text_box["libreoffice_unmatched"]) != 0:
+            failures.add(f"hard_feature_text_box_reference_unmatched:{name}")
+        if (
+            text_box["median_error_millipoints"] is None
+            or int(text_box["median_error_millipoints"])
+            > TEXT_BOX_MEDIAN_MAX_MILLIPOINTS
+        ):
+            failures.add(f"hard_feature_text_box_median_above_target:{name}")
+        if (
+            text_box["p95_error_millipoints"] is None
+            or int(text_box["p95_error_millipoints"])
+            > TEXT_BOX_P95_MAX_MILLIPOINTS
+        ):
+            failures.add(f"hard_feature_text_box_p95_above_target:{name}")
+        if int(line_box["matched"]) <= 0:
+            failures.add(f"hard_feature_text_line_box_coverage_empty:{name}")
+        if int(line_box["precision_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(
+                f"hard_feature_text_line_box_precision_below_target:{name}"
+            )
+        if int(line_box["recall_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(
+                f"hard_feature_text_line_box_recall_below_target:{name}"
+            )
+        if int(line_box["f1_ppm"]) < TEXT_BOX_MATCH_MIN_PPM:
+            failures.add(f"hard_feature_text_line_box_f1_below_target:{name}")
+        if int(line_box["ambiguous"]) != 0:
+            failures.add(f"hard_feature_text_line_box_ambiguous:{name}")
+        if int(line_box["rxls_unmatched"]) != 0:
+            failures.add(
+                f"hard_feature_text_line_box_rxls_unmatched:{name}"
+            )
+        if int(line_box["libreoffice_unmatched"]) != 0:
+            failures.add(
+                f"hard_feature_text_line_box_reference_unmatched:{name}"
+            )
+        if (
+            line_box["median_error_millipoints"] is None
+            or int(line_box["median_error_millipoints"])
+            > TEXT_BOX_MEDIAN_MAX_MILLIPOINTS
+        ):
+            failures.add(f"hard_feature_text_line_box_median_above_target:{name}")
+        if (
+            line_box["p95_error_millipoints"] is None
+            or int(line_box["p95_error_millipoints"])
+            > TEXT_BOX_P95_MAX_MILLIPOINTS
+        ):
+            failures.add(f"hard_feature_text_line_box_p95_above_target:{name}")
 
     thresholds = {
         "broad_similarity_min_ppm": BROAD_SIMILARITY_MIN_PPM,
@@ -809,6 +1573,10 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
         "page_box_max_millipoints": PAGE_BOX_MAX_MILLIPOINTS,
         "page_box_median_max_millipoints": PAGE_BOX_MEDIAN_MAX_MILLIPOINTS,
         "page_box_p95_max_millipoints": PAGE_BOX_P95_MAX_MILLIPOINTS,
+        "pdf_point_geometry_exact": True,
+        "pdf_xhtml_crosscheck_max_micropoints": (
+            PDF_XHTML_CROSSCHECK_MAX_MICROPOINTS
+        ),
         "semantic_codepoint_precision_min_ppm": SEMANTIC_CODEPOINT_MIN_PPM,
         "semantic_codepoint_recall_min_ppm": SEMANTIC_CODEPOINT_MIN_PPM,
         "text_box_match_min_ppm": TEXT_BOX_MATCH_MIN_PPM,
@@ -818,19 +1586,43 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
     return {
         "coverage": {
             "broad_workbooks": len(broad_files),
-            "core_text_box_candidates": text_box_candidates,
-            "core_text_box_matches": text_box_matched,
-            "core_text_box_ambiguous": text_box_ambiguous,
-            "core_text_box_unmatched": text_box_unmatched,
+            "core_text_box_candidates": core_text_box["rxls_items"],
+            "core_text_box_libreoffice_items": core_text_box[
+                "libreoffice_items"
+            ],
+            "core_text_box_matches": core_text_box["matched"],
+            "core_text_box_ambiguous": core_text_box["ambiguous"],
+            "core_text_box_unmatched": core_text_box["rxls_unmatched"],
+            "core_text_box_libreoffice_unmatched": core_text_box[
+                "libreoffice_unmatched"
+            ],
+            "core_text_line_box_candidates": core_line_box["rxls_items"],
+            "core_text_line_box_libreoffice_items": core_line_box[
+                "libreoffice_items"
+            ],
+            "core_text_line_box_matches": core_line_box["matched"],
+            "core_text_line_box_ambiguous": core_line_box["ambiguous"],
+            "core_text_line_box_unmatched": core_line_box["rxls_unmatched"],
+            "core_text_line_box_libreoffice_unmatched": core_line_box[
+                "libreoffice_unmatched"
+            ],
             "core_workbooks": len(core_files),
             "format_workbooks": dict(sorted(format_counts.items())),
             "libreoffice_pdf_font_objects": font_objects,
+            "native_pdf_documents": native_pdf_documents,
+            "native_pdf_font_objects": native_pdf_font_objects,
             "pages": total_pages,
             "report_workbooks": len(files),
             "status_counts": dict(sorted(status_counts.items())),
+            "hard_feature_workbooks": {
+                name: len(hard_files[name]) for name in sorted(hard_files)
+            },
         },
         "evidence": {
             "bytes": evidence_bytes,
+            "feature_map_sha256": manifest_binding["feature_map_sha256"],
+            "input_set_sha256": manifest_binding["input_set_sha256"],
+            "manifest_sha256": manifest_binding["manifest_sha256"],
             "sha256": evidence_sha256,
             **identities,
         },
@@ -841,12 +1633,29 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
             "core_semantic_codepoint_precision_ppm": core_precision,
             "core_semantic_codepoint_recall_ppm": core_recall,
             "core_similarity_mean_ppm": core_similarity,
+            "hard_feature_cohorts": hard_feature_metrics,
             "page_box_max_millipoints": page_max,
             "page_box_median_millipoints": page_median,
             "page_box_p95_millipoints": page_p95,
-            "text_box_match_coverage_ppm": text_box_coverage,
+            "pdf_point_geometry_mismatches": point_geometry_mismatches,
+            "pdf_xhtml_crosscheck_max_micropoints": (
+                xhtml_crosscheck_max_micropoints
+            ),
+            "text_box_f1_ppm": text_box_f1,
+            "text_box_match_coverage_ppm": text_box_precision,
             "text_box_median_error_millipoints": text_box_median,
             "text_box_p95_error_millipoints": text_box_p95,
+            "text_box_precision_ppm": text_box_precision,
+            "text_box_recall_ppm": text_box_recall,
+            "text_line_box_f1_ppm": core_line_box["f1_ppm"],
+            "text_line_box_median_error_millipoints": core_line_box[
+                "median_error_millipoints"
+            ],
+            "text_line_box_p95_error_millipoints": core_line_box[
+                "p95_error_millipoints"
+            ],
+            "text_line_box_precision_ppm": core_line_box["precision_ppm"],
+            "text_line_box_recall_ppm": core_line_box["recall_ppm"],
         },
         "passed": not failures,
         "policy": {
@@ -854,6 +1663,11 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
             "minimum_broad_workbooks": MIN_BROAD_WORKBOOKS,
             "minimum_core_text_boxes": MIN_CORE_TEXT_BOXES,
             "minimum_core_workbooks": MIN_CORE_WORKBOOKS,
+            "minimum_hard_feature_workbooks": MIN_HARD_FEATURE_WORKBOOKS,
+            "hard_feature_cohorts": {
+                name: sorted(features)
+                for name, features in sorted(HARD_FEATURE_COHORTS.items())
+            },
             "oracle_formats": list(ORACLE_FORMATS),
         },
         "schema": OUTPUT_SCHEMA,
@@ -864,6 +1678,7 @@ def evaluate(report: dict[str, Any], evidence_sha256: str, evidence_bytes: int) 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path, help="complete parity report")
+    parser.add_argument("--campaign-manifest", type=Path)
     return parser
 
 
@@ -871,7 +1686,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         report, digest, size = _read_report(args.report)
-        result = evaluate(report, digest, size)
+        expected_manifest_binding = (
+            _campaign_manifest_binding(args.campaign_manifest)
+            if args.campaign_manifest is not None
+            else None
+        )
+        result = evaluate(
+            report,
+            digest,
+            size,
+            expected_manifest_binding=expected_manifest_binding,
+        )
     except GateError as error:
         print(f"check-render-fidelity-targets: {error}", file=sys.stderr)
         return 2

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "scripts" / "check_workflow_policy.py"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
+FUZZ_WORKFLOW = ROOT / ".github" / "workflows" / "fuzz.yml"
 RENDER_ORACLE_WORKFLOW = ROOT / ".github" / "workflows" / "render-oracle.yml"
 RENDER_HARDENING_WORKFLOW = ROOT / ".github" / "workflows" / "render-hardening.yml"
 RENDER_BROWSER_WORKFLOW = ROOT / ".github" / "workflows" / "render-browser.yml"
@@ -134,6 +135,41 @@ jobs:
             with self.subTest(mutation=mutation):
                 self.assertTrue(
                     self.policy.audit_pr_head_checkouts(path, mutation)
+                )
+
+    def test_pull_request_checkout_accepts_only_exact_hardened_verifier(self) -> None:
+        expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+        hardened = f"""
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@{"a" * 40} # v7.0.0
+        with:
+          ref: {expression}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: {expression}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+"""
+        path = Path(".github/workflows/example.yml")
+        self.assertEqual(self.policy.audit_pr_head_checkouts(path, hardened), [])
+
+        for command in (
+            "          set -euo pipefail\n",
+            "          git diff --exit-code\n",
+            "          git diff --cached --exit-code\n",
+        ):
+            with self.subTest(command=command):
+                weakened = hardened.replace(command, "", 1)
+                self.assertTrue(
+                    self.policy.audit_pr_head_checkouts(path, weakened)
                 )
 
     def test_flow_map_pull_request_cannot_bypass_exact_head_guards(self) -> None:
@@ -288,18 +324,49 @@ steps:
         self.assertTrue(any("must not invoke mutable nightly" in error for error in errors))
 
     def test_exact_fuzz_workflow_tools_are_accepted(self) -> None:
-        text = """
-env:
-  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
-  CARGO_FUZZ_VERSION: "0.13.2"
-steps:
-  - run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
-  - run: cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build
-"""
+        text = FUZZ_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertEqual(
             self.policy.audit_fuzz_workflow(Path("fuzz.yml"), text), []
         )
+
+    def test_fuzz_dispatch_bridge_rejects_accidental_or_unbound_oracle_runs(self) -> None:
+        original = FUZZ_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "oracle_default": original.replace(
+                "        default: fuzz",
+                "        default: render-oracle",
+                1,
+            ),
+            "ordinary_fuzz_skipped": original.replace(
+                "    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'fuzz' }}",
+                "    if: ${{ inputs.target == 'fuzz' }}",
+                1,
+            ),
+            "oracle_on_pr": original.replace(
+                "    if: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'render-oracle' }}",
+                "    if: ${{ inputs.target == 'render-oracle' }}",
+                1,
+            ),
+            "write_permission": original.replace(
+                "    permissions:\n      contents: read\n"
+                "    uses: ./.github/workflows/render-oracle.yml",
+                "    permissions:\n      contents: write\n"
+                "    uses: ./.github/workflows/render-oracle.yml",
+                1,
+            ),
+            "mutable_source": original.replace(
+                "      source_sha: ${{ github.sha }}",
+                "      source_sha: ${{ github.ref }}",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                self.assertTrue(
+                    self.policy.audit_fuzz_workflow(Path("fuzz.yml"), workflow)
+                )
 
     def test_mutable_tools_are_rejected_in_any_workflow(self) -> None:
         text = """
@@ -389,9 +456,9 @@ steps:
                 '                  "wrapper_sha256": renderer["sha256"],',
                 1,
             ),
-            "summary_schema_v4": original.replace(
+            "summary_schema_v5": original.replace(
+                "rxls.render-oracle-hosted-campaign.v6",
                 "rxls.render-oracle-hosted-campaign.v5",
-                "rxls.render-oracle-hosted-campaign.v4",
                 1,
             ),
         }
@@ -639,20 +706,43 @@ steps:
                 "assert shards",
             ),
             "timeout": original.replace(
-                "inputs.campaign == 'full' && 330 || 120",
-                "inputs.campaign == 'full' && 360 || 120",
+                "&& 330 || 120",
+                "&& 360 || 120",
+                1,
             ),
             "scheduled_profile": original.replace(
-                "github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot'",
+                "(github.event_name == 'workflow_dispatch' || "
+                "github.event_name == 'workflow_call') && inputs.campaign || 'pilot'",
                 "inputs.campaign",
+                1,
             ),
             "head_sha": original.replace(
-                'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+                'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
                 "git rev-parse HEAD",
+                1,
             ),
             "pdffonts_identity": original.replace(
                 '--pdffonts-binary-sha256 "$PDFFONTS_SHA256"',
                 "",
+            ),
+            "host_tools_closure": original.replace(
+                '--host-tools-identity-sha256 "$HOST_TOOLS_IDENTITY_SHA256"',
+                "",
+            ),
+            "persisted_checkout_credentials": original.replace(
+                "          persist-credentials: false\n",
+                "",
+                1,
+            ),
+            "native_pdf_smoke": original.replace(
+                "pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens",
+                "pdf::tests::unreviewed_smoke",
+                1,
+            ),
+            "native_common_raster": original.replace(
+                "          command -v pdftoppm\n",
+                "",
+                1,
             ),
             "merge": original.replace(
                 "python3 scripts/merge-render-parity-reports.py",
@@ -661,6 +751,11 @@ steps:
             "absolute_gate": original.replace(
                 "python3 scripts/check-render-fidelity-targets.py \\\n",
                 "python3 scripts/unchecked-fidelity.py \\\n",
+                1,
+            ),
+            "absolute_gate_diagnostics": original.replace(
+                "| tee target/render-oracle-hosted/fidelity-a.json",
+                "> target/render-oracle-hosted/fidelity-a.json",
                 1,
             ),
             "repeat_gate": original.replace(
@@ -713,18 +808,191 @@ steps:
                 "              --max-similarity-drift-ppm 1000000 \\\n",
             ),
             "raw_artifact": original.replace(
-                "            target/render-oracle-hosted/renderer.json\n",
-                "            target/render-oracle-hosted/renderer.json\n"
+                "            target/render-oracle-upload/renderer.json\n",
+                "            target/render-oracle-upload/renderer.json\n"
                 "            target/render-oracle-hosted/parity-report-a.json\n",
             ),
             "raw_authored_artifact": original.replace(
-                "            target/render-oracle-hosted/authored-print-gate.json\n",
-                "            target/render-oracle-hosted/authored-print-gate.json\n"
+                "            target/render-oracle-upload/authored-print-gate.json\n",
+                "            target/render-oracle-upload/authored-print-gate.json\n"
                 "            target/render-oracle-hosted/authored-print-report.json\n",
+            ),
+            "upload_after_failure": original.replace(
+                "        if: ${{ success() }}",
+                "        if: always()",
+            ),
+            "unstaged_upload": original.replace(
+                "target/render-oracle-upload",
+                "target/render-oracle-hosted",
+            ),
+            "path_key_variants_allowed": original.replace(
+                'normalized_key.endswith("path")',
+                'normalized_key == "path"',
+            ),
+            "path_traversal_allowed": original.replace(
+                "                  assert traversal.search(value) is None\n",
+                "",
+            ),
+            "relative_artifact_name_allowed": original.replace(
+                "                  assert artifact_extension.search(value) is None\n",
+                "",
+            ),
+            "aggregate_extra_key_allowed": original.replace(
+                "                  assert set(document) == expected_keys\n",
+                "",
+                1,
+            ),
+            "late_clean_removed": original.replace(
+                "      - name: Verify evidence source remained exact and clean\n",
+                "      - name: Unreviewed late step\n",
+                1,
+            ),
+            "late_untracked_allowed": original.replace(
+                '          test -z "$(git status --porcelain=v1 --untracked-files=all)"\n',
+                "",
+                1,
             ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
+                self.assertTrue(
+                    self.policy.audit_render_oracle_workflow(
+                        Path("render-oracle.yml"), workflow
+                    )
+                )
+
+    def test_render_oracle_pr_campaigns_are_same_repo_label_guarded(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        pilot_label = "rxls-render-oracle-pilot"
+        full_label = "rxls-render-oracle-full"
+        head_expression = self.policy.ORACLE_SOURCE_SHA_EXPRESSION
+        expected_condition = (
+            "${{ github.event_name != 'pull_request' || "
+            "(github.event.action == 'labeled' && "
+            f"(github.event.label.name == '{pilot_label}' || "
+            f"github.event.label.name == '{full_label}') && "
+            "github.event.pull_request.head.repo.full_name == github.repository) }}"
+        )
+        campaign_expression = self.policy.ORACLE_CAMPAIGN_EXPRESSION
+        timeout_expression = self.policy.ORACLE_TIMEOUT_EXPRESSION
+        bootstrap_expression = self.policy.ORACLE_BOOTSTRAP_EXPRESSION
+        baseline_expression = self.policy.ORACLE_BASELINE_MODE_EXPRESSION
+        hardened_verifier = (
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n'
+            "          git diff --exit-code\n"
+            "          git diff --cached --exit-code\n"
+        )
+
+        self.assertIn("  pull_request:\n    types: [labeled]\n", original)
+        self.assertIn(f"    if: {expected_condition}\n", original)
+        self.assertIn(f"    timeout-minutes: {timeout_expression}\n", original)
+        self.assertEqual(original.count(f"ref: {head_expression}"), 1)
+        self.assertEqual(original.count(f"EXPECTED_SHA: {head_expression}"), 3)
+        self.assertEqual(original.count(f"EXPECTED_SOURCE_SHA: {head_expression}"), 1)
+        self.assertEqual(original.count(f"EXPECTED_HEAD_SHA: {head_expression}"), 1)
+        self.assertEqual(original.count(hardened_verifier), 2)
+        self.assertEqual(
+            original.count(f"RXLS_ORACLE_CAMPAIGN: {campaign_expression}"),
+            1,
+        )
+        self.assertEqual(
+            original.count(f"RXLS_IDENTITY_BOOTSTRAP: {bootstrap_expression}"),
+            1,
+        )
+        self.assertIn(
+            "name: render-oracle-"
+            f"{head_expression}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}-"
+            f"{campaign_expression}-"
+            f"{baseline_expression}",
+            original,
+        )
+
+        mutations = {
+            "unfiltered_pr_events": original.replace(
+                "    types: [labeled]",
+                "    types: [opened, synchronize, labeled]",
+                1,
+            ),
+            "broad_label": original.replace(
+                f"github.event.label.name == '{full_label}'",
+                "github.event.label.name != ''",
+                1,
+            ),
+            "pilot_label_removed": original.replace(
+                f"github.event.label.name == '{pilot_label}'",
+                "false",
+                1,
+            ),
+            "fork_allowed": original.replace(
+                " && github.event.pull_request.head.repo.full_name == github.repository",
+                "",
+                1,
+            ),
+            "merge_checkout": original.replace(
+                f"          ref: {head_expression}\n",
+                "          ref: ${{ github.sha }}\n",
+                1,
+            ),
+            "merge_build_identity": original.replace(
+                f"          EXPECTED_SOURCE_SHA: {head_expression}\n",
+                "          EXPECTED_SOURCE_SHA: ${{ github.sha }}\n",
+                1,
+            ),
+            "merge_summary_identity": original.replace(
+                f"          EXPECTED_HEAD_SHA: {head_expression}\n",
+                "          EXPECTED_HEAD_SHA: ${{ github.sha }}\n",
+                1,
+            ),
+            "full_selects_pilot": original.replace(
+                f"github.event.label.name == '{full_label}' && 'full'",
+                f"github.event.label.name == '{full_label}' && 'pilot'",
+                1,
+            ),
+            "pilot_selects_full": original.replace(
+                f"github.event.label.name == '{pilot_label}' && 'pilot'",
+                f"github.event.label.name == '{pilot_label}' && 'full'",
+                1,
+            ),
+            "pilot_gets_full_timeout": original.replace(
+                "&& 330 || 120",
+                "&& 330 || 330",
+                1,
+            ),
+            "pr_bootstrap": original.replace(
+                f"RXLS_IDENTITY_BOOTSTRAP: {bootstrap_expression}",
+                (
+                    "RXLS_IDENTITY_BOOTSTRAP: "
+                    "${{ github.event_name == 'pull_request' && '1' || '0' }}"
+                ),
+                1,
+            ),
+            "non_strict_verifier": original.replace(
+                "          set -euo pipefail\n",
+                "",
+                1,
+            ),
+            "dirty_worktree_allowed": original.replace(
+                "          git diff --exit-code\n",
+                "",
+                1,
+            ),
+            "dirty_index_allowed": original.replace(
+                "          git diff --cached --exit-code\n",
+                "",
+                1,
+            ),
+            "unbound_artifact": original.replace(
+                f"name: render-oracle-{head_expression}-",
+                "name: render-oracle-${{ github.sha }}-",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
                 self.assertTrue(
                     self.policy.audit_render_oracle_workflow(
                         Path("render-oracle.yml"), workflow
@@ -1052,6 +1320,16 @@ steps:
     def test_render_browser_rejects_mutable_or_commented_wasm_build_tools(self) -> None:
         original = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
+            "runner": original.replace(
+                "    runs-on: ubuntu-24.04",
+                "    runs-on: ubuntu-latest",
+                1,
+            ),
+            "persisted_checkout_credentials": original.replace(
+                "          persist-credentials: false\n",
+                "",
+                1,
+            ),
             "build_rust": original.replace(
                 'WASM_BINDGEN_BUILD_RUST: "1.88.0"',
                 'WASM_BINDGEN_BUILD_RUST: "1.88"',
@@ -1136,6 +1414,234 @@ steps:
                 '            "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs"',
                 '            node "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs"',
             ),
+            "direct_browser_pipefail": original.replace(
+                "      - name: Exercise worker under strict CSP in pinned Chromium\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                "      - name: Exercise worker under strict CSP in pinned Chromium\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: bash\n"
+                "        run: |\n",
+            ),
+            "installed_browser_pipefail": original.replace(
+                "      - name: Pack and consume the publishable artifact\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                "      - name: Pack and consume the publishable artifact\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: bash\n"
+                "        run: |\n",
+            ),
+            "browser_pipeline_shell": original.replace(
+                "      - name: Exercise worker under strict CSP in pinned Chromium\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: bash\n",
+                "      - name: Exercise worker under strict CSP in pinned Chromium\n"
+                "        working-directory: bindings/render-wasm\n"
+                "        shell: sh\n",
+            ),
+            "sandbox_owner": original.replace(
+                '          sudo chown root:root "$chrome_root/chrome_sandbox"\n',
+                "",
+                1,
+            ),
+            "sandbox_mode": original.replace(
+                '          sudo chmod 4755 "$chrome_root/chrome_sandbox"\n',
+                '          sudo chmod 0755 "$chrome_root/chrome_sandbox"\n',
+                1,
+            ),
+            "sandbox_owner_check": original.replace(
+                '          test "$(stat --format=%u "$chrome_root/chrome_sandbox")" = "0"\n',
+                "",
+                1,
+            ),
+            "sandbox_mode_check": original.replace(
+                '          test "$(stat --format=%a "$chrome_root/chrome_sandbox")" = "4755"\n',
+                "",
+                1,
+            ),
+            "sandbox_export": original.replace(
+                '          echo "CHROME_DEVEL_SANDBOX=$GITHUB_WORKSPACE/target/render-chrome/chrome-linux64/chrome_sandbox" >> "$GITHUB_ENV"\n',
+                "",
+                1,
+            ),
+            "runtime_ldd": original.replace(
+                '          ldd "$chrome_root/chrome" | tee "$RUNNER_TEMP/rxls-chromium-ldd.txt"\n',
+                "",
+                1,
+            ),
+            "runtime_not_found": original.replace(
+                '          if grep -Fq "not found" "$RUNNER_TEMP/rxls-chromium-ldd.txt"; then\n'
+                "            exit 1\n"
+                "          fi\n",
+                "",
+                1,
+            ),
+            "runtime_pass_artifact": original.replace(
+                '          printf \'%s\\n\' "PASS pinned Chromium runtime closure resolved" \\\n'
+                "            > target/render-browser-evidence/chromium-runtime.txt\n",
+                "",
+                1,
+            ),
+            "source_browser_stderr": original.replace(
+                "          npm run test:browser 2>&1 | tee ",
+                "          npm run test:browser | tee ",
+                1,
+            ),
+            "installed_browser_stderr": original.replace(
+                "            2>&1 | tee ../render-browser-evidence/installed-package-chromium.log",
+                "            | tee ../render-browser-evidence/installed-package-chromium.log",
+                1,
+            ),
+            "late_expected_head": original.replace(
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n",
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.sha }}\n",
+                1,
+            ),
+            "late_head_check": original.replace(
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n',
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                1,
+            ),
+            "late_unstaged_check": original.replace(
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n'
+                "          git diff --exit-code\n",
+                "      - name: Verify evidence source remained exact and clean\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n',
+                1,
+            ),
+            "late_staged_check": original.replace(
+                "          git diff --cached --exit-code\n"
+                "      - name: Upload browser-rendering evidence\n",
+                "      - name: Upload browser-rendering evidence\n",
+                1,
+            ),
+            "summary_extra_field": original.replace(
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n",
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        continue-on-error: true\n"
+                "        shell: bash\n",
+                1,
+            ),
+            "summary_expected_head": original.replace(
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n",
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.sha }}\n",
+                1,
+            ),
+            "summary_strict_shell": original.replace(
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n",
+                1,
+            ),
+            "summary_head_check": original.replace(
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"\n',
+                "      - name: Build path-neutral exact-SHA browser evidence\n"
+                "        shell: bash\n"
+                "        env:\n"
+                "          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                1,
+            ),
+            "summary_verifier": original.replace(
+                "          python3 scripts/check_render_browser_release_evidence.py verify \\\n",
+                "          python3 scripts/check_render_browser_release_evidence.py build \\\n",
+                1,
+            ),
+            "summary_run_attempt_binding": original.replace(
+                '            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \\\n',
+                '            --workflow-run-attempt "1" \\\n',
+                1,
+            ),
+            "summary_source_adjacency": original.replace(
+                "          git diff --cached --exit-code\n"
+                "      - name: Build path-neutral exact-SHA browser evidence\n",
+                "          git diff --cached --exit-code\n"
+                "      - name: Unexpected source-summary interstitial\n"
+                "        run: true\n"
+                "      - name: Build path-neutral exact-SHA browser evidence\n",
+                1,
+            ),
+            "summary_upload_adjacency": original.replace(
+                "          git diff --cached --exit-code\n"
+                "      - name: Upload browser-rendering evidence\n",
+                "          git diff --cached --exit-code\n"
+                "      - name: Unexpected summary-upload interstitial\n"
+                "        run: true\n"
+                "      - name: Upload browser-rendering evidence\n",
+                1,
+            ),
+            "summary_upload_success": original.replace(
+                "      - name: Upload browser-rendering evidence\n"
+                "        if: ${{ success() }}\n",
+                "      - name: Upload browser-rendering evidence\n"
+                "        if: ${{ always() }}\n",
+                1,
+            ),
+            "summary_upload_name": original.replace(
+                "          name: render-browser-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}\n",
+                "          name: render-browser-${{ github.sha }}\n",
+                1,
+            ),
+            "summary_upload_path": original.replace(
+                "          path: target/render-browser-evidence/browser-summary.json\n",
+                "          path: target/render-browser-evidence/\n",
+                1,
+            ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
@@ -1190,23 +1696,103 @@ steps:
                 ".github/workflows/ci.yml",
                 1,
             ),
+            "browser_artifact_name": original.replace(
+                'browser_artifact_name="render-browser-${GITHUB_SHA}-${browser_run_id}-${browser_run_attempt}"',
+                'browser_artifact_name="render-browser-${GITHUB_SHA}"',
+                1,
+            ),
+            "browser_artifact_run_scope": original.replace(
+                "actions/runs/$browser_run_id/artifacts",
+                "actions/artifacts",
+                1,
+            ),
+            "browser_artifact_exact_one": original.replace(
+                'test "${#matching_browser_artifacts[@]}" = "1"',
+                'test "${#matching_browser_artifacts[@]}" -ge "1"',
+                1,
+            ),
+            "browser_artifact_id": original.replace(
+                '"$browser_artifact_id" =~ ^[1-9][0-9]*$',
+                '-n "$browser_artifact_id"',
+                1,
+            ),
+            "browser_artifact_size": original.replace(
+                '&& "$size_bytes" -le 1048576',
+                '&& "$size_bytes" -gt 0',
+                1,
+            ),
+            "browser_artifact_digest": original.replace(
+                '&& "$digest" =~ ^sha256:[0-9a-f]{64}$',
+                '&& -n "$digest"',
+                1,
+            ),
+            "browser_verifier": original.replace(
+                "python3 scripts/check_render_browser_release_evidence.py download",
+                "python3 scripts/check_render_package.py",
+                1,
+            ),
+            "browser_artifact_name_arg": original.replace(
+                '--artifact-name "$browser_artifact_name"',
+                '--artifact-name "render-browser-${GITHUB_SHA}"',
+                1,
+            ),
+            "browser_head_arg": original.replace(
+                '--head-sha "$GITHUB_SHA" \\\n'
+                "            --platform linux \\\n"
+                '            --workflow-run-id "$browser_run_id"',
+                '--head-sha "$browser_run_id" \\\n'
+                "            --platform linux \\\n"
+                '            --workflow-run-id "$browser_run_id"',
+                1,
+            ),
+            "browser_platform_arg": original.replace(
+                "--platform linux",
+                "--platform darwin",
+                1,
+            ),
+            "browser_run_arg": original.replace(
+                '--workflow-run-id "$browser_run_id"',
+                '--workflow-run-id "$SELECTED_RUN_ID"',
+                1,
+            ),
+            "browser_attempt_arg": original.replace(
+                '--workflow-run-attempt "$browser_run_attempt"',
+                '--workflow-run-attempt "1"',
+                1,
+            ),
+            "browser_receipt_output": original.replace(
+                "--output target/render-package/browser-prerequisite.json",
+                "--output target/render-package/browser.json",
+                1,
+            ),
+            "browser_dry_run_binding": original.replace(
+                "browser-proven package differs from release candidate",
+                "browser package check skipped",
+                1,
+            ),
+            "browser_publish_binding": original.replace(
+                "Render Browser prerequisite evidence differs",
+                "browser receipt check skipped",
+                1,
+            ),
             "run_api_fields": original.replace(
                 "[.head_sha, .event, .conclusion, .status, .path, .run_attempt]",
                 "[.head_sha, .conclusion]",
             ),
             "oracle_workflow": original.replace(
-                "--workflow render-oracle.yml", "--workflow ci.yml"
+                "for oracle_workflow in fuzz.yml render-oracle.yml; do",
+                "for oracle_workflow in ci.yml; do",
             ),
             "oracle_event": original.replace(
                 '&& "$event" == "workflow_dispatch"', '&& "$event" == "push"'
             ),
             "oracle_path": original.replace(
-                '&& "$run_path" == ".github/workflows/render-oracle.yml"',
-                '&& "$run_path" == ".github/workflows/ci.yml"',
+                '"$run_path" == ".github/workflows/fuzz.yml"',
+                '"$run_path" == ".github/workflows/ci.yml"',
             ),
             "oracle_profile": original.replace(
-                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"',
-                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-pilot"',
+                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-verify"',
+                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-candidate"',
             ),
             "oracle_run_attempt": original.replace(
                 '&& "$run_attempt" =~ ^[1-9][0-9]*$',

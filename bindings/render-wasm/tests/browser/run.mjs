@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { BoundedEntryLog, BoundedTextTail } from "./bounded-evidence.mjs";
 import {
   OperationTimeoutError,
   closeServer,
@@ -13,19 +14,39 @@ import {
   waitForWebSocketOpen,
   withTimeout
 } from "./lifecycle.mjs";
+import {
+  correlateHardStopTarget,
+  findNonceBoundWorker
+} from "./hard-stop-evidence.mjs";
+import {
+  combineHeaps,
+  largerHeap,
+  resolveProcessMemoryGate,
+  sampleProcessTreeRss,
+  summarizeProcessMemory
+} from "./memory-evidence.mjs";
+import {
+  validateCspNetworkSilence,
+  validateOfflineNetworkBlock
+} from "./network-evidence.mjs";
 
 const CDP_HTTP_TIMEOUT_MS = 2_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
-const BROWSER_RUN_TIMEOUT_MS = 30_000;
+const BROWSER_START_TIMEOUT_MS = 20_000;
+const BROWSER_RUN_TIMEOUT_MS = 45_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
+const MAX_REQUEST_URL_BYTES = 4_096;
+const MAX_ROUTE_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_ROUTE_ENTRIES = 256;
+const MAX_ROUTE_LOG_BYTES = 64 * 1024;
+const MAX_STDERR_BYTES = 64 * 1024;
+const MAX_CDP_EVENTS = 4_096;
+const MAX_CDP_HTTP_RESPONSE_BYTES = 256 * 1024;
 
 const packageRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const installedPackageRoot = process.env.RXLS_RENDER_INSTALLED_PACKAGE_ROOT
   ? resolve(process.env.RXLS_RENDER_INSTALLED_PACKAGE_ROOT)
   : null;
-const fixture = fileURLToPath(
-  new URL("../../../wasm/tests/fixtures/macro-enabled.xlsm.b64", import.meta.url)
-);
 const lock = JSON.parse(await readFile(new URL("../../toolchain-lock.json", import.meta.url)));
 const generatedWasm = resolve(packageRoot, "pkg/rxls_render_wasm_bg.wasm");
 try {
@@ -50,8 +71,12 @@ const chrome =
   (process.platform === "darwin"
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "chromium");
-const version = spawnSync(chrome, ["--version"], { encoding: "utf8" });
-const expected = `${lock.chromium.product} ${lock.chromium.version}`;
+const version = spawnSync(chrome, ["--version"], {
+  encoding: "utf8",
+  timeout: CDP_HTTP_TIMEOUT_MS,
+  maxBuffer: 16 * 1024,
+  killSignal: "SIGKILL"
+});
 const acceptedProducts = [lock.chromium.product, lock.chromium.testingProduct].filter(Boolean);
 const actualVersion = (version.stdout ?? "").trim();
 if (
@@ -69,20 +94,64 @@ if (
   heapGate.maxAccountedBytes <= 0 ||
   !Number.isSafeInteger(heapGate?.maxRetainedGrowthBytes) ||
   heapGate.maxRetainedGrowthBytes <= 0 ||
-  heapGate.maxRetainedGrowthBytes > heapGate.maxAccountedBytes
+  heapGate.maxRetainedGrowthBytes > heapGate.maxAccountedBytes ||
+  !Number.isSafeInteger(heapGate?.maxProcessTreeRssBytes) ||
+  heapGate.maxProcessTreeRssBytes <= 0 ||
+  !Number.isSafeInteger(heapGate?.maxProcessTreeRetainedGrowthBytes) ||
+  heapGate.maxProcessTreeRetainedGrowthBytes <= 0 ||
+  heapGate.maxProcessTreeRetainedGrowthBytes > heapGate.maxProcessTreeRssBytes
 ) {
   console.error("invalid Chromium heap gate in toolchain-lock.json");
   process.exit(2);
 }
+const processMemoryGate = resolveProcessMemoryGate(heapGate, process.platform);
 
-const requestedPaths = [];
-const server = createServer(async (request, response) => {
+const requestedPaths = new BoundedEntryLog({
+  maxEntries: MAX_ROUTE_ENTRIES,
+  maxBytes: MAX_ROUTE_LOG_BYTES,
+  maxEntryBytes: MAX_REQUEST_URL_BYTES
+});
+const networkSinkRequests = new BoundedEntryLog({
+  maxEntries: 8,
+  maxBytes: 8 * 1024,
+  maxEntryBytes: 1024
+});
+let networkSinkFailure = null;
+const networkSinkServer = createServer(
+  { maxHeaderSize: 4 * 1024 },
+  (request, response) => {
+    try {
+      networkSinkRequests.add(`${request.method ?? "GET"} ${request.url ?? "/"}`);
+    } catch (error) {
+      networkSinkFailure = error;
+    }
+    response.writeHead(503, {
+      "content-type": "text/plain; charset=utf-8",
+      connection: "close"
+    });
+    response.end("network control escaped CDP interception");
+  }
+);
+const server = createServer({ maxHeaderSize: 16 * 1024 }, async (request, response) => {
   try {
+    if (
+      typeof request.url !== "string" ||
+      Buffer.byteLength(request.url) > MAX_REQUEST_URL_BYTES
+    ) {
+      response.writeHead(431, { "content-type": "text/plain; charset=utf-8" });
+      response.end("request URL too large");
+      return;
+    }
     const url = new URL(request.url, "http://127.0.0.1");
-    requestedPaths.push(url.pathname);
+    requestedPaths.add(`${request.method ?? "GET"} ${url.pathname}${url.search}`);
     const target = requestTarget(url.pathname);
     const metadata = await stat(target);
-    if (!metadata.isFile()) {
+    if (
+      !metadata.isFile() ||
+      !Number.isSafeInteger(metadata.size) ||
+      metadata.size < 0 ||
+      metadata.size > MAX_ROUTE_FILE_BYTES
+    ) {
       throw new Error("not a file");
     }
     response.writeHead(200, {
@@ -103,12 +172,23 @@ const server = createServer(async (request, response) => {
 });
 
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+await new Promise((resolveListen) =>
+  networkSinkServer.listen(0, "127.0.0.1", resolveListen)
+);
 const address = server.address();
+const networkSinkAddress = networkSinkServer.address();
 const browserEntry =
   installedPackageRoot === null
     ? "/tests/browser/index.html"
     : "/tests/browser/installed-package.html";
 const url = `http://127.0.0.1:${address.port}${browserEntry}`;
+const networkControl = new URL(
+  `http://127.0.0.1:${networkSinkAddress.port}/__rxls_network_negative_control__`
+);
+const networkControlUrl = networkControl.href;
+if (networkControl.origin === new URL(url).origin) {
+  throw new Error("CDP Network negative control is not off-origin");
+}
 const profile = await mkdtemp(join(tmpdir(), "rxls-render-browser-"));
 const child = spawn(
   chrome,
@@ -119,6 +199,8 @@ const child = spawn(
     "--disable-default-apps",
     "--disable-extensions",
     "--disable-sync",
+    "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+    "--no-proxy-server",
     "--no-first-run",
     "--js-flags=--max-old-space-size=192",
     "--remote-debugging-port=0",
@@ -127,10 +209,24 @@ const child = spawn(
   ],
   { stdio: ["ignore", "ignore", "pipe"] }
 );
-let stderr = "";
+const stderr = new BoundedTextTail(MAX_STDERR_BYTES);
+let childError = null;
+let childExit = null;
 child.stderr.setEncoding("utf8");
-child.stderr.on("data", (chunk) => (stderr += chunk));
-let browserResult = { message: "", heap: null };
+child.stderr.on("data", (chunk) => stderr.append(chunk));
+child.once("error", (error) => {
+  childError = error;
+});
+child.once("exit", (code, signal) => {
+  childExit = { code, signal };
+});
+let browserResult = {
+  message: "",
+  heap: null,
+  processMemory: null,
+  hardStop: null,
+  csp: null
+};
 try {
   const portFile = join(profile, "DevToolsActivePort");
   const port = Number.parseInt((await waitForFile(portFile)).split("\n")[0], 10);
@@ -148,40 +244,78 @@ try {
   }
   browserResult = await waitForBrowserResult(
     browserMetadata.webSocketDebuggerUrl,
-    page.id
+    page.id,
+    child.pid
   );
+} catch (error) {
+  browserResult = {
+    message: `FAIL harness: ${error instanceof Error ? error.message : String(error)}`,
+    heap: null,
+    processMemory: null,
+    hardStop: null,
+    csp: null
+  };
 } finally {
   await terminateChild(child);
-  await closeServer(server);
+  await Promise.all([closeServer(server), closeServer(networkSinkServer)]);
   await withTimeout(
     rm(profile, { recursive: true, force: true }),
     CLEANUP_TIMEOUT_MS,
     "Chromium profile cleanup"
   );
 }
+const escapedNetworkRequests = networkSinkRequests.values();
+if (
+  browserResult.message.startsWith("PASS ") &&
+  (networkSinkFailure !== null || escapedNetworkRequests.length !== 0)
+) {
+  browserResult.message =
+    `FAIL network_egress: ${networkSinkFailure?.message ?? escapedNetworkRequests.join(", ")}`;
+}
 if (!browserResult.message.startsWith("PASS ")) {
-  console.error(`requests: ${requestedPaths.join(", ")}`);
+  console.error(`requests: ${requestedPaths.values().join(", ")}`);
+  if (escapedNetworkRequests.length !== 0) {
+    console.error(`network sink requests: ${escapedNetworkRequests.join(", ")}`);
+  }
   console.error(browserResult.message || "browser returned no result");
-  console.error(stderr.slice(-4_000));
+  console.error(stderr.text());
   process.exit(1);
 }
 console.log(
   `PASS ${actualVersion} ${
     installedPackageRoot === null
-      ? "worker/WASM CSP, limits, cancellation, progress, tile and page smoke"
-      : "installed package README worker URL and render-page smoke"
+      ? "worker/WASM rich font/image, CSP, limits, virtual tile/page and hard-stop smoke"
+      : "installed package rich font/image, CSP, virtual tile/page and hard-stop smoke"
   }; ` +
     `heap baseline=${browserResult.heap.baseline.accountedBytes} ` +
     `peak=${browserResult.heap.peak.accountedBytes} ` +
     `retained=${browserResult.heap.retained.accountedBytes} ` +
-    `growth=${browserResult.heap.retainedGrowthBytes} bytes`
+    `growth=${browserResult.heap.retainedGrowthBytes} bytes; ` +
+    `rss baseline=${browserResult.processMemory.baseline.rssBytes} ` +
+    `peak=${browserResult.processMemory.peak.rssBytes} ` +
+    `retained=${browserResult.processMemory.retained.rssBytes} ` +
+    `growth=${browserResult.processMemory.retainedGrowthBytes} bytes; ` +
+    `hard-stop target=${browserResult.hardStop.elapsedMs}/${browserResult.hardStop.deadlineMs}ms ` +
+    `wasm=${browserResult.hardStop.wasmFrame.url}; ` +
+    `CSP Network=${browserResult.csp.networkControl.errorText}`
 );
 
 async function waitForFile(path) {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  const deadline = Date.now() + BROWSER_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
     try {
       return await readFile(path, "utf8");
     } catch {
+      if (childError !== null) {
+        throw new Error(`Chromium failed to start: ${childError.message}`);
+      }
+      if (childExit !== null) {
+        throw new Error(
+          `Chromium exited before exposing DevTools (code=${String(
+            childExit.code
+          )}, signal=${String(childExit.signal)})`
+        );
+      }
       await delay(50);
     }
   }
@@ -208,15 +342,162 @@ async function waitForPages(port) {
   throw new Error("timed out waiting for Chromium page target");
 }
 
-async function waitForBrowserResult(webSocketUrl, pageTargetId) {
+async function waitForBrowserResult(webSocketUrl, pageTargetId, browserRootPid) {
   const socket = new WebSocket(webSocketUrl);
   await waitForWebSocketOpen(socket, CDP_COMMAND_TIMEOUT_MS);
   const attachedTargets = [];
+  const targetBySession = new Map();
+  const destroyedTargets = new Map();
+  const detachedTargets = new Map();
+  const scriptsBySession = new Map();
+  const pausesBySession = new Map();
+  const networkRequests = [];
+  const networkFailures = [];
+  const networkResponses = [];
+  const fetchPauses = [];
+  let pageSession = null;
+  let eventFailure = null;
+  let cdpEvidenceEntries = 0;
+  const reserveEvidenceEntry = (label) => {
+    if (cdpEvidenceEntries >= MAX_CDP_EVENTS) {
+      eventFailure ??= new Error(`${label} exceeded the global ${MAX_CDP_EVENTS}-event bound`);
+      return false;
+    }
+    cdpEvidenceEntries += 1;
+    return true;
+  };
+  const boundedPush = (array, value, label) => {
+    if (array.length >= MAX_CDP_EVENTS || !reserveEvidenceEntry(label)) {
+      eventFailure ??= new Error(`${label} exceeded ${MAX_CDP_EVENTS} events`);
+      return false;
+    }
+    array.push(value);
+    return true;
+  };
+  const recordTargetEvent = (events, targetId, label) => {
+    if (
+      typeof targetId === "string" &&
+      !events.has(targetId) &&
+      reserveEvidenceEntry(label)
+    ) {
+      events.set(targetId, Date.now());
+    }
+  };
+  const boundedPushByKey = (entries, key, value, label) => {
+    const existing = entries.get(key);
+    if (
+      (existing?.length ?? 0) >= MAX_CDP_EVENTS ||
+      !reserveEvidenceEntry(label)
+    ) {
+      eventFailure ??= new Error(`${label} exceeded ${MAX_CDP_EVENTS} events`);
+      return;
+    }
+    const target = existing ?? [];
+    if (!existing) {
+      entries.set(key, target);
+    }
+    target.push(value);
+  };
   const client = createCdpClient(socket, {
     commandTimeoutMs: CDP_COMMAND_TIMEOUT_MS,
     onEvent(message) {
       if (message.method === "Target.attachedToTarget") {
-        attachedTargets.push(message.params);
+        const attached = {
+          ...message.params,
+          observedAtEpochMs: Date.now()
+        };
+        const recorded = boundedPush(
+          attachedTargets,
+          attached,
+          "attached-target evidence"
+        );
+        if (recorded && attached.sessionId && attached.targetInfo?.targetId) {
+          targetBySession.set(attached.sessionId, attached.targetInfo.targetId);
+        }
+      } else if (message.method === "Target.detachedFromTarget") {
+        const targetId =
+          message.params?.targetId ?? targetBySession.get(message.params?.sessionId);
+        recordTargetEvent(detachedTargets, targetId, "detached-target evidence");
+      } else if (message.method === "Target.targetDestroyed") {
+        recordTargetEvent(
+          destroyedTargets,
+          message.params?.targetId,
+          "destroyed-target evidence"
+        );
+      } else if (message.method === "Debugger.scriptParsed" && message.sessionId) {
+        let scripts = scriptsBySession.get(message.sessionId);
+        if (scripts?.has(message.params.scriptId)) {
+          scripts.set(message.params.scriptId, {
+            url: message.params.url,
+            scriptLanguage: message.params.scriptLanguage
+          });
+        } else if (
+          (scripts?.size ?? 0) >= MAX_CDP_EVENTS ||
+          !reserveEvidenceEntry("Debugger script evidence")
+        ) {
+          eventFailure ??= new Error("Debugger script evidence exceeded its bound");
+        } else {
+          if (!scripts) {
+            scripts = new Map();
+            scriptsBySession.set(message.sessionId, scripts);
+          }
+          scripts.set(message.params.scriptId, {
+            url: message.params.url,
+            scriptLanguage: message.params.scriptLanguage
+          });
+        }
+      } else if (message.method === "Debugger.paused" && message.sessionId) {
+        boundedPushByKey(
+          pausesBySession,
+          message.sessionId,
+          { ...message.params, observedAtEpochMs: Date.now() },
+          "Debugger pause evidence"
+        );
+      } else if (message.method === "Network.requestWillBeSent") {
+        boundedPush(
+          networkRequests,
+          {
+            requestId: message.params.requestId,
+            sessionId: message.sessionId ?? null,
+            url: message.params.request?.url
+          },
+          "Network request evidence"
+        );
+      } else if (message.method === "Network.loadingFailed") {
+        boundedPush(
+          networkFailures,
+          {
+            requestId: message.params.requestId,
+            sessionId: message.sessionId ?? null,
+            blockedReason: message.params.blockedReason ?? null,
+            canceled: message.params.canceled ?? false,
+            errorText: message.params.errorText
+          },
+          "Network failure evidence"
+        );
+      } else if (message.method === "Network.responseReceived") {
+        boundedPush(
+          networkResponses,
+          {
+            requestId: message.params.requestId,
+            sessionId: message.sessionId ?? null,
+            status: message.params.response?.status,
+            url: message.params.response?.url
+          },
+          "Network response evidence"
+        );
+      } else if (message.method === "Fetch.requestPaused") {
+        boundedPush(
+          fetchPauses,
+          {
+            requestId: message.params.requestId,
+            sessionId: message.sessionId ?? null,
+            networkId: message.params.networkId ?? null,
+            url: message.params.request?.url,
+            resourceType: message.params.resourceType
+          },
+          "Fetch interception evidence"
+        );
       }
     }
   });
@@ -229,61 +510,209 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId) {
   }, BROWSER_RUN_TIMEOUT_MS);
   const attach = async (targetId) =>
     (await command("Target.attachToTarget", { targetId, flatten: true })).sessionId;
-  const sampleHeap = async (sessionId) =>
-    normalizeHeap(await command("Runtime.getHeapUsage", {}, sessionId));
   try {
-    const pageSession = await attach(pageTargetId);
+    pageSession = await attach(pageTargetId);
     const evaluate = (expression) =>
       command("Runtime.evaluate", { expression, returnByValue: true }, pageSession);
     await command("Target.setDiscoverTargets", { discover: true });
     await command("Runtime.enable", {}, pageSession);
     await command("HeapProfiler.enable", {}, pageSession);
+    await command("Page.enable", {}, pageSession);
+    await command("Network.enable", {
+      maxTotalBufferSize: 1024 * 1024,
+      maxResourceBufferSize: 256 * 1024,
+      maxPostDataSize: 64 * 1024
+    }, pageSession);
     await command(
       "Target.setAutoAttach",
       { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
       pageSession
     );
     const workerTarget = await waitForWorkerTarget(attachedTargets);
-    const workerSession = workerTarget.sessionId;
-    await command("Runtime.enable", {}, workerSession);
-    await command("HeapProfiler.enable", {}, workerSession);
+    const primaryTargetId = workerTarget.targetInfo.targetId;
+    const heapEnabledSessions = new Set();
+    const ensureHeapEnabled = async (target) => {
+      if (heapEnabledSessions.has(target.sessionId)) {
+        return;
+      }
+      await command("Runtime.enable", {}, target.sessionId);
+      await command("HeapProfiler.enable", {}, target.sessionId);
+      heapEnabledSessions.add(target.sessionId);
+    };
+    const liveWorkerTargets = () => {
+      const targets = new Map();
+      for (const attached of attachedTargets) {
+        const targetId = attached.targetInfo?.targetId;
+        if (
+          attached.targetInfo?.type === "worker" &&
+          typeof targetId === "string" &&
+          !destroyedTargets.has(targetId)
+        ) {
+          targets.set(targetId, attached);
+        }
+      }
+      return [...targets.values()];
+    };
+    const collectAllGarbage = async () => {
+      await command("HeapProfiler.collectGarbage", {}, pageSession);
+      for (const target of liveWorkerTargets()) {
+        await ensureHeapEnabled(target);
+        await command("HeapProfiler.collectGarbage", {}, target.sessionId);
+      }
+    };
+    const sampleAllHeaps = async () => {
+      const workers = liveWorkerTargets();
+      if (
+        workers.length === 0 ||
+        !workers.some(({ targetInfo }) => targetInfo.targetId === primaryTargetId)
+      ) {
+        throw new Error("heap sampling lost the primary render worker");
+      }
+      await Promise.all(workers.map(ensureHeapEnabled));
+      const samples = [
+        {
+          label: "page",
+          sample: await command("Runtime.getHeapUsage", {}, pageSession)
+        }
+      ];
+      for (const target of workers) {
+        samples.push({
+          label: `worker:${target.targetInfo.targetId}`,
+          sample: await command("Runtime.getHeapUsage", {}, target.sessionId)
+        });
+      }
+      return combineHeaps(samples);
+    };
+    await ensureHeapEnabled(workerTarget);
     await waitForWorkerProbeReady(evaluate);
-    await command("HeapProfiler.collectGarbage", {}, pageSession);
-    await command("HeapProfiler.collectGarbage", {}, workerSession);
-    const sampleAllHeaps = async () =>
-      combineHeaps(
-        await Promise.all([sampleHeap(pageSession), sampleHeap(workerSession)])
-      );
+    await collectAllGarbage();
     const baseline = await sampleAllHeaps();
     let peak = baseline;
-    let lastValue = "";
-    await evaluate("globalThis.__rxlsHeapProbeReady = true");
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      const response = await evaluate("document.querySelector('pre')?.textContent ?? ''");
-      const value = response.result?.value ?? "";
-      lastValue = value;
+    const processBaseline = sampleProcessTreeRss(browserRootPid);
+    let processPeak = processBaseline;
+    const sampleEvidence = async () => {
+      if (eventFailure) {
+        throw eventFailure;
+      }
       peak = largerHeap(peak, await sampleAllHeaps());
+      const processSample = sampleProcessTreeRss(browserRootPid);
+      if (processSample.rssBytes > processPeak.rssBytes) {
+        processPeak = processSample;
+      }
+    };
+    let lastValue = "";
+    let hardStop = null;
+    await evaluate("globalThis.__rxlsHeapProbeReady = true");
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      const state = await evaluateJson(
+        evaluate,
+        "JSON.stringify({result: document.querySelector('pre')?.textContent ?? '', hardStop: globalThis.__rxlsHardStopProof ?? null})",
+        "browser smoke state"
+      );
+      const value = state.result ?? "";
+      lastValue = value;
+      if (value.startsWith("FAIL ")) {
+        return {
+          message: value,
+          heap: null,
+          processMemory: null,
+          hardStop: null,
+          csp: null
+        };
+      }
+      await sampleEvidence();
+      if (hardStop === null && state.hardStop?.phase === "armed") {
+        hardStop = await driveHardStop({
+          command,
+          evaluate,
+          attachedTargets,
+          primaryTargetId,
+          destroyedTargets,
+          scriptsBySession,
+          pausesBySession,
+          proof: state.hardStop,
+          sampleEvidence
+        });
+      }
       if (value.startsWith("PASS ") || value.startsWith("FAIL ")) {
-        await command("HeapProfiler.collectGarbage", {}, pageSession);
-        await command("HeapProfiler.collectGarbage", {}, workerSession);
+        if (value.startsWith("PASS ") && hardStop === null) {
+          throw new Error("browser passed without nonce-bound hard-stop evidence");
+        }
+        let csp = null;
+        if (value.startsWith("PASS ")) {
+          const cspProof = await evaluateJson(
+            evaluate,
+            "JSON.stringify(globalThis.__rxlsCspProof)",
+            "CSP page proof"
+          );
+          const pageControl = validateCspNetworkSilence({
+            proof: cspProof,
+            requests: networkRequests,
+            responses: networkResponses
+          });
+          const networkControl = await driveOfflineNetworkControl({
+            command,
+            requests: networkRequests,
+            failures: networkFailures,
+            responses: networkResponses,
+            pauses: fetchPauses,
+            controlUrl: networkControlUrl,
+            sampleProcessEvidence() {
+              const sample = sampleProcessTreeRss(browserRootPid);
+              if (sample.rssBytes > processPeak.rssBytes) {
+                processPeak = sample;
+              }
+            }
+          });
+          if (eventFailure) {
+            throw eventFailure;
+          }
+          csp = {
+            pageControl,
+            networkControl,
+            blockedReason: "csp+offline"
+          };
+        }
+        await collectAllGarbage();
+        if (eventFailure) {
+          throw eventFailure;
+        }
         const retained = await sampleAllHeaps();
         peak = largerHeap(peak, retained);
         const retainedGrowthBytes = Math.max(0, retained.accountedBytes - baseline.accountedBytes);
         const heap = { baseline, peak, retained, retainedGrowthBytes };
+        const processRetained = sampleProcessTreeRss(browserRootPid);
+        if (processRetained.rssBytes > processPeak.rssBytes) {
+          processPeak = processRetained;
+        }
+        const processMemory = summarizeProcessMemory(
+          {
+            baseline: processBaseline,
+            peak: processPeak,
+            retained: processRetained
+          },
+          processMemoryGate
+        );
         await evaluate("globalThis.__rxlsHeapProbeRelease = true");
         if (peak.accountedBytes > heapGate.maxAccountedBytes) {
           return {
             message: `FAIL heap_limit: accounted heap peak ${peak.accountedBytes} exceeds ${heapGate.maxAccountedBytes}`,
-            heap
+            heap,
+            processMemory,
+            hardStop,
+            csp
           };
         }
         if (retainedGrowthBytes > heapGate.maxRetainedGrowthBytes) {
           return {
             message: `FAIL heap_retention: retained growth ${retainedGrowthBytes} exceeds ${heapGate.maxRetainedGrowthBytes}`,
-            heap
+            heap,
+            processMemory,
+            hardStop,
+            csp
           };
         }
-        return { message: value, heap };
+        return { message: value, heap, processMemory, hardStop, csp };
       }
       await delay(50);
     }
@@ -293,12 +722,297 @@ async function waitForBrowserResult(webSocketUrl, pageTargetId) {
     const detail = diagnostic.result?.value ?? "no diagnostic";
     return {
       message: `FAIL timeout: browser smoke did not complete (${lastValue}; ${detail})`,
-      heap: null
+      heap: null,
+      processMemory: null,
+      hardStop: null,
+      csp: null
     };
   } finally {
     clearTimeout(browserDeadline);
     client.dispose();
     socket.close();
+  }
+}
+
+async function driveOfflineNetworkControl({
+  command,
+  requests,
+  failures,
+  responses,
+  pauses,
+  controlUrl,
+  sampleProcessEvidence
+}) {
+  const requestStart = requests.length;
+  const failureStart = failures.length;
+  const responseStart = responses.length;
+  const pauseStart = pauses.length;
+  const { targetId } = await command("Target.createTarget", {
+    url: "about:blank",
+    background: true
+  });
+  if (typeof targetId !== "string" || targetId.length === 0) {
+    throw new Error("CDP did not create the isolated network-control target");
+  }
+  let controlSession = null;
+  let evaluation;
+  let evaluationState = { status: "not-started" };
+  try {
+    controlSession = (
+      await command("Target.attachToTarget", { targetId, flatten: true })
+    ).sessionId;
+    if (typeof controlSession !== "string" || controlSession.length === 0) {
+      throw new Error("CDP did not attach the isolated network-control target");
+    }
+    await command("Runtime.enable", {}, controlSession);
+    await command(
+      "Network.enable",
+      {
+        maxTotalBufferSize: 64 * 1024,
+        maxResourceBufferSize: 32 * 1024,
+        maxPostDataSize: 4 * 1024
+      },
+      controlSession
+    );
+    await command(
+      "Fetch.enable",
+      {
+        patterns: [{
+          urlPattern: controlUrl,
+          requestStage: "Request"
+        }],
+        handleAuthRequests: false
+      },
+      controlSession
+    );
+    const evaluationPromise = command(
+      "Runtime.evaluate",
+      {
+        expression:
+          `(async () => { try { await fetch(${JSON.stringify(controlUrl)}, ` +
+          `{ cache: "no-store", credentials: "omit", mode: "no-cors", ` +
+          `referrerPolicy: "no-referrer" }); ` +
+          `return { rejected: false }; } catch (error) { ` +
+          `return { rejected: true, name: error?.name ?? null, ` +
+          `message: error?.message ?? null }; } })()`,
+        awaitPromise: true,
+        returnByValue: true
+      },
+      controlSession
+    );
+    evaluationState = { status: "pending" };
+    void evaluationPromise.then(
+      (value) => {
+        evaluationState = { status: "fulfilled", value };
+      },
+      (error) => {
+        evaluationState = { status: "rejected", message: error.message };
+      }
+    );
+    let pause;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const matchingPauses = pauses
+        .slice(pauseStart)
+        .filter(({ url }) => url === controlUrl);
+      if (matchingPauses.length > 1) {
+        throw new Error("CDP Fetch intercepted the network control more than once");
+      }
+      if (matchingPauses.length === 1) {
+        [pause] = matchingPauses;
+        break;
+      }
+      await delay(10);
+    }
+    if (!pause) {
+      throw new Error(
+        `CDP Fetch did not intercept the network control; evaluation=${JSON.stringify(evaluationState).slice(0, 2_048)}`
+      );
+    }
+    await command(
+      "Fetch.failRequest",
+      {
+        requestId: pause.requestId,
+        errorReason: "InternetDisconnected"
+      },
+      controlSession
+    );
+    evaluation = await evaluationPromise;
+    await sampleProcessEvidence();
+  } finally {
+    try {
+      if (controlSession !== null) {
+        await command("Fetch.disable", {}, controlSession);
+      }
+    } finally {
+      const closed = await command("Target.closeTarget", { targetId });
+      if (closed.success !== true) {
+        throw new Error("CDP did not close the isolated network-control target");
+      }
+    }
+  }
+  if (
+    evaluation?.result?.value?.rejected !== true ||
+    evaluation.result.value.name !== "TypeError"
+  ) {
+    throw new Error("CDP Network negative-control fetch was not rejected");
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const evidence = {
+      requests: requests.slice(requestStart),
+      failures: failures.slice(failureStart),
+      responses: responses.slice(responseStart),
+      pauses: pauses.slice(pauseStart)
+    };
+    try {
+      return validateOfflineNetworkBlock(evidence, controlUrl);
+    } catch (error) {
+      if (attempt === 99) {
+        throw new Error(
+          `${error.message}; evidence=${JSON.stringify(evidence).slice(0, 8_192)}`
+        );
+      }
+    }
+    await delay(10);
+  }
+  throw new Error("CDP Network negative-control evidence did not arrive");
+}
+
+async function driveHardStop({
+  command,
+  evaluate,
+  attachedTargets,
+  primaryTargetId,
+  destroyedTargets,
+  scriptsBySession,
+  pausesBySession,
+  proof,
+  sampleEvidence
+}) {
+  const target = await waitForNonceBoundWorker({
+    attachedTargets,
+    primaryTargetId,
+    proof
+  });
+  const sessionId = target.sessionId;
+  await command("Debugger.enable", { maxScriptsCacheSize: 1024 * 1024 }, sessionId);
+  await sampleEvidence();
+  await evaluate(
+    `globalThis.__rxlsHardStopBegin = ${JSON.stringify(proof.nonce)}`
+  );
+  const activeProof = await waitForPageProofPhase(evaluate, ["wasm-active", "failed"]);
+  if (activeProof.phase === "failed") {
+    throw new Error(activeProof.failure ?? "hard-stop proof failed before WASM activation");
+  }
+  const activeObservedAtEpochMs = Date.now();
+  await command("Debugger.pause", {}, sessionId);
+  const pause = await waitForDebuggerPause(pausesBySession, sessionId);
+  const scripts = scriptsBySession.get(sessionId) ?? new Map();
+  const frames = pause.callFrames.map((frame) => {
+    const script = scripts.get(frame.location?.scriptId) ?? {};
+    return {
+      functionName: frame.functionName,
+      scriptId: frame.location?.scriptId,
+      url: frame.url || script.url || "",
+      scriptLanguage: script.scriptLanguage
+    };
+  });
+  const wasmFrame = frames.find(
+    (frame) =>
+      frame.url.startsWith("wasm://") || frame.scriptLanguage === "WebAssembly"
+  );
+  const pauseEvidence = {
+    targetId: target.targetInfo.targetId,
+    sessionId,
+    activeObservedAtEpochMs,
+    observedAtEpochMs: pause.observedAtEpochMs,
+    wasmFrame,
+    terminationCommandEpochMs: null
+  };
+  if (!wasmFrame) {
+    throw new Error(`Debugger pause had no WASM frame: ${JSON.stringify(frames.slice(0, 16))}`);
+  }
+  await sampleEvidence();
+  pauseEvidence.terminationCommandEpochMs = Date.now();
+  await evaluate(
+    `globalThis.__rxlsHardStopTerminate = ${JSON.stringify(proof.nonce)}`
+  );
+  const completedProof = await waitForPageProofPhase(evaluate, ["complete", "failed"]);
+  if (completedProof.phase === "failed") {
+    throw new Error(completedProof.failure ?? "hard-stop page proof failed");
+  }
+  const observationDeadline =
+    pauseEvidence.terminationCommandEpochMs + completedProof.deadlineMs + 500;
+  while (Date.now() <= observationDeadline) {
+    if (destroyedTargets.has(target.targetInfo.targetId)) {
+      const inventory = await command("Target.getTargets");
+      const evidence = correlateHardStopTarget({
+        attachedTargets,
+        primaryTargetId,
+        destroyedTargets,
+        currentTargets: inventory.targetInfos,
+        pauseEvidence,
+        proof: completedProof
+      });
+      if (evidence !== null) {
+        return evidence;
+      }
+    }
+    await delay(10);
+  }
+  throw new Error("nonce-bound hard-stop target was not destroyed by its deadline");
+}
+
+async function waitForNonceBoundWorker({ attachedTargets, primaryTargetId, proof }) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const target = findNonceBoundWorker({
+      attachedTargets,
+      primaryTargetId,
+      proof
+    });
+    if (target !== null) {
+      return target;
+    }
+    await delay(10);
+  }
+  throw new Error("nonce-bound hard-stop worker target did not attach");
+}
+
+async function waitForPageProofPhase(evaluate, phases) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const proof = await evaluateJson(
+      evaluate,
+      "JSON.stringify(globalThis.__rxlsHardStopProof)",
+      "hard-stop page proof"
+    );
+    if (phases.includes(proof?.phase)) {
+      return proof;
+    }
+    await delay(5);
+  }
+  throw new Error(`hard-stop page proof did not reach ${phases.join(" or ")}`);
+}
+
+async function waitForDebuggerPause(pausesBySession, sessionId) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const pause = pausesBySession.get(sessionId)?.[0];
+    if (pause) {
+      return pause;
+    }
+    await delay(5);
+  }
+  throw new Error("Debugger.pause did not pause the nonce-bound worker");
+}
+
+async function evaluateJson(evaluate, expression, label) {
+  const response = await evaluate(expression);
+  const value = response.result?.value;
+  if (typeof value !== "string" || Buffer.byteLength(value) > 64 * 1024) {
+    throw new Error(`${label} was missing or exceeded its byte bound`);
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`${label} was not valid JSON`);
   }
 }
 
@@ -313,7 +1027,63 @@ async function fetchJson(url, label, timeoutMs = CDP_HTTP_TIMEOUT_MS) {
   if (!response.ok) {
     throw new Error(`${label} returned HTTP ${response.status}`);
   }
-  return withTimeout(response.json(), timeoutMs, `${label} JSON`, () => controller.abort());
+  const declaredLength = response.headers.get("content-length");
+  if (
+    declaredLength !== null &&
+    (!/^\d+$/.test(declaredLength) ||
+      Number(declaredLength) > MAX_CDP_HTTP_RESPONSE_BYTES)
+  ) {
+    controller.abort();
+    throw new Error(`${label} exceeded its response byte bound`);
+  }
+  return withTimeout(
+    readBoundedJson(response, label),
+    timeoutMs,
+    `${label} JSON`,
+    () => controller.abort()
+  );
+}
+
+async function readBoundedJson(response, label) {
+  if (response.body === null) {
+    throw new Error(`${label} had no response body`);
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!(value instanceof Uint8Array) || total > MAX_CDP_HTTP_RESPONSE_BYTES - value.byteLength) {
+        await reader.cancel();
+        throw new Error(`${label} exceeded its response byte bound`);
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`${label} was not valid UTF-8`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${label} was not valid JSON`);
+  }
 }
 
 async function waitForWorkerTarget(attachedTargets) {
@@ -339,10 +1109,11 @@ async function waitForWorkerTarget(attachedTargets) {
 
 async function waitForWorkerProbeReady(evaluate) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const response = await evaluate(
-      "JSON.stringify({ready: globalThis.__rxlsWorkerReadyForHeapProbe === true, result: document.querySelector('pre')?.textContent ?? ''})"
+    const state = await evaluateJson(
+      evaluate,
+      "JSON.stringify({ready: globalThis.__rxlsWorkerReadyForHeapProbe === true, result: document.querySelector('pre')?.textContent ?? ''})",
+      "worker heap-probe state"
     );
-    const state = JSON.parse(response.result?.value ?? "{}");
     if (state.ready) {
       return;
     }
@@ -352,39 +1123,6 @@ async function waitForWorkerProbeReady(evaluate) {
     await delay(50);
   }
   throw new Error("timed out waiting for the initialized worker heap probe");
-}
-
-function normalizeHeap(sample) {
-  const normalized = {
-    usedSize: finiteBytes(sample.usedSize),
-    totalSize: finiteBytes(sample.totalSize),
-    embedderHeapUsedSize: finiteBytes(sample.embedderHeapUsedSize),
-    backingStorageSize: finiteBytes(sample.backingStorageSize)
-  };
-  normalized.accountedBytes =
-    normalized.usedSize + normalized.embedderHeapUsedSize + normalized.backingStorageSize;
-  return normalized;
-}
-
-function combineHeaps([page, worker]) {
-  const combined = {
-    usedSize: page.usedSize + worker.usedSize,
-    totalSize: page.totalSize + worker.totalSize,
-    embedderHeapUsedSize: page.embedderHeapUsedSize + worker.embedderHeapUsedSize,
-    backingStorageSize: page.backingStorageSize + worker.backingStorageSize,
-    targets: { page, worker }
-  };
-  combined.accountedBytes =
-    combined.usedSize + combined.embedderHeapUsedSize + combined.backingStorageSize;
-  return combined;
-}
-
-function finiteBytes(value) {
-  return Number.isFinite(value) && value >= 0 ? Math.ceil(value) : 0;
-}
-
-function largerHeap(left, right) {
-  return right.accountedBytes > left.accountedBytes ? right : left;
 }
 
 function delay(milliseconds) {
@@ -401,9 +1139,6 @@ function safeTarget(root, pathname) {
 }
 
 function requestTarget(pathname) {
-  if (pathname === "/fixture.b64") {
-    return fixture;
-  }
   if (pathname.startsWith("/installed-package/")) {
     if (installedPackageRoot === null) {
       throw new Error("installed package route is unavailable");
