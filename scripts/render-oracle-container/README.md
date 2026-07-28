@@ -7,7 +7,8 @@ library.
 
 ## Prerequisites
 
-- Docker or Podman with Linux container support.
+- Docker with Buildx for canonical image builds. Docker or Podman may run an
+  already verified Linux image.
 - Enough local storage for the 216,816,909-byte official TDF archive and the
   built image.
 - The checked-in render font pack acquired under `local/`.
@@ -19,18 +20,34 @@ and local assets explicitly in bootstrap mode:
 python3 scripts/run-render-oracle-container.py verify-lock --bootstrap-identities
 ```
 
-That mode is deliberately non-accepting: it records that the built image ID is
-still missing. After a trusted hosted build emits bootstrap evidence, review
-and pin the exact image identity:
+That mode is deliberately non-accepting: it records that the built config and
+manifest digests are still missing. After a trusted hosted build emits two
+matching isolated-build identities, select the artifact by exact workflow run,
+source SHA, run attempt, and artifact ID; verify its GitHub artifact digest and
+that the job reached the deliberate bootstrap failure. Download its
+`render-oracle-image-build.json`, then emit a separate candidate lock:
 
 ```sh
 python3 scripts/run-render-oracle-container.py pin-image \
-  --build-evidence target/render-oracle-hosted/container-build.json
-python3 scripts/run-render-oracle-container.py verify-lock
+  --build-evidence target/render-oracle-image-build.json \
+  --github-run-id RUN_ID \
+  --github-run-attempt RUN_ATTEMPT \
+  --github-job-id JOB_ID \
+  --github-artifact-id ARTIFACT_ID \
+  --output-lock scripts/render-oracle-container/lock.pinned.json
+python3 scripts/run-render-oracle-container.py \
+  --lock scripts/render-oracle-container/lock.pinned.json \
+  verify-lock
+git diff --no-index \
+  scripts/render-oracle-container/lock.json \
+  scripts/render-oracle-container/lock.pinned.json
 ```
 
-Normal campaign and release gates use the second command and fail closed until
-the checked-in image identity exists.
+Only after reviewing both pinned digests, the bootstrap source commit, and the
+diff should the candidate atomically replace `lock.json`. Never redirect
+`pin-image` output over the input lock: the shell truncates a redirection target
+before the wrapper can validate it. Normal campaign gates fail closed until the
+reviewed config and manifest identities exist.
 
 Acquire and verify the OFL-only font pack. It contains pinned metric-compatible
 Latin faces (Carlito, Arimo, Tinos, Cousine, and Caladea), explicit Office font
@@ -52,7 +69,10 @@ python3 scripts/run-render-oracle-container.py build \
   --dry-run
 ```
 
-Build and inspect the resulting content-addressed image ID:
+Build twice in independent pinned BuildKit builders. Each build streams an
+explicit Docker-schema2 archive through a 4 GiB stdout cap, hashes the exact
+image-config blob, loads the archive explicitly, and then compares the complete
+config/manifest/descriptor/RootFS identities:
 
 ```sh
 python3 scripts/run-render-oracle-container.py build \
@@ -61,9 +81,15 @@ python3 scripts/run-render-oracle-container.py build \
   --execute
 ```
 
-Use `--engine podman` for Podman. An unpinned lock is permitted only for the
-one-time hosted identity bootstrap. Normal builds require the reviewed,
-checked-in image ID and reject any different engine result.
+Canonical builds require Docker. Podman remains supported for the isolated
+`render` command after the image has been built and verified. An unpinned lock
+is permitted only for the one-time hosted identity bootstrap. Normal builds
+require the reviewed config and manifest digests and reject any different
+result.
+
+Executed builds and pinning additionally require a clean Git tree. The lock,
+wrapper, Containerfile, entrypoint, and profile must all be tracked and
+byte-identical to the recorded source commit.
 
 ## Render one workbook
 

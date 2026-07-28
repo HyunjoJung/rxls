@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -30,30 +31,85 @@ import threading
 import time
 from typing import Any, Protocol, Sequence
 from urllib.parse import quote
+import zipfile
 
 
-ROOT = Path(__file__).resolve().parents[1]
+WRAPPER_PATH = Path(__file__).resolve()
+ROOT = WRAPPER_PATH.parents[1]
 CONTAINER_DIR = ROOT / "scripts" / "render-oracle-container"
 DEFAULT_LOCK = CONTAINER_DIR / "lock.json"
+PINNED_LOCK_OUTPUT = CONTAINER_DIR / "lock.pinned.json"
 CONTAINERFILE = CONTAINER_DIR / "Containerfile"
-LOCK_SCHEMA = "rxls.render-oracle-container-lock.v2"
+WRAPPER_RELATIVE_PATH = "scripts/run-render-oracle-container.py"
+LOCK_RELATIVE_PATH = "scripts/render-oracle-container/lock.json"
+LOCK_SCHEMA = "rxls.render-oracle-container-lock.v3"
 OUTPUT_SCHEMA = "rxls.render-oracle-container-output.v2"
-EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v2"
+EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
 PLAN_SCHEMA = "rxls.render-oracle-container-plan.v1"
+BUILD_EVIDENCE_SCHEMA = "rxls.render-oracle-container-build.v3"
+BOOTSTRAP_RECEIPT_SCHEMA = "rxls.render-oracle-bootstrap-receipt.v1"
 SOURCE_DATE_EPOCH = 1_783_900_800
+SOURCE_DATE_EPOCH_RFC3339 = "2026-07-13T00:00:00Z"
 FONT_PACK_SCHEMA = "rxls.render-font-pack.v1"
 SUPPORTED_EXTENSIONS = {".xls", ".xlsx", ".xlsm", ".xlsb", ".ods"}
 PRINT_MODES = {"authored", "single-page-sheets"}
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RUN_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\Z")
+BUILDER_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9_.-]{0,62})\Z")
 IMAGE_RE = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
+DOCKER_V2_MANIFEST_MEDIA_TYPE = (
+    "application/vnd.docker.distribution.manifest.v2+json"
+)
+IMAGE_MANIFEST_MEDIA_TYPES = {DOCKER_V2_MANIFEST_MEDIA_TYPE}
 MAX_LOCK_BYTES = 256 * 1024
+MAX_WRAPPER_BYTES = 512 * 1024
 MAX_FONT_PACK_BYTES = 128 * 1024 * 1024
 MAX_FONT_PACK_FILES = 128
 MAX_EVIDENCE_FILES = 16
 MAX_ENGINE_DIAGNOSTIC_BYTES = 1024 * 1024
 MAX_BUILD_DIAGNOSTIC_BYTES = 64 * 1024
+MAX_BUILD_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
+MAX_BUILD_ARCHIVE_MEMBERS = 4096
+MAX_BUILD_ARCHIVE_MANIFEST_BYTES = 1024 * 1024
+MAX_IMAGE_CONFIG_BYTES = 16 * 1024 * 1024
+MAX_BUILD_STDERR_BYTES = 16 * 1024 * 1024
+MAX_GITHUB_API_BYTES = 512 * 1024
+MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES = 1024 * 1024
+MAX_GITHUB_ID = (1 << 63) - 1
+GITHUB_REPOSITORY = "HyunjoJung/rxls"
+GITHUB_REPOSITORY_ID = 1_297_467_060
+GITHUB_WORKFLOW_PATH = ".github/workflows/render-hardening.yml"
+GITHUB_WORKFLOW_NAME = "render-hardening"
+GITHUB_BOOTSTRAP_EVENT = "pull_request"
+GITHUB_BOOTSTRAP_JOB_NAME = "locked LibreOffice oracle image"
+GITHUB_BOOTSTRAP_BUILD_STEP = "Build and verify the locked oracle image"
+GITHUB_BOOTSTRAP_UPLOAD_STEP = "Upload oracle image identity evidence"
+GITHUB_BOOTSTRAP_EVIDENCE_MEMBER = "render-oracle-image-build.json"
+BUILDX_VERSION = "v0.35.0"
+BUILDX_COMMIT = "a319e5b15052cf6557ceb666eb8ff6e32380b782"
+BUILDX_SETUP_ACTION = (
+    "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
+)
+BUILDKIT_VERSION = "v0.31.2"
+BUILDKIT_COMMIT = "e42e1bfd389af7203238cce77b1f7dad447285e9"
+BUILDKIT_INDEX_SHA256 = (
+    "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
+)
+BUILDKIT_AMD64_MANIFEST_SHA256 = (
+    "63db51c9b30208a7c2b1c40392c7ebb9ce2f85ba238a18a85420f8f5ea2d4684"
+)
+BUILDKIT_IMAGE = (
+    "docker.io/moby/buildkit:v0.31.2@sha256:"
+    + BUILDKIT_INDEX_SHA256
+)
+BUILDKIT_SNAPSHOTTER = "overlayfs"
+# Stock Buildx v0.35.0 leaves SolveOpt.CompatibilityVersion unset. The pinned
+# BuildKit v0.31.2 daemon maps that zero value to its immutable default, 30.
+BUILDKIT_DEFAULT_COMPATIBILITY_VERSION = 30
+BUILDKIT_COMPATIBILITY_SOURCE = "pinned-buildkit-default"
+REPRODUCIBILITY_BUILD_COUNT = 2
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -137,6 +193,162 @@ class CommandResult:
     stderr: bytes = b""
 
 
+@dataclass(frozen=True)
+class SourceIdentity:
+    commit: str
+    wrapper_sha256: str
+
+
+@dataclass(frozen=True)
+class BuildMetadataIdentity:
+    config_digest: str
+    manifest_digest: str
+    descriptor_digest: str
+    descriptor_media_type: str
+    descriptor_size: int
+    descriptor_annotations: tuple[tuple[str, str], ...]
+    descriptor_platform: tuple[tuple[str, str], ...] | None
+
+
+@dataclass(frozen=True)
+class ImageIdentity:
+    image_id: str
+    platform: str
+    created: str
+    diff_ids: tuple[str, ...]
+    labels: tuple[tuple[str, str], ...]
+    manifest_digest: str | None = None
+    descriptor_digest: str | None = None
+    descriptor_media_type: str | None = None
+    descriptor_size: int | None = None
+    descriptor_annotations: tuple[tuple[str, str], ...] = ()
+    descriptor_platform: tuple[tuple[str, str], ...] | None = None
+
+    @property
+    def diff_ids_sha256(self) -> str:
+        return sha256_bytes(canonical_json_bytes(list(self.diff_ids)))
+
+    def normalized_document(self) -> dict[str, Any]:
+        descriptor_values = (
+            self.descriptor_digest,
+            self.descriptor_media_type,
+            self.descriptor_size,
+        )
+        if all(value is None for value in descriptor_values):
+            if self.descriptor_annotations or self.descriptor_platform is not None:
+                raise OracleContainerError("image_descriptor_identity")
+            descriptor: dict[str, Any] | None = None
+        elif any(value is None for value in descriptor_values):
+            raise OracleContainerError("image_descriptor_identity")
+        else:
+            descriptor = {
+                "annotations": dict(self.descriptor_annotations),
+                "digest": self.descriptor_digest,
+                "mediaType": self.descriptor_media_type,
+                "size": self.descriptor_size,
+            }
+            if self.descriptor_platform is not None:
+                descriptor["platform"] = dict(self.descriptor_platform)
+        return {
+            "config_id": self.image_id,
+            "created": self.created,
+            "descriptor": descriptor,
+            "labels": dict(self.labels),
+            "manifest_digest": self.manifest_digest,
+            "platform": self.platform,
+            "rootfs_diff_ids": list(self.diff_ids),
+        }
+
+    @property
+    def identity_sha256(self) -> str:
+        return sha256_bytes(canonical_json_bytes(self.normalized_document()))
+
+    def evidence_row(self) -> dict[str, Any]:
+        document = self.normalized_document()
+        if document["manifest_digest"] is None or document["descriptor"] is None:
+            raise OracleContainerError("image_identity_incomplete")
+        document["identity_sha256"] = self.identity_sha256
+        document["rootfs_diff_ids_sha256"] = self.diff_ids_sha256
+        return document
+
+
+@dataclass(frozen=True)
+class ReproducibleBuild:
+    identities: tuple[ImageIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.identities) != REPRODUCIBILITY_BUILD_COUNT
+            or any(
+                identity != self.identities[0]
+                for identity in self.identities[1:]
+            )
+        ):
+            raise OracleContainerError("image_reproducibility_mismatch")
+        for identity in self.identities:
+            identity.evidence_row()
+
+    @property
+    def image_id(self) -> str:
+        return self.identities[-1].image_id
+
+    @property
+    def manifest_digest(self) -> str:
+        value = self.identities[-1].manifest_digest
+        if value is None:
+            raise OracleContainerError("build_manifest_digest")
+        return value
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "build_count": len(self.identities),
+            "buildkit_compatibility": {
+                "explicit": False,
+                "source": BUILDKIT_COMPATIBILITY_SOURCE,
+                "version": BUILDKIT_DEFAULT_COMPATIBILITY_VERSION,
+            },
+            "buildkit_commit": BUILDKIT_COMMIT,
+            "buildkit_image": BUILDKIT_IMAGE,
+            "buildkit_version": BUILDKIT_VERSION,
+            "buildx_commit": BUILDX_COMMIT,
+            "buildx_version": BUILDX_VERSION,
+            "config_ids": [identity.image_id for identity in self.identities],
+            "descriptor_digests": [
+                identity.descriptor_digest for identity in self.identities
+            ],
+            "descriptor_media_types": [
+                identity.descriptor_media_type for identity in self.identities
+            ],
+            "descriptor_sizes": [
+                identity.descriptor_size for identity in self.identities
+            ],
+            "driver": "docker-container",
+            "export_archive_max_bytes": MAX_BUILD_ARCHIVE_BYTES,
+            "export_destination": "stdout",
+            "export_media_type": DOCKER_V2_MANIFEST_MEDIA_TYPE,
+            "export_tar": True,
+            "identities": [
+                identity.evidence_row() for identity in self.identities
+            ],
+            "identity_sha256": [
+                identity.identity_sha256 for identity in self.identities
+            ],
+            "manifest_digests": [
+                identity.manifest_digest for identity in self.identities
+            ],
+            "no_cache": True,
+            "provenance": False,
+            "rewrite_timestamp": True,
+            "rootfs_diff_ids_sha256": [
+                identity.diff_ids_sha256 for identity in self.identities
+            ],
+            "sbom": False,
+            "snapshotter": BUILDKIT_SNAPSHOTTER,
+            "source_date_epoch": SOURCE_DATE_EPOCH,
+            "status": "matched",
+        }
+
+
 class CommandRunner(Protocol):
     def run(
         self,
@@ -145,6 +357,8 @@ class CommandRunner(Protocol):
         timeout_seconds: float,
         output_limit_bytes: int,
         stdout_path: Path | None = None,
+        stdout_limit_bytes: int | None = None,
+        stderr_limit_bytes: int | None = None,
     ) -> CommandResult: ...
 
 
@@ -158,9 +372,17 @@ class BoundedProcessRunner:
         timeout_seconds: float,
         output_limit_bytes: int,
         stdout_path: Path | None = None,
+        stdout_limit_bytes: int | None = None,
+        stderr_limit_bytes: int | None = None,
     ) -> CommandResult:
         if not command:
             return CommandResult("not_found", None)
+        output_file = None
+        if stdout_path is not None:
+            try:
+                output_file = stdout_path.open("xb")
+            except OSError:
+                return CommandResult("not_found", None)
         try:
             process = subprocess.Popen(
                 list(command),
@@ -170,17 +392,36 @@ class BoundedProcessRunner:
                 start_new_session=(os.name != "nt"),
             )
         except (FileNotFoundError, PermissionError, OSError):
+            if output_file is not None:
+                output_file.close()
             return CommandResult("not_found", None)
 
         output_limit_bytes = max(1, output_limit_bytes)
+        stdout_limit_bytes = max(
+            1,
+            output_limit_bytes
+            if stdout_limit_bytes is None
+            else stdout_limit_bytes,
+        )
+        stderr_limit_bytes = max(
+            1,
+            output_limit_bytes
+            if stderr_limit_bytes is None
+            else stderr_limit_bytes,
+        )
         stdout = bytearray()
         stderr = bytearray()
         total_read = 0
+        stream_totals = {"stdout": 0, "stderr": 0}
         over_limit = threading.Event()
         lock = threading.Lock()
-        output_file = stdout_path.open("wb") if stdout_path is not None else None
 
-        def drain(stream: Any, destination: bytearray | None) -> None:
+        def drain(
+            stream: Any,
+            destination: bytearray | None,
+            stream_name: str,
+            stream_limit: int,
+        ) -> None:
             nonlocal total_read
             try:
                 while True:
@@ -188,15 +429,29 @@ class BoundedProcessRunner:
                     if not chunk:
                         break
                     with lock:
-                        remaining = max(0, output_limit_bytes - total_read)
-                        retained = chunk[:remaining]
+                        remaining_total = max(
+                            0, output_limit_bytes - total_read
+                        )
+                        remaining_stream = max(
+                            0,
+                            stream_limit - stream_totals[stream_name],
+                        )
+                        retained = chunk[
+                            : min(remaining_total, remaining_stream)
+                        ]
                         total_read += len(chunk)
+                        stream_totals[stream_name] += len(chunk)
                         if destination is not None:
                             destination.extend(retained)
                         elif output_file is not None and retained:
                             output_file.write(retained)
-                        if total_read > output_limit_bytes:
+                        if (
+                            total_read > output_limit_bytes
+                            or stream_totals[stream_name] > stream_limit
+                        ):
                             over_limit.set()
+            except OSError:
+                over_limit.set()
             finally:
                 stream.close()
 
@@ -204,10 +459,24 @@ class BoundedProcessRunner:
         threads = [
             threading.Thread(
                 target=drain,
-                args=(process.stdout, None if stdout_path else stdout),
+                args=(
+                    process.stdout,
+                    None if stdout_path else stdout,
+                    "stdout",
+                    stdout_limit_bytes,
+                ),
                 daemon=True,
             ),
-            threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
+            threading.Thread(
+                target=drain,
+                args=(
+                    process.stderr,
+                    stderr,
+                    "stderr",
+                    stderr_limit_bytes,
+                ),
+                daemon=True,
+            ),
         ]
         for thread in threads:
             thread.start()
@@ -321,27 +590,178 @@ def sha256_file(path: Path, limit: int) -> str:
 
 def load_lock(path: Path = DEFAULT_LOCK) -> tuple[dict[str, Any], bytes, str]:
     try:
-        payload = path.read_bytes()
-        if len(payload) > MAX_LOCK_BYTES:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise OracleContainerError("lock_type")
+        if not 0 < metadata.st_size <= MAX_LOCK_BYTES:
             raise OracleContainerError("lock_limit")
+        payload = path.read_bytes()
+        if len(payload) != metadata.st_size:
+            raise OracleContainerError("lock_changed")
         document = json.loads(payload)
     except (OSError, json.JSONDecodeError) as error:
         raise OracleContainerError("lock_unreadable") from error
     validate_lock(document)
     verify_locked_files(document, path.parent)
+    verify_wrapper_identity(document)
     return document, payload, build_contract_sha256(document)
 
 
 def build_contract_sha256(document: dict[str, Any]) -> str:
-    """Hash build inputs while excluding the optional post-build image pin.
+    """Hash build inputs while excluding optional post-build image pins.
 
-    The OCI image config contains this digest as a label. Excluding only the
-    expected image ID avoids a recursive digest while preserving a stable,
-    reviewable contract for every byte that affects the build.
+    The OCI image config contains this digest as a label. Excluding the
+    post-build config/manifest pins and their hosted bootstrap receipt avoids
+    recursion while preserving a stable, reviewable contract for every input
+    that affects the build.
     """
     normalized = json.loads(json.dumps(document))
     normalized["built_image"]["expected_id"] = None
+    normalized["built_image"]["expected_manifest_digest"] = None
+    normalized["built_image"]["bootstrap_receipt"] = None
     return sha256_bytes(canonical_json_bytes(normalized))
+
+
+def _is_github_id(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and 0 < value <= MAX_GITHUB_ID
+    )
+
+
+def bootstrap_artifact_name(
+    source_commit: str, run_id: int, run_attempt: int
+) -> str:
+    if (
+        not isinstance(source_commit, str)
+        or GIT_COMMIT_RE.fullmatch(source_commit) is None
+    ):
+        raise OracleContainerError("bootstrap_receipt_source")
+    if not _is_github_id(run_id) or not _is_github_id(run_attempt):
+        raise OracleContainerError("bootstrap_receipt_run")
+    return (
+        f"render-oracle-image-{source_commit}-{run_id}-{run_attempt}"
+    )
+
+
+def validate_bootstrap_receipt(
+    receipt: object,
+    *,
+    source_commit: str | None = None,
+    evidence_payload: bytes | None = None,
+) -> dict[str, Any]:
+    """Validate the path-neutral GitHub bootstrap provenance receipt."""
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "artifact",
+        "evidence",
+        "job",
+        "repository",
+        "run",
+        "schema",
+    }:
+        raise OracleContainerError("bootstrap_receipt_schema")
+    if receipt.get("schema") != BOOTSTRAP_RECEIPT_SCHEMA:
+        raise OracleContainerError("bootstrap_receipt_schema")
+
+    repository = receipt.get("repository")
+    if repository != {
+        "full_name": GITHUB_REPOSITORY,
+        "id": GITHUB_REPOSITORY_ID,
+    }:
+        raise OracleContainerError("bootstrap_receipt_repository")
+
+    run = receipt.get("run")
+    if not isinstance(run, dict) or set(run) != {
+        "conclusion",
+        "event",
+        "head_sha",
+        "id",
+        "run_attempt",
+        "workflow",
+    }:
+        raise OracleContainerError("bootstrap_receipt_run")
+    run_id = run.get("id")
+    run_attempt = run.get("run_attempt")
+    head_sha = run.get("head_sha")
+    if (
+        not _is_github_id(run_id)
+        or not _is_github_id(run_attempt)
+        or not isinstance(head_sha, str)
+        or GIT_COMMIT_RE.fullmatch(head_sha) is None
+        or run.get("event") != GITHUB_BOOTSTRAP_EVENT
+        or run.get("workflow") != GITHUB_WORKFLOW_PATH
+        or run.get("conclusion") != "failure"
+    ):
+        raise OracleContainerError("bootstrap_receipt_run")
+    if source_commit is not None and head_sha != source_commit:
+        raise OracleContainerError("bootstrap_receipt_source")
+
+    job = receipt.get("job")
+    if not isinstance(job, dict) or set(job) != {
+        "conclusion",
+        "id",
+        "name",
+        "run_attempt",
+        "run_id",
+    }:
+        raise OracleContainerError("bootstrap_receipt_job")
+    if (
+        not _is_github_id(job.get("id"))
+        or job.get("run_id") != run_id
+        or not _is_github_id(job.get("run_id"))
+        or job.get("run_attempt") != run_attempt
+        or not _is_github_id(job.get("run_attempt"))
+        or job.get("name") != GITHUB_BOOTSTRAP_JOB_NAME
+        or job.get("conclusion") != "failure"
+    ):
+        raise OracleContainerError("bootstrap_receipt_job")
+
+    artifact = receipt.get("artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "digest",
+        "id",
+        "name",
+        "size_in_bytes",
+    }:
+        raise OracleContainerError("bootstrap_receipt_artifact")
+    artifact_size = artifact.get("size_in_bytes")
+    if (
+        not _is_github_id(artifact.get("id"))
+        or artifact.get("name")
+        != bootstrap_artifact_name(head_sha, run_id, run_attempt)
+        or not isinstance(artifact.get("digest"), str)
+        or IMAGE_ID_RE.fullmatch(artifact["digest"]) is None
+        or isinstance(artifact_size, bool)
+        or not isinstance(artifact_size, int)
+        or not 0 < artifact_size <= MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+    ):
+        raise OracleContainerError("bootstrap_receipt_artifact")
+
+    evidence = receipt.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "bytes",
+        "member",
+        "sha256",
+    }:
+        raise OracleContainerError("bootstrap_receipt_evidence")
+    evidence_size = evidence.get("bytes")
+    evidence_sha256 = evidence.get("sha256")
+    if (
+        evidence.get("member") != GITHUB_BOOTSTRAP_EVIDENCE_MEMBER
+        or isinstance(evidence_size, bool)
+        or not isinstance(evidence_size, int)
+        or not 0 < evidence_size <= MAX_LOCK_BYTES
+        or not isinstance(evidence_sha256, str)
+        or SHA256_RE.fullmatch(evidence_sha256) is None
+    ):
+        raise OracleContainerError("bootstrap_receipt_evidence")
+    if evidence_payload is not None and (
+        len(evidence_payload) != evidence_size
+        or sha256_bytes(evidence_payload) != evidence_sha256
+    ):
+        raise OracleContainerError("bootstrap_receipt_evidence")
+    return receipt
 
 
 def validate_lock(document: object) -> dict[str, Any]:
@@ -349,12 +769,14 @@ def validate_lock(document: object) -> dict[str, Any]:
         raise OracleContainerError("lock_schema")
     if set(document) != {
         "base_image",
+        "builder",
         "built_image",
         "debian_snapshot",
         "files",
         "libreoffice",
         "runtime_defaults",
         "schema",
+        "wrapper",
     }:
         raise OracleContainerError("lock_keys")
     base = document.get("base_image")
@@ -368,6 +790,46 @@ def validate_lock(document: object) -> dict[str, Any]:
         raise OracleContainerError("lock_base_digest")
     if not isinstance(reference, str) or not reference.endswith(f"@sha256:{digest}"):
         raise OracleContainerError("lock_base_reference")
+
+    builder = document.get("builder")
+    if builder != {
+        "buildkit": {
+            "commit": BUILDKIT_COMMIT,
+            "compatibility": {
+                "explicit": False,
+                "source": BUILDKIT_COMPATIBILITY_SOURCE,
+                "version": BUILDKIT_DEFAULT_COMPATIBILITY_VERSION,
+            },
+            "image": BUILDKIT_IMAGE,
+            "index_sha256": BUILDKIT_INDEX_SHA256,
+            "linux_amd64_manifest_sha256": BUILDKIT_AMD64_MANIFEST_SHA256,
+            "version": BUILDKIT_VERSION,
+        },
+        "buildx": {
+            "commit": BUILDX_COMMIT,
+            "setup_action": BUILDX_SETUP_ACTION,
+            "version": BUILDX_VERSION,
+        },
+        "driver": "docker-container",
+        "driver_options": {
+            "provenance_add_gha": False,
+        },
+        "exporter": {
+            "archive_max_bytes": MAX_BUILD_ARCHIVE_BYTES,
+            "destination": "stdout",
+            "media_type": DOCKER_V2_MANIFEST_MEDIA_TYPE,
+            "oci_mediatypes": False,
+            "provenance": False,
+            "rewrite_timestamp": True,
+            "sbom": False,
+            "tar": True,
+            "type": "docker",
+        },
+        "platform": "linux/amd64",
+        "reproducibility_builds": REPRODUCIBILITY_BUILD_COUNT,
+        "snapshotter": BUILDKIT_SNAPSHOTTER,
+    }:
+        raise OracleContainerError("lock_builder")
 
     snapshot = document.get("debian_snapshot")
     if not isinstance(snapshot, dict):
@@ -422,18 +884,23 @@ def validate_lock(document: object) -> dict[str, Any]:
             raise OracleContainerError("lock_file_bytes")
     built_image = document.get("built_image")
     if not isinstance(built_image, dict) or set(built_image) != {
+        "bootstrap_receipt",
         "expected_id",
+        "expected_manifest_digest",
         "identity_kind",
         "source_date_epoch",
         "unpinned_verification",
     }:
         raise OracleContainerError("lock_built_image")
-    if built_image.get("identity_kind") != "oci_image_config_digest":
+    if built_image.get("identity_kind") != (
+        "docker_schema2_manifest_digest_plus_oci_image_config_digest"
+    ):
         raise OracleContainerError("lock_built_image_kind")
     if built_image.get("source_date_epoch") != SOURCE_DATE_EPOCH:
         raise OracleContainerError("lock_built_image_epoch")
     if built_image.get("unpinned_verification") != (
-        "bootstrap_only_runtime_image_id_plus_exact_build_contract_and_labels"
+        "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_"
+        "manifest_descriptor_rootfs_contract_and_labels"
     ):
         raise OracleContainerError("lock_built_image_verification")
     expected_id = built_image.get("expected_id")
@@ -441,6 +908,19 @@ def validate_lock(document: object) -> dict[str, Any]:
         not isinstance(expected_id, str) or not IMAGE_ID_RE.fullmatch(expected_id)
     ):
         raise OracleContainerError("lock_built_image_id")
+    expected_manifest_digest = built_image.get("expected_manifest_digest")
+    if expected_manifest_digest is not None and (
+        not isinstance(expected_manifest_digest, str)
+        or IMAGE_ID_RE.fullmatch(expected_manifest_digest) is None
+    ):
+        raise OracleContainerError("lock_built_image_manifest_digest")
+    if (expected_id is None) != (expected_manifest_digest is None):
+        raise OracleContainerError("lock_built_image_pin_pair")
+    bootstrap_receipt = built_image.get("bootstrap_receipt")
+    if bootstrap_receipt is not None:
+        validate_bootstrap_receipt(bootstrap_receipt)
+    if (expected_id is None) != (bootstrap_receipt is None):
+        raise OracleContainerError("lock_bootstrap_receipt_pair")
     if "built_image_digest" in document or "image_digest" in document:
         raise OracleContainerError("lock_ambiguous_image_claim")
     if document.get("runtime_defaults") != {
@@ -455,6 +935,28 @@ def validate_lock(document: object) -> dict[str, Any]:
         "timeout_seconds": 180,
     }:
         raise OracleContainerError("lock_runtime_defaults")
+    wrapper = document.get("wrapper")
+    if not isinstance(wrapper, dict) or set(wrapper) != {
+        "bytes",
+        "path",
+        "sha256",
+    }:
+        raise OracleContainerError("lock_wrapper")
+    if wrapper.get("path") != WRAPPER_RELATIVE_PATH:
+        raise OracleContainerError("lock_wrapper_path")
+    wrapper_bytes = wrapper.get("bytes")
+    wrapper_sha256 = wrapper.get("sha256")
+    if (
+        isinstance(wrapper_bytes, bool)
+        or not isinstance(wrapper_bytes, int)
+        or not 0 < wrapper_bytes <= MAX_WRAPPER_BYTES
+    ):
+        raise OracleContainerError("lock_wrapper_bytes")
+    if (
+        not isinstance(wrapper_sha256, str)
+        or SHA256_RE.fullmatch(wrapper_sha256) is None
+    ):
+        raise OracleContainerError("lock_wrapper_sha256")
     return document
 
 
@@ -480,6 +982,465 @@ def verify_locked_files(document: dict[str, Any], root: Path) -> None:
             raise OracleContainerError("locked_file_size")
         if sha256_file(path, 1024 * 1024) != row["sha256"]:
             raise OracleContainerError("locked_file_hash")
+
+
+def verify_wrapper_identity(
+    document: dict[str, Any], path: Path = WRAPPER_PATH
+) -> str:
+    row = document["wrapper"]
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise OracleContainerError("wrapper_missing") from error
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise OracleContainerError("wrapper_type")
+    if metadata.st_size != row["bytes"]:
+        raise OracleContainerError("wrapper_size")
+    digest = sha256_file(path, MAX_WRAPPER_BYTES)
+    if digest != row["sha256"]:
+        raise OracleContainerError("wrapper_hash")
+    return digest
+
+
+def require_canonical_build_lock(path: Path) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+        canonical = DEFAULT_LOCK.resolve(strict=True)
+    except OSError as error:
+        raise OracleContainerError("canonical_build_lock") from error
+    if resolved != canonical:
+        raise OracleContainerError("canonical_build_lock")
+
+
+def _run_git(
+    args: Sequence[str],
+    *,
+    root: Path = ROOT,
+    limit: int = 1024 * 1024,
+) -> bytes:
+    result = BoundedProcessRunner().run(
+        ["git", "-C", str(root), *args],
+        timeout_seconds=15.0,
+        output_limit_bytes=limit,
+    )
+    if result.status != "ok":
+        raise OracleContainerError("source_git_state")
+    return result.stdout
+
+
+def require_clean_source(
+    document: dict[str, Any],
+    *,
+    root: Path = ROOT,
+    wrapper_path: Path = WRAPPER_PATH,
+    lock_path: Path = DEFAULT_LOCK,
+) -> SourceIdentity:
+    raw_commit = _run_git(
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        root=root,
+        limit=1024,
+    ).decode("ascii", errors="strict").strip()
+    if GIT_COMMIT_RE.fullmatch(raw_commit) is None:
+        raise OracleContainerError("source_commit")
+
+    status = _run_git(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        root=root,
+    )
+    if status:
+        raise OracleContainerError("source_tree_dirty")
+    locked_paths = [
+        (
+            f"scripts/render-oracle-container/{row['path']}",
+            lock_path.parent / row["path"],
+            1024 * 1024,
+        )
+        for row in document["files"]
+    ]
+    tracked_paths = [
+        (WRAPPER_RELATIVE_PATH, wrapper_path, MAX_WRAPPER_BYTES),
+        (LOCK_RELATIVE_PATH, lock_path, MAX_LOCK_BYTES),
+        *locked_paths,
+    ]
+    _run_git(
+        [
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            *(relative for relative, _, _ in tracked_paths),
+        ],
+        root=root,
+        limit=16 * 1024,
+    )
+    for relative, live_path, maximum in tracked_paths:
+        head_payload = _run_git(
+            ["cat-file", "blob", f"HEAD:{relative}"],
+            root=root,
+            limit=maximum,
+        )
+        try:
+            live_payload = live_path.read_bytes()
+        except OSError as error:
+            raise OracleContainerError("source_tracked_file") from error
+        if head_payload != live_payload:
+            raise OracleContainerError("source_tracked_file")
+
+    wrapper_sha256 = verify_wrapper_identity(document, wrapper_path)
+    return SourceIdentity(
+        commit=raw_commit,
+        wrapper_sha256=wrapper_sha256,
+    )
+
+
+def read_bootstrap_evidence_payload(evidence_path: Path) -> bytes:
+    try:
+        metadata = evidence_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or evidence_path.is_symlink():
+            raise OracleContainerError("bootstrap_build_type")
+        if not 0 < metadata.st_size <= MAX_LOCK_BYTES:
+            raise OracleContainerError("bootstrap_build_limit")
+        payload = evidence_path.read_bytes()
+        if len(payload) != metadata.st_size:
+            raise OracleContainerError("bootstrap_build_changed")
+        return payload
+    except OracleContainerError:
+        raise
+    except OSError as error:
+        raise OracleContainerError("bootstrap_build_unreadable") from error
+
+
+def github_api_command(endpoint: str) -> list[str]:
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint.startswith(f"/repos/{GITHUB_REPOSITORY}/")
+        or any(character in endpoint for character in ("\0", "\r", "\n"))
+    ):
+        raise OracleContainerError("bootstrap_receipt_endpoint")
+    return [
+        "gh",
+        "api",
+        "--hostname",
+        "github.com",
+        "--method",
+        "GET",
+        "--header",
+        "Accept: application/vnd.github+json",
+        "--header",
+        "X-GitHub-Api-Version: 2022-11-28",
+        endpoint,
+    ]
+
+
+def github_api_json(
+    runner: CommandRunner, endpoint: str, error_code: str
+) -> object:
+    result = runner.run(
+        github_api_command(endpoint),
+        timeout_seconds=30.0,
+        output_limit_bytes=MAX_GITHUB_API_BYTES,
+    )
+    if result.status != "ok":
+        raise OracleContainerError(error_code)
+    try:
+        return json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OracleContainerError(error_code) from error
+
+
+def _github_repository_matches(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("id") == GITHUB_REPOSITORY_ID
+        and value.get("full_name") == GITHUB_REPOSITORY
+    )
+
+
+def validate_hosted_run(
+    document: object,
+    *,
+    run_id: int,
+    run_attempt: int,
+    source_commit: str,
+) -> None:
+    if not isinstance(document, dict):
+        raise OracleContainerError("bootstrap_receipt_run")
+    if (
+        document.get("id") != run_id
+        or not _is_github_id(document.get("id"))
+        or document.get("run_attempt") != run_attempt
+        or not _is_github_id(document.get("run_attempt"))
+        or document.get("event") != GITHUB_BOOTSTRAP_EVENT
+        or document.get("head_sha") != source_commit
+        or document.get("path") != GITHUB_WORKFLOW_PATH
+        or document.get("status") != "completed"
+        or document.get("conclusion") != "failure"
+        or not _github_repository_matches(document.get("repository"))
+        or not _github_repository_matches(document.get("head_repository"))
+    ):
+        raise OracleContainerError("bootstrap_receipt_run")
+
+
+def validate_hosted_job(
+    document: object,
+    *,
+    run_id: int,
+    run_attempt: int,
+    job_id: int,
+    source_commit: str,
+) -> None:
+    if not isinstance(document, dict):
+        raise OracleContainerError("bootstrap_receipt_job")
+    if (
+        document.get("id") != job_id
+        or not _is_github_id(document.get("id"))
+        or document.get("run_id") != run_id
+        or not _is_github_id(document.get("run_id"))
+        or document.get("run_attempt") != run_attempt
+        or not _is_github_id(document.get("run_attempt"))
+        or document.get("workflow_name") != GITHUB_WORKFLOW_NAME
+        or document.get("head_sha") != source_commit
+        or document.get("name") != GITHUB_BOOTSTRAP_JOB_NAME
+        or document.get("status") != "completed"
+        or document.get("conclusion") != "failure"
+    ):
+        raise OracleContainerError("bootstrap_receipt_job")
+    steps = document.get("steps")
+    if not isinstance(steps, list):
+        raise OracleContainerError("bootstrap_receipt_job")
+    required_steps = {
+        GITHUB_BOOTSTRAP_BUILD_STEP: "failure",
+        GITHUB_BOOTSTRAP_UPLOAD_STEP: "success",
+    }
+    for name, conclusion in required_steps.items():
+        matching = [
+            step
+            for step in steps
+            if isinstance(step, dict) and step.get("name") == name
+        ]
+        if (
+            len(matching) != 1
+            or matching[0].get("status") != "completed"
+            or matching[0].get("conclusion") != conclusion
+        ):
+            raise OracleContainerError("bootstrap_receipt_job")
+
+
+def validate_hosted_artifact(
+    document: object,
+    *,
+    run_id: int,
+    run_attempt: int,
+    artifact_id: int,
+    source_commit: str,
+) -> tuple[str, int, str]:
+    if not isinstance(document, dict):
+        raise OracleContainerError("bootstrap_receipt_artifact")
+    expected_name = bootstrap_artifact_name(
+        source_commit, run_id, run_attempt
+    )
+    digest = document.get("digest")
+    size = document.get("size_in_bytes")
+    workflow_run = document.get("workflow_run")
+    if (
+        document.get("id") != artifact_id
+        or not _is_github_id(document.get("id"))
+        or document.get("name") != expected_name
+        or not isinstance(digest, str)
+        or IMAGE_ID_RE.fullmatch(digest) is None
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+        or document.get("expired") is not False
+        or not isinstance(workflow_run, dict)
+        or workflow_run.get("id") != run_id
+        or not _is_github_id(workflow_run.get("id"))
+        or workflow_run.get("repository_id") != GITHUB_REPOSITORY_ID
+        or workflow_run.get("head_repository_id")
+        != GITHUB_REPOSITORY_ID
+        or workflow_run.get("head_sha") != source_commit
+    ):
+        raise OracleContainerError("bootstrap_receipt_artifact")
+    return digest, size, expected_name
+
+
+def read_bootstrap_artifact_member(archive: Path) -> bytes:
+    try:
+        with zipfile.ZipFile(archive, mode="r") as bundle:
+            members = bundle.infolist()
+            if len(members) != 1:
+                raise OracleContainerError("bootstrap_receipt_zip")
+            member = members[0]
+            mode = (member.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(mode)
+            if (
+                member.filename != GITHUB_BOOTSTRAP_EVIDENCE_MEMBER
+                or member.is_dir()
+                or member.flag_bits & 0x1
+                or file_type not in (0, stat.S_IFREG)
+                or member.compress_type
+                not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                or not 0 < member.file_size <= MAX_LOCK_BYTES
+                or not 0 <= member.compress_size
+                <= MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+            ):
+                raise OracleContainerError("bootstrap_receipt_zip")
+            with bundle.open(member, mode="r") as stream:
+                payload = stream.read(MAX_LOCK_BYTES + 1)
+            if len(payload) != member.file_size:
+                raise OracleContainerError("bootstrap_receipt_zip")
+            return payload
+    except OracleContainerError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+        raise OracleContainerError("bootstrap_receipt_zip") from error
+
+
+def fetch_hosted_bootstrap_receipt(
+    evidence_path: Path,
+    source_identity: SourceIdentity,
+    *,
+    run_id: int,
+    run_attempt: int,
+    job_id: int,
+    artifact_id: int,
+    runner: CommandRunner | None = None,
+) -> dict[str, Any]:
+    """Authenticate exact live GitHub run/job/artifact evidence."""
+    if (
+        not isinstance(source_identity, SourceIdentity)
+        or GIT_COMMIT_RE.fullmatch(source_identity.commit) is None
+        or SHA256_RE.fullmatch(source_identity.wrapper_sha256) is None
+        or not all(
+            _is_github_id(value)
+            for value in (run_id, run_attempt, job_id, artifact_id)
+        )
+    ):
+        raise OracleContainerError("bootstrap_receipt_identity")
+    runner = runner or BoundedProcessRunner()
+    local_evidence = read_bootstrap_evidence_payload(evidence_path)
+
+    run_endpoint = (
+        f"/repos/{GITHUB_REPOSITORY}/actions/runs/{run_id}"
+    )
+    run_document = github_api_json(
+        runner, run_endpoint, "bootstrap_receipt_run"
+    )
+    validate_hosted_run(
+        run_document,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        source_commit=source_identity.commit,
+    )
+
+    job_endpoint = (
+        f"/repos/{GITHUB_REPOSITORY}/actions/jobs/{job_id}"
+    )
+    job_document = github_api_json(
+        runner, job_endpoint, "bootstrap_receipt_job"
+    )
+    validate_hosted_job(
+        job_document,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        job_id=job_id,
+        source_commit=source_identity.commit,
+    )
+
+    artifact_endpoint = (
+        f"/repos/{GITHUB_REPOSITORY}/actions/artifacts/{artifact_id}"
+    )
+    artifact_document = github_api_json(
+        runner, artifact_endpoint, "bootstrap_receipt_artifact"
+    )
+    artifact_digest, artifact_size, artifact_name = (
+        validate_hosted_artifact(
+            artifact_document,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            artifact_id=artifact_id,
+            source_commit=source_identity.commit,
+        )
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="rxls-bootstrap-artifact-"
+    ) as raw:
+        archive = Path(raw) / "artifact.zip"
+        download_endpoint = f"{artifact_endpoint}/zip"
+        downloaded = runner.run(
+            github_api_command(download_endpoint),
+            timeout_seconds=60.0,
+            output_limit_bytes=(
+                MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+                + MAX_BUILD_DIAGNOSTIC_BYTES
+            ),
+            stdout_path=archive,
+            stdout_limit_bytes=MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES,
+            stderr_limit_bytes=MAX_BUILD_DIAGNOSTIC_BYTES,
+        )
+        if downloaded.status != "ok":
+            raise OracleContainerError("bootstrap_receipt_download")
+        try:
+            metadata = archive.lstat()
+        except OSError as error:
+            raise OracleContainerError(
+                "bootstrap_receipt_download"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or archive.is_symlink()
+            or metadata.st_size != artifact_size
+            or not 0 < metadata.st_size
+            <= MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+            or sha256_file(
+                archive, MAX_BOOTSTRAP_ARTIFACT_ZIP_BYTES
+            )
+            != artifact_digest.removeprefix("sha256:")
+        ):
+            raise OracleContainerError("bootstrap_receipt_download")
+        hosted_evidence = read_bootstrap_artifact_member(archive)
+    if hosted_evidence != local_evidence:
+        raise OracleContainerError("bootstrap_receipt_evidence")
+
+    receipt = {
+        "artifact": {
+            "digest": artifact_digest,
+            "id": artifact_id,
+            "name": artifact_name,
+            "size_in_bytes": artifact_size,
+        },
+        "evidence": {
+            "bytes": len(local_evidence),
+            "member": GITHUB_BOOTSTRAP_EVIDENCE_MEMBER,
+            "sha256": sha256_bytes(local_evidence),
+        },
+        "job": {
+            "conclusion": "failure",
+            "id": job_id,
+            "name": GITHUB_BOOTSTRAP_JOB_NAME,
+            "run_attempt": run_attempt,
+            "run_id": run_id,
+        },
+        "repository": {
+            "full_name": GITHUB_REPOSITORY,
+            "id": GITHUB_REPOSITORY_ID,
+        },
+        "run": {
+            "conclusion": "failure",
+            "event": GITHUB_BOOTSTRAP_EVENT,
+            "head_sha": source_identity.commit,
+            "id": run_id,
+            "run_attempt": run_attempt,
+            "workflow": GITHUB_WORKFLOW_PATH,
+        },
+        "schema": BOOTSTRAP_RECEIPT_SCHEMA,
+    }
+    validate_bootstrap_receipt(
+        receipt,
+        source_commit=source_identity.commit,
+        evidence_payload=local_evidence,
+    )
+    return receipt
 
 
 def validate_run_id(value: str) -> str:
@@ -754,28 +1715,195 @@ def build_create_command(
     return command
 
 
-def build_build_command(
-    engine: str, image: str, lock_sha256: str
-) -> list[str]:
-    validate_image_reference(image)
-    if not SHA256_RE.fullmatch(lock_sha256):
-        raise OracleContainerError("invalid_lock_sha256")
+def validate_builder_name(value: str) -> str:
+    if not isinstance(value, str) or BUILDER_NAME_RE.fullmatch(value) is None:
+        raise OracleContainerError("invalid_builder_name")
+    return value
+
+
+def require_docker_build_engine(engine: str) -> str:
+    if engine != "docker":
+        raise OracleContainerError("build_engine_docker_required")
+    return engine
+
+
+def buildx_create_command(engine: str, builder_name: str) -> list[str]:
+    require_docker_build_engine(engine)
+    builder_name = validate_builder_name(builder_name)
     return [
         engine,
+        "buildx",
+        "create",
+        "--name",
+        builder_name,
+        "--driver",
+        "docker-container",
+        "--driver-opt",
+        f"image={BUILDKIT_IMAGE}",
+        "--driver-opt",
+        "provenance-add-gha=false",
+        "--buildkitd-flags",
+        f"--oci-worker-snapshotter={BUILDKIT_SNAPSHOTTER}",
+        "--platform",
+        "linux/amd64",
+        "--bootstrap",
+    ]
+
+
+def buildx_inspect_command(engine: str, builder_name: str) -> list[str]:
+    require_docker_build_engine(engine)
+    return [
+        engine,
+        "buildx",
+        "inspect",
+        "--builder",
+        validate_builder_name(builder_name),
+        "--bootstrap",
+    ]
+
+
+def buildx_remove_command(engine: str, builder_name: str) -> list[str]:
+    require_docker_build_engine(engine)
+    return [
+        engine,
+        "buildx",
+        "rm",
+        "--force",
+        validate_builder_name(builder_name),
+    ]
+
+
+def build_build_command(
+    engine: str,
+    image: str,
+    lock_sha256: str,
+    *,
+    builder_name: str = "rxls-oracle-repro",
+    metadata_file: Path | None = None,
+) -> list[str]:
+    require_docker_build_engine(engine)
+    validate_image_reference(image)
+    builder_name = validate_builder_name(builder_name)
+    if not SHA256_RE.fullmatch(lock_sha256):
+        raise OracleContainerError("invalid_lock_sha256")
+    if metadata_file is None:
+        metadata_file = Path("render-oracle-build-metadata.json")
+    metadata_value = str(metadata_file)
+    if not metadata_value or "\0" in metadata_value:
+        raise OracleContainerError("invalid_build_metadata_path")
+    return [
+        engine,
+        "buildx",
         "build",
+        "--builder",
+        builder_name,
         "--platform",
         "linux/amd64",
         "--pull=false",
+        "--no-cache",
+        "--provenance=false",
+        "--sbom=false",
+        "--progress",
+        "plain",
         "--build-arg",
         f"ORACLE_LOCK_SHA256={lock_sha256}",
         "--build-arg",
         f"SOURCE_DATE_EPOCH={SOURCE_DATE_EPOCH}",
+        "--output",
+        (
+            "type=docker,dest=-,tar=true,rewrite-timestamp=true,"
+            "oci-mediatypes=false"
+        ),
+        "--metadata-file",
+        metadata_value,
         "--tag",
         image,
         "--file",
         str(CONTAINERFILE),
         str(CONTAINER_DIR),
     ]
+
+
+def image_load_command(engine: str, archive: Path) -> list[str]:
+    require_docker_build_engine(engine)
+    value = str(archive)
+    if not value or "\0" in value:
+        raise OracleContainerError("invalid_build_archive_path")
+    return [engine, "image", "load", "--input", value]
+
+
+def validate_build_archive(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise OracleContainerError("build_archive_missing") from error
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        raise OracleContainerError("build_archive_type")
+    if not 0 < metadata.st_size <= MAX_BUILD_ARCHIVE_BYTES:
+        raise OracleContainerError("build_archive_limit")
+
+
+def verify_docker_archive_config(
+    path: Path, expected_config_digest: str
+) -> None:
+    if IMAGE_ID_RE.fullmatch(expected_config_digest) is None:
+        raise OracleContainerError("build_archive_config_digest")
+    try:
+        with tarfile.open(path, mode="r:") as archive:
+            members: dict[str, tarfile.TarInfo] = {}
+            for member in archive:
+                if len(members) >= MAX_BUILD_ARCHIVE_MEMBERS:
+                    raise OracleContainerError("build_archive_members")
+                if member.name in members:
+                    raise OracleContainerError("build_archive_duplicate")
+                members[member.name] = member
+
+            manifest_member = members.get("manifest.json")
+            if (
+                manifest_member is None
+                or not manifest_member.isreg()
+                or not 0
+                < manifest_member.size
+                <= MAX_BUILD_ARCHIVE_MANIFEST_BYTES
+            ):
+                raise OracleContainerError("build_archive_manifest")
+            manifest_stream = archive.extractfile(manifest_member)
+            if manifest_stream is None:
+                raise OracleContainerError("build_archive_manifest")
+            manifest_payload = manifest_stream.read(
+                MAX_BUILD_ARCHIVE_MANIFEST_BYTES + 1
+            )
+            if len(manifest_payload) != manifest_member.size:
+                raise OracleContainerError("build_archive_manifest")
+            manifest = json.loads(manifest_payload)
+            if not isinstance(manifest, list) or len(manifest) != 1:
+                raise OracleContainerError("build_archive_manifest")
+            row = manifest[0]
+            if not isinstance(row, dict):
+                raise OracleContainerError("build_archive_manifest")
+            config_name = safe_relative(row.get("Config"))
+            config_member = members.get(config_name)
+            if (
+                config_member is None
+                or not config_member.isreg()
+                or not 0 < config_member.size <= MAX_IMAGE_CONFIG_BYTES
+            ):
+                raise OracleContainerError("build_archive_config")
+            config_stream = archive.extractfile(config_member)
+            if config_stream is None:
+                raise OracleContainerError("build_archive_config")
+            config_payload = config_stream.read(MAX_IMAGE_CONFIG_BYTES + 1)
+            if len(config_payload) != config_member.size:
+                raise OracleContainerError("build_archive_config")
+    except (
+        OSError,
+        tarfile.TarError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise OracleContainerError("build_archive_unreadable") from error
+    if f"sha256:{sha256_bytes(config_payload)}" != expected_config_digest:
+        raise OracleContainerError("build_archive_config_digest")
 
 
 def path_neutral_command(
@@ -795,13 +1923,113 @@ def path_neutral_command(
     return rendered
 
 
-def inspect_image(
+def normalize_image_created(value: object) -> str:
+    if not isinstance(value, str):
+        raise OracleContainerError("image_created")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise OracleContainerError("image_created") from error
+    if parsed.tzinfo is None:
+        raise OracleContainerError("image_created")
+    if parsed.astimezone(timezone.utc).timestamp() != SOURCE_DATE_EPOCH:
+        raise OracleContainerError("image_created")
+    return SOURCE_DATE_EPOCH_RFC3339
+
+
+def normalize_diff_id(value: object) -> str:
+    if isinstance(value, str) and SHA256_RE.fullmatch(value):
+        return f"sha256:{value}"
+    if not isinstance(value, str) or IMAGE_ID_RE.fullmatch(value) is None:
+        raise OracleContainerError("image_rootfs")
+    return value
+
+
+def normalize_descriptor_annotations(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(annotation, str)
+        for key, annotation in value.items()
+    ):
+        raise OracleContainerError("build_metadata_descriptor_annotations")
+    if set(value) != {"org.opencontainers.image.created"}:
+        raise OracleContainerError("build_metadata_descriptor_annotations")
+    created = value.get("org.opencontainers.image.created")
+    try:
+        normalized_created = normalize_image_created(created)
+    except OracleContainerError as error:
+        raise OracleContainerError(
+            "build_metadata_descriptor_created"
+        ) from error
+    normalized = dict(value)
+    normalized["org.opencontainers.image.created"] = normalized_created
+    return tuple(sorted(normalized.items()))
+
+
+def normalize_descriptor_platform(
+    value: object,
+) -> tuple[tuple[str, str], ...] | None:
+    if value is None:
+        return None
+    if value != {"architecture": "amd64", "os": "linux"}:
+        raise OracleContainerError("build_metadata_descriptor_platform")
+    return (("architecture", "amd64"), ("os", "linux"))
+
+
+def identity_diagnostic_row(identity: ImageIdentity) -> dict[str, Any]:
+    return {
+        "created": identity.created,
+        "descriptor_digest": identity.descriptor_digest,
+        "descriptor_media_type": identity.descriptor_media_type,
+        "descriptor_size": identity.descriptor_size,
+        "image_id": identity.image_id,
+        "identity_sha256": identity.identity_sha256,
+        "manifest_digest": identity.manifest_digest,
+        "platform": identity.platform,
+        "rootfs_diff_ids": len(identity.diff_ids),
+        "rootfs_diff_ids_sha256": identity.diff_ids_sha256,
+    }
+
+
+def emit_image_identity_mismatch(
+    reason: str,
+    *,
+    expected_image_id: str | None = None,
+    expected_manifest_digest: str | None = None,
+    identities: Sequence[ImageIdentity] = (),
+) -> None:
+    payload = {
+        "expected_image_id": expected_image_id,
+        "expected_manifest_digest": expected_manifest_digest,
+        "observed": [identity_diagnostic_row(identity) for identity in identities],
+        "reason": reason,
+    }
+    rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(rendered.encode("utf-8")) > MAX_BUILD_DIAGNOSTIC_BYTES:
+        rendered = json.dumps(
+            {
+                "expected_image_id": expected_image_id,
+                "expected_manifest_digest": expected_manifest_digest,
+                "observed_identity_sha256": [
+                    identity.identity_sha256 for identity in identities
+                ],
+                "reason": reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    print(f"render_oracle_image_identity_diagnostic {rendered}", file=sys.stderr)
+
+
+def inspect_image_identity(
     runner: CommandRunner,
     engine: str,
     image: str,
     lock_sha256: str,
     expected_image_id: str | None = None,
-) -> str:
+    expected_manifest_digest: str | None = None,
+) -> ImageIdentity:
     result = runner.run(
         [engine, "image", "inspect", image],
         timeout_seconds=30.0,
@@ -812,26 +2040,91 @@ def inspect_image(
     try:
         document = json.loads(result.stdout)
         row = document[0]
-        image_id = row["Id"]
+        loaded_store_id = row["Id"]
         architecture = row["Architecture"]
+        operating_system = row["Os"]
+        created = row["Created"]
         labels = row["Config"]["Labels"]
+        rootfs_type = row["RootFS"]["Type"]
+        rootfs_layers = row["RootFS"]["Layers"]
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
         raise OracleContainerError("image_inspect_schema") from error
-    if isinstance(image_id, str) and re.fullmatch(r"[0-9a-f]{64}", image_id):
-        image_id = f"sha256:{image_id}"
-    if not isinstance(image_id, str) or not IMAGE_ID_RE.fullmatch(image_id):
+    if isinstance(loaded_store_id, str) and re.fullmatch(
+        r"[0-9a-f]{64}", loaded_store_id
+    ):
+        loaded_store_id = f"sha256:{loaded_store_id}"
+    if (
+        not isinstance(loaded_store_id, str)
+        or not IMAGE_ID_RE.fullmatch(loaded_store_id)
+    ):
         raise OracleContainerError("image_id")
-    if expected_image_id is not None and image_id != expected_image_id:
-        raise OracleContainerError("image_id_mismatch")
     if architecture not in {"amd64", "x86_64"}:
         raise OracleContainerError("image_architecture")
-    if not isinstance(labels, dict):
+    if operating_system != "linux":
+        raise OracleContainerError("image_operating_system")
+    if rootfs_type != "layers" or not isinstance(rootfs_layers, list) or not rootfs_layers:
+        raise OracleContainerError("image_rootfs")
+    diff_ids = tuple(normalize_diff_id(value) for value in rootfs_layers)
+    if not isinstance(labels, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in labels.items()
+    ):
         raise OracleContainerError("image_labels")
     expected = {**EXPECTED_IMAGE_LABELS, "org.rxls.render-oracle.lock-sha256": lock_sha256}
     for key, value in expected.items():
         if labels.get(key) != value:
             raise OracleContainerError("image_label_mismatch")
-    return image_id
+    observed_identity = ImageIdentity(
+        image_id=loaded_store_id,
+        platform="linux/amd64",
+        created=normalize_image_created(created),
+        diff_ids=diff_ids,
+        labels=tuple(sorted(labels.items())),
+    )
+    if expected_manifest_digest is not None and (
+        not isinstance(expected_manifest_digest, str)
+        or IMAGE_ID_RE.fullmatch(expected_manifest_digest) is None
+        or expected_image_id is None
+    ):
+        raise OracleContainerError("image_manifest_digest")
+    if expected_image_id is not None and loaded_store_id not in {
+        expected_image_id,
+        expected_manifest_digest,
+    }:
+        emit_image_identity_mismatch(
+            "expected_loaded_store_id_mismatch",
+            expected_image_id=expected_image_id,
+            expected_manifest_digest=expected_manifest_digest,
+            identities=(observed_identity,),
+        )
+        raise OracleContainerError("image_id_mismatch")
+    if expected_image_id is None:
+        return observed_identity
+    return ImageIdentity(
+        image_id=expected_image_id,
+        platform=observed_identity.platform,
+        created=observed_identity.created,
+        diff_ids=observed_identity.diff_ids,
+        labels=observed_identity.labels,
+    )
+
+
+def inspect_image(
+    runner: CommandRunner,
+    engine: str,
+    image: str,
+    lock_sha256: str,
+    expected_image_id: str | None = None,
+    expected_manifest_digest: str | None = None,
+) -> str:
+    return inspect_image_identity(
+        runner,
+        engine,
+        image,
+        lock_sha256,
+        expected_image_id,
+        expected_manifest_digest,
+    ).image_id
 
 
 def resolve_engine(requested: str, *, execute: bool) -> str:
@@ -913,6 +2206,7 @@ def render_plan(
     image: str,
     lock_sha256: str,
     expected_image_id: str | None = None,
+    expected_manifest_digest: str | None = None,
 ) -> dict[str, Any]:
     source, source_bytes, source_sha, extension, font_pack, corpus = (
         validate_render_config(config)
@@ -957,6 +2251,7 @@ def render_plan(
         },
         "image_verified": False,
         "expected_image_id": expected_image_id,
+        "expected_manifest_digest": expected_manifest_digest,
         "schema": PLAN_SCHEMA,
     }
 
@@ -967,6 +2262,7 @@ def execute_render(
     image: str,
     lock_sha256: str,
     expected_image_id: str | None = None,
+    expected_manifest_digest: str | None = None,
     lock_file_sha256: str | None = None,
     *,
     runner: CommandRunner | None = None,
@@ -980,7 +2276,12 @@ def execute_render(
         validate_render_config(config)
     )
     image_id = inspect_image(
-        runner, engine, image, lock_sha256, expected_image_id
+        runner,
+        engine,
+        image,
+        lock_sha256,
+        expected_image_id,
+        expected_manifest_digest,
     )
     name = f"rxls-lo-{config.run_id}"
     destination = config.evidence_dir.resolve(strict=False)
@@ -1064,6 +2365,7 @@ def execute_render(
                 output=output,
                 font_pack_sha256=font_pack.pack_sha256,
                 expected_image_id=expected_image_id,
+                expected_manifest_digest=expected_manifest_digest,
                 lock_file_sha256=lock_file_sha256,
             )
             (atomic_stage / "execution.json").write_bytes(
@@ -1245,6 +2547,7 @@ def build_execution_evidence(
     output: dict[str, Any],
     font_pack_sha256: str,
     expected_image_id: str | None,
+    expected_manifest_digest: str | None,
     lock_file_sha256: str,
 ) -> dict[str, Any]:
     return {
@@ -1255,11 +2558,13 @@ def build_execution_evidence(
         "image": {
             "architecture": "linux/amd64",
             "expected_id": expected_image_id,
+            "expected_manifest_digest": expected_manifest_digest,
             "id": image_id,
             "identity_status": (
                 "pinned_match" if expected_image_id is not None else "runtime_verified"
             ),
             "lock_sha256": lock_sha256,
+            "manifest_digest": expected_manifest_digest,
         },
         "font_pack_sha256": font_pack_sha256,
         "isolation": {
@@ -1294,26 +2599,407 @@ def build_execution_evidence(
     }
 
 
+def verify_buildx_client(runner: CommandRunner, engine: str) -> None:
+    require_docker_build_engine(engine)
+    result = runner.run(
+        [engine, "buildx", "version"],
+        timeout_seconds=30.0,
+        output_limit_bytes=1024 * 1024,
+    )
+    if result.status != "ok":
+        print(build_failure_diagnostic(result), file=sys.stderr, end="")
+        raise OracleContainerError(f"buildx_client_{result.status}")
+    output = (result.stdout + b"\n" + result.stderr).decode(
+        "utf-8", errors="replace"
+    )
+    if (
+        re.search(rf"(?<![0-9A-Za-z]){re.escape(BUILDX_VERSION)}(?![0-9A-Za-z])", output)
+        is None
+        or BUILDX_COMMIT not in output
+    ):
+        raise OracleContainerError("buildx_client_identity")
+
+
+def verify_buildx_builder_description(result: CommandResult) -> None:
+    if result.status != "ok":
+        print(build_failure_diagnostic(result), file=sys.stderr, end="")
+        raise OracleContainerError(f"buildx_builder_inspect_{result.status}")
+    output = (result.stdout + b"\n" + result.stderr).decode(
+        "utf-8", errors="replace"
+    )
+    if (
+        re.search(
+            rf"BuildKit\s+version:\s*{re.escape(BUILDKIT_VERSION)}(?:\s|$)",
+            output,
+            re.IGNORECASE,
+        )
+        is None
+    ):
+        raise OracleContainerError("buildkit_version")
+    if (
+        re.search(
+            (
+                r"org\.mobyproject\.buildkit\.worker\.snapshotter:\s*"
+                + re.escape(BUILDKIT_SNAPSHOTTER)
+                + r"(?:\s|$)"
+            ),
+            output,
+            re.IGNORECASE,
+        )
+        is None
+    ):
+        raise OracleContainerError("buildkit_snapshotter")
+
+
+def read_build_metadata(path: Path) -> BuildMetadataIdentity:
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.is_symlink()
+        ):
+            raise OracleContainerError("build_metadata_symlink")
+        if not 0 < metadata.st_size <= MAX_LOCK_BYTES:
+            raise OracleContainerError("build_metadata_limit")
+        payload = path.read_bytes()
+        if len(payload) != metadata.st_size:
+            raise OracleContainerError("build_metadata_changed")
+        document = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise OracleContainerError("build_metadata_unreadable") from error
+    if not isinstance(document, dict):
+        raise OracleContainerError("build_metadata_unreadable")
+    config_digest = document.get("containerimage.config.digest")
+    if not isinstance(config_digest, str) or IMAGE_ID_RE.fullmatch(config_digest) is None:
+        raise OracleContainerError("build_metadata_config_digest")
+    manifest_digest = document.get("containerimage.digest")
+    if (
+        not isinstance(manifest_digest, str)
+        or IMAGE_ID_RE.fullmatch(manifest_digest) is None
+    ):
+        raise OracleContainerError("build_metadata_manifest_digest")
+
+    descriptor = document.get("containerimage.descriptor")
+    descriptor_keys = set(descriptor) if isinstance(descriptor, dict) else set()
+    if not isinstance(descriptor, dict) or descriptor_keys not in ({
+        "annotations",
+        "digest",
+        "mediaType",
+        "size",
+    }, {
+        "annotations",
+        "digest",
+        "mediaType",
+        "platform",
+        "size",
+    }):
+        raise OracleContainerError("build_metadata_descriptor")
+    descriptor_digest = descriptor.get("digest")
+    if (
+        not isinstance(descriptor_digest, str)
+        or IMAGE_ID_RE.fullmatch(descriptor_digest) is None
+    ):
+        raise OracleContainerError("build_metadata_descriptor_digest")
+    if descriptor_digest != manifest_digest:
+        raise OracleContainerError(
+            "build_metadata_descriptor_digest_mismatch"
+        )
+    descriptor_media_type = descriptor.get("mediaType")
+    if (
+        not isinstance(descriptor_media_type, str)
+        or descriptor_media_type not in IMAGE_MANIFEST_MEDIA_TYPES
+    ):
+        raise OracleContainerError(
+            "build_metadata_descriptor_media_type"
+        )
+    descriptor_size = descriptor.get("size")
+    if (
+        isinstance(descriptor_size, bool)
+        or not isinstance(descriptor_size, int)
+        or descriptor_size <= 0
+    ):
+        raise OracleContainerError("build_metadata_descriptor_size")
+    descriptor_annotations = normalize_descriptor_annotations(
+        descriptor.get("annotations")
+    )
+    descriptor_platform = normalize_descriptor_platform(
+        descriptor.get("platform")
+    )
+    return BuildMetadataIdentity(
+        config_digest=config_digest,
+        manifest_digest=manifest_digest,
+        descriptor_digest=descriptor_digest,
+        descriptor_media_type=descriptor_media_type,
+        descriptor_size=descriptor_size,
+        descriptor_annotations=descriptor_annotations,
+        descriptor_platform=descriptor_platform,
+    )
+
+
+def execute_isolated_build(
+    runner: CommandRunner,
+    engine: str,
+    image: str,
+    lock_sha256: str,
+    builder_name: str,
+    metadata_file: Path,
+    archive_file: Path,
+) -> ImageIdentity:
+    create_result: CommandResult | None = None
+    completed = False
+    try:
+        create_result = runner.run(
+            buildx_create_command(engine, builder_name),
+            timeout_seconds=300.0,
+            output_limit_bytes=4 * 1024 * 1024,
+        )
+        if create_result.status != "ok":
+            print(build_failure_diagnostic(create_result), file=sys.stderr, end="")
+            raise OracleContainerError(
+                f"buildx_builder_create_{create_result.status}"
+            )
+        description = runner.run(
+            buildx_inspect_command(engine, builder_name),
+            timeout_seconds=120.0,
+            output_limit_bytes=4 * 1024 * 1024,
+        )
+        verify_buildx_builder_description(description)
+        result = runner.run(
+            build_build_command(
+                engine,
+                image,
+                lock_sha256,
+                builder_name=builder_name,
+                metadata_file=metadata_file,
+            ),
+            timeout_seconds=1800.0,
+            output_limit_bytes=(
+                MAX_BUILD_ARCHIVE_BYTES + MAX_BUILD_STDERR_BYTES
+            ),
+            stdout_path=archive_file,
+            stdout_limit_bytes=MAX_BUILD_ARCHIVE_BYTES,
+            stderr_limit_bytes=MAX_BUILD_STDERR_BYTES,
+        )
+        if result.status != "ok":
+            print(build_failure_diagnostic(result), file=sys.stderr, end="")
+            raise OracleContainerError(f"image_build_{result.status}")
+        validate_build_archive(archive_file)
+        metadata_identity = read_build_metadata(metadata_file)
+        verify_docker_archive_config(
+            archive_file, metadata_identity.config_digest
+        )
+        loaded = runner.run(
+            image_load_command(engine, archive_file),
+            timeout_seconds=300.0,
+            output_limit_bytes=4 * 1024 * 1024,
+        )
+        if loaded.status != "ok":
+            print(build_failure_diagnostic(loaded), file=sys.stderr, end="")
+            raise OracleContainerError(f"image_load_{loaded.status}")
+        inspected_identity = inspect_image_identity(
+            runner,
+            engine,
+            image,
+            lock_sha256,
+            metadata_identity.config_digest,
+            metadata_identity.manifest_digest,
+        )
+        identity = ImageIdentity(
+            image_id=inspected_identity.image_id,
+            platform=inspected_identity.platform,
+            created=inspected_identity.created,
+            diff_ids=inspected_identity.diff_ids,
+            labels=inspected_identity.labels,
+            manifest_digest=metadata_identity.manifest_digest,
+            descriptor_digest=metadata_identity.descriptor_digest,
+            descriptor_media_type=metadata_identity.descriptor_media_type,
+            descriptor_size=metadata_identity.descriptor_size,
+            descriptor_annotations=metadata_identity.descriptor_annotations,
+            descriptor_platform=metadata_identity.descriptor_platform,
+        )
+        completed = True
+        return identity
+    finally:
+        archive_cleanup_failed = False
+        try:
+            archive_file.unlink(missing_ok=True)
+        except OSError:
+            archive_cleanup_failed = True
+        cleanup = runner.run(
+            buildx_remove_command(engine, builder_name),
+            timeout_seconds=120.0,
+            output_limit_bytes=4 * 1024 * 1024,
+        )
+        if completed and cleanup.status != "ok":
+            print(build_failure_diagnostic(cleanup), file=sys.stderr, end="")
+            raise OracleContainerError(
+                f"buildx_builder_cleanup_{cleanup.status}"
+            )
+        if completed and archive_cleanup_failed:
+            raise OracleContainerError("build_archive_cleanup")
+
+
 def execute_build(
     engine: str,
     image: str,
     lock_sha256: str,
     expected_image_id: str | None = None,
+    expected_manifest_digest: str | None = None,
     *,
     runner: CommandRunner | None = None,
-) -> str:
+) -> ReproducibleBuild:
     runner = runner or BoundedProcessRunner()
-    result = runner.run(
-        build_build_command(engine, image, lock_sha256),
-        timeout_seconds=1800.0,
-        output_limit_bytes=16 * 1024 * 1024,
-    )
-    if result.status != "ok":
-        print(build_failure_diagnostic(result), file=sys.stderr, end="")
-        raise OracleContainerError(f"image_build_{result.status}")
-    return inspect_image(
-        runner, engine, image, lock_sha256, expected_image_id
-    )
+    require_docker_build_engine(engine)
+    verify_buildx_client(runner, engine)
+    identities: list[ImageIdentity] = []
+    with tempfile.TemporaryDirectory(prefix="rxls-oracle-build-") as raw:
+        root = Path(raw)
+        nonce = secrets.token_hex(8)
+        for index in range(REPRODUCIBILITY_BUILD_COUNT):
+            identities.append(
+                execute_isolated_build(
+                    runner,
+                    engine,
+                    image,
+                    lock_sha256,
+                    f"rxls-oracle-{nonce}-{index + 1}",
+                    root / f"metadata-{index + 1}.json",
+                    root / f"image-{index + 1}.tar",
+                )
+            )
+    if (
+        len(identities) != REPRODUCIBILITY_BUILD_COUNT
+        or any(identity != identities[0] for identity in identities[1:])
+    ):
+        emit_image_identity_mismatch(
+            "isolated_build_identity_mismatch",
+            identities=identities,
+        )
+        raise OracleContainerError("image_reproducibility_mismatch")
+    if expected_image_id is not None and identities[0].image_id != expected_image_id:
+        emit_image_identity_mismatch(
+            "expected_config_id_mismatch",
+            expected_image_id=expected_image_id,
+            identities=identities,
+        )
+        raise OracleContainerError("image_id_mismatch")
+    if (
+        expected_manifest_digest is not None
+        and identities[0].manifest_digest != expected_manifest_digest
+    ):
+        emit_image_identity_mismatch(
+            "expected_manifest_digest_mismatch",
+            expected_image_id=expected_image_id,
+            expected_manifest_digest=expected_manifest_digest,
+            identities=identities,
+        )
+        raise OracleContainerError("image_manifest_digest_mismatch")
+    return ReproducibleBuild(tuple(identities))
+
+
+def image_identity_from_evidence_row(
+    row: object, lock_sha256: str
+) -> ImageIdentity:
+    """Reconstruct and authenticate one normalized hosted-build identity."""
+    try:
+        if not isinstance(row, dict) or set(row) != {
+            "config_id",
+            "created",
+            "descriptor",
+            "identity_sha256",
+            "labels",
+            "manifest_digest",
+            "platform",
+            "rootfs_diff_ids",
+            "rootfs_diff_ids_sha256",
+        }:
+            raise OracleContainerError("identity_row_schema")
+        config_id = row.get("config_id")
+        manifest_digest = row.get("manifest_digest")
+        if (
+            not isinstance(config_id, str)
+            or IMAGE_ID_RE.fullmatch(config_id) is None
+            or not isinstance(manifest_digest, str)
+            or IMAGE_ID_RE.fullmatch(manifest_digest) is None
+            or row.get("platform") != "linux/amd64"
+        ):
+            raise OracleContainerError("identity_row_core")
+        created = normalize_image_created(row.get("created"))
+        rootfs_diff_ids = row.get("rootfs_diff_ids")
+        if not isinstance(rootfs_diff_ids, list) or not rootfs_diff_ids:
+            raise OracleContainerError("identity_row_rootfs")
+        diff_ids = tuple(
+            normalize_diff_id(value) for value in rootfs_diff_ids
+        )
+        labels = row.get("labels")
+        if not isinstance(labels, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in labels.items()
+        ):
+            raise OracleContainerError("identity_row_labels")
+        expected_labels = {
+            **EXPECTED_IMAGE_LABELS,
+            "org.rxls.render-oracle.lock-sha256": lock_sha256,
+        }
+        if any(labels.get(key) != value for key, value in expected_labels.items()):
+            raise OracleContainerError("identity_row_labels")
+
+        descriptor = row.get("descriptor")
+        descriptor_keys = (
+            set(descriptor) if isinstance(descriptor, dict) else set()
+        )
+        if not isinstance(descriptor, dict) or descriptor_keys not in ({
+            "annotations",
+            "digest",
+            "mediaType",
+            "size",
+        }, {
+            "annotations",
+            "digest",
+            "mediaType",
+            "platform",
+            "size",
+        }):
+            raise OracleContainerError("identity_row_descriptor")
+        descriptor_digest = descriptor.get("digest")
+        descriptor_media_type = descriptor.get("mediaType")
+        descriptor_size = descriptor.get("size")
+        if (
+            not isinstance(descriptor_digest, str)
+            or IMAGE_ID_RE.fullmatch(descriptor_digest) is None
+            or descriptor_digest != manifest_digest
+            or descriptor_media_type != DOCKER_V2_MANIFEST_MEDIA_TYPE
+            or isinstance(descriptor_size, bool)
+            or not isinstance(descriptor_size, int)
+            or descriptor_size <= 0
+        ):
+            raise OracleContainerError("identity_row_descriptor")
+        descriptor_annotations = normalize_descriptor_annotations(
+            descriptor.get("annotations")
+        )
+        descriptor_platform = normalize_descriptor_platform(
+            descriptor.get("platform")
+        )
+        identity = ImageIdentity(
+            image_id=config_id,
+            platform="linux/amd64",
+            created=created,
+            diff_ids=diff_ids,
+            labels=tuple(sorted(labels.items())),
+            manifest_digest=manifest_digest,
+            descriptor_digest=descriptor_digest,
+            descriptor_media_type=descriptor_media_type,
+            descriptor_size=descriptor_size,
+            descriptor_annotations=descriptor_annotations,
+            descriptor_platform=descriptor_platform,
+        )
+        if identity.evidence_row() != row:
+            raise OracleContainerError("identity_row_authentication")
+        return identity
+    except (OracleContainerError, TypeError, ValueError) as error:
+        raise OracleContainerError(
+            "bootstrap_build_reproducibility"
+        ) from error
 
 
 def add_mode_flags(parser: argparse.ArgumentParser) -> None:
@@ -1322,48 +3008,173 @@ def add_mode_flags(parser: argparse.ArgumentParser) -> None:
     mode.add_argument("--execute", action="store_true")
 
 
+def github_id_argument(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected a positive GitHub numeric ID"
+        ) from error
+    if not _is_github_id(parsed):
+        raise argparse.ArgumentTypeError(
+            "expected a positive GitHub numeric ID"
+        )
+    return parsed
+
+
+def reject_bootstrap_after_pin(
+    expected_image_id: str | None,
+    expected_manifest_digest: str | None,
+    bootstrap_identities: bool,
+) -> None:
+    if bootstrap_identities and (
+        expected_image_id is not None
+        or expected_manifest_digest is not None
+    ):
+        raise OracleContainerError("bootstrap_identities_after_pin")
+
+
 def pin_image_from_evidence(
     lock: dict[str, Any],
     lock_payload: bytes,
     lock_sha256: str,
     evidence_path: Path,
+    source_identity: SourceIdentity,
+    bootstrap_receipt: object,
 ) -> dict[str, Any]:
-    """Validate one hosted bootstrap build and return a pinned lock document."""
-    if lock["built_image"]["expected_id"] is not None:
+    """Validate hosted two-build bootstrap evidence and return a pinned lock."""
+    if (
+        not isinstance(source_identity, SourceIdentity)
+        or GIT_COMMIT_RE.fullmatch(source_identity.commit) is None
+        or SHA256_RE.fullmatch(source_identity.wrapper_sha256) is None
+    ):
+        raise OracleContainerError("bootstrap_source_identity")
+    if (
+        lock["built_image"]["expected_id"] is not None
+        or lock["built_image"]["expected_manifest_digest"] is not None
+        or lock["built_image"]["bootstrap_receipt"] is not None
+    ):
         raise OracleContainerError("image_lock_already_pinned")
     try:
-        payload = evidence_path.read_bytes()
-        if len(payload) > MAX_LOCK_BYTES:
-            raise OracleContainerError("bootstrap_build_limit")
+        payload = read_bootstrap_evidence_payload(evidence_path)
         evidence = json.loads(payload)
-    except (OSError, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         raise OracleContainerError("bootstrap_build_unreadable") from error
+    validate_bootstrap_receipt(
+        bootstrap_receipt,
+        source_commit=source_identity.commit,
+        evidence_payload=payload,
+    )
     if not isinstance(evidence, dict) or set(evidence) != {
         "build_contract_sha256",
         "built_image_id",
+        "built_manifest_digest",
         "expected_image_id",
+        "expected_manifest_digest",
         "image_identity_status",
         "lock_file_sha256",
         "platform",
+        "reproducibility",
+        "schema",
+        "source_commit",
         "status",
+        "wrapper_sha256",
     }:
         raise OracleContainerError("bootstrap_build_schema")
     image_id = evidence.get("built_image_id")
+    manifest_digest = evidence.get("built_manifest_digest")
+    reproducibility = evidence.get("reproducibility")
     if (
-        evidence.get("build_contract_sha256") != lock_sha256
+        evidence.get("schema") != BUILD_EVIDENCE_SCHEMA
+        or evidence.get("build_contract_sha256") != lock_sha256
         or evidence.get("expected_image_id") is not None
+        or evidence.get("expected_manifest_digest") is not None
         or evidence.get("image_identity_status") != "bootstrap_capture_required"
         or evidence.get("lock_file_sha256") != sha256_bytes(lock_payload)
         or evidence.get("platform") != "linux/amd64"
+        or evidence.get("source_commit") != source_identity.commit
         or evidence.get("status") != "ok"
+        or evidence.get("wrapper_sha256")
+        != source_identity.wrapper_sha256
+        or evidence.get("wrapper_sha256")
+        != lock["wrapper"]["sha256"]
         or not isinstance(image_id, str)
         or IMAGE_ID_RE.fullmatch(image_id) is None
+        or not isinstance(manifest_digest, str)
+        or IMAGE_ID_RE.fullmatch(manifest_digest) is None
+    ):
+        raise OracleContainerError("bootstrap_build_identity")
+    if not isinstance(reproducibility, dict):
+        raise OracleContainerError("bootstrap_build_reproducibility")
+    identity_rows = reproducibility.get("identities")
+    if (
+        not isinstance(identity_rows, list)
+        or len(identity_rows) != REPRODUCIBILITY_BUILD_COUNT
+    ):
+        raise OracleContainerError("bootstrap_build_reproducibility")
+    identities = tuple(
+        image_identity_from_evidence_row(row, lock_sha256)
+        for row in identity_rows
+    )
+    try:
+        reproducible_build = ReproducibleBuild(identities)
+    except OracleContainerError as error:
+        raise OracleContainerError(
+            "bootstrap_build_reproducibility"
+        ) from error
+    if reproducibility != reproducible_build.evidence():
+        raise OracleContainerError("bootstrap_build_reproducibility")
+    if (
+        reproducible_build.image_id != image_id
+        or reproducible_build.manifest_digest != manifest_digest
     ):
         raise OracleContainerError("bootstrap_build_identity")
     pinned = json.loads(json.dumps(lock))
     pinned["built_image"]["expected_id"] = image_id
+    pinned["built_image"]["expected_manifest_digest"] = manifest_digest
+    pinned["built_image"]["bootstrap_receipt"] = json.loads(
+        json.dumps(bootstrap_receipt)
+    )
     validate_lock(pinned)
     return pinned
+
+
+def write_pinned_lock(
+    document: dict[str, Any],
+    output: Path,
+    *,
+    expected_output: Path = PINNED_LOCK_OUTPUT,
+) -> tuple[int, str]:
+    candidate = output if output.is_absolute() else ROOT / output
+    if candidate.resolve(strict=False) != expected_output.resolve(
+        strict=False
+    ):
+        raise OracleContainerError("pinned_lock_output")
+    payload = canonical_json_bytes(document)
+    descriptor: int | None = None
+    created = False
+    try:
+        descriptor = os.open(
+            candidate,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        created = True
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise OracleContainerError("pinned_lock_write") from error
+    return len(payload), sha256_bytes(payload)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1379,9 +3190,22 @@ def build_parser() -> argparse.ArgumentParser:
         "pin-image", help="validate hosted bootstrap evidence and emit a pinned lock"
     )
     pin.add_argument("--build-evidence", required=True, type=Path)
+    pin.add_argument(
+        "--github-run-id", required=True, type=github_id_argument
+    )
+    pin.add_argument(
+        "--github-run-attempt", required=True, type=github_id_argument
+    )
+    pin.add_argument(
+        "--github-job-id", required=True, type=github_id_argument
+    )
+    pin.add_argument(
+        "--github-artifact-id", required=True, type=github_id_argument
+    )
+    pin.add_argument("--output-lock", required=True, type=Path)
 
     build = subparsers.add_parser("build", help="build the locked linux/amd64 image")
-    build.add_argument("--engine", choices=("auto", "docker", "podman"), default="auto")
+    build.add_argument("--engine", choices=("auto", "docker"), default="auto")
     build.add_argument("--image", default="rxls-render-oracle:lo-26.2.3")
     build.add_argument("--bootstrap-identities", action="store_true")
     add_mode_flags(build)
@@ -1420,6 +3244,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         lock, payload, lock_sha256 = load_lock(args.lock)
         lock_file_sha256 = sha256_bytes(payload)
         expected_image_id = lock["built_image"]["expected_id"]
+        expected_manifest_digest = lock["built_image"][
+            "expected_manifest_digest"
+        ]
+        if args.action in {"verify-lock", "build"}:
+            reject_bootstrap_after_pin(
+                expected_image_id,
+                expected_manifest_digest,
+                args.bootstrap_identities,
+            )
+        if args.action in {"build", "pin-image"}:
+            require_canonical_build_lock(args.lock)
         if args.action == "verify-lock":
             if expected_image_id is None and not args.bootstrap_identities:
                 raise OracleContainerError("image_pin_required")
@@ -1428,9 +3263,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {
                         "build_contract_sha256": lock_sha256,
                         "expected_image_id": expected_image_id,
+                        "expected_manifest_digest": expected_manifest_digest,
                         "lock_file_sha256": lock_file_sha256,
                         "schema": LOCK_SCHEMA,
                         "status": "ok",
+                        "wrapper_sha256": lock["wrapper"]["sha256"],
                     }
                 ).decode("utf-8"),
                 end="",
@@ -1438,49 +3275,141 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.action == "pin-image":
-            pinned = pin_image_from_evidence(
-                lock, payload, lock_sha256, args.build_evidence
+            source_identity = require_clean_source(lock)
+            bootstrap_receipt = fetch_hosted_bootstrap_receipt(
+                args.build_evidence,
+                source_identity,
+                run_id=args.github_run_id,
+                run_attempt=args.github_run_attempt,
+                job_id=args.github_job_id,
+                artifact_id=args.github_artifact_id,
             )
-            print(canonical_json_bytes(pinned).decode("utf-8"), end="")
+            pinned = pin_image_from_evidence(
+                lock,
+                payload,
+                lock_sha256,
+                args.build_evidence,
+                source_identity,
+                bootstrap_receipt,
+            )
+            output_bytes, output_sha256 = write_pinned_lock(
+                pinned, args.output_lock
+            )
+            print(
+                canonical_json_bytes(
+                    {
+                        "bytes": output_bytes,
+                        "output": (
+                            "scripts/render-oracle-container/"
+                            "lock.pinned.json"
+                        ),
+                        "schema": LOCK_SCHEMA,
+                        "sha256": output_sha256,
+                        "status": "ok",
+                    }
+                ).decode("utf-8"),
+                end="",
+            )
             return 0
 
         engine = resolve_engine(args.engine, execute=args.execute)
         image = validate_image_reference(args.image)
         if args.action == "build":
+            require_docker_build_engine(engine)
             if args.dry_run:
+                isolated_builds = []
+                for index in range(REPRODUCIBILITY_BUILD_COUNT):
+                    builder_name = f"rxls-oracle-dry-run-{index + 1}"
+                    archive_placeholder = Path(
+                        f"<build-archive-{index + 1}>"
+                    )
+                    isolated_builds.append(
+                        {
+                            "archive_stdout": {
+                                "max_bytes": MAX_BUILD_ARCHIVE_BYTES,
+                                "path": str(archive_placeholder),
+                            },
+                            "build": path_neutral_command(
+                                build_build_command(
+                                    engine,
+                                    image,
+                                    lock_sha256,
+                                    builder_name=builder_name,
+                                    metadata_file=Path(
+                                        f"<build-metadata-{index + 1}>"
+                                    ),
+                                ),
+                                [
+                                    (
+                                        CONTAINERFILE,
+                                        "<container-context>/Containerfile",
+                                    ),
+                                    (CONTAINER_DIR, "<container-context>"),
+                                ],
+                            ),
+                            "cleanup": buildx_remove_command(
+                                engine, builder_name
+                            ),
+                            "create": buildx_create_command(
+                                engine, builder_name
+                            ),
+                            "inspect": buildx_inspect_command(
+                                engine, builder_name
+                            ),
+                            "load": image_load_command(
+                                engine, archive_placeholder
+                            ),
+                        }
+                    )
                 document = {
                     "commands": {
-                        "build": path_neutral_command(
-                            build_build_command(engine, image, lock_sha256),
-                            [
-                                (CONTAINERFILE, "<container-context>/Containerfile"),
-                                (CONTAINER_DIR, "<container-context>"),
-                            ],
-                        )
+                        "buildx_client_version": [
+                            engine,
+                            "buildx",
+                            "version",
+                        ],
+                        "isolated_builds": isolated_builds,
                     },
                     "dry_run": True,
                     "expected_image_id": expected_image_id,
+                    "expected_manifest_digest": expected_manifest_digest,
                     "image_verified": False,
                     "schema": PLAN_SCHEMA,
                 }
             else:
                 if expected_image_id is None and not args.bootstrap_identities:
                     raise OracleContainerError("image_pin_required")
-                image_id = execute_build(
-                    engine, image, lock_sha256, expected_image_id
+                source_identity = require_clean_source(lock)
+                build_result = execute_build(
+                    engine,
+                    image,
+                    lock_sha256,
+                    expected_image_id,
+                    expected_manifest_digest,
                 )
+                image_id = build_result.image_id
+                manifest_digest = build_result.manifest_digest
                 document = {
                     "build_contract_sha256": lock_sha256,
                     "built_image_id": image_id,
+                    "built_manifest_digest": manifest_digest,
                     "expected_image_id": expected_image_id,
+                    "expected_manifest_digest": expected_manifest_digest,
                     "image_identity_status": (
                         "pinned_match"
-                        if expected_image_id is not None
+                        if (
+                            expected_image_id is not None
+                            and expected_manifest_digest is not None
+                        )
                         else "bootstrap_capture_required"
                     ),
                     "lock_file_sha256": lock_file_sha256,
                     "platform": "linux/amd64",
+                    "reproducibility": build_result.evidence(),
+                    "schema": BUILD_EVIDENCE_SCHEMA,
+                    "source_commit": source_identity.commit,
                     "status": "ok",
+                    "wrapper_sha256": source_identity.wrapper_sha256,
                 }
             print(canonical_json_bytes(document).decode("utf-8"), end="")
             return 0
@@ -1507,7 +3436,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.dry_run:
             document = render_plan(
-                config, engine, image, lock_sha256, expected_image_id
+                config,
+                engine,
+                image,
+                lock_sha256,
+                expected_image_id,
+                expected_manifest_digest,
             )
         else:
             if expected_image_id is None:
@@ -1518,6 +3452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 image,
                 lock_sha256,
                 expected_image_id,
+                expected_manifest_digest,
                 lock_file_sha256,
             )
         print(canonical_json_bytes(document).decode("utf-8"), end="")

@@ -620,10 +620,12 @@ class ContainerOracleRunner(FakeRunner):
                 "font_pack_sha256": self.font_pack_sha256,
                 "image": {
                     "architecture": "linux/amd64",
-                    "expected_id": None,
+                    "expected_id": "sha256:" + "a" * 64,
+                    "expected_manifest_digest": "sha256:" + "d" * 64,
                     "id": "sha256:" + "a" * 64,
-                    "identity_status": "runtime_verified",
+                    "identity_status": "pinned_match",
                     "lock_sha256": lock_sha256,
+                    "manifest_digest": "sha256:" + "d" * 64,
                 },
                 "isolation": {
                     "capabilities": "none",
@@ -885,8 +887,10 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             {
                 "architecture": "linux/amd64",
                 "config_digest": "sha256:" + "a" * 64,
-                "expected_config_digest": None,
-                "identity_status": "runtime_verified",
+                "expected_config_digest": "sha256:" + "a" * 64,
+                "expected_manifest_digest": "sha256:" + "d" * 64,
+                "identity_status": "pinned_match",
+                "manifest_digest": "sha256:" + "d" * 64,
             },
         )
         self.assertEqual(
@@ -1015,7 +1019,59 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
 
             execution["image"]["id"] = "sha256:" + "a" * 64
             execution["image"]["expected_id"] = None
-            execution["image"]["identity_status"] = "runtime_verified"
+            execution_path.write_bytes(MODULE._canonical_json_bytes(execution))
+            with self.assertRaisesRegex(
+                MODULE.HarnessError, "libreoffice_adapter_image_identity"
+            ):
+                MODULE.validate_libreoffice_adapter_output(
+                    output,
+                    input_sha256=hashlib.sha256(b"fixture").hexdigest(),
+                    input_bytes=7,
+                    extension=".xlsx",
+                    font_pack_sha256=pack_sha,
+                )
+
+            execution["image"]["expected_id"] = "sha256:" + "a" * 64
+            execution["image"]["expected_manifest_digest"] = "sha256:" + "c" * 64
+            execution_path.write_bytes(MODULE._canonical_json_bytes(execution))
+            with self.assertRaisesRegex(
+                MODULE.HarnessError, "libreoffice_adapter_image_identity"
+            ):
+                MODULE.validate_libreoffice_adapter_output(
+                    output,
+                    input_sha256=hashlib.sha256(b"fixture").hexdigest(),
+                    input_bytes=7,
+                    extension=".xlsx",
+                    font_pack_sha256=pack_sha,
+                )
+
+            execution["image"]["expected_manifest_digest"] = "sha256:" + "d" * 64
+            del execution["image"]["manifest_digest"]
+            execution_path.write_bytes(MODULE._canonical_json_bytes(execution))
+            with self.assertRaisesRegex(
+                MODULE.HarnessError, "libreoffice_adapter_image_keys"
+            ):
+                MODULE.validate_libreoffice_adapter_output(
+                    output,
+                    input_sha256=hashlib.sha256(b"fixture").hexdigest(),
+                    input_bytes=7,
+                    extension=".xlsx",
+                    font_pack_sha256=pack_sha,
+                )
+
+            execution["image"]["manifest_digest"] = "sha256:" + "d" * 64
+            execution["schema"] = "rxls.render-oracle-container-execution.v2"
+            execution_path.write_bytes(MODULE._canonical_json_bytes(execution))
+            with self.assertRaisesRegex(MODULE.HarnessError, "oracle_lock_schema"):
+                MODULE.validate_libreoffice_adapter_output(
+                    output,
+                    input_sha256=hashlib.sha256(b"fixture").hexdigest(),
+                    input_bytes=7,
+                    extension=".xlsx",
+                    font_pack_sha256=pack_sha,
+                )
+
+            execution["schema"] = MODULE.CONTAINER_EXECUTION_SCHEMA
             execution_path.write_bytes(MODULE._canonical_json_bytes(execution))
             (output / "unexpected.txt").write_text("unexpected", encoding="utf-8")
             with self.assertRaisesRegex(
@@ -1056,8 +1112,10 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             "image": {
                 "architecture": "linux/amd64",
                 "expected_id": "sha256:" + "a" * 64,
+                "expected_manifest_digest": "sha256:" + "d" * 64,
                 "id": "sha256:" + "a" * 64,
                 "identity_status": "pinned_match",
+                "manifest_digest": "sha256:" + "d" * 64,
             },
             "lock_sha256": "b" * 64,
             "lock_file_sha256": "c" * 64,
@@ -1076,6 +1134,9 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertEqual(
             identity["image"]["config_digest"], "sha256:" + "a" * 64
         )
+        self.assertEqual(
+            identity["image"]["manifest_digest"], "sha256:" + "d" * 64
+        )
 
         with self.assertRaisesRegex(MODULE.HarnessError, "identity_missing"):
             MODULE.aggregate_container_oracle_identity(
@@ -1090,6 +1151,38 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                     {"status": "compared", "oracle_adapter": adapter},
                     {"status": "compared", "oracle_adapter": mixed},
                 ],
+                config=config,
+            )
+
+        mixed_manifest = copy.deepcopy(adapter)
+        mixed_manifest["image"]["manifest_digest"] = "sha256:" + "e" * 64
+        mixed_manifest["image"]["expected_manifest_digest"] = (
+            "sha256:" + "e" * 64
+        )
+        with self.assertRaisesRegex(MODULE.HarnessError, "identity_mixed"):
+            MODULE.aggregate_container_oracle_identity(
+                [
+                    {"status": "compared", "oracle_adapter": adapter},
+                    {"status": "compared", "oracle_adapter": mixed_manifest},
+                ],
+                config=config,
+            )
+
+        unpinned_manifest = copy.deepcopy(adapter)
+        unpinned_manifest["image"]["expected_manifest_digest"] = None
+        with self.assertRaisesRegex(
+            MODULE.HarnessError, "aggregate_image"
+        ):
+            MODULE.aggregate_container_oracle_identity(
+                [{"status": "compared", "oracle_adapter": unpinned_manifest}],
+                config=config,
+            )
+
+        legacy = copy.deepcopy(adapter)
+        legacy["schema"] = "rxls.render-oracle-container-execution.v2"
+        with self.assertRaisesRegex(MODULE.HarnessError, "aggregate_identity"):
+            MODULE.aggregate_container_oracle_identity(
+                [{"status": "compared", "oracle_adapter": legacy}],
                 config=config,
             )
 

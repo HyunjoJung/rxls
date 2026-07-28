@@ -53,6 +53,194 @@ class WorkflowPolicyTests(unittest.TestCase):
 
         self.assertTrue(any("needs a version comment" in error for error in errors))
 
+    def test_pull_request_checkouts_require_exact_head_and_immediate_verifier(
+        self,
+    ) -> None:
+        expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+        valid = f"""
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@{"a" * 40} # v7.0.0
+        with:
+          ref: {expression}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: {expression}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - run: true
+"""
+        path = Path(".github/workflows/example.yml")
+        self.assertEqual(self.policy.audit_pr_head_checkouts(path, valid), [])
+
+        trigger_forms = (
+            "on:\n  pull_request: {}",
+            'on:\n  "pull_request": {}',
+            "on: pull_request",
+            "on: [push, pull_request]",
+            "on: {push: {}, pull_request: {}}",
+            '"on": {"pull_request": {}}',
+        )
+        for trigger in trigger_forms:
+            with self.subTest(trigger=trigger):
+                workflow = valid.replace("on:\n  pull_request:", trigger, 1)
+                self.assertEqual(
+                    self.policy.audit_pr_head_checkouts(path, workflow),
+                    [],
+                )
+
+        mutations = (
+            valid.replace(
+                f"        with:\n          ref: {expression}\n",
+                "",
+            ),
+            valid.replace(expression, "${{ github.sha }}", 1),
+            valid.replace(
+                "      - name: Verify exact source revision\n",
+                "      # - name: Verify exact source revision\n",
+            ),
+            valid.replace(
+                'run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+                'run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+            ),
+            valid.replace(
+                "      - name: Verify exact source revision\n",
+                "      - run: true\n"
+                "      - name: Verify exact source revision\n",
+            ),
+            valid.replace(
+                "        shell: bash\n",
+                "        continue-on-error: true\n"
+                "        shell: bash\n",
+                1,
+            ),
+            valid.replace(
+                "        shell: bash\n",
+                "        if: ${{ false }}\n"
+                "        shell: bash\n",
+                1,
+            ),
+            valid.replace(
+                "        with:\n",
+                "        if: ${{ false }}\n"
+                "        with:\n",
+                1,
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertTrue(
+                    self.policy.audit_pr_head_checkouts(path, mutation)
+                )
+
+    def test_flow_map_pull_request_cannot_bypass_exact_head_guards(self) -> None:
+        expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+        valid = f"""
+on:
+  pull_request: {{}}
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@{"a" * 40} # v7.0.0
+        with:
+          ref: {expression}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: {expression}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+"""
+        without_ref = valid.replace(
+            f"        with:\n          ref: {expression}\n",
+            "",
+        )
+        verifier = f"""      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: {expression}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+"""
+        without_ref_or_verifier = without_ref.replace(verifier, "")
+        path = Path(".github/workflows/example.yml")
+
+        self.assertTrue(self.policy.audit_pr_head_checkouts(path, without_ref))
+        self.assertTrue(
+            self.policy.audit_pr_head_checkouts(path, without_ref_or_verifier)
+        )
+
+    def test_each_pull_request_job_requires_its_own_guarded_checkout(self) -> None:
+        expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+        guarded_steps = f"""    steps:
+      - uses: actions/checkout@{"a" * 40} # v7.0.0
+        with:
+          ref: {expression}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: {expression}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+"""
+        valid = (
+            "on: pull_request\n"
+            "jobs:\n"
+            "  linux:\n"
+            + guarded_steps
+            + "  macos:\n"
+            + guarded_steps
+        )
+        path = Path(".github/workflows/example.yml")
+        self.assertEqual(self.policy.audit_pr_head_checkouts(path, valid), [])
+
+        mutations = (
+            valid.replace("  macos:\n" + guarded_steps, "  macos:\n    steps:\n      - run: true\n"),
+            valid.replace(
+                "  macos:\n" + guarded_steps,
+                "  macos:\n    uses: owner/repository/.github/workflows/test.yml@main\n",
+            ),
+            valid.replace(
+                "  macos:\n" + guarded_steps,
+                "  macos: {runs-on: ubuntu-latest, steps: []}\n",
+            ),
+            valid.replace(
+                "jobs:\n",
+                "jobs: {linux: {runs-on: ubuntu-latest, steps: []}}\nignored:\n",
+                1,
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertTrue(self.policy.audit_pr_head_checkouts(path, mutation))
+
+    def test_pull_request_target_is_explicitly_rejected(self) -> None:
+        for trigger in (
+            "on: pull_request_target",
+            "on: [push, pull_request_target]",
+            'on: {"pull_request_target": {}}',
+        ):
+            with self.subTest(trigger=trigger):
+                errors = self.policy.audit_pr_head_checkouts(
+                    Path(".github/workflows/example.yml"),
+                    trigger + "\njobs: {}\n",
+                )
+                self.assertTrue(
+                    any("pull_request_target is forbidden" in error for error in errors)
+                )
+
+    def test_non_pull_request_checkout_does_not_require_head_expression(self) -> None:
+        text = (
+            "on:\n  workflow_dispatch:\n  # pull_request: {}\njobs:\n  test:\n    steps:\n"
+            f"      - uses: actions/checkout@{'a' * 40} # v7.0.0\n"
+        )
+        self.assertEqual(
+            self.policy.audit_pr_head_checkouts(
+                Path(".github/workflows/manual.yml"), text
+            ),
+            [],
+        )
+
     def test_unversioned_release_cargo_fuzz_is_rejected(self) -> None:
         text = """
 env:
@@ -146,9 +334,70 @@ steps:
                 'assert document["image_identity_status"] == "pinned_match"',
                 'assert document["image_identity_status"] in {"pinned_match", "runtime_verified"}',
             ),
+            "buildx_version": original.replace(
+                "          version: v0.35.0",
+                "          version: latest",
+                1,
+            ),
+            "buildkit_image": original.replace(
+                "moby/buildkit:v0.31.2@sha256:",
+                "moby/buildkit:latest@sha256:",
+                1,
+            ),
+            "reproducibility": original.replace(
+                '          assert reproducibility["config_ids"] == [image_id, image_id], reproducibility',
+                '          # assert reproducibility["config_ids"] == [image_id, image_id], reproducibility',
+                1,
+            ),
+            "manifest_reproducibility": original.replace(
+                '          assert reproducibility["manifest_digests"] == [manifest_digest, manifest_digest], reproducibility',
+                '          # assert reproducibility["manifest_digests"] == [manifest_digest, manifest_digest], reproducibility',
+                1,
+            ),
+            "bootstrap_reuse": original.replace(
+                '              assert document["image_identity_status"] == "bootstrap_capture_required"',
+                '              assert document["image_identity_status"] in {"bootstrap_capture_required", "pinned_match"}',
+                1,
+            ),
+            "runtime_identity_schema": original.replace(
+                "rxls.render-oracle-container-execution.v3",
+                "rxls.render-oracle-container-execution.v2",
+                1,
+            ),
+            "runtime_manifest_digest": original.replace(
+                '              assert {row["image"]["manifest_digest"] for row in adapters} == {',
+                '              # assert {row["image"]["manifest_digest"] for row in adapters} == {',
+                1,
+            ),
+            "configuration_identity_schema": original.replace(
+                'oracle_lock["schema"] == "rxls.render-oracle-container-identity.v2"',
+                'oracle_lock["schema"] == "rxls.render-oracle-container-identity.v1"',
+                1,
+            ),
+            "fidelity_manifest_digest": original.replace(
+                '                  gate["evidence"]["oracle_image_manifest_digest"]',
+                '                  gate["evidence"]["oracle_image_config_digest"]',
+                1,
+            ),
+            "summary_source_commit": original.replace(
+                '                  "source_commit": build["source_commit"],',
+                '                  "source_commit": "unbound",',
+                1,
+            ),
+            "summary_wrapper_identity": original.replace(
+                '                  "wrapper_sha256": build["wrapper_sha256"],',
+                '                  "wrapper_sha256": renderer["sha256"],',
+                1,
+            ),
+            "summary_schema_v4": original.replace(
+                "rxls.render-oracle-hosted-campaign.v5",
+                "rxls.render-oracle-hosted-campaign.v4",
+                1,
+            ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
                 errors = self.policy.audit_render_oracle_workflow(
                     Path("render-oracle.yml"), workflow
                 )
@@ -162,6 +411,213 @@ steps:
             ),
             [],
         )
+
+    def test_oracle_build_jobs_reject_unreviewed_step_surface(self) -> None:
+        oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        action_sha = "a" * 40
+        injected_steps = {
+            "sha_pinned_build_push": (
+                "      - uses: docker/build-push-action@"
+                f"{action_sha} # v6.18.0\n"
+            ),
+            "local_composite": (
+                "      - uses: ./.github/actions/unreviewed-oracle-build\n"
+            ),
+            "injected_remote": (
+                f"      - uses: actions/cache@{action_sha} # v4.3.0\n"
+            ),
+            "extra_make_step": (
+                "      - name: Alternate oracle build\n"
+                "        run: make oracle-image\n"
+            ),
+            "download_chmod_execute_step": (
+                "      - name: Download alternate build tool\n"
+                "        run: |\n"
+                "          curl --fail --location --output /tmp/tool "
+                "https://example.invalid/tool\n"
+                "          chmod +x /tmp/tool\n"
+                "          /tmp/tool\n"
+            ),
+        }
+        setup_header = "      - name: Set up the pinned Buildx client\n"
+        for workflow_name, original, audit in (
+            (
+                "render-oracle.yml",
+                oracle,
+                self.policy.audit_render_oracle_workflow,
+            ),
+            (
+                "render-hardening.yml",
+                hardening,
+                self.policy.audit_render_hardening_workflow,
+            ),
+        ):
+            self.assertEqual(audit(Path(workflow_name), original), [])
+            for case, injected in injected_steps.items():
+                with self.subTest(workflow=workflow_name, case=case):
+                    mutated = original.replace(
+                        setup_header,
+                        injected + setup_header,
+                        1,
+                    )
+                    self.assertNotEqual(mutated, original)
+                    self.assertTrue(audit(Path(workflow_name), mutated))
+            build_invocation = (
+                "          python3 scripts/run-render-oracle-container.py build \\\n"
+            )
+            mutated_build_block = original.replace(
+                build_invocation,
+                "          echo unreviewed-build-block-mutation\n"
+                + build_invocation,
+                1,
+            )
+            self.assertNotEqual(mutated_build_block, original)
+            self.assertTrue(
+                audit(Path(workflow_name), mutated_build_block),
+                workflow_name,
+            )
+
+        reusable_oracle = oracle.replace(
+            "    steps:\n",
+            "    uses: owner/repository/.github/workflows/build.yml@"
+            f"{action_sha} # v1.0.0\n"
+            "    steps:\n",
+            1,
+        )
+        self.assertTrue(
+            self.policy.audit_render_oracle_workflow(
+                Path("render-oracle.yml"), reusable_oracle
+            )
+        )
+        image_start = hardening.index("  oracle-image:\n")
+        image_end = hardening.index("  performance:\n", image_start)
+        image_job = hardening[image_start:image_end]
+        reusable_image_job = image_job.replace(
+            "    steps:\n",
+            "    uses: owner/repository/.github/workflows/build.yml@"
+            f"{action_sha} # v1.0.0\n"
+            "    steps:\n",
+            1,
+        )
+        self.assertNotEqual(image_job, reusable_image_job)
+        reusable_hardening = (
+            hardening[:image_start]
+            + reusable_image_job
+            + hardening[image_end:]
+        )
+        self.assertTrue(
+            self.policy.audit_render_hardening_workflow(
+                Path("render-hardening.yml"), reusable_hardening
+            )
+        )
+
+    def test_oracle_workflows_reject_unreviewed_execution_context(self) -> None:
+        oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+
+        def add_workflow_env(workflow: str, assignment: str) -> str:
+            if "\nenv:\n" in workflow:
+                return workflow.replace(
+                    "\nenv:\n",
+                    f"\nenv:\n  {assignment}\n",
+                    1,
+                )
+            return workflow.replace(
+                "\njobs:\n",
+                f"\nenv:\n  {assignment}\n\njobs:\n",
+                1,
+            )
+
+        for workflow_name, original, job_name, next_job, audit in (
+            (
+                "render-oracle.yml",
+                oracle,
+                "locked-linux-oracle",
+                None,
+                self.policy.audit_render_oracle_workflow,
+            ),
+            (
+                "render-hardening.yml",
+                hardening,
+                "oracle-image",
+                "performance",
+                self.policy.audit_render_hardening_workflow,
+            ),
+        ):
+            job_start = original.index(f"  {job_name}:\n")
+            job_end = (
+                len(original)
+                if next_job is None
+                else original.index(f"  {next_job}:\n", job_start)
+            )
+            job = original[job_start:job_end]
+            if "    env:\n" in job:
+                job_docker_host = job.replace(
+                    "    env:\n",
+                    "    env:\n"
+                    "      DOCKER_HOST: unix:///tmp/unreviewed-docker.sock\n",
+                    1,
+                )
+            else:
+                job_docker_host = job.replace(
+                    "    steps:\n",
+                    "    env:\n"
+                    "      DOCKER_HOST: unix:///tmp/unreviewed-docker.sock\n"
+                    "    steps:\n",
+                    1,
+                )
+            context_mutations = {
+                "workflow_docker_host": add_workflow_env(
+                    original,
+                    "DOCKER_HOST: unix:///tmp/unreviewed-docker.sock",
+                ),
+                "workflow_bash_env": add_workflow_env(
+                    original,
+                    "BASH_ENV: /tmp/unreviewed-bash-env",
+                ),
+                "oracle_job_docker_host": (
+                    original[:job_start] + job_docker_host + original[job_end:]
+                ),
+                "job_default_shell": (
+                    original[:job_start]
+                    + job.replace(
+                        "    steps:\n",
+                        "    defaults:\n"
+                        "      run:\n"
+                        "        shell: bash -c 'source /tmp/tool; exec bash -e {0}'\n"
+                        "    steps:\n",
+                        1,
+                    )
+                    + original[job_end:]
+                ),
+                "privileged_job_container": (
+                    original[:job_start]
+                    + job.replace(
+                        "    steps:\n",
+                        "    container:\n"
+                        "      image: docker:latest\n"
+                        "      options: --privileged\n"
+                        "    steps:\n",
+                        1,
+                    )
+                    + original[job_end:]
+                ),
+                "outside_steps_permissions": original.replace(
+                    "  contents: read",
+                    "  contents: write",
+                    1,
+                ),
+            }
+            self.assertEqual(audit(Path(workflow_name), original), [])
+            for case, mutated in context_mutations.items():
+                with self.subTest(workflow=workflow_name, case=case):
+                    self.assertNotEqual(mutated, original)
+                    errors = audit(Path(workflow_name), mutated)
+                    self.assertTrue(
+                        any("reviewed SHA-256" in error for error in errors),
+                        errors,
+                    )
 
     def test_render_oracle_rejects_weakened_full_campaign_contract(self) -> None:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
@@ -369,9 +825,85 @@ steps:
                 "        run: python3 scripts/check_workflow_policy.py",
                 "        run: true",
             ),
+            "oci_buildx_version": mutate_image(
+                "          version: v0.35.0",
+                "          version: latest",
+            ),
+            "oci_buildkit_image": mutate_image(
+                "moby/buildkit:v0.31.2@sha256:",
+                "moby/buildkit:latest@sha256:",
+            ),
             "oci_build_step_scope": mutate_image(
                 "      - name: Build and verify the locked oracle image",
                 "      - name: Describe the locked oracle image",
+            ),
+            "oci_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          docker buildx build .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_env_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          env docker buildx build .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_command_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          command docker build .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_sudo_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          sudo -u root docker buildx build .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_assignment_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          DOCKER_BUILDKIT=1 docker build .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_bake_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          docker buildx bake .\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_shell_c_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          bash -c 'docker build .'\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_eval_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          eval 'docker buildx build .'\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_static_variable_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          DOCKER_COMMAND=docker\n"
+                "          DOCKER_SUBCOMMAND=build\n"
+                '          "$DOCKER_COMMAND" "$DOCKER_SUBCOMMAND" .\n'
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_backtick_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          IMAGE_ID=`docker build .`\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_python_inline_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          python3 -c 'import subprocess; "
+                'subprocess.run(["docker", "build", "."])\'\n'
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_perl_inline_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          perl -e 'system(\"docker build .\")'\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+            ),
+            "oci_sh_c_direct_build_bypass": mutate_image(
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
+                "          sh -c 'docker build .'\n"
+                "          python3 scripts/run-render-oracle-container.py build \\\n",
             ),
             "bootstrap_argument_commented": mutate_image(
                 "            BOOTSTRAP_ARGS+=(--bootstrap-identities)",
@@ -384,6 +916,18 @@ steps:
             "bootstrap_status_commented": mutate_image(
                 '              assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence',
                 '              # assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence',
+            ),
+            "reproducible_config_ids_commented": mutate_image(
+                '          assert reproducibility["config_ids"] == [evidence["built_image_id"]] * 2, reproducibility',
+                '          # assert reproducibility["config_ids"] == [evidence["built_image_id"]] * 2, reproducibility',
+            ),
+            "reproducible_manifest_digests_commented": mutate_image(
+                '          assert reproducibility["manifest_digests"] == [evidence["built_manifest_digest"]] * 2, reproducibility',
+                '          # assert reproducibility["manifest_digests"] == [evidence["built_manifest_digest"]] * 2, reproducibility',
+            ),
+            "reproducible_identities_commented": mutate_image(
+                '          assert len(reproducibility["identities"]) == 2, reproducibility',
+                '          # assert len(reproducibility["identities"]) == 2, reproducibility',
             ),
             "bootstrap_identity_commented": mutate_image(
                 '              assert evidence["expected_image_id"] is None, evidence',
@@ -401,6 +945,18 @@ steps:
                 '          assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence',
                 '          # assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence',
             ),
+            "source_commit_commented": mutate_image(
+                '          assert evidence["source_commit"] == expected_source, evidence',
+                '          # assert evidence["source_commit"] == expected_source, evidence',
+            ),
+            "wrapper_identity_commented": mutate_image(
+                '          assert evidence["wrapper_sha256"] == live_wrapper_sha256 == lock["wrapper"]["sha256"], evidence',
+                '          # assert evidence["wrapper_sha256"] == live_wrapper_sha256 == lock["wrapper"]["sha256"], evidence',
+            ),
+            "receipt_artifact_name_unbound": mutate_image(
+                "          name: render-oracle-image-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+                "          name: render-oracle-image-${{ github.run_id }}-${{ github.run_attempt }}",
+            ),
             "host_bootstrap_argument_commented": original.replace(
                 "            --bootstrap-identities \\\n",
                 "            # --bootstrap-identities \\\n",
@@ -414,6 +970,74 @@ steps:
                     Path("render-hardening.yml"), workflow
                 )
                 self.assertTrue(errors)
+
+    def test_direct_docker_build_detection_ignores_comments_and_echoes(self) -> None:
+        inactive = """
+steps:
+  - run: |
+      # env docker buildx build .
+      true  # sudo docker build .
+      echo "command docker buildx build ."
+      printf '%s\\n' 'DOCKER_BUILDKIT=1 docker build .'
+      command -v docker build
+      cat <<'EOF'
+      docker build .
+      EOF
+"""
+        self.assertEqual(self.policy._direct_docker_build_commands(inactive), [])
+
+        workflows = (
+            "steps:\n  - run: env docker buildx build .\n",
+            "steps:\n  - run: /usr/bin/env PINNED=1 command docker build .\n",
+            "steps:\n  - run: sudo --preserve-env -u root docker buildx build .\n",
+            "steps:\n  - run: DOCKER_BUILDKIT=1 docker build .\n",
+            "steps:\n  - run: 'docker build .'\n",
+            "steps:\n  - run: env -S 'docker build .'\n",
+            "steps:\n  - run: docker --context default build .\n",
+            "steps:\n  - run: docker buildx bake .\n",
+            "steps:\n  - run: docker buildx \"$SUBCOMMAND\" .\n",
+            "steps:\n  - run: docker buildx \"${SUBCOMMAND:-build}\" .\n",
+            "steps:\n  - run: bash -c 'docker build .'\n",
+            "steps:\n  - run: bash /tmp/generated-build-script.sh\n",
+            "steps:\n  - run: sh -c \"$BUILD_COMMAND\"\n",
+            "steps:\n  - run: eval \"$BUILD_COMMAND\"\n",
+            "steps:\n  - run: IMAGE_ID=`docker build .`\n",
+            "steps:\n  - run: echo `docker buildx build .`\n",
+            (
+                "steps:\n  - run: python3 -c 'import subprocess; "
+                'subprocess.run(["docker", "build", "."])\'\n'
+            ),
+            "steps:\n  - run: perl -e 'system(\"docker build .\")'\n",
+            "steps:\n  - run: find . -exec docker build {} ;\n",
+            "steps:\n  - run: timeout 30 docker build .\n",
+            "steps:\n  - run: . /tmp/generated-build-script.sh\n",
+            "steps:\n  - run: \"$UNKNOWN_COMMAND\" .\n",
+            "steps:\n  - run: 'docker build .\n",
+            "steps:\n  - run: |\n      DOCKER=docker\n      SUBCOMMAND=build\n      \"$DOCKER\" \"$SUBCOMMAND\" .\n",
+            "steps:\n  - run: |\n      COMMAND='docker buildx bake'\n      $COMMAND .\n",
+            "steps:\n  - run: |\n      COMMAND=dock\n      COMMAND+=er\n      $COMMAND build .\n",
+            "steps:\n  - run: >-\n      docker buildx\n      build .\n",
+            "steps: [{run: docker build .}]\n",
+            "steps:\n  - {run: docker build .}\n",
+            "steps:\n  - <<: *docker-build-step\n",
+            "steps:\n  - run: ${{ format('{0} {1}', 'docker', 'build') }}\n",
+        )
+        for workflow in workflows:
+            with self.subTest(workflow=workflow):
+                self.assertTrue(
+                    self.policy._direct_docker_build_commands(workflow)
+                )
+
+        safe = """
+steps:
+  - run: |
+      bash -n scripts/render-oracle-container/oracle-entrypoint.sh
+      python3 scripts/run-render-oracle-container.py build --engine docker
+      docker version
+      docker buildx version
+      printf '%s\\n' 'bash -c "docker build ."'
+"""
+        self.assertEqual(self.policy._direct_docker_build_commands(safe), [])
 
     def test_checked_in_render_browser_policy_passes(self) -> None:
         text = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
@@ -567,7 +1191,7 @@ steps:
                 1,
             ),
             "run_api_fields": original.replace(
-                "[.head_sha, .event, .conclusion, .status, .path]",
+                "[.head_sha, .event, .conclusion, .status, .path, .run_attempt]",
                 "[.head_sha, .conclusion]",
             ),
             "oracle_workflow": original.replace(
@@ -581,8 +1205,12 @@ steps:
                 '&& "$run_path" == ".github/workflows/ci.yml"',
             ),
             "oracle_profile": original.replace(
-                'artifact_name="render-oracle-${GITHUB_SHA}-full"',
-                'artifact_name="render-oracle-${GITHUB_SHA}-pilot"',
+                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"',
+                'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-pilot"',
+            ),
+            "oracle_run_attempt": original.replace(
+                '&& "$run_attempt" =~ ^[1-9][0-9]*$',
+                '&& -n "$run_attempt"',
             ),
             "oracle_artifact_api": original.replace(
                 "actions/runs/$run_id/artifacts", "actions/artifacts"

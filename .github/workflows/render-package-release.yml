@@ -128,10 +128,7 @@ jobs:
             push \
             render-browser
 
-          artifact_name="render-oracle-${GITHUB_SHA}-full"
-          evidence_root="$RUNNER_TEMP/render-oracle-release-prerequisites"
-          rm -rf "$evidence_root"
-          mkdir -p "$evidence_root" target/render-package
+          mkdir -p target/render-package
           selected_oracle=""
           mapfile -t oracle_run_ids < <(gh run list \
             --repo "$GITHUB_REPOSITORY" \
@@ -144,13 +141,15 @@ jobs:
           for run_id in "${oracle_run_ids[@]}"; do
             record=$(gh api \
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
-              --jq '[.head_sha, .event, .conclusion, .status, .path] | @tsv')
-            IFS=$'\t' read -r head_sha event conclusion status run_path <<< "$record"
+              --jq '[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv')
+            IFS=$'\t' read -r head_sha event conclusion status run_path run_attempt <<< "$record"
             [[ "$head_sha" == "$GITHUB_SHA" \
               && "$event" == "workflow_dispatch" \
               && "$conclusion" == "success" \
               && "$status" == "completed" \
-              && "$run_path" == ".github/workflows/render-oracle.yml" ]] || continue
+              && "$run_path" == ".github/workflows/render-oracle.yml" \
+              && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || continue
+            artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"
 
             mapfile -t artifact_rows < <(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
@@ -171,27 +170,20 @@ jobs:
               && "$size_bytes" -le 67108864 \
               && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
 
-            candidate="$evidence_root/$run_id"
-            rm -rf "$candidate"
-            mkdir -p "$candidate"
-            if ! gh run download "$run_id" \
-              --repo "$GITHUB_REPOSITORY" \
-              --name "$artifact_name" \
-              --dir "$candidate"; then
-              rm -rf "$candidate"
-              continue
-            fi
             if python3 scripts/check_render_oracle_release_evidence.py \
-              --artifact-dir "$candidate" \
+              --download-repository "$GITHUB_REPOSITORY" \
+              --github-artifact-id "$artifact_id" \
+              --artifact-name "$artifact_name" \
+              --artifact-size-bytes "$size_bytes" \
               --head-sha "$GITHUB_SHA" \
               --reviewed-baseline scripts/render-parity-baseline-full.json \
               --workflow-run-id "$run_id" \
+              --workflow-run-attempt "$run_attempt" \
               --artifact-digest "$digest" \
               --write-report target/render-package/oracle-prerequisite.json; then
               selected_oracle="$run_id"
               break
             fi
-            rm -rf "$candidate"
           done
           test -n "$selected_oracle" || {
             echo "Render Oracle has no valid reviewed full run for exact SHA $GITHUB_SHA" >&2
@@ -375,6 +367,19 @@ jobs:
               or prerequisites.get("ratchets") != 2
               or not isinstance(prerequisites.get("workflow_run_id"), int)
               or prerequisites["workflow_run_id"] < 1
+              or not isinstance(prerequisites.get("workflow_run_attempt"), int)
+              or prerequisites["workflow_run_attempt"] < 1
+              or not isinstance(prerequisites.get("artifact_id"), int)
+              or prerequisites["artifact_id"] < 1
+              or not isinstance(prerequisites.get("artifact_size_bytes"), int)
+              or not 1 <= prerequisites["artifact_size_bytes"] <= 67108864
+              or prerequisites.get("artifact_repository") != "HyunjoJung/rxls"
+              or prerequisites.get("artifact_name")
+              != (
+                  f"render-oracle-{os.environ['GITHUB_SHA']}-"
+                  f"{prerequisites['workflow_run_id']}-"
+                  f"{prerequisites['workflow_run_attempt']}-full"
+              )
               or re.fullmatch(
                   r"sha256:[0-9a-f]{64}",
                   prerequisites.get("artifact_digest", ""),

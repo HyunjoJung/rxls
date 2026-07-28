@@ -5,11 +5,50 @@
     "platform": "linux/amd64",
     "reference": "docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e"
   },
+  "builder": {
+    "buildkit": {
+      "commit": "e42e1bfd389af7203238cce77b1f7dad447285e9",
+      "compatibility": {
+        "explicit": false,
+        "source": "pinned-buildkit-default",
+        "version": 30
+      },
+      "image": "docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
+      "index_sha256": "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
+      "linux_amd64_manifest_sha256": "63db51c9b30208a7c2b1c40392c7ebb9ce2f85ba238a18a85420f8f5ea2d4684",
+      "version": "v0.31.2"
+    },
+    "buildx": {
+      "commit": "a319e5b15052cf6557ceb666eb8ff6e32380b782",
+      "setup_action": "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
+      "version": "v0.35.0"
+    },
+    "driver": "docker-container",
+    "driver_options": {
+      "provenance_add_gha": false
+    },
+    "exporter": {
+      "archive_max_bytes": 4294967296,
+      "destination": "stdout",
+      "media_type": "application/vnd.docker.distribution.manifest.v2+json",
+      "oci_mediatypes": false,
+      "provenance": false,
+      "rewrite_timestamp": true,
+      "sbom": false,
+      "tar": true,
+      "type": "docker"
+    },
+    "platform": "linux/amd64",
+    "reproducibility_builds": 2,
+    "snapshotter": "overlayfs"
+  },
   "built_image": {
-    "expected_id": "sha256:b3717f7083549f874129090013918d03280af5e4d312a2199fdd2df6763c0b01",
-    "identity_kind": "oci_image_config_digest",
+    "bootstrap_receipt": null,
+    "expected_id": null,
+    "expected_manifest_digest": null,
+    "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
-    "unpinned_verification": "bootstrap_only_runtime_image_id_plus_exact_build_contract_and_labels"
+    "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
   },
   "debian_snapshot": {
     "timestamp": "20260713T000000Z",
@@ -17,9 +56,9 @@
   },
   "files": [
     {
-      "bytes": 4727,
+      "bytes": 4905,
       "path": "Containerfile",
-      "sha256": "9bbeec50ba7d63917169c7b1246b174b65348364a390a05dd6a3703819cebf01"
+      "sha256": "1453a228244a98a2df3232876ba684011b1dd4f7da3a0322314285d433e5c830"
     },
     {
       "bytes": 4554,
@@ -52,5 +91,10 @@
     "root_filesystem": "read_only",
     "timeout_seconds": 180
   },
-  "schema": "rxls.render-oracle-container-lock.v2"
+  "schema": "rxls.render-oracle-container-lock.v3",
+  "wrapper": {
+    "bytes": 127001,
+    "path": "scripts/run-render-oracle-container.py",
+    "sha256": "d4d7151eb82aa10e72294004c1e7f7e894d3268be2b2f371d3b5ff2764c4f67c"
+  }
 }

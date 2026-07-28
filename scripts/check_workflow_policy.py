@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -29,6 +32,52 @@ RENDER_PACKAGE_NODE_VERSION = "24.18.0"
 RENDER_PACKAGE_NPM_VERSION = "11.16.0"
 RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST = "1.88.0"
 RENDER_PACKAGE_WASM_BINDGEN_VERSION = "0.2.126"
+ORACLE_BUILDX_VERSION = "v0.35.0"
+ORACLE_BUILDX_ACTION = (
+    "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
+)
+ORACLE_CHECKOUT_ACTION = (
+    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+)
+ORACLE_SETUP_PYTHON_ACTION = (
+    "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+)
+ORACLE_UPLOAD_ARTIFACT_ACTION = (
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+)
+ORACLE_RENDER_STEP_SHA256 = (
+    "2749d6af5803d3c39cf6f3ac102f624270a1f890dc7d5de857e68d8dc9f52ffa",
+    "fd310c68a384cb3379a59a669357ba6d0106dc5c551d0194586f94ec6184a55a",
+    "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
+    "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
+    "e68111b94d173e641656a08128f361c61c4521f9262bd5ab7644eff4e4c4ad52",
+    "550ef35d2ed02fa5403ec22cf9526fe431a4908ba7bf6b8bcde23156fee79c66",
+    "455b842e761235cf52cc695d818461372c5b1c99132d9c6df12224ca82af42bb",
+    "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
+    "11c3256a804cc01812f61ef29b4704e5386a7a20ad06a7986802885ed54be6aa",
+    "d57b5ea788b9602ed0e8dc38eda6a5ac2bc067b6167883ebdf55340681ac5547",
+    "13e889c1b3e254d53879c4a593f72f0d0c45f2962b9b7b1590717ca8a5820b38",
+    "1f3453b34f490f6ec86e9655d994b5af8fb7fb7c68c0da7b6016112e4b764202",
+    "3a68e719dd211780d0c0778445d63fc19cdbcadf80fc7068e132c623f38030ac",
+)
+ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
+    "82dcaaf5e601cb509cf5312a5caf66a1f08e651165b53a3758e346938a32b7f4",
+    "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
+    "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
+    "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
+    "1fbac1d8e41eb4bab96ebfdbdbd64a9964cc30e513bb3c804d3e80275d817e2b",
+    "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
+)
+ORACLE_RENDER_WORKFLOW_SHA256 = (
+    "d4d2791735de8376e7adf8b282c707ff43bba903cd333dabd9b23b1e1f208d04"
+)
+ORACLE_HARDENING_WORKFLOW_SHA256 = (
+    "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
+)
+ORACLE_BUILDKIT_IMAGE = (
+    "docker.io/moby/buildkit:v0.31.2@sha256:"
+    "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
+)
 
 
 def _without_commented_lines(text: str) -> str:
@@ -37,6 +86,182 @@ def _without_commented_lines(text: str) -> str:
     return "\n".join(
         "" if line.lstrip().startswith("#") else line for line in text.splitlines()
     )
+
+
+def _strip_yaml_inline_comment(text: str) -> str:
+    """Strip a YAML comment without treating a hash inside quotes as a comment."""
+
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(text):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif quote == "'":
+            if character == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    continue
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "#" and (index == 0 or text[index - 1].isspace()):
+            return text[:index].rstrip()
+    return text.rstrip()
+
+
+def _yaml_scalar_name(text: str) -> str | None:
+    """Return a simple YAML string scalar used for workflow trigger names."""
+
+    value = _strip_yaml_inline_comment(text).strip()
+    if not value:
+        return None
+    if value.startswith("'") and value.endswith("'") and len(value) >= 2:
+        return value[1:-1].replace("''", "'")
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        inner = value[1:-1]
+        if "\\" in inner:
+            return None
+        return inner
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value):
+        return value
+    return None
+
+
+def _yaml_top_level_parts(text: str, separator: str) -> list[str] | None:
+    """Split one YAML flow collection outside quotes and nested collections."""
+
+    parts: list[str] = []
+    start = 0
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    pairs = {"]": "[", "}": "{"}
+    for index, character in enumerate(text):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if quote == "'":
+            if character == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    continue
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "[{":
+            stack.append(character)
+        elif character in "]}":
+            if not stack or stack.pop() != pairs[character]:
+                return None
+        elif character == separator and not stack:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    if quote is not None or stack:
+        return None
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _yaml_mapping_entry(text: str) -> tuple[str, str] | None:
+    """Parse a simple YAML mapping entry, including quoted keys."""
+
+    parts = _yaml_top_level_parts(text, ":")
+    if parts is None or len(parts) < 2:
+        return None
+    key = _yaml_scalar_name(parts[0])
+    if key is None:
+        return None
+    return key, ":".join(parts[1:]).strip()
+
+
+def _trigger_names_from_value(value: str) -> set[str] | None:
+    """Parse the scalar, flow-sequence, or flow-map form of a workflow trigger."""
+
+    value = _strip_yaml_inline_comment(value).strip()
+    if value in {"", "~", "null", "Null", "NULL"}:
+        return set()
+    if value.startswith("[") and value.endswith("]"):
+        parts = _yaml_top_level_parts(value[1:-1], ",")
+        if parts is None:
+            return None
+        names = {_yaml_scalar_name(part) for part in parts if part}
+        return None if None in names else {name for name in names if name is not None}
+    if value.startswith("{") and value.endswith("}"):
+        parts = _yaml_top_level_parts(value[1:-1], ",")
+        if parts is None:
+            return None
+        names: set[str] = set()
+        for part in parts:
+            if not part:
+                continue
+            entry = _yaml_mapping_entry(part)
+            if entry is None:
+                return None
+            names.add(entry[0])
+        return names
+    name = _yaml_scalar_name(value)
+    return None if name is None else {name}
+
+
+def _workflow_trigger_names(text: str) -> tuple[set[str], list[str]]:
+    """Read the top-level GitHub Actions trigger using YAML mapping semantics."""
+
+    lines = text.splitlines()
+    on_entries: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) != len(line.lstrip(" ")):
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line))
+        if entry is not None and entry[0] == "on":
+            on_entries.append((index, entry[1]))
+    if not on_entries:
+        return set(), ["workflow is missing a top-level on trigger"]
+    if len(on_entries) != 1:
+        return set(), ["workflow must contain exactly one top-level on trigger"]
+
+    start, value = on_entries[0]
+    if value:
+        names = _trigger_names_from_value(value)
+        if names is None:
+            return set(), ["workflow on trigger uses an unsupported YAML value"]
+        return names, []
+
+    body: list[tuple[int, str]] = []
+    for line in lines[start + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            break
+        body.append((indent, _strip_yaml_inline_comment(line.lstrip(" "))))
+    if not body:
+        return set(), []
+
+    event_indent = min(indent for indent, line in body if line)
+    event_lines = [line for indent, line in body if indent == event_indent and line]
+    sequence = all(line.startswith("- ") for line in event_lines)
+    names: set[str] = set()
+    for line in event_lines:
+        if sequence:
+            name = _yaml_scalar_name(line[2:])
+        else:
+            entry = _yaml_mapping_entry(line)
+            name = None if entry is None else entry[0]
+        if name is None:
+            return set(), ["workflow on trigger block is not a supported YAML collection"]
+        names.add(name)
+    return names, []
 
 
 def _yaml_blocks(text: str, header: str, indent: int) -> list[str]:
@@ -79,6 +304,728 @@ def _normalized_active_commands(text: str) -> list[str]:
     active = _without_commented_lines(text)
     normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", active)
     return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+_SHELL_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+_EXECUTABLE_WRAPPER_ARGUMENT_OPTIONS = {
+    "env": {
+        "-C",
+        "--chdir",
+        "-S",
+        "--split-string",
+        "-u",
+        "--unset",
+    },
+    "sudo": {
+        "-C",
+        "--close-from",
+        "-D",
+        "--chdir",
+        "-g",
+        "--group",
+        "-h",
+        "--host",
+        "-p",
+        "--prompt",
+        "-R",
+        "--chroot",
+        "-r",
+        "--role",
+        "-T",
+        "--command-timeout",
+        "-t",
+        "--type",
+        "-u",
+        "--user",
+    },
+    "command": set(),
+    "exec": {"-a"},
+    "nice": {"-n", "--adjustment"},
+    "time": {"-f", "--format", "-o", "--output"},
+}
+_DOCKER_GLOBAL_ARGUMENT_OPTIONS = {
+    "-c",
+    "--config",
+    "--context",
+    "-H",
+    "--host",
+    "-l",
+    "--log-level",
+    "--tlscacert",
+    "--tlscert",
+    "--tlskey",
+}
+
+
+def _shell_command_segments(command: str) -> list[list[str]] | None:
+    """Tokenize executable shell segments while honoring quotes and comments.
+
+    Redirections remain attached to their command so their operands cannot be
+    mistaken for a second command.  ``None`` is deliberately distinct from an
+    empty command: callers must fail closed when shell syntax cannot be parsed.
+    """
+
+    try:
+        lexer = shlex.shlex(
+            command,
+            posix=True,
+            punctuation_chars="();<>|&",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    segments: list[list[str]] = []
+    segment: list[str] = []
+    arithmetic_depth = 0
+    for token in tokens:
+        if token == "((":
+            arithmetic_depth += 1
+            continue
+        if token == "))" and arithmetic_depth:
+            arithmetic_depth -= 1
+            continue
+        if arithmetic_depth:
+            continue
+        if token and all(character in "();|&" for character in token):
+            if segment:
+                segments.append(segment)
+                segment = []
+            continue
+        segment.append(token)
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+_SHELL_VARIABLE_RE = re.compile(
+    r"\$(?:[A-Za-z_][A-Za-z0-9_]*|"
+    r"\{[A-Za-z_][A-Za-z0-9_]*(?:\[@\]|\[\*\])?\})\Z"
+)
+_UNSAFE_SHELL_EXECUTORS = {
+    ".",
+    "chroot",
+    "eval",
+    "nohup",
+    "parallel",
+    "setsid",
+    "source",
+    "stdbuf",
+    "timeout",
+    "watch",
+    "xargs",
+}
+_SHELL_INTERPRETERS = {"bash", "dash", "ksh", "sh", "zsh"}
+_PYTHON_INTERPRETER_RE = re.compile(
+    r"(?:python|pypy)(?:\d+(?:\.\d+)*)?\Z"
+)
+_INLINE_EVAL_OPTIONS = {
+    "lua": {"-e"},
+    "node": {"-e", "--eval", "-p", "--print"},
+    "perl": {"-e", "-E"},
+    "php": {"-r"},
+    "ruby": {"-e"},
+}
+_REDIRECTION_RE = re.compile(r"(?:[0-9]+)?(?:<<?|>>?|<>|>&|<&)\Z")
+
+
+def _assignment_parts(token: str) -> tuple[str, str] | None:
+    match = re.fullmatch(
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<append>\+)?=(?P<value>.*)",
+        token,
+    )
+    if match is None:
+        return None
+    if match.group("append") is not None:
+        # The prior value is shell state.  Mark concatenation as dynamic so a
+        # later executable expansion is rejected rather than mis-resolved.
+        return match.group("name"), "$<concatenated>"
+    return match.group("name"), match.group("value")
+
+
+def _static_assignment_value(value: str) -> str | None:
+    """Return a literal shell assignment value or ``None`` when it is dynamic."""
+
+    if any(marker in value for marker in ("$", "`", "\n", "\r", "\0")):
+        return None
+    return value
+
+
+def _variable_name(token: str) -> str | None:
+    if _SHELL_VARIABLE_RE.fullmatch(token) is None:
+        return None
+    if not token.startswith("${"):
+        return token[1:]
+    name = token[2:-1]
+    return re.sub(r"\[(?:@|\*)\]\Z", "", name)
+
+
+def _executable_name(token: str) -> str:
+    """Return a command basename without Path's special handling of ``.``."""
+
+    return token.rsplit("/", 1)[-1]
+
+
+def _python_inline_is_policy_safe(source: str) -> bool:
+    """Allow only the read-only JSON snippets already used by oracle workflows."""
+
+    try:
+        tree = ast.parse(source, mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+    allowed_nodes = (
+        ast.Attribute,
+        ast.Call,
+        ast.Constant,
+        ast.Expr,
+        ast.Import,
+        ast.Load,
+        ast.Module,
+        ast.Name,
+        ast.Subscript,
+        ast.Tuple,
+        ast.alias,
+        ast.keyword,
+    )
+    if any(not isinstance(node, allowed_nodes) for node in ast.walk(tree)):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if len(node.names) != 1:
+                return False
+            imported = node.names[0]
+            if imported.name != "json" or imported.asname is not None:
+                return False
+        elif isinstance(node, ast.Name):
+            if node.id not in {"json", "open", "print"}:
+                return False
+        elif isinstance(node, ast.Call):
+            function = node.func
+            if isinstance(function, ast.Name):
+                if function.id not in {"open", "print"}:
+                    return False
+                if function.id == "open" and (
+                    not node.args
+                    or not isinstance(node.args[0], ast.Constant)
+                    or not isinstance(node.args[0].value, str)
+                ):
+                    return False
+            elif not (
+                isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "json"
+                and function.attr in {"dumps", "load"}
+            ):
+                return False
+    return True
+
+
+def _inline_interpreter_is_unsafe(
+    executable: str,
+    arguments: list[str],
+) -> bool:
+    """Reject inline interpreter programs unless they match the narrow safe form."""
+
+    if _PYTHON_INTERPRETER_RE.fullmatch(executable):
+        for index, argument in enumerate(arguments):
+            if argument == "-c":
+                return (
+                    index + 1 >= len(arguments)
+                    or not _python_inline_is_policy_safe(arguments[index + 1])
+                )
+            if argument.startswith("-c") and len(argument) > 2:
+                return not _python_inline_is_policy_safe(argument[2:])
+            if "$" in argument and (
+                index == 0 or argument.startswith("-")
+            ):
+                return True
+        return False
+    options = _INLINE_EVAL_OPTIONS.get(executable)
+    if options is None:
+        return False
+    for index, argument in enumerate(arguments):
+        if argument in options:
+            return True
+        if any(
+            argument.startswith(option) and len(argument) > len(option)
+            for option in options
+            if option.startswith("-") and not option.startswith("--")
+        ):
+            return True
+        if index == 0 and "$" in argument:
+            return True
+    return False
+
+
+def _expand_static_tokens(
+    tokens: list[str],
+    assignments: dict[str, str | None],
+) -> tuple[list[str], bool]:
+    """Expand exact scalar-variable tokens and report unresolved executables."""
+
+    expanded: list[str] = []
+    unresolved_executable = False
+    for index, token in enumerate(tokens):
+        name = _variable_name(token)
+        if name is None:
+            expanded.append(token)
+            continue
+        value = assignments.get(name)
+        if value is None:
+            expanded.append(token)
+            if index == 0:
+                unresolved_executable = True
+            continue
+        try:
+            replacement = shlex.split(value, posix=True)
+        except ValueError:
+            replacement = []
+        if not replacement:
+            expanded.append(token)
+            if index == 0:
+                unresolved_executable = True
+            continue
+        expanded.extend(replacement)
+    return expanded, unresolved_executable
+
+
+def _skip_redirection(tokens: list[str], index: int) -> int | None:
+    """Return the token after one leading redirection, if present."""
+
+    if index >= len(tokens):
+        return None
+    token = tokens[index]
+    if token.isdigit() and index + 1 < len(tokens):
+        if _REDIRECTION_RE.fullmatch(tokens[index + 1]):
+            return index + 3 if index + 2 < len(tokens) else None
+    if _REDIRECTION_RE.fullmatch(token):
+        return index + 2 if index + 1 < len(tokens) else None
+    return None
+
+
+def _command_index(tokens: list[str]) -> int:
+    """Locate a segment's executable after assignments and redirections."""
+
+    index = 0
+    control_words = {
+        "!",
+        "do",
+        "elif",
+        "else",
+        "if",
+        "then",
+        "until",
+        "while",
+    }
+    while index < len(tokens):
+        if tokens[index] in control_words:
+            index += 1
+            continue
+        if _assignment_parts(tokens[index]) is not None:
+            index += 1
+            continue
+        redirected = _skip_redirection(tokens, index)
+        if redirected is not None:
+            index = redirected
+            continue
+        break
+    return index
+
+
+def _unwrap_executable_wrapper(
+    tokens: list[str], index: int
+) -> tuple[list[str], int] | None:
+    """Consume or expand one known wrapper and locate its executed command."""
+
+    wrapper = _executable_name(tokens[index])
+    if wrapper not in _EXECUTABLE_WRAPPER_ARGUMENT_OPTIONS:
+        return None
+    index += 1
+    argument_options = _EXECUTABLE_WRAPPER_ARGUMENT_OPTIONS[wrapper]
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return tokens, index + 1
+        if wrapper == "command" and token.startswith("-") and any(
+            flag in token[1:] for flag in ("v", "V")
+        ):
+            return [], 0
+        option = token.split("=", 1)[0]
+        if token.startswith("-"):
+            if wrapper == "env" and option in {"-S", "--split-string"}:
+                if "=" in token:
+                    split_string = token.split("=", 1)[1]
+                    remaining_index = index + 1
+                elif option == "-S" and len(token) > 2:
+                    split_string = token[2:]
+                    remaining_index = index + 1
+                elif index + 1 < len(tokens):
+                    split_string = tokens[index + 1]
+                    remaining_index = index + 2
+                else:
+                    return [], 0
+                try:
+                    split_tokens = shlex.split(split_string, posix=True)
+                except ValueError:
+                    return [], 0
+                return (
+                    tokens[: index - 1]
+                    + split_tokens
+                    + tokens[remaining_index:],
+                    index - 1,
+                )
+            index += 1
+            if option in argument_options and "=" not in token:
+                index += 1
+            continue
+        if wrapper == "env" and _SHELL_ASSIGNMENT_RE.fullmatch(token):
+            index += 1
+            continue
+        return tokens, index
+    return tokens, index
+
+
+def _segment_invokes_docker_build(
+    tokens: list[str],
+    assignments: dict[str, str | None] | None = None,
+) -> bool:
+    """Return whether a shell segment can bypass the reviewed build wrapper."""
+
+    assignments = {} if assignments is None else assignments
+    tokens, unresolved_executable = _expand_static_tokens(tokens, assignments)
+    index = _command_index(tokens)
+    if unresolved_executable or (
+        index < len(tokens)
+        and (
+            _variable_name(tokens[index]) is not None
+            or tokens[index].startswith("$")
+        )
+    ):
+        # A computed executable is precisely the kind of construct this
+        # lightweight policy cannot prove safe.  Oracle build workflows must
+        # use literal, reviewable executables.
+        return True
+    while index < len(tokens):
+        unwrapped = _unwrap_executable_wrapper(tokens, index)
+        if unwrapped is None:
+            break
+        tokens, index = unwrapped
+        tokens, unresolved_executable = _expand_static_tokens(tokens, assignments)
+        if unresolved_executable or (
+            index < len(tokens)
+            and (
+                _variable_name(tokens[index]) is not None
+                or tokens[index].startswith("$")
+            )
+        ):
+            return True
+        while index < len(tokens) and _assignment_parts(tokens[index]) is not None:
+            index += 1
+    if index >= len(tokens):
+        return False
+    executable = _executable_name(tokens[index])
+    if executable in _UNSAFE_SHELL_EXECUTORS:
+        return True
+    if executable in _SHELL_INTERPRETERS:
+        # ``-c`` can hide arbitrary shell parsing, including additional
+        # expansion and aliases.  Ban it rather than attempting a partial
+        # second shell implementation.  Non-executing modes such as ``-n``
+        # remain permitted.
+        arguments = tokens[index + 1 :]
+        return not arguments or arguments[0] != "-n"
+    if _inline_interpreter_is_unsafe(executable, tokens[index + 1 :]):
+        return True
+    if executable == "find" and any(
+        token in {"-exec", "-execdir", "-ok", "-okdir"}
+        for token in tokens[index + 1 :]
+    ):
+        return True
+    if executable != "docker":
+        return False
+    arguments = tokens[index + 1 :]
+    arguments, _ = _expand_static_tokens(arguments, assignments)
+    argument_index = 0
+    while argument_index < len(arguments) and arguments[argument_index].startswith("-"):
+        option = arguments[argument_index].split("=", 1)[0]
+        argument_index += 1
+        if (
+            option in _DOCKER_GLOBAL_ARGUMENT_OPTIONS
+            and "=" not in arguments[argument_index - 1]
+        ):
+            argument_index += 1
+    arguments = arguments[argument_index:]
+    if not arguments:
+        return False
+    if _variable_name(arguments[0]) is not None or "$" in arguments[0]:
+        return True
+    if (
+        arguments[0] in {"builder", "buildx", "compose", "image"}
+        and len(arguments) >= 2
+        and (
+            _variable_name(arguments[1]) is not None
+            or "$" in arguments[1]
+        )
+    ):
+        return True
+    return (
+        arguments[0] == "build"
+        or len(arguments) >= 2
+        and arguments[:2] in (
+            ["builder", "build"],
+            ["buildx", "bake"],
+            ["buildx", "build"],
+            ["compose", "build"],
+            ["image", "build"],
+        )
+    )
+
+
+def _block_scalar_text(
+    block: list[str],
+    parent_index: int,
+    parent_indent: int,
+    style: str,
+) -> str:
+    """Resolve the command-relevant line folding of one YAML block scalar."""
+
+    raw_lines: list[tuple[int, str]] = []
+    for line in block[parent_index + 1 :]:
+        if line.strip():
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= parent_indent:
+                break
+            raw_lines.append((indent, line))
+        else:
+            raw_lines.append((parent_indent + 1, ""))
+    nonempty_indents = [indent for indent, line in raw_lines if line.strip()]
+    if not nonempty_indents:
+        return ""
+    content_indent = min(nonempty_indents)
+    content = [
+        (
+            indent,
+            line[content_indent:] if line.strip() else "",
+        )
+        for indent, line in raw_lines
+    ]
+    if style == "|":
+        return "\n".join(line for _, line in content)
+
+    folded = ""
+    previous_indent: int | None = None
+    previous_line: str | None = None
+    for indent, line in content:
+        if previous_line is not None:
+            if (
+                previous_line
+                and line
+                and previous_indent == content_indent
+                and indent == content_indent
+            ):
+                folded += " "
+            else:
+                folded += "\n"
+        folded += line
+        previous_indent = indent
+        previous_line = line
+    return folded
+
+
+def _workflow_run_scripts(text: str) -> list[str]:
+    """Resolve active inline and block-style run scalars from workflow steps."""
+
+    scripts: list[str] = []
+    for line in _without_commented_lines(text).splitlines():
+        if not line.strip():
+            continue
+        entry = _yaml_mapping_entry(
+            _strip_yaml_inline_comment(line.lstrip(" "))
+        )
+        if entry is not None and entry[0] == "steps" and entry[1] != "":
+            scripts.append("\0")
+    for blocks in _workflow_step_sequences(text):
+        for step_indent, block in blocks:
+            entries = _step_mapping_entries(step_indent, block)
+            mapping_indent = step_indent + 2
+            has_unreadable_step = False
+            for index, line in enumerate(block):
+                indent = len(line) - len(line.lstrip(" "))
+                content = line.lstrip(" ")
+                effective_indent = indent
+                if index == 0 and indent == step_indent and content.startswith("-"):
+                    content = content[1:].lstrip(" ")
+                    effective_indent = mapping_indent
+                if effective_indent != mapping_indent or not content:
+                    continue
+                if (
+                    _yaml_mapping_entry(_strip_yaml_inline_comment(content))
+                    is None
+                ):
+                    has_unreadable_step = True
+            names = [name for name, _, _, _ in entries]
+            if len(names) != len(set(names)):
+                has_unreadable_step = True
+            if has_unreadable_step:
+                scripts.append("\0")
+            for name, value, line_index, parent_indent in entries:
+                if name != "run":
+                    continue
+                scalar = _strip_yaml_inline_comment(value).strip()
+                block_match = re.fullmatch(r"(?P<style>[|>])[-+0-9]*", scalar)
+                if block_match is None:
+                    scripts.append(_yaml_unquote_scalar(scalar))
+                else:
+                    scripts.append(
+                        _block_scalar_text(
+                            block,
+                            line_index,
+                            parent_indent,
+                            block_match.group("style"),
+                        )
+                    )
+    return scripts
+
+
+_HEREDOC_RE = re.compile(
+    r"<<(?P<tabs>-)?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P=quote)"
+)
+
+
+def _without_heredoc_bodies(script: str) -> str:
+    """Remove shell heredoc data so inert text is not audited as execution."""
+
+    active_lines: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    for line in script.splitlines():
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == delimiter:
+                pending.pop(0)
+            continue
+        active_lines.append(line)
+        pending.extend(
+            (match.group("delimiter"), match.group("tabs") is not None)
+            for match in _HEREDOC_RE.finditer(line)
+        )
+    return "\n".join(active_lines)
+
+
+def _direct_docker_build_commands(text: str) -> list[str]:
+    """Find active or unprovable commands bypassing the reviewed wrapper."""
+
+    commands: list[str] = []
+    for script in _workflow_run_scripts(text):
+        assignments: dict[str, str | None] = {}
+        if "\0" in script:
+            commands.append("<unreadable run scalar>")
+            continue
+        active = _without_heredoc_bodies(script)
+        normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", active)
+        for line in normalized.splitlines():
+            command = line.strip()
+            if not command:
+                continue
+            if "`" in command:
+                commands.append(command)
+                continue
+            substitution_assignment = re.fullmatch(
+                r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
+                r"(?P<quote>[\"']?)\$\((?P<tail>.*)",
+                command,
+            )
+            if substitution_assignment is not None:
+                assignments[substitution_assignment.group("name")] = None
+                command = substitution_assignment.group("tail").strip()
+                suffix = ")" + substitution_assignment.group("quote")
+                if command.endswith(suffix):
+                    command = command[: -len(suffix)].rstrip()
+                if not command:
+                    continue
+            if re.fullmatch(r"\)+[\"']?", command):
+                continue
+            array_assignment = re.fullmatch(
+                r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<append>\+)?="
+                r"\((?P<value>.*)\)",
+                command,
+            )
+            if array_assignment is not None:
+                value = array_assignment.group("value")
+                if "$(" in value or "`" in value:
+                    commands.append(command)
+                    continue
+                if array_assignment.group("append") is None:
+                    try:
+                        values = shlex.split(value, posix=True)
+                    except ValueError:
+                        commands.append(command)
+                        continue
+                    assignments[array_assignment.group("name")] = (
+                        " ".join(values)
+                        if all(
+                            _static_assignment_value(item) is not None
+                            for item in values
+                        )
+                        else None
+                    )
+                continue
+            segments = _shell_command_segments(command)
+            if segments is None:
+                commands.append(command)
+                continue
+            violation = False
+            for segment in segments:
+                local_assignments = dict(assignments)
+                for token in segment:
+                    parts = _assignment_parts(token)
+                    if parts is None:
+                        break
+                    name, value = parts
+                    local_assignments[name] = _static_assignment_value(value)
+                if _segment_invokes_docker_build(segment, local_assignments):
+                    violation = True
+                if _command_index(segment) >= len(segment):
+                    assignments.update(local_assignments)
+                elif all(_assignment_parts(token) is not None for token in segment):
+                    assignments.update(local_assignments)
+            if violation:
+                commands.append(command)
+    return commands
+
+
+def _audit_oracle_buildx_setup(
+    path: Path, text: str, errors: list[str]
+) -> None:
+    setup = _single_yaml_block(
+        path,
+        text,
+        "- name: Set up the pinned Buildx client",
+        6,
+        "pinned oracle Buildx setup step",
+        errors,
+    )
+    required = (
+        f"uses: {ORACLE_BUILDX_ACTION} # v4.2.0",
+        "name: rxls-oracle-client",
+        f"version: {ORACLE_BUILDX_VERSION}",
+        "driver: docker-container",
+        "platforms: linux/amd64",
+        f"image={ORACLE_BUILDKIT_IMAGE}",
+        "provenance-add-gha=false",
+        "buildkitd-flags: --oci-worker-snapshotter=overlayfs",
+    )
+    if any(setup.count(snippet) != 1 for snippet in required):
+        errors.append(
+            f"{path}: oracle builds must pin Buildx, BuildKit, linux/amd64, "
+            "overlayfs, and disabled GitHub provenance"
+        )
+    if _direct_docker_build_commands(text):
+        errors.append(
+            f"{path}: oracle workflows must build only through the reviewed wrapper"
+        )
 
 
 def _audit_exact_wasm_bindgen_install(
@@ -249,6 +1196,393 @@ def audit_action_pins(path: Path, text: str) -> list[str]:
     return errors
 
 
+def _workflow_step_sequences(text: str) -> list[list[tuple[int, list[str]]]]:
+    """Return each active steps sequence as indentation-aware YAML blocks."""
+
+    lines = _without_commented_lines(text).splitlines()
+    sequences: list[list[tuple[int, list[str]]]] = []
+    for header_index, line in enumerate(lines):
+        indent = len(line) - len(line.lstrip(" "))
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
+        if entry is None or entry != ("steps", ""):
+            continue
+        body_end = len(lines)
+        for index in range(header_index + 1, len(lines)):
+            candidate = lines[index]
+            if not candidate.strip():
+                continue
+            candidate_indent = len(candidate) - len(candidate.lstrip(" "))
+            if candidate_indent <= indent:
+                body_end = index
+                break
+        starts = [
+            index
+            for index in range(header_index + 1, body_end)
+            if re.match(r"^\s*-(?:\s|$)", lines[index])
+        ]
+        if not starts:
+            sequences.append([])
+            continue
+        step_indent = min(
+            len(lines[index]) - len(lines[index].lstrip(" ")) for index in starts
+        )
+        starts = [
+            index
+            for index in starts
+            if len(lines[index]) - len(lines[index].lstrip(" ")) == step_indent
+        ]
+        blocks: list[tuple[int, list[str]]] = []
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else body_end
+            blocks.append((step_indent, lines[start:end]))
+        sequences.append(blocks)
+    return sequences
+
+
+def _workflow_job_step_sequences(
+    text: str,
+) -> tuple[list[tuple[str, list[tuple[int, list[str]]]]], list[str]]:
+    """Return the single inline step sequence for every workflow job.
+
+    This intentionally accepts only the block mapping form used by reviewed
+    workflows.  Flow mappings, duplicate ``jobs`` keys, reusable-workflow jobs,
+    and jobs whose steps cannot be scoped are rejected instead of being
+    silently omitted from the PR-head policy.
+    """
+
+    lines = _without_commented_lines(text).splitlines()
+    jobs_entries: list[int] = []
+    for index, line in enumerate(lines):
+        if not line.strip() or len(line) != len(line.lstrip(" ")):
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line))
+        if entry == ("jobs", ""):
+            jobs_entries.append(index)
+        elif entry is not None and entry[0] == "jobs":
+            return [], ["jobs must use a supported block mapping"]
+    if len(jobs_entries) != 1:
+        return [], ["workflow must contain exactly one block-mapped jobs section"]
+
+    start = jobs_entries[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and len(line) == len(line.lstrip(" ")):
+            end = index
+            break
+    body = [
+        (index, line)
+        for index, line in enumerate(lines[start + 1 : end], start=start + 1)
+        if line.strip()
+    ]
+    if not body:
+        return [], ["jobs section is empty"]
+    job_indent = min(len(line) - len(line.lstrip(" ")) for _, line in body)
+    starts: list[tuple[int, str]] = []
+    for index, line in body:
+        indent = len(line) - len(line.lstrip(" "))
+        if indent != job_indent:
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
+        if entry is None or entry[1] != "":
+            return [], ["every job must use a supported block mapping"]
+        starts.append((index, entry[0]))
+    if not starts:
+        return [], ["jobs section has no supported jobs"]
+    if len({name for _, name in starts}) != len(starts):
+        return [], ["job names must be unique"]
+
+    jobs: list[tuple[str, list[tuple[int, list[str]]]]] = []
+    errors: list[str] = []
+    for position, (job_start, name) in enumerate(starts):
+        job_end = starts[position + 1][0] if position + 1 < len(starts) else end
+        job_text = "\n".join(lines[job_start:job_end])
+        sequences = _workflow_step_sequences(job_text)
+        if len(sequences) != 1:
+            errors.append(f"job {name!r} must contain exactly one inline steps sequence")
+            continue
+        jobs.append((name, sequences[0]))
+    return jobs, errors
+
+
+def _yaml_unquote_scalar(text: str) -> str:
+    value = _strip_yaml_inline_comment(text).strip()
+    if value.startswith("'") and value.endswith("'") and len(value) >= 2:
+        return value[1:-1].replace("''", "'")
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        return value[1:-1]
+    return value
+
+
+def _step_mapping_entries(
+    step_indent: int, block: list[str]
+) -> list[tuple[str, str, int, int]]:
+    """Return top-level mapping entries from one YAML step."""
+
+    entries: list[tuple[str, str, int, int]] = []
+    mapping_indent = step_indent + 2
+    for index, line in enumerate(block):
+        indent = len(line) - len(line.lstrip(" "))
+        content = line.lstrip(" ")
+        effective_indent = indent
+        if index == 0 and indent == step_indent and content.startswith("-"):
+            content = content[1:].lstrip(" ")
+            effective_indent = mapping_indent
+        if effective_indent != mapping_indent or not content:
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(content))
+        if entry is not None:
+            entries.append((*entry, index, effective_indent))
+    return entries
+
+
+def _nested_mapping_values(
+    block: list[str],
+    parent_index: int,
+    parent_indent: int,
+    key: str,
+) -> list[str]:
+    """Return exact child values from one block-style YAML mapping."""
+
+    child_lines: list[tuple[int, str]] = []
+    for line in block[parent_index + 1 :]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= parent_indent:
+            break
+        child_lines.append((indent, line.lstrip(" ")))
+    if not child_lines:
+        return []
+    child_indent = min(indent for indent, _ in child_lines)
+    values: list[str] = []
+    for indent, content in child_lines:
+        if indent != child_indent:
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(content))
+        if entry is not None and entry[0] == key:
+            values.append(_yaml_unquote_scalar(entry[1]))
+    return values
+
+
+def _step_values(
+    entries: list[tuple[str, str, int, int]], key: str
+) -> list[str]:
+    return [_yaml_unquote_scalar(value) for name, value, _, _ in entries if name == key]
+
+
+def _audit_exact_job_step_sequence(
+    path: Path,
+    text: str,
+    job_name: str,
+    expected_uses: tuple[str, ...],
+    expected_step_sha256: tuple[str, ...],
+    errors: list[str],
+) -> None:
+    """Authenticate every complete step and action in one oracle-build job."""
+
+    jobs, job_errors = _workflow_job_step_sequences(text)
+    if job_errors:
+        errors.extend(f"{path}: {error}" for error in job_errors)
+        return
+    matches = [blocks for name, blocks in jobs if name == job_name]
+    if len(matches) != 1:
+        errors.append(f"{path}: expected exactly one supported {job_name!r} job")
+        return
+
+    job_blocks = _yaml_blocks(text, f"{job_name}:", 2)
+    if len(job_blocks) != 1:
+        errors.append(f"{path}: expected exactly one block-mapped {job_name!r} job")
+        return
+    for line in job_blocks[0].splitlines()[1:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent != 4:
+            continue
+        entry = _yaml_mapping_entry(
+            _strip_yaml_inline_comment(line.lstrip(" "))
+        )
+        if entry is not None and entry[0] == "uses":
+            errors.append(
+                f"{path}: oracle-build job {job_name!r} cannot call a reusable workflow"
+            )
+
+    actual: list[str] = []
+    actual_step_sha256: list[str] = []
+    unsupported = False
+    for step_indent, block in matches[0]:
+        canonical_block = "\n".join(
+            _strip_yaml_inline_comment(line) for line in block
+        )
+        actual_step_sha256.append(
+            hashlib.sha256(canonical_block.encode("utf-8")).hexdigest()
+        )
+        entries = _step_mapping_entries(step_indent, block)
+        mapping_indent = step_indent + 2
+        for index, line in enumerate(block):
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            content = line.lstrip(" ")
+            effective_indent = indent
+            if index == 0 and indent == step_indent and content.startswith("-"):
+                content = content[1:].lstrip(" ")
+                effective_indent = mapping_indent
+            if effective_indent != mapping_indent:
+                continue
+            if (
+                not content
+                or _yaml_mapping_entry(_strip_yaml_inline_comment(content)) is None
+            ):
+                unsupported = True
+        names = [name for name, _, _, _ in entries]
+        if len(names) != len(set(names)):
+            unsupported = True
+        uses = _step_values(entries, "uses")
+        if len(uses) > 1:
+            unsupported = True
+        elif uses:
+            actual.append(uses[0])
+    if unsupported:
+        errors.append(
+            f"{path}: oracle-build job {job_name!r} contains an unsupported step mapping"
+        )
+    if tuple(actual) != expected_uses:
+        errors.append(
+            f"{path}: oracle-build job {job_name!r} must use only the exact "
+            "ordered action allowlist"
+        )
+    if tuple(actual_step_sha256) != expected_step_sha256:
+        errors.append(
+            f"{path}: oracle-build job {job_name!r} must preserve the exact "
+            "reviewed step count, order, and complete step contents"
+        )
+
+
+def _audit_exact_workflow_sha256(
+    path: Path,
+    text: str,
+    expected_sha256: str,
+    errors: list[str],
+) -> None:
+    """Authenticate every byte of a reviewed oracle workflow."""
+
+    actual_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if actual_sha256 != expected_sha256:
+        errors.append(
+            f"{path}: complete active workflow and execution context must match "
+            "the reviewed SHA-256"
+        )
+
+
+def _checkout_step_is_exact(
+    step_indent: int,
+    block: list[str],
+    expected_expression: str,
+) -> bool:
+    entries = _step_mapping_entries(step_indent, block)
+    if [name for name, _, _, _ in entries] != ["uses", "with"]:
+        return False
+    with_entries = [entry for entry in entries if entry[0] == "with"]
+    if len(with_entries) != 1 or _yaml_unquote_scalar(with_entries[0][1]) != "":
+        return False
+    _, _, parent_index, parent_indent = with_entries[0]
+    return _nested_mapping_values(
+        block,
+        parent_index,
+        parent_indent,
+        "ref",
+    ) == [expected_expression]
+
+
+def _verifier_step_is_exact(
+    step_indent: int,
+    block: list[str],
+    expected_expression: str,
+) -> bool:
+    entries = _step_mapping_entries(step_indent, block)
+    if [name for name, _, _, _ in entries] != ["name", "shell", "env", "run"]:
+        return False
+    if _step_values(entries, "name") != ["Verify exact source revision"]:
+        return False
+    if _step_values(entries, "shell") != ["bash"]:
+        return False
+    if _step_values(entries, "run") != [
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"'
+    ]:
+        return False
+    env_entries = [entry for entry in entries if entry[0] == "env"]
+    if len(env_entries) != 1 or _yaml_unquote_scalar(env_entries[0][1]) != "":
+        return False
+    _, _, parent_index, parent_indent = env_entries[0]
+    return _nested_mapping_values(
+        block,
+        parent_index,
+        parent_indent,
+        "EXPECTED_SHA",
+    ) == [expected_expression]
+
+
+def audit_pr_head_checkouts(path: Path, text: str) -> list[str]:
+    """Require every PR job to test the actual head commit, never a merge ref."""
+
+    active = _without_commented_lines(text)
+    triggers, trigger_errors = _workflow_trigger_names(active)
+    errors = [f"{path}: {error}" for error in trigger_errors]
+    if "pull_request_target" in triggers:
+        errors.append(
+            f"{path}: pull_request_target is forbidden by the exact PR-head policy"
+        )
+    if "pull_request" not in triggers:
+        return errors
+    expected_expression = "${{ github.event.pull_request.head.sha || github.sha }}"
+    jobs, job_errors = _workflow_job_step_sequences(active)
+    errors.extend(f"{path}: {error}" for error in job_errors)
+    for job_name, blocks in jobs:
+        checkout_count = 0
+        for index, (step_indent, block) in enumerate(blocks):
+            entries = _step_mapping_entries(step_indent, block)
+            uses = _step_values(entries, "uses")
+            if not any(value.startswith("actions/checkout@") for value in uses):
+                continue
+            checkout_count += 1
+            if not _checkout_step_is_exact(
+                step_indent,
+                block,
+                expected_expression,
+            ):
+                errors.append(
+                    f"{path}: job {job_name!r} checkout must use the exact "
+                    "pull-request head SHA"
+                )
+            if index + 1 >= len(blocks):
+                errors.append(
+                    f"{path}: job {job_name!r} checkout needs an immediate "
+                    "exact-SHA verifier"
+                )
+                continue
+            verifier_indent, verifier = blocks[index + 1]
+            if not _verifier_step_is_exact(
+                verifier_indent,
+                verifier,
+                expected_expression,
+            ):
+                errors.append(
+                    f"{path}: job {job_name!r} checkout needs an immediate "
+                    "exact-SHA verifier"
+                )
+            if "$GITHUB_SHA" in "\n".join(verifier):
+                errors.append(
+                    f"{path}: PR source verification must not use the synthetic GITHUB_SHA"
+                )
+        if checkout_count == 0:
+            errors.append(
+                f"{path}: pull-request job {job_name!r} has no guarded checkout step"
+            )
+    return errors
+
+
 def _cargo_fuzz_commands(text: str) -> list[tuple[int, str]]:
     lines = text.splitlines()
     commands: list[tuple[int, str]] = []
@@ -337,6 +1671,27 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     """Require exact identities and bounded pilot/full rendering campaigns."""
 
     errors: list[str] = []
+    _audit_exact_workflow_sha256(
+        path,
+        text,
+        ORACLE_RENDER_WORKFLOW_SHA256,
+        errors,
+    )
+    active = _without_commented_lines(text)
+    _audit_exact_job_step_sequence(
+        path,
+        active,
+        "locked-linux-oracle",
+        (
+            ORACLE_CHECKOUT_ACTION,
+            ORACLE_SETUP_PYTHON_ACTION,
+            ORACLE_BUILDX_ACTION,
+            ORACLE_UPLOAD_ARTIFACT_ACTION,
+        ),
+        ORACLE_RENDER_STEP_SHA256,
+        errors,
+    )
+    _audit_oracle_buildx_setup(path, active, errors)
     required = {
         f'python-version: "{RENDER_ORACLE_PYTHON_VERSION}"': (
             "must pin the complete Python patch version"
@@ -359,6 +1714,72 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ),
         'assert document["image_identity_status"] == "pinned_match"': (
             "normal oracle builds must require pinned_match"
+        ),
+        'assert document["schema"] == "rxls.render-oracle-container-build.v3"': (
+            "must verify the versioned reproducible image-build evidence"
+        ),
+        'assert reproducibility["build_count"] == 2': (
+            "must require two isolated canonical image builds"
+        ),
+        'assert len(reproducibility["identities"]) == 2': (
+            "must require two complete normalized image identities"
+        ),
+        'assert reproducibility["identities"][0] == reproducibility["identities"][1]': (
+            "must compare both complete normalized image identities"
+        ),
+        'assert reproducibility["config_ids"] == [image_id, image_id]': (
+            "must bind both image config digests to the loaded image ID"
+        ),
+        'assert len(reproducibility["identity_sha256"]) == 2': (
+            "must require exactly two complete image identity hashes"
+        ),
+        'assert len(set(reproducibility["identity_sha256"])) == 1': (
+            "must require identical complete image identities"
+        ),
+        'assert reproducibility["manifest_digests"] == [manifest_digest, manifest_digest]': (
+            "must require identical complete image manifest digests"
+        ),
+        'assert reproducibility["descriptor_digests"] == [manifest_digest, manifest_digest]': (
+            "must bind both image descriptors to the manifest digest"
+        ),
+        'assert len(reproducibility["descriptor_media_types"]) == 2': (
+            "must require exactly two descriptor media types"
+        ),
+        'assert len(reproducibility["descriptor_sizes"]) == 2': (
+            "must require exactly two descriptor sizes"
+        ),
+        'assert len(reproducibility["rootfs_diff_ids_sha256"]) == 2': (
+            "must require exactly two root filesystem DiffID sequences"
+        ),
+        'assert len(set(reproducibility["rootfs_diff_ids_sha256"])) == 1': (
+            "must require identical root filesystem DiffID sequences"
+        ),
+        'assert document["expected_manifest_digest"] == manifest_digest': (
+            "normal oracle builds must require the pinned manifest digest"
+        ),
+        'assert document["image_identity_status"] == "bootstrap_capture_required"': (
+            "bootstrap mode must accept only an initially unpinned image"
+        ),
+        'assert document["expected_manifest_digest"] is None': (
+            "bootstrap mode must not claim a reviewed manifest digest"
+        ),
+        '"rxls.render-oracle-container-execution.v3"': (
+            "campaign rows must require the paired runtime image identity schema"
+        ),
+        'row["image"]["manifest_digest"] for row in adapters': (
+            "campaign rows must bind the observed image manifest digest"
+        ),
+        'row["image"]["expected_manifest_digest"]': (
+            "campaign rows must bind the expected image manifest digest"
+        ),
+        'oracle_lock["schema"] == "rxls.render-oracle-container-identity.v2"': (
+            "campaign configuration must require the paired image identity schema"
+        ),
+        '"expected_manifest_digest": build["built_manifest_digest"]': (
+            "campaign configuration must bind the expected manifest pin"
+        ),
+        '"manifest_digest": build["built_manifest_digest"]': (
+            "campaign configuration must bind the observed manifest digest"
         ),
         'assert host_tools["identity_status"] == "pinned_match"': (
             "normal campaigns must require the pinned host identity"
@@ -457,7 +1878,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'authored_gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256': (
             "must bind authored-print text evidence to the pinned PDF inspector"
         ),
-        '"schema": "rxls.render-oracle-hosted-campaign.v4"': (
+        '"schema": "rxls.render-oracle-hosted-campaign.v5"': (
             "must emit the aggregate-only hosted campaign contract"
         ),
         '"acquired_corpus_included": False': (
@@ -478,13 +1899,22 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'gate["evidence"]["oracle_image_config_digest"]': (
             "must bind absolute-gate evidence to the pinned OCI image"
         ),
+        'gate["evidence"]["oracle_image_manifest_digest"]': (
+            "must bind absolute-gate evidence to the pinned image manifest"
+        ),
+        '"source_commit": build["source_commit"]': (
+            "aggregate evidence must preserve the exact source commit"
+        ),
+        '"wrapper_sha256": build["wrapper_sha256"]': (
+            "aggregate evidence must preserve the authenticated wrapper identity"
+        ),
         'gate["evidence"]["pdffonts_sha256"] == pdffonts_sha256': (
             "must bind absolute-gate font inspection to the pinned host tool"
         ),
         "compression-level: 9": "must bound aggregate artifact transfer size",
     }
     for snippet, message in required.items():
-        if snippet not in text:
+        if snippet not in active:
             errors.append(f"{path}: {message}")
     if re.search(r"python-version:\s*[\"']?3\.13[\"']?\s*$", text, re.MULTILINE):
         errors.append(f"{path}: mutable Python minor selectors are forbidden")
@@ -616,6 +2046,12 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     """Require scoped, fail-closed host and OCI rendering identity gates."""
 
     errors: list[str] = []
+    _audit_exact_workflow_sha256(
+        path,
+        text,
+        ORACLE_HARDENING_WORKFLOW_SHA256,
+        errors,
+    )
     active = _without_commented_lines(text)
 
     pull_request = _single_yaml_block(
@@ -720,6 +2156,18 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     image_job = _single_yaml_block(
         path, active, "oracle-image:", 2, "oracle-image job", errors
     )
+    _audit_exact_job_step_sequence(
+        path,
+        active,
+        "oracle-image",
+        (
+            ORACLE_CHECKOUT_ACTION,
+            ORACLE_BUILDX_ACTION,
+            ORACLE_UPLOAD_ARTIFACT_ACTION,
+        ),
+        ORACLE_HARDENING_IMAGE_STEP_SHA256,
+        errors,
+    )
     image_runners = re.findall(
         r"^\s{4}runs-on:\s*(\S+)\s*$", image_job, re.MULTILINE
     )
@@ -727,6 +2175,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         errors.append(f"{path}: oracle-image job must use only ubuntu-24.04")
     if "    name: locked LibreOffice oracle image" not in image_job.splitlines():
         errors.append(f"{path}: oracle-image job must retain its reviewed identity")
+    _audit_oracle_buildx_setup(path, image_job, errors)
     image_policy_step = _single_yaml_block(
         path,
         image_job,
@@ -754,11 +2203,72 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "BOOTSTRAP_ARGS+=(--bootstrap-identities)": (
             "oracle image bootstrap must pass the explicit bootstrap argument"
         ),
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"': (
+            "oracle image evidence must bind to the exact checked-out source"
+        ),
+        'test -z "$(git status --porcelain=v1 --untracked-files=all)"': (
+            "oracle image evidence must come from a clean source tree"
+        ),
+        'assert evidence["source_commit"] == expected_source, evidence': (
+            "oracle image evidence must authenticate its exact source commit"
+        ),
+        (
+            'assert evidence["wrapper_sha256"] == live_wrapper_sha256 '
+            '== lock["wrapper"]["sha256"], evidence'
+        ): "oracle image evidence must authenticate the reviewed wrapper",
         'assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence': (
             "unpinned image evidence must have the bootstrap status"
         ),
+        'assert evidence["schema"] == "rxls.render-oracle-container-build.v3", evidence': (
+            "oracle image evidence must use the reproducible-build schema"
+        ),
+        'assert reproducibility["build_count"] == 2, reproducibility': (
+            "oracle image evidence must prove two isolated builds"
+        ),
+        'assert len(reproducibility["identities"]) == 2, reproducibility': (
+            "oracle image evidence must contain both normalized identities"
+        ),
+        'assert reproducibility["identities"][0] == reproducibility["identities"][1], reproducibility': (
+            "normalized image identities must match across isolated builds"
+        ),
+        'assert reproducibility["config_ids"] == [evidence["built_image_id"]] * 2, reproducibility': (
+            "both image config digests must bind to the loaded image ID"
+        ),
+        'assert len(reproducibility["identity_sha256"]) == 2, reproducibility': (
+            "oracle image evidence must contain exactly two identity hashes"
+        ),
+        'assert len(set(reproducibility["identity_sha256"])) == 1, reproducibility': (
+            "complete image identities must match across isolated builds"
+        ),
+        'assert reproducibility["manifest_digests"] == [evidence["built_manifest_digest"]] * 2, reproducibility': (
+            "both image manifest digests must bind to the built manifest"
+        ),
+        'assert reproducibility["descriptor_digests"] == reproducibility["manifest_digests"], reproducibility': (
+            "image descriptors must bind the matching manifest digests"
+        ),
+        'assert len(reproducibility["descriptor_media_types"]) == 2, reproducibility': (
+            "oracle image evidence must contain exactly two descriptor media types"
+        ),
+        'assert len(reproducibility["descriptor_sizes"]) == 2, reproducibility': (
+            "oracle image evidence must contain exactly two descriptor sizes"
+        ),
+        'assert len(reproducibility["rootfs_diff_ids_sha256"]) == 2, reproducibility': (
+            "oracle image evidence must contain exactly two DiffID hashes"
+        ),
+        'assert len(set(reproducibility["rootfs_diff_ids_sha256"])) == 1, reproducibility': (
+            "root filesystem DiffIDs must match across isolated builds"
+        ),
+        'assert evidence["built_manifest_digest"] == reproducibility["manifest_digests"][0], evidence': (
+            "build evidence must expose the matched manifest digest"
+        ),
         'assert evidence["expected_image_id"] is None, evidence': (
             "unpinned image evidence must not claim a reviewed identity"
+        ),
+        'assert evidence["expected_manifest_digest"] is None, evidence': (
+            "unpinned image evidence must not claim a reviewed manifest"
+        ),
+        'assert evidence["expected_manifest_digest"] == expected_manifest == evidence["built_manifest_digest"], evidence': (
+            "pinned image evidence must match the reviewed manifest digest"
         ),
         "raise SystemExit(1)": "unpinned oracle image capture must fail closed",
         'assert evidence["image_identity_status"] == "pinned_match", evidence': (
@@ -797,6 +2307,12 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     )
     if (
         "if: always()" not in image_upload
+        or (
+            "name: render-oracle-image-"
+            "${{ github.event.pull_request.head.sha || github.sha }}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        )
+        not in image_upload
         or "path: target/render-oracle-image-build.json" not in image_upload
         or "if-no-files-found: error" not in image_upload
     ):
@@ -959,8 +2475,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ".github/workflows/render-browser.yml": (
             "must require the exact-SHA push render-browser path"
         ),
-        "'[.head_sha, .event, .conclusion, .status, .path] | @tsv'": (
-            "must revalidate hosted run SHA, event, conclusion, status, and path"
+        "'[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv'": (
+            "must revalidate hosted run SHA, event, conclusion, status, path, "
+            "and attempt"
         ),
         "--workflow render-oracle.yml": (
             "must require a successful exact-SHA Render Oracle run"
@@ -971,8 +2488,11 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         '&& "$run_path" == ".github/workflows/render-oracle.yml"': (
             "must validate the Render Oracle workflow path"
         ),
-        'artifact_name="render-oracle-${GITHUB_SHA}-full"': (
-            "must select only the exact-SHA full-campaign artifact"
+        '"$run_attempt" =~ ^[1-9][0-9]*$': (
+            "must require a positive immutable hosted run attempt"
+        ),
+        'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full"': (
+            "must select only the exact-SHA, run-bound full-campaign artifact"
         ),
         'actions/runs/$run_id/artifacts': (
             "must inspect the selected run's artifact metadata"
@@ -1139,8 +2659,9 @@ def audit_repository(root: Path) -> list[str]:
     errors: list[str] = []
     for path in workflows:
         text = path.read_text(encoding="utf-8")
-        errors.extend(audit_action_pins(path.relative_to(root), text))
         relative = path.relative_to(root)
+        errors.extend(audit_action_pins(relative, text))
+        errors.extend(audit_pr_head_checkouts(relative, text))
         if path.name == "fuzz.yml":
             errors.extend(audit_fuzz_workflow(relative, text))
         elif path.name != "release.yml":

@@ -21,8 +21,8 @@ from typing import Any, Sequence
 
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
 OUTPUT_SCHEMA = "rxls.authored-print-parity.v1"
-CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v1"
-CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v2"
+CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
+CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
 CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -259,16 +259,41 @@ def _text_box_histogram(
 
 def _container_identity(configuration: dict[str, Any]) -> dict[str, Any]:
     identity = configuration.get("oracle_lock")
-    if not isinstance(identity, dict) or identity.get("schema") != CONTAINER_IDENTITY_SCHEMA:
+    if (
+        not isinstance(identity, dict)
+        or set(identity)
+        != {
+            "build_contract_sha256",
+            "font_pack_sha256",
+            "image",
+            "libreoffice",
+            "lock_file_sha256",
+            "pdf_font_inspector",
+            "runtime",
+            "schema",
+        }
+        or identity.get("schema") != CONTAINER_IDENTITY_SCHEMA
+    ):
         raise GateError("oracle_identity")
     image = identity.get("image")
-    if not isinstance(image, dict):
+    if not isinstance(image, dict) or set(image) != {
+        "architecture",
+        "config_digest",
+        "expected_config_digest",
+        "expected_manifest_digest",
+        "identity_status",
+        "manifest_digest",
+    }:
         raise GateError("oracle_image")
-    digest = image.get("config_digest")
+    config_digest = image.get("config_digest")
+    manifest_digest = image.get("manifest_digest")
     if (
-        not isinstance(digest, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
-        or image.get("expected_config_digest") != digest
+        not isinstance(config_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest) is None
+        or image.get("expected_config_digest") != config_digest
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+        or image.get("expected_manifest_digest") != manifest_digest
         or image.get("identity_status") != "pinned_match"
         or image.get("architecture") != "linux/amd64"
     ):
@@ -386,13 +411,35 @@ def _font_attestation(row: dict[str, Any]) -> int:
 def _adapter(row: dict[str, Any], identity: dict[str, Any]) -> None:
     adapter = row.get("oracle_adapter")
     image = adapter.get("image") if isinstance(adapter, dict) else None
-    expected_image = identity["image"]["config_digest"]
+    expected_config = identity["image"]["config_digest"]
+    expected_manifest = identity["image"]["manifest_digest"]
     if (
         not isinstance(adapter, dict)
+        or set(adapter)
+        != {
+            "font_pack_sha256",
+            "image",
+            "lock_file_sha256",
+            "lock_sha256",
+            "oracle",
+            "runtime",
+            "schema",
+        }
         or adapter.get("schema") != CONTAINER_EXECUTION_SCHEMA
         or not isinstance(image, dict)
-        or image.get("id") != expected_image
-        or image.get("expected_id") != expected_image
+        or set(image)
+        != {
+            "architecture",
+            "expected_id",
+            "expected_manifest_digest",
+            "id",
+            "identity_status",
+            "manifest_digest",
+        }
+        or image.get("id") != expected_config
+        or image.get("expected_id") != expected_config
+        or image.get("manifest_digest") != expected_manifest
+        or image.get("expected_manifest_digest") != expected_manifest
         or image.get("identity_status") != "pinned_match"
         or image.get("architecture") != "linux/amd64"
         or adapter.get("lock_sha256") != identity["build_contract_sha256"]
@@ -614,6 +661,7 @@ def evaluate(
             "font_pack_sha256": font_pack_sha,
             "oracle_build_contract_sha256": identity["build_contract_sha256"],
             "oracle_image_config_digest": identity["image"]["config_digest"],
+            "oracle_image_manifest_digest": identity["image"]["manifest_digest"],
             "oracle_lock_file_sha256": identity["lock_file_sha256"],
             "oracle_libreoffice_artifact_sha256": identity["libreoffice"][
                 "artifact_sha256"

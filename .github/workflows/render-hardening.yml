@@ -41,6 +41,13 @@ jobs:
       RXLS_REQUIRE_POPPLER: "1"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.RENDER_MSRV }}
@@ -111,12 +118,39 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up the pinned Buildx client
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          name: rxls-oracle-client
+          version: v0.35.0
+          driver: docker-container
+          platforms: linux/amd64
+          driver-opts: |
+            image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+            provenance-add-gha=false
+          buildkitd-flags: --oci-worker-snapshotter=overlayfs
       - name: Enforce hosted workflow policy
         run: python3 scripts/check_workflow_policy.py
       - name: Build and verify the locked oracle image
         shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          LIVE_WRAPPER_SHA256="$(sha256sum scripts/run-render-oracle-container.py | awk '{print $1}')"
+          LOCK_WRAPPER_SHA256="$(
+            python3 -c 'import json; print(json.load(open("scripts/render-oracle-container/lock.json"))["wrapper"]["sha256"])'
+          )"
+          test "$LIVE_WRAPPER_SHA256" = "$LOCK_WRAPPER_SHA256"
           mkdir -p target
           EXPECTED_IMAGE_ID="$(
             python3 -c 'import json; print(json.dumps(json.load(open("scripts/render-oracle-container/lock.json"))["built_image"]["expected_id"], separators=(",", ":")))'
@@ -134,26 +168,59 @@ jobs:
             "${BOOTSTRAP_ARGS[@]}" \
             > target/render-oracle-image-build.json
           python3 - <<'PY'
+          import hashlib
           import json
+          import os
           import pathlib
           import sys
 
           lock = json.loads(pathlib.Path("scripts/render-oracle-container/lock.json").read_text())
           evidence = json.loads(pathlib.Path("target/render-oracle-image-build.json").read_text())
+          expected_source = os.environ["EXPECTED_SOURCE_SHA"]
+          live_wrapper_sha256 = hashlib.sha256(
+              pathlib.Path("scripts/run-render-oracle-container.py").read_bytes()
+          ).hexdigest()
           expected = lock["built_image"]["expected_id"]
+          expected_manifest = lock["built_image"]["expected_manifest_digest"]
+          reproducibility = evidence["reproducibility"]
+          assert evidence["schema"] == "rxls.render-oracle-container-build.v3", evidence
+          assert evidence["source_commit"] == expected_source, evidence
+          assert evidence["wrapper_sha256"] == live_wrapper_sha256 == lock["wrapper"]["sha256"], evidence
+          assert reproducibility["status"] == "matched", reproducibility
+          assert reproducibility["build_count"] == 2, reproducibility
+          assert reproducibility["export_destination"] == "stdout", reproducibility
+          assert reproducibility["export_tar"] is True, reproducibility
+          assert reproducibility["export_media_type"] == "application/vnd.docker.distribution.manifest.v2+json", reproducibility
+          assert len(reproducibility["identities"]) == 2, reproducibility
+          assert reproducibility["identities"][0] == reproducibility["identities"][1], reproducibility
+          assert reproducibility["config_ids"] == [evidence["built_image_id"]] * 2, reproducibility
+          assert len(reproducibility["identity_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["identity_sha256"])) == 1, reproducibility
+          assert reproducibility["manifest_digests"] == [evidence["built_manifest_digest"]] * 2, reproducibility
+          assert reproducibility["descriptor_digests"] == reproducibility["manifest_digests"], reproducibility
+          assert len(reproducibility["descriptor_media_types"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_media_types"])) == 1, reproducibility
+          assert len(reproducibility["descriptor_sizes"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_sizes"])) == 1, reproducibility
+          assert len(reproducibility["rootfs_diff_ids_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["rootfs_diff_ids_sha256"])) == 1, reproducibility
+          assert evidence["built_manifest_digest"] == reproducibility["manifest_digests"][0], evidence
           if expected is None:
+              assert expected_manifest is None, lock
               assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence
               assert evidence["expected_image_id"] is None, evidence
+              assert evidence["expected_manifest_digest"] is None, evidence
               print("Review and pin the uploaded oracle image identity before this gate can pass.", file=sys.stderr)
               raise SystemExit(1)
           assert evidence["image_identity_status"] == "pinned_match", evidence
           assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence
+          assert evidence["expected_manifest_digest"] == expected_manifest == evidence["built_manifest_digest"], evidence
           PY
       - name: Upload oracle image identity evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: render-oracle-image-${{ github.run_id }}-${{ github.run_attempt }}
+          name: render-oracle-image-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/render-oracle-image-build.json
           if-no-files-found: error
           retention-days: 14
@@ -163,6 +230,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.RENDER_MSRV }}
@@ -205,6 +279,13 @@ jobs:
       FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '10' || '60' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.FUZZ_NIGHTLY_VERSION }}

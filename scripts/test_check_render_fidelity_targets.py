@@ -143,6 +143,7 @@ def container_report_document(count: int = 4) -> dict[str, object]:
     report = report_document(count)
     font_pack_sha256 = report["configuration"]["font_pack"]["pack_sha256"]
     image_id = "sha256:" + "2" * 64
+    manifest_digest = "sha256:" + "6" * 64
     oracle = {
         "artifact_sha256": MODULE.CONTAINER_LIBREOFFICE_ARTIFACT_SHA256,
         "name": "LibreOffice",
@@ -155,7 +156,9 @@ def container_report_document(count: int = 4) -> dict[str, object]:
             "architecture": "linux/amd64",
             "config_digest": image_id,
             "expected_config_digest": image_id,
+            "expected_manifest_digest": manifest_digest,
             "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "libreoffice": oracle,
         "lock_file_sha256": "4" * 64,
@@ -172,8 +175,10 @@ def container_report_document(count: int = 4) -> dict[str, object]:
         "image": {
             "architecture": "linux/amd64",
             "expected_id": image_id,
+            "expected_manifest_digest": manifest_digest,
             "id": image_id,
             "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "lock_file_sha256": "4" * 64,
         "lock_sha256": "3" * 64,
@@ -223,6 +228,10 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
             result["evidence"]["oracle_image_config_digest"],
             "sha256:" + "2" * 64,
         )
+        self.assertEqual(
+            result["evidence"]["oracle_image_manifest_digest"],
+            "sha256:" + "6" * 64,
+        )
         self.assertEqual(result["evidence"]["pdffonts_sha256"], "5" * 64)
 
     def test_container_identity_is_fail_closed_for_missing_mixed_and_unpinned_rows(self) -> None:
@@ -244,6 +253,48 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
             "identity_status"
         ] = "runtime_verified"
         with self.assertRaisesRegex(MODULE.GateError, "configuration_container_image"):
+            self.evaluate_small(report)
+
+        report = container_report_document()
+        del report["configuration"]["oracle_lock"]["image"]["manifest_digest"]
+        with self.assertRaisesRegex(
+            MODULE.GateError, "configuration_container_image"
+        ):
+            self.evaluate_small(report)
+
+        report = container_report_document()
+        report["configuration"]["oracle_lock"]["image"][
+            "expected_manifest_digest"
+        ] = "sha256:" + "7" * 64
+        with self.assertRaisesRegex(
+            MODULE.GateError, "configuration_container_image"
+        ):
+            self.evaluate_small(report)
+
+        report = container_report_document()
+        report["files"][0]["oracle_adapter"]["image"]["manifest_digest"] = (
+            "sha256:" + "7" * 64
+        )
+        report["files"][0]["oracle_adapter"]["image"][
+            "expected_manifest_digest"
+        ] = "sha256:" + "7" * 64
+        with self.assertRaisesRegex(MODULE.GateError, "file_oracle_adapter_identity"):
+            self.evaluate_small(report)
+
+        report = container_report_document()
+        report["files"][0]["oracle_adapter"][
+            "schema"
+        ] = "rxls.render-oracle-container-execution.v2"
+        with self.assertRaisesRegex(MODULE.GateError, "file_oracle_adapter_identity"):
+            self.evaluate_small(report)
+
+        report = container_report_document()
+        report["configuration"]["oracle_lock"][
+            "schema"
+        ] = "rxls.render-oracle-container-identity.v1"
+        with self.assertRaisesRegex(
+            MODULE.GateError, "configuration_container_identity"
+        ):
             self.evaluate_small(report)
 
         report = container_report_document()

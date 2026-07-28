@@ -28,6 +28,7 @@ MODULE = load_module()
 
 def report_document() -> dict[str, object]:
     image_id = "sha256:" + "1" * 64
+    manifest_digest = "sha256:" + "4" * 64
     identity = {
         "build_contract_sha256": "2" * 64,
         "font_pack_sha256": "3" * 64,
@@ -35,7 +36,9 @@ def report_document() -> dict[str, object]:
             "architecture": "linux/amd64",
             "config_digest": image_id,
             "expected_config_digest": image_id,
+            "expected_manifest_digest": manifest_digest,
             "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "libreoffice": {
             "artifact_sha256": MODULE.CONTAINER_LIBREOFFICE_ARTIFACT_SHA256,
@@ -52,8 +55,10 @@ def report_document() -> dict[str, object]:
         "image": {
             "architecture": "linux/amd64",
             "expected_id": image_id,
+            "expected_manifest_digest": manifest_digest,
             "id": image_id,
             "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "lock_file_sha256": "5" * 64,
         "lock_sha256": "2" * 64,
@@ -183,6 +188,10 @@ class AuthoredPrintGateTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["similarity_mean_ppm"], 1_000_000)
         self.assertEqual(result["metrics"]["text_box_match_coverage_ppm"], 1_000_000)
         self.assertEqual(
+            result["evidence"]["oracle_image_manifest_digest"],
+            "sha256:" + "4" * 64,
+        )
+        self.assertEqual(
             result["thresholds"],
             {
                 "edge_f1_min_ppm": 970_000,
@@ -256,6 +265,67 @@ class AuthoredPrintGateTests(unittest.TestCase):
         report = report_document()
         report["configuration"]["oracle_lock"]["image"]["expected_config_digest"] = None
         with self.assertRaisesRegex(MODULE.GateError, "oracle_image"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        del report["configuration"]["oracle_lock"]["image"]["manifest_digest"]
+        with self.assertRaisesRegex(MODULE.GateError, "oracle_image"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["configuration"]["oracle_lock"]["image"][
+            "expected_manifest_digest"
+        ] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(MODULE.GateError, "oracle_image"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["files"][0]["oracle_adapter"]["image"]["manifest_digest"] = (
+            "sha256:" + "0" * 64
+        )
+        report["files"][0]["oracle_adapter"]["image"][
+            "expected_manifest_digest"
+        ] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(MODULE.GateError, "oracle_adapter"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["files"][0]["oracle_adapter"][
+            "schema"
+        ] = "rxls.render-oracle-container-execution.v2"
+        with self.assertRaisesRegex(MODULE.GateError, "oracle_adapter"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["configuration"]["oracle_lock"][
+            "schema"
+        ] = "rxls.render-oracle-container-identity.v1"
+        with self.assertRaisesRegex(MODULE.GateError, "oracle_identity"):
             MODULE.evaluate(
                 report,
                 report_sha256="a" * 64,

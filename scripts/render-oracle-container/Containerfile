@@ -1,9 +1,10 @@
 # The architecture-specific manifest digest is locked in lock.json. The tag is
 # documentary; the digest is authoritative.
+ARG SOURCE_DATE_EPOCH=1783900800
 FROM --platform=linux/amd64 docker.io/library/debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e
 
 ARG ORACLE_LOCK_SHA256
-ARG SOURCE_DATE_EPOCH=1783900800
+ARG SOURCE_DATE_EPOCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -80,8 +81,15 @@ RUN set -eux; \
       /tmp/libreoffice \
       "${archive}" \
       /var/lib/apt/lists/* \
-      /var/cache/apt/*; \
-    rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/*
+      /var/cache/apt/* \
+      /var/cache/debconf/* \
+      /var/cache/fontconfig/*; \
+    rm -f \
+      /var/cache/ldconfig/aux-cache \
+      /var/lib/dpkg/status-old \
+      /var/log/alternatives.log \
+      /var/log/dpkg.log \
+      /var/log/apt/*
 
 COPY --chmod=0555 oracle-entrypoint.sh /opt/rxls/oracle-entrypoint.sh
 COPY --chmod=0444 profile/registrymodifications.xcu /opt/rxls/profile/registrymodifications.xcu

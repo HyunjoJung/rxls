@@ -82,8 +82,8 @@ ORACLE_PROFILE_PATH = ROOT / "scripts" / "render-oracle-host-profile.xcu"
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
 RENDER_MANIFEST_SCHEMA = "rxls.render.bundle.v1"
 CONTAINER_OUTPUT_SCHEMA = "rxls.render-oracle-container-output.v2"
-CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v2"
-CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v1"
+CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
+CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -2200,22 +2200,34 @@ def validate_libreoffice_adapter_output(
         raise HarnessError("libreoffice_adapter_export_contract")
     image = _exact_keys(
         execution.get("image"),
-        {"architecture", "expected_id", "id", "identity_status", "lock_sha256"},
+        {
+            "architecture",
+            "expected_id",
+            "expected_manifest_digest",
+            "id",
+            "identity_status",
+            "lock_sha256",
+            "manifest_digest",
+        },
         "libreoffice_adapter_image_keys",
     )
     image_id = image.get("id")
     expected_image_id = image.get("expected_id")
-    if not isinstance(image_id, str) or not re.fullmatch(
-        r"sha256:[0-9a-f]{64}", image_id
+    manifest_digest = image.get("manifest_digest")
+    expected_manifest_digest = image.get("expected_manifest_digest")
+    if (
+        not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        or expected_image_id != image_id
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+        or expected_manifest_digest != manifest_digest
     ):
         raise HarnessError("libreoffice_adapter_image_identity")
-    if expected_image_id is not None and expected_image_id != image_id:
-        raise HarnessError("libreoffice_adapter_image_identity")
-    expected_status = "pinned_match" if expected_image_id is not None else "runtime_verified"
     if (
         image.get("architecture") != "linux/amd64"
         or image.get("lock_sha256") != lock_sha256
-        or image.get("identity_status") != expected_status
+        or image.get("identity_status") != "pinned_match"
     ):
         raise HarnessError("libreoffice_adapter_image_identity")
     if execution.get("runtime") not in {"docker", "podman"}:
@@ -2311,8 +2323,10 @@ def validate_libreoffice_adapter_output(
         "image": {
             "architecture": "linux/amd64",
             "expected_id": expected_image_id,
+            "expected_manifest_digest": expected_manifest_digest,
             "id": image_id,
-            "identity_status": expected_status,
+            "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "lock_sha256": lock_sha256,
         "lock_file_sha256": lock_file_sha256,
@@ -2349,26 +2363,29 @@ def _container_identity_from_adapter(
         raise HarnessError("libreoffice_adapter_aggregate_identity")
     image = _exact_keys(
         row.get("image"),
-        {"architecture", "expected_id", "id", "identity_status"},
+        {
+            "architecture",
+            "expected_id",
+            "expected_manifest_digest",
+            "id",
+            "identity_status",
+            "manifest_digest",
+        },
         "libreoffice_adapter_aggregate_image",
     )
     image_id = image.get("id")
     expected_image_id = image.get("expected_id")
+    manifest_digest = image.get("manifest_digest")
+    expected_manifest_digest = image.get("expected_manifest_digest")
     if (
         image.get("architecture") != "linux/amd64"
         or not isinstance(image_id, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-        or (
-            expected_image_id is not None
-            and (
-                expected_image_id != image_id
-                or image.get("identity_status") != "pinned_match"
-            )
-        )
-        or (
-            expected_image_id is None
-            and image.get("identity_status") != "runtime_verified"
-        )
+        or expected_image_id != image_id
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+        or expected_manifest_digest != manifest_digest
+        or image.get("identity_status") != "pinned_match"
     ):
         raise HarnessError("libreoffice_adapter_aggregate_image")
     oracle = _exact_keys(
@@ -2404,7 +2421,9 @@ def _container_identity_from_adapter(
             "architecture": "linux/amd64",
             "config_digest": image_id,
             "expected_config_digest": expected_image_id,
-            "identity_status": image["identity_status"],
+            "expected_manifest_digest": expected_manifest_digest,
+            "identity_status": "pinned_match",
+            "manifest_digest": manifest_digest,
         },
         "libreoffice": dict(oracle),
         "lock_file_sha256": _locked_sha256(

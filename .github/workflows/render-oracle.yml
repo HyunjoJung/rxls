@@ -95,6 +95,17 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13.14"
+      - name: Set up the pinned Buildx client
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          name: rxls-oracle-client
+          version: v0.35.0
+          driver: docker-container
+          platforms: linux/amd64
+          driver-opts: |
+            image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+            provenance-add-gha=false
+          buildkitd-flags: --oci-worker-snapshotter=overlayfs
       - name: Verify container, adapter, corpus, and font contracts
         shell: bash
         run: |
@@ -232,7 +243,17 @@ jobs:
           PY
       - name: Build and inspect the locked oracle image
         shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          LIVE_WRAPPER_SHA256="$(sha256sum scripts/run-render-oracle-container.py | awk '{print $1}')"
+          LOCK_WRAPPER_SHA256="$(
+            python3 -c 'import json; print(json.load(open("scripts/render-oracle-container/lock.json"))["wrapper"]["sha256"])'
+          )"
+          test "$LIVE_WRAPPER_SHA256" = "$LOCK_WRAPPER_SHA256"
           BOOTSTRAP_ARGS=()
           if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
             BOOTSTRAP_ARGS+=(--bootstrap-identities)
@@ -244,17 +265,47 @@ jobs:
             "${BOOTSTRAP_ARGS[@]}" \
             > target/render-oracle-hosted/build.json
           python3 - <<'PY'
-          import json, os, pathlib, re
+          import hashlib, json, os, pathlib, re
           document = json.load(open("target/render-oracle-hosted/build.json", encoding="utf-8"))
+          lock = json.load(open("scripts/render-oracle-container/lock.json", encoding="utf-8"))
+          expected_source = os.environ["EXPECTED_SOURCE_SHA"]
+          live_wrapper_sha256 = hashlib.sha256(
+              pathlib.Path("scripts/run-render-oracle-container.py").read_bytes()
+          ).hexdigest()
           image_id = document.get("built_image_id", "")
+          manifest_digest = document.get("built_manifest_digest", "")
           assert re.fullmatch(r"sha256:[0-9a-f]{64}", image_id), document
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest), document
+          reproducibility = document["reproducibility"]
+          assert document["schema"] == "rxls.render-oracle-container-build.v3", document
+          assert document["source_commit"] == expected_source, document
+          assert document["wrapper_sha256"] == live_wrapper_sha256 == lock["wrapper"]["sha256"], document
+          assert reproducibility["status"] == "matched", reproducibility
+          assert reproducibility["build_count"] == 2, reproducibility
+          assert reproducibility["export_destination"] == "stdout", reproducibility
+          assert reproducibility["export_tar"] is True, reproducibility
+          assert reproducibility["export_media_type"] == "application/vnd.docker.distribution.manifest.v2+json", reproducibility
+          assert len(reproducibility["identities"]) == 2, reproducibility
+          assert reproducibility["identities"][0] == reproducibility["identities"][1], reproducibility
+          assert reproducibility["config_ids"] == [image_id, image_id], reproducibility
+          assert len(reproducibility["identity_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["identity_sha256"])) == 1, reproducibility
+          assert reproducibility["manifest_digests"] == [manifest_digest, manifest_digest], reproducibility
+          assert reproducibility["descriptor_digests"] == [manifest_digest, manifest_digest], reproducibility
+          assert len(reproducibility["descriptor_media_types"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_media_types"])) == 1, reproducibility
+          assert len(reproducibility["descriptor_sizes"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_sizes"])) == 1, reproducibility
+          assert len(reproducibility["rootfs_diff_ids_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["rootfs_diff_ids_sha256"])) == 1, reproducibility
           if os.environ["RXLS_IDENTITY_BOOTSTRAP"] == "1":
-              assert document["image_identity_status"] in {
-                  "bootstrap_capture_required", "pinned_match"
-              }
+              assert document["image_identity_status"] == "bootstrap_capture_required"
+              assert document["expected_image_id"] is None
+              assert document["expected_manifest_digest"] is None
           else:
               assert document["image_identity_status"] == "pinned_match"
               assert document["expected_image_id"] == image_id
+              assert document["expected_manifest_digest"] == manifest_digest
           pathlib.Path("target/render-oracle-hosted/image-id.txt").write_text(
               image_id + "\n", encoding="utf-8"
           )
@@ -534,6 +585,9 @@ jobs:
               report_paths.append(root / "parity-report-b.json")
 
           build = load(root / "build.json")
+          container_lock = load(
+              pathlib.Path("scripts/render-oracle-container/lock.json")
+          )
           renderer = load(root / "renderer.json")
           host_tools = load(root / "host-tools.json")
           corpus_path = (
@@ -545,8 +599,23 @@ jobs:
 
           head_sha = os.environ["EXPECTED_HEAD_SHA"]
           assert re.fullmatch(r"[0-9a-f]{40}", head_sha)
+          assert build["schema"] == "rxls.render-oracle-container-build.v3"
+          assert build["source_commit"] == head_sha
+          assert (
+              build["wrapper_sha256"]
+              == container_lock["wrapper"]["sha256"]
+              == sha256(
+                  pathlib.Path(
+                      "scripts/run-render-oracle-container.py"
+                  ).read_bytes()
+              )
+          )
           assert build["image_identity_status"] == "pinned_match"
           assert build["expected_image_id"] == build["built_image_id"]
+          assert (
+              build["expected_manifest_digest"]
+              == build["built_manifest_digest"]
+          )
           assert host_tools["identity_status"] == "pinned_match"
           assert host_tools["scope"] == "all"
           assert host_tools["captured_identity_sha256"] == host_tools["expected_identity_sha256"]
@@ -605,7 +674,7 @@ jobs:
               adapters = [row.get("oracle_adapter") for row in report["files"]]
               assert all(isinstance(row, dict) for row in adapters)
               assert {row["schema"] for row in adapters} == {
-                  "rxls.render-oracle-container-execution.v2"
+                  "rxls.render-oracle-container-execution.v3"
               }
               assert {row["image"]["architecture"] for row in adapters} == {
                   "linux/amd64"
@@ -616,6 +685,13 @@ jobs:
               assert {row["image"]["expected_id"] for row in adapters} == {
                   build["built_image_id"]
               }
+              assert {row["image"]["manifest_digest"] for row in adapters} == {
+                  build["built_manifest_digest"]
+              }
+              assert {
+                  row["image"]["expected_manifest_digest"]
+                  for row in adapters
+              } == {build["built_manifest_digest"]}
               assert {row["image"]["identity_status"] for row in adapters} == {
                   "pinned_match"
               }
@@ -644,7 +720,7 @@ jobs:
                   "runtime",
                   "schema",
               }
-              assert oracle_lock["schema"] == "rxls.render-oracle-container-identity.v1"
+              assert oracle_lock["schema"] == "rxls.render-oracle-container-identity.v2"
               assert oracle_lock["build_contract_sha256"] == build["build_contract_sha256"]
               assert oracle_lock["lock_file_sha256"] == build["lock_file_sha256"]
               assert oracle_lock["font_pack_sha256"] == font_manifest["pack_sha256"]
@@ -652,7 +728,9 @@ jobs:
                   "architecture": "linux/amd64",
                   "config_digest": build["built_image_id"],
                   "expected_config_digest": build["built_image_id"],
+                  "expected_manifest_digest": build["built_manifest_digest"],
                   "identity_status": "pinned_match",
+                  "manifest_digest": build["built_manifest_digest"],
               }
               assert oracle_lock["libreoffice"] == adapters[0]["oracle"]
               assert oracle_lock["runtime"] == "docker"
@@ -696,6 +774,10 @@ jobs:
               assert (
                   gate["evidence"]["oracle_image_config_digest"]
                   == build["built_image_id"]
+              )
+              assert (
+                  gate["evidence"]["oracle_image_manifest_digest"]
+                  == build["built_manifest_digest"]
               )
               assert (
                   gate["evidence"]["oracle_lock_file_sha256"]
@@ -903,11 +985,15 @@ jobs:
               "container": {
                   "build_contract_sha256": build["build_contract_sha256"],
                   "expected_image_id": build["expected_image_id"],
+                  "expected_manifest_digest": build["expected_manifest_digest"],
                   "image_id": build["built_image_id"],
                   "identity_status": build["image_identity_status"],
                   "lock_file_sha256": build["lock_file_sha256"],
+                  "manifest_digest": build["built_manifest_digest"],
                   "oracle_artifact_sha256": adapters[0]["oracle"]["artifact_sha256"],
                   "oracle_version": adapters[0]["oracle"]["version"],
+                  "source_commit": build["source_commit"],
+                  "wrapper_sha256": build["wrapper_sha256"],
               },
               "corpus": {
                   "acquired_corpus_included": False,
@@ -937,7 +1023,7 @@ jobs:
               "metrics": report["summary"]["metric_cohorts"],
               "renderer": renderer,
               "repeatability": repeatability_summary,
-              "schema": "rxls.render-oracle-hosted-campaign.v4",
+              "schema": "rxls.render-oracle-hosted-campaign.v5",
               "summary": {
                   "by_classification": report["summary"]["by_classification"],
                   "by_status": report["summary"]["by_status"],
@@ -993,7 +1079,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: render-oracle-${{ github.sha }}-${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
+          name: render-oracle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event_name == 'workflow_dispatch' && inputs.campaign || 'pilot' }}
           path: |
             target/render-oracle-hosted/authored-print-gate.json
             target/render-oracle-hosted/baseline-candidate-a.json

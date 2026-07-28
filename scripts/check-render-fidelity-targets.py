@@ -26,8 +26,8 @@ from typing import Any, Sequence
 
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
 OUTPUT_SCHEMA = "rxls.render-fidelity-targets.v1"
-CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v2"
-CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v1"
+CONTAINER_EXECUTION_SCHEMA = "rxls.render-oracle-container-execution.v3"
+CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -329,16 +329,22 @@ def _container_oracle_identity(
             "architecture",
             "config_digest",
             "expected_config_digest",
+            "expected_manifest_digest",
             "identity_status",
+            "manifest_digest",
         },
         "configuration_container_image",
     )
     config_digest = image.get("config_digest")
+    manifest_digest = image.get("manifest_digest")
     if (
         image.get("architecture") != "linux/amd64"
         or not isinstance(config_digest, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest) is None
         or image.get("expected_config_digest") != config_digest
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+        or image.get("expected_manifest_digest") != manifest_digest
         or image.get("identity_status") != "pinned_match"
     ):
         raise GateError("configuration_container_image")
@@ -392,7 +398,14 @@ def _adapter_identity(
     )
     image = _exact_object(
         row.get("image"),
-        {"architecture", "expected_id", "id", "identity_status"},
+        {
+            "architecture",
+            "expected_id",
+            "expected_manifest_digest",
+            "id",
+            "identity_status",
+            "manifest_digest",
+        },
         "file_oracle_adapter_image",
     )
     expected_image = aggregate["image"]
@@ -402,6 +415,9 @@ def _adapter_identity(
         or image.get("architecture") != expected_image["architecture"]
         or image.get("id") != expected_image["config_digest"]
         or image.get("expected_id") != expected_image["expected_config_digest"]
+        or image.get("manifest_digest") != expected_image["manifest_digest"]
+        or image.get("expected_manifest_digest")
+        != expected_image["expected_manifest_digest"]
         or image.get("identity_status") != expected_image["identity_status"]
         or row.get("lock_sha256") != aggregate["build_contract_sha256"]
         or row.get("lock_file_sha256") != aggregate["lock_file_sha256"]
@@ -474,7 +490,14 @@ def _configuration(
     ):
         raise GateError("configuration_identity")
     container_identity: dict[str, Any] | None = None
-    if oracle_lock.get("schema") == CONTAINER_IDENTITY_SCHEMA:
+    oracle_schema = oracle_lock.get("schema")
+    if (
+        isinstance(oracle_schema, str)
+        and oracle_schema.startswith("rxls.render-oracle-container-identity.")
+        and oracle_schema != CONTAINER_IDENTITY_SCHEMA
+    ):
+        raise GateError("configuration_container_identity")
+    if oracle_schema == CONTAINER_IDENTITY_SCHEMA:
         container_identity = _container_oracle_identity(
             oracle_lock,
             dpi=dpi,
@@ -485,6 +508,7 @@ def _configuration(
             {
                 "oracle_build_contract_sha256": container_identity["build_contract_sha256"],
                 "oracle_image_config_digest": container_identity["image"]["config_digest"],
+                "oracle_image_manifest_digest": container_identity["image"]["manifest_digest"],
                 "oracle_lock_file_sha256": container_identity["lock_file_sha256"],
                 "oracle_libreoffice_artifact_sha256": container_identity["libreoffice"]["artifact_sha256"],
                 "pdffonts_sha256": container_identity["pdf_font_inspector"]["pdffonts_sha256"],
