@@ -2181,7 +2181,7 @@ jobs:
           aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
           checker = runpy.run_path("scripts/check-ooxml-row-oracle.py")
           checker["_validate_output"](aggregate)
-          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v3"
+          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v4"
           assert aggregate["passed"] is True
           assert aggregate["baseline"] == {
               "case_count": 12,

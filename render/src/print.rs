@@ -1409,7 +1409,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v11");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v12");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 

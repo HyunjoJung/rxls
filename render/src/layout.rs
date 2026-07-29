@@ -22,7 +22,7 @@ use crate::scene::{
     LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
     TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
 };
-use crate::typography::wrap_text_ranges;
+use crate::typography::{wrap_text_lines, CellLineLayoutPolicy};
 use unicode_bidi::{bidi_class, BidiClass};
 use unicode_script::{Script, UnicodeScript};
 
@@ -68,11 +68,17 @@ const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: f64 = 5.0;
 const XLSB_DIGIT_WIDTH_SCALE: u32 = 256;
 /// Calc converts XLSB digit widths through integer twips at 96 CSS pixels/inch.
 const TWIPS_PER_CSS_PIXEL: i128 = 15;
+/// Calc's non-printer optimal-row path samples 1,000 twips through a 96-DPI
+/// virtual device. `LogicToPixel(1000 twips)` rounds to 67 pixels, so its
+/// stored pixels-per-twip value is 67/1000 rather than the exact 1/15.
+const CALC_OPTIMAL_HEIGHT_SAMPLE_TWIPS: u64 = 1_000;
+const CALC_OPTIMAL_HEIGHT_SAMPLE_PIXELS: u64 = 67;
+const CALC_DEVICE_DPI: u64 = 96;
+const MM100_PER_INCH: u64 = 2_540;
 /// `cchDefColWidth` excludes the four margins and one gridline screen pixel.
 const XLSB_BASE_COLUMN_SCREEN_PIXELS: u16 = 5;
-/// Calc leaves a small, DPI-stable vertical inset around optimally sized
-/// multiline cells. The pinned LibreOffice oracle rounds this to about two CSS
-/// pixels at 96 DPI; keeping it fixed avoids platform font or UI dependencies.
+/// Calc's default 20-twip top and bottom margins each truncate to one device
+/// pixel through the 67/1000 optimal-height scale.
 const AUTO_ROW_VERTICAL_PADDING_PIXELS: i64 = 2;
 
 /// Inclusive zero-based worksheet rectangle.
@@ -969,6 +975,7 @@ pub(crate) fn build_auxiliary_text_node(
         source: CellCoordinate { row: 0, col: 0 },
         rect: bounds,
         is_merged: false,
+        line_layout_policy: CellLineLayoutPolicy::Native,
         style: None,
         conditional: ConditionalPaint::default(),
         text,
@@ -998,6 +1005,7 @@ struct MergeLayout {
     owner: CellCoordinate,
     anchor: CellCoordinate,
     rect: Rect,
+    has_adjustable_row: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1005,6 +1013,7 @@ struct Region {
     source: CellCoordinate,
     rect: Rect,
     is_merged: bool,
+    line_layout_policy: CellLineLayoutPolicy,
     style: Option<CellStyle>,
     conditional: ConditionalPaint,
     text: String,
@@ -1243,6 +1252,8 @@ fn build_sheet_scene_inner(
         options.limits.max_conditional_rules,
         sheet.conditional_formats().len() as u64,
     )?;
+    let calc_line_layout_available =
+        verified_implicit_xlsx(sheet, options) && !has_conditional_text_layout_overlay(sheet);
     let unsupported_shapes = sheet
         .drawing_metadata()
         .iter()
@@ -1461,6 +1472,9 @@ fn build_sheet_scene_inner(
                 width,
                 height,
             },
+            has_adjustable_row: merge_rows
+                .iter()
+                .any(|slot| !sheet.row_heights().contains_key(&slot.index)),
         };
         if layout.anchor != layout.owner {
             warnings.add(
@@ -1512,25 +1526,26 @@ fn build_sheet_scene_inner(
                 row: row.index,
                 col: col.index,
             };
-            let (source, rect, is_merged) = if let Some(&merge_index) = merge_cover.get(&coordinate)
-            {
-                let merge = &merge_layouts[merge_index];
-                if coordinate != merge.owner {
-                    continue;
-                }
-                (merge.anchor, merge.rect, true)
-            } else {
-                (
-                    coordinate,
-                    Rect {
-                        x: col.offset,
-                        y: row.offset,
-                        width: col.size,
-                        height: row.size,
-                    },
-                    false,
-                )
-            };
+            let (source, rect, is_merged, has_adjustable_row) =
+                if let Some(&merge_index) = merge_cover.get(&coordinate) {
+                    let merge = &merge_layouts[merge_index];
+                    if coordinate != merge.owner {
+                        continue;
+                    }
+                    (merge.anchor, merge.rect, true, merge.has_adjustable_row)
+                } else {
+                    (
+                        coordinate,
+                        Rect {
+                            x: col.offset,
+                            y: row.offset,
+                            width: col.size,
+                            height: row.size,
+                        },
+                        false,
+                        !sheet.row_heights().contains_key(&coordinate.row),
+                    )
+                };
             let display_cell = display_cells.get(&source);
             let raw_text = display_cell.map_or("", |cell| cell.formatted);
             let (text, replaced) = sanitize_xml_text(raw_text);
@@ -1582,6 +1597,15 @@ fn build_sheet_scene_inner(
                 source,
                 rect,
                 is_merged,
+                line_layout_policy: cell_line_layout_policy(
+                    sheet,
+                    source,
+                    style.as_ref(),
+                    rich_text.as_deref(),
+                    has_adjustable_row,
+                    calc_line_layout_available,
+                    options,
+                ),
                 style,
                 conditional: ConditionalPaint::default(),
                 text,
@@ -2184,6 +2208,31 @@ fn round_unsigned_ratio(value: u64, numerator: u64, denominator: u64) -> Option<
         .checked_add(u128::from(denominator / 2))?
         .checked_div(u128::from(denominator))?;
     u64::try_from(rounded).ok()
+}
+
+fn round_signed_ratio(value: i128, numerator: i128, denominator: i128) -> Result<i64, RenderError> {
+    if numerator < 0 || denominator <= 0 {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    let scaled = value
+        .checked_mul(numerator)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let magnitude = scaled.unsigned_abs();
+    let denominator = denominator as u128;
+    let rounded = magnitude
+        .checked_add(denominator / 2)
+        .and_then(|value| value.checked_div(denominator))
+        .and_then(|value| i128::try_from(value).ok())
+        .and_then(|value| {
+            if scaled < 0 {
+                value.checked_neg()
+            } else {
+                Some(value)
+            }
+        })
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(rounded)
 }
 
 fn terminal_used_column(
@@ -2961,6 +3010,59 @@ fn verified_ooxml_normal_font_size(sheet: &Sheet, options: &RenderOptions) -> Op
     Some((points, points_to_fixed(f32::from(points))?))
 }
 
+fn verified_implicit_xlsx(sheet: &Sheet, options: &RenderOptions) -> bool {
+    sheet.has_implicit_ooxml_row_height()
+        && verified_ooxml_normal_font_size(sheet, options).is_some()
+}
+
+fn has_conditional_text_layout_overlay(sheet: &Sheet) -> bool {
+    sheet.conditional_format_metadata().iter().any(|metadata| {
+        metadata
+            .differential_style
+            .as_ref()
+            .is_some_and(|style| style.font.is_some() || style.align.is_some())
+    })
+}
+
+fn cell_line_layout_policy(
+    sheet: &Sheet,
+    source: CellCoordinate,
+    style: Option<&CellStyle>,
+    rich_text: Option<&[rxls::TextRun]>,
+    has_adjustable_row: bool,
+    calc_line_layout_available: bool,
+    options: &RenderOptions,
+) -> CellLineLayoutPolicy {
+    let verified = || {
+        if !has_adjustable_row || rich_text.is_some() || !calc_line_layout_available {
+            return None;
+        }
+        let style = style?;
+        let alignment = style.align.as_ref()?;
+        if !alignment.wrap || alignment.rotation != 0 || alignment.shrink_to_fit {
+            return None;
+        }
+        let exact_points = sheet.verified_xlsx_cell_font_size_pt(source.row, source.col)?;
+        let font = style.font.as_ref()?;
+        if font.size_pt != Some(exact_points) || font.script != FormatScript::None {
+            return None;
+        }
+        let family = font.name.as_deref()?;
+        let pack = options.font_pack.as_ref()?;
+        let resolution = pack.resolve(FontRequest {
+            family,
+            weight: if font.bold { 700 } else { 400 },
+            italic: font.italic,
+        });
+        (resolution.exact_family && resolution.exact_style).then_some(())
+    };
+    if verified().is_some() {
+        CellLineLayoutPolicy::CalcEditEngine
+    } else {
+        CellLineLayoutPolicy::Native
+    }
+}
+
 fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Option<Fixed> {
     if !sheet.has_implicit_ooxml_row_height() {
         return None;
@@ -3228,6 +3330,8 @@ fn expand_automatic_row_heights(
         .and_then(|_| sheet.default_cell_style()?.font.as_ref());
     let verified_implicit_xlsx =
         sheet.has_implicit_ooxml_row_height() && verified_normal_font.is_some();
+    let calc_line_layout_available =
+        verified_implicit_xlsx && !has_conditional_text_layout_overlay(sheet);
 
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
@@ -3423,6 +3527,15 @@ fn expand_automatic_row_heights(
                     height: Fixed::from_raw(1),
                 },
                 is_merged,
+                line_layout_policy: cell_line_layout_policy(
+                    sheet,
+                    source,
+                    style.as_ref(),
+                    rich_text.as_deref(),
+                    true,
+                    calc_line_layout_available,
+                    options,
+                ),
                 style,
                 conditional: ConditionalPaint::default(),
                 text,
@@ -9064,6 +9177,7 @@ struct StyledSourceSpan {
 
 struct PreparedLine {
     source: Range<usize>,
+    advance_end: usize,
     shaped: ShapedText,
     width: Fixed,
     metrics: CombinedLineMetrics,
@@ -9072,6 +9186,7 @@ struct PreparedLine {
 struct PreparedText {
     styles: Vec<ResolvedRunStyle>,
     lines: Vec<PreparedLine>,
+    line_layout_policy: CellLineLayoutPolicy,
     horizontal_padding: Fixed,
     available_width: Fixed,
     max_width: Fixed,
@@ -9088,15 +9203,18 @@ fn measure_automatic_cell_height(
 ) -> Result<Fixed, RenderError> {
     let style = text_style(region, options, sheet_right_to_left);
     let prepared = prepare_styled_text(pack, region, &style, sheet_right_to_left, options, stats)?;
-    sum_fixed(
-        prepared
-            .lines
-            .iter()
-            .map(|line| line_height_from_metrics(line.metrics))
-            .collect::<Result<Vec<_>, _>>()?,
-    )?
-    .checked_add(Fixed::from_pixels(AUTO_ROW_VERTICAL_PADDING_PIXELS))
-    .ok_or(RenderError::CoordinateOverflow)
+    match prepared.line_layout_policy {
+        CellLineLayoutPolicy::Native => sum_fixed(
+            prepared
+                .lines
+                .iter()
+                .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?
+        .checked_add(Fixed::from_pixels(AUTO_ROW_VERTICAL_PADDING_PIXELS))
+        .ok_or(RenderError::CoordinateOverflow),
+        CellLineLayoutPolicy::CalcEditEngine => calc_automatic_cell_height(&prepared.lines),
+    }
 }
 
 fn account_shaping(
@@ -9128,13 +9246,66 @@ fn account_shaping(
     )
 }
 
-fn line_height_from_metrics(metrics: CombinedLineMetrics) -> Result<Fixed, RenderError> {
-    metrics
+fn line_height_from_metrics(
+    metrics: CombinedLineMetrics,
+    policy: CellLineLayoutPolicy,
+) -> Result<Fixed, RenderError> {
+    let physical = metrics
         .ascent
         .checked_sub(metrics.descent)
-        .and_then(|height| height.checked_add(metrics.line_gap))
-        .ok_or(RenderError::CoordinateOverflow)
-        .map(|height| height.max(Fixed::from_raw(1)))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let height = match policy {
+        CellLineLayoutPolicy::Native => physical
+            .checked_add(metrics.line_gap)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        CellLineLayoutPolicy::CalcEditEngine => physical,
+    };
+    Ok(height.max(Fixed::from_raw(1)))
+}
+
+fn calc_line_height_mm100(metrics: CombinedLineMetrics) -> Result<u64, RenderError> {
+    let ascent =
+        u64::try_from(metrics.calc_ascent_pixels).map_err(|_| RenderError::CoordinateOverflow)?;
+    let descent = metrics.calc_descent_pixels.unsigned_abs();
+    let formatter = round_unsigned_ratio(ascent, MM100_PER_INCH, CALC_DEVICE_DPI)
+        .and_then(|value| {
+            round_unsigned_ratio(descent, MM100_PER_INCH, CALC_DEVICE_DPI)
+                .and_then(|descent| value.checked_add(descent))
+        })
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(metrics.calc_portion_height_mm100.max(formatter).max(1))
+}
+
+fn calc_automatic_cell_height(lines: &[PreparedLine]) -> Result<Fixed, RenderError> {
+    let total_mm100 = lines.iter().try_fold(0_u64, |total, line| {
+        total
+            .checked_add(calc_line_height_mm100(line.metrics)?)
+            .ok_or(RenderError::CoordinateOverflow)
+    })?;
+    calc_automatic_height_from_engine_mm100(total_mm100)
+}
+
+fn calc_automatic_height_from_engine_mm100(total_mm100: u64) -> Result<Fixed, RenderError> {
+    let text_pixels = round_unsigned_ratio(total_mm100, CALC_DEVICE_DPI, MM100_PER_INCH)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let row_pixels = text_pixels
+        .checked_add(
+            u64::try_from(AUTO_ROW_VERTICAL_PADDING_PIXELS)
+                .map_err(|_| RenderError::CoordinateOverflow)?,
+        )
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let row_twips = row_pixels
+        .checked_mul(CALC_OPTIMAL_HEIGHT_SAMPLE_TWIPS)
+        .and_then(|value| value.checked_div(CALC_OPTIMAL_HEIGHT_SAMPLE_PIXELS))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let raw = round_unsigned_ratio(
+        row_twips,
+        FIXED_UNITS_PER_PIXEL as u64,
+        u64::try_from(TWIPS_PER_CSS_PIXEL).map_err(|_| RenderError::CoordinateOverflow)?,
+    )
+    .and_then(|value| i64::try_from(value).ok())
+    .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(Fixed::from_raw(raw.max(1)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9186,6 +9357,7 @@ fn build_glyph_run(
                 pack,
                 &line.shaped,
                 &prepared.styles,
+                prepared.line_layout_policy,
                 scale_numerator,
                 scale_denominator,
             )?;
@@ -9195,7 +9367,7 @@ fn build_glyph_run(
     let line_heights = prepared
         .lines
         .iter()
-        .map(|line| line_height_from_metrics(line.metrics))
+        .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
         .collect::<Result<Vec<_>, _>>()?;
     let block_height = sum_fixed(line_heights.iter().copied())?;
     let top = vertical_block_top(region.rect, block_height, style.baseline)?;
@@ -9234,6 +9406,39 @@ fn build_glyph_run(
             &mut paints,
             &mut decorations,
         )?;
+        if line.advance_end < line.source.end {
+            if region.text.get(line.advance_end..line.source.end) != Some(" ") {
+                return Err(RenderError::Typography {
+                    reason: "invalid_suppressed_line_suffix",
+                });
+            }
+            let command_index =
+                u64::try_from(commands.len()).map_err(|_| RenderError::CoordinateOverflow)?;
+            let source_start =
+                u64::try_from(line.advance_end).map_err(|_| RenderError::CoordinateOverflow)?;
+            let source_end =
+                u64::try_from(line.source.end).map_err(|_| RenderError::CoordinateOverflow)?;
+            clusters.push(GlyphCluster {
+                source_start,
+                source_end,
+                command_start: command_index,
+                command_end: command_index,
+            });
+            let origin_x = if line.shaped.base_direction == BaseDirection::RightToLeft {
+                line_x
+            } else {
+                line_x
+                    .checked_add(line.width)
+                    .ok_or(RenderError::CoordinateOverflow)?
+            };
+            cluster_metrics.push(GlyphClusterMetrics {
+                origin_x,
+                advance_x: Fixed::ZERO,
+                baseline_y: baseline,
+                ascent: line.metrics.ascent.max(Fixed::from_raw(1)),
+                descent: line.metrics.descent.min(Fixed::ZERO),
+            });
+        }
         line_top = line_top
             .checked_add(line_height)
             .ok_or(RenderError::CoordinateOverflow)?;
@@ -9298,9 +9503,10 @@ fn prepare_styled_text(
         .as_ref()
         .and_then(|style| style.align.as_ref())
         .is_some_and(|alignment| alignment.wrap);
-    let line_ranges = wrap_text_ranges(
+    let wrapped_lines = wrap_text_lines(
         &region.text,
         wrap,
+        region.line_layout_policy,
         available_width,
         remaining_lines,
         work,
@@ -9318,15 +9524,16 @@ fn prepare_styled_text(
         },
     )?;
 
-    let mut lines = Vec::with_capacity(line_ranges.len());
+    let mut lines = Vec::with_capacity(wrapped_lines.len());
     let mut max_width = Fixed::ZERO;
     let mut missing_glyphs = 0_u64;
     let mut family_substituted = false;
-    for source in line_ranges {
+    for line in wrapped_lines {
+        let source = line.source;
         let shaped = shape_styled_range(
             pack,
             &region.text,
-            source.clone(),
+            source.start..line.advance_end,
             &spans,
             &styles,
             direction,
@@ -9334,12 +9541,13 @@ fn prepare_styled_text(
         )?;
         account_shaping(pack, &shaped, options, stats)?;
         let width = styled_shaped_width(pack, &shaped, &styles, 1, 1)?;
-        let metrics = styled_line_metrics(pack, &shaped, &styles, 1, 1)?;
+        let metrics = styled_line_metrics(pack, &shaped, &styles, region.line_layout_policy, 1, 1)?;
         max_width = max_width.max(width);
         missing_glyphs = missing_glyphs.saturating_add(shaped.missing_glyphs as u64);
         family_substituted |= !shaped.requested_family_matched;
         lines.push(PreparedLine {
             source,
+            advance_end: line.advance_end,
             shaped,
             width,
             metrics,
@@ -9357,6 +9565,7 @@ fn prepare_styled_text(
     Ok(PreparedText {
         styles,
         lines,
+        line_layout_policy: region.line_layout_policy,
         horizontal_padding,
         available_width,
         max_width,
@@ -9652,12 +9861,16 @@ struct CombinedLineMetrics {
     ascent: Fixed,
     descent: Fixed,
     line_gap: Fixed,
+    calc_ascent_pixels: i64,
+    calc_descent_pixels: i64,
+    calc_portion_height_mm100: u64,
 }
 
 fn styled_line_metrics(
     pack: &FontPack,
     shaped: &ShapedText,
     styles: &[ResolvedRunStyle],
+    policy: CellLineLayoutPolicy,
     scale_numerator: i64,
     scale_denominator: i64,
 ) -> Result<CombinedLineMetrics, RenderError> {
@@ -9665,47 +9878,92 @@ fn styled_line_metrics(
         ascent: Fixed::ZERO,
         descent: Fixed::ZERO,
         line_gap: Fixed::ZERO,
+        calc_ascent_pixels: 0,
+        calc_descent_pixels: 0,
+        calc_portion_height_mm100: 0,
     };
     let mut initialized = false;
-    let mut include =
-        |font_id: crate::font::FontId, style: &ResolvedRunStyle| -> Result<(), RenderError> {
-            let metrics = pack.metrics(font_id).map_err(map_font_error)?;
-            let font_size = styled_font_size(style, scale_numerator, scale_denominator)?;
-            let shift = styled_script_shift(style, scale_numerator, scale_denominator)?;
-            let ascent = scale_font_units(
-                i64::from(metrics.ascent),
-                font_size,
-                metrics.units_per_em,
-                1,
-            )?
-            .checked_sub(shift)
-            .ok_or(RenderError::CoordinateOverflow)?;
-            let descent = scale_font_units(
-                i64::from(metrics.descent),
-                font_size,
-                metrics.units_per_em,
-                1,
-            )?
-            .checked_sub(shift)
-            .ok_or(RenderError::CoordinateOverflow)?;
-            let line_gap = scale_font_units(
-                i64::from(metrics.line_gap.max(0)),
-                font_size,
-                metrics.units_per_em,
-                1,
-            )?;
-            if !initialized {
-                combined.ascent = ascent;
-                combined.descent = descent;
-                combined.line_gap = line_gap;
-                initialized = true;
+    let mut include = |font_id: crate::font::FontId,
+                       style: &ResolvedRunStyle|
+     -> Result<(), RenderError> {
+        let metrics = pack.metrics(font_id).map_err(map_font_error)?;
+        let font_size = styled_font_size(style, scale_numerator, scale_denominator)?;
+        let shift = styled_script_shift(style, scale_numerator, scale_denominator)?;
+        let ascent = scale_font_units(
+            i64::from(metrics.ascent),
+            font_size,
+            metrics.units_per_em,
+            1,
+        )?
+        .checked_sub(shift)
+        .ok_or(RenderError::CoordinateOverflow)?;
+        let descent = scale_font_units(
+            i64::from(metrics.descent),
+            font_size,
+            metrics.units_per_em,
+            1,
+        )?
+        .checked_sub(shift)
+        .ok_or(RenderError::CoordinateOverflow)?;
+        let line_gap = scale_font_units(
+            i64::from(metrics.line_gap.max(0)),
+            font_size,
+            metrics.units_per_em,
+            1,
+        )?;
+        let (calc_ascent_pixels, calc_descent_pixels, calc_portion_height_mm100) =
+            if policy == CellLineLayoutPolicy::CalcEditEngine {
+                let device_em_pixels = round_unsigned_ratio(
+                    u64::try_from(font_size.raw()).map_err(|_| RenderError::CoordinateOverflow)?,
+                    1,
+                    FIXED_UNITS_PER_PIXEL as u64,
+                )
+                .ok_or(RenderError::CoordinateOverflow)?;
+                let calc_ascent_pixels = round_signed_ratio(
+                    i128::from(metrics.ascent),
+                    i128::from(device_em_pixels),
+                    i128::from(metrics.units_per_em),
+                )?;
+                let calc_descent_pixels = round_signed_ratio(
+                    i128::from(metrics.descent),
+                    i128::from(device_em_pixels),
+                    i128::from(metrics.units_per_em),
+                )?;
+                let calc_portion_pixels = calc_ascent_pixels
+                    .checked_sub(calc_descent_pixels)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                let calc_portion_height_mm100 =
+                    round_unsigned_ratio(calc_portion_pixels, MM100_PER_INCH, CALC_DEVICE_DPI)
+                        .ok_or(RenderError::CoordinateOverflow)?;
+                (
+                    calc_ascent_pixels,
+                    calc_descent_pixels,
+                    calc_portion_height_mm100,
+                )
             } else {
-                combined.ascent = combined.ascent.max(ascent);
-                combined.descent = combined.descent.min(descent);
-                combined.line_gap = combined.line_gap.max(line_gap);
-            }
-            Ok(())
-        };
+                (0, 0, 0)
+            };
+        if !initialized {
+            combined.ascent = ascent;
+            combined.descent = descent;
+            combined.line_gap = line_gap;
+            combined.calc_ascent_pixels = calc_ascent_pixels;
+            combined.calc_descent_pixels = calc_descent_pixels;
+            combined.calc_portion_height_mm100 = calc_portion_height_mm100;
+            initialized = true;
+        } else {
+            combined.ascent = combined.ascent.max(ascent);
+            combined.descent = combined.descent.min(descent);
+            combined.line_gap = combined.line_gap.max(line_gap);
+            combined.calc_ascent_pixels = combined.calc_ascent_pixels.max(calc_ascent_pixels);
+            combined.calc_descent_pixels = combined.calc_descent_pixels.min(calc_descent_pixels);
+            combined.calc_portion_height_mm100 = combined
+                .calc_portion_height_mm100
+                .max(calc_portion_height_mm100);
+        }
+        Ok(())
+    };
     if shaped.runs.is_empty() {
         let primary = styles.first().ok_or(RenderError::Typography {
             reason: "missing_text_style",
@@ -11512,6 +11770,132 @@ mod tests {
     }
 
     #[test]
+    fn calc_line_height_excludes_gap_while_native_retains_it() {
+        let metrics = CombinedLineMetrics {
+            ascent: Fixed::from_pixels(8),
+            descent: Fixed::from_pixels(-2),
+            line_gap: Fixed::from_pixels(3),
+            calc_ascent_pixels: 8,
+            calc_descent_pixels: -2,
+            calc_portion_height_mm100: 265,
+        };
+        assert_eq!(
+            line_height_from_metrics(metrics, CellLineLayoutPolicy::Native).unwrap(),
+            Fixed::from_pixels(13)
+        );
+        assert_eq!(
+            line_height_from_metrics(metrics, CellLineLayoutPolicy::CalcEditEngine).unwrap(),
+            Fixed::from_pixels(10)
+        );
+    }
+
+    #[test]
+    fn calc_automatic_height_replays_virtual_device_quantization() {
+        let locked_metrics = CombinedLineMetrics {
+            ascent: Fixed::from_raw(17_422),
+            descent: Fixed::from_raw(-4_325),
+            line_gap: Fixed::ZERO,
+            calc_ascent_pixels: 17,
+            calc_descent_pixels: -4,
+            calc_portion_height_mm100: 556,
+        };
+        assert_eq!(calc_line_height_mm100(locked_metrics).unwrap(), 556);
+        for (lines, expected_raw) in [(1_u64, 23_415_i64), (21, 451_311), (24, 515_550)] {
+            assert_eq!(
+                calc_automatic_height_from_engine_mm100(556 * lines).unwrap(),
+                Fixed::from_raw(expected_raw),
+                "{lines} lines"
+            );
+        }
+    }
+
+    #[test]
+    fn calc_suppressed_space_does_not_advance_paint_or_decoration() {
+        let pack = synthetic_test_pack();
+        let mut options = outlined_options(RenderRange::new(0, 0, 0, 0));
+        options.font_pack = Some(pack.clone());
+        options.horizontal_padding = Fixed::ZERO;
+        let text = "ab cd";
+        let style = CellStyle::new()
+            .font_name(pack.default_family())
+            .size(11)
+            .wrap()
+            .underline();
+        let mut region = Region {
+            source: CellCoordinate { row: 0, col: 0 },
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(100),
+                height: Fixed::from_pixels(100),
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            style: Some(style),
+            conditional: ConditionalPaint::default(),
+            text: text.to_string(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+        };
+        let base = text_style(&region, &options, false);
+        let (styles, spans) = resolve_rich_styles(&region, &base).unwrap();
+        let direction = text_base_direction(text, false);
+        let full_atom =
+            shape_styled_range(&pack, text, 0..3, &spans, &styles, direction, &options).unwrap();
+        let prefix =
+            shape_styled_range(&pack, text, 0..2, &spans, &styles, direction, &options).unwrap();
+        let full_width = styled_shaped_width(&pack, &full_atom, &styles, 1, 1).unwrap();
+        let prefix_width = styled_shaped_width(&pack, &prefix, &styles, 1, 1).unwrap();
+        assert!(full_width > prefix_width);
+        region.rect.width = full_width;
+
+        let mut statistics = TypographyStats::default();
+        let prepared =
+            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        assert_eq!(prepared.lines[0].source, 0..3);
+        assert_eq!(prepared.lines[0].width, prefix_width);
+        assert!(prepared.lines[0]
+            .shaped
+            .runs
+            .iter()
+            .all(|run| run.source.end <= 2));
+
+        let mut statistics = TypographyStats::default();
+        let run = build_glyph_run(
+            &pack,
+            &region,
+            region.rect,
+            &base,
+            false,
+            &options,
+            &mut statistics,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert!(run.metadata_is_valid());
+        assert!(run.decorations.len() >= 2);
+        assert_eq!(
+            run.decorations[0].x2.raw() - run.decorations[0].x1.raw(),
+            prefix_width.raw()
+        );
+        let (suppressed_index, suppressed) = run
+            .clusters
+            .iter()
+            .enumerate()
+            .find(|(_, cluster)| cluster.source_start == 2 && cluster.source_end == 3)
+            .expect("zero-advance trailing-space cluster");
+        assert_eq!(suppressed.command_start, suppressed.command_end);
+        assert_eq!(run.cluster_metrics[suppressed_index].advance_x, Fixed::ZERO);
+        assert!(run
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.source_start < 2)
+            .all(|cluster| cluster.source_end <= 2));
+    }
+
+    #[test]
     fn rich_text_styles_clusters_backends_and_auto_height_are_exact() {
         let mut workbook = Workbook::new();
         let wrapped_text = "Latin 한글 אב a\u{301}";
@@ -12440,6 +12824,171 @@ mod tests {
         assert_eq!(explicit_rows[0].size, Fixed::from_pixels(20));
         assert_eq!(overridden_rows[0].size, Fixed::from_pixels(16));
         assert_eq!(authored_rows[0].size, Fixed::from_pixels(37));
+    }
+
+    #[test]
+    fn verified_wrapped_implicit_xlsx_quantizes_height_and_shares_wrap_with_painting() {
+        const TEXT: &str = "aa aa aa aa aa aa";
+
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let workbook = |row_attributes: &str| {
+            imported_xlsx(
+                &styles,
+                &format!(
+                    r#"<worksheet><cols><col min="1" max="1" width="4" customWidth="1"/></cols><sheetData><row r="1"{row_attributes}><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c></row></sheetData></worksheet>"#
+                ),
+            )
+        };
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family.clone(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+
+        let automatic = workbook("");
+        let sheet = &automatic.sheets[0];
+        let style = sheet.resolved_cell_style(0, 0).expect("wrapped style");
+        assert_eq!(sheet.verified_xlsx_cell_font_size_pt(0, 0), Some(11));
+        assert_eq!(
+            cell_line_layout_policy(
+                sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&style),
+                None,
+                true,
+                true,
+                &options,
+            ),
+            CellLineLayoutPolicy::CalcEditEngine
+        );
+
+        let (rows, columns) = measure_sheet_axes(sheet, range, &options).unwrap();
+        let region = Region {
+            source: CellCoordinate { row: 0, col: 0 },
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: columns[0].size,
+                height: rows[0].size,
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            style: Some(style),
+            conditional: ConditionalPaint::default(),
+            text: TEXT.to_string(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+        };
+        let text_style = text_style(&region, &options, false);
+        let mut statistics = TypographyStats::default();
+        let prepared = prepare_styled_text(
+            options.font_pack.as_ref().unwrap(),
+            &region,
+            &text_style,
+            false,
+            &options,
+            &mut statistics,
+        )
+        .unwrap();
+        assert!(prepared.lines.len() >= 2);
+        let line_heights = prepared
+            .lines
+            .iter()
+            .map(|line| {
+                line_height_from_metrics(line.metrics, CellLineLayoutPolicy::CalcEditEngine)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected_height = calc_automatic_cell_height(&prepared.lines).unwrap();
+        assert_eq!(rows[0].size, expected_height);
+
+        let automatic_scene = build_scene(&automatic, 0, &options).unwrap();
+        let automatic_baselines = glyph_run(&automatic_scene.scene, TEXT)
+            .cluster_metrics
+            .iter()
+            .map(|metric| metric.baseline_y.raw())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(automatic_baselines.len(), prepared.lines.len());
+        for (window, expected) in automatic_baselines.windows(2).zip(line_heights) {
+            assert_eq!(window[1] - window[0], expected.raw());
+        }
+
+        let explicit = workbook(r#" ht="42" customHeight="1""#);
+        let explicit_sheet = &explicit.sheets[0];
+        let explicit_style = explicit_sheet
+            .resolved_cell_style(0, 0)
+            .expect("explicit wrapped style");
+        assert_eq!(
+            cell_line_layout_policy(
+                explicit_sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&explicit_style),
+                None,
+                false,
+                true,
+                &options,
+            ),
+            CellLineLayoutPolicy::Native
+        );
+        let (explicit_rows, _) = measure_sheet_axes(explicit_sheet, range, &options).unwrap();
+        assert_eq!(explicit_rows[0].size, points_to_fixed(42.0).unwrap());
+        let explicit_scene = build_scene(&explicit, 0, &options).unwrap();
+        let explicit_baselines = glyph_run(&explicit_scene.scene, TEXT)
+            .cluster_metrics
+            .iter()
+            .map(|metric| metric.baseline_y.raw())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let native_step =
+            line_height_from_metrics(prepared.lines[0].metrics, CellLineLayoutPolicy::Native)
+                .unwrap();
+        assert!(explicit_baselines.len() >= 2);
+        assert_eq!(
+            explicit_baselines[1] - explicit_baselines[0],
+            native_step.raw()
+        );
+
+        let conditional_styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><alignment textRotation="30"/></dxf></dxfs></styleSheet>"#
+        );
+        let conditional = imported_xlsx(
+            &conditional_styles,
+            &format!(
+                r#"<worksheet><cols><col min="1" max="1" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="expression" dxfId="0" priority="1"><formula>1=1</formula></cfRule></conditionalFormatting></worksheet>"#
+            ),
+        );
+        let conditional_sheet = &conditional.sheets[0];
+        assert!(has_conditional_text_layout_overlay(conditional_sheet));
+        let conditional_style = conditional_sheet
+            .resolved_cell_style(0, 0)
+            .expect("conditionally overlaid wrapped style");
+        let calc_line_layout_available = verified_implicit_xlsx(conditional_sheet, &options)
+            && !has_conditional_text_layout_overlay(conditional_sheet);
+        assert_eq!(
+            cell_line_layout_policy(
+                conditional_sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&conditional_style),
+                None,
+                true,
+                calc_line_layout_available,
+                &options,
+            ),
+            CellLineLayoutPolicy::Native
+        );
+        build_scene(&conditional, 0, &options).unwrap();
     }
 
     #[test]

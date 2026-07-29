@@ -280,6 +280,9 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             "text_line_box_rxls_items": 2,
             "text_line_box_libreoffice_items": 2,
             "text_line_box_matched_items": 1,
+            "text_line_box_ambiguous_items": 0,
+            "text_line_box_rxls_unmatched_items": 1,
+            "text_line_box_libreoffice_unmatched_items": 1,
         }
 
     def _reduce(self, report: dict[str, object] | None = None):
@@ -294,7 +297,7 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
 
     def test_reduces_to_exact_path_and_content_neutral_contract(self) -> None:
         output = self._reduce()
-        self.assertEqual(output["schema"], "rxls.ooxml-row-oracle.v3")
+        self.assertEqual(output["schema"], "rxls.ooxml-row-oracle.v4")
         self.assertIs(output["passed"], True)
         self.assertEqual(
             output["baseline"],
@@ -333,6 +336,17 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         )
         for row in output["cohorts"]:
             self.assertEqual(
+                row["line_counts"],
+                {
+                    "ambiguous": 0,
+                    "libreoffice": 2,
+                    "libreoffice_unmatched": 1,
+                    "matched": 1,
+                    "rxls": 2,
+                    "rxls_unmatched": 1,
+                },
+            )
+            self.assertEqual(
                 set(row["unique_word_geometry"]),
                 {
                     "rxls_unique_items",
@@ -368,10 +382,65 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             "row oracle",
             "commands",
             "similarity_ppm",
+            "text_line_box_libreoffice_items",
+            "text_line_box_rxls_items",
+            "text_line_box_matched_items",
+            "text_line_box_ambiguous_items",
+            "text_line_box_rxls_unmatched_items",
+            "text_line_box_libreoffice_unmatched_items",
             "text_box_unique_geometry",
             "text_line_box_unique_geometry",
         ):
             self.assertNotIn(forbidden, encoded)
+
+    def test_retains_bounded_line_counts_for_the_matching_cohort(self) -> None:
+        report = copy.deepcopy(self.report)
+        source = report["files"][0]
+        source["pages"][0]["text_line_box_rxls_items"] = 24
+        source["pages"][0]["text_line_box_libreoffice_items"] = 21
+        source["pages"][0]["text_line_box_rxls_unmatched_items"] = 23
+        source["pages"][0]["text_line_box_libreoffice_unmatched_items"] = 20
+        expected_dimension = self.checker._dimension_from_features(
+            source["features"]
+        )
+        output = self._reduce(report)
+        cohort = next(
+            row
+            for row in output["cohorts"]
+            if row["dimensions"] == expected_dimension
+        )
+        self.assertEqual(
+            cohort["line_counts"],
+            {
+                "ambiguous": 0,
+                "libreoffice": 21,
+                "libreoffice_unmatched": 20,
+                "matched": 1,
+                "rxls": 24,
+                "rxls_unmatched": 23,
+            },
+        )
+        self.checker._validate_output(output)
+
+    def test_rejects_malformed_or_inconsistent_line_count_sources(self) -> None:
+        mutations = (
+            lambda page: page.pop("text_line_box_rxls_items"),
+            lambda page: page.update(
+                {"text_line_box_libreoffice_items": True}
+            ),
+            lambda page: page.update({"text_line_box_rxls_items": 250_001}),
+            lambda page: page.update({"text_line_box_rxls_items": 1}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                report = copy.deepcopy(self.report)
+                mutation(report["files"][0]["pages"][0])
+                with self.assertRaisesRegex(
+                    self.checker.DiagnosticError,
+                    "(?:text_line_box_count|"
+                    "text_line_box_unique_geometry_count)",
+                ):
+                    self._reduce(report)
 
     def test_rejects_regressed_accepted_baseline(self) -> None:
         report = copy.deepcopy(self.report)
@@ -982,6 +1051,25 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
                 "delta_histograms_millipoints"
             ]["height"][0].update({"count": 2}),
             lambda value: value["cohorts"][0].pop("unique_line_geometry"),
+            lambda value: value["cohorts"][0]["line_counts"].update(
+                {"rxls": True}
+            ),
+            lambda value: value["cohorts"][0]["line_counts"].update(
+                {"libreoffice": 250_001}
+            ),
+            lambda value: value["cohorts"][0]["line_counts"].update(
+                {"unexpected": 1}
+            ),
+            lambda value: value["cohorts"][0]["line_counts"].update(
+                {"rxls": 1}
+            ),
+            lambda value: value["cohorts"][0]["line_counts"].update(
+                {
+                    "matched": 0,
+                    "rxls_unmatched": 2,
+                    "libreoffice_unmatched": 2,
+                }
+            ),
             lambda value: value["cohorts"].reverse(),
         )
         for mutation in mutations:

@@ -109,7 +109,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
     "8d8442c6caf1e5c35b0e6cfc4046042d9809cdcd3a7d23a47027a9bf19f78156",
-    "5ea44fde403183edaee2838845657ed4ca3a1ffefcccf59e00aa01f8e008a86a",
+    "792449bf571ae8efb3bed9c16b2c17e4a980d2e1dfd1e5a4ffd2eefa57e74234",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
     "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "fd789f69c54a6f283c1130cea1c88022a3baab797e09df4bfc92dbf996b2b0a1"
+    "294363ed5adbb994010471b3da906513e5560c95c0aacde4f775f145d946004e"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -2027,7 +2027,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'checker["_validate_output"](aggregate)': (
             "must revalidate the exact diagnostic output contract before upload"
         ),
-        'assert aggregate["schema"] == "rxls.ooxml-row-oracle.v3"': (
+        'assert aggregate["schema"] == "rxls.ooxml-row-oracle.v4"': (
             "must require the expanded diagnostic aggregate schema"
         ),
         '"threshold_max_absolute_height_delta_millipoints": 50': (

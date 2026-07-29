@@ -22,7 +22,7 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 REPORT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v3"
+OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v4"
 MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
 METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
@@ -161,6 +161,16 @@ UNIQUE_GEOMETRY_KEYS = frozenset(
         "matched_items",
         "delta_histograms_millipoints",
         "exact_delta_summaries_millipoints",
+    }
+)
+LINE_COUNT_KEYS = frozenset(
+    {
+        "ambiguous",
+        "libreoffice",
+        "libreoffice_unmatched",
+        "matched",
+        "rxls",
+        "rxls_unmatched",
     }
 )
 UNIQUE_GEOMETRY_POLICY = {
@@ -432,6 +442,29 @@ def _nonnegative_int(
         code,
     )
     return value
+
+
+def _line_counts(value: object, code: str) -> dict[str, int]:
+    _require(
+        isinstance(value, dict) and set(value) == LINE_COUNT_KEYS,
+        code,
+    )
+    result = {
+        key: _nonnegative_int(
+            value.get(key),
+            code,
+            MAX_UNIQUE_GEOMETRY_ITEMS,
+        )
+        for key in sorted(LINE_COUNT_KEYS)
+    }
+    _require(
+        result["rxls"]
+        == result["matched"] + result["ambiguous"] + result["rxls_unmatched"]
+        and result["libreoffice"]
+        == result["matched"] + result["libreoffice_unmatched"],
+        code,
+    )
+    return result
 
 
 def _dimension_from_features(features: Iterable[str]) -> dict[str, object]:
@@ -1183,6 +1216,7 @@ def _validate_output(value: dict[str, object]) -> None:
                 "dimensions",
                 "height_delta_millipoints",
                 "libreoffice_height_millipoints",
+                "line_counts",
                 "page_count",
                 "rxls_height_millipoints",
                 "unique_line_geometry",
@@ -1194,6 +1228,10 @@ def _validate_output(value: dict[str, object]) -> None:
             and type(row.get("workbook_count")) is int
             and row.get("workbook_count") == 1,
             "output_cohort_contract",
+        )
+        line_counts = _line_counts(
+            row.get("line_counts"),
+            "output_line_count_contract",
         )
         dimension = row.get("dimensions")
         _require(
@@ -1228,7 +1266,16 @@ def _validate_output(value: dict[str, object]) -> None:
             "output_height_contract",
         )
         _unique_geometry(row.get("unique_word_geometry"), "unique_word_geometry")
-        _unique_geometry(row.get("unique_line_geometry"), "unique_line_geometry")
+        line_geometry = _unique_geometry(
+            row.get("unique_line_geometry"), "unique_line_geometry"
+        )
+        _require(
+            line_geometry["rxls_unique_items"] <= line_counts["rxls"]
+            and line_geometry["libreoffice_unique_items"]
+            <= line_counts["libreoffice"]
+            and line_geometry["matched_items"] <= line_counts["matched"],
+            "output_line_count_contract",
+        )
     _require(
         observed_dimensions == _expected_dimensions(),
         "output_dimension_contract",
@@ -1451,6 +1498,23 @@ def reduce_report(
             page.get("text_line_box_unique_geometry"),
             "text_line_box_unique_geometry",
         )
+        line_counts = _line_counts(
+            {
+                "ambiguous": page.get("text_line_box_ambiguous_items"),
+                "libreoffice": page.get(
+                    "text_line_box_libreoffice_items"
+                ),
+                "libreoffice_unmatched": page.get(
+                    "text_line_box_libreoffice_unmatched_items"
+                ),
+                "matched": page.get("text_line_box_matched_items"),
+                "rxls": page.get("text_line_box_rxls_items"),
+                "rxls_unmatched": page.get(
+                    "text_line_box_rxls_unmatched_items"
+                ),
+            },
+            "text_line_box_count",
+        )
         geometry_pages += 1
         geometry_histogram_buckets += sum(
             len(geometry["delta_histograms_millipoints"][axis])
@@ -1497,6 +1561,7 @@ def reduce_report(
                 "dimensions": expected["dimension"],
                 "height_delta_millipoints": delta,
                 "libreoffice_height_millipoints": libreoffice_height,
+                "line_counts": line_counts,
                 "page_count": 1,
                 "rxls_height_millipoints": rxls_height,
                 "unique_line_geometry": unique_line_geometry,
