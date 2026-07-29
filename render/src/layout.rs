@@ -36,9 +36,10 @@ const DEFAULT_COLUMN_CHARACTERS: f32 = 10.0;
 /// allowance because it is derived from the verified default font instead.
 const IMPORTED_COLUMN_PADDING_PIXELS: f64 = 2.0;
 const DEFAULT_COLUMN_PADDING_PIXELS: f64 = 5.0;
-/// Calc's application default when an OOXML worksheet omits sheet-format
-/// width metadata. Its import is byte-for-byte equivalent to an explicit 8.5.
-const OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS: f32 = 8.5;
+/// Calc's 8.5-character application default when an OOXML worksheet omits
+/// sheet-format width metadata, encoded in 1/256 digit-width units.
+const OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256: u32 =
+    XLSB_DIGIT_WIDTH_SCALE * 8 + XLSB_DIGIT_WIDTH_SCALE / 2;
 /// Calc's fixed application default for BIFF worksheets that omit both
 /// `STANDARDWIDTH` and `DEFCOLWIDTH`: 64 points at 96 CSS pixels per inch.
 const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH: Fixed = Fixed::from_raw(87_381);
@@ -2633,10 +2634,10 @@ fn column_width(
             // Without verified font metrics the caller's physical fallback is
             // safer than projecting Calc's font-dependent application default.
             Some(None) if options.font_pack.is_some() => (
-                column_chars_to_fixed(
-                    OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS,
+                xlsb_digits_to_fixed(
+                    OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256,
                     maximum_digit_width,
-                    IMPORTED_COLUMN_PADDING_PIXELS,
+                    0,
                 ),
                 true,
             ),
@@ -11604,7 +11605,8 @@ mod tests {
     }
 
     #[test]
-    fn ooxml_absent_explicit_and_base_default_widths_match_calc_import_geometry() {
+    fn ooxml_absent_default_uses_calc_twips_without_changing_explicit_or_base_widths() {
+        const PINNED_NOTO_SANS_CJK_KR_11_MDW: Fixed = Fixed::from_raw(8_336);
         let imported = |sheet_format: &str| {
             imported_xlsx(
                 "<styleSheet/>",
@@ -11627,6 +11629,14 @@ mod tests {
         assert_eq!(
             base_8.sheets[0].implicit_ooxml_column_width(),
             Some(Some(8.0))
+        );
+        assert_eq!(
+            xlsb_digits_to_fixed(
+                OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256,
+                PINNED_NOTO_SANS_CJK_KR_11_MDW,
+                0,
+            ),
+            Some(Fixed::from_raw(70_793))
         );
 
         let approximate = build_scene(
@@ -11657,8 +11667,9 @@ mod tests {
             .unwrap()
             .scene
             .width;
-        assert_eq!(absent_width, explicit_8_5_width);
-        assert_eq!(absent_width, Fixed::from_pixels(70));
+        assert_eq!(absent_width, Fixed::from_raw(76_049));
+        assert_eq!(explicit_8_5_width, Fixed::from_pixels(70));
+        assert_eq!(explicit_8_width, Fixed::from_pixels(66));
         assert_eq!(base_8_width, Fixed::from_pixels(71));
         assert_eq!(
             base_8_width.checked_sub(explicit_8_width),
