@@ -30,6 +30,7 @@ const HEADER_FOOTER_FONT_SIZE: Fixed = Fixed::from_pixels(12);
 const SINGLE_PAGE_CUSTOM_PAPER_CODE: u16 = 0;
 const MIN_PRINT_SCALE_PERMILLE: u16 = 100;
 const MAX_PRINT_SCALE_PERMILLE: u16 = 4_000;
+const MAX_FIT_SCALE_PERMILLE: u16 = 1_000;
 
 /// Hard ceilings specific to pagination and multi-backend output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,11 +268,11 @@ pub struct PrintReport {
     /// Effective authored traversal order, or `None` when a layout override
     /// ignored source pagination.
     pub page_order: Option<PrintPageOrder>,
-    /// Effective retained manual row breaks. Empty when a layout override
-    /// ignored source pagination.
+    /// Effective retained manual row breaks. Empty when a layout override or
+    /// fit-to-page mode ignored source manual breaks.
     pub manual_row_breaks: Vec<u32>,
     /// Effective retained manual column breaks. Empty when a layout override
-    /// ignored source pagination.
+    /// or fit-to-page mode ignored source manual breaks.
     pub manual_col_breaks: Vec<u16>,
     /// Final percentage in permille (1000 = 100%). Zero means authored print
     /// areas selected distinct fit scales; exact values remain in `pages`.
@@ -830,8 +831,6 @@ fn prepare_print_area(
     };
     let row_merges = merge_intervals_rows(sheet, body_first_row, range.last_row);
     let col_merges = merge_intervals_columns(sheet, body_first_col, range.last_col);
-    let row_breaks = sheet.print_metadata().manual_row_breaks();
-    let col_breaks = sheet.print_metadata().manual_col_breaks();
 
     let scale_permille = choose_scale(
         setup,
@@ -844,10 +843,18 @@ fn prepare_print_area(
         content_rect,
         &row_merges,
         &col_merges,
-        row_breaks,
-        col_breaks,
         warnings,
     )?;
+    let row_breaks: &[u32] = if fit_to_page_active(setup) {
+        &[]
+    } else {
+        sheet.print_metadata().manual_row_breaks()
+    };
+    let col_breaks: &[u16] = if fit_to_page_active(setup) {
+        &[]
+    } else {
+        sheet.print_metadata().manual_col_breaks()
+    };
     let body_capacity_height = unscaled_capacity(
         content_rect.height,
         scale_permille,
@@ -1240,6 +1247,14 @@ pub fn prepare_sheet_print_document(
         .first()
         .cloned()
         .ok_or(RenderError::CoordinateOverflow)?;
+    let (manual_row_breaks, manual_col_breaks) = if fit_to_page_active(&setup) {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            sheet.print_metadata().manual_row_breaks().to_vec(),
+            sheet.print_metadata().manual_col_breaks().to_vec(),
+        )
+    };
     let report = PrintReport {
         schema_version: 2,
         source,
@@ -1248,8 +1263,8 @@ pub fn prepare_sheet_print_document(
         content_rect,
         layout_override: None,
         page_order: Some(behavior.page_order),
-        manual_row_breaks: sheet.print_metadata().manual_row_breaks().to_vec(),
-        manual_col_breaks: sheet.print_metadata().manual_col_breaks().to_vec(),
+        manual_row_breaks,
+        manual_col_breaks,
         scale_permille,
         logical_pages,
         sparse_pages_omitted,
@@ -2784,15 +2799,13 @@ fn choose_scale(
     content: Rect,
     row_merges: &[(u32, u32)],
     col_merges: &[(u16, u16)],
-    row_breaks: &[u32],
-    col_breaks: &[u16],
     warnings: &mut PrintWarnings,
 ) -> Result<u16, RenderError> {
     let fit_width = setup.fit_to_width.filter(|value| *value != 0);
     let fit_height = setup.fit_to_height.filter(|value| *value != 0);
     if fit_width.is_none() && fit_height.is_none() {
         let requested = setup.scale.unwrap_or(100);
-        let clamped = requested.clamp(10, 400);
+        let clamped = requested.clamp(MIN_PRINT_SCALE_PERMILLE / 10, MAX_PRINT_SCALE_PERMILLE / 10);
         if requested != clamped {
             warnings.add(PrintWarningCode::PrintScaleClamped);
         }
@@ -2817,10 +2830,8 @@ fn choose_scale(
         let row_capacity =
             unscaled_capacity(content.height, scale, repeated_height, headings_height)?;
         let col_capacity = unscaled_capacity(content.width, scale, repeated_width, headings_width)?;
-        let (row_pages, _, _) =
-            partition_axis_with_breaks(rows, row_capacity, row_merges, row_breaks)?;
-        let (col_pages, _, _) =
-            partition_axis_with_breaks(columns, col_capacity, col_merges, col_breaks)?;
+        let (row_pages, _) = partition_axis(rows, row_capacity, row_merges)?;
+        let (col_pages, _) = partition_axis(columns, col_capacity, col_merges)?;
         Ok(row_pages.iter().all(|page| page.size <= row_capacity)
             && col_pages.iter().all(|page| page.size <= col_capacity)
             && fit_height.is_none_or(|target| row_pages.len() <= usize::from(target))
@@ -2831,7 +2842,7 @@ fn choose_scale(
         return Ok(MIN_PRINT_SCALE_PERMILLE);
     }
     let mut low = MIN_PRINT_SCALE_PERMILLE;
-    let mut high = MAX_PRINT_SCALE_PERMILLE;
+    let mut high = MAX_FIT_SCALE_PERMILLE;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         if fits(middle)? {
@@ -2841,6 +2852,11 @@ fn choose_scale(
         }
     }
     Ok(low)
+}
+
+fn fit_to_page_active(setup: &PageSetup) -> bool {
+    setup.fit_to_width.is_some_and(|value| value != 0)
+        || setup.fit_to_height.is_some_and(|value| value != 0)
 }
 
 fn unscaled_capacity(

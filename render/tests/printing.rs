@@ -268,6 +268,40 @@ fn synthetic_print_metadata_xlsx() -> Vec<u8> {
     ])
 }
 
+fn synthetic_fit_breaks_xlsx(print_area: &str, page_setup: &str) -> Vec<u8> {
+    let workbook = format!(
+        r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Fit Breaks" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">'Fit Breaks'!{print_area}</definedName></definedNames></workbook>"#
+    );
+    let relationships = r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
+    let columns = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    let mut rows = String::new();
+    for row in 1..=20 {
+        std::fmt::Write::write_fmt(
+            &mut rows,
+            format_args!(r#"<row r="{row}" ht="60" customHeight="1">"#),
+        )
+        .expect("writing XML into a String is infallible");
+        for column in columns {
+            std::fmt::Write::write_fmt(
+                &mut rows,
+                format_args!(
+                    r#"<c r="{column}{row}" t="inlineStr"><is><t>{column}{row}</t></is></c>"#
+                ),
+            )
+            .expect("writing XML into a String is infallible");
+        }
+        rows.push_str("</row>");
+    }
+    let worksheet = format!(
+        r#"<worksheet><cols><col min="1" max="8" width="40" customWidth="1"/></cols><sheetData>{rows}</sheetData><pageSetup paperSize="1" {page_setup}/><rowBreaks count="1" manualBreakCount="1"><brk id="1" min="0" max="16383" man="1"/></rowBreaks><colBreaks count="1" manualBreakCount="1"><brk id="1" min="0" max="1048575" man="1"/></colBreaks></worksheet>"#
+    );
+    zip_text_parts(&[
+        ("xl/workbook.xml", &workbook),
+        ("xl/_rels/workbook.xml.rels", relationships),
+        ("xl/worksheets/sheet1.xml", &worksheet),
+    ])
+}
+
 fn synthetic_lossy_print_metadata_xlsx() -> Vec<u8> {
     zip_text_parts(&[
         (
@@ -1349,6 +1383,166 @@ fn fit_to_page_is_selected_before_sparse_pages_are_omitted() {
             .iter()
             .any(|warning| warning.code == PrintWarningCode::SparsePagesOmitted));
     }
+}
+
+#[test]
+fn fit_to_page_ignores_manual_breaks_without_enlarging_small_ranges() {
+    let workbook = Workbook::open(&synthetic_fit_breaks_xlsx(
+        "$A$1:$B$2",
+        r#"fitToWidth="1" fitToHeight="1""#,
+    ))
+    .unwrap();
+    let metadata = workbook.sheets[0].print_metadata();
+    assert_eq!(metadata.manual_row_breaks(), &[1]);
+    assert_eq!(metadata.manual_col_breaks(), &[1]);
+
+    let options = PrintOptions {
+        omit_sparse_pages: false,
+        ..PrintOptions::default()
+    };
+    let document = build_print_document(&workbook, 0, &options).unwrap();
+    assert_eq!(
+        document,
+        build_print_document(&workbook, 0, &options).unwrap()
+    );
+    assert_eq!(document.report.scale_permille, 1_000);
+    assert_eq!(document.report.logical_pages, 1);
+    assert_eq!(document.report.pages.len(), 1);
+    assert_eq!(
+        document.report.pages[0].body_range,
+        RenderRange::new(0, 0, 1, 1)
+    );
+    assert_eq!(document.report.pages[0].scale_permille, 1_000);
+    assert!(document.report.manual_row_breaks.is_empty());
+    assert!(document.report.manual_col_breaks.is_empty());
+    assert!(!document.report.pages[0].manual_row_break_before);
+    assert!(!document.report.pages[0].manual_col_break_before);
+    assert!(!document
+        .report
+        .warnings
+        .iter()
+        .any(|warning| warning.code == PrintWarningCode::FitTargetUnreachable));
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_row_breaks(),
+        &[1]
+    );
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_col_breaks(),
+        &[1]
+    );
+    let json = document.report.to_json();
+    assert!(json.contains("\"manual_row_breaks\":[]"));
+    assert!(json.contains("\"manual_col_breaks\":[]"));
+    assert!(!json.contains("\"manual_row_break_before\":true"));
+    assert!(!json.contains("\"manual_col_break_before\":true"));
+}
+
+#[test]
+fn fit_to_page_shrinks_large_ranges_to_target_without_manual_break_pages() {
+    let workbook = Workbook::open(&synthetic_fit_breaks_xlsx(
+        "$A$1:$H$20",
+        r#"fitToWidth="1" fitToHeight="1""#,
+    ))
+    .unwrap();
+    let metadata = workbook.sheets[0].print_metadata();
+    assert_eq!(metadata.manual_row_breaks(), &[1]);
+    assert_eq!(metadata.manual_col_breaks(), &[1]);
+
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert!((100..1_000).contains(&document.report.scale_permille));
+    assert_eq!(document.report.logical_pages, 1);
+    assert_eq!(document.report.pages.len(), 1);
+    assert_eq!(
+        document.report.pages[0].body_range,
+        RenderRange::new(0, 0, 19, 7)
+    );
+    assert_eq!(
+        document.report.pages[0].scale_permille,
+        document.report.scale_permille
+    );
+    assert!(document.report.manual_row_breaks.is_empty());
+    assert!(document.report.manual_col_breaks.is_empty());
+    assert!(!document.report.pages[0].manual_row_break_before);
+    assert!(!document.report.pages[0].manual_col_break_before);
+    assert!(!document
+        .report
+        .warnings
+        .iter()
+        .any(|warning| warning.code == PrintWarningCode::FitTargetUnreachable));
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_row_breaks(),
+        &[1]
+    );
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_col_breaks(),
+        &[1]
+    );
+}
+
+#[test]
+fn fixed_scale_preserves_manual_break_pagination_and_reporting() {
+    let workbook =
+        Workbook::open(&synthetic_fit_breaks_xlsx("$A$1:$B$2", r#"scale="100""#)).unwrap();
+    let metadata = workbook.sheets[0].print_metadata();
+    assert_eq!(metadata.manual_row_breaks(), &[1]);
+    assert_eq!(metadata.manual_col_breaks(), &[1]);
+
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(document.report.scale_permille, 1_000);
+    assert_eq!(document.report.logical_pages, 4);
+    assert_eq!(document.report.pages.len(), 4);
+    assert_eq!(document.report.manual_row_breaks, [1]);
+    assert_eq!(document.report.manual_col_breaks, [1]);
+    assert_eq!(
+        document
+            .report
+            .pages
+            .iter()
+            .map(|page| {
+                (
+                    page.horizontal_index,
+                    page.vertical_index,
+                    page.manual_col_break_before,
+                    page.manual_row_break_before,
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (0, 0, false, false),
+            (0, 1, false, true),
+            (1, 0, true, false),
+            (1, 1, true, true),
+        ]
+    );
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_row_breaks(),
+        &[1]
+    );
+    assert_eq!(
+        workbook.sheets[0].print_metadata().manual_col_breaks(),
+        &[1]
+    );
+    let json = document.report.to_json();
+    assert!(json.contains("\"manual_row_breaks\":[1]"));
+    assert!(json.contains("\"manual_col_breaks\":[1]"));
+    assert!(json.contains("\"manual_row_break_before\":true"));
+    assert!(json.contains("\"manual_col_break_before\":true"));
 }
 
 #[test]
