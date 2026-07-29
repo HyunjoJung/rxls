@@ -363,6 +363,7 @@ class FakeRunner:
         archive: Path | None = None,
         *,
         start_status: str = "ok",
+        start_stderr: bytes = b"",
         load_status: str = "ok",
         label_mutation: dict[str, str] | None = None,
         image_ids: tuple[str, ...] = (FAKE_CONFIG_ID,),
@@ -387,6 +388,7 @@ class FakeRunner:
         self.lock_sha256 = lock_sha256
         self.archive = archive
         self.start_status = start_status
+        self.start_stderr = start_stderr
         self.load_status = load_status
         self.label_mutation = label_mutation
         self.image_ids = image_ids
@@ -518,7 +520,11 @@ class FakeRunner:
                 assert stdout_path is not None and self.archive is not None
                 Path(stdout_path).write_bytes(self.archive.read_bytes())
                 return MODULE.CommandResult("ok", 0)
-            return MODULE.CommandResult(self.start_status, None)
+            return MODULE.CommandResult(
+                self.start_status,
+                None,
+                stderr=self.start_stderr,
+            )
         if command[1] == "rm":
             return MODULE.CommandResult("ok", 0)
         raise AssertionError(f"unexpected command: {command!r}")
@@ -1075,6 +1081,26 @@ class RenderOracleContainerTests(unittest.TestCase):
             "LibreOffice runtime dependency scan failed",
             containerfile,
         )
+        for suffix in (
+            "*.ttf",
+            "*.otf",
+            "*.ttc",
+            "*.otc",
+            "*.pfa",
+            "*.pfb",
+            "*.afm",
+            "*.pcf",
+            "*.pcf.gz",
+            "*.bdf",
+            "*.woff",
+            "*.woff2",
+        ):
+            self.assertEqual(containerfile.count(f"-iname '{suffix}'"), 2)
+        self.assertIn("find /usr /opt -type f", containerfile)
+        self.assertIn(
+            "LibreOffice image font closure is not empty",
+            containerfile,
+        )
         self.assertIn(
             f"ARG SOURCE_DATE_EPOCH={lock['built_image']['source_date_epoch']}",
             containerfile,
@@ -1319,6 +1345,19 @@ class RenderOracleContainerTests(unittest.TestCase):
         )
         self.assertIn("|| fail evidence_archive_failed", entrypoint)
         self.assertNotIn("curl ", entrypoint)
+        self.assertIn(
+            "find /oracle/fonts/fonts",
+            entrypoint,
+        )
+        self.assertIn(
+            "fc-list --format='%{file}\\n'",
+            entrypoint,
+        )
+        self.assertIn(
+            'cmp -s "${expected_fonts}" "${active_fonts}"',
+            entrypoint,
+        )
+        self.assertIn("font_runtime_closure_mismatch", entrypoint)
         self.assertIn(
             "chmod 0555 /opt/rxls /opt/rxls/profile",
             containerfile,
@@ -2598,6 +2637,72 @@ class RenderOracleContainerTests(unittest.TestCase):
                 )
             self.assertEqual(list(evidence.iterdir()), [])
             self.assertEqual(runner.commands[-1][1:3], ["rm", "--force"])
+
+    def test_execute_render_propagates_only_reviewed_font_closure_errors(
+        self,
+    ) -> None:
+        _, _, lock_sha = MODULE.load_lock()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.xlsx"
+            source.write_bytes(b"source")
+            font_pack = write_font_pack(root / "font-pack")
+            config = MODULE.RenderConfig(
+                source=source,
+                font_pack=font_pack,
+                corpus=None,
+                evidence_dir=root / "evidence",
+                run_id="closure-test",
+                limits=MODULE.ResourceLimits(
+                    timeout_seconds=1,
+                    memory_mib=512,
+                    evidence_mib=16,
+                    runtime_mib=64,
+                    tmp_mib=64,
+                ),
+            )
+            for code in sorted(MODULE.REVIEWED_ENTRYPOINT_ERROR_CODES):
+                runner = FakeRunner(
+                    lock_sha,
+                    start_status="nonzero",
+                    start_stderr=f"oracle_error:{code}\n".encode("ascii"),
+                )
+                with self.subTest(code=code), self.assertRaisesRegex(
+                    MODULE.OracleContainerError,
+                    rf"^{code}$",
+                ):
+                    MODULE.execute_render(
+                        config,
+                        "docker",
+                        "local/oracle:test",
+                        lock_sha,
+                        runner=runner,
+                    )
+
+            for name, stderr in (
+                ("unreviewed", b"oracle_error:private_path_suffix\n"),
+                (
+                    "extra_line",
+                    b"diagnostic\noracle_error:font_runtime_closure_mismatch\n",
+                ),
+                ("oversized", b"x" * 257),
+            ):
+                runner = FakeRunner(
+                    lock_sha,
+                    start_status="nonzero",
+                    start_stderr=stderr,
+                )
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    MODULE.OracleContainerError,
+                    "^container_start_nonzero$",
+                ):
+                    MODULE.execute_render(
+                        config,
+                        "docker",
+                        "local/oracle:test",
+                        lock_sha,
+                        runner=runner,
+                    )
 
     def test_bounded_runner_enforces_output_and_wall_time(self) -> None:
         runner = MODULE.BoundedProcessRunner()

@@ -59,6 +59,16 @@ IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RUN_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\Z")
 BUILDER_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9_.-]{0,62})\Z")
 IMAGE_RE = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
+ENTRYPOINT_ERROR_RE = re.compile(
+    rb"oracle_error:([a-z][a-z0-9_]{0,63})\n?\Z"
+)
+REVIEWED_ENTRYPOINT_ERROR_CODES = frozenset(
+    {
+        "font_runtime_closure_empty",
+        "font_runtime_closure_failed",
+        "font_runtime_closure_mismatch",
+    }
+)
 DOCKER_V2_MANIFEST_MEDIA_TYPE = (
     "application/vnd.docker.distribution.manifest.v2+json"
 )
@@ -510,6 +520,17 @@ class BoundedProcessRunner:
         if status is None:
             status = "ok" if returncode == 0 else "nonzero"
         return CommandResult(status, returncode, bytes(stdout), bytes(stderr))
+
+
+def reviewed_entrypoint_error(stderr: object) -> str | None:
+    """Return only a fixed path/content-neutral entrypoint failure code."""
+    if not isinstance(stderr, bytes) or len(stderr) > 256:
+        return None
+    match = ENTRYPOINT_ERROR_RE.fullmatch(stderr)
+    if match is None:
+        return None
+    code = match.group(1).decode("ascii")
+    return code if code in REVIEWED_ENTRYPOINT_ERROR_CODES else None
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -2327,6 +2348,13 @@ def execute_render(
                     stdout_path=archive,
                 )
                 if started.status != "ok":
+                    entrypoint_error = (
+                        reviewed_entrypoint_error(started.stderr)
+                        if started.status == "nonzero"
+                        else None
+                    )
+                    if entrypoint_error is not None:
+                        raise OracleContainerError(entrypoint_error)
                     raise OracleContainerError(f"container_start_{started.status}")
             finally:
                 runner.run(

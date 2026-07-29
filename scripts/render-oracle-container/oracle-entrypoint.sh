@@ -83,6 +83,25 @@ test -f "${source}" || fail source_missing
 test ! -L "${source}" || fail source_symlink
 test -f /oracle/fonts/fonts.conf || fail font_config_missing
 test -d /oracle/fonts/fonts || fail font_directory_missing
+
+# Prove that fontconfig exposes every and only the already host-verified font
+# payload mounted under the pinned pack. This keeps the check path-private and
+# prevents a newly visible system or LibreOffice-bundled face from silently
+# changing layout while still passing a family-name-only PDF attestation.
+expected_fonts="${runtime}/font-files.expected"
+active_fonts="${runtime}/font-files.active"
+find /oracle/fonts/fonts \
+    -mindepth 1 -maxdepth 1 -type f -print \
+  | LC_ALL=C sort -u > "${expected_fonts}" \
+  || fail font_runtime_closure_failed
+test -s "${expected_fonts}" || fail font_runtime_closure_empty
+fc-list --format='%{file}\n' \
+  | LC_ALL=C sort -u > "${active_fonts}" \
+  || fail font_runtime_closure_failed
+test -s "${active_fonts}" || fail font_runtime_closure_empty
+cmp -s "${expected_fonts}" "${active_fonts}" \
+  || fail font_runtime_closure_mismatch
+
 test "$(wc -c < "${source}")" = "${RXLS_SOURCE_BYTES}" || fail source_size_mismatch
 actual_source_sha256="$(sha256sum "${source}" | cut -d ' ' -f 1)"
 test "${actual_source_sha256}" = "${RXLS_SOURCE_SHA256}" || fail source_hash_mismatch

@@ -43,41 +43,9 @@
     "snapshotter": "overlayfs"
   },
   "built_image": {
-    "bootstrap_receipt": {
-      "artifact": {
-        "digest": "sha256:4f4ec1cde454895a377d75b9adf08b97273bfd509015153f21e8a47d0a354546",
-        "id": 8705116263,
-        "name": "render-oracle-image-20c1ed578230be4b91f038d879436ec99ec0f666-30401862214-1",
-        "size_in_bytes": 1757
-      },
-      "evidence": {
-        "bytes": 6948,
-        "member": "render-oracle-image-build.json",
-        "sha256": "f8cbb09ec25c41fb398e255f28f5ccbbf8ac24670669ade2347ac9c1f78dc1de"
-      },
-      "job": {
-        "conclusion": "failure",
-        "id": 90418326430,
-        "name": "locked LibreOffice oracle image",
-        "run_attempt": 1,
-        "run_id": 30401862214
-      },
-      "repository": {
-        "full_name": "HyunjoJung/rxls",
-        "id": 1297467060
-      },
-      "run": {
-        "conclusion": "failure",
-        "event": "pull_request",
-        "head_sha": "20c1ed578230be4b91f038d879436ec99ec0f666",
-        "id": 30401862214,
-        "run_attempt": 1,
-        "workflow": ".github/workflows/render-hardening.yml"
-      },
-      "schema": "rxls.render-oracle-bootstrap-receipt.v1"
-    },
-    "expected_id": "sha256:21a72c4406141ef9f64e5e53e0d40e064058a7594a6df43878c1d8f80025ed3e",
-    "expected_manifest_digest": "sha256:45156f93e4b0bd362e771f8b3d166709dc18bef8b8544e6367d81e82dc7ee386",
+    "bootstrap_receipt": null,
+    "expected_id": null,
+    "expected_manifest_digest": null,
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
@@ -88,14 +56,14 @@
   },
   "files": [
     {
-      "bytes": 5365,
+      "bytes": 6445,
       "path": "Containerfile",
-      "sha256": "f314426720873bbeb5929d98aab14f4215dcd99a5045ed63cfd5433fad736066"
+      "sha256": "36f36e95e27acb21c28e4bb766b60dd364fb8bc8f3cd5d31be0502284e26e380"
     },
     {
-      "bytes": 5310,
+      "bytes": 6189,
       "path": "oracle-entrypoint.sh",
-      "sha256": "4684591145af271179de46b6c1bc475ec97dcd5c339ea650aee38d1f74b37c0b"
+      "sha256": "34abb2bfbd717aaac51c6214f68a0597bf0d538813e544b2e4d0c4e0a35a4e94"
     },
     {
       "bytes": 1217,
@@ -125,8 +93,8 @@
   },
   "schema": "rxls.render-oracle-container-lock.v3",
   "wrapper": {
-    "bytes": 127001,
+    "bytes": 128024,
     "path": "scripts/run-render-oracle-container.py",
-    "sha256": "d4d7151eb82aa10e72294004c1e7f7e894d3268be2b2f371d3b5ff2764c4f67c"
+    "sha256": "9ed435af4ebd8ef95a3e8960c2d6e619aeab507c29c1d95adcc347e0e41338d0"
   }
 }

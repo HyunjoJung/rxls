@@ -147,8 +147,29 @@ PDFFONTS_SEPARATOR = (
     "--- --- --- ---------"
 )
 PDF_SUBSET_PREFIX_RE = re.compile(r"[A-Z]{6}\+")
-PDF_FONT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._,+-]{0,127}\Z")
+POSTSCRIPT_FONT_NAME_FORBIDDEN = frozenset("[](){}<>/%")
+PDF_FONT_NAME_CHARACTERS = "".join(
+    chr(codepoint)
+    for codepoint in range(33, 127)
+    if chr(codepoint) not in POSTSCRIPT_FONT_NAME_FORBIDDEN
+)
+PDF_FONT_NAME_RE = re.compile(
+    rf"[{re.escape(PDF_FONT_NAME_CHARACTERS)}]{{1,128}}\Z"
+)
+POSTSCRIPT_FONT_NAME_RE = re.compile(
+    rf"[{re.escape(PDF_FONT_NAME_CHARACTERS)}]{{1,63}}\Z"
+)
 PDF_FONT_ENCODING_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,15}\Z")
+MAX_FONT_PACK_FONT_BYTES = 32 * 1024 * 1024
+MAX_SFNT_FACES = 32
+MAX_SFNT_TABLES_PER_FACE = 256
+MAX_SFNT_NAME_TABLE_BYTES = 1024 * 1024
+MAX_SFNT_NAME_RECORDS_PER_FACE = 1024
+MAX_SFNT_LANGUAGE_TAGS_PER_FACE = 256
+MAX_SFNT_SELECTED_STRING_BYTES = 512
+MAX_SFNT_IDENTITIES_PER_FILE = 4096
+SFNT_SCALER_TYPES = frozenset({b"\x00\x01\x00\x00", b"OTTO"})
+SFNT_SELECTED_NAME_IDS = frozenset({1, 4, 6})
 PDF_FONT_TYPES = frozenset(
     {
         "Type 1",
@@ -818,6 +839,402 @@ def _safe_pack_member(root: Path, value: object) -> Path:
     return path
 
 
+def _read_verified_font_bytes(
+    path: Path,
+    expected_bytes: int,
+    expected_sha256: str,
+) -> bytes:
+    """Read, bound, and authenticate one font once before parsing its bytes."""
+    try:
+        with path.open("rb") as source:
+            payload = source.read(expected_bytes + 1)
+    except OSError as error:
+        raise HarnessError("font_pack_font_identity") from error
+    if (
+        len(payload) != expected_bytes
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise HarnessError("font_pack_font_identity")
+    return payload
+
+
+def _sfnt_uint(payload: bytes | memoryview, offset: int, width: int) -> int:
+    if (
+        not isinstance(offset, int)
+        or not isinstance(width, int)
+        or offset < 0
+        or width <= 0
+        or offset + width > len(payload)
+    ):
+        raise HarnessError("font_pack_font_identity")
+    return int.from_bytes(payload[offset : offset + width], "big")
+
+
+def _sfnt_interval(
+    payload: bytes | memoryview,
+    offset: int,
+    length: int,
+) -> memoryview:
+    if (
+        not isinstance(offset, int)
+        or not isinstance(length, int)
+        or offset < 0
+        or length < 0
+        or offset + length > len(payload)
+    ):
+        raise HarnessError("font_pack_font_identity")
+    return memoryview(payload)[offset : offset + length]
+
+
+def _decode_sfnt_name(
+    raw: bytes,
+    *,
+    platform_id: int,
+    encoding_id: int,
+) -> str | None:
+    encoding: str | None = None
+    if platform_id == 0 and encoding_id in {0, 1, 2, 3, 4}:
+        encoding = "utf-16-be"
+    elif platform_id == 3 and encoding_id in {0, 1, 2, 6, 10}:
+        encoding = "utf-16-be"
+    elif platform_id == 1 and encoding_id == 0:
+        encoding = "mac_roman"
+    if encoding is None:
+        return None
+    if encoding == "utf-16-be" and len(raw) % 2 != 0:
+        raise HarnessError("font_pack_font_identity")
+    try:
+        return raw.decode(encoding, "strict")
+    except UnicodeDecodeError as error:
+        raise HarnessError("font_pack_font_identity") from error
+
+
+def _sfnt_name_table_identities(
+    payload: bytes,
+    table_offset: int,
+    table_length: int,
+) -> dict[int, frozenset[str]]:
+    if not 6 <= table_length <= MAX_SFNT_NAME_TABLE_BYTES:
+        raise HarnessError("font_pack_font_identity")
+    table = _sfnt_interval(payload, table_offset, table_length)
+    format_version = _sfnt_uint(table, 0, 2)
+    record_count = _sfnt_uint(table, 2, 2)
+    storage_offset = _sfnt_uint(table, 4, 2)
+    if (
+        format_version not in {0, 1}
+        or not 1 <= record_count <= MAX_SFNT_NAME_RECORDS_PER_FACE
+    ):
+        raise HarnessError("font_pack_font_identity")
+
+    records_end = 6 + 12 * record_count
+    if records_end > len(table):
+        raise HarnessError("font_pack_font_identity")
+    language_tag_count = 0
+    structural_end = records_end
+    if format_version == 1:
+        if records_end + 2 > len(table):
+            raise HarnessError("font_pack_font_identity")
+        language_tag_count = _sfnt_uint(table, records_end, 2)
+        if language_tag_count > MAX_SFNT_LANGUAGE_TAGS_PER_FACE:
+            raise HarnessError("font_pack_font_identity")
+        structural_end = records_end + 2 + 4 * language_tag_count
+        if structural_end > len(table):
+            raise HarnessError("font_pack_font_identity")
+    if not structural_end <= storage_offset <= len(table):
+        raise HarnessError("font_pack_font_identity")
+    storage_length = len(table) - storage_offset
+
+    language_tags: list[str] = []
+    for index in range(language_tag_count):
+        row_offset = records_end + 2 + 4 * index
+        raw_length = _sfnt_uint(table, row_offset, 2)
+        raw_offset = _sfnt_uint(table, row_offset + 2, 2)
+        if (
+            raw_length == 0
+            or raw_length > MAX_SFNT_SELECTED_STRING_BYTES
+            or raw_length % 2 != 0
+            or raw_offset + raw_length > storage_length
+        ):
+            raise HarnessError("font_pack_font_identity")
+        raw = bytes(
+            _sfnt_interval(
+                table,
+                storage_offset + raw_offset,
+                raw_length,
+            )
+        )
+        try:
+            language_tag = raw.decode("utf-16-be", "strict")
+        except UnicodeDecodeError as error:
+            raise HarnessError("font_pack_font_identity") from error
+        if (
+            not language_tag
+            or "\x00" in language_tag
+            or language_tag != language_tag.strip()
+            or not language_tag.isprintable()
+        ):
+            raise HarnessError("font_pack_font_identity")
+        # Language-tag contents never influence identity selection. Treat the
+        # bounded UTF-16BE value as opaque and validate only safe decoding and
+        # the record references below rather than approximating BCP 47.
+        language_tags.append(language_tag)
+
+    identities: dict[int, set[str]] = {1: set(), 4: set(), 6: set()}
+    previous_key: tuple[int, int, int, int] | None = None
+    for index in range(record_count):
+        row_offset = 6 + 12 * index
+        platform_id = _sfnt_uint(table, row_offset, 2)
+        encoding_id = _sfnt_uint(table, row_offset + 2, 2)
+        language_id = _sfnt_uint(table, row_offset + 4, 2)
+        name_id = _sfnt_uint(table, row_offset + 6, 2)
+        raw_length = _sfnt_uint(table, row_offset + 8, 2)
+        raw_offset = _sfnt_uint(table, row_offset + 10, 2)
+        key = (platform_id, encoding_id, language_id, name_id)
+        if previous_key is not None and key <= previous_key:
+            raise HarnessError("font_pack_font_identity")
+        previous_key = key
+        if raw_offset + raw_length > storage_length:
+            raise HarnessError("font_pack_font_identity")
+        if format_version == 0 and language_id >= 0x8000:
+            raise HarnessError("font_pack_font_identity")
+        if (
+            format_version == 1
+            and language_id >= 0x8000
+            and language_id - 0x8000 >= len(language_tags)
+        ):
+            raise HarnessError("font_pack_font_identity")
+        if name_id not in SFNT_SELECTED_NAME_IDS:
+            continue
+        raw = bytes(
+            _sfnt_interval(
+                table,
+                storage_offset + raw_offset,
+                raw_length,
+            )
+        )
+        decoded = _decode_sfnt_name(
+            raw,
+            platform_id=platform_id,
+            encoding_id=encoding_id,
+        )
+        if decoded is None:
+            continue
+        if (
+            raw_length == 0
+            or raw_length > MAX_SFNT_SELECTED_STRING_BYTES
+        ):
+            raise HarnessError("font_pack_font_identity")
+        if (
+            "\x00" in decoded
+            or decoded != decoded.strip()
+            or not decoded.isprintable()
+        ):
+            raise HarnessError("font_pack_font_identity")
+        if not decoded.isascii():
+            if name_id == 6:
+                raise HarnessError("font_pack_font_identity")
+            continue
+        if (
+            name_id == 6
+            and POSTSCRIPT_FONT_NAME_RE.fullmatch(decoded) is None
+        ):
+            raise HarnessError("font_pack_font_identity")
+        identities[name_id].add(
+            _normalized_pdf_font_identity(
+                decoded,
+                "font_pack_font_identity",
+            )
+        )
+
+    if any(not identities[name_id] for name_id in SFNT_SELECTED_NAME_IDS):
+        raise HarnessError("font_pack_font_identity")
+    if len(identities[6]) != 1:
+        raise HarnessError("font_pack_font_identity")
+    return {
+        name_id: frozenset(values)
+        for name_id, values in identities.items()
+    }
+
+
+def _sfnt_pdf_font_identities(
+    payload: bytes,
+) -> tuple[frozenset[str], frozenset[str], int]:
+    """Derive PDF-matchable names from the exact authenticated SFNT bytes."""
+    if not isinstance(payload, bytes) or len(payload) < 12:
+        raise HarnessError("font_pack_font_identity")
+
+    collection_header_end = 0
+    collection_dsig: tuple[int, int] | None = None
+    if payload[:4] == b"ttcf":
+        version = _sfnt_uint(payload, 4, 4)
+        face_count = _sfnt_uint(payload, 8, 4)
+        if (
+            version not in {0x00010000, 0x00020000}
+            or not 1 <= face_count <= MAX_SFNT_FACES
+        ):
+            raise HarnessError("font_pack_font_identity")
+        offsets_end = 12 + 4 * face_count
+        collection_header_end = offsets_end + (
+            12 if version == 0x00020000 else 0
+        )
+        if collection_header_end > len(payload):
+            raise HarnessError("font_pack_font_identity")
+        face_offsets = tuple(
+            _sfnt_uint(payload, 12 + 4 * index, 4)
+            for index in range(face_count)
+        )
+        if (
+            len(set(face_offsets)) != face_count
+            or any(
+                offset % 4 != 0
+                or offset < collection_header_end
+                or offset + 12 > len(payload)
+                for offset in face_offsets
+            )
+        ):
+            raise HarnessError("font_pack_font_identity")
+        if version == 0x00020000:
+            dsig_tag = _sfnt_uint(payload, offsets_end, 4)
+            dsig_length = _sfnt_uint(payload, offsets_end + 4, 4)
+            dsig_offset = _sfnt_uint(payload, offsets_end + 8, 4)
+            if (dsig_tag, dsig_length, dsig_offset) != (0, 0, 0):
+                if (
+                    dsig_tag != 0x44534947
+                    or dsig_length == 0
+                    or dsig_offset % 4 != 0
+                    or dsig_offset + dsig_length > len(payload)
+                ):
+                    raise HarnessError("font_pack_font_identity")
+                collection_dsig = (
+                    dsig_offset,
+                    dsig_offset + dsig_length,
+                )
+    else:
+        if payload[:4] not in SFNT_SCALER_TYPES:
+            raise HarnessError("font_pack_font_identity")
+        face_offsets = (0,)
+        face_count = 1
+
+    face_directories: list[tuple[int, int, int]] = []
+    for face_offset in face_offsets:
+        if bytes(_sfnt_interval(payload, face_offset, 4)) not in SFNT_SCALER_TYPES:
+            raise HarnessError("font_pack_font_identity")
+        table_count = _sfnt_uint(payload, face_offset + 4, 2)
+        if not 1 <= table_count <= MAX_SFNT_TABLES_PER_FACE:
+            raise HarnessError("font_pack_font_identity")
+        maximum_power = 1 << (table_count.bit_length() - 1)
+        if (
+            _sfnt_uint(payload, face_offset + 6, 2) != maximum_power * 16
+            or _sfnt_uint(payload, face_offset + 8, 2)
+            != maximum_power.bit_length() - 1
+            or _sfnt_uint(payload, face_offset + 10, 2)
+            != table_count * 16 - maximum_power * 16
+        ):
+            raise HarnessError("font_pack_font_identity")
+        directory_end = face_offset + 12 + 16 * table_count
+        if directory_end > len(payload):
+            raise HarnessError("font_pack_font_identity")
+        face_directories.append((face_offset, directory_end, table_count))
+
+    directory_intervals = sorted(
+        (start, end) for start, end, _ in face_directories
+    )
+    if any(
+        current[0] < previous[1]
+        for previous, current in zip(
+            directory_intervals,
+            directory_intervals[1:],
+        )
+    ):
+        raise HarnessError("font_pack_font_identity")
+    protected_intervals = list(directory_intervals)
+    if collection_header_end:
+        protected_intervals.append((0, collection_header_end))
+    if collection_dsig is not None:
+        protected_intervals.append(collection_dsig)
+    ordered_protected = sorted(protected_intervals)
+    if any(
+        current[0] < previous[1]
+        for previous, current in zip(
+            ordered_protected,
+            ordered_protected[1:],
+        )
+    ):
+        raise HarnessError("font_pack_font_identity")
+
+    all_identities: set[str] = set()
+    family_identities: set[str] = set()
+    all_table_intervals: list[tuple[int, int]] = []
+    for face_offset, _, table_count in face_directories:
+        previous_tag: bytes | None = None
+        name_tables: list[tuple[int, int]] = []
+        table_intervals: list[tuple[int, int]] = []
+        for index in range(table_count):
+            row_offset = face_offset + 12 + 16 * index
+            tag = bytes(_sfnt_interval(payload, row_offset, 4))
+            table_offset = _sfnt_uint(payload, row_offset + 8, 4)
+            table_length = _sfnt_uint(payload, row_offset + 12, 4)
+            if (
+                (
+                    previous_tag is not None
+                    and tag <= previous_tag
+                )
+                or any(byte < 0x20 or byte > 0x7E for byte in tag)
+                or table_offset % 4 != 0
+                or table_offset + table_length > len(payload)
+            ):
+                raise HarnessError("font_pack_font_identity")
+            previous_tag = tag
+            if table_length:
+                table_interval = (
+                    table_offset,
+                    table_offset + table_length,
+                )
+                if any(
+                    table_interval[0] < protected_end
+                    and protected_start < table_interval[1]
+                    for protected_start, protected_end in ordered_protected
+                ):
+                    raise HarnessError("font_pack_font_identity")
+                table_intervals.append(table_interval)
+                all_table_intervals.append(table_interval)
+            if tag == b"name":
+                name_tables.append((table_offset, table_length))
+        ordered_intervals = sorted(set(table_intervals))
+        if any(
+            current[0] < previous[1]
+            for previous, current in zip(
+                ordered_intervals,
+                ordered_intervals[1:],
+            )
+        ):
+            raise HarnessError("font_pack_font_identity")
+        if len(name_tables) != 1:
+            raise HarnessError("font_pack_font_identity")
+        names = _sfnt_name_table_identities(payload, *name_tables[0])
+        for values in names.values():
+            all_identities.update(values)
+        family_identities.update(names[1])
+        if len(all_identities) > MAX_SFNT_IDENTITIES_PER_FILE:
+            raise HarnessError("font_pack_font_identity")
+
+    ordered_table_intervals = sorted(set(all_table_intervals))
+    if any(
+        current[0] < previous[1]
+        for previous, current in zip(
+            ordered_table_intervals,
+            ordered_table_intervals[1:],
+        )
+    ):
+        raise HarnessError("font_pack_font_identity")
+
+    return (
+        frozenset(all_identities),
+        frozenset(family_identities),
+        face_count,
+    )
+
+
 def _normalized_pdf_font_identity(value: object, code: str) -> str:
     """Normalize one trusted PDF/PostScript font identity for exact matching."""
     if (
@@ -869,29 +1286,27 @@ def load_font_pack(manifest_path: Path) -> FontPack:
         digest = row.get("sha256")
         if (
             not isinstance(size, int)
-            or not 0 < size <= 32 * 1024 * 1024
+            or not 0 < size <= MAX_FONT_PACK_FONT_BYTES
             or not isinstance(digest, str)
             or not SHA256_RE.fullmatch(digest)
-            or path.stat().st_size != size
-            or _sha256_file(path, 32 * 1024 * 1024) != digest
             or not isinstance(row.get("family"), str)
             or row.get("style") not in {"normal", "italic"}
             or not isinstance(row.get("weight"), int)
         ):
             raise HarnessError("font_pack_font_identity")
+        payload = _read_verified_font_bytes(path, size, digest)
+        identities, family_identities, _face_count = (
+            _sfnt_pdf_font_identities(payload)
+        )
+        normalized_family = _normalized_pdf_font_identity(
+            row["family"],
+            "font_pack_font_identity",
+        )
+        if normalized_family not in family_identities:
+            raise HarnessError("font_pack_font_identity")
         total_bytes += size
         font_paths.append(path)
-        pdf_identities.add(
-            _normalized_pdf_font_identity(
-                row["family"], "font_pack_font_identity"
-            )
-        )
-        pdf_identities.add(
-            _normalized_pdf_font_identity(
-                PurePosixPath(str(row["output"])).stem,
-                "font_pack_font_identity",
-            )
-        )
+        pdf_identities.update(identities)
     for row in licenses:
         if not isinstance(row, dict):
             raise HarnessError("font_pack_license")
@@ -4088,8 +4503,7 @@ def parse_pdffonts_output(
         has_subset_prefix = prefix is not None
         base_name = raw_name[prefix.end() :] if prefix is not None else raw_name
         if (
-            "+" in base_name
-            or (subset == "yes") != has_subset_prefix
+            (subset == "yes") != has_subset_prefix
             or not PDF_FONT_NAME_RE.fullmatch(base_name)
         ):
             raise HarnessError("pdffonts_subset_contract")

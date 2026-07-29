@@ -958,7 +958,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "license": "SIL-OFL-1.1",
                 "pack_sha256": font_pack_sha256,
                 "pdf_identities_sha256": "8" * 64,
-                "pdf_identity_count": 34,
+                "pdf_identity_count": 59,
             },
             "host_tools": host_tools,
             "metrics": copy.deepcopy(candidates[1][0]["cohorts"]),

@@ -16,7 +16,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Debian dependencies are resolved from a dated snapshot. LibreOffice itself
 # is the official TDF x86_64 artifact and is checked by exact byte count and
-# SHA-256 before any package is installed.
+# SHA-256 before any package is installed. The TDF installation includes its
+# own large font bundle and fontconfig's dependency closure can add system
+# faces. LibreOffice discovers its private bundle independently of
+# FONTCONFIG_FILE, so every image-resident face is removed after installation;
+# the runtime's separately mounted OFL pack remains authoritative.
 RUN set -eux; \
     printf '%s' "${ORACLE_LOCK_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
       || { echo "invalid ORACLE_LOCK_SHA256" >&2; exit 64; }; \
@@ -75,6 +79,23 @@ RUN set -eux; \
     /opt/libreoffice26.2/program/soffice --headless --version \
       | grep --fixed-strings 'LibreOffice 26.2.3.2'; \
     fc-cache --version; \
+    find /usr /opt -type f \( \
+        -iname '*.ttf' -o -iname '*.otf' -o \
+        -iname '*.ttc' -o -iname '*.otc' -o \
+        -iname '*.pfa' -o -iname '*.pfb' -o -iname '*.afm' -o \
+        -iname '*.pcf' -o -iname '*.pcf.gz' -o -iname '*.bdf' -o \
+        -iname '*.woff' -o -iname '*.woff2' \
+      \) -delete; \
+    if find /usr /opt -type f \( \
+        -iname '*.ttf' -o -iname '*.otf' -o \
+        -iname '*.ttc' -o -iname '*.otc' -o \
+        -iname '*.pfa' -o -iname '*.pfb' -o -iname '*.afm' -o \
+        -iname '*.pcf' -o -iname '*.pcf.gz' -o -iname '*.bdf' -o \
+        -iname '*.woff' -o -iname '*.woff2' \
+      \) -print -quit | grep -q .; then \
+      echo 'LibreOffice image font closure is not empty' >&2; \
+      exit 68; \
+    fi; \
     rm -rf \
       /root/.cache/fontconfig \
       /root/.config/libreoffice \

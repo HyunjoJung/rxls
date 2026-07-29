@@ -1857,7 +1857,7 @@ def _validate_font_pack(value: object, expected_sha256: object) -> None:
         and value["configured"] is True
         and value["alias_count"] == 10
         and value["font_count"] == 26
-        and value["pdf_identity_count"] == 34
+        and value["pdf_identity_count"] == 59
         and value["license"] == "SIL-OFL-1.1"
         and value["pack_sha256"] == expected_sha256
         and _nonzero_hash_matches(value["fonts_conf_sha256"])

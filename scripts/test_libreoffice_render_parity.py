@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -312,11 +313,157 @@ def write_authored_print_xlsx(
         archive.writestr("xl/worksheets/sheet1.xml", sheet)
 
 
-def write_font_pack(root: Path) -> tuple[Path, str]:
-    font = b"fixture deterministic font"
+def minimal_sfnt_font(
+    names: tuple[tuple[int, int, int, int, str], ...] = (
+        (3, 1, 0x0409, 1, "Fixture Sans"),
+        (3, 1, 0x0409, 4, "Fixture Sans Regular"),
+        (3, 1, 0x0409, 6, "FixtureSans-Regular"),
+    ),
+    *,
+    language_tags: tuple[str, ...] = (),
+) -> bytes:
+    ordered = tuple(sorted(names, key=lambda row: row[:4]))
+    strings = bytearray()
+    records = bytearray()
+    for platform_id, encoding_id, language_id, name_id, value in ordered:
+        if platform_id == 1 and encoding_id == 0:
+            encoded = value.encode("mac_roman")
+        else:
+            encoded = value.encode("utf-16-be")
+        records.extend(
+            struct.pack(
+                ">6H",
+                platform_id,
+                encoding_id,
+                language_id,
+                name_id,
+                len(encoded),
+                len(strings),
+            )
+        )
+        strings.extend(encoded)
+    language_tag_records = bytearray()
+    for language_tag in language_tags:
+        encoded = language_tag.encode("utf-16-be")
+        language_tag_records.extend(
+            struct.pack(">2H", len(encoded), len(strings))
+        )
+        strings.extend(encoded)
+    format_fields = (
+        struct.pack(">H", len(language_tags)) + bytes(language_tag_records)
+        if language_tags
+        else b""
+    )
+    storage_offset = 6 + len(records) + len(format_fields)
+    name_table = (
+        struct.pack(
+            ">3H",
+            1 if language_tags else 0,
+            len(ordered),
+            storage_offset,
+        )
+        + bytes(records)
+        + format_fields
+        + bytes(strings)
+    )
+    table_offset = 28
+    header = (
+        b"\x00\x01\x00\x00"
+        + struct.pack(">4H", 1, 16, 0, 0)
+        + b"name"
+        + struct.pack(">3I", 0, table_offset, len(name_table))
+    )
+    payload = header + name_table
+    return payload + b"\x00" * ((-len(payload)) % 4)
+
+
+def minimal_ttc_font() -> bytes:
+    first = minimal_sfnt_font()
+    second = minimal_sfnt_font(
+        (
+            (3, 1, 0x0409, 1, "Second Serif"),
+            (3, 1, 0x0409, 4, "Second Serif Regular"),
+            (3, 1, 0x0409, 6, "SecondSerif-Regular"),
+        )
+    )
+
+    def name_table(font: bytes) -> bytes:
+        offset = int.from_bytes(font[20:24], "big")
+        length = int.from_bytes(font[24:28], "big")
+        return font[offset : offset + length]
+
+    first_name = name_table(first)
+    second_name = name_table(second)
+    first_face_offset = 20
+    second_face_offset = 48
+    first_table_offset = 76
+    second_table_offset = (
+        first_table_offset + len(first_name) + 3
+    ) & ~3
+
+    def face(table_offset: int, table_length: int) -> bytes:
+        return (
+            b"\x00\x01\x00\x00"
+            + struct.pack(">4H", 1, 16, 0, 0)
+            + b"name"
+            + struct.pack(">3I", 0, table_offset, table_length)
+        )
+
+    payload = bytearray(
+        b"ttcf"
+        + struct.pack(">2I", 0x00010000, 2)
+        + struct.pack(">2I", first_face_offset, second_face_offset)
+        + face(first_table_offset, len(first_name))
+        + face(second_table_offset, len(second_name))
+    )
+    payload.extend(first_name)
+    payload.extend(b"\x00" * (second_table_offset - len(payload)))
+    payload.extend(second_name)
+    payload.extend(b"\x00" * ((-len(payload)) % 4))
+    return bytes(payload)
+
+
+def minimal_shared_table_ttc_font() -> bytes:
+    font = minimal_sfnt_font()
+    name_offset = int.from_bytes(font[20:24], "big")
+    name_length = int.from_bytes(font[24:28], "big")
+    name_table = font[name_offset : name_offset + name_length]
+    first_face_offset = 20
+    table_offset = 48
+    second_face_offset = (table_offset + len(name_table) + 3) & ~3
+
+    def face() -> bytes:
+        return (
+            b"\x00\x01\x00\x00"
+            + struct.pack(">4H", 1, 16, 0, 0)
+            + b"name"
+            + struct.pack(">3I", 0, table_offset, len(name_table))
+        )
+
+    payload = bytearray(
+        b"ttcf"
+        + struct.pack(">2I", 0x00010000, 2)
+        + struct.pack(">2I", first_face_offset, second_face_offset)
+        + face()
+        + name_table
+    )
+    payload.extend(b"\x00" * (second_face_offset - len(payload)))
+    payload.extend(face())
+    payload.extend(b"\x00" * ((-len(payload)) % 4))
+    return bytes(payload)
+
+
+def write_font_pack(
+    root: Path,
+    *,
+    font: bytes | None = None,
+    family: str = "Fixture Sans",
+    filename: str = "FixtureSans-Regular.ttf",
+) -> tuple[Path, str]:
+    font = minimal_sfnt_font() if font is None else font
     license_payload = b"fixture OFL license"
     configuration = b'<fontconfig><dir prefix="relative">fonts</dir></fontconfig>\n'
-    font_path = root / "fonts" / "FixtureSans-Regular.ttf"
+    font_path = root / "fonts" / filename
     license_path = root / "licenses" / "fixture-OFL.txt"
     font_path.parent.mkdir(parents=True)
     license_path.parent.mkdir(parents=True)
@@ -326,8 +473,8 @@ def write_font_pack(root: Path) -> tuple[Path, str]:
     fonts = [
         {
             "bytes": len(font),
-            "family": "Fixture Sans",
-            "output": "fonts/FixtureSans-Regular.ttf",
+            "family": family,
+            "output": f"fonts/{filename}",
             "sha256": hashlib.sha256(font).hexdigest(),
             "style": "normal",
             "weight": 400,
@@ -2874,6 +3021,329 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.HarnessError, "font_pack_font_identity"):
                 MODULE.load_font_pack(manifest)
 
+    def test_font_pack_derives_exact_pdf_identities_from_authenticated_sfnt_names(
+        self,
+    ) -> None:
+        expected = frozenset(
+            {
+                "fixturesans",
+                "fixturesansregular",
+                "fixturesans-regular",
+            }
+        )
+        identities, families, face_count = MODULE._sfnt_pdf_font_identities(
+            minimal_sfnt_font()
+        )
+        self.assertEqual(identities, expected)
+        self.assertEqual(families, frozenset({"fixturesans"}))
+        self.assertEqual(face_count, 1)
+
+        with tempfile.TemporaryDirectory() as raw:
+            manifest, _ = write_font_pack(Path(raw) / "font-pack")
+            pack = MODULE.load_font_pack(manifest)
+            rendered_evidence = json.dumps(pack.evidence, sort_keys=True)
+            full_name_records = MODULE.parse_pdffonts_output(
+                pdffonts_payload(
+                    [
+                        (
+                            "BAAAAA+FixtureSansRegular",
+                            "TrueType",
+                            "WinAnsi",
+                            "yes",
+                            "yes",
+                            "yes",
+                            17,
+                            0,
+                        )
+                    ]
+                ),
+                max_bytes=4096,
+            )
+            punctuation_variant = MODULE.parse_pdffonts_output(
+                pdffonts_payload(
+                    [
+                        (
+                            "BAAAAA+FixtureSans,Regular",
+                            "TrueType",
+                            "WinAnsi",
+                            "yes",
+                            "yes",
+                            "yes",
+                            19,
+                            0,
+                        )
+                    ]
+                ),
+                max_bytes=4096,
+            )
+
+        self.assertEqual(pack.pdf_identities, expected)
+        self.assertEqual(pack.evidence["pdf_identity_count"], 3)
+        self.assertEqual(
+            pack.evidence["pdf_identities_sha256"],
+            hashlib.sha256(
+                b"fixturesans\nfixturesans-regular\nfixturesansregular\n"
+            ).hexdigest(),
+        )
+        self.assertNotIn("Fixture", rendered_evidence)
+        self.assertEqual(
+            MODULE.attest_pdf_fonts(full_name_records, pack)[
+                "matched_font_objects"
+            ],
+            1,
+        )
+        self.assertEqual(
+            MODULE.attest_pdf_fonts(punctuation_variant, pack)[
+                "matched_font_objects"
+            ],
+            0,
+        )
+
+    def test_sfnt_name_parser_accepts_bounded_encodings_and_ttc_faces(self) -> None:
+        localized = minimal_sfnt_font(
+            (
+                (3, 1, 0x0409, 1, "Fixture Sans"),
+                (3, 1, 0x0409, 4, "Fixture Sans Regular"),
+                (3, 1, 0x0409, 6, "FixtureSans-Regular"),
+                (3, 1, 0x0411, 1, "フィクスチャ サンズ"),
+                (3, 1, 0x0411, 4, "フィクスチャ サンズ Regular"),
+                (3, 3, 0x0409, 4, "I" * 600),
+            )
+        )
+        identities, families, face_count = MODULE._sfnt_pdf_font_identities(
+            localized
+        )
+        self.assertEqual(
+            identities,
+            frozenset(
+                {
+                    "fixturesans",
+                    "fixturesansregular",
+                    "fixturesans-regular",
+                }
+            ),
+        )
+        self.assertEqual(families, frozenset({"fixturesans"}))
+        self.assertEqual(face_count, 1)
+
+        mac_font = minimal_sfnt_font(
+            (
+                (1, 0, 0, 1, "Mac Fixture"),
+                (1, 0, 0, 4, "Mac Fixture Regular"),
+                (1, 0, 0, 6, "MacFixture-Regular"),
+            )
+        )
+        mac_identities, _, _ = MODULE._sfnt_pdf_font_identities(mac_font)
+        self.assertEqual(
+            mac_identities,
+            frozenset(
+                {
+                    "macfixture",
+                    "macfixtureregular",
+                    "macfixture-regular",
+                }
+            ),
+        )
+
+        for encoding_id in (2, 6):
+            with self.subTest(windows_encoding_id=encoding_id):
+                legacy_identities, _, _ = MODULE._sfnt_pdf_font_identities(
+                    minimal_sfnt_font(
+                        (
+                            (3, encoding_id, 0x0409, 1, "Legacy Fixture"),
+                            (
+                                3,
+                                encoding_id,
+                                0x0409,
+                                4,
+                                "Legacy Fixture Regular",
+                            ),
+                            (
+                                3,
+                                encoding_id,
+                                0x0409,
+                                6,
+                                "LegacyFixture-Regular",
+                            ),
+                        )
+                    )
+                )
+                self.assertIn("legacyfixture-regular", legacy_identities)
+
+        opaque_language_identities, _, _ = MODULE._sfnt_pdf_font_identities(
+            minimal_sfnt_font(
+                (
+                    (3, 1, 0x8000, 1, "Tagged Fixture"),
+                    (3, 1, 0x8000, 4, "Tagged Fixture Regular"),
+                    (3, 1, 0x8000, 6, "TaggedFixture-Regular"),
+                ),
+                language_tags=("opaque language tag",),
+            )
+        )
+        self.assertIn("taggedfixture-regular", opaque_language_identities)
+
+        ttc_identities, ttc_families, ttc_face_count = (
+            MODULE._sfnt_pdf_font_identities(minimal_ttc_font())
+        )
+        self.assertEqual(ttc_face_count, 2)
+        self.assertEqual(
+            ttc_families,
+            frozenset({"fixturesans", "secondserif"}),
+        )
+        self.assertEqual(
+            ttc_identities,
+            frozenset(
+                {
+                    "fixturesans",
+                    "fixturesansregular",
+                    "fixturesans-regular",
+                    "secondserif",
+                    "secondserifregular",
+                    "secondserif-regular",
+                }
+            ),
+        )
+        shared_identities, shared_families, shared_face_count = (
+            MODULE._sfnt_pdf_font_identities(
+                minimal_shared_table_ttc_font()
+            )
+        )
+        self.assertEqual(shared_face_count, 2)
+        self.assertEqual(shared_families, frozenset({"fixturesans"}))
+        self.assertEqual(
+            shared_identities,
+            frozenset(
+                {
+                    "fixturesans",
+                    "fixturesansregular",
+                    "fixturesans-regular",
+                }
+            ),
+        )
+
+    def test_sfnt_name_parser_rejects_malformed_structures_and_truncation(
+        self,
+    ) -> None:
+        valid = minimal_sfnt_font()
+
+        def rejected(name: str, payload: bytes) -> None:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                MODULE.HarnessError,
+                "font_pack_font_identity",
+            ):
+                MODULE._sfnt_pdf_font_identities(payload)
+
+        mutations: dict[str, bytes] = {}
+
+        def mutated(start: int, end: int, replacement: bytes) -> bytes:
+            payload = bytearray(valid)
+            payload[start:end] = replacement
+            return bytes(payload)
+
+        mutations["unknown_magic"] = b"wOFF" + valid[4:]
+        mutations["zero_tables"] = mutated(4, 6, b"\x00\x00")
+        mutations["noncanonical_search"] = mutated(6, 8, b"\x00\x00")
+        mutations["unaligned_name_table"] = mutated(
+            20, 24, (29).to_bytes(4, "big")
+        )
+        mutations["unsupported_name_version"] = mutated(
+            28, 30, b"\x00\x02"
+        )
+        mutations["excessive_name_records"] = mutated(
+            30, 32, (1025).to_bytes(2, "big")
+        )
+        mutations["storage_inside_records"] = mutated(
+            32, 34, b"\x00\x05"
+        )
+        mutations["duplicate_record_key"] = mutated(
+            52, 54, b"\x00\x01"
+        )
+        mutations["string_interval_overflow"] = mutated(
+            42, 44, b"\xff\xff"
+        )
+        mutations["odd_utf16"] = mutated(42, 44, b"\x00\x17")
+        mutations["missing_postscript_name"] = mutated(
+            64, 66, b"\x00\x05"
+        )
+        for name, payload in mutations.items():
+            rejected(name, payload)
+
+        inconsistent_postscript = minimal_sfnt_font(
+            (
+                (3, 1, 0x0409, 1, "Fixture Sans"),
+                (3, 1, 0x0409, 4, "Fixture Sans Regular"),
+                (3, 1, 0x0409, 6, "FixtureSans-Regular"),
+                (3, 1, 0x040C, 6, "FixtureSans-Other"),
+            )
+        )
+        rejected("inconsistent_postscript", inconsistent_postscript)
+        for name, postscript_name in (
+            ("postscript_space", "Fixture Sans-Regular"),
+            ("postscript_too_long", "A" * 64),
+            ("postscript_forbidden_delimiter", "Fixture/Sans-Regular"),
+        ):
+            rejected(
+                name,
+                minimal_sfnt_font(
+                    (
+                        (3, 1, 0x0409, 1, "Fixture Sans"),
+                        (3, 1, 0x0409, 4, "Fixture Sans Regular"),
+                        (3, 1, 0x0409, 6, postscript_name),
+                    )
+                ),
+            )
+
+        punctuation_identities, _, _ = MODULE._sfnt_pdf_font_identities(
+            minimal_sfnt_font(
+                (
+                    (3, 1, 0x0409, 1, "Fixture Sans"),
+                    (3, 1, 0x0409, 4, "Fixture Sans Regular"),
+                    (3, 1, 0x0409, 6, "Fixture!Sans-Regular"),
+                )
+            )
+        )
+        self.assertIn("fixture!sans-regular", punctuation_identities)
+
+        for name, language_tag in (
+            ("empty_language_tag", ""),
+            ("oversized_language_tag", "A" * 257),
+            ("nonprintable_language_tag", "en\nUS"),
+            ("padded_language_tag", " en-US"),
+        ):
+            rejected(
+                name,
+                minimal_sfnt_font(
+                    (
+                        (3, 1, 0x8000, 1, "Fixture Sans"),
+                        (3, 1, 0x8000, 4, "Fixture Sans Regular"),
+                        (3, 1, 0x8000, 6, "FixtureSans-Regular"),
+                    ),
+                    language_tags=(language_tag,),
+                ),
+            )
+        rejected(
+            "dangling_language_tag_reference",
+            minimal_sfnt_font(
+                (
+                    (3, 1, 0x8001, 1, "Fixture Sans"),
+                    (3, 1, 0x8001, 4, "Fixture Sans Regular"),
+                    (3, 1, 0x8001, 6, "FixtureSans-Regular"),
+                ),
+                language_tags=("en-US",),
+            ),
+        )
+
+        ttc_duplicate_face = bytearray(minimal_ttc_font())
+        ttc_duplicate_face[16:20] = ttc_duplicate_face[12:16]
+        rejected("ttc_duplicate_face", bytes(ttc_duplicate_face))
+
+        required_bytes = (
+            int.from_bytes(valid[20:24], "big")
+            + int.from_bytes(valid[24:28], "big")
+        )
+        for length in range(required_bytes):
+            rejected(f"truncated_at_{length}", valid[:length])
+
     def test_dry_run_records_verified_font_pack_without_host_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2965,6 +3435,76 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.HarnessError, "output_contract"):
             MODULE.parse_pdffonts_output(payload, max_bytes=len(payload), max_fonts=0)
 
+    def test_pdffonts_parser_attests_legal_plus_in_postscript_base_name(
+        self,
+    ) -> None:
+        font = minimal_sfnt_font(
+            (
+                (3, 1, 0x0409, 1, "Fixture Plus"),
+                (3, 1, 0x0409, 4, "Fixture Plus Regular"),
+                (3, 1, 0x0409, 6, "Fixture+Sans-Regular"),
+            )
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            manifest, _ = write_font_pack(
+                Path(raw) / "font-pack",
+                font=font,
+                family="Fixture Plus",
+                filename="FixturePlus-Regular.ttf",
+            )
+            pack = MODULE.load_font_pack(manifest)
+            subset_payload = pdffonts_payload(
+                [
+                    (
+                        "BAAAAA+Fixture+Sans-Regular",
+                        "TrueType",
+                        "WinAnsi",
+                        "yes",
+                        "yes",
+                        "yes",
+                        17,
+                        0,
+                    )
+                ]
+            )
+            subset_records = MODULE.parse_pdffonts_output(
+                subset_payload,
+                max_bytes=len(subset_payload),
+            )
+            plain_payload = pdffonts_payload(
+                [
+                    (
+                        "Fixture+Sans-Regular",
+                        "TrueType",
+                        "WinAnsi",
+                        "yes",
+                        "no",
+                        "yes",
+                        18,
+                        0,
+                    )
+                ]
+            )
+            plain_records = MODULE.parse_pdffonts_output(
+                plain_payload,
+                max_bytes=len(plain_payload),
+            )
+
+        self.assertEqual(
+            subset_records[0].normalized_identity,
+            "fixture+sans-regular",
+        )
+        self.assertEqual(
+            plain_records[0].normalized_identity,
+            "fixture+sans-regular",
+        )
+        self.assertEqual(
+            MODULE.attest_pdf_fonts(subset_records, pack)[
+                "matched_font_objects"
+            ],
+            1,
+        )
+
     def test_pdffonts_parser_rejects_adversarial_fixed_table_variants(self) -> None:
         valid = pdffonts_payload(
             [
@@ -2989,7 +3529,6 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             "unknown_type": valid.replace(b"TrueType", b"Unknown!", 1),
             "invalid_flag": valid.replace(b"yes yes yes", b"YES yes yes", 1),
             "missing_subset_prefix": valid.replace(b"BAAAAA+", b"       ", 1),
-            "unexpected_plus": valid.replace(b"FixtureSans", b"Fixture+Sans", 1),
         }
         duplicate = valid + valid.splitlines(keepends=True)[2]
         invalid["duplicate_object"] = duplicate

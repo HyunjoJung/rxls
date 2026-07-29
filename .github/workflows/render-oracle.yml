@@ -1160,7 +1160,7 @@ jobs:
                   report["configuration"]["font_pack"][
                       "pdf_identity_count"
                   ]
-                  == 34
+                  == 59
               )
               assert re.fullmatch(
                   r"[0-9a-f]{64}",
