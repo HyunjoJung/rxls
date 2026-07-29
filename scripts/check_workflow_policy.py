@@ -103,7 +103,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "e5884311c0ad309aef1d77895e5be999a32781d9bf7fc15f409649bcb691c863",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
-    "d4964276024870ab039eb6a725f03a1f6fbe244ad736f86846219dbc29c6fe06",
+    "68020e7c8b3d68f841ce71c138d65dbe11e904941ca035f8612c4d3222c9160a",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
@@ -120,14 +120,14 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
-    "1fbac1d8e41eb4bab96ebfdbdbd64a9964cc30e513bb3c804d3e80275d817e2b",
+    "7e6dab898f2562f84647482ce56a837dbb1b4dbb2e1e00860cb09012f2445856",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "91197ae093025e6f8d992b9c750dcbb1e6a2c5c8928e11b8e401275b34909e30"
+    "b0374ac13f7b39b4a23da4e125a322027204c431a7e22330d01b7be47247cc00"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
+    "789bebea01be1b6d44d0223697b10733524f85bd6ae23dfa2c0fc345bd48949b"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -359,6 +359,59 @@ def _normalized_active_commands(text: str) -> list[str]:
     active = _without_commented_lines(text)
     normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", active)
     return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+def _audit_oracle_build_retry(
+    path: Path,
+    step: str,
+    output_path: str,
+    errors: list[str],
+) -> None:
+    """Require a bounded, fail-closed retry around the locked image builder."""
+
+    required_once = {
+        "build_oracle_image() {": (
+            "locked image retries must call one reviewed build function"
+        ),
+        "build_status=1": "locked image retries must initialize a failing status",
+        "for build_attempt in 1 2 3; do": (
+            "locked image retries must use exactly three bounded attempts"
+        ),
+        f"rm -f {output_path}": (
+            "locked image retries must remove stale evidence before every attempt"
+        ),
+        "if build_oracle_image; then": (
+            "locked image retries must test the reviewed build function directly"
+        ),
+        "build_status=0": (
+            "locked image retries must record only an actual successful build"
+        ),
+        "build_status=$?": (
+            "locked image retries must preserve the failed builder status"
+        ),
+        'if [[ "$build_attempt" -lt 3 ]]; then': (
+            "locked image retries must not sleep after the final attempt"
+        ),
+        "retry_delay_seconds=$((build_attempt * 5))": (
+            "locked image retries must use the reviewed bounded backoff"
+        ),
+        'sleep "$retry_delay_seconds"': (
+            "locked image retries must apply the reviewed bounded backoff"
+        ),
+        'if [[ "$build_status" -ne 0 ]]; then': (
+            "locked image retries must fail closed after exhaustion"
+        ),
+        'exit "$build_status"': (
+            "locked image retries must propagate the final builder status"
+        ),
+    }
+    for snippet, message in required_once.items():
+        if step.count(snippet) != 1:
+            errors.append(f"{path}: {message}")
+    if step.count("\n              break\n") != 1:
+        errors.append(
+            f"{path}: locked image retries must stop after the first successful build"
+        )
 
 
 _SHELL_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
@@ -1848,6 +1901,20 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         errors,
     )
     _audit_oracle_buildx_setup(path, active, errors)
+    oracle_image_build = _single_yaml_block(
+        path,
+        active,
+        "- name: Build and inspect the locked oracle image",
+        6,
+        "locked oracle image build step",
+        errors,
+    )
+    _audit_oracle_build_retry(
+        path,
+        oracle_image_build,
+        "target/render-oracle-hosted/build.json",
+        errors,
+    )
     required = {
         f'python-version: "{RENDER_ORACLE_PYTHON_VERSION}"': (
             "must pin the complete Python patch version"
@@ -2797,6 +2864,12 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "- name: Build and verify the locked oracle image",
         6,
         "oracle-image build step",
+        errors,
+    )
+    _audit_oracle_build_retry(
+        path,
+        image_build,
+        "target/render-oracle-image-build.json",
         errors,
     )
     for snippet, message in {

@@ -486,6 +486,62 @@ steps:
             [],
         )
 
+    def test_oracle_image_retry_contract_is_bounded_and_fail_closed(self) -> None:
+        cases = (
+            (
+                Path("render-oracle.yml"),
+                RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8"),
+                "- name: Build and inspect the locked oracle image",
+                "target/render-oracle-hosted/build.json",
+            ),
+            (
+                Path("render-hardening.yml"),
+                RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8"),
+                "- name: Build and verify the locked oracle image",
+                "target/render-oracle-image-build.json",
+            ),
+        )
+        mutations = {
+            "unbounded_attempts": (
+                "for build_attempt in 1 2 3; do",
+                "for build_attempt in 1 2 3 4; do",
+            ),
+            "stale_output": ("rm -f target/", "test -e target/"),
+            "discard_status": ("build_status=$?", "build_status=1"),
+            "long_backoff": (
+                "retry_delay_seconds=$((build_attempt * 5))",
+                "retry_delay_seconds=$((build_attempt * 60))",
+            ),
+            "continue_after_success": ("\n              break\n", "\n              continue\n"),
+            "mask_final_failure": ('exit "$build_status"', "exit 0"),
+        }
+        for path, workflow, header, output_path in cases:
+            extraction_errors: list[str] = []
+            step = self.policy._single_yaml_block(
+                path,
+                workflow,
+                header,
+                6,
+                "locked oracle image build step",
+                extraction_errors,
+            )
+            self.assertEqual(extraction_errors, [])
+            errors: list[str] = []
+            self.policy._audit_oracle_build_retry(path, step, output_path, errors)
+            self.assertEqual(errors, [])
+            for name, (source, replacement) in mutations.items():
+                with self.subTest(workflow=path.name, mutation=name):
+                    mutated = step.replace(source, replacement, 1)
+                    self.assertNotEqual(mutated, step)
+                    errors = []
+                    self.policy._audit_oracle_build_retry(
+                        path,
+                        mutated,
+                        output_path,
+                        errors,
+                    )
+                    self.assertTrue(errors)
+
     def test_oracle_build_jobs_reject_unreviewed_step_surface(self) -> None:
         oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")

@@ -161,12 +161,34 @@ jobs:
           fi
           python3 scripts/run-render-oracle-container.py verify-lock \
             "${BOOTSTRAP_ARGS[@]}"
-          python3 scripts/run-render-oracle-container.py build \
-            --engine docker \
-            --image rxls-render-oracle:lo-26.2.3 \
-            --execute \
-            "${BOOTSTRAP_ARGS[@]}" \
-            > target/render-oracle-image-build.json
+          build_oracle_image() {
+            python3 scripts/run-render-oracle-container.py build \
+              --engine docker \
+              --image rxls-render-oracle:lo-26.2.3 \
+              --execute \
+              "${BOOTSTRAP_ARGS[@]}" \
+              > target/render-oracle-image-build.json
+          }
+          build_status=1
+          for build_attempt in 1 2 3; do
+            rm -f target/render-oracle-image-build.json
+            if build_oracle_image; then
+              build_status=0
+              break
+            else
+              build_status=$?
+            fi
+            if [[ "$build_attempt" -lt 3 ]]; then
+              retry_delay_seconds=$((build_attempt * 5))
+              printf \
+                'Locked oracle image build attempt %s/3 failed; retrying after %s seconds.\n' \
+                "$build_attempt" "$retry_delay_seconds" >&2
+              sleep "$retry_delay_seconds"
+            fi
+          done
+          if [[ "$build_status" -ne 0 ]]; then
+            exit "$build_status"
+          fi
           python3 - <<'PY'
           import hashlib
           import json
