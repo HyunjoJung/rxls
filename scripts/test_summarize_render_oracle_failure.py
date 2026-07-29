@@ -68,6 +68,7 @@ def _point_text(value: Fraction) -> str:
 
 def _geometry_page(
     *,
+    crop_height_delta: Fraction = Fraction(),
     crop_width_delta: Fraction = Fraction(),
     xhtml_internal_width_delta: Fraction = Fraction(),
 ) -> dict[str, object]:
@@ -76,6 +77,7 @@ def _geometry_page(
 
     def side(
         *,
+        crop_height: Fraction = height,
         crop_width: Fraction = width,
     ) -> dict[str, object]:
         def dimensions(
@@ -87,13 +89,16 @@ def _geometry_page(
             }
 
         return {
-            "crop_box": dimensions(crop_width, height),
+            "crop_box": dimensions(crop_width, crop_height),
             "media_box": dimensions(width, height),
             "page_size": dimensions(width, height),
         }
 
     libreoffice = side()
-    rxls = side(crop_width=width + crop_width_delta)
+    rxls = side(
+        crop_height=height + crop_height_delta,
+        crop_width=width + crop_width_delta,
+    )
     xhtml_width = width + xhtml_internal_width_delta
     xhtml = {
         name: {
@@ -103,7 +108,7 @@ def _geometry_page(
         for name in ("libreoffice", "rxls")
     }
     deltas = {
-        "crop_box_height": Fraction(),
+        "crop_box_height": crop_height_delta,
         "crop_box_width": crop_width_delta,
         "libreoffice_xhtml_page_size_height": Fraction(),
         "libreoffice_xhtml_page_size_width": xhtml_internal_width_delta,
@@ -430,7 +435,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v6",
+                "rxls.render-oracle-failure-summary.v7",
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
@@ -553,6 +558,167 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             "1001/1000000",
             "pdf_point_geometry",
             "deltas_points",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_page_box_geometry_is_signed_and_grouped_by_reviewed_cohorts(
+        self,
+    ) -> None:
+        rows = _pilot_rows()
+        for index, row in enumerate(rows):
+            if index not in {1, 2, 3}:
+                _as_premeasurement_error(row)
+        rows[1]["features"] = sorted(
+            (
+                "column-width",
+                "latin-text",
+                "number-cell",
+                "row-height",
+            )
+        )
+        rows[2]["features"] = sorted(
+            (
+                "hidden-column",
+                "hidden-row",
+                "latin-text",
+                "number-cell",
+            )
+        )
+        rows[3]["features"] = sorted(
+            (
+                "chart",
+                "image-drawing",
+                "latin-text",
+                "number-cell",
+            )
+        )
+        _with_geometry(
+            rows[1],
+            [
+                _geometry_page(
+                    crop_height_delta=Fraction(-1, 4),
+                    crop_width_delta=Fraction(1, 2),
+                )
+            ],
+        )
+        _with_geometry(
+            rows[2],
+            [
+                _geometry_page(
+                    crop_height_delta=Fraction(1, 8),
+                    crop_width_delta=Fraction(-1, 4),
+                )
+            ],
+        )
+        _with_geometry(
+            rows[3],
+            [
+                _geometry_page(crop_width_delta=Fraction(1, 10)),
+                _geometry_page(crop_width_delta=Fraction(-1, 20)),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        page_box = summary["reports"][1]["page_box_geometry"]
+        self.assertEqual(
+            {
+                key: page_box[key]
+                for key in MODULE.PAGE_BOX_GEOMETRY_POLICY
+            },
+            MODULE.PAGE_BOX_GEOMETRY_POLICY,
+        )
+        self.assertEqual(
+            set(page_box["by_format"]), {"xls", "xlsb", "xlsx"}
+        )
+        self.assertEqual(
+            set(page_box["by_feature"]),
+            {
+                "chart",
+                "column-width",
+                "hidden-column",
+                "hidden-row",
+                "image-drawing",
+                "row-height",
+            },
+        )
+        self.assertEqual(
+            page_box["all"],
+            {
+                "by_axis": {
+                    "height": {
+                        "max_delta_micropoints": 125_000,
+                        "min_delta_micropoints": -250_000,
+                        "nonzero_pages": 2,
+                        "sum_delta_micropoints": -125_000,
+                    },
+                    "width": {
+                        "max_delta_micropoints": 500_000,
+                        "min_delta_micropoints": -250_000,
+                        "nonzero_pages": 4,
+                        "sum_delta_micropoints": 300_000,
+                    },
+                },
+                "pages": 4,
+                "workbooks": 3,
+            },
+        )
+        self.assertEqual(
+            page_box["by_format"]["xls"]["by_axis"]["width"],
+            {
+                "max_delta_micropoints": 500_000,
+                "min_delta_micropoints": 500_000,
+                "nonzero_pages": 1,
+                "sum_delta_micropoints": 500_000,
+            },
+        )
+        self.assertEqual(
+            page_box["by_format"]["xlsx"]["by_axis"]["width"],
+            {
+                "max_delta_micropoints": 100_000,
+                "min_delta_micropoints": -50_000,
+                "nonzero_pages": 2,
+                "sum_delta_micropoints": 50_000,
+            },
+        )
+        for feature in ("chart", "image-drawing"):
+            self.assertEqual(
+                page_box["by_feature"][feature],
+                page_box["by_format"]["xlsx"],
+            )
+        self.assertEqual(
+            page_box["by_feature"]["column-width"],
+            page_box["by_format"]["xls"],
+        )
+        self.assertEqual(
+            page_box["by_feature"]["hidden-column"],
+            page_box["by_format"]["xlsb"],
+        )
+        self.assertEqual(
+            page_box["by_feature"]["hidden-row"],
+            page_box["by_format"]["xlsb"],
+        )
+        self.assertEqual(
+            page_box["by_feature"]["row-height"],
+            page_box["by_format"]["xls"],
+        )
+        rendered = MODULE._json(summary).decode("ascii")
+        for forbidden in (
+            "600/1",
+            "450/1",
+            "/srv/private",
+            "customer-",
+            "pdf_point_geometry",
         ):
             self.assertNotIn(forbidden, rendered)
 
@@ -2428,6 +2594,30 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         geometry_drift["reports"][1]["geometry"][
             "max_direct_absolute_delta_micropoints"
         ] = 1
+        page_box_injected = copy.deepcopy(summary)
+        page_box_injected["reports"][1]["page_box_geometry"][
+            "private_path"
+        ] = "/private/workbook.xlsx"
+        page_box_policy_drift = copy.deepcopy(summary)
+        page_box_policy_drift["reports"][1]["page_box_geometry"][
+            "delta_direction"
+        ] = "libreoffice_minus_rxls"
+        page_box_format_drift = copy.deepcopy(summary)
+        page_box_format_drift["reports"][1]["page_box_geometry"][
+            "by_format"
+        ].pop("ods")
+        page_box_feature_injected = copy.deepcopy(summary)
+        page_box_feature_injected["reports"][1]["page_box_geometry"][
+            "by_feature"
+        ]["private-feature"] = copy.deepcopy(
+            page_box_feature_injected["reports"][1][
+                "page_box_geometry"
+            ]["by_format"]["xlsx"]
+        )
+        page_box_axis_injected = copy.deepcopy(summary)
+        page_box_axis_injected["reports"][1]["page_box_geometry"][
+            "all"
+        ]["by_axis"]["width"]["private_delta"] = 0
         for document in (
             injected,
             drifted,
@@ -2437,6 +2627,11 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             geometry_injected,
             delta_injected,
             geometry_drift,
+            page_box_injected,
+            page_box_policy_drift,
+            page_box_format_drift,
+            page_box_feature_injected,
+            page_box_axis_injected,
         ):
             with self.subTest(document=document):
                 with self.assertRaises(MODULE.SummaryError):

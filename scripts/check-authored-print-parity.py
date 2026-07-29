@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.authored-print-parity.v1"
+OUTPUT_SCHEMA = "rxls.authored-print-parity.v2"
 MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
 METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
@@ -66,7 +66,10 @@ EXPECTED_PAGE_WIDTH = 816
 EXPECTED_PAGE_HEIGHT = 1056
 EXPECTED_PAGE_WIDTH_POINTS = Fraction(612)
 EXPECTED_PAGE_HEIGHT_POINTS = Fraction(792)
-EXPECTED_PAGES_PER_WORKBOOK = 4
+EXPECTED_PAGES_BY_SCALE_MODE = {
+    "fit": 1,
+    "scale": 4,
+}
 PDF_POINT_DELTA_KEYS = frozenset(
     {
         "crop_box_height",
@@ -1333,7 +1336,8 @@ def evaluate(
         ):
             raise GateError("workbook_row")
         _sha(row.get("sha256"), "workbook_identity")
-        scale_modes[_attestation(row)] += 1
+        scale_mode = _attestation(row)
+        scale_modes[scale_mode] += 1
         font_objects += _font_attestation(row)
         native_documents, native_objects = _native_pdf_attestation(row)
         native_pdf_documents += native_documents
@@ -1370,7 +1374,7 @@ def evaluate(
             raise GateError("page_limit")
         page_count_histogram[page_count] += 1
         if (
-            page_count != EXPECTED_PAGES_PER_WORKBOOK
+            page_count != EXPECTED_PAGES_BY_SCALE_MODE[scale_mode]
             or artifacts.get("rxls_pages") != page_count
             or artifacts.get("libreoffice_pages") != page_count
             or len(scenes) != page_count
@@ -1619,7 +1623,9 @@ def evaluate(
                 "height": "792/1",
                 "width": "612/1",
             },
-            "pages_per_workbook": EXPECTED_PAGES_PER_WORKBOOK,
+            "pages_per_workbook_by_scale_mode": dict(
+                sorted(EXPECTED_PAGES_BY_SCALE_MODE.items())
+            ),
             "workbooks_by_scale_mode": expected_scale_modes,
         },
         "failures": sorted(failures),

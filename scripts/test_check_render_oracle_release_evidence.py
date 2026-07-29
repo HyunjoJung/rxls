@@ -623,7 +623,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             payload = self._write(artifact / f"fidelity-{label}.json", fidelity)
             fidelities.append((fidelity, payload))
         authored = {
-            "schema": "rxls.authored-print-parity.v1",
+            "schema": "rxls.authored-print-parity.v2",
             "passed": True,
             "failures": [],
             "coverage": {
@@ -633,8 +633,8 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "libreoffice_pdf_font_objects": 100,
                 "native_pdf_documents": 100,
                 "native_pdf_font_objects": 100,
-                "page_count_histogram": {"4": 100},
-                "pages": 400,
+                "page_count_histogram": {"1": 50, "4": 50},
+                "pages": 250,
                 "semantic_codepoint_libreoffice_items": 1000,
                 "semantic_codepoint_rxls_items": 1000,
                 "text_box_candidates": 1000,
@@ -673,7 +673,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "expected": {
                 "page_box_pixels": {"height": 1056, "width": 816},
                 "page_box_points": {"height": "792/1", "width": "612/1"},
-                "pages_per_workbook": 4,
+                "pages_per_workbook_by_scale_mode": {"fit": 1, "scale": 4},
                 "workbooks_by_scale_mode": {"fit": 50, "scale": 50},
             },
             "metrics": {

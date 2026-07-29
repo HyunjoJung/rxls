@@ -159,6 +159,7 @@ def report_document() -> dict[str, object]:
     }
     files = []
     for workbook_index, scale_mode in enumerate(("scale", "fit")):
+        page_count = MODULE.EXPECTED_PAGES_BY_SCALE_MODE[scale_mode]
         pages = [
             {
                 "source_sheet_index": 0,
@@ -213,7 +214,7 @@ def report_document() -> dict[str, object]:
                 "text_line_box_unique_geometry": unique_geometry(1),
                 "pdf_point_geometry": point_geometry(),
             }
-            for index in range(4)
+            for index in range(page_count)
         ]
         files.append(
             {
@@ -235,11 +236,14 @@ def report_document() -> dict[str, object]:
                     "repeated_rows": True,
                     "scale_mode": scale_mode,
                 },
-                "artifacts": {"rxls_pages": 4, "libreoffice_pages": 4},
+                "artifacts": {
+                    "rxls_pages": page_count,
+                    "libreoffice_pages": page_count,
+                },
                 "metrics": {
                     "max_pdf_point_geometry_delta_millipoints": 0,
                     "max_pdf_xhtml_crosscheck_delta_micropoints": 0,
-                    "pages": 4,
+                    "pages": page_count,
                     "pdf_point_geometry_mismatches": 0,
                     "similarity_ppm": 1_000_000,
                 },
@@ -250,7 +254,7 @@ def report_document() -> dict[str, object]:
                         "source_pdf_page_index": index,
                         "oracle_output_page_index": index,
                     }
-                    for index in range(4)
+                    for index in range(page_count)
                 ],
                 "font_attestation": {
                     "font_objects": 2,
@@ -647,8 +651,17 @@ class AuthoredPrintGateTests(unittest.TestCase):
             expected_workbooks=2,
         )
         self.assertTrue(result["passed"])
+        self.assertEqual(result["schema"], "rxls.authored-print-parity.v2")
         self.assertEqual(result["coverage"]["by_scale_mode"], {"fit": 1, "scale": 1})
-        self.assertEqual(result["coverage"]["page_count_histogram"], {"4": 2})
+        self.assertEqual(
+            result["coverage"]["page_count_histogram"],
+            {"1": 1, "4": 1},
+        )
+        self.assertEqual(result["coverage"]["pages"], 5)
+        self.assertEqual(
+            result["expected"]["pages_per_workbook_by_scale_mode"],
+            {"fit": 1, "scale": 4},
+        )
         self.assertEqual(result["metrics"]["similarity_mean_ppm"], 1_000_000)
         self.assertEqual(result["metrics"]["text_box_match_coverage_ppm"], 1_000_000)
         self.assertEqual(
@@ -673,6 +686,20 @@ class AuthoredPrintGateTests(unittest.TestCase):
             },
         )
         self.assertNotIn("path", result["evidence"])
+
+    def test_page_counts_are_bound_to_each_scale_mode(self) -> None:
+        report = report_document()
+        report["files"][0]["authored_print"]["scale_mode"] = "fit"
+        report["files"][1]["authored_print"]["scale_mode"] = "scale"
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertIn("page_count_mismatch", result["failures"])
+        self.assertNotIn("scale_fit_coverage_incomplete", result["failures"])
 
     def test_page_count_and_calibrated_page_box_thresholds_fail(self) -> None:
         report = report_document()
@@ -883,7 +910,7 @@ class AuthoredPrintGateTests(unittest.TestCase):
         with self.subTest(limit="pages"), mock.patch.object(
             contract,
             "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
-            7,
+            4,
         ):
             with self.assertRaisesRegex(
                 MODULE.GateError, "unique_text_geometry_report_limit"
@@ -898,7 +925,7 @@ class AuthoredPrintGateTests(unittest.TestCase):
         with self.subTest(limit="histogram_buckets"), mock.patch.object(
             contract,
             "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
-            127,
+            79,
         ):
             with self.assertRaisesRegex(
                 MODULE.GateError, "unique_text_geometry_report_limit"

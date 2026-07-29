@@ -1003,6 +1003,11 @@ steps:
                 "--required-feature print-settings",
                 "--required-feature formulas",
             ),
+            "authored_print_page_contract": original.replace(
+                "              == expected_authored_print_pages\n",
+                "              == expected_authored_print * 4\n",
+                1,
+            ),
             "authored_print_cleanup": original.replace(
                 "          authored_report_path.unlink()",
                 "          pass  # detailed authored report retained",
@@ -1454,6 +1459,11 @@ steps:
         self.assertIn("scripts/check-authored-print-parity.py", text)
         self.assertIn("--print-mode authored", text)
         self.assertIn("--required-feature print-settings", text)
+        self.assertIn(
+            '"pages_per_workbook_by_scale_mode"\n'
+            '          ] == {"fit": 1, "scale": 4}',
+            text,
+        )
         self.assertIn("--require-hosted-full-800", text)
         self.assertIn('"acquired_corpus_included": False', text)
         self.assertIn("generate-ooxml-row-oracle.py --generate", text)

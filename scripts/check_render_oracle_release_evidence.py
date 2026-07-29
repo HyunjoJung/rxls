@@ -2349,7 +2349,7 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
             "schema",
             "thresholds",
         }
-        and value.get("schema") == "rxls.authored-print-parity.v1",
+        and value.get("schema") == "rxls.authored-print-parity.v2",
         "authored_schema",
     )
     _require(
@@ -2368,7 +2368,7 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
         == {
             "page_box_pixels": {"height": 1056, "width": 816},
             "page_box_points": {"height": "792/1", "width": "612/1"},
-            "pages_per_workbook": 4,
+            "pages_per_workbook_by_scale_mode": {"fit": 1, "scale": 4},
             "workbooks_by_scale_mode": {"fit": 50, "scale": 50},
         },
         "authored_expected",
@@ -2447,8 +2447,8 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
     )
     _require(
         coverage["workbooks"] == 100
-        and coverage["pages"] == 400
-        and coverage["page_count_histogram"] == {"4": 100}
+        and coverage["pages"] == 250
+        and coverage["page_count_histogram"] == {"1": 50, "4": 50}
         and coverage["by_scale_mode"] == {"fit": 50, "scale": 50},
         "authored_coverage",
     )

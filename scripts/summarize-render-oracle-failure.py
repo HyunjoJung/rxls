@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v6"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v7"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -321,6 +321,49 @@ GEOMETRY_KEYS = {
 GEOMETRY_DELTA_KEYS = {
     "max_absolute_micropoints",
     "nonzero_pages",
+}
+PAGE_BOX_GEOMETRY_AXES = ("height", "width")
+PAGE_BOX_GEOMETRY_FEATURES = frozenset(
+    {
+        "chart",
+        "column-width",
+        "explicit-row-height",
+        "hidden-column",
+        "hidden-row",
+        "image-drawing",
+        "ooxml-implicit-row",
+        "print-settings",
+        "row-height",
+        "sheet-format-missing",
+        "sheet-format-present",
+        "wrapped-text",
+    }
+)
+PAGE_BOX_GEOMETRY_KEYS = {
+    "all",
+    "box",
+    "by_feature",
+    "by_format",
+    "delta_direction",
+    "rounding",
+    "units",
+}
+PAGE_BOX_GEOMETRY_COHORT_KEYS = {
+    "by_axis",
+    "pages",
+    "workbooks",
+}
+PAGE_BOX_GEOMETRY_AXIS_KEYS = {
+    "max_delta_micropoints",
+    "min_delta_micropoints",
+    "nonzero_pages",
+    "sum_delta_micropoints",
+}
+PAGE_BOX_GEOMETRY_POLICY = {
+    "box": "pdf_crop_box",
+    "delta_direction": "rxls_minus_libreoffice",
+    "rounding": "away_from_zero",
+    "units": "micropoints",
 }
 TEXT_GEOMETRY_AXES = (
     "x_min",
@@ -690,6 +733,11 @@ def _ceil_micropoints(value: Fraction) -> int:
         + absolute.denominator
         - 1
     ) // absolute.denominator
+
+
+def _signed_ceil_micropoints(value: Fraction) -> int:
+    rounded = _ceil_micropoints(value)
+    return -rounded if value < 0 else rounded
 
 
 def _ceil_millipoints(value: Fraction) -> int:
@@ -1253,6 +1301,77 @@ def _empty_text_geometry() -> dict[str, object]:
     }
 
 
+def _new_page_box_geometry_accumulator() -> dict[str, object]:
+    return {
+        "by_axis": {
+            axis: {
+                "max_delta_micropoints": None,
+                "min_delta_micropoints": None,
+                "nonzero_pages": 0,
+                "sum_delta_micropoints": 0,
+            }
+            for axis in PAGE_BOX_GEOMETRY_AXES
+        },
+        "pages": 0,
+        "workbooks": 0,
+    }
+
+
+def _merge_page_box_geometry_workbook(
+    accumulator: dict[str, object],
+    pages: Sequence[dict[str, Fraction]],
+) -> None:
+    accumulator["workbooks"] += 1
+    accumulator["pages"] += len(pages)
+    axes = accumulator["by_axis"]
+    for page in pages:
+        for axis in PAGE_BOX_GEOMETRY_AXES:
+            value = _signed_ceil_micropoints(
+                page[f"crop_box_{axis}"]
+            )
+            aggregate = axes[axis]
+            aggregate["sum_delta_micropoints"] += value
+            aggregate["nonzero_pages"] += int(value != 0)
+            aggregate["min_delta_micropoints"] = (
+                value
+                if aggregate["min_delta_micropoints"] is None
+                else min(
+                    aggregate["min_delta_micropoints"], value
+                )
+            )
+            aggregate["max_delta_micropoints"] = (
+                value
+                if aggregate["max_delta_micropoints"] is None
+                else max(
+                    aggregate["max_delta_micropoints"], value
+                )
+            )
+
+
+def _finish_page_box_geometry_cohort(
+    accumulator: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "by_axis": {
+            axis: dict(accumulator["by_axis"][axis])
+            for axis in PAGE_BOX_GEOMETRY_AXES
+        },
+        "pages": int(accumulator["pages"]),
+        "workbooks": int(accumulator["workbooks"]),
+    }
+
+
+def _empty_page_box_geometry() -> dict[str, object]:
+    return {
+        **PAGE_BOX_GEOMETRY_POLICY,
+        "all": _finish_page_box_geometry_cohort(
+            _new_page_box_geometry_accumulator()
+        ),
+        "by_feature": {},
+        "by_format": {},
+    }
+
+
 def _empty_geometry() -> dict[str, object]:
     return {
         "by_delta": {
@@ -1530,6 +1649,7 @@ def _empty(label: str) -> dict[str, object]:
         "geometry": _empty_geometry(),
         "label": label,
         "line_geometry": _empty_text_geometry(),
+        "page_box_geometry": _empty_page_box_geometry(),
         "page_count_mismatches": [],
         "word_geometry": _empty_text_geometry(),
         "workbooks": 0,
@@ -1590,6 +1710,15 @@ def _summarize_label(
     features: dict[str, Counter[str]] = {}
     page_count_mismatches: Counter[tuple[int, int]] = Counter()
     geometry = _empty_geometry()
+    page_box_geometry_all = _new_page_box_geometry_accumulator()
+    page_box_geometry_by_format = {
+        format_name: _new_page_box_geometry_accumulator()
+        for format_name in FORMATS
+    }
+    page_box_geometry_by_feature = {
+        feature: _new_page_box_geometry_accumulator()
+        for feature in PAGE_BOX_GEOMETRY_FEATURES
+    }
     word_geometry_all = _new_text_geometry_accumulator()
     line_geometry_all = _new_text_geometry_accumulator()
     word_geometry_by_format: dict[str, dict[str, object]] = {}
@@ -1638,6 +1767,18 @@ def _summarize_label(
                 raise SummaryError("text_geometry_report_limit")
         if row_geometry is not None:
             pages, mismatch_pages = row_geometry
+            _merge_page_box_geometry_workbook(
+                page_box_geometry_all, pages
+            )
+            _merge_page_box_geometry_workbook(
+                page_box_geometry_by_format[fmt], pages
+            )
+            for feature in PAGE_BOX_GEOMETRY_FEATURES.intersection(
+                row["features"]
+            ):
+                _merge_page_box_geometry_workbook(
+                    page_box_geometry_by_feature[feature], pages
+                )
             geometry["workbooks"] += 1
             geometry["pages"] += len(pages)
             geometry["mismatch_pages"] += mismatch_pages
@@ -1713,6 +1854,30 @@ def _summarize_label(
                 )
             },
         },
+        "page_box_geometry": {
+            **PAGE_BOX_GEOMETRY_POLICY,
+            "all": _finish_page_box_geometry_cohort(
+                page_box_geometry_all
+            ),
+            "by_feature": {
+                feature: _finish_page_box_geometry_cohort(
+                    accumulator
+                )
+                for feature, accumulator in sorted(
+                    page_box_geometry_by_feature.items()
+                )
+                if int(accumulator["workbooks"]) > 0
+            },
+            "by_format": {
+                format_name: _finish_page_box_geometry_cohort(
+                    accumulator
+                )
+                for format_name, accumulator in sorted(
+                    page_box_geometry_by_format.items()
+                )
+                if int(accumulator["workbooks"]) > 0
+            },
+        },
         "page_count_mismatches": [
             {
                 "libreoffice_pages": libreoffice_pages,
@@ -1752,7 +1917,9 @@ def _validate_namespace(root: Path) -> None:
         raise SummaryError("unexpected_report_name")
 
 
-def _validate_geometry_output(value: object, total: int) -> None:
+def _validate_geometry_output(
+    value: object, total: int
+) -> dict[str, object]:
     code = "output_geometry"
     if not isinstance(value, dict) or set(value) != GEOMETRY_KEYS:
         raise SummaryError(code)
@@ -1821,6 +1988,278 @@ def _validate_geometry_output(value: object, total: int) -> None:
     )
     if not minimum_mismatches <= mismatch_pages <= maximum_mismatches:
         raise SummaryError(code)
+    return {
+        "by_delta": parsed,
+        "pages": pages,
+        "workbooks": workbooks,
+    }
+
+
+def _validate_page_box_geometry_cohort(
+    value: object,
+    *,
+    workbook_limit: int,
+) -> dict[str, object]:
+    code = "output_page_box_geometry"
+    if (
+        not isinstance(value, dict)
+        or set(value) != PAGE_BOX_GEOMETRY_COHORT_KEYS
+    ):
+        raise SummaryError(code)
+    workbooks = _integer(
+        value["workbooks"], code, workbook_limit
+    )
+    pages = _integer(
+        value["pages"], code, workbooks * MAX_PAGE_COUNT
+    )
+    if (
+        (workbooks == 0) != (pages == 0)
+        or pages < workbooks
+    ):
+        raise SummaryError(code)
+    by_axis = value["by_axis"]
+    if (
+        not isinstance(by_axis, dict)
+        or set(by_axis) != set(PAGE_BOX_GEOMETRY_AXES)
+    ):
+        raise SummaryError(code)
+    axes: dict[str, dict[str, int | None]] = {}
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        raw_axis = by_axis[axis]
+        if (
+            not isinstance(raw_axis, dict)
+            or set(raw_axis) != PAGE_BOX_GEOMETRY_AXIS_KEYS
+        ):
+            raise SummaryError(code)
+        nonzero_pages = _integer(
+            raw_axis["nonzero_pages"], code, pages
+        )
+        total_delta = _signed_integer(
+            raw_axis["sum_delta_micropoints"],
+            code,
+            pages * MAX_POINT_DELTA_MICROPOINTS,
+        )
+        raw_minimum = raw_axis["min_delta_micropoints"]
+        raw_maximum = raw_axis["max_delta_micropoints"]
+        if pages == 0:
+            if (
+                raw_minimum is not None
+                or raw_maximum is not None
+                or nonzero_pages != 0
+                or total_delta != 0
+            ):
+                raise SummaryError(code)
+            minimum = None
+            maximum = None
+        else:
+            minimum = _signed_integer(
+                raw_minimum, code, MAX_POINT_DELTA_MICROPOINTS
+            )
+            maximum = _signed_integer(
+                raw_maximum, code, MAX_POINT_DELTA_MICROPOINTS
+            )
+            if (
+                minimum > maximum
+                or (nonzero_pages == 0)
+                != (minimum == maximum == total_delta == 0)
+                or (minimum > 0 or maximum < 0)
+                and nonzero_pages != pages
+            ):
+                raise SummaryError(code)
+            if pages == 1:
+                if minimum != maximum or total_delta != minimum:
+                    raise SummaryError(code)
+            else:
+                minimum_sum = (
+                    minimum
+                    + maximum
+                    + (pages - 2) * minimum
+                )
+                maximum_sum = (
+                    minimum
+                    + maximum
+                    + (pages - 2) * maximum
+                )
+                if not minimum_sum <= total_delta <= maximum_sum:
+                    raise SummaryError(code)
+            if nonzero_pages < pages and not minimum <= 0 <= maximum:
+                raise SummaryError(code)
+        axes[axis] = {
+            "max_delta_micropoints": maximum,
+            "min_delta_micropoints": minimum,
+            "nonzero_pages": nonzero_pages,
+            "sum_delta_micropoints": total_delta,
+        }
+    return {
+        "by_axis": axes,
+        "pages": pages,
+        "workbooks": workbooks,
+    }
+
+
+def _page_box_partition_matches(
+    all_cohort: dict[str, object],
+    cohorts: Iterable[dict[str, object]],
+) -> bool:
+    rows = list(cohorts)
+    if any(
+        sum(int(row[key]) for row in rows) != all_cohort[key]
+        for key in ("pages", "workbooks")
+    ):
+        return False
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        all_axis = all_cohort["by_axis"][axis]
+        cohort_axes = [row["by_axis"][axis] for row in rows]
+        nonempty = [
+            axis_value
+            for axis_value in cohort_axes
+            if axis_value["min_delta_micropoints"] is not None
+        ]
+        if (
+            sum(
+                int(axis_value["nonzero_pages"])
+                for axis_value in cohort_axes
+            )
+            != all_axis["nonzero_pages"]
+            or sum(
+                int(axis_value["sum_delta_micropoints"])
+                for axis_value in cohort_axes
+            )
+            != all_axis["sum_delta_micropoints"]
+            or (
+                min(
+                    (
+                        int(axis_value["min_delta_micropoints"])
+                        for axis_value in nonempty
+                    ),
+                    default=None,
+                )
+                != all_axis["min_delta_micropoints"]
+            )
+            or (
+                max(
+                    (
+                        int(axis_value["max_delta_micropoints"])
+                        for axis_value in nonempty
+                    ),
+                    default=None,
+                )
+                != all_axis["max_delta_micropoints"]
+            )
+        ):
+            return False
+    return True
+
+
+def _validate_page_box_geometry_output(
+    value: object,
+    *,
+    total: int,
+    format_workbooks: dict[str, int],
+    feature_workbooks: dict[str, int],
+    point_geometry: dict[str, object],
+) -> None:
+    code = "output_page_box_geometry"
+    if (
+        not isinstance(value, dict)
+        or set(value) != PAGE_BOX_GEOMETRY_KEYS
+        or any(
+            value.get(key) != expected
+            for key, expected in PAGE_BOX_GEOMETRY_POLICY.items()
+        )
+    ):
+        raise SummaryError(code)
+    all_cohort = _validate_page_box_geometry_cohort(
+        value["all"], workbook_limit=total
+    )
+    if (
+        all_cohort["workbooks"] != point_geometry["workbooks"]
+        or all_cohort["pages"] != point_geometry["pages"]
+    ):
+        raise SummaryError(code)
+    point_deltas = point_geometry["by_delta"]
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        aggregate = all_cohort["by_axis"][axis]
+        nonzero_pages, maximum_absolute = point_deltas[
+            f"crop_box_{axis}"
+        ]
+        if (
+            aggregate["nonzero_pages"] != nonzero_pages
+            or max(
+                abs(int(aggregate["min_delta_micropoints"] or 0)),
+                abs(int(aggregate["max_delta_micropoints"] or 0)),
+            )
+            != maximum_absolute
+        ):
+            raise SummaryError(code)
+
+    by_format = value["by_format"]
+    if (
+        not isinstance(by_format, dict)
+        or len(by_format) > len(FORMATS)
+        or any(
+            not isinstance(format_name, str)
+            or format_name not in FORMATS
+            for format_name in by_format
+        )
+    ):
+        raise SummaryError(code)
+    format_cohorts = {
+        format_name: _validate_page_box_geometry_cohort(
+            raw_cohort,
+            workbook_limit=format_workbooks.get(format_name, 0),
+        )
+        for format_name, raw_cohort in by_format.items()
+    }
+    if any(
+        cohort["workbooks"] == 0
+        for cohort in format_cohorts.values()
+    ):
+        raise SummaryError(code)
+    if not _page_box_partition_matches(
+        all_cohort, format_cohorts.values()
+    ):
+        raise SummaryError(code)
+
+    by_feature = value["by_feature"]
+    if (
+        not isinstance(by_feature, dict)
+        or len(by_feature) > len(PAGE_BOX_GEOMETRY_FEATURES)
+        or any(
+            not isinstance(feature, str)
+            or feature not in PAGE_BOX_GEOMETRY_FEATURES
+            for feature in by_feature
+        )
+    ):
+        raise SummaryError(code)
+    for feature, raw_cohort in by_feature.items():
+        cohort = _validate_page_box_geometry_cohort(
+            raw_cohort,
+            workbook_limit=feature_workbooks.get(feature, 0),
+        )
+        if (
+            cohort["workbooks"] == 0
+            or cohort["workbooks"] > all_cohort["workbooks"]
+            or cohort["pages"] > all_cohort["pages"]
+        ):
+            raise SummaryError(code)
+        for axis in PAGE_BOX_GEOMETRY_AXES:
+            cohort_axis = cohort["by_axis"][axis]
+            all_axis = all_cohort["by_axis"][axis]
+            if (
+                cohort_axis["nonzero_pages"]
+                > all_axis["nonzero_pages"]
+                or (
+                    cohort_axis["min_delta_micropoints"] is not None
+                    and (
+                        cohort_axis["min_delta_micropoints"]
+                        < all_axis["min_delta_micropoints"]
+                        or cohort_axis["max_delta_micropoints"]
+                        > all_axis["max_delta_micropoints"]
+                    )
+                )
+            ):
+                raise SummaryError(code)
 
 
 def _validate_text_geometry_cohort(
@@ -2046,6 +2485,7 @@ def _validate_output(value: object) -> None:
         "geometry",
         "label",
         "line_geometry",
+        "page_box_geometry",
         "page_count_mismatches",
         "word_geometry",
         "workbooks",
@@ -2086,7 +2526,9 @@ def _validate_output(value: object) -> None:
             "output_classification",
             OUTPUT_CLASSIFICATIONS,
         )
-        _validate_geometry_output(report["geometry"], total)
+        point_geometry = _validate_geometry_output(
+            report["geometry"], total
+        )
         page_count_mismatches = report["page_count_mismatches"]
         if (
             not isinstance(page_count_mismatches, list)
@@ -2120,7 +2562,11 @@ def _validate_output(value: object) -> None:
             "page_count_mismatch", 0
         ):
             raise SummaryError("output_page_count_diagnostic")
-        for key, allowed in (("by_format", FORMATS), ("by_feature", FEATURES)):
+        group_workbooks: dict[str, dict[str, int]] = {}
+        for key, allowed in (
+            ("by_format", FORMATS),
+            ("by_feature", FEATURES),
+        ):
             groups = report[key]
             if (
                 not isinstance(groups, dict)
@@ -2133,7 +2579,8 @@ def _validate_output(value: object) -> None:
                 raise SummaryError("output_group")
             grouped_total = 0
             grouped_classes: Counter[str] = Counter()
-            for group in groups.values():
+            group_workbooks[key] = {}
+            for name, group in groups.items():
                 if (
                     not isinstance(group, dict)
                     or set(group) != {"by_classification", "workbooks"}
@@ -2157,15 +2604,20 @@ def _validate_output(value: object) -> None:
                     raise SummaryError("output_group")
                 grouped_classes.update(group_classes)
                 grouped_total += group_total
+                group_workbooks[key][name] = group_total
             if key == "by_format" and (
                 grouped_total != total
                 or dict(sorted(grouped_classes.items())) != report_classes
             ):
                 raise SummaryError("output_group")
-        format_workbooks = {
-            format_name: int(group["workbooks"])
-            for format_name, group in report["by_format"].items()
-        }
+        format_workbooks = group_workbooks["by_format"]
+        _validate_page_box_geometry_output(
+            report["page_box_geometry"],
+            total=total,
+            format_workbooks=format_workbooks,
+            feature_workbooks=group_workbooks["by_feature"],
+            point_geometry=point_geometry,
+        )
         word_geometry = _validate_text_geometry_output(
             report["word_geometry"], total, format_workbooks
         )

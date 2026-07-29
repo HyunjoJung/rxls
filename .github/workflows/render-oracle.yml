@@ -1140,6 +1140,18 @@ jobs:
           assert baseline_mode == "verify" or profile == "full"
           expected_cases = 40 if profile == "pilot" else 800
           expected_authored_print = 4 if profile == "pilot" else 100
+          expected_authored_print_by_scale_mode = {
+              "fit": expected_authored_print // 2,
+              "scale": expected_authored_print // 2,
+          }
+          expected_authored_print_pages = (
+              expected_authored_print_by_scale_mode["fit"]
+              + expected_authored_print_by_scale_mode["scale"] * 4
+          )
+          expected_authored_print_page_count_histogram = {
+              "1": expected_authored_print_by_scale_mode["fit"],
+              "4": expected_authored_print_by_scale_mode["scale"],
+          }
           expected_per_format = 10 if profile == "pilot" else 200
           expected_repetitions = 1 if profile == "pilot" else 2
           expected_shards = 1 if profile == "pilot" else 4
@@ -1511,11 +1523,25 @@ jobs:
           authored_gate_path = root / "authored-print-gate.json"
           authored_gate_payload = authored_gate_path.read_bytes()
           authored_gate = json.loads(authored_gate_payload)
-          assert authored_gate["schema"] == "rxls.authored-print-parity.v1"
+          assert authored_gate["schema"] == "rxls.authored-print-parity.v2"
           assert authored_gate["passed"] is True
           assert authored_gate["failures"] == []
           assert authored_gate["coverage"]["workbooks"] == expected_authored_print
-          assert authored_gate["coverage"]["pages"] == expected_authored_print * 4
+          assert (
+              authored_gate["coverage"]["pages"]
+              == expected_authored_print_pages
+          )
+          assert (
+              authored_gate["coverage"]["page_count_histogram"]
+              == expected_authored_print_page_count_histogram
+          )
+          assert (
+              authored_gate["coverage"]["by_scale_mode"]
+              == expected_authored_print_by_scale_mode
+          )
+          assert authored_gate["expected"][
+              "pages_per_workbook_by_scale_mode"
+          ] == {"fit": 1, "scale": 4}
           assert authored_gate["coverage"]["native_pdf_documents"] > 0
           assert authored_gate["coverage"]["native_pdf_font_objects"] > 0
           assert authored_gate["metrics"]["pdf_point_geometry_mismatches"] == 0
@@ -1534,7 +1560,6 @@ jobs:
               ]
               == 1_000
           )
-          assert set(authored_gate["coverage"]["by_scale_mode"]) == {"fit", "scale"}
           assert authored_gate["evidence"]["report_sha256"] == sha256(
               authored_report_payload
           )
@@ -1944,7 +1969,7 @@ jobs:
           )
           aggregate_contracts = {
               "authored-print-gate.json": (
-                  "rxls.authored-print-parity.v1",
+                  "rxls.authored-print-parity.v2",
                   {
                       "coverage",
                       "evidence",

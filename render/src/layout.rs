@@ -42,6 +42,9 @@ const OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS: f32 = 8.5;
 /// Calc's fixed application default for BIFF worksheets that omit both
 /// `STANDARDWIDTH` and `DEFCOLWIDTH`: 64 points at 96 CSS pixels per inch.
 const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH: Fixed = Fixed::from_raw(87_381);
+/// Calc's fixed application default for BIFF worksheets that omit
+/// `DEFAULTROWHEIGHT`: 255 twips, or 12.75 points / 17 CSS pixels.
+const BIFF_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_pixels(17);
 /// The pinned Calc oracle resolves an OOXML worksheet without an authoritative
 /// default row height to 0.5 cm (14.173228 points / 18.897638 CSS pixels).
 /// Fixed-point layout rounds that imported-only value to the nearest 1/1024 px.
@@ -2743,7 +2746,9 @@ fn row_height(sheet: &Sheet, row: u32, options: &RenderOptions, warnings: &mut W
 }
 
 fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
-    if sheet.has_implicit_ooxml_row_height() {
+    if sheet.biff_uses_application_default_row_height() {
+        BIFF_APPLICATION_DEFAULT_ROW_HEIGHT
+    } else if sheet.has_implicit_ooxml_row_height() {
         OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
     } else {
         options.default_row_height.max(Fixed::from_raw(1))
@@ -11886,6 +11891,46 @@ mod tests {
         assert_eq!(explicit_rows[0].size, Fixed::from_pixels(20));
         assert_eq!(overridden_rows[0].size, Fixed::from_pixels(16));
         assert_eq!(authored_rows[0].size, Fixed::from_pixels(37));
+    }
+
+    #[test]
+    fn biff_application_default_row_height_is_calc_specific_not_a_global_fallback() {
+        let candidates = [
+            include_bytes!("../../tests/fixtures/xls/reader-basic.xls").as_slice(),
+            include_bytes!("../../tests/fixtures/xls/korean-unicode-biff8.xls").as_slice(),
+            include_bytes!("../../tests/fixtures/xls/korean-cp949-biff5.xls").as_slice(),
+        ];
+        let implicit = candidates
+            .into_iter()
+            .map(|bytes| Workbook::open(bytes).expect("imported BIFF fixture"))
+            .find(|workbook| {
+                workbook
+                    .sheets
+                    .first()
+                    .is_some_and(|sheet| sheet.biff_uses_application_default_row_height())
+            })
+            .expect("at least one BIFF fixture without DEFAULTROWHEIGHT");
+        let mut overridden = implicit.clone();
+        overridden.sheets[0].set_default_row_height(12.0);
+
+        assert!(implicit.sheets[0].biff_uses_application_default_row_height());
+        assert!(!overridden.sheets[0].biff_uses_application_default_row_height());
+
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            gridlines: false,
+            default_row_height: Fixed::from_pixels(37),
+            ..RenderOptions::default()
+        };
+        let measured = |workbook: &Workbook| {
+            measure_sheet_axes(&workbook.sheets[0], RenderRange::new(0, 0, 0, 0), &options)
+                .unwrap()
+                .0[0]
+                .size
+        };
+
+        assert_eq!(measured(&implicit), BIFF_APPLICATION_DEFAULT_ROW_HEIGHT);
+        assert_eq!(measured(&overridden), Fixed::from_pixels(16));
     }
 
     #[test]

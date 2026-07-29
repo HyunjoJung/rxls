@@ -108,7 +108,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "6bc906ede4cd0618808e81f98ae8a819e9967b98f7474c3f97ad6ed054115d8a",
+    "8d8442c6caf1e5c35b0e6cfc4046042d9809cdcd3a7d23a47027a9bf19f78156",
     "4efd835342590bf4a0b46b26b1e07488fed8a17dc63eaaaf74757117ac00ebe3",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "87f634223865b73207dfcf5e62dd1ea5f4d10f8e869f13d8fb57cb829e23076e"
+    "013451d9f38eff91b441ae74c3724cdd997925eed5e1d3df8ddb24243b500f1d"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -2335,11 +2335,26 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "authored_report_path.unlink()": (
             "must remove the detailed authored-print report after aggregation"
         ),
-        'assert authored_gate["schema"] == "rxls.authored-print-parity.v1"': (
+        'assert authored_gate["schema"] == "rxls.authored-print-parity.v2"': (
             "must verify the aggregate authored-print gate schema"
         ),
         'assert authored_gate["passed"] is True': (
             "must reject failed authored-print aggregate evidence"
+        ),
+        '"fit": expected_authored_print // 2': (
+            "must bind half of authored-print workbooks to fit-to-page mode"
+        ),
+        '"scale": expected_authored_print // 2': (
+            "must bind half of authored-print workbooks to explicit-scale mode"
+        ),
+        '== expected_authored_print_pages': (
+            "must validate the mixed authored-print page total"
+        ),
+        '== expected_authored_print_page_count_histogram': (
+            "must validate authored-print page counts by pagination mode"
+        ),
+        '"pages_per_workbook_by_scale_mode"': (
+            "must preserve the fit-one-page and scale-four-page contract"
         ),
         'authored_gate["evidence"]["oracle_libreoffice_artifact_sha256"]': (
             "must bind authored-print evidence to the locked LibreOffice artifact"

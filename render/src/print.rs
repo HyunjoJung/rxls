@@ -1406,7 +1406,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v8");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v9");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1430,6 +1430,10 @@ fn print_source_identity(
     update_debug(
         &mut digest,
         &sheet.biff_uses_application_default_column_width(),
+    );
+    update_debug(
+        &mut digest,
+        &sheet.biff_uses_application_default_row_height(),
     );
     update_debug(&mut digest, sheet.physical_column_widths());
     update_debug(&mut digest, &sheet.default_column_width());

@@ -5748,6 +5748,9 @@ pub struct Sheet {
     /// Whether a BIFF worksheet omitted every valid sheet-wide width record
     /// and therefore uses Calc's fixed application default.
     pub(crate) biff_application_default_col_width: bool,
+    /// Whether a BIFF worksheet omitted every valid sheet-wide row-height
+    /// record and therefore uses Calc's fixed application default.
+    pub(crate) biff_application_default_row_height: bool,
     /// Source column widths expressed in physical points when the format stores
     /// an absolute length (currently ODS). Renderers prefer these values over
     /// the compatibility character-unit projection in `col_widths`.
@@ -6141,6 +6144,7 @@ impl Default for Sheet {
             xlsb_col_widths_256: BTreeMap::default(),
             xlsb_default_col_width: None,
             biff_application_default_col_width: false,
+            biff_application_default_row_height: false,
             physical_col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
             hidden_cols: BTreeSet::default(),
@@ -8296,6 +8300,15 @@ impl Sheet {
         self.biff_application_default_col_width
     }
 
+    /// Whether this imported BIFF worksheet uses Calc's application-default
+    /// row height because no valid `DEFAULTROWHEIGHT` record was present.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`.
+    #[doc(hidden)]
+    pub fn biff_uses_application_default_row_height(&self) -> bool {
+        self.biff_application_default_row_height
+    }
+
     /// Explicit absolute column widths in points, keyed by 0-based column.
     ///
     /// Formats such as ODS store physical lengths rather than Excel character
@@ -10332,6 +10345,7 @@ impl Sheet {
     pub fn set_default_row_height(&mut self, points: f32) {
         self.default_row_height = Some(points);
         self.ooxml_implicit_row_height = OoxmlImplicitRowHeight::None;
+        self.biff_application_default_row_height = false;
     }
     /// Set the default column width (character units) for columns without an
     /// explicit width.

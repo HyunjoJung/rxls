@@ -241,6 +241,7 @@ impl XlsSheetDefaults {
         sheet.default_col_width = explicit_width;
         sheet.biff_application_default_col_width = sheet.is_worksheet && explicit_width.is_none();
         sheet.default_row_height = self.row_height;
+        sheet.biff_application_default_row_height = sheet.is_worksheet && self.row_height.is_none();
     }
 }
 
@@ -6106,6 +6107,7 @@ mod tests {
         assert_eq!(sheet.column_widths().len(), 1);
         assert_eq!(sheet.row_heights().len(), 1);
         assert!(!sheet.biff_uses_application_default_column_width());
+        assert!(!sheet.biff_uses_application_default_row_height());
     }
 
     #[test]
@@ -6124,6 +6126,8 @@ mod tests {
         );
         assert_eq!(sheet.row_heights().get(&4), Some(&18.0));
         assert_eq!(sheet.row_heights().len(), 1);
+        assert_eq!(sheet.default_row_height(), None);
+        assert!(sheet.biff_uses_application_default_row_height());
     }
 
     #[test]
@@ -6255,6 +6259,20 @@ mod tests {
     }
 
     #[test]
+    fn biff_missing_row_height_retains_calc_application_default_provenance() {
+        for biff8 in [false, true] {
+            let mut workbook = workbook_with_geometry_records(biff8, &[]);
+            let sheet = &mut workbook.sheets[0];
+            assert_eq!(sheet.default_row_height(), None);
+            assert!(sheet.biff_uses_application_default_row_height());
+
+            sheet.set_default_row_height(12.0);
+            assert_eq!(sheet.default_row_height(), Some(12.0));
+            assert!(!sheet.biff_uses_application_default_row_height());
+        }
+    }
+
+    #[test]
     fn biff_colinfo_zero_width_hides_and_restores_sheet_default() {
         let records = vec![
             (COLINFO, test_colinfo(2, 2, 3072)),
@@ -6329,6 +6347,7 @@ mod tests {
         assert_eq!(workbook.sheets[0].default_column_width(), None);
         assert_eq!(workbook.sheets[0].default_row_height(), None);
         assert!(workbook.sheets[0].biff_uses_application_default_column_width());
+        assert!(workbook.sheets[0].biff_uses_application_default_row_height());
 
         let invalid = vec![
             (DEFAULTCOLWIDTH, 0u16.to_le_bytes().to_vec()),
@@ -6340,6 +6359,7 @@ mod tests {
         assert_eq!(workbook.sheets[0].default_column_width(), None);
         assert_eq!(workbook.sheets[0].default_row_height(), None);
         assert!(workbook.sheets[0].biff_uses_application_default_column_width());
+        assert!(workbook.sheets[0].biff_uses_application_default_row_height());
 
         let bounded = vec![
             (DEFAULTCOLWIDTH, 256u16.to_le_bytes().to_vec()),
@@ -6351,6 +6371,7 @@ mod tests {
         let workbook = workbook_with_geometry_records(true, &bounded);
         assert_eq!(workbook.sheets[0].default_column_width(), None);
         assert_eq!(workbook.sheets[0].default_row_height(), None);
+        assert!(workbook.sheets[0].biff_uses_application_default_row_height());
     }
 
     #[test]
