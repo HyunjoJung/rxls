@@ -7370,8 +7370,71 @@ fn fixed_as_pixels(value: Fixed) -> f64 {
     value.raw() as f64 / FIXED_UNITS_PER_PIXEL as f64
 }
 
+fn rounded_scaled_raw(value: i64, scale: f64) -> Result<i128, RenderError> {
+    if !scale.is_finite() {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    if value == 0 || scale == 0.0 {
+        return Ok(0);
+    }
+
+    // Decode the binary float so boundary checks use the exact represented
+    // scale. Casting a large i64 to f64 first can round away a one-unit
+    // overflow at either signed boundary.
+    let bits = scale.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    let (significand, binary_exponent) = if exponent_bits == 0 {
+        (fraction, -1_074)
+    } else {
+        ((1_u64 << 52) | fraction, exponent_bits - 1_023 - 52)
+    };
+    if significand == 0 {
+        return Ok(0);
+    }
+
+    let numerator = u128::from(value.unsigned_abs())
+        .checked_mul(u128::from(significand))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let magnitude = if binary_exponent >= 0 {
+        let factor = 1_u128
+            .checked_shl(binary_exponent as u32)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        numerator
+            .checked_mul(factor)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        let shift = binary_exponent.unsigned_abs();
+        if shift >= u128::BITS {
+            0
+        } else {
+            let truncated = numerator >> shift;
+            let remainder_mask = (1_u128 << shift) - 1;
+            let halfway = 1_u128 << (shift - 1);
+            truncated
+                .checked_add(u128::from(numerator & remainder_mask >= halfway))
+                .ok_or(RenderError::CoordinateOverflow)?
+        }
+    };
+
+    // Two signed i64 endpoints differ by at most u64::MAX. A larger rounded
+    // delta cannot be brought back into range by any valid start coordinate.
+    if magnitude > u128::from(u64::MAX) {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    let magnitude = i128::try_from(magnitude).map_err(|_| RenderError::CoordinateOverflow)?;
+    Ok(if (value < 0) ^ scale.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    })
+}
+
 fn pixels_as_fixed(value: f64) -> Result<Fixed, RenderError> {
-    float_pixels_to_fixed(value).ok_or(RenderError::CoordinateOverflow)
+    let raw = rounded_scaled_raw(FIXED_UNITS_PER_PIXEL, value)?;
+    Ok(Fixed::from_raw(
+        i64::try_from(raw).map_err(|_| RenderError::CoordinateOverflow)?,
+    ))
 }
 
 fn drawing_clip(
@@ -8202,14 +8265,12 @@ fn push_solid_rect(
 }
 
 fn interpolate_fixed(start: Fixed, extent: Fixed, ratio: f64) -> Result<Fixed, RenderError> {
-    if !ratio.is_finite() {
-        return Err(RenderError::CoordinateOverflow);
-    }
-    let raw = start.raw() as f64 + extent.raw() as f64 * ratio;
-    if !raw.is_finite() || raw < i64::MIN as f64 || raw > i64::MAX as f64 {
-        return Err(RenderError::CoordinateOverflow);
-    }
-    Ok(Fixed::from_raw(raw.round() as i64))
+    let delta = rounded_scaled_raw(extent.raw(), ratio)?;
+    let raw = i128::from(start.raw())
+        .checked_add(delta)
+        .and_then(|raw| i64::try_from(raw).ok())
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(Fixed::from_raw(raw))
 }
 
 fn push_sparkline_placeholder(
@@ -13234,6 +13295,239 @@ mod tests {
                 actual: 6,
             })
         );
+    }
+
+    fn imported_rtl_circle_chart() -> Workbook {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Render" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><sheetViews><sheetView rightToLeft="1"/></sheetViews><sheetData>
+                  <row r="1"><c r="A1" t="inlineStr"><is><t>Q1</t></is></c><c r="B1"><v>10</v></c></row>
+                  <row r="2"><c r="A2" t="inlineStr"><is><t>Q2</t></is></c><c r="B2"><v>23</v></c></row>
+                  <row r="3"><c r="A3" t="inlineStr"><is><t>Q3</t></is></c><c r="B3"><v>36</v></c></row>
+                  <row r="4"><c r="A4" t="inlineStr"><is><t>Q4</t></is></c><c r="B4"><v>49</v></c></row>
+                </sheetData><drawing r:id="rIdDraw"/></worksheet>"#,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/drawings/drawing1.xml",
+                r#"<wsDr><twoCellAnchor><from><col>0</col><row>7</row></from><to><col>6</col><row>18</row></to><graphicFrame><graphic><graphicData><chart r:id="rIdChart"/></graphicData></graphic></graphicFrame></twoCellAnchor></wsDr>"#,
+            ),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/charts/chart1.xml",
+                r#"<chartSpace><chart><plotArea><lineChart><ser>
+                  <marker><symbol val="circle"/><size val="3"/></marker>
+                  <cat><strRef><f>Render!$A$1:$A$4</f></strRef></cat>
+                  <val><numRef><f>Render!$B$1:$B$4</f></numRef></val>
+                </ser></lineChart></plotArea></chart></chartSpace>"#,
+            ),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        Workbook::open(&writer.finish().unwrap().into_inner()).expect("imported RTL circle chart")
+    }
+
+    #[test]
+    fn rtl_chart_continuation_keeps_signed_tile_coordinates() {
+        let workbook = imported_rtl_circle_chart();
+        assert_eq!(workbook.sheets[0].charts().len(), 1);
+
+        let rows = (0_u32..=18)
+            .map(|index| MeasuredAxisSlot {
+                index,
+                offset: Fixed::from_pixels(i64::from(index) * 20),
+                size: Fixed::from_pixels(20),
+            })
+            .collect::<Vec<_>>();
+        let columns = (0_u16..=6)
+            .map(|index| MeasuredAxisSlot {
+                index,
+                offset: Fixed::from_pixels(i64::from(index) * 64),
+                size: Fixed::from_pixels(64),
+            })
+            .collect::<Vec<_>>();
+        let options = outlined_options(RenderRange::new(1, 0, 8, 2));
+        let build = build_sheet_scene_with_geometry(
+            &workbook.sheets[0],
+            0,
+            &options,
+            SheetGeometryOverride::new(&rows, &columns),
+        )
+        .expect("a continued chart may retain negative pre-clip coordinates");
+
+        assert!(build
+            .report
+            .warnings
+            .iter()
+            .all(|warning| warning.code != WarningCode::ChartPlaceholder));
+        let chart_group = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::ClipGroup(group)
+                    if group.nodes.iter().any(|node| {
+                        matches!(
+                            node,
+                            SceneNode::Path(path)
+                                if path.commands.iter().filter(|command| {
+                                    matches!(command, PathCommand::CubicTo { .. })
+                                }).count() == 4
+                        )
+                    }) =>
+                {
+                    Some(group)
+                }
+                _ => None,
+            })
+            .expect("the continued imported chart must retain its clipped circle markers");
+        assert!(chart_group.clip.x.raw() >= 0);
+        let circle_markers = chart_group
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Path(path)
+                    if path
+                        .commands
+                        .iter()
+                        .filter(|command| matches!(command, PathCommand::CubicTo { .. }))
+                        .count()
+                        == 4 =>
+                {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(circle_markers.len(), 4);
+        assert!(
+            circle_markers
+                .iter()
+                .flat_map(|path| &path.commands)
+                .any(|command| match command {
+                    PathCommand::MoveTo { x, .. }
+                    | PathCommand::LineTo { x, .. }
+                    | PathCommand::QuadraticTo { x, .. }
+                    | PathCommand::CubicTo { x, .. } => x.raw() < 0,
+                    PathCommand::Close => false,
+                }),
+            "a real circle marker must retain a negative pre-clip x coordinate"
+        );
+    }
+
+    #[test]
+    fn chart_coordinate_conversion_is_signed_and_fail_closed() {
+        assert_eq!(pixels_as_fixed(0.0).unwrap(), Fixed::ZERO);
+        assert_eq!(
+            pixels_as_fixed(-0.25).unwrap(),
+            Fixed::from_raw(-FIXED_UNITS_PER_PIXEL / 4)
+        );
+        assert_eq!(
+            pixels_as_fixed(-9_007_199_254_740_992.0).unwrap(),
+            Fixed::from_raw(i64::MIN)
+        );
+        assert_eq!(
+            pixels_as_fixed(9_007_199_254_740_991.0).unwrap(),
+            Fixed::from_raw(i64::MAX - (FIXED_UNITS_PER_PIXEL - 1))
+        );
+
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+            -9_007_199_254_740_994.0,
+        ] {
+            assert_eq!(
+                pixels_as_fixed(invalid),
+                Err(RenderError::CoordinateOverflow)
+            );
+        }
+        for boundary in [i64::MIN, i64::MAX] {
+            assert_eq!(
+                interpolate_fixed(Fixed::from_raw(boundary), Fixed::ZERO, 0.0).unwrap(),
+                Fixed::from_raw(boundary)
+            );
+        }
+        assert_eq!(
+            interpolate_fixed(Fixed::from_raw(i64::MIN), Fixed::from_raw(i64::MAX), 1.0).unwrap(),
+            Fixed::from_raw(-1)
+        );
+        assert_eq!(
+            interpolate_fixed(
+                Fixed::from_raw((1_i64 << 62) - 1),
+                Fixed::from_raw((1_i64 << 62) + 1),
+                1.0
+            ),
+            Err(RenderError::CoordinateOverflow)
+        );
+        for (start, extent, ratio) in [
+            (i64::MAX, 1, 1.0),
+            (i64::MIN, -1, 1.0),
+            (i64::MAX, 1, 0.5),
+            (i64::MIN, -1, 0.5),
+            (0, 1_i64 << 62, 2.0),
+        ] {
+            assert_eq!(
+                interpolate_fixed(Fixed::from_raw(start), Fixed::from_raw(extent), ratio),
+                Err(RenderError::CoordinateOverflow)
+            );
+        }
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                interpolate_fixed(Fixed::ZERO, Fixed::ZERO, ratio),
+                Err(RenderError::CoordinateOverflow)
+            );
+        }
+    }
+
+    #[test]
+    fn clipped_circle_chart_marker_keeps_negative_coordinates() {
+        let mut nodes = Vec::new();
+        let mut typography_stats = TypographyStats::default();
+        let mut style = ChartSeriesStyle::default();
+        style.marker = ChartMarkerSymbol::Circle;
+        style.marker_size = Some(3);
+
+        push_chart_marker(
+            &mut nodes,
+            pixels_as_fixed(-188.25).unwrap(),
+            Fixed::from_pixels(12),
+            Rgb::new(0x12, 0x34, 0x56),
+            &style,
+            &mut typography_stats,
+            &RenderOptions::default(),
+        )
+        .expect("a clipped circular marker may retain negative pre-clip coordinates");
+
+        let SceneNode::Path(path) = &nodes[0] else {
+            panic!("a circular marker must render as a path");
+        };
+        assert!(path.commands.iter().any(|command| match command {
+            PathCommand::MoveTo { x, .. }
+            | PathCommand::LineTo { x, .. }
+            | PathCommand::QuadraticTo { x, .. }
+            | PathCommand::CubicTo { x, .. } => x.raw() < 0,
+            PathCommand::Close => false,
+        }));
     }
 
     #[test]
