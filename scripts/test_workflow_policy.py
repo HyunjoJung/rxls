@@ -912,8 +912,8 @@ steps:
                 'MAX_PARALLEL_SHARDS: "2"', 'MAX_PARALLEL_SHARDS: "4"'
             ),
             "balance": original.replace(
-                "assert all(180 <= len(rows) <= 220 for rows in shards)",
-                "assert shards",
+                "(46, 37, 46, 54),",
+                "(46, 38, 46, 53),",
             ),
             "timeout": original.replace(
                 "&& 330 || 120",

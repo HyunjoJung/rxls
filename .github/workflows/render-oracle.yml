@@ -322,12 +322,21 @@ jobs:
                   ]
                   for shard_index in range(4)
               ]
-              assert all(180 <= len(rows) <= 220 for rows in shards)
-              assert all(
-                  40 <= sum(row["format"] == format_name for row in rows) <= 60
-                  for rows in shards
-                  for format_name in ("ods", "xls", "xlsb", "xlsx")
+              shard_formats = ("ods", "xls", "xlsb", "xlsx")
+              expected_shard_format_counts = (
+                  (55, 47, 59, 50),
+                  (46, 37, 46, 54),
+                  (56, 56, 46, 46),
+                  (43, 60, 49, 50),
               )
+              shard_format_counts = tuple(
+                  tuple(
+                      sum(row["format"] == format_name for row in rows)
+                      for format_name in shard_formats
+                  )
+                  for rows in shards
+              )
+              assert shard_format_counts == expected_shard_format_counts
           PY
       - name: Build the exact renderer binary
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}

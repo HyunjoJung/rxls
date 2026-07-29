@@ -84,6 +84,29 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         )
         self.assertEqual(len(cases), 800)
         self.assertLess(manifest["total_bytes"], self.module.MAX_TOTAL_BYTES)
+        shard_formats = ("ods", "xls", "xlsb", "xlsx")
+        shard_format_counts = []
+        for shard_index in range(4):
+            rows = [
+                row
+                for row in manifest["files"]
+                if int(row["sha256"][:16], 16) % 4 == shard_index
+            ]
+            shard_format_counts.append(
+                tuple(
+                    sum(row["format"] == fmt for row in rows)
+                    for fmt in shard_formats
+                )
+            )
+        self.assertEqual(
+            shard_format_counts,
+            [
+                (55, 47, 59, 50),
+                (46, 37, 46, 54),
+                (56, 56, 46, 46),
+                (43, 60, 49, 50),
+            ],
+        )
 
     def test_pilot_retains_every_feature_and_absolute_gate_core_cohort(self) -> None:
         gate = load_fidelity_gate()

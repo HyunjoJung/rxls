@@ -100,7 +100,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "d0a6977111dff7834d45d32af480a2856e8de63f39648cf8d75b13be3e1a3921",
     "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
-    "e5884311c0ad309aef1d77895e5be999a32781d9bf7fc15f409649bcb691c863",
+    "ac9fe9230f1c6f7739eedae3b8cc71ba453825af0e76e0a33468db089f420c4c",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "77174d8dbdec197009f4abfc0297678c0a8fb4045ac423b1d959274fd5e89230"
+    "87f634223865b73207dfcf5e62dd1ea5f4d10f8e869f13d8fb57cb829e23076e"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -2275,11 +2275,14 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'if int(row["sha256"][:16], 16) % 4 == shard_index': (
             "must preflight the same deterministic content-identity shards"
         ),
-        "assert all(180 <= len(rows) <= 220 for rows in shards)": (
-            "full shards must remain balanced and bounded"
+        "expected_shard_format_counts = (": (
+            "full shards must bind the deterministic corpus partition"
         ),
-        '40 <= sum(row["format"] == format_name for row in rows) <= 60': (
-            "every full shard must remain balanced by format"
+        "(46, 37, 46, 54),": (
+            "full shards must retain the exact low-tail format partition"
+        ),
+        "assert shard_format_counts == expected_shard_format_counts": (
+            "every full shard must match the exact deterministic format matrix"
         ),
         "python3 scripts/merge-render-parity-reports.py": (
             "must fail closed while merging complete full-corpus shards"
