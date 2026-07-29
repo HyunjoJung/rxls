@@ -103,7 +103,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "e5884311c0ad309aef1d77895e5be999a32781d9bf7fc15f409649bcb691c863",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
-    "68020e7c8b3d68f841ce71c138d65dbe11e904941ca035f8612c4d3222c9160a",
+    "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
@@ -120,14 +120,14 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
-    "7e6dab898f2562f84647482ce56a837dbb1b4dbb2e1e00860cb09012f2445856",
+    "5ac13b1b0327e245fb52c4e08fc1647ba6e89fa29fb82ef2f1860b17a3adabca",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "b0374ac13f7b39b4a23da4e125a322027204c431a7e22330d01b7be47247cc00"
+    "21c10f0e2a15d340a6122a4944eff86dd1be614a6ac4840ad1bf4f950ca6f8d1"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "789bebea01be1b6d44d0223697b10733524f85bd6ae23dfa2c0fc345bd48949b"
+    "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -365,22 +365,40 @@ def _audit_oracle_build_retry(
     path: Path,
     step: str,
     output_path: str,
+    log_path: str,
     errors: list[str],
 ) -> None:
-    """Require a bounded, fail-closed retry around the locked image builder."""
+    """Retry only typed transient downloads and fail closed on integrity errors."""
 
     required_once = {
         "build_oracle_image() {": (
             "locked image retries must call one reviewed build function"
         ),
+        "retryable_oracle_download_failure() {": (
+            "locked image retries must classify only reviewed download failures"
+        ),
+        (
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
+            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+        ): "locked image retries must bind failures to the exact LibreOffice artifact",
+        r"curl: \((5|6|7|18|28|35|52|55|56|92)\)": (
+            "locked image retries must use the reviewed curl transport allowlist"
+        ),
+        (
+            r"curl: \(22\) The requested URL returned error: "
+            r"(408|429|500|502|503|504)([^0-9]|$)"
+        ): "locked image retries must use the reviewed transient HTTP allowlist",
         "build_status=1": "locked image retries must initialize a failing status",
         "for build_attempt in 1 2 3; do": (
             "locked image retries must use exactly three bounded attempts"
         ),
-        f"rm -f {output_path}": (
+        f"build_log={log_path}": (
+            "locked image retries must use only the reviewed private diagnostic log"
+        ),
+        f'rm -f {output_path} "$build_log"': (
             "locked image retries must remove stale evidence before every attempt"
         ),
-        "if build_oracle_image; then": (
+        'if build_oracle_image 2> "$build_log"; then': (
             "locked image retries must test the reviewed build function directly"
         ),
         "build_status=0": (
@@ -388,6 +406,9 @@ def _audit_oracle_build_retry(
         ),
         "build_status=$?": (
             "locked image retries must preserve the failed builder status"
+        ),
+        'if ! retryable_oracle_download_failure "$build_log"; then': (
+            "locked image retries must reject every unclassified failure immediately"
         ),
         'if [[ "$build_attempt" -lt 3 ]]; then': (
             "locked image retries must not sleep after the final attempt"
@@ -401,16 +422,29 @@ def _audit_oracle_build_retry(
         'if [[ "$build_status" -ne 0 ]]; then': (
             "locked image retries must fail closed after exhaustion"
         ),
-        'exit "$build_status"': (
-            "locked image retries must propagate the final builder status"
-        ),
+        'rm -f "$build_log"': "successful retries must delete the private build log",
     }
     for snippet, message in required_once.items():
         if step.count(snippet) != 1:
             errors.append(f"{path}: {message}")
+    if step.count('cat "$build_log" >&2') != 2:
+        errors.append(
+            f"{path}: locked image retries must preserve both success and failure logs"
+        )
+    if step.count('exit "$build_status"') != 2:
+        errors.append(
+            f"{path}: locked image retries must propagate immediate and exhausted failures"
+        )
     if step.count("\n              break\n") != 1:
         errors.append(
             f"{path}: locked image retries must stop after the first successful build"
+        )
+    classify = step.find('if ! retryable_oracle_download_failure "$build_log"; then')
+    immediate_exit = step.find('exit "$build_status"', classify)
+    retry_delay = step.find('if [[ "$build_attempt" -lt 3 ]]; then', classify)
+    if not 0 <= classify < immediate_exit < retry_delay:
+        errors.append(
+            f"{path}: unclassified locked image failures must exit before any retry"
         )
 
 
@@ -1913,6 +1947,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         path,
         oracle_image_build,
         "target/render-oracle-hosted/build.json",
+        "target/render-oracle-hosted/build.stderr",
         errors,
     )
     required = {
@@ -2870,6 +2905,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         path,
         image_build,
         "target/render-oracle-image-build.json",
+        "target/render-oracle-image-build.stderr",
         errors,
     )
     for snippet, message in {

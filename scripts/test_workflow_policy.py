@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -493,12 +495,14 @@ steps:
                 RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8"),
                 "- name: Build and inspect the locked oracle image",
                 "target/render-oracle-hosted/build.json",
+                "target/render-oracle-hosted/build.stderr",
             ),
             (
                 Path("render-hardening.yml"),
                 RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8"),
                 "- name: Build and verify the locked oracle image",
                 "target/render-oracle-image-build.json",
+                "target/render-oracle-image-build.stderr",
             ),
         )
         mutations = {
@@ -508,14 +512,28 @@ steps:
             ),
             "stale_output": ("rm -f target/", "test -e target/"),
             "discard_status": ("build_status=$?", "build_status=1"),
+            "retry_every_curl_failure": (
+                r"curl: \((5|6|7|18|28|35|52|55|56|92)\)",
+                r"curl: \([0-9]+\)",
+            ),
+            "retry_not_found": (
+                "(408|429|500|502|503|504)",
+                "(404|408|429|500|502|503|504)",
+            ),
             "long_backoff": (
                 "retry_delay_seconds=$((build_attempt * 5))",
                 "retry_delay_seconds=$((build_attempt * 60))",
             ),
             "continue_after_success": ("\n              break\n", "\n              continue\n"),
+            "retry_integrity_failure": (
+                'if ! retryable_oracle_download_failure "$build_log"; then\n'
+                '              exit "$build_status"',
+                'if ! retryable_oracle_download_failure "$build_log"; then\n'
+                "              :",
+            ),
             "mask_final_failure": ('exit "$build_status"', "exit 0"),
         }
-        for path, workflow, header, output_path in cases:
+        for path, workflow, header, output_path, log_path in cases:
             extraction_errors: list[str] = []
             step = self.policy._single_yaml_block(
                 path,
@@ -527,7 +545,13 @@ steps:
             )
             self.assertEqual(extraction_errors, [])
             errors: list[str] = []
-            self.policy._audit_oracle_build_retry(path, step, output_path, errors)
+            self.policy._audit_oracle_build_retry(
+                path,
+                step,
+                output_path,
+                log_path,
+                errors,
+            )
             self.assertEqual(errors, [])
             for name, (source, replacement) in mutations.items():
                 with self.subTest(workflow=path.name, mutation=name):
@@ -538,9 +562,132 @@ steps:
                         path,
                         mutated,
                         output_path,
+                        log_path,
                         errors,
                     )
                     self.assertTrue(errors)
+
+    def test_oracle_image_retry_executes_only_for_transient_downloads(self) -> None:
+        cases = (
+            (
+                "render-oracle",
+                RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8"),
+                "- name: Build and inspect the locked oracle image",
+                Path("target/render-oracle-hosted/build.json"),
+            ),
+            (
+                "render-hardening",
+                RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8"),
+                "- name: Build and verify the locked oracle image",
+                Path("target/render-oracle-image-build.json"),
+            ),
+        )
+        scenarios = {
+            "integrity": (2, ["1"]),
+            "transient": (0, ["1", "2"]),
+            "exhausted": (2, ["1", "2", "3"]),
+        }
+        mock_function = textwrap.dedent(
+            """\
+            build_oracle_image() {
+              mock_attempt=$((mock_attempt + 1))
+              printf '%s\\n' "$mock_attempt" >> "$MOCK_ATTEMPTS_FILE"
+              case "$MOCK_MODE" in
+                integrity)
+                  if [[ "$mock_attempt" -eq 1 ]]; then
+                    printf '%s\\n' \
+                      'render_oracle_error:image_reproducibility_mismatch' >&2
+                    return 2
+                  fi
+                  ;;
+                transient)
+                  if [[ "$mock_attempt" -eq 1 ]]; then
+                    printf '%s\\n' \
+                      "$MOCK_ORACLE_URL" \
+                      'curl: (18) transfer closed with bytes remaining to read' >&2
+                    return 2
+                  fi
+                  ;;
+                exhausted)
+                  printf '%s\\n' \
+                    "$MOCK_ORACLE_URL" \
+                    'curl: (22) The requested URL returned error: 500' >&2
+                  return 2
+                  ;;
+              esac
+              return 0
+            }
+            """
+        )
+        oracle_url = (
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
+            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+        )
+        for workflow_name, workflow, header, output_path in cases:
+            extraction_errors: list[str] = []
+            step = self.policy._single_yaml_block(
+                Path(f"{workflow_name}.yml"),
+                workflow,
+                header,
+                6,
+                "locked oracle image build step",
+                extraction_errors,
+            )
+            self.assertEqual(extraction_errors, [])
+            run_marker = "        run: |\n"
+            self.assertIn(run_marker, step)
+            run_script = textwrap.dedent(step.split(run_marker, 1)[1])
+            retry_start = run_script.index("build_oracle_image() {")
+            retry_end = run_script.index("python3 - <<'PY'", retry_start)
+            retry_script = run_script[retry_start:retry_end]
+            retry_script, replacements = re.subn(
+                r"(?ms)^build_oracle_image\(\) \{\n.*?^\}\n",
+                mock_function,
+                retry_script,
+                count=1,
+            )
+            self.assertEqual(replacements, 1)
+            retry_script = retry_script.replace(
+                'sleep "$retry_delay_seconds"',
+                ': "$retry_delay_seconds"',
+            )
+            for scenario, (expected_status, expected_attempts) in scenarios.items():
+                with self.subTest(workflow=workflow_name, scenario=scenario):
+                    with tempfile.TemporaryDirectory() as raw:
+                        root = Path(raw)
+                        (root / output_path).parent.mkdir(parents=True)
+                        attempts_path = root / "attempts.txt"
+                        environment = os.environ.copy()
+                        environment.update(
+                            {
+                                "MOCK_ATTEMPTS_FILE": str(attempts_path),
+                                "MOCK_MODE": scenario,
+                                "MOCK_ORACLE_URL": oracle_url,
+                            }
+                        )
+                        result = subprocess.run(
+                            ["bash"],
+                            input=(
+                                "set -euo pipefail\n"
+                                "mock_attempt=0\n"
+                                f"{retry_script}"
+                            ),
+                            text=True,
+                            cwd=root,
+                            env=environment,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                        )
+                        self.assertEqual(
+                            result.returncode,
+                            expected_status,
+                            result.stderr,
+                        )
+                        self.assertEqual(
+                            attempts_path.read_text(encoding="utf-8").splitlines(),
+                            expected_attempts,
+                        )
 
     def test_oracle_build_jobs_reject_unreviewed_step_surface(self) -> None:
         oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
