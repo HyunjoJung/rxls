@@ -12,8 +12,8 @@ use rxls_render::{
     build_print_document, build_print_page, build_scene, build_sheet_print_page,
     prepare_print_document, prepare_sheet_print_document, render_print_document_pdf, Fixed,
     GlyphCluster, GlyphPaint, GlyphRunNode, LimitKind, PathCommand, PrintLayoutOverride,
-    PrintLimits, PrintOptions, PrintWarningCode, Rect, RenderError, RenderLimits, RenderOptions,
-    RenderRange, RenderSelection, Rgb, Scene, SceneNode, WarningCode,
+    PrintLimits, PrintOptions, PrintWarningCode, Rect, RenderError, RenderOptions, RenderRange,
+    RenderSelection, Rgb, Scene, SceneNode, WarningCode,
 };
 use zip::write::SimpleFileOptions;
 
@@ -1689,12 +1689,8 @@ fn omitted_or_false_fit_flag_keeps_fixed_scale_and_manual_breaks() {
 }
 
 #[test]
-fn single_page_uses_declared_blank_extent_without_changing_used_rendering() {
+fn single_page_ignores_declared_blank_extent() {
     let workbook = declared_blank_extent_xlsx(false);
-    assert_eq!(
-        workbook.sheets[0].source_used_dimensions(),
-        Some((0, 0, 5, 3))
-    );
     assert_eq!(workbook.sheets[0].dimensions(), Some((0, 0, 0, 0)));
 
     let render = RenderOptions {
@@ -1714,15 +1710,15 @@ fn single_page_uses_declared_blank_extent_without_changing_used_rendering() {
     };
     let document = build_print_document(&workbook, 0, &options).unwrap();
     assert_eq!(document.pages.len(), 1);
-    assert_eq!(document.report.source.range, RenderRange::new(0, 0, 5, 3));
+    assert_eq!(document.report.source.range, RenderRange::new(0, 0, 0, 0));
     assert_eq!(
         document.report.pages[0].body_range,
-        RenderRange::new(0, 0, 5, 3)
+        RenderRange::new(0, 0, 0, 0)
     );
-    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(334));
-    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(140));
-    assert_eq!(document.report.source.visible_columns, 4);
-    assert_eq!(document.report.source.visible_rows, 6);
+    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(document.report.source.visible_columns, 1);
+    assert_eq!(document.report.source.visible_rows, 1);
     assert_eq!(document.report.source.merged_regions, 0);
     assert_eq!(document.report.paper.width, document.pages[0].scene.width);
     assert_eq!(document.report.paper.height, document.pages[0].scene.height);
@@ -1759,7 +1755,7 @@ fn single_page_uses_declared_blank_extent_without_changing_used_rendering() {
 }
 
 #[test]
-fn single_page_declared_extent_respects_hidden_axis_policy() {
+fn single_page_ignores_declared_blank_axes_regardless_of_hidden_policy() {
     let workbook = declared_blank_extent_xlsx(true);
     let hidden = build_print_document(
         &workbook,
@@ -1774,11 +1770,11 @@ fn single_page_declared_extent_respects_hidden_axis_policy() {
         },
     )
     .unwrap();
-    assert_eq!(hidden.report.source.range, RenderRange::new(0, 0, 5, 3));
-    assert_eq!(hidden.pages[0].scene.width, Fixed::from_pixels(192));
-    assert_eq!(hidden.pages[0].scene.height, Fixed::from_pixels(100));
-    assert_eq!(hidden.report.source.visible_columns, 3);
-    assert_eq!(hidden.report.source.visible_rows, 5);
+    assert_eq!(hidden.report.source.range, RenderRange::new(0, 0, 0, 0));
+    assert_eq!(hidden.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(hidden.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(hidden.report.source.visible_columns, 1);
+    assert_eq!(hidden.report.source.visible_rows, 1);
 
     let included = build_print_document(
         &workbook,
@@ -1794,24 +1790,20 @@ fn single_page_declared_extent_respects_hidden_axis_policy() {
         },
     )
     .unwrap();
-    assert_eq!(included.pages[0].scene.width, Fixed::from_pixels(334));
-    assert_eq!(included.pages[0].scene.height, Fixed::from_pixels(140));
-    assert_eq!(included.report.source.visible_columns, 4);
-    assert_eq!(included.report.source.visible_rows, 6);
+    assert_eq!(included.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(included.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(included.report.source.visible_columns, 1);
+    assert_eq!(included.report.source.visible_rows, 1);
 }
 
 #[test]
-fn single_page_unions_stale_small_declarations_with_actual_content() {
+fn single_page_ignores_stale_small_declaration_and_uses_actual_content() {
     let mut workbook = source_dimension_xlsx(
         "A1:B2",
         r#"<sheetFormatPr defaultRowHeight="15"/>
         <sheetData>
           <row r="6"><c r="D6" t="inlineStr"><is><t>outside</t></is></c></row>
         </sheetData>"#,
-    );
-    assert_eq!(
-        workbook.sheets[0].source_used_dimensions(),
-        Some((0, 0, 1, 1))
     );
     assert_eq!(workbook.sheets[0].dimensions(), Some((5, 3, 5, 3)));
 
@@ -1834,9 +1826,9 @@ fn single_page_unions_stale_small_declarations_with_actual_content() {
         },
     )
     .unwrap();
-    assert_eq!(document.report.source.range, RenderRange::new(0, 0, 5, 3));
-    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(256));
-    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(120));
+    assert_eq!(document.report.source.range, RenderRange::new(5, 3, 5, 3));
+    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(20));
 
     workbook.sheets[0].add_chart(Chart::new(ChartKind::Line, (8, 5), (9, 6)));
     let drawing_union = build_print_document(
@@ -1854,16 +1846,16 @@ fn single_page_unions_stale_small_declarations_with_actual_content() {
     .unwrap();
     assert_eq!(
         drawing_union.report.source.range,
-        RenderRange::new(0, 0, 9, 6)
+        RenderRange::new(5, 3, 9, 6)
     );
     assert_eq!(
         drawing_union.report.pages[0].body_range,
-        RenderRange::new(0, 0, 9, 6)
+        RenderRange::new(5, 3, 9, 6)
     );
 }
 
 #[test]
-fn single_page_declared_extent_fails_before_oversized_grid_materialization() {
+fn single_page_ignores_oversized_declared_extent_before_materialization() {
     let workbook = source_dimension_xlsx(
         "A1:XFD1048576",
         r#"<sheetData>
@@ -1879,31 +1871,24 @@ fn single_page_declared_extent_fails_before_oversized_grid_materialization() {
         RenderRange::new(0, 0, 0, 0)
     );
 
-    assert_eq!(
-        build_print_document(
-            &workbook,
-            0,
-            &PrintOptions {
-                render,
-                single_page_sheets: true,
-                ..PrintOptions::default()
-            },
-        ),
-        Err(RenderError::LimitExceeded {
-            kind: LimitKind::Rows,
-            limit: RenderLimits::default().max_rows,
-            actual: 1_048_576,
-        })
-    );
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            render,
+            single_page_sheets: true,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(document.report.source.range, RenderRange::new(0, 0, 0, 0));
+    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(document.pages[0].scene.height, Fixed::from_raw(19_351));
 }
 
 #[test]
 fn single_page_keeps_an_empty_a1_dimension_sentinel_empty() {
     let workbook = source_dimension_xlsx("A1", "<sheetData/>");
-    assert_eq!(
-        workbook.sheets[0].source_used_dimensions(),
-        Some((0, 0, 0, 0))
-    );
     assert_eq!(workbook.sheets[0].dimensions(), None);
 
     let render = RenderOptions {
@@ -1932,7 +1917,7 @@ fn single_page_keeps_an_empty_a1_dimension_sentinel_empty() {
 }
 
 #[test]
-fn prepared_single_page_rechecks_current_source_dimensions() {
+fn prepared_single_page_ignores_output_inert_source_dimension_changes() {
     let body = r#"<sheetFormatPr defaultRowHeight="15"/>
       <sheetData>
         <row r="1"><c r="A1" t="inlineStr"><is><t>anchor</t></is></c></row>
@@ -1949,12 +1934,9 @@ fn prepared_single_page_rechecks_current_source_dimensions() {
     };
     let prepared = prepare_print_document(&original, 0, &options).unwrap();
 
-    assert_eq!(
-        build_print_page(&replacement, &prepared, 0),
-        Err(RenderError::Backend {
-            reason: "prepared_print_source_changed",
-        })
-    );
+    let original_page = build_print_page(&original, &prepared, 0).unwrap();
+    let replacement_page = build_print_page(&replacement, &prepared, 0).unwrap();
+    assert_eq!(replacement_page, original_page);
 }
 
 #[test]

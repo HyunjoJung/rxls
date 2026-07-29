@@ -21,7 +21,7 @@ use encoding_rs::{
     Encoding, BIG5, EUC_KR, GBK, SHIFT_JIS, UTF_8, WINDOWS_1251, WINDOWS_1252, WINDOWS_1253,
     WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1258, WINDOWS_874,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // --- BIFF record type ids ([MS-XLS] 2.3) ---
 const BOF: u16 = 0x0809;
@@ -73,7 +73,6 @@ const ARRAY: u16 = 0x0221;
 const SHRFMLA: u16 = 0x04BC;
 const STRING: u16 = 0x0207;
 const ROW: u16 = 0x0208;
-const DIMENSIONS: u16 = 0x0200;
 const COLINFO: u16 = 0x007D;
 const DEFAULTCOLWIDTH: u16 = 0x0055;
 const STANDARDWIDTH: u16 = 0x0099;
@@ -232,18 +231,15 @@ impl XlsSheetDefaults {
         }
     }
 
-    fn apply_to(self, sheet: &mut Sheet, biff8: bool) {
-        // BIFF8 defines STANDARDWIDTH as the width for every column without a
-        // COLINFO record, with DEFCOLWIDTH as its fallback. In BIFF4/5,
-        // STANDARDWIDTH is selected per column by GCW, so promoting it to the
-        // model's single sheet-wide default would be incorrect for mixed GCW
-        // bitmaps. Retain the universal DEFCOLWIDTH fallback for BIFF5 instead;
-        // explicit COLINFO widths remain in `Sheet::col_widths` and win later.
-        sheet.default_col_width = if biff8 {
-            self.standard_col_width.or(self.def_col_width)
-        } else {
-            self.def_col_width
-        };
+    fn apply_to(self, sheet: &mut Sheet) {
+        // Calc treats STANDARDWIDTH as the sheet-wide authority for every BIFF
+        // generation supported here, regardless of record order. DEFCOLWIDTH
+        // is its fallback; when both are absent Calc starts from its fixed
+        // 64-point application default. Explicit COLINFO widths still win per
+        // column during rendering.
+        let explicit_width = self.standard_col_width.or(self.def_col_width);
+        sheet.default_col_width = explicit_width;
+        sheet.biff_application_default_col_width = sheet.is_worksheet && explicit_width.is_none();
         sheet.default_row_height = self.row_height;
     }
 }
@@ -904,6 +900,7 @@ impl Workbook {
         let mut sheet_builtin_names: Vec<SheetBuiltinName> = Vec::new();
         let mut sheet_page_setups: Vec<XlsPageSetup> = Vec::new();
         let mut sheet_defaults: Vec<XlsSheetDefaults> = Vec::new();
+        let mut sheet_explicit_hidden_cols: Vec<BTreeSet<u16>> = Vec::new();
         let mut sheet_note_texts: Vec<HashMap<u16, String>> = Vec::new();
         let mut sheet_unkeyed_note_texts: Vec<VecDeque<String>> = Vec::new();
         let mut pending_note_obj: Option<(usize, u16)> = None;
@@ -1110,6 +1107,7 @@ impl Workbook {
                     frozen_views.push(false);
                     sheet_page_setups.push(XlsPageSetup::default());
                     sheet_defaults.push(XlsSheetDefaults::default());
+                    sheet_explicit_hidden_cols.push(BTreeSet::new());
                     sheet_note_texts.push(HashMap::new());
                     sheet_unkeyed_note_texts.push(VecDeque::new());
                 }
@@ -1258,15 +1256,6 @@ impl Workbook {
                         }
                     }
                 }
-                DIMENSIONS => {
-                    if depth == 1 {
-                        if let Some(sheet) = cur_sheet.and_then(|si| sheets.get_mut(si)) {
-                            if sheet.declared_dimensions.is_none() {
-                                sheet.declared_dimensions = parse_biff_dimensions(data, ctx.biff8);
-                            }
-                        }
-                    }
-                }
                 ROW => {
                     if depth == 1 {
                         if let Some(si) = cur_sheet {
@@ -1276,6 +1265,7 @@ impl Workbook {
                                     &mut sheets[si],
                                     &xls_styles,
                                     &mut style_budget,
+                                    ctx.biff8,
                                 );
                             }
                         }
@@ -1288,6 +1278,7 @@ impl Workbook {
                                 apply_col_outline(
                                     data,
                                     &mut sheets[si],
+                                    &mut sheet_explicit_hidden_cols[si],
                                     &xls_styles,
                                     &mut style_budget,
                                 );
@@ -1464,7 +1455,7 @@ impl Workbook {
             return Err(Error::Biff("truncated BIFF record header"));
         }
         for (sheet, defaults) in sheets.iter_mut().zip(sheet_defaults) {
-            defaults.apply_to(sheet, ctx.biff8);
+            defaults.apply_to(sheet);
         }
         apply_sheet_page_setups(&mut sheets, sheet_page_setups);
         apply_sheet_builtin_names(&mut sheets, sheet_builtin_names);
@@ -3349,45 +3340,13 @@ fn parse_pane_freeze(data: &[u8]) -> Option<(u32, u16)> {
     }
 }
 
-fn parse_biff_dimensions(data: &[u8], biff8: bool) -> Option<(u32, u16, u32, u16)> {
-    let maximum_row_exclusive = if biff8 { 65_536 } else { 16_384 };
-    let (first_row, last_row_exclusive, first_col, last_col_exclusive) = if biff8 {
-        if data.len() != 14 {
-            return None;
-        }
-        (
-            u32le(data, 0)?,
-            u32le(data, 4)?,
-            u16le(data, 8)?,
-            u16le(data, 10)?,
-        )
-    } else {
-        if data.len() != 10 {
-            return None;
-        }
-        (
-            u32::from(u16le(data, 0)?),
-            u32::from(u16le(data, 2)?),
-            u16le(data, 4)?,
-            u16le(data, 6)?,
-        )
-    };
-    if first_row >= last_row_exclusive
-        || last_row_exclusive > maximum_row_exclusive
-        || first_col >= last_col_exclusive
-        || last_col_exclusive > 256
-    {
-        return None;
-    }
-    Some((
-        first_row,
-        first_col,
-        last_row_exclusive - 1,
-        last_col_exclusive - 1,
-    ))
-}
-
-fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_budget: &mut usize) {
+fn apply_row_outline(
+    data: &[u8],
+    sheet: &mut Sheet,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
+    biff8: bool,
+) {
     let (Some(row), Some(height_twips), Some(options)) =
         (u16le(data, 0), u16le(data, 6), u32le(data, 12))
     else {
@@ -3395,10 +3354,15 @@ fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_b
     };
     let level = (options & 0x07) as u8;
     let row = u32::from(row);
+    let maximum_row = if biff8 { 65_535 } else { 16_383 };
+    if row > maximum_row {
+        return;
+    }
     // [MS-XLS] 2.4.221 Row: `fUnsynced` marks a manually assigned `miyRw`;
-    // otherwise the stored height is not an explicit per-row override.
-    if options & BIFF_ROW_FLAG_UNSYNCED != 0
-        && (MIN_BIFF_ROW_HEIGHT_TWIPS..=MAX_BIFF_ROW_HEIGHT_TWIPS).contains(&height_twips)
+    // Calc retains that manual provenance monotonically across duplicate ROW
+    // records while the most recent valid `miyRw` remains authoritative.
+    if (MIN_BIFF_ROW_HEIGHT_TWIPS..=MAX_BIFF_ROW_HEIGHT_TWIPS).contains(&height_twips)
+        && (options & BIFF_ROW_FLAG_UNSYNCED != 0 || sheet.row_heights.contains_key(&row))
     {
         sheet
             .row_heights
@@ -3422,7 +3386,13 @@ fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_b
     }
 }
 
-fn apply_col_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_budget: &mut usize) {
+fn apply_col_outline(
+    data: &[u8],
+    sheet: &mut Sheet,
+    explicit_hidden_cols: &mut BTreeSet<u16>,
+    styles: &XlsStyles,
+    style_budget: &mut usize,
+) {
     let (Some(first), Some(last), Some(width_256), Some(ixfe), Some(options)) = (
         u16le(data, 0),
         u16le(data, 2),
@@ -3441,9 +3411,20 @@ fn apply_col_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_b
     for col in first..=last.min(255) {
         if width_256 > 0 {
             sheet.col_widths.insert(col, f32::from(width_256) / 256.0);
+        } else {
+            // Calc interprets a zero COLINFO width as a hidden column and
+            // restores the sheet default when it is shown again.
+            sheet.col_widths.remove(&col);
         }
         if options & 0x01 != 0 {
+            explicit_hidden_cols.insert(col);
+        }
+        if explicit_hidden_cols.contains(&col) || width_256 == 0 {
             sheet.hidden_cols.insert(col);
+        } else {
+            // Explicit fHidden is monotonic in Calc, while zero-width hiding
+            // follows only the final effective COLINFO width.
+            sheet.hidden_cols.remove(&col);
         }
         if level > 0 {
             sheet.col_outline.insert(col, level);
@@ -6082,15 +6063,19 @@ mod tests {
         Workbook::open(&wrap_xls(&stream, stream_name)).expect("synthetic geometry workbook")
     }
 
-    fn test_colinfo(first: u16, last: u16, width_256: u16) -> Vec<u8> {
+    fn test_colinfo_with_options(first: u16, last: u16, width_256: u16, options: u16) -> Vec<u8> {
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(&first.to_le_bytes());
         body.extend_from_slice(&last.to_le_bytes());
         body.extend_from_slice(&width_256.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes()); // default XF
-        body.extend_from_slice(&0u16.to_le_bytes()); // flags
+        body.extend_from_slice(&options.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes()); // unused
         body
+    }
+
+    fn test_colinfo(first: u16, last: u16, width_256: u16) -> Vec<u8> {
+        test_colinfo_with_options(first, last, width_256, 0)
     }
 
     fn test_row(row: u16, height_twips: u16, options: u32) -> Vec<u8> {
@@ -6099,99 +6084,6 @@ mod tests {
         body[6..8].copy_from_slice(&height_twips.to_le_bytes());
         body[12..16].copy_from_slice(&options.to_le_bytes());
         body
-    }
-
-    fn test_dimensions(
-        biff8: bool,
-        first_row: u32,
-        last_row_exclusive: u32,
-        first_col: u16,
-        last_col_exclusive: u16,
-    ) -> Vec<u8> {
-        let mut body = Vec::new();
-        if biff8 {
-            body.extend_from_slice(&first_row.to_le_bytes());
-            body.extend_from_slice(&last_row_exclusive.to_le_bytes());
-        } else {
-            body.extend_from_slice(&(first_row as u16).to_le_bytes());
-            body.extend_from_slice(&(last_row_exclusive as u16).to_le_bytes());
-        }
-        body.extend_from_slice(&first_col.to_le_bytes());
-        body.extend_from_slice(&last_col_exclusive.to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes());
-        body
-    }
-
-    #[test]
-    fn biff_dimensions_are_retained_with_exclusive_end_bounds() {
-        for biff8 in [false, true] {
-            let records = vec![
-                (DIMENSIONS, test_dimensions(biff8, 0, 5, 0, 6)),
-                (LABEL, {
-                    let mut body = Vec::new();
-                    body.extend_from_slice(&0u16.to_le_bytes());
-                    body.extend_from_slice(&0u16.to_le_bytes());
-                    body.extend_from_slice(&0u16.to_le_bytes());
-                    if biff8 {
-                        body.extend_from_slice(&1u16.to_le_bytes());
-                        body.push(0);
-                    } else {
-                        body.extend_from_slice(&1u16.to_le_bytes());
-                    }
-                    body.push(b'x');
-                    body
-                }),
-            ];
-            let workbook = workbook_with_geometry_records(biff8, &records);
-            let sheet = &workbook.sheets[0];
-            assert_eq!(sheet.source_used_dimensions(), Some((0, 0, 4, 5)));
-            assert_eq!(sheet.dimensions(), Some((0, 0, 0, 0)));
-        }
-    }
-
-    #[test]
-    fn biff_dimensions_enforce_generation_specific_row_limits() {
-        let biff5_maximum = test_dimensions(false, 16_383, 16_384, 0, 1);
-        assert_eq!(
-            parse_biff_dimensions(&biff5_maximum, false),
-            Some((16_383, 0, 16_383, 0))
-        );
-        assert_eq!(
-            parse_biff_dimensions(&test_dimensions(false, 16_384, 16_385, 0, 1), false),
-            None
-        );
-
-        let biff8_maximum = test_dimensions(true, 65_535, 65_536, 0, 1);
-        assert_eq!(
-            parse_biff_dimensions(&biff8_maximum, true),
-            Some((65_535, 0, 65_535, 0))
-        );
-        assert_eq!(
-            parse_biff_dimensions(&test_dimensions(true, 65_536, 65_537, 0, 1), true),
-            None
-        );
-    }
-
-    #[test]
-    fn biff_dimensions_reject_malformed_reversed_and_out_of_grid_records() {
-        for biff8 in [false, true] {
-            let mut truncated = test_dimensions(biff8, 0, 5, 0, 6);
-            truncated.pop();
-            let records = vec![
-                (DIMENSIONS, truncated),
-                (DIMENSIONS, test_dimensions(biff8, 5, 5, 0, 6)),
-                (DIMENSIONS, test_dimensions(biff8, 0, 5, 6, 6)),
-                (DIMENSIONS, test_dimensions(biff8, 0, 5, 0, 257)),
-                (DIMENSIONS, test_dimensions(biff8, 1, 5, 2, 6)),
-                (DIMENSIONS, test_dimensions(biff8, 0, 2, 0, 2)),
-            ];
-            let workbook = workbook_with_geometry_records(biff8, &records);
-            assert_eq!(
-                workbook.sheets[0].source_used_dimensions(),
-                Some((1, 2, 4, 5)),
-                "the first valid declaration must win"
-            );
-        }
     }
 
     #[test]
@@ -6213,6 +6105,7 @@ mod tests {
         assert_eq!(sheet.row_heights().get(&3), Some(&18.0));
         assert_eq!(sheet.column_widths().len(), 1);
         assert_eq!(sheet.row_heights().len(), 1);
+        assert!(!sheet.biff_uses_application_default_column_width());
     }
 
     #[test]
@@ -6231,6 +6124,52 @@ mod tests {
         );
         assert_eq!(sheet.row_heights().get(&4), Some(&18.0));
         assert_eq!(sheet.row_heights().len(), 1);
+    }
+
+    #[test]
+    fn biff_duplicate_rows_keep_manual_provenance_and_latest_valid_height() {
+        for (records, expected) in [
+            (
+                vec![
+                    (ROW, test_row(3, 360, BIFF_ROW_FLAG_UNSYNCED)),
+                    (ROW, test_row(3, 255, 0)),
+                ],
+                12.75,
+            ),
+            (
+                vec![
+                    (ROW, test_row(3, 255, 0)),
+                    (ROW, test_row(3, 360, BIFF_ROW_FLAG_UNSYNCED)),
+                ],
+                18.0,
+            ),
+        ] {
+            let workbook = workbook_with_geometry_records(true, &records);
+            assert_eq!(workbook.sheets[0].row_heights().get(&3), Some(&expected));
+            assert_eq!(workbook.sheets[0].row_heights().len(), 1);
+        }
+    }
+
+    #[test]
+    fn biff_row_metadata_obeys_generation_specific_row_bounds() {
+        let biff5 = workbook_with_geometry_records(
+            false,
+            &[
+                (ROW, test_row(16_383, 360, BIFF_ROW_FLAG_UNSYNCED | 0x20)),
+                (ROW, test_row(16_384, 420, BIFF_ROW_FLAG_UNSYNCED | 0x20)),
+            ],
+        );
+        assert_eq!(biff5.sheets[0].row_heights().get(&16_383), Some(&18.0));
+        assert_eq!(biff5.sheets[0].row_heights().get(&16_384), None);
+        assert!(biff5.sheets[0].hidden_rows().contains(&16_383));
+        assert!(!biff5.sheets[0].hidden_rows().contains(&16_384));
+
+        let biff8 = workbook_with_geometry_records(
+            true,
+            &[(ROW, test_row(65_535, 420, BIFF_ROW_FLAG_UNSYNCED | 0x20))],
+        );
+        assert_eq!(biff8.sheets[0].row_heights().get(&65_535), Some(&21.0));
+        assert!(biff8.sheets[0].hidden_rows().contains(&65_535));
     }
 
     #[test]
@@ -6272,22 +6211,111 @@ mod tests {
     }
 
     #[test]
-    fn biff5_retains_defcolwidth_instead_of_promoting_gcw_standard_width() {
-        let records = vec![
-            (STANDARDWIDTH, 2432u16.to_le_bytes().to_vec()),
-            (DEFAULTCOLWIDTH, 10u16.to_le_bytes().to_vec()),
-            (
+    fn biff5_standardwidth_overrides_defcolwidth_and_ignored_gcw() {
+        for records in [
+            vec![
+                (STANDARDWIDTH, 2432u16.to_le_bytes().to_vec()),
+                (DEFAULTCOLWIDTH, 10u16.to_le_bytes().to_vec()),
+                (0x00AB, vec![0xAA; 34]), // GCW is ignored by Calc's importer.
+            ],
+            vec![
+                (DEFAULTCOLWIDTH, 10u16.to_le_bytes().to_vec()),
+                (0x00AB, vec![0x55; 34]),
+                (STANDARDWIDTH, 2432u16.to_le_bytes().to_vec()),
+            ],
+        ] {
+            let mut records = records;
+            records.push((
                 DEFAULTROWHEIGHT,
                 [0x02, 0x00, 0xFF, 0x00].to_vec(), // fDyZero, 255 unhidden twips
-            ),
+            ));
+            let workbook = workbook_with_geometry_records(false, &records);
+            let sheet = &workbook.sheets[0];
+
+            assert_eq!(sheet.default_column_width(), Some(9.5));
+            assert_eq!(sheet.default_row_height(), Some(12.75));
+            assert!(sheet.column_widths().is_empty());
+            assert!(sheet.row_heights().is_empty());
+            assert!(!sheet.biff_uses_application_default_column_width());
+        }
+    }
+
+    #[test]
+    fn biff_missing_width_records_retain_calc_application_default_provenance() {
+        for biff8 in [false, true] {
+            let mut workbook = workbook_with_geometry_records(biff8, &[]);
+            let sheet = &mut workbook.sheets[0];
+            assert_eq!(sheet.default_column_width(), None);
+            assert!(sheet.biff_uses_application_default_column_width());
+
+            sheet.set_default_col_width(12.0);
+            assert_eq!(sheet.default_column_width(), Some(12.0));
+            assert!(!sheet.biff_uses_application_default_column_width());
+        }
+    }
+
+    #[test]
+    fn biff_colinfo_zero_width_hides_and_restores_sheet_default() {
+        let records = vec![
+            (COLINFO, test_colinfo(2, 2, 3072)),
+            (COLINFO, test_colinfo(2, 2, 0)),
         ];
-        let workbook = workbook_with_geometry_records(false, &records);
+        let workbook = workbook_with_geometry_records(true, &records);
         let sheet = &workbook.sheets[0];
 
-        assert_eq!(sheet.default_column_width(), Some(10.0));
-        assert_eq!(sheet.default_row_height(), Some(12.75));
-        assert!(sheet.column_widths().is_empty());
-        assert!(sheet.row_heights().is_empty());
+        assert!(sheet.hidden_columns().contains(&2));
+        assert_eq!(sheet.column_widths().get(&2), None);
+        assert!(sheet.biff_uses_application_default_column_width());
+    }
+
+    #[test]
+    fn biff_colinfo_visibility_uses_final_width_and_monotonic_explicit_hidden() {
+        let zero_then_nonzero = workbook_with_geometry_records(
+            true,
+            &[
+                (COLINFO, test_colinfo(1, 3, 0)),
+                (COLINFO, test_colinfo(2, 4, 3072)),
+            ],
+        );
+        let sheet = &zero_then_nonzero.sheets[0];
+        assert!(sheet.hidden_columns().contains(&1));
+        assert_eq!(sheet.column_widths().get(&1), None);
+        for col in 2..=4 {
+            assert!(!sheet.hidden_columns().contains(&col));
+            assert_eq!(sheet.column_widths().get(&col), Some(&12.0));
+        }
+
+        let nonzero_then_zero = workbook_with_geometry_records(
+            true,
+            &[
+                (COLINFO, test_colinfo(1, 3, 3072)),
+                (COLINFO, test_colinfo(2, 4, 0)),
+            ],
+        );
+        let sheet = &nonzero_then_zero.sheets[0];
+        assert!(!sheet.hidden_columns().contains(&1));
+        assert_eq!(sheet.column_widths().get(&1), Some(&12.0));
+        for col in 2..=4 {
+            assert!(sheet.hidden_columns().contains(&col));
+            assert_eq!(sheet.column_widths().get(&col), None);
+        }
+
+        let explicit_hidden_then_visible_width = workbook_with_geometry_records(
+            true,
+            &[
+                (COLINFO, test_colinfo_with_options(1, 3, 2048, 0x01)),
+                (COLINFO, test_colinfo(2, 4, 3072)),
+            ],
+        );
+        let sheet = &explicit_hidden_then_visible_width.sheets[0];
+        for col in 1..=3 {
+            assert!(sheet.hidden_columns().contains(&col));
+        }
+        assert!(!sheet.hidden_columns().contains(&4));
+        assert_eq!(sheet.column_widths().get(&1), Some(&8.0));
+        for col in 2..=4 {
+            assert_eq!(sheet.column_widths().get(&col), Some(&12.0));
+        }
     }
 
     #[test]
@@ -6300,6 +6328,7 @@ mod tests {
         let workbook = workbook_with_geometry_records(true, &malformed);
         assert_eq!(workbook.sheets[0].default_column_width(), None);
         assert_eq!(workbook.sheets[0].default_row_height(), None);
+        assert!(workbook.sheets[0].biff_uses_application_default_column_width());
 
         let invalid = vec![
             (DEFAULTCOLWIDTH, 0u16.to_le_bytes().to_vec()),
@@ -6310,6 +6339,7 @@ mod tests {
         let workbook = workbook_with_geometry_records(false, &invalid);
         assert_eq!(workbook.sheets[0].default_column_width(), None);
         assert_eq!(workbook.sheets[0].default_row_height(), None);
+        assert!(workbook.sheets[0].biff_uses_application_default_column_width());
 
         let bounded = vec![
             (DEFAULTCOLWIDTH, 256u16.to_le_bytes().to_vec()),

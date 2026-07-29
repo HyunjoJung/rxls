@@ -9,13 +9,12 @@ use sha2::{Digest, Sha256};
 use crate::error::{LimitKind, RenderError};
 use crate::layout::{
     absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene,
-    build_sheet_scene_with_geometry, build_sheet_scene_with_used_extent_floor,
-    cell_drawings_intersect_prepared_range, cell_style_has_visible_blank_paint,
-    external_render_dependency_cells, measure_sheet_axes_for_ranges,
-    prepared_drawing_geometry_extent, render_used_print_range, render_used_scene_range_with_floor,
-    CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions, RenderRange, RenderReport,
-    RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex, WarningCode,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    build_sheet_scene_with_geometry, cell_drawings_intersect_prepared_range,
+    cell_style_has_visible_blank_paint, external_render_dependency_cells,
+    measure_sheet_axes_for_ranges, prepared_drawing_geometry_extent, render_used_print_range,
+    render_used_scene_range, CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions,
+    RenderRange, RenderReport, RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex,
+    WarningCode, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
 use crate::scene::{
     ClipGroupNode, Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
@@ -404,7 +403,6 @@ pub struct PreparedPrintDocument {
 enum PreparedPrintState {
     SinglePage {
         render_options: RenderOptions,
-        used_extent_floor: Option<RenderRange>,
     },
     Paginated {
         behavior: PrintBehavior,
@@ -457,24 +455,17 @@ impl DecodedMediaBudget {
         sheet_index: usize,
         base_options: &RenderOptions,
         geometry: Option<SheetGeometryOverride<'_>>,
-        used_extent_floor: Option<RenderRange>,
     ) -> Result<Scene, RenderError> {
         let mut options = base_options.clone();
         options.limits.max_decoded_media_bytes = self
             .limit
             .checked_sub(self.retained)
             .ok_or(RenderError::CoordinateOverflow)?;
-        let build = match (geometry, used_extent_floor) {
-            (Some(_), Some(_)) => Err(RenderError::Backend {
-                reason: "conflicting_sheet_geometry_overrides",
-            }),
-            (Some(geometry), None) => {
+        let build = match geometry {
+            Some(geometry) => {
                 build_sheet_scene_with_geometry(sheet, sheet_index, &options, geometry)
             }
-            (None, Some(floor)) => {
-                build_sheet_scene_with_used_extent_floor(sheet, sheet_index, &options, floor)
-            }
-            (None, None) => build_sheet_scene(sheet, sheet_index, &options),
+            None => build_sheet_scene(sheet, sheet_index, &options),
         };
         let build = match build {
             Ok(build) => build,
@@ -1035,15 +1026,7 @@ fn prepare_single_page_sheet_document(
         .print_gridlines()
         .unwrap_or_else(|| sheet.print_gridlines());
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
-    let used_extent_floor = tracks_used_extent
-        .then(|| sheet.source_used_dimensions().map(RenderRange::from))
-        .flatten();
-    let build = match used_extent_floor {
-        Some(floor) => {
-            build_sheet_scene_with_used_extent_floor(sheet, sheet_index, &render_options, floor)?
-        }
-        None => build_sheet_scene(sheet, sheet_index, &render_options)?,
-    };
+    let build = build_sheet_scene(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
     let mut source = build.report;
     source
@@ -1127,10 +1110,7 @@ fn prepare_single_page_sheet_document(
         source_identity,
         source_dependencies,
         tracks_used_extent,
-        state: PreparedPrintState::SinglePage {
-            render_options,
-            used_extent_floor,
-        },
+        state: PreparedPrintState::SinglePage { render_options },
     })
 }
 
@@ -1426,7 +1406,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v7");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v8");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1447,6 +1427,10 @@ fn print_source_identity(
     update_debug(&mut digest, sheet.column_widths());
     update_debug(&mut digest, sheet.xlsb_column_widths_256());
     update_debug(&mut digest, &sheet.xlsb_default_column_width());
+    update_debug(
+        &mut digest,
+        &sheet.biff_uses_application_default_column_width(),
+    );
     update_debug(&mut digest, sheet.physical_column_widths());
     update_debug(&mut digest, &sheet.default_column_width());
     update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
@@ -1646,11 +1630,7 @@ fn build_sheet_print_page_with_budget(
             };
             options.selection = RenderSelection::Used;
             let current_range = match &prepared.state {
-                PreparedPrintState::SinglePage { .. } => render_used_scene_range_with_floor(
-                    sheet,
-                    &options,
-                    sheet.source_used_dimensions().map(RenderRange::from),
-                )?,
+                PreparedPrintState::SinglePage { .. } => render_used_scene_range(sheet, &options)?,
                 PreparedPrintState::Paginated { .. } => render_used_print_range(sheet, &options)?,
             };
             if current_range != prepared.report.source.range {
@@ -1698,17 +1678,8 @@ fn build_sheet_print_page_with_budget(
         })?;
     let sheet_index = prepared.report.source.sheet_index;
     let scene = match &prepared.state {
-        PreparedPrintState::SinglePage {
-            render_options,
-            used_extent_floor,
-        } => {
-            let scene = media_budget.build_sheet_scene(
-                sheet,
-                sheet_index,
-                render_options,
-                None,
-                *used_extent_floor,
-            )?;
+        PreparedPrintState::SinglePage { render_options } => {
+            let scene = media_budget.build_sheet_scene(sheet, sheet_index, render_options, None)?;
             let scene_nodes = scene_node_count(&scene.nodes)?;
             enforce_print_limit(
                 LimitKind::PageSceneNodes,
@@ -2215,7 +2186,6 @@ fn append_block(
         sheet_index,
         &options,
         Some(SheetGeometryOverride::new(measured_rows, measured_columns)),
-        None,
     )?;
     let mut nodes = Vec::with_capacity(scene.nodes.len());
     for node in scene.nodes {

@@ -5317,7 +5317,6 @@ mod tests {
         let workbook = Workbook::open(&ods_bytes(content)).unwrap();
         let sheet = &workbook.sheets[0];
 
-        assert_eq!(sheet.source_used_dimensions(), None);
         assert_eq!(sheet.dimensions(), None);
         assert_eq!(sheet.cells().count(), 0);
     }

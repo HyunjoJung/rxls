@@ -5734,10 +5734,6 @@ pub struct Sheet {
     /// Parsed sheet type for metadata when the source format exposes it.
     pub(crate) sheet_type: Option<SheetType>,
     pub(crate) cells: Vec<CellEntry>,
-    /// Worksheet extent declared by the source container. This read-side
-    /// structural range may include trailing empty rows or columns and is kept
-    /// separate from the populated-cell dimensions.
-    pub(crate) declared_dimensions: Option<(u32, u16, u32, u16)>,
     /// Lazily built compact last-write-wins coordinate index used by whole-sheet,
     /// range, and point display access. Readers finish populating `cells` before
     /// any public access; authoring writes invalidate this cache before appending
@@ -5749,6 +5745,9 @@ pub struct Sheet {
     pub(crate) xlsb_col_widths_256: BTreeMap<u16, u32>,
     /// Applicable XLSB sheet-wide width provenance, absent for other formats.
     pub(crate) xlsb_default_col_width: Option<XlsbDefaultColumnWidth>,
+    /// Whether a BIFF worksheet omitted every valid sheet-wide width record
+    /// and therefore uses Calc's fixed application default.
+    pub(crate) biff_application_default_col_width: bool,
     /// Source column widths expressed in physical points when the format stores
     /// an absolute length (currently ODS). Renderers prefer these values over
     /// the compatibility character-unit projection in `col_widths`.
@@ -6137,11 +6136,11 @@ impl Default for Sheet {
             display_date1904: false,
             sheet_type: None,
             cells: Vec::default(),
-            declared_dimensions: None,
             display_cell_index: OnceLock::new(),
             col_widths: BTreeMap::default(),
             xlsb_col_widths_256: BTreeMap::default(),
             xlsb_default_col_width: None,
+            biff_application_default_col_width: false,
             physical_col_widths: BTreeMap::default(),
             row_heights: BTreeMap::default(),
             hidden_cols: BTreeSet::default(),
@@ -8287,6 +8286,16 @@ impl Sheet {
         self.xlsb_default_col_width
     }
 
+    /// Whether this imported BIFF worksheet uses Calc's application-default
+    /// column width because no valid `STANDARDWIDTH` or `DEFCOLWIDTH` record
+    /// was present.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`.
+    #[doc(hidden)]
+    pub fn biff_uses_application_default_column_width(&self) -> bool {
+        self.biff_application_default_col_width
+    }
+
     /// Explicit absolute column widths in points, keyed by 0-based column.
     ///
     /// Formats such as ODS store physical lengths rather than Excel character
@@ -8589,15 +8598,6 @@ impl Sheet {
             c1 = c1.max(c.col);
         }
         Some((r0, c0, r1, c1))
-    }
-
-    /// Renderer-only source used-range metadata retained by format readers.
-    ///
-    /// This structural range can contain trailing empty axes and intentionally
-    /// remains separate from [`Self::dimensions`].
-    #[doc(hidden)]
-    pub fn source_used_dimensions(&self) -> Option<(u32, u16, u32, u16)> {
-        self.declared_dimensions
     }
 
     /// Inclusive dimensions covering values, format-only blanks, and merged
@@ -10339,6 +10339,7 @@ impl Sheet {
         self.default_col_width = Some(chars);
         self.ooxml_implicit_col_width = OoxmlImplicitColumnWidth::None;
         self.xlsb_default_col_width = None;
+        self.biff_application_default_col_width = false;
     }
     /// Freeze the panes above `row` and left of `col`.
     pub fn freeze_panes(&mut self, row: u32, col: u16) {

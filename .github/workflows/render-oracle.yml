@@ -941,6 +941,26 @@ jobs:
                   "selected_case_count": len(mapped),
               }
 
+          def campaign_input_set_sha256(rows):
+              identities = [
+                  {
+                      "features": row["features"],
+                      "format": row["format"],
+                      "rights_tier": row.get("rights_tier"),
+                      "sha256": row["sha256"],
+                  }
+                  for row in rows
+              ]
+              identities.sort(
+                  key=lambda row: (
+                      row["sha256"],
+                      row["format"],
+                      row["rights_tier"] or "",
+                      row["features"],
+                  )
+              )
+              return sha256(canonical_payload(identities))
+
           def group_topology_sha256(rows):
               counts = Counter(
                   (row["format"], tuple(row["features"]))
@@ -1180,18 +1200,24 @@ jobs:
           corpus_manifest_sha256 = sha256(corpus_payload)
           if profile == "full":
               assert corpus_manifest_sha256 == (
-                  "402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"
+                  "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
               )
           corpus_binding = manifest_binding(
               corpus["files"],
               corpus_manifest_sha256,
+          )
+          corpus_campaign_input_set_sha256 = campaign_input_set_sha256(
+              corpus["files"]
           )
           corpus_group_topology_sha256 = group_topology_sha256(
               corpus["files"]
           )
           if profile == "full":
               assert corpus_binding["input_set_sha256"] == (
-                  "410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"
+                  "1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"
+              )
+              assert corpus_campaign_input_set_sha256 == (
+                  "785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"
               )
               assert corpus_group_topology_sha256 == (
                   "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"
@@ -1787,9 +1813,7 @@ jobs:
                   "group_topology_sha256": (
                       corpus_group_topology_sha256
                   ),
-                  "input_set_sha256": corpus_binding[
-                      "input_set_sha256"
-                  ],
+                  "input_set_sha256": corpus_campaign_input_set_sha256,
                   "license": corpus["license"],
                   "manifest_sha256": sha256(corpus_payload),
                   "render_redistributable": corpus[

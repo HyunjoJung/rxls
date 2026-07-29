@@ -124,7 +124,7 @@ def _select_pilot_fixture(path: Path, wrapper: Any) -> tuple[Path, dict[str, Any
             "xlsx": 10,
         },
         "generator": "rxls-synthetic-render-corpus",
-        "generator_version": "1.3.0",
+        "generator_version": "1.4.0",
         "license": "MIT",
         "profile": "pilot",
         "redistribution": "allowed",
@@ -152,7 +152,7 @@ def _select_pilot_fixture(path: Path, wrapper: Any) -> tuple[Path, dict[str, Any
     selected = matches[0]
     owned = {
         "generator": "rxls-synthetic-render-corpus",
-        "generator_version": "1.3.0",
+        "generator_version": "1.4.0",
         "license": "MIT",
         "redistribution": "allowed",
         "render_redistributable": True,

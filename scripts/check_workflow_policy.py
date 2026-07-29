@@ -108,7 +108,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "0bba6907205954c7a1fa24b88b0ba4eb614a3fc5ce54038f53f6af1b468dd834",
+    "e9ea02f8b502584fa3a7ae7a9fd57c4db25f7ed79558f9d36b2581c2861a0f18",
     "fc038e866e71d3c98fde9591d627097c8b06577f505e57f74da7abc78cd31df9",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "21c10f0e2a15d340a6122a4944eff86dd1be614a6ac4840ad1bf4f950ca6f8d1"
+    "d37d5a4ca0a8faed840d73386ea5c34de9c9b5e12ad2bbf8707f4164687d7ad4"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -2362,11 +2362,14 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '"fidelity_gate_bytes": len(gate_payload)': (
             "hosted evidence runs must bind fidelity gate bytes"
         ),
-        '"402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"': (
+        '"d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"': (
             "full hosted evidence must bind the authoritative manifest bytes"
         ),
-        '"410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"': (
-            "full hosted evidence must bind the authoritative input set"
+        '"785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"': (
+            "full hosted evidence must bind the authoritative campaign input identity"
+        ),
+        '"1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"': (
+            "full hosted evidence must bind the authoritative renderer input digest set"
         ),
         '"559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"': (
             "observed candidates must bind the exact correlated group topology"

@@ -199,9 +199,9 @@ class GenerateRenderCorpusTests(unittest.TestCase):
 
     def test_exact_bytes_are_reproducible_with_golden_hashes(self) -> None:
         expected = {
-            "xls-0000": "1a3c7407c94dc7429db7fd12c2bce2f9cc49087034f0ef2e82f7f66a981fc062",
+            "xls-0000": "24d2ffb3e5df477e7d5a7cd64a02b6a18ca670a364b4c74019aeb82e8c1b8f71",
             "xlsx-0000": "19e3c35c44ad71b5974721888b2234d29a3e39716f4d7f467e5c63b59ad2c62b",
-            "xlsb-0000": "637c4c276da0dd387dc375ebe85c777c1a017f41c0560dc47a8ce1585b4d1708",
+            "xlsb-0000": "12a2ae5f2baf0464a87ca900ec5b6e147fdf8a2ee369202a5b4d4e30a99546a1",
             "ods-0000": "bc590b68230ad1acd484b7925b53bfa7aeeb16e8423fc039003b7ccc70ef770e",
         }
         for spec in (case for case in self.module.profile_specs("pilot") if case.index == 0):
@@ -349,7 +349,7 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         xls_spec = first_case(pilot, "xls", "print-settings")
         xls = self.module.build_case(xls_spec)
         self.assertIn(self.module._biff_font("Noto Sans CJK KR"), xls)
-        self.assertIn(self.module._biff_row(0, 600), xls)
+        self.assertIn(self.module._biff_row(0, 600, custom_height=True), xls)
         self.assertIn(self.module._biff_row(3, 255, hidden=True), xls)
         self.assertIn(self.module._biff_col(5, 5, 8 * 256, hidden=True), xls)
         self.assertIn(self.module._biff_merge(2, 0, 2, 2), xls)
@@ -429,6 +429,61 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         self.assertIn('table:style-name="ce-border"', content)
         self.assertIn('style:print-orientation="landscape"', styles)
         self.assertIn('style:name="Noto Sans CJK KR"', styles)
+
+    def test_biff_rows_separate_manual_height_hidden_state_and_reserved_bits(self) -> None:
+        for spec in (
+            case for case in self.module.profile_specs("pilot") if case.format == "xls"
+        ):
+            custom_height = "row-height" in spec.features
+            hidden_row = "hidden-row" in spec.features
+            payload = self.module.build_case(spec)
+            expected = (
+                self.module._biff_row(
+                    0,
+                    600 if custom_height else 255,
+                    custom_height=custom_height,
+                ),
+                self.module._biff_row(
+                    1,
+                    360 if custom_height else 255,
+                    custom_height=custom_height,
+                ),
+                self.module._biff_row(
+                    2,
+                    480 if custom_height else 255,
+                    custom_height=custom_height,
+                ),
+                self.module._biff_row(3, 255, hidden=hidden_row),
+            )
+            for row_record in expected:
+                with self.subTest(case=spec.case_id, record=row_record.hex()):
+                    self.assertIn(row_record, payload)
+
+        for hidden, custom_height, expected_flags in (
+            (False, False, 0),
+            (True, False, 0x20),
+            (False, True, 0x40),
+            (True, True, 0x60),
+        ):
+            record = self.module._biff_row(
+                7,
+                360,
+                hidden=hidden,
+                custom_height=custom_height,
+            )
+            self.assertEqual(int.from_bytes(record[0:2], "little"), 0x0208)
+            self.assertEqual(int.from_bytes(record[2:4], "little"), 16)
+            body = record[4:]
+            self.assertEqual(int.from_bytes(body[0:2], "little"), 7)
+            self.assertEqual(int.from_bytes(body[6:8], "little"), 360)
+            options = int.from_bytes(body[12:16], "little")
+            self.assertEqual((options >> 8) & 0xFF, 1)
+            self.assertEqual(options & 0x60, expected_flags)
+
+        for row, height in ((-1, 255), (65_536, 255), (0, 1), (0, 8_193)):
+            with self.subTest(row=row, height=height):
+                with self.assertRaises(self.module.CorpusError):
+                    self.module._biff_row(row, height)
 
     def test_xlsb_record_streams_are_complete_counted_and_well_nested(self) -> None:
         spec = next(
@@ -992,7 +1047,7 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         manifest, cases = self.module.materialize("pilot")
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["generator"], self.module.GENERATOR)
-        self.assertEqual(manifest["generator_version"], "1.3.0")
+        self.assertEqual(manifest["generator_version"], "1.4.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(manifest["redistribution"], "allowed")
         self.assertEqual(manifest["rights_tier"], "S")

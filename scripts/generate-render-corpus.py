@@ -40,7 +40,7 @@ MANIFEST_NAME = "manifest.json"
 
 SCHEMA_VERSION = 1
 GENERATOR = "rxls-synthetic-render-corpus"
-GENERATOR_VERSION = "1.3.0"
+GENERATOR_VERSION = "1.4.0"
 LICENSE = "MIT"
 REDISTRIBUTION = "allowed"
 
@@ -473,8 +473,24 @@ def _biff_formula(row: int, col: int, cached: float, seed: int) -> bytes:
     return _biff_record(0x0006, bytes(payload))
 
 
-def _biff_row(row: int, height_twips: int, *, hidden: bool = False) -> bytes:
-    options = 0x20 if hidden else 0
+def _biff_row(
+    row: int,
+    height_twips: int,
+    *,
+    hidden: bool = False,
+    custom_height: bool = False,
+) -> bytes:
+    if not 0 <= row < 65_536:
+        raise CorpusError("BIFF8 ROW index is outside the worksheet")
+    if not 2 <= height_twips <= 8_192:
+        raise CorpusError("BIFF8 ROW height is outside the supported twip range")
+    # [MS-XLS] Row: reserved3 must be 1. fDyZero and fUnsynced are
+    # independent; only genuinely authored heights carry fUnsynced.
+    options = 0x0100
+    if hidden:
+        options |= 0x20
+    if custom_height:
+        options |= 0x40
     payload = bytearray(_u16(row) + _u16(0) + _u16(6) + _u16(height_twips))
     payload.extend(_u16(0) + _u16(0) + _u32(options))
     return _biff_record(0x0208, bytes(payload))
@@ -512,6 +528,7 @@ def _biff_page_setup() -> bytes:
 
 def _build_xls(spec: CaseSpec) -> bytes:
     texts = _case_texts(spec)
+    custom_height = _has(spec, "row-height")
     sheet = bytearray(_biff_bof(0x0010))
     sheet.extend(
         _biff_record(
@@ -523,10 +540,14 @@ def _build_xls(spec: CaseSpec) -> bytes:
         sheet.extend(_biff_col(1, 4, 14 * 256))
     if _has(spec, "hidden-column"):
         sheet.extend(_biff_col(5, 5, 8 * 256, hidden=True))
-    sheet.extend(_biff_row(0, 600 if _has(spec, "row-height") else 255))
+    sheet.extend(
+        _biff_row(0, 600 if custom_height else 255, custom_height=custom_height)
+    )
     for col in range(5):
         sheet.extend(_biff_labelsst(0, col, col))
-    sheet.extend(_biff_row(1, 360 if _has(spec, "row-height") else 255))
+    sheet.extend(
+        _biff_row(1, 360 if custom_height else 255, custom_height=custom_height)
+    )
     number = float((spec.seed % 1000) + 0.25)
     sheet.extend(_biff_number(1, 0, number))
     sheet.extend(
@@ -551,7 +572,9 @@ def _build_xls(spec: CaseSpec) -> bytes:
         )
     else:
         sheet.extend(_biff_number(1, 3, float((spec.seed % 1000) + 2)))
-    sheet.extend(_biff_row(2, 480 if _has(spec, "row-height") else 255))
+    sheet.extend(
+        _biff_row(2, 480 if custom_height else 255, custom_height=custom_height)
+    )
     sheet.extend(_biff_labelsst(2, 0, 6))
     if _has(spec, "merged-cells"):
         sheet.extend(_biff_merge(2, 0, 2, 2))

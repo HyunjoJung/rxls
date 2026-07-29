@@ -39,6 +39,9 @@ const DEFAULT_COLUMN_PADDING_PIXELS: f64 = 5.0;
 /// Calc's application default when an OOXML worksheet omits sheet-format
 /// width metadata. Its import is byte-for-byte equivalent to an explicit 8.5.
 const OOXML_APPLICATION_DEFAULT_COLUMN_CHARACTERS: f32 = 8.5;
+/// Calc's fixed application default for BIFF worksheets that omit both
+/// `STANDARDWIDTH` and `DEFCOLWIDTH`: 64 points at 96 CSS pixels per inch.
+const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH: Fixed = Fixed::from_raw(87_381);
 /// The pinned Calc oracle resolves an OOXML worksheet without an authoritative
 /// default row height to 0.5 cm (14.173228 points / 18.897638 CSS pixels).
 /// Fixed-point layout rounds that imported-only value to the nearest 1/1024 px.
@@ -1125,7 +1128,7 @@ pub fn build_sheet_scene(
     sheet_index: usize,
     options: &RenderOptions,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, None, None)
+    build_sheet_scene_inner(sheet, sheet_index, options, None)
 }
 
 pub(crate) fn build_sheet_scene_with_geometry(
@@ -1134,22 +1137,7 @@ pub(crate) fn build_sheet_scene_with_geometry(
     options: &RenderOptions,
     geometry: SheetGeometryOverride<'_>,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry), None)
-}
-
-pub(crate) fn build_sheet_scene_with_used_extent_floor(
-    sheet: &Sheet,
-    sheet_index: usize,
-    options: &RenderOptions,
-    used_extent_floor: RenderRange,
-) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(
-        sheet,
-        sheet_index,
-        options,
-        None,
-        Some(used_extent_floor.validate()?),
-    )
+    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry))
 }
 
 fn build_sheet_scene_inner(
@@ -1157,16 +1145,13 @@ fn build_sheet_scene_inner(
     sheet_index: usize,
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
-    used_extent_floor: Option<RenderRange>,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
     let used_extent = match options.selection {
         RenderSelection::Used => {
             style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-            let mut extent = render_used_extent(sheet, &style_snapshot, options)?;
-            apply_used_extent_floor(&mut extent, used_extent_floor);
-            Some(extent)
+            Some(render_used_extent(sheet, &style_snapshot, options)?)
         }
         RenderSelection::Range(_) => None,
     };
@@ -1707,20 +1692,6 @@ fn build_sheet_scene_inner(
 struct UsedRenderExtent {
     range: Option<RenderRange>,
     active_merges: BTreeSet<(u32, u16, u32, u16)>,
-}
-
-fn apply_used_extent_floor(extent: &mut UsedRenderExtent, used_extent_floor: Option<RenderRange>) {
-    if let Some(range) = used_extent_floor {
-        // OOXML and XLSB commonly serialize `A1` as the dimension sentinel
-        // for an otherwise empty worksheet. Preserve the established empty
-        // Used-selection behavior unless either real visual content or a
-        // larger structural extent exists.
-        if extent.range.is_none() && range == RenderRange::new(0, 0, 0, 0) {
-            return;
-        }
-        include_render_coordinate(&mut extent.range, range.first_row, range.first_col);
-        include_render_coordinate(&mut extent.range, range.last_row, range.last_col);
-    }
 }
 
 /// Resolve Calc-compatible visual content for [`RenderSelection::Used`].
@@ -2326,16 +2297,13 @@ pub(crate) fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
 }
 
 /// Resolve the exact used range recorded by a single expanded sheet scene.
-pub(crate) fn render_used_scene_range_with_floor(
+pub(crate) fn render_used_scene_range(
     sheet: &Sheet,
     options: &RenderOptions,
-    used_extent_floor: Option<RenderRange>,
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    let mut extent = render_used_extent(sheet, &style_snapshot, options)?;
-    let floor = used_extent_floor.map(RenderRange::validate).transpose()?;
-    apply_used_extent_floor(&mut extent, floor);
+    let extent = render_used_extent(sheet, &style_snapshot, options)?;
     Ok(extent.range.unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
 
@@ -2642,6 +2610,9 @@ fn column_width(
             warnings,
         );
     }
+    if sheet.biff_uses_application_default_column_width() {
+        return BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH;
+    }
     let (measured, invalid_source_geometry) = match sheet.default_column_width() {
         Some(chars) => (
             column_chars_to_fixed(chars, maximum_digit_width, IMPORTED_COLUMN_PADDING_PIXELS),
@@ -2724,6 +2695,9 @@ fn empty_used_column_width(
                 Ok(Fixed::from_pixels(1))
             }
         };
+    }
+    if sheet.biff_uses_application_default_column_width() {
+        return Ok(BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH);
     }
     let Some(chars) = sheet.default_column_width() else {
         return Ok(Fixed::from_pixels(1));
@@ -11568,6 +11542,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outlined.scene.width, Fixed::from_pixels(602));
+    }
+
+    #[test]
+    fn implicit_biff_columns_use_calcs_fixed_sixty_four_point_default() {
+        let candidates = [
+            include_bytes!("../../tests/fixtures/xls/reader-basic.xls").as_slice(),
+            include_bytes!("../../tests/fixtures/xls/korean-unicode-biff8.xls").as_slice(),
+            include_bytes!("../../tests/fixtures/xls/korean-cp949-biff5.xls").as_slice(),
+        ];
+        let workbook = candidates
+            .into_iter()
+            .map(|bytes| Workbook::open(bytes).expect("imported BIFF fixture"))
+            .find(|workbook| {
+                workbook
+                    .sheets
+                    .first()
+                    .is_some_and(|sheet| sheet.biff_uses_application_default_column_width())
+            })
+            .expect("at least one BIFF fixture without a sheet-wide width record");
+        let sheet = &workbook.sheets[0];
+        let first_col = (0_u16..=251)
+            .find(|first| {
+                (*first..=*first + 4).all(|col| !sheet.column_widths().contains_key(&col))
+            })
+            .expect("five implicit BIFF columns");
+        let range = RenderRange::new(0, first_col, 0, first_col + 4);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            include_hidden: true,
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+
+        let (_, columns) = measure_sheet_axes(sheet, range, &options).unwrap();
+        assert_eq!(columns.len(), 5);
+        assert!(columns
+            .iter()
+            .all(|column| column.size == BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH));
+        assert_eq!(
+            columns.iter().map(|column| column.size.raw()).sum::<i64>(),
+            436_905
+        );
+
+        let authored = {
+            let mut workbook = Workbook::new();
+            workbook.add_sheet("authored").write(0, 4, "A");
+            workbook
+        };
+        let (_, authored_columns) =
+            measure_sheet_axes(&authored.sheets[0], RenderRange::new(0, 0, 0, 4), &options)
+                .unwrap();
+        assert!(authored_columns
+            .iter()
+            .all(|column| column.size == options.default_column_width));
     }
 
     #[test]

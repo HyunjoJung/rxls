@@ -60,10 +60,13 @@ DOWNLOAD_TIMEOUT_SECONDS = 60
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_REPOSITORY_ID = 1_297_467_060
 EXPECTED_HOSTED_FULL_MANIFEST_SHA256 = (
-    "402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"
+    "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
 )
 EXPECTED_HOSTED_FULL_INPUT_SET_SHA256 = (
-    "410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"
+    "785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"
+)
+EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256 = (
+    "1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"
 )
 EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256 = (
     "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"
@@ -3008,7 +3011,7 @@ def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     _require(campaign.get("profile") == "full", "campaign_profile")
     _require(
         campaign.get("generator") == "rxls-synthetic-render-corpus"
-        and campaign.get("generator_version") == "1.3.0",
+        and campaign.get("generator_version") == "1.4.0",
         "campaign_generator",
     )
     _require(campaign.get("case_count") == 800, "campaign_case_count")
@@ -3475,7 +3478,7 @@ def validate(
             "feature_counts": candidate_campaign["feature_counts"],
             "format_counts": candidate_campaign["format_counts"],
             "generator": "rxls-synthetic-render-corpus",
-            "generator_version": "1.3.0",
+            "generator_version": "1.4.0",
             "group_topology_sha256": (
                 EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
             ),
@@ -3498,7 +3501,9 @@ def validate(
         fidelity_bindings[0]["manifest_sha256"]
         == candidate_campaign["manifest_sha256"]
         and fidelity_bindings[0]["input_set_sha256"]
-        == candidate_campaign["input_set_sha256"],
+        == EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256
+        and candidate_campaign["input_set_sha256"]
+        == EXPECTED_HOSTED_FULL_INPUT_SET_SHA256,
         "candidate_fidelity_corpus_binding",
     )
     _require(summary.get("renderer") == renderer, "summary_renderer")
@@ -3844,7 +3849,9 @@ def build_adoption_baseline_and_receipt(
         and fidelity_bindings[0]["manifest_sha256"]
         == campaign["manifest_sha256"]
         and fidelity_bindings[0]["input_set_sha256"]
-        == campaign["input_set_sha256"],
+        == EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256
+        and campaign["input_set_sha256"]
+        == EXPECTED_HOSTED_FULL_INPUT_SET_SHA256,
         "adoption_fidelity_binding",
     )
     _require(

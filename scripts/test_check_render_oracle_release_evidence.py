@@ -93,6 +93,83 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         path.write_bytes(payload)
         return payload
 
+    def test_hosted_full_generator_derives_each_authoritative_identity(self) -> None:
+        manifest, cases = self.corpus_generator.materialize("full")
+        manifest_payload = self.corpus_generator._json_bytes(manifest)
+        rows = manifest["files"]
+        self.assertIsInstance(rows, list)
+
+        campaign_identities = sorted(
+            (
+                {
+                    "features": row["features"],
+                    "format": row["format"],
+                    "rights_tier": row["rights_tier"],
+                    "sha256": row["sha256"],
+                }
+                for row in rows
+            ),
+            key=lambda row: (
+                row["sha256"],
+                row["format"],
+                row["rights_tier"],
+                row["features"],
+            ),
+        )
+        binding_inputs = sorted(row["sha256"] for row in rows)
+        lattice = [
+            {
+                "case_id": spec.case_id,
+                "features": list(spec.features),
+                "format": spec.format,
+                "generator": self.corpus_generator.GENERATOR,
+                "generator_version": self.corpus_generator.GENERATOR_VERSION,
+                "seed": spec.seed,
+            }
+            for spec, _ in sorted(cases, key=lambda item: item[0].case_id)
+        ]
+        group_counts: dict[tuple[str, tuple[str, ...]], int] = {}
+        for row in rows:
+            key = (row["format"], tuple(row["features"]))
+            group_counts[key] = group_counts.get(key, 0) + 1
+        topology = [
+            {
+                "features": list(features),
+                "format": format_name,
+                "workbooks": count,
+            }
+            for (format_name, features), count in sorted(group_counts.items())
+        ]
+
+        def canonical(value: object) -> bytes:
+            return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+        baseline_checker = self.checker._load_baseline_checker()
+        self.assertEqual(
+            hashlib.sha256(manifest_payload).hexdigest(),
+            self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical(campaign_identities)).hexdigest(),
+            self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical(binding_inputs)).hexdigest(),
+            self.checker.EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256,
+        )
+        self.assertNotEqual(
+            self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256,
+            self.checker.EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical(lattice)).hexdigest(),
+            baseline_checker.HOSTED_FULL_LATTICE_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256(canonical(topology)).hexdigest(),
+            self.checker.EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256,
+        )
+
     def _archive(
         self,
         artifact: Path,
@@ -216,7 +293,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "kind": "project_generated_hosted_full",
             "profile": "full",
             "generator": "rxls-synthetic-render-corpus",
-            "generator_version": "1.3.0",
+            "generator_version": "1.4.0",
             "case_count": 800,
             "format_counts": copy.deepcopy(
                 self.checker.EXPECTED_FORMAT_COUNTS
@@ -485,7 +562,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                         host_tools_identity_sha256
                     ),
                     "input_set_sha256": (
-                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                        self.checker.EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256
                     ),
                     "manifest_sha256": (
                         self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256
@@ -682,11 +759,11 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "input_set": {
                     "baseline_count": 800,
                     "baseline_sha256": (
-                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                        self.checker.EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256
                     ),
                     "candidate_count": 800,
                     "candidate_sha256": (
-                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                        self.checker.EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256
                     ),
                     "equal": True,
                 },
@@ -930,7 +1007,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     self.checker.EXPECTED_FORMAT_COUNTS
                 ),
                 "generator": "rxls-synthetic-render-corpus",
-                "generator_version": "1.3.0",
+                "generator_version": "1.4.0",
                 "group_topology_sha256": (
                     self.checker.EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
                 ),

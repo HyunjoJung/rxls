@@ -136,7 +136,6 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         };
         let ParsedSheet {
             cells,
-            declared_dimensions,
             direct_cell_formats,
             rich,
             merges,
@@ -287,7 +286,6 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             style_fidelity: StyleFidelity::Partial,
             sheet_type: Some(sheet_type),
             cells,
-            declared_dimensions,
             rich,
             read_merges: merges,
             read_hyperlinks,
@@ -4336,34 +4334,6 @@ fn parse_range(s: &str) -> Option<(u32, u16, u32, u16)> {
     Some((first.0, first.1, last.0, last.1))
 }
 
-fn parse_declared_dimensions(s: &str) -> Option<(u32, u16, u32, u16)> {
-    fn strict_ref(value: &str) -> Option<(u32, u16)> {
-        let digit = value.bytes().position(|byte| byte.is_ascii_digit())?;
-        if digit == 0
-            || digit == value.len()
-            || !value.as_bytes()[..digit]
-                .iter()
-                .all(u8::is_ascii_alphabetic)
-            || !value.as_bytes()[digit..].iter().all(u8::is_ascii_digit)
-        {
-            return None;
-        }
-        parse_ref(value)
-    }
-
-    let mut parts = s.split(':');
-    let first = strict_ref(parts.next()?)?;
-    let last = match parts.next() {
-        Some(value) => strict_ref(value)?,
-        None => first,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    let range = (first.0, first.1, last.0, last.1);
-    (range.0 <= range.2 && range.1 <= range.3).then_some(range)
-}
-
 /// Convert a 0-based column index to A1 letters (0→`A`, 25→`Z`, 26→`AA`).
 fn col_letters(mut idx: u32) -> String {
     let mut s = Vec::new();
@@ -4643,7 +4613,6 @@ fn shift_formula(f: &str, drow: i64, dcol: i64) -> String {
 #[derive(Debug, Default)]
 struct ParsedSheet {
     cells: Vec<CellEntry>,
-    declared_dimensions: Option<SheetRange>,
     direct_cell_formats: BTreeMap<(u32, u16), CellStyleOverlay>,
     rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
     merges: Vec<(u32, u16, u32, u16)>,
@@ -4852,25 +4821,8 @@ fn parse_sheet(
     let mut row_started = false;
     let mut selected_sheet_view_rank = 0u8;
     let mut in_selected_sheet_view = false;
-    let mut xml_depth = 0usize;
     loop {
-        let event = r.read_event();
-        let parent_depth = xml_depth;
-        match &event {
-            Ok(Event::Start(_)) => xml_depth = xml_depth.saturating_add(1),
-            Ok(Event::End(_)) => xml_depth = xml_depth.saturating_sub(1),
-            _ => {}
-        }
-        match event {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if parent_depth == 1 && local(e.name().as_ref()) == b"dimension" =>
-            {
-                if parsed.declared_dimensions.is_none() {
-                    parsed.declared_dimensions = attr(&e, b"ref")
-                        .as_deref()
-                        .and_then(parse_declared_dimensions);
-                }
-            }
+        match r.read_event() {
             // A self-closing `<f/>` (a shared-formula follower has no formula text)
             // must NOT open formula-text capture: otherwise pretty-printing
             // whitespace between `<f/>` and `<v>` is captured as the formula and the
@@ -8212,52 +8164,6 @@ mod tests {
         assert_eq!(parse_range("B2"), Some((1, 1, 1, 1))); // lone ref = 1×1
         assert_eq!(parse_range("A1:"), None);
         assert_eq!(parse_range("junk"), None);
-        assert_eq!(parse_declared_dimensions("A1:F7"), Some((0, 0, 6, 5)));
-        assert_eq!(parse_declared_dimensions("F7:A1"), None);
-        assert_eq!(parse_declared_dimensions("A1:B2:C3"), None);
-        assert_eq!(parse_declared_dimensions("XFE1"), None);
-        assert_eq!(parse_declared_dimensions("$A$1"), None);
-        assert_eq!(parse_declared_dimensions("A!1"), None);
-        assert_eq!(parse_declared_dimensions(" A1"), None);
-    }
-
-    #[test]
-    fn worksheet_dimension_is_retained_separately_from_cells() {
-        let xml = r#"<worksheet>
-            <dimension ref="A1:F7"/>
-            <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
-        </worksheet>"#;
-        let mut budget = crate::MAX_TEXT_BYTES;
-        let parsed = parse_sheet(
-            xml,
-            &[],
-            &Styles::default(),
-            &ThemeColors::default(),
-            false,
-            &mut budget,
-        );
-        assert_eq!(parsed.declared_dimensions, Some((0, 0, 6, 5)));
-        assert_eq!(parsed.cells.len(), 1);
-    }
-
-    #[test]
-    fn nested_extension_dimension_does_not_replace_a_missing_worksheet_dimension() {
-        let xml = r#"<worksheet>
-            <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
-            <extLst><ext><vendor:dimension xmlns:vendor="urn:vendor" ref="A1:XFD1048576"/></ext></extLst>
-        </worksheet>"#;
-        let mut budget = crate::MAX_TEXT_BYTES;
-        let parsed = parse_sheet(
-            xml,
-            &[],
-            &Styles::default(),
-            &ThemeColors::default(),
-            false,
-            &mut budget,
-        );
-
-        assert_eq!(parsed.declared_dimensions, None);
-        assert_eq!(parsed.cells.len(), 1);
     }
 
     #[test]
