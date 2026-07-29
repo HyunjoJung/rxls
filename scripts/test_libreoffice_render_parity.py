@@ -180,7 +180,10 @@ def write_authored_bundle(
     source: Path,
     *,
     visibilities: tuple[str, ...] = ("visible",),
+    scale_mode: str = MODULE.AUTHORED_SCALE_MODE_SCALE,
 ) -> None:
+    if scale_mode not in MODULE.AUTHORED_SCALE_MODES:
+        raise ValueError("invalid authored scale mode")
     write_bundle(
         bundle_dir,
         source,
@@ -193,12 +196,15 @@ def write_authored_bundle(
     for sheet_index, sheet in enumerate(manifest["sheets"]):
         print_bundle = sheet["print"]
         del print_bundle["layout_override"]
-        print_bundle["page_count"] = 4
+        page_count = (
+            4 if scale_mode == MODULE.AUTHORED_SCALE_MODE_SCALE else 1
+        )
+        print_bundle["page_count"] = page_count
         first_page = bundle_dir / print_bundle["svg_pages"][0]["file"]
         page_payload = first_page.read_bytes()
         page_artifacts = []
         page_scenes = []
-        for page_index in range(4):
+        for page_index in range(page_count):
             filename = (
                 f"sheet-{sheet_index:04d}-pages/page-{page_index + 1:04d}.svg"
             )
@@ -225,6 +231,46 @@ def write_authored_bundle(
         report_path = bundle_dir / print_bundle["report"]["file"]
         report = json.loads(report_path.read_text(encoding="utf-8"))
         del report["layout_override"]
+        fit_mode = scale_mode == MODULE.AUTHORED_SCALE_MODE_FIT
+        report_pages = []
+        for page_index in range(page_count):
+            if fit_mode:
+                horizontal_index = 0
+                vertical_index = 0
+                manual_col_break_before = False
+                manual_row_break_before = False
+                body_range = {
+                    "first_row": 1,
+                    "first_col": 0,
+                    "last_row": 17,
+                    "last_col": 4,
+                }
+            else:
+                horizontal_index = page_index % 2
+                vertical_index = page_index // 2
+                manual_col_break_before = page_index % 2 == 1
+                manual_row_break_before = page_index >= 2
+                body_range = {
+                    "first_row": 1 if page_index < 2 else 8,
+                    "first_col": 0 if page_index % 2 == 0 else 3,
+                    "last_row": 7 if page_index < 2 else 17,
+                    "last_col": 2 if page_index % 2 == 0 else 5,
+                }
+            report_pages.append(
+                {
+                    "output_index": page_index,
+                    "displayed_page_number": page_index + 1,
+                    "area_index": 0,
+                    "horizontal_index": horizontal_index,
+                    "vertical_index": vertical_index,
+                    "manual_col_break_before": manual_col_break_before,
+                    "manual_row_break_before": manual_row_break_before,
+                    "body_range": body_range,
+                    "repeat_rows": [0, 0],
+                    "repeat_cols": [5, 5],
+                    "scale_permille": 1_000 if fit_mode else 850,
+                }
+            )
         report.update(
             {
                 "paper": {"code": 1, "width_raw": 835584, "height_raw": 1081344},
@@ -235,32 +281,12 @@ def write_authored_bundle(
                     "height_raw": 933888,
                 },
                 "page_order": "over_then_down",
-                "manual_row_breaks": [8],
-                "manual_col_breaks": [3],
-                "scale_permille": 850,
-                "logical_pages": 4,
+                "manual_row_breaks": [] if fit_mode else [8],
+                "manual_col_breaks": [] if fit_mode else [3],
+                "scale_permille": 1_000 if fit_mode else 850,
+                "logical_pages": page_count,
                 "sparse_pages_omitted": 0,
-                "pages": [
-                    {
-                        "output_index": page_index,
-                        "displayed_page_number": page_index + 1,
-                        "area_index": 0,
-                        "horizontal_index": page_index % 2,
-                        "vertical_index": page_index // 2,
-                        "manual_col_break_before": page_index % 2 == 1,
-                        "manual_row_break_before": page_index >= 2,
-                        "body_range": {
-                            "first_row": 1 if page_index < 2 else 8,
-                            "first_col": 0 if page_index % 2 == 0 else 3,
-                            "last_row": 7 if page_index < 2 else 17,
-                            "last_col": 2 if page_index % 2 == 0 else 5,
-                        },
-                        "repeat_rows": [0, 0],
-                        "repeat_cols": [5, 5],
-                        "scale_permille": 850,
-                    }
-                    for page_index in range(4)
-                ],
+                "pages": report_pages,
             }
         )
         report_payload = json.dumps(report, sort_keys=True).encode()
@@ -782,10 +808,12 @@ class ContainerOracleRunner(FakeRunner):
         font_pack_sha256: str,
         *,
         print_mode: str = MODULE.PRINT_MODE_SINGLE_PAGE,
+        authored_scale_mode: str = MODULE.AUTHORED_SCALE_MODE_SCALE,
     ) -> None:
         super().__init__(source)
         self.font_pack_sha256 = font_pack_sha256
         self.print_mode = print_mode
+        self.authored_scale_mode = authored_scale_mode
 
     def run(self, command, **kwargs):
         command = list(command)
@@ -793,7 +821,11 @@ class ContainerOracleRunner(FakeRunner):
             self.commands.append(command)
             output = Path(command[command.index("--output-dir") + 1])
             if self.print_mode == MODULE.PRINT_MODE_AUTHORED:
-                write_authored_bundle(output, self.source)
+                write_authored_bundle(
+                    output,
+                    self.source,
+                    scale_mode=self.authored_scale_mode,
+                )
                 manifest_path = output / "render-manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 manifest["renderer"]["font_pack_sha256"] = self.font_pack_sha256
@@ -1223,6 +1255,105 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             runner.commands[1][runner.commands[1].index("--print-mode") + 1],
             "authored",
         )
+
+    def test_evaluate_case_couples_authored_bundle_to_attested_scale_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest, pack_sha = write_font_pack(root / "font-pack")
+            font_pack = MODULE.load_font_pack(manifest)
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="unused-soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+                font_pack=font_pack,
+                libreoffice_command=(
+                    "container-adapter",
+                    "--source",
+                    "{input}",
+                    "--font-pack",
+                    "{font_pack}",
+                    "--evidence-dir",
+                    "{output_dir}",
+                    "--run-id",
+                    "{run_id}",
+                ),
+                poppler_identity=poppler_identity(),
+                print_mode=MODULE.PRINT_MODE_AUTHORED,
+            )
+
+            for index, (scale_mode, fit, expected_pages) in enumerate(
+                (
+                    (MODULE.AUTHORED_SCALE_MODE_SCALE, False, 4),
+                    (MODULE.AUTHORED_SCALE_MODE_FIT, True, 1),
+                )
+            ):
+                source = root / f"{scale_mode}.xlsx"
+                write_authored_print_xlsx(source, fit=fit)
+                case = MODULE.InputCase(
+                    source,
+                    source.name,
+                    source.stat().st_size,
+                    features=("print-settings",),
+                )
+                runner = ContainerOracleRunner(
+                    source,
+                    pack_sha,
+                    print_mode=MODULE.PRINT_MODE_AUTHORED,
+                    authored_scale_mode=scale_mode,
+                )
+                with self.subTest(scale_mode=scale_mode):
+                    result = MODULE.evaluate_case(
+                        case,
+                        index=index,
+                        work_root=root / f"work-{scale_mode}",
+                        config=config,
+                        backends=MODULE.Backends(False, False, False),
+                        runner=runner,
+                    )
+                    self.assertEqual(result["status"], "skipped")
+                    self.assertEqual(
+                        result["classification"],
+                        "visual_dependencies_missing",
+                    )
+                    self.assertEqual(
+                        result["authored_print"]["scale_mode"],
+                        scale_mode,
+                    )
+                    self.assertEqual(len(result["scenes"]), expected_pages)
+
+            fit_source = root / "fit-cross-mode.xlsx"
+            write_authored_print_xlsx(fit_source, fit=True)
+            fit_case = MODULE.InputCase(
+                fit_source,
+                fit_source.name,
+                fit_source.stat().st_size,
+                features=("print-settings",),
+            )
+            mismatched_runner = ContainerOracleRunner(
+                fit_source,
+                pack_sha,
+                print_mode=MODULE.PRINT_MODE_AUTHORED,
+                authored_scale_mode=MODULE.AUTHORED_SCALE_MODE_SCALE,
+            )
+            mismatch = MODULE.evaluate_case(
+                fit_case,
+                index=2,
+                work_root=root / "work-cross-mode",
+                config=config,
+                backends=MODULE.Backends(False, False, False),
+                runner=mismatched_runner,
+            )
+            self.assertEqual(mismatch["status"], "error")
+            self.assertRegex(
+                mismatch["classification"],
+                r"render_manifest_authored_",
+            )
 
     def test_offline_adapter_output_fails_closed_on_identity_drift_and_extra_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1729,6 +1860,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 caps=MODULE.Caps(),
                 dpi=96,
                 print_mode=MODULE.PRINT_MODE_AUTHORED,
+                authored_scale_mode=MODULE.AUTHORED_SCALE_MODE_SCALE,
             )
             self.assertEqual(len(bundle.pages), 4)
             self.assertEqual(
@@ -1748,6 +1880,98 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                     caps=MODULE.Caps(),
                     dpi=96,
                     print_mode=MODULE.PRINT_MODE_AUTHORED,
+                    authored_scale_mode=MODULE.AUTHORED_SCALE_MODE_SCALE,
+                )
+
+    def test_authored_bundle_validation_is_bound_to_attested_scale_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "fixture.xlsx"
+            source.write_bytes(b"fixture")
+            source_sha256 = hashlib.sha256(b"fixture").hexdigest()
+            bundles = {}
+            for scale_mode, expected_pages in (
+                (MODULE.AUTHORED_SCALE_MODE_SCALE, 4),
+                (MODULE.AUTHORED_SCALE_MODE_FIT, 1),
+            ):
+                bundle_dir = root / scale_mode
+                write_authored_bundle(
+                    bundle_dir,
+                    source,
+                    scale_mode=scale_mode,
+                )
+                bundles[scale_mode] = bundle_dir
+                with self.subTest(scale_mode=scale_mode):
+                    bundle = MODULE.validate_bundle(
+                        bundle_dir,
+                        input_sha256=source_sha256,
+                        input_bytes=7,
+                        caps=MODULE.Caps(),
+                        dpi=96,
+                        print_mode=MODULE.PRINT_MODE_AUTHORED,
+                        authored_scale_mode=scale_mode,
+                    )
+                    self.assertEqual(len(bundle.pages), expected_pages)
+
+            for supplied_mode, bundle_mode in (
+                (
+                    MODULE.AUTHORED_SCALE_MODE_FIT,
+                    MODULE.AUTHORED_SCALE_MODE_SCALE,
+                ),
+                (
+                    MODULE.AUTHORED_SCALE_MODE_SCALE,
+                    MODULE.AUTHORED_SCALE_MODE_FIT,
+                ),
+            ):
+                with (
+                    self.subTest(
+                        supplied_mode=supplied_mode,
+                        bundle_mode=bundle_mode,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.HarnessError,
+                        "render_manifest_authored_",
+                    ),
+                ):
+                    MODULE.validate_bundle(
+                        bundles[bundle_mode],
+                        input_sha256=source_sha256,
+                        input_bytes=7,
+                        caps=MODULE.Caps(),
+                        dpi=96,
+                        print_mode=MODULE.PRINT_MODE_AUTHORED,
+                        authored_scale_mode=supplied_mode,
+                    )
+
+            for invalid_mode in (None, "automatic", ["scale"]):
+                with (
+                    self.subTest(invalid_mode=invalid_mode),
+                    self.assertRaisesRegex(
+                        MODULE.HarnessError,
+                        "render_manifest_authored_scale_mode",
+                    ),
+                ):
+                    MODULE.validate_bundle(
+                        bundles[MODULE.AUTHORED_SCALE_MODE_SCALE],
+                        input_sha256=source_sha256,
+                        input_bytes=7,
+                        caps=MODULE.Caps(),
+                        dpi=96,
+                        print_mode=MODULE.PRINT_MODE_AUTHORED,
+                        authored_scale_mode=invalid_mode,
+                    )
+
+            with self.assertRaisesRegex(
+                MODULE.HarnessError,
+                "render_manifest_authored_scale_mode",
+            ):
+                MODULE.validate_bundle(
+                    bundles[MODULE.AUTHORED_SCALE_MODE_SCALE],
+                    input_sha256=source_sha256,
+                    input_bytes=7,
+                    caps=MODULE.Caps(),
+                    dpi=96,
+                    authored_scale_mode=MODULE.AUTHORED_SCALE_MODE_SCALE,
                 )
 
     def test_authored_hidden_sheet_and_multipage_indices_remain_distinct(self) -> None:
@@ -1769,6 +1993,7 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 caps=MODULE.Caps(),
                 dpi=96,
                 print_mode=MODULE.PRINT_MODE_AUTHORED,
+                authored_scale_mode=MODULE.AUTHORED_SCALE_MODE_SCALE,
             )
 
         self.assertEqual(len(bundle.pages), 8)

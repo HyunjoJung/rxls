@@ -112,6 +112,11 @@ AUTHORED_PDF_FILTER = "pdf:calc_pdf_Export"
 PRINT_MODE_SINGLE_PAGE = "single-page-sheets"
 PRINT_MODE_AUTHORED = "authored"
 PRINT_MODES = frozenset({PRINT_MODE_SINGLE_PAGE, PRINT_MODE_AUTHORED})
+AUTHORED_SCALE_MODE_SCALE = "scale"
+AUTHORED_SCALE_MODE_FIT = "fit"
+AUTHORED_SCALE_MODES = frozenset(
+    {AUTHORED_SCALE_MODE_SCALE, AUTHORED_SCALE_MODE_FIT}
+)
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_LABEL_PART_RE = re.compile(r"[^A-Za-z0-9._+@()\[\]{} -]+")
 LOCALE_RE = re.compile(r"[A-Za-z0-9_.@-]{1,64}\Z")
@@ -2317,8 +2322,15 @@ def _validate_bundle_artifact(
     return path
 
 
-def _validate_authored_print_report(report: dict[str, object], page_count: int) -> None:
+def _validate_authored_print_report(
+    report: dict[str, object],
+    page_count: int,
+    scale_mode: str,
+) -> None:
     """Validate content-neutral authored pagination facts before comparison."""
+    if not isinstance(scale_mode, str) or scale_mode not in AUTHORED_SCALE_MODES:
+        raise HarnessError("render_manifest_authored_scale_mode")
+    expected_page_count = 4 if scale_mode == AUTHORED_SCALE_MODE_SCALE else 1
     paper = report.get("paper")
     content = report.get("content_rect")
     pages = report.get("pages")
@@ -2338,7 +2350,7 @@ def _validate_authored_print_report(report: dict[str, object], page_count: int) 
         }
         or not isinstance(pages, list)
         or len(pages) != page_count
-        or page_count != 4
+        or page_count != expected_page_count
     ):
         raise HarnessError("render_manifest_authored_paper")
     for key in ("x_raw", "y_raw", "width_raw", "height_raw"):
@@ -2352,15 +2364,27 @@ def _validate_authored_print_report(report: dict[str, object], page_count: int) 
     if report.get("page_order") != "over_then_down":
         raise HarnessError("render_manifest_authored_page_order")
     scale = report.get("scale_permille")
-    if not isinstance(scale, int) or isinstance(scale, bool) or not 100 <= scale <= 4_000:
+    expected_scale = 850 if scale_mode == AUTHORED_SCALE_MODE_SCALE else 1_000
+    if (
+        not isinstance(scale, int)
+        or isinstance(scale, bool)
+        or scale != expected_scale
+    ):
         raise HarnessError("render_manifest_authored_scale")
+    if (
+        report.get("logical_pages") != expected_page_count
+        or report.get("sparse_pages_omitted") != 0
+    ):
+        raise HarnessError("render_manifest_authored_page_map")
     manual_rows = report.get("manual_row_breaks")
     manual_cols = report.get("manual_col_breaks")
+    expected_rows = [8] if scale_mode == AUTHORED_SCALE_MODE_SCALE else []
+    expected_cols = [3] if scale_mode == AUTHORED_SCALE_MODE_SCALE else []
     if (
         not isinstance(manual_rows, list)
-        or manual_rows != [8]
+        or manual_rows != expected_rows
         or not isinstance(manual_cols, list)
-        or manual_cols != [3]
+        or manual_cols != expected_cols
     ):
         raise HarnessError("render_manifest_authored_breaks")
     for output_index, page in enumerate(pages):
@@ -2371,23 +2395,39 @@ def _validate_authored_print_report(report: dict[str, object], page_count: int) 
             page_scale != scale
             or page.get("displayed_page_number") != output_index + 1
             or page.get("area_index") != 0
-            or page.get("horizontal_index") != output_index % 2
-            or page.get("vertical_index") != output_index // 2
-            or page.get("manual_col_break_before") is not (output_index % 2 == 1)
-            or page.get("manual_row_break_before") is not (output_index >= 2)
         ):
             raise HarnessError("render_manifest_authored_page_map")
         if page.get("repeat_rows") != [0, 0] or page.get("repeat_cols") != [5, 5]:
             raise HarnessError("render_manifest_authored_titles")
         body = page.get("body_range")
-        if (
-            not isinstance(body, dict)
-            or body.get("first_row") != (1 if output_index < 2 else 8)
-            or body.get("last_row") != (7 if output_index < 2 else 17)
-            or body.get("first_col") != (0 if output_index % 2 == 0 else 3)
-            or body.get("last_col") not in (
-                {2} if output_index % 2 == 0 else {4, 5}
-            )
+        if not isinstance(body, dict):
+            raise HarnessError("render_manifest_authored_page_map")
+        if scale_mode == AUTHORED_SCALE_MODE_SCALE:
+            if (
+                page.get("horizontal_index") != output_index % 2
+                or page.get("vertical_index") != output_index // 2
+                or page.get("manual_col_break_before") is not (
+                    output_index % 2 == 1
+                )
+                or page.get("manual_row_break_before") is not (output_index >= 2)
+                or body.get("first_row") != (1 if output_index < 2 else 8)
+                or body.get("last_row") != (7 if output_index < 2 else 17)
+                or body.get("first_col") != (
+                    0 if output_index % 2 == 0 else 3
+                )
+                or body.get("last_col")
+                not in ({2} if output_index % 2 == 0 else {4, 5})
+            ):
+                raise HarnessError("render_manifest_authored_page_map")
+        elif (
+            page.get("horizontal_index") != 0
+            or page.get("vertical_index") != 0
+            or page.get("manual_col_break_before") is not False
+            or page.get("manual_row_break_before") is not False
+            or body.get("first_row") != 1
+            or body.get("last_row") != 17
+            or body.get("first_col") != 0
+            or body.get("last_col") not in {4, 5}
         ):
             raise HarnessError("render_manifest_authored_page_map")
 
@@ -2402,6 +2442,7 @@ def validate_bundle(
     expected_font_pack_sha256: str | None = None,
     require_single_page_print: bool = False,
     print_mode: str | None = None,
+    authored_scale_mode: str | None = None,
 ) -> Bundle:
     if require_single_page_print:
         if print_mode not in {None, PRINT_MODE_SINGLE_PAGE}:
@@ -2409,6 +2450,14 @@ def validate_bundle(
         print_mode = PRINT_MODE_SINGLE_PAGE
     if print_mode is not None and print_mode not in PRINT_MODES:
         raise HarnessError("render_manifest_print_mode")
+    if print_mode == PRINT_MODE_AUTHORED:
+        if (
+            not isinstance(authored_scale_mode, str)
+            or authored_scale_mode not in AUTHORED_SCALE_MODES
+        ):
+            raise HarnessError("render_manifest_authored_scale_mode")
+    elif authored_scale_mode is not None:
+        raise HarnessError("render_manifest_authored_scale_mode")
     files = _bounded_directory_files(bundle_dir)
     total_bytes = sum(path.stat().st_size for path in files)
     if total_bytes > caps.max_artifact_bytes:
@@ -2681,7 +2730,12 @@ def validate_bundle(
             ):
                 raise HarnessError("render_manifest_print_report")
         if print_mode == PRINT_MODE_AUTHORED:
-            _validate_authored_print_report(print_report, page_count)
+            assert authored_scale_mode is not None
+            _validate_authored_print_report(
+                print_report,
+                page_count,
+                authored_scale_mode,
+            )
         print_warnings = _manifest_warning_evidence(
             print_report.get("warnings"), code="render_manifest_print_warning"
         )
@@ -6846,11 +6900,24 @@ def evaluate_case(
     base["sha256"] = input_sha256
     if case.expected_sha256 is not None and input_sha256 != case.expected_sha256:
         return _classified(base, "error", "manifest_sha256_mismatch")
+    authored_scale_mode = None
     if config.print_mode == PRINT_MODE_AUTHORED:
         try:
-            base["authored_print"] = attest_authored_print_source(case)
+            authored_print = attest_authored_print_source(case)
         except HarnessError as error:
             return _classified(base, "error", str(error))
+        candidate_scale_mode = authored_print.get("scale_mode")
+        if (
+            not isinstance(candidate_scale_mode, str)
+            or candidate_scale_mode not in AUTHORED_SCALE_MODES
+        ):
+            return _classified(
+                base,
+                "error",
+                "render_manifest_authored_scale_mode",
+            )
+        authored_scale_mode = candidate_scale_mode
+        base["authored_print"] = authored_print
 
     if config.dry_run:
         planned_rxls = [
@@ -6952,6 +7019,7 @@ def evaluate_case(
                 else None
             ),
             print_mode=config.print_mode,
+            authored_scale_mode=authored_scale_mode,
         )
     except HarnessError as error:
         return _classified(
