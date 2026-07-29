@@ -12,8 +12,8 @@ use crate::format::Formats;
 use crate::model::{
     Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, Color, Comment,
     DataValidation, DocProperties, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript, HAlign,
-    HeaderFooterKind, PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder, Sheet, SheetType,
-    StyleFidelity, VAlign,
+    HeaderFooterKind, ImportedAxisMeasure, PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder,
+    Sheet, SheetType, StyleFidelity, VAlign,
 };
 use crate::{error_code, rk_to_f64, Error, Result, Workbook, MAX_TEXT_BYTES};
 
@@ -103,6 +103,7 @@ const MAX_BIFF_FONT_RECORD_BYTES: usize = 78;
 const MAX_BIFF_XF_RECORD_BYTES: usize = 20;
 const MAX_BIFF_DEFAULT_COL_WIDTH_CHARS: u16 = 255;
 const MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS: i16 = 8179;
+const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_POINTS: u64 = 64;
 const MIN_BIFF_ROW_HEIGHT_TWIPS: u16 = 2;
 const MAX_BIFF_ROW_HEIGHT_TWIPS: u16 = 8192;
 const BIFF_ROW_FLAG_UNSYNCED: u32 = 1 << 6;
@@ -204,22 +205,29 @@ struct Ctx {
 /// generation is known and record-order-independent precedence can be applied.
 #[derive(Debug, Default)]
 struct XlsSheetDefaults {
-    def_col_width: Option<f32>,
-    standard_col_width: Option<f32>,
-    row_height: Option<f32>,
+    def_col_width_256: Option<u32>,
+    standard_col_width_256: Option<u32>,
+    row_height: Option<BiffDefaultRowHeight>,
+    explicit_visible_rows: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BiffDefaultRowHeight {
+    twips: u32,
+    hidden: bool,
 }
 
 impl XlsSheetDefaults {
     fn apply_record(&mut self, typ: u16, data: &[u8]) {
         match typ {
             DEFAULTCOLWIDTH => {
-                if let Some(width) = parse_biff_default_col_width(data) {
-                    self.def_col_width = Some(width);
+                if let Some(width) = parse_biff_default_col_width_256(data) {
+                    self.def_col_width_256 = Some(width);
                 }
             }
             STANDARDWIDTH => {
-                if let Some(width) = parse_biff_standard_width(data) {
-                    self.standard_col_width = Some(width);
+                if let Some(width) = parse_biff_standard_width_256(data) {
+                    self.standard_col_width_256 = Some(width);
                 }
             }
             DEFAULTROWHEIGHT => {
@@ -237,48 +245,67 @@ impl XlsSheetDefaults {
         // is its fallback; when both are absent Calc starts from its fixed
         // 64-point application default. Explicit COLINFO widths still win per
         // column during rendering.
-        let explicit_width = self.standard_col_width.or(self.def_col_width);
-        sheet.default_col_width = explicit_width;
-        sheet.biff_application_default_col_width = sheet.is_worksheet && explicit_width.is_none();
-        sheet.default_row_height = self.row_height;
+        let explicit_width_256 = self.standard_col_width_256.or(self.def_col_width_256);
+        sheet.default_col_width = explicit_width_256.map(|width| width as f32 / 256.0);
+        sheet.imported_default_column_axis_measure = explicit_width_256
+            .map(ImportedAxisMeasure::CharacterWidth256)
+            .or_else(|| {
+                sheet
+                    .is_worksheet
+                    .then_some(ImportedAxisMeasure::PointRatio(
+                        BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_POINTS,
+                        1,
+                    ))
+            });
+        sheet.biff_application_default_col_width =
+            sheet.is_worksheet && explicit_width_256.is_none();
+        sheet.default_row_height = self.row_height.map(|height| height.twips as f32 / 20.0);
+        sheet.imported_default_row_axis_measure = self
+            .row_height
+            .map(|height| ImportedAxisMeasure::Twips(height.twips));
         sheet.biff_application_default_row_height = sheet.is_worksheet && self.row_height.is_none();
+        if sheet.is_worksheet && self.row_height.is_some_and(|height| height.hidden) {
+            sheet.default_hidden_row_exceptions = Some(self.explicit_visible_rows);
+        }
     }
 }
 
-fn parse_biff_default_col_width(data: &[u8]) -> Option<f32> {
+fn parse_biff_default_col_width_256(data: &[u8]) -> Option<u32> {
     if data.len() != 2 {
         return None;
     }
     u16le(data, 0)
         .filter(|width| (1..=MAX_BIFF_DEFAULT_COL_WIDTH_CHARS).contains(width))
-        .map(f32::from)
+        .map(|width| u32::from(width) * 256)
 }
 
-fn parse_biff_standard_width(data: &[u8]) -> Option<f32> {
+fn parse_biff_standard_width_256(data: &[u8]) -> Option<u32> {
     if data.len() != 2 {
         return None;
     }
-    u16le(data, 0)
-        .filter(|width| *width > 0)
-        .map(|width| f32::from(width) / 256.0)
+    u16le(data, 0).filter(|width| *width > 0).map(u32::from)
 }
 
-fn parse_biff_default_row_height(data: &[u8]) -> Option<f32> {
+fn parse_biff_default_row_height(data: &[u8]) -> Option<BiffDefaultRowHeight> {
     // rxls accepts BIFF5/8 workbooks. Both use the BIFF3+ four-byte layout:
     // option flags first, then a signed twip height. A two-byte body is the
     // incompatible BIFF2 layout and must not be reinterpreted here.
     if data.len() != 4 {
         return None;
     }
-    let _flags = u16le(data, 0)?;
+    let flags = u16le(data, 0)?;
     let twips = i16le(data, 2)?;
-    // fDyZero (flags bit 1) makes empty rows hidden while the payload retains
-    // their unhidden height. The current public model has no sheet-wide hidden
-    // row flag, so preserve that positive source height without expanding the
-    // worksheet into individual hidden rows.
-    (1..=MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS)
+    let hidden = flags & 0x0002 != 0;
+    let minimum = if hidden { 0 } else { 1 };
+    (minimum..=MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS)
         .contains(&twips)
-        .then(|| f32::from(twips) / 20.0)
+        .then(|| {
+            Some(BiffDefaultRowHeight {
+                twips: u32::try_from(twips).ok()?,
+                hidden,
+            })
+        })
+        .flatten()
 }
 
 /// Resolve a BIFF `CODEPAGE` value to its `encoding_rs` codec.
@@ -1264,6 +1291,7 @@ impl Workbook {
                                 apply_row_outline(
                                     data,
                                     &mut sheets[si],
+                                    &mut sheet_defaults[si].explicit_visible_rows,
                                     &xls_styles,
                                     &mut style_budget,
                                     ctx.biff8,
@@ -3344,6 +3372,7 @@ fn parse_pane_freeze(data: &[u8]) -> Option<(u32, u16)> {
 fn apply_row_outline(
     data: &[u8],
     sheet: &mut Sheet,
+    explicit_visible_rows: &mut BTreeSet<u32>,
     styles: &XlsStyles,
     style_budget: &mut usize,
     biff8: bool,
@@ -3368,9 +3397,15 @@ fn apply_row_outline(
         sheet
             .row_heights
             .insert(row, f32::from(height_twips) / 20.0);
+        sheet
+            .imported_row_axis_measures
+            .insert(row, ImportedAxisMeasure::Twips(u32::from(height_twips)));
     }
     if options & 0x20 != 0 {
         sheet.hidden_rows.insert(row);
+        explicit_visible_rows.remove(&row);
+    } else {
+        explicit_visible_rows.insert(row);
     }
     if level > 0 {
         sheet.row_outline.insert(row, level);
@@ -3412,10 +3447,15 @@ fn apply_col_outline(
     for col in first..=last.min(255) {
         if width_256 > 0 {
             sheet.col_widths.insert(col, f32::from(width_256) / 256.0);
+            sheet.imported_column_axis_measures.insert(
+                col,
+                ImportedAxisMeasure::CharacterWidth256(u32::from(width_256)),
+            );
         } else {
             // Calc interprets a zero COLINFO width as a hidden column and
             // restores the sheet default when it is shown again.
             sheet.col_widths.remove(&col);
+            sheet.imported_column_axis_measures.remove(&col);
         }
         if options & 0x01 != 0 {
             explicit_hidden_cols.insert(col);
@@ -6108,6 +6148,22 @@ mod tests {
         assert_eq!(sheet.row_heights().get(&3), Some(&18.0));
         assert_eq!(sheet.column_widths().len(), 1);
         assert_eq!(sheet.row_heights().len(), 1);
+        assert_eq!(
+            sheet.imported_default_column_axis_measure(),
+            Some(ImportedAxisMeasure::CharacterWidth256(2_432))
+        );
+        assert_eq!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::Twips(300))
+        );
+        assert_eq!(
+            sheet.imported_column_axis_measures().get(&2),
+            Some(&ImportedAxisMeasure::CharacterWidth256(3_072))
+        );
+        assert_eq!(
+            sheet.imported_row_axis_measures().get(&3),
+            Some(&ImportedAxisMeasure::Twips(360))
+        );
         assert!(!sheet.biff_uses_application_default_column_width());
         assert!(!sheet.biff_uses_application_default_row_height());
     }
@@ -6243,6 +6299,10 @@ mod tests {
             assert!(sheet.column_widths().is_empty());
             assert!(sheet.row_heights().is_empty());
             assert!(!sheet.biff_uses_application_default_column_width());
+            assert_eq!(
+                sheet.default_hidden_row_exceptions().map(BTreeSet::len),
+                Some(0)
+            );
         }
     }
 
@@ -6253,10 +6313,45 @@ mod tests {
             let sheet = &mut workbook.sheets[0];
             assert_eq!(sheet.default_column_width(), None);
             assert!(sheet.biff_uses_application_default_column_width());
+            assert_eq!(
+                sheet.imported_default_column_axis_measure(),
+                Some(ImportedAxisMeasure::PointRatio(64, 1))
+            );
 
             sheet.set_default_col_width(12.0);
             assert_eq!(sheet.default_column_width(), Some(12.0));
             assert!(!sheet.biff_uses_application_default_column_width());
+            assert_eq!(sheet.imported_default_column_axis_measure(), None);
+        }
+    }
+
+    #[test]
+    fn biff_default_hidden_rows_retain_visible_exceptions_and_zero_unhidden_height() {
+        for biff8 in [false, true] {
+            let records = vec![
+                (DEFAULTROWHEIGHT, [0x02, 0x00, 0x00, 0x00].to_vec()),
+                (ROW, test_row(1, 255, 0)),
+                (ROW, test_row(2, 255, 0x20)),
+            ];
+            let workbook = workbook_with_geometry_records(biff8, &records);
+            let sheet = &workbook.sheets[0];
+
+            assert_eq!(sheet.default_row_height(), Some(0.0));
+            assert_eq!(
+                sheet.imported_default_row_axis_measure(),
+                Some(ImportedAxisMeasure::Twips(0))
+            );
+            assert!(!sheet.biff_uses_application_default_row_height());
+            assert_eq!(
+                sheet
+                    .default_hidden_row_exceptions()
+                    .expect("fDyZero provenance")
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [1]
+            );
+            assert!(sheet.hidden_rows().contains(&2));
         }
     }
 
@@ -6271,6 +6366,7 @@ mod tests {
             sheet.set_default_row_height(12.0);
             assert_eq!(sheet.default_row_height(), Some(12.0));
             assert!(!sheet.biff_uses_application_default_row_height());
+            assert_eq!(sheet.imported_default_row_axis_measure(), None);
         }
     }
 

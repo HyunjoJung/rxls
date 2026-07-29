@@ -16,6 +16,7 @@ use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
+use crate::model::{parse_decimal_ratio_u64, parse_decimal_scaled_u32, ImportedAxisMeasure};
 use crate::{
     Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, Color, Comment,
     DataValidation, DocProperties, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata,
@@ -294,8 +295,10 @@ struct OdsStyleProps {
     locked: Option<bool>,
     hidden_formula: Option<bool>,
     row_height_pt: Option<f32>,
+    row_axis_measure: Option<ImportedAxisMeasure>,
     col_width_chars: Option<f32>,
     col_width_points: Option<f32>,
+    col_axis_measure: Option<ImportedAxisMeasure>,
     hidden: Option<bool>,
     break_before_page: Option<bool>,
     break_after_page: Option<bool>,
@@ -349,6 +352,15 @@ impl OdsStyleProps {
             break_after_page,
             clip,
         );
+        // A valid child length that is not exactly representable in the retained
+        // integer domain must clear the parent's exact measure while preserving
+        // the compatibility floating-point projection.
+        if other.row_height_pt.is_some() {
+            self.row_axis_measure = other.row_axis_measure;
+        }
+        if other.col_width_points.is_some() {
+            self.col_axis_measure = other.col_axis_measure;
+        }
         if other.fill_transparent {
             self.fill_color = None;
             self.fill_transparent = true;
@@ -930,6 +942,80 @@ fn parse_ods_length_points(value: &str) -> Option<f64> {
     parse_ods_signed_length_points(value).filter(|value| *value >= 0.0)
 }
 
+fn parse_ods_axis_measure(value: &str) -> Option<ImportedAxisMeasure> {
+    let value = value.trim();
+    let (number, unit) = ["pt", "pc", "in", "px", "cm", "mm"]
+        .into_iter()
+        .find_map(|unit| value.strip_suffix(unit).map(|number| (number.trim(), unit)))?;
+    let integral = match unit {
+        "pt" => parse_decimal_scaled_u32(number, 20).map(ImportedAxisMeasure::Twips),
+        "pc" => parse_decimal_scaled_u32(number, 240).map(ImportedAxisMeasure::Twips),
+        "in" => parse_decimal_scaled_u32(number, 1_440).map(ImportedAxisMeasure::Twips),
+        "px" => parse_decimal_scaled_u32(number, 15).map(ImportedAxisMeasure::Twips),
+        "cm" => {
+            parse_decimal_scaled_u32(number, 1_000).map(ImportedAxisMeasure::MillimeterHundredths)
+        }
+        "mm" => {
+            parse_decimal_scaled_u32(number, 100).map(ImportedAxisMeasure::MillimeterHundredths)
+        }
+        _ => None,
+    };
+    if let Some(measure) = integral.filter(|measure| {
+        !matches!(
+            measure,
+            ImportedAxisMeasure::Twips(0) | ImportedAxisMeasure::MillimeterHundredths(0)
+        )
+    }) {
+        return Some(measure);
+    }
+
+    let (numerator, denominator) = parse_decimal_ratio_u64(number)?;
+    if numerator == 0 {
+        return None;
+    }
+    let (point_numerator, point_denominator) = match unit {
+        "pt" => exact_ratio_product(numerator, denominator, 1, 1),
+        "pc" => exact_ratio_product(numerator, denominator, 12, 1),
+        "in" => exact_ratio_product(numerator, denominator, 72, 1),
+        "px" => exact_ratio_product(numerator, denominator, 3, 4),
+        "cm" => exact_ratio_product(numerator, denominator, 3_600, 127),
+        "mm" => exact_ratio_product(numerator, denominator, 360, 127),
+        _ => None,
+    }?;
+    Some(ImportedAxisMeasure::PointRatio(
+        point_numerator,
+        point_denominator,
+    ))
+}
+
+fn exact_ratio_product(
+    numerator: u64,
+    denominator: u64,
+    multiplier_numerator: u64,
+    multiplier_denominator: u64,
+) -> Option<(u64, u64)> {
+    let numerator = u128::from(numerator).checked_mul(u128::from(multiplier_numerator))?;
+    let denominator = u128::from(denominator).checked_mul(u128::from(multiplier_denominator))?;
+    let divisor = gcd_u128(numerator, denominator);
+    Some((
+        u64::try_from(numerator / divisor).ok()?,
+        u64::try_from(denominator / divisor).ok()?,
+    ))
+}
+
+const fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    if left == 0 {
+        1
+    } else {
+        left
+    }
+}
+
 fn parse_ods_length_inches(value: &str) -> Option<f64> {
     parse_ods_length_points(value).map(|points| points / 72.0)
 }
@@ -1341,6 +1427,7 @@ fn apply_ods_style_properties(
             if let Some(value) = attr(e, b"row-height") {
                 if let Some(height) = parse_ods_length_points(&value) {
                     props.row_height_pt = Some(height.clamp(0.0, f64::from(f32::MAX)) as f32);
+                    props.row_axis_measure = parse_ods_axis_measure(&value);
                 } else {
                     add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
                 }
@@ -1356,6 +1443,7 @@ fn apply_ods_style_properties(
                     props.col_width_points = Some(width.clamp(0.0, f64::from(f32::MAX)) as f32);
                     // The public model stores Excel-compatible character units.
                     props.col_width_chars = Some((width / 5.25).clamp(0.0, 255.0) as f32);
+                    props.col_axis_measure = parse_ods_axis_measure(&value);
                 } else {
                     add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
                 }
@@ -3040,6 +3128,7 @@ fn apply_ods_column_style(
     col_formats: &mut BTreeMap<u16, CellStyle>,
     col_widths: &mut BTreeMap<u16, f32>,
     physical_col_widths: &mut BTreeMap<u16, f32>,
+    imported_column_axis_measures: &mut BTreeMap<u16, ImportedAxisMeasure>,
     hidden_cols: &mut std::collections::BTreeSet<u16>,
     losses: &mut Vec<StyleLoss>,
 ) {
@@ -3062,6 +3151,7 @@ fn apply_ods_column_style(
         if col_formats
             .len()
             .max(col_widths.len())
+            .max(imported_column_axis_measures.len())
             .max(hidden_cols.len())
             >= MAX_ODS_LAYOUT_ENTRIES
         {
@@ -3078,6 +3168,9 @@ fn apply_ods_column_style(
         if let Some(width) = layout.and_then(|style| style.col_width_points) {
             physical_col_widths.insert(col, width);
         }
+        if let Some(measure) = layout.and_then(|style| style.col_axis_measure) {
+            imported_column_axis_measures.insert(col, measure);
+        }
         if directly_hidden || layout.and_then(|style| style.hidden) == Some(true) {
             hidden_cols.insert(col);
         }
@@ -3092,6 +3185,7 @@ fn apply_ods_row_style(
     repeat: u32,
     row_formats: &mut BTreeMap<u32, CellStyle>,
     row_heights: &mut BTreeMap<u32, f32>,
+    imported_row_axis_measures: &mut BTreeMap<u32, ImportedAxisMeasure>,
     hidden_rows: &mut std::collections::BTreeSet<u32>,
     losses: &mut Vec<StyleLoss>,
 ) {
@@ -3114,6 +3208,7 @@ fn apply_ods_row_style(
         if row_formats
             .len()
             .max(row_heights.len())
+            .max(imported_row_axis_measures.len())
             .max(hidden_rows.len())
             >= MAX_ODS_LAYOUT_ENTRIES
         {
@@ -3125,6 +3220,9 @@ fn apply_ods_row_style(
         }
         if let Some(height) = layout.and_then(|style| style.row_height_pt) {
             row_heights.insert(row, height);
+        }
+        if let Some(measure) = layout.and_then(|style| style.row_axis_measure) {
+            imported_row_axis_measures.insert(row, measure);
         }
         if directly_hidden || layout.and_then(|style| style.hidden) == Some(true) {
             hidden_rows.insert(row);
@@ -3276,6 +3374,8 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
     let mut row_heights: BTreeMap<u32, f32> = BTreeMap::new();
     let mut col_widths: BTreeMap<u16, f32> = BTreeMap::new();
     let mut physical_col_widths: BTreeMap<u16, f32> = BTreeMap::new();
+    let mut imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure> = BTreeMap::new();
+    let mut imported_column_axis_measures: BTreeMap<u16, ImportedAxisMeasure> = BTreeMap::new();
     let mut hidden_rows = std::collections::BTreeSet::new();
     let mut hidden_cols = std::collections::BTreeSet::new();
     let mut style_losses = styles.losses.clone();
@@ -3394,6 +3494,8 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                     row_heights = BTreeMap::new();
                     col_widths = BTreeMap::new();
                     physical_col_widths = BTreeMap::new();
+                    imported_row_axis_measures = BTreeMap::new();
+                    imported_column_axis_measures = BTreeMap::new();
                     hidden_rows = std::collections::BTreeSet::new();
                     hidden_cols = std::collections::BTreeSet::new();
                     row_outline = BTreeMap::new();
@@ -3442,6 +3544,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         &mut col_formats,
                         &mut col_widths,
                         &mut physical_col_widths,
+                        &mut imported_column_axis_measures,
                         &mut hidden_cols,
                         &mut style_losses,
                     );
@@ -3473,6 +3576,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         row_rep,
                         &mut row_formats,
                         &mut row_heights,
+                        &mut imported_row_axis_measures,
                         &mut hidden_rows,
                         &mut style_losses,
                     );
@@ -3786,6 +3890,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         &mut col_formats,
                         &mut col_widths,
                         &mut physical_col_widths,
+                        &mut imported_column_axis_measures,
                         &mut hidden_cols,
                         &mut style_losses,
                     );
@@ -3810,6 +3915,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         rep,
                         &mut row_formats,
                         &mut row_heights,
+                        &mut imported_row_axis_measures,
                         &mut hidden_rows,
                         &mut style_losses,
                     );
@@ -4184,6 +4290,10 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         row_heights: std::mem::take(&mut row_heights),
                         col_widths: std::mem::take(&mut col_widths),
                         physical_col_widths: std::mem::take(&mut physical_col_widths),
+                        imported_row_axis_measures: std::mem::take(&mut imported_row_axis_measures),
+                        imported_column_axis_measures: std::mem::take(
+                            &mut imported_column_axis_measures,
+                        ),
                         hidden_rows: std::mem::take(&mut hidden_rows),
                         hidden_cols: std::mem::take(&mut hidden_cols),
                         style_losses: std::mem::take(&mut style_losses),
@@ -5473,6 +5583,18 @@ mod tests {
         assert_eq!(sheet.row_heights().get(&0), Some(&36.0));
         assert!((sheet.column_widths()[&0] - (2.0 * 72.0 / 2.54 / 5.25) as f32).abs() < 0.01);
         assert!((sheet.physical_column_widths()[&0] - (2.0 * 72.0 / 2.54) as f32).abs() < 0.01);
+        assert_eq!(
+            sheet.imported_row_axis_measures().get(&0),
+            Some(&ImportedAxisMeasure::Twips(720))
+        );
+        assert_eq!(
+            sheet.imported_column_axis_measures().get(&0),
+            Some(&ImportedAxisMeasure::MillimeterHundredths(2_000))
+        );
+        assert_eq!(
+            sheet.imported_column_axis_measures().get(&1),
+            Some(&ImportedAxisMeasure::MillimeterHundredths(2_000))
+        );
 
         let inherited = sheet.resolved_cell_style(0, 0).expect("row style");
         assert!(inherited.font.as_ref().is_some_and(|font| font.bold));
@@ -5495,6 +5617,43 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(runs[0].font.italic);
         assert_eq!(runs[0].font.color, Some(Color::rgb(0x00, 0x88, 0x00)));
+    }
+
+    #[test]
+    fn ods_child_geometry_clears_unrepresentable_parent_axis_provenance() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Geometry"><table:table-column table:style-name="ChildColumn"/><table:table-column table:style-name="InheritedColumn"/><table:table-row table:style-name="ChildRow"><table:table-cell/><table:table-cell/></table:table-row><table:table-row table:style-name="InheritedRow"><table:table-cell/><table:table-cell/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles><style:style style:name="BaseRow" style:family="table-row"><style:table-row-properties style:row-height="1cm"/></style:style><style:style style:name="ChildRow" style:family="table-row" style:parent-style-name="BaseRow"><style:table-row-properties style:row-height="0.00000000000000000001cm"/></style:style><style:style style:name="InheritedRow" style:family="table-row" style:parent-style-name="BaseRow"/><style:style style:name="BaseColumn" style:family="table-column"><style:table-column-properties style:column-width="1cm"/></style:style><style:style style:name="ChildColumn" style:family="table-column" style:parent-style-name="BaseColumn"><style:table-column-properties style:column-width="0.00000000000000000001cm"/></style:style><style:style style:name="InheritedColumn" style:family="table-column" style:parent-style-name="BaseColumn"/></office:styles></office:document-styles>"#;
+
+        let mut workbook = Workbook::open(&ods_bytes_with_styles(content, styles)).expect("ods");
+        let sheet = &mut workbook.sheets[0];
+        let inherited_points = (1.0 * 72.0 / 2.54) as f32;
+
+        assert_eq!(
+            parse_ods_axis_measure("1.23456cm"),
+            Some(ImportedAxisMeasure::PointRatio(555_552, 15_875))
+        );
+        assert!(sheet.row_heights()[&0] < 1e-10);
+        assert!(sheet.physical_column_widths()[&0] < 1e-10);
+        assert!(!sheet.imported_row_axis_measures().contains_key(&0));
+        assert!(!sheet.imported_column_axis_measures().contains_key(&0));
+        assert!((sheet.row_heights()[&1] - inherited_points).abs() < 0.001);
+        assert!((sheet.physical_column_widths()[&1] - inherited_points).abs() < 0.001);
+        assert_eq!(
+            sheet.imported_row_axis_measures().get(&1),
+            Some(&ImportedAxisMeasure::MillimeterHundredths(1_000))
+        );
+        assert_eq!(
+            sheet.imported_column_axis_measures().get(&1),
+            Some(&ImportedAxisMeasure::MillimeterHundredths(1_000))
+        );
+
+        sheet.set_col_width(1, 9.0);
+        assert_eq!(sheet.column_widths().get(&1), Some(&9.0));
+        assert!(!sheet.physical_column_widths().contains_key(&1));
+        assert!(!sheet.imported_column_axis_measures().contains_key(&1));
+        sheet.set_row_height(1, 9.0);
+        assert_eq!(sheet.row_heights().get(&1), Some(&9.0));
+        assert!(!sheet.imported_row_axis_measures().contains_key(&1));
     }
 
     #[test]

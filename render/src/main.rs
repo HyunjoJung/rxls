@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rxls::Workbook;
 use rxls_render::{
     build_print_document, render_print_document_pdf, render_print_page_png, render_scene_svg,
-    render_sheet_svg, Fixed, FontPack, PathCommand, PrintOptions, Rect, RenderOptions, RenderRange,
-    RenderSelection, Rgb, Scene, SceneNode, TextAnchor, TextBaseline, FIXED_UNITS_PER_PIXEL,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    render_sheet_svg, Fixed, FontPack, PathCommand, PrintDocument, PrintOptions, Rect,
+    RenderOptions, RenderRange, RenderSelection, Rgb, Scene, SceneNode, TextAnchor, TextBaseline,
+    FIXED_UNITS_PER_PIXEL, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
 use sha2::{Digest, Sha256};
 
@@ -80,12 +80,49 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|| sheet.print_gridlines());
             sheet_options.gridlines &= source_print_gridlines;
         }
-        let output = render_sheet_svg(&workbook, index, &sheet_options)?;
+        let single_page_document = if command.single_page_sheets {
+            Some(build_print_document(
+                &workbook,
+                index,
+                &PrintOptions {
+                    render: sheet_options.clone(),
+                    single_page_sheets: true,
+                    ..PrintOptions::default()
+                },
+            )?)
+        } else {
+            None
+        };
+        let (svg, scene_sha256, canvas_width_raw, canvas_height_raw, report_json) =
+            if let Some(document) = single_page_document.as_ref() {
+                let page = document
+                    .pages
+                    .first()
+                    .ok_or("single-page render produced no page")?;
+                let svg = render_scene_svg(&page.scene, sheet_options.limits.max_output_bytes)?;
+                let mut report = document.report.source.clone();
+                report.svg_bytes = svg.len() as u64;
+                (
+                    svg,
+                    scene_sha256_hex(&page.scene),
+                    page.scene.width.raw(),
+                    page.scene.height.raw(),
+                    report.to_json(),
+                )
+            } else {
+                let output = render_sheet_svg(&workbook, index, &sheet_options)?;
+                (
+                    output.svg,
+                    scene_sha256_hex(&output.scene),
+                    output.scene.width.raw(),
+                    output.scene.height.raw(),
+                    output.report.to_json(),
+                )
+            };
         let file = format!("sheet-{index:04}.svg");
-        let svg_sha256 = sha256_hex(output.svg.as_bytes());
-        let scene_sha256 = scene_sha256_hex(&output.scene);
+        let svg_sha256 = sha256_hex(svg.as_bytes());
         bundle_bytes = bundle_bytes
-            .checked_add(output.svg.len() as u64)
+            .checked_add(svg.len() as u64)
             .ok_or("bundle output byte count overflow")?;
         if bundle_bytes > MAX_BUNDLE_BYTES {
             return Err(format!(
@@ -93,7 +130,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        fs::write(transaction.staging_dir().join(&file), output.svg.as_bytes())?;
+        fs::write(transaction.staging_dir().join(&file), svg.as_bytes())?;
         let visibility = if sheet.is_very_hidden() {
             "very_hidden"
         } else if sheet.is_hidden() {
@@ -110,6 +147,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 PrintBundlePolicy {
                     single_page_sheets: command.single_page_sheets,
                     png_dpi: command.png_dpi,
+                    prebuilt_document: single_page_document,
                 },
                 transaction.staging_dir(),
                 &mut bundle_bytes,
@@ -122,12 +160,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             name: sheet.name.clone(),
             visibility,
             file,
-            canvas_width_raw: output.scene.width.raw(),
-            canvas_height_raw: output.scene.height.raw(),
-            svg_bytes: output.svg.len() as u64,
+            canvas_width_raw,
+            canvas_height_raw,
+            svg_bytes: svg.len() as u64,
             svg_sha256,
             scene_sha256,
-            report_json: output.report.to_json(),
+            report_json,
             print,
         });
     }
@@ -464,10 +502,11 @@ struct BundlePrint {
     png_dpi: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PrintBundlePolicy {
     single_page_sheets: bool,
     png_dpi: u32,
+    prebuilt_document: Option<PrintDocument>,
 }
 
 fn render_print_bundle(
@@ -479,15 +518,19 @@ fn render_print_bundle(
     staging_dir: &Path,
     bundle_bytes: &mut u64,
 ) -> Result<BundlePrint, Box<dyn Error>> {
-    let document = build_print_document(
-        workbook,
-        sheet_index,
-        &PrintOptions {
-            render: render_options.clone(),
-            single_page_sheets: policy.single_page_sheets,
-            ..PrintOptions::default()
-        },
-    )?;
+    let document = if let Some(document) = policy.prebuilt_document {
+        document
+    } else {
+        build_print_document(
+            workbook,
+            sheet_index,
+            &PrintOptions {
+                render: render_options.clone(),
+                single_page_sheets: policy.single_page_sheets,
+                ..PrintOptions::default()
+            },
+        )?
+    };
     let page_dir_name = format!("sheet-{sheet_index:04}-pages");
     let page_dir = staging_dir.join(&page_dir_name);
     if backends.contains(&PrintBackend::Svg) || backends.contains(&PrintBackend::Png) {

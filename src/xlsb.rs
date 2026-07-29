@@ -18,7 +18,9 @@ use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
-use crate::model::{OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight, XlsbDefaultColumnWidth};
+use crate::model::{
+    ImportedAxisMeasure, OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight, XlsbDefaultColumnWidth,
+};
 use crate::{
     format, rk_to_f64, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle,
     Chart, Color, Comment, DataValidation, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata,
@@ -105,6 +107,8 @@ const MAX_DVAL_RANGES: usize = 8192;
 const MAX_TABLE_COLUMNS: usize = 16_384;
 const MAX_XLSB_COL_INDEX: u32 = 16_383;
 const MAX_XLSB_ROW_INDEX: u32 = 1_048_575;
+const MAX_XLSB_ROW_HEIGHT_TWIPS: u16 = 8_192;
+const XLSB_APPLICATION_DEFAULT_COL_WIDTH_256: u32 = 8 * 256 + 128;
 const MAX_XLSB_SUPPORTING_LINKS: usize = 1 << 20;
 const MAX_XLSB_EXTERNAL_NAMES: usize = 1 << 20;
 const MAX_XLSB_STYLE_RECORDS: usize = 65_536;
@@ -355,9 +359,21 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             Some(XlsbDefaultColumnWidth::ApplicationDefault)
         };
         let ooxml_implicit_row_height = if is_worksheet && metadata.default_row_height.is_none() {
-            OoxmlImplicitRowHeight::ApplicationDefault
+            OoxmlImplicitRowHeight::XlsbApplicationDefault
         } else {
             OoxmlImplicitRowHeight::None
+        };
+        let imported_default_column_axis_measure = match xlsb_default_col_width {
+            Some(XlsbDefaultColumnWidth::Digits256(width)) => {
+                Some(ImportedAxisMeasure::DigitWidth256(width))
+            }
+            Some(XlsbDefaultColumnWidth::BaseCharacters(characters)) => u32::from(characters)
+                .checked_mul(256)
+                .map(ImportedAxisMeasure::DigitBaseWidth256),
+            Some(XlsbDefaultColumnWidth::ApplicationDefault) => Some(
+                ImportedAxisMeasure::DigitWidth256(XLSB_APPLICATION_DEFAULT_COL_WIDTH_256),
+            ),
+            None => None,
         };
         let default_hidden_row_exceptions = (is_worksheet && metadata.default_rows_hidden)
             .then_some(std::mem::take(&mut metadata.explicit_visible_rows));
@@ -399,6 +415,10 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_widths: metadata.col_widths,
             xlsb_col_widths_256: metadata.col_widths_256,
             xlsb_default_col_width,
+            imported_row_axis_measures: metadata.imported_row_axis_measures,
+            imported_default_row_axis_measure: metadata.imported_default_row_axis_measure,
+            imported_column_axis_measures: metadata.imported_column_axis_measures,
+            imported_default_column_axis_measure,
             default_row_height: metadata.default_row_height,
             default_col_width: metadata.default_col_width,
             ooxml_implicit_col_width,
@@ -1607,6 +1627,9 @@ struct SheetReadMetadata {
     row_heights: BTreeMap<u32, f32>,
     col_widths: BTreeMap<u16, f32>,
     col_widths_256: BTreeMap<u16, u32>,
+    imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
+    imported_column_axis_measures: BTreeMap<u16, ImportedAxisMeasure>,
+    imported_default_row_axis_measure: Option<ImportedAxisMeasure>,
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
     default_col_width_256: Option<u32>,
@@ -1989,10 +2012,16 @@ fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
     else {
         return;
     };
-    if height_twips > 0 && flags & (1 << 13) != 0 {
+    if row > MAX_XLSB_ROW_INDEX {
+        return;
+    }
+    if (1..=MAX_XLSB_ROW_HEIGHT_TWIPS).contains(&height_twips) && flags & (1 << 13) != 0 {
         metadata
             .row_heights
             .insert(row, f32::from(height_twips) / 20.0);
+        metadata
+            .imported_row_axis_measures
+            .insert(row, ImportedAxisMeasure::Twips(u32::from(height_twips)));
     }
     if flags & (1 << 12) != 0 {
         metadata.hidden_rows.insert(row);
@@ -2050,6 +2079,9 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
         if (1..=65_535).contains(&width_256) {
             metadata.col_widths.insert(col, width_256 as f32 / 256.0);
             metadata.col_widths_256.insert(col, width_256);
+            metadata
+                .imported_column_axis_measures
+                .insert(col, ImportedAxisMeasure::DigitWidth256(width_256));
         }
         if flags & 0x01 != 0 {
             metadata.hidden_cols.insert(col);
@@ -2077,6 +2109,7 @@ fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
     metadata.default_col_width_256 = None;
     metadata.ooxml_base_col_width = None;
     metadata.default_row_height = None;
+    metadata.imported_default_row_axis_measure = None;
     metadata.default_rows_hidden = flags & 0x0002 != 0;
     if default_width_256 == u32::MAX {
         if base_characters <= 255 {
@@ -2090,6 +2123,9 @@ fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
     // fUnsynced is set. Otherwise the application default remains in force.
     if flags & 0x0001 != 0 && default_row_height_twips > 0 {
         metadata.default_row_height = Some(f32::from(default_row_height_twips) / 20.0);
+        metadata.imported_default_row_axis_measure = Some(ImportedAxisMeasure::Twips(u32::from(
+            default_row_height_twips,
+        )));
     }
 }
 
@@ -3743,8 +3779,18 @@ mod tests {
             wb.sheets[0].xlsb_default_column_width(),
             Some(XlsbDefaultColumnWidth::ApplicationDefault)
         );
+        assert_eq!(
+            wb.sheets[0].imported_default_column_axis_measure(),
+            Some(ImportedAxisMeasure::DigitWidth256(
+                XLSB_APPLICATION_DEFAULT_COL_WIDTH_256
+            ))
+        );
         assert_eq!(wb.sheets[0].default_row_height(), None);
         assert!(wb.sheets[0].has_implicit_ooxml_row_height());
+        assert_eq!(
+            wb.sheets[0].implicit_ooxml_row_height_source(),
+            Some(OoxmlImplicitRowHeight::XlsbApplicationDefault)
+        );
         assert_eq!(
             wb.sheets[0]
                 .rich_text_runs(0, 0)
@@ -3799,13 +3845,23 @@ mod tests {
             sheet.xlsb_default_column_width(),
             Some(XlsbDefaultColumnWidth::Digits256(14 * 256))
         );
+        assert_eq!(
+            sheet.imported_column_axis_measures().get(&0),
+            Some(&ImportedAxisMeasure::DigitWidth256(18 * 256))
+        );
+        assert_eq!(
+            sheet.imported_default_column_axis_measure(),
+            Some(ImportedAxisMeasure::DigitWidth256(14 * 256))
+        );
         assert!(sheet.hidden_columns().contains(&0));
 
         sheet.set_col_width(0, 20.0);
         assert!(sheet.xlsb_column_widths_256().get(&0).is_none());
+        assert!(sheet.imported_column_axis_measures().get(&0).is_none());
         assert_eq!(sheet.column_widths().get(&0), Some(&20.0));
         sheet.set_default_col_width(12.0);
         assert_eq!(sheet.xlsb_default_column_width(), None);
+        assert_eq!(sheet.imported_default_column_axis_measure(), None);
 
         let mut oversized = Vec::new();
         oversized.extend_from_slice(&0_u32.to_le_bytes());
@@ -4160,6 +4216,10 @@ mod tests {
 
         let custom_row = parse(u32::MAX, 8, 0x0001);
         assert_eq!(custom_row.default_row_height, Some(15.0));
+        assert_eq!(
+            custom_row.imported_default_row_axis_measure,
+            Some(ImportedAxisMeasure::Twips(300))
+        );
 
         let default_hidden = parse(u32::MAX, 8, 0x0002);
         assert!(default_hidden.default_rows_hidden);
@@ -4208,6 +4268,59 @@ mod tests {
             metadata.hidden_rows.iter().copied().collect::<Vec<_>>(),
             [2]
         );
+    }
+
+    #[test]
+    fn xlsb_row_geometry_enforces_schema_row_and_height_bounds() {
+        let row_header = |row: u32, height_twips: u16, flags: u16| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&row.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&height_twips.to_le_bytes());
+            payload.extend_from_slice(&flags.to_le_bytes());
+            payload
+        };
+        let mut metadata = SheetReadMetadata::default();
+        let styles = Styles::default();
+
+        apply_row_outline(
+            &row_header(MAX_XLSB_ROW_INDEX, MAX_XLSB_ROW_HEIGHT_TWIPS, 1 << 13),
+            &mut metadata,
+            &styles,
+        );
+        assert_eq!(
+            metadata.row_heights.get(&MAX_XLSB_ROW_INDEX),
+            Some(&(f32::from(MAX_XLSB_ROW_HEIGHT_TWIPS) / 20.0))
+        );
+        assert_eq!(
+            metadata.imported_row_axis_measures.get(&MAX_XLSB_ROW_INDEX),
+            Some(&ImportedAxisMeasure::Twips(u32::from(
+                MAX_XLSB_ROW_HEIGHT_TWIPS
+            )))
+        );
+
+        let out_of_range_row = MAX_XLSB_ROW_INDEX + 1;
+        apply_row_outline(
+            &row_header(out_of_range_row, 300, (1 << 13) | (1 << 12)),
+            &mut metadata,
+            &styles,
+        );
+        assert!(!metadata.row_heights.contains_key(&out_of_range_row));
+        assert!(!metadata
+            .imported_row_axis_measures
+            .contains_key(&out_of_range_row));
+        assert!(!metadata.hidden_rows.contains(&out_of_range_row));
+        assert!(!metadata.explicit_visible_rows.contains(&out_of_range_row));
+
+        let oversized_height = MAX_XLSB_ROW_HEIGHT_TWIPS + 1;
+        apply_row_outline(
+            &row_header(7, oversized_height, 1 << 13),
+            &mut metadata,
+            &styles,
+        );
+        assert!(!metadata.row_heights.contains_key(&7));
+        assert!(!metadata.imported_row_axis_measures.contains_key(&7));
+        assert!(metadata.explicit_visible_rows.contains(&7));
     }
 
     #[test]

@@ -1096,8 +1096,13 @@ fn prepare_single_page_sheet_document(
         pages: vec![map.clone()],
         warnings: Vec::new(),
     };
-    let source_dependencies =
-        external_render_dependency_cells(sheet, &[report.source.range], &render_options, None)?;
+    let source_dependencies = external_render_dependency_cells(
+        sheet,
+        &[report.source.range],
+        &render_options,
+        None,
+        true,
+    )?;
     let source_identity = print_source_identity(
         sheet,
         sheet_index,
@@ -1301,6 +1306,7 @@ pub fn prepare_sheet_print_document(
                 &area.measured_rows,
                 &area.measured_columns,
             )),
+            false,
         )?);
     }
     let source_dependencies = source_dependencies.into_iter().collect::<Vec<_>>();
@@ -1409,7 +1415,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v13");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v14");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1440,12 +1446,17 @@ fn print_source_identity(
         &sheet.biff_uses_application_default_row_height(),
     );
     update_debug(&mut digest, sheet.physical_column_widths());
+    update_debug(&mut digest, sheet.imported_column_axis_measures());
+    update_debug(&mut digest, &sheet.imported_default_column_axis_measure());
     update_debug(&mut digest, &sheet.default_column_width());
     update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
     update_debug(&mut digest, &sheet.ooxml_uses_defaulted_base_column_width());
     update_debug(&mut digest, sheet.row_heights());
+    update_debug(&mut digest, sheet.imported_row_axis_measures());
+    update_debug(&mut digest, &sheet.imported_default_row_axis_measure());
     update_debug(&mut digest, &sheet.default_row_height());
     update_debug(&mut digest, &sheet.has_implicit_ooxml_row_height());
+    update_debug(&mut digest, &sheet.implicit_ooxml_row_height_source());
     update_debug(&mut digest, &sheet.verified_xlsx_normal_font_size_pt());
     update_debug(&mut digest, sheet.hidden_columns());
     update_debug(&mut digest, sheet.hidden_rows());
@@ -4338,6 +4349,47 @@ mod tests {
         build_print_page(&exact, &prepared, 0).unwrap();
         assert!(matches!(
             build_print_page(&fractional, &prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed"
+            })
+        ));
+    }
+
+    #[test]
+    fn prepared_identity_distinguishes_equal_public_and_exact_axis_geometry() {
+        let bytes = zip_parts(&[
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Geometry" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetFormatPr defaultRowHeight="14"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
+            ),
+        ]);
+        let exact = Workbook::open(&bytes).unwrap();
+        let mut authored = Workbook::open(&bytes).unwrap();
+        authored.sheets[0].set_default_row_height(14.0);
+
+        assert_eq!(
+            exact.sheets[0].default_row_height(),
+            authored.sheets[0].default_row_height()
+        );
+        assert_eq!(
+            exact.sheets[0].imported_default_row_axis_measure(),
+            Some(rxls::ImportedAxisMeasure::Twips(280))
+        );
+        assert_eq!(authored.sheets[0].imported_default_row_axis_measure(), None);
+
+        let options = PrintOptions::default();
+        let prepared = prepare_print_document(&exact, 0, &options).unwrap();
+        build_print_page(&exact, &prepared, 0).unwrap();
+        assert!(matches!(
+            build_print_page(&authored, &prepared, 0),
             Err(RenderError::Backend {
                 reason: "prepared_print_source_changed"
             })

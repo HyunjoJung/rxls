@@ -16,8 +16,8 @@ use quick_xml::{Reader, XmlVersion};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CellStyleOverlay, OoxmlImplicitColumnWidth, OoxmlImplicitRowHeight, TableStyleApplication,
-    TableStyleDefinition, TableStyleRegion,
+    parse_decimal_ratio_u64, CellStyleOverlay, ImportedAxisMeasure, OoxmlImplicitColumnWidth,
+    OoxmlImplicitRowHeight, TableStyleApplication, TableStyleDefinition, TableStyleRegion,
 };
 use crate::{
     format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
@@ -155,6 +155,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            imported_column_axis_measures,
+            imported_row_axis_measures,
             col_formats,
             row_formats,
             hidden_cols,
@@ -163,6 +165,8 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             explicit_visible_rows,
             default_row_height,
             default_col_width,
+            imported_default_row_axis_measure,
+            imported_default_column_axis_measure,
             base_col_width,
             defaulted_base_col_width,
             collapsed_rows,
@@ -184,7 +188,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             OoxmlImplicitColumnWidth::ApplicationDefault
         };
         let ooxml_implicit_row_height = if is_worksheet && default_row_height.is_none() {
-            OoxmlImplicitRowHeight::ApplicationDefault
+            OoxmlImplicitRowHeight::XlsxApplicationDefault
         } else {
             OoxmlImplicitRowHeight::None
         };
@@ -314,6 +318,10 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            imported_column_axis_measures,
+            imported_default_column_axis_measure,
+            imported_row_axis_measures,
+            imported_default_row_axis_measure,
             col_formats,
             row_formats,
             default_format: styles.cell_styles.first().cloned(),
@@ -438,6 +446,8 @@ const MAX_XLSX_STYLE_RECORDS: usize = 65_536;
 const MAX_XLSX_CUSTOM_NUMBER_FORMATS: usize = 65_536;
 const MAX_XLSX_FORMAT_CODE_BYTES: usize = 4_096;
 const MAX_XLSX_INDEXED_COLORS: usize = 256;
+const MAX_XLSX_COLUMN_INDEX: u16 = 16_383;
+const MAX_XLSX_ROW_INDEX: u32 = 1_048_575;
 // [MS-OI29500] Part 1 §18.4.11: Office accepts SpreadsheetML font sizes from
 // 1 through 409.55 points. The verified renderer sidecar is deliberately
 // narrower because the public Font model uses whole points: only exact
@@ -5400,6 +5410,8 @@ struct ParsedSheet {
     col_outline: BTreeMap<u16, u8>,
     col_widths: BTreeMap<u16, f32>,
     row_heights: BTreeMap<u32, f32>,
+    imported_column_axis_measures: BTreeMap<u16, ImportedAxisMeasure>,
+    imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
     col_formats: BTreeMap<u16, CellStyle>,
     row_formats: BTreeMap<u32, CellStyle>,
     hidden_cols: BTreeSet<u16>,
@@ -5408,6 +5420,8 @@ struct ParsedSheet {
     explicit_visible_rows: BTreeSet<u32>,
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
+    imported_default_row_axis_measure: Option<ImportedAxisMeasure>,
+    imported_default_column_axis_measure: Option<ImportedAxisMeasure>,
     base_col_width: Option<f32>,
     defaulted_base_col_width: bool,
     collapsed_rows: BTreeSet<u32>,
@@ -5420,6 +5434,40 @@ struct ParsedSheet {
     show_headers: Option<bool>,
     right_to_left: bool,
     tab_selected: bool,
+}
+
+fn scaled_ratio_u32(numerator: u64, denominator: u64, scale: u32) -> Option<u32> {
+    let scaled = u128::from(numerator).checked_mul(u128::from(scale))?;
+    (scaled % u128::from(denominator) == 0)
+        .then(|| u32::try_from(scaled / u128::from(denominator)).ok())
+        .flatten()
+}
+
+fn parse_point_axis_measure(value: &str) -> Option<ImportedAxisMeasure> {
+    let (numerator, denominator) = parse_decimal_ratio_u64(value)?;
+    if numerator == 0 {
+        return None;
+    }
+    Some(
+        scaled_ratio_u32(numerator, denominator, 20)
+            .map(ImportedAxisMeasure::Twips)
+            .unwrap_or(ImportedAxisMeasure::PointRatio(numerator, denominator)),
+    )
+}
+
+fn parse_character_axis_measure(value: &str) -> Option<ImportedAxisMeasure> {
+    let (numerator, denominator) = parse_decimal_ratio_u64(value)?;
+    if numerator == 0 {
+        return None;
+    }
+    Some(
+        scaled_ratio_u32(numerator, denominator, 256)
+            .map(ImportedAxisMeasure::CharacterWidth256)
+            .unwrap_or(ImportedAxisMeasure::CharacterWidthRatio(
+                numerator,
+                denominator,
+            )),
+    )
 }
 
 type SheetRange = (u32, u16, u32, u16);
@@ -5585,8 +5633,8 @@ fn parse_sheet(
     // in [ISO/IEC 29500]; when omitted, position is implicit (cells fill
     // left-to-right, rows top-to-bottom). Some writers (LibreOffice, EPPlus, …)
     // omit it. Without this, every `r`-less cell would be dropped.
-    let mut cur_row: u32 = 0;
-    let mut cur_col: u16 = 0;
+    let mut cur_row: Option<u32> = Some(0);
+    let mut cur_col: Option<u16> = Some(0);
     let mut row_started = false;
     let mut selected_sheet_view_rank = 0u8;
     let mut in_selected_sheet_view = false;
@@ -5639,44 +5687,69 @@ fn parse_sheet(
             }
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
                 b"row" => {
-                    match attr(&e, b"r").and_then(|s| s.parse::<u32>().ok()) {
-                        Some(n) if n >= 1 => cur_row = n - 1,
-                        _ if row_started => cur_row = cur_row.saturating_add(1),
-                        _ => {}
-                    }
+                    cur_row = match attr(&e, b"r") {
+                        Some(value) => value
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(|row| row.checked_sub(1))
+                            .filter(|row| *row <= MAX_XLSX_ROW_INDEX),
+                        None if row_started => cur_row
+                            .and_then(|row| row.checked_add(1))
+                            .filter(|row| *row <= MAX_XLSX_ROW_INDEX),
+                        None => Some(0),
+                    };
                     row_started = true;
-                    cur_col = 0;
-                    if let Some(level) = attr(&e, b"outlineLevel")
-                        .and_then(|s| s.parse::<u8>().ok())
-                        .filter(|level| *level > 0)
-                    {
-                        parsed.row_outline.insert(cur_row, level);
-                    }
-                    if attr(&e, b"collapsed").as_deref().is_some_and(attr_true) {
-                        parsed.collapsed_rows.insert(cur_row);
-                    }
-                    if let Some(height) = attr(&e, b"ht").and_then(|s| s.parse::<f32>().ok()) {
-                        parsed.row_heights.insert(cur_row, height);
-                    }
-                    if attr(&e, b"hidden").as_deref().is_some_and(attr_true) {
-                        parsed.hidden_rows.insert(cur_row);
-                        parsed.explicit_visible_rows.remove(&cur_row);
-                    } else {
-                        parsed.hidden_rows.remove(&cur_row);
-                        parsed.explicit_visible_rows.insert(cur_row);
-                    }
-                    if let Some(style) = attr(&e, b"s")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .and_then(|index| styles.cell_style(index))
-                    {
-                        parsed.row_formats.insert(cur_row, style.clone());
+                    cur_col = Some(0);
+                    if let Some(cur_row) = cur_row {
+                        if let Some(level) = attr(&e, b"outlineLevel")
+                            .and_then(|s| s.parse::<u8>().ok())
+                            .filter(|level| (1..=7).contains(level))
+                        {
+                            parsed.row_outline.insert(cur_row, level);
+                        }
+                        if attr(&e, b"collapsed").as_deref().is_some_and(attr_true) {
+                            parsed.collapsed_rows.insert(cur_row);
+                        }
+                        if let Some(source_height) = attr(&e, b"ht") {
+                            if let Ok(height) = source_height.trim().parse::<f32>() {
+                                parsed.row_heights.insert(cur_row, height);
+                                match parse_point_axis_measure(&source_height) {
+                                    Some(measure) => {
+                                        parsed.imported_row_axis_measures.insert(cur_row, measure);
+                                    }
+                                    None => {
+                                        parsed.imported_row_axis_measures.remove(&cur_row);
+                                    }
+                                }
+                            }
+                        }
+                        if attr(&e, b"hidden").as_deref().is_some_and(attr_true) {
+                            parsed.hidden_rows.insert(cur_row);
+                            parsed.explicit_visible_rows.remove(&cur_row);
+                        } else {
+                            parsed.hidden_rows.remove(&cur_row);
+                            parsed.explicit_visible_rows.insert(cur_row);
+                        }
+                        if let Some(style) = attr(&e, b"s")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .and_then(|index| styles.cell_style(index))
+                        {
+                            parsed.row_formats.insert(cur_row, style.clone());
+                        }
                     }
                 }
                 b"sheetFormatPr" => {
-                    parsed.default_row_height =
-                        attr(&e, b"defaultRowHeight").and_then(|s| s.parse::<f32>().ok());
-                    parsed.default_col_width = attr(&e, b"defaultColWidth")
-                        .and_then(|s| s.parse::<f32>().ok())
+                    let default_row_height = attr(&e, b"defaultRowHeight");
+                    parsed.default_row_height = default_row_height
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<f32>().ok());
+                    parsed.imported_default_row_axis_measure = default_row_height
+                        .as_deref()
+                        .and_then(parse_point_axis_measure);
+                    let default_col_width = attr(&e, b"defaultColWidth");
+                    parsed.default_col_width = default_col_width
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<f32>().ok())
                         .filter(|width| width.is_finite() && *width > 0.0);
                     // ECMA-376 defaults baseColWidth to 8 when the element is
                     // present. Keep that import branch separate from the
@@ -5695,6 +5768,19 @@ fn parse_sheet(
                             .map(|width| width as f32),
                         None => None,
                     };
+                    parsed.imported_default_column_axis_measure =
+                        if parsed.default_col_width.is_some() {
+                            default_col_width
+                                .as_deref()
+                                .and_then(parse_character_axis_measure)
+                        } else {
+                            parsed.base_col_width.and_then(|characters| {
+                                let characters = characters as u32;
+                                characters
+                                    .checked_mul(256)
+                                    .map(ImportedAxisMeasure::CharacterBaseWidth256)
+                            })
+                        };
                     parsed.default_rows_hidden = attr(&e, b"zeroHeight")
                         .as_deref()
                         .and_then(parse_bool_attr)
@@ -5730,7 +5816,13 @@ fn parse_sheet(
                         .unwrap_or(first)
                         .min(16_384);
                     if first <= last {
-                        let width = attr(&e, b"width").and_then(|s| s.parse::<f32>().ok());
+                        let width_source = attr(&e, b"width");
+                        let width = width_source
+                            .as_deref()
+                            .and_then(|s| s.trim().parse::<f32>().ok());
+                        let width_measure = width_source
+                            .as_deref()
+                            .and_then(parse_character_axis_measure);
                         let hidden = attr(&e, b"hidden").as_deref().is_some_and(attr_true);
                         let style = attr(&e, b"style")
                             .and_then(|value| value.parse::<usize>().ok())
@@ -5739,6 +5831,16 @@ fn parse_sheet(
                             if let Ok(col) = u16::try_from(col - 1) {
                                 if let Some(width) = width {
                                     parsed.col_widths.insert(col, width);
+                                    match width_measure {
+                                        Some(measure) => {
+                                            parsed
+                                                .imported_column_axis_measures
+                                                .insert(col, measure);
+                                        }
+                                        None => {
+                                            parsed.imported_column_axis_measures.remove(&col);
+                                        }
+                                    }
                                 }
                                 if hidden {
                                     parsed.hidden_cols.insert(col);
@@ -5751,7 +5853,7 @@ fn parse_sheet(
                     }
                     if let Some(level) = attr(&e, b"outlineLevel")
                         .and_then(|s| s.parse::<u8>().ok())
-                        .filter(|level| *level > 0)
+                        .filter(|level| (1..=7).contains(level))
                     {
                         if first <= last {
                             for col in first..=last {
@@ -5823,16 +5925,30 @@ fn parse_sheet(
                 b"c" => {
                     // Use the explicit `r` when present (and resync the implicit
                     // column to it); otherwise fall back to the running position.
-                    let pos = match attr(&e, b"r").as_deref().and_then(parse_ref) {
-                        Some((row, col)) => {
-                            cur_row = row;
-                            cur_col = col;
+                    // A cell reference never repairs an invalid enclosing row:
+                    // only a later valid `<row r>` may resynchronize row order.
+                    let pos = match (cur_row, attr(&e, b"r")) {
+                        (Some(_), Some(reference)) => match parse_ref(&reference) {
+                            Some((row, col)) => {
+                                cur_col = col
+                                    .checked_add(1)
+                                    .filter(|column| *column <= MAX_XLSX_COLUMN_INDEX);
+                                Some((row, col))
+                            }
+                            None => {
+                                cur_col = None;
+                                None
+                            }
+                        },
+                        (Some(row), None) => cur_col.map(|col| {
+                            cur_col = col
+                                .checked_add(1)
+                                .filter(|column| *column <= MAX_XLSX_COLUMN_INDEX);
                             (row, col)
-                        }
-                        None => (cur_row, cur_col),
+                        }),
+                        (None, _) => None,
                     };
-                    cur_col = cur_col.saturating_add(1);
-                    rc = Some(pos);
+                    rc = pos;
                     ctype = attr(&e, b"t").unwrap_or_default();
                     style_idx = attr(&e, b"s").and_then(|s| s.parse().ok()).unwrap_or(0);
                     value.clear();
@@ -7786,6 +7902,10 @@ mod tests {
         assert_eq!(s.implicit_ooxml_column_width(), Some(None));
         assert_eq!(s.default_row_height(), None);
         assert!(s.has_implicit_ooxml_row_height());
+        assert_eq!(
+            s.implicit_ooxml_row_height_source(),
+            Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+        );
     }
 
     #[test]
@@ -7825,11 +7945,258 @@ mod tests {
         assert_eq!(explicit.default_col_width, Some(8.43));
         assert_eq!(explicit.base_col_width, Some(8.0));
         assert!(!explicit.defaulted_base_col_width);
+        assert_eq!(
+            explicit.imported_default_column_axis_measure,
+            Some(ImportedAxisMeasure::CharacterWidthRatio(843, 100))
+        );
 
         let base = parse(r#"<sheetFormatPr baseColWidth="10"/>"#);
         assert_eq!(base.default_col_width, None);
         assert_eq!(base.base_col_width, Some(10.0));
         assert!(!base.defaulted_base_col_width);
+        assert_eq!(
+            base.imported_default_column_axis_measure,
+            Some(ImportedAxisMeasure::CharacterBaseWidth256(10 * 256))
+        );
+    }
+
+    #[test]
+    fn worksheet_retains_exact_twip_and_width_256_axis_sources() {
+        let xml = r#"<worksheet><sheetFormatPr defaultRowHeight="15" defaultColWidth="8"/><cols><col min="1" max="2" width="14"/></cols><sheetData><row r="1" ht="18"/><row r="2" hidden="1" ht="12.75"/></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(
+            parsed.imported_default_row_axis_measure,
+            Some(ImportedAxisMeasure::Twips(300))
+        );
+        assert_eq!(
+            parsed.imported_default_column_axis_measure,
+            Some(ImportedAxisMeasure::CharacterWidth256(8 * 256))
+        );
+        assert_eq!(
+            parsed
+                .imported_column_axis_measures
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [
+                ImportedAxisMeasure::CharacterWidth256(14 * 256),
+                ImportedAxisMeasure::CharacterWidth256(14 * 256),
+            ]
+        );
+        assert_eq!(
+            parsed.imported_row_axis_measures.get(&0),
+            Some(&ImportedAxisMeasure::Twips(360))
+        );
+        assert_eq!(
+            parsed.imported_row_axis_measures.get(&1),
+            Some(&ImportedAxisMeasure::Twips(255))
+        );
+        assert!(parsed.hidden_rows.contains(&1));
+    }
+
+    #[test]
+    fn worksheet_retains_decimal_and_scientific_axis_sources_without_float_drift() {
+        let xml = r#"<worksheet><sheetFormatPr defaultRowHeight=" 1.5E1 " defaultColWidth="8.43"/><cols><col min="1" max="1" width="8.43"/></cols><sheetData><row r="1" ht="1.2345E1"/></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.default_row_height, Some(15.0));
+        assert_eq!(
+            parsed.imported_default_row_axis_measure,
+            Some(ImportedAxisMeasure::Twips(300))
+        );
+        assert_eq!(
+            parsed.imported_default_column_axis_measure,
+            Some(ImportedAxisMeasure::CharacterWidthRatio(843, 100))
+        );
+        assert_eq!(
+            parsed.imported_column_axis_measures.get(&0),
+            Some(&ImportedAxisMeasure::CharacterWidthRatio(843, 100))
+        );
+        assert_eq!(
+            parsed.imported_row_axis_measures.get(&0),
+            Some(&ImportedAxisMeasure::PointRatio(2_469, 200))
+        );
+    }
+
+    #[test]
+    fn worksheet_invalid_column_widths_keep_legacy_values_without_exact_provenance() {
+        let xml = r#"<worksheet><cols>
+            <col min="1" max="1" width="0" style="1"/>
+            <col min="2" max="2" width="NaN" hidden="1" style="1"/>
+        </cols><sheetData/></worksheet>"#;
+        let styles = parse_styles(
+            r#"<styleSheet><cellXfs count="2"><xf/><xf applyAlignment="1"><alignment wrapText="1"/></xf></cellXfs></styleSheet>"#,
+            &ThemeColors::default(),
+        );
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.col_widths.get(&0), Some(&0.0));
+        assert!(parsed
+            .col_widths
+            .get(&1)
+            .is_some_and(|width| width.is_nan()));
+        assert!(parsed.imported_column_axis_measures.is_empty());
+        assert_eq!(
+            parsed.col_formats.keys().copied().collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(parsed.hidden_cols.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn worksheet_implicit_cell_columns_fail_closed_outside_the_ooxml_grid() {
+        let xml = r#"<worksheet><sheetData><row r="1">
+            <c r="XFD1" t="inlineStr"><is><t>last</t></is></c>
+            <c t="inlineStr"><is><t>overflow</t></is></c>
+            <c t="inlineStr"><is><t>still-overflow</t></is></c>
+            <c r="A1" t="inlineStr"><is><t>resynced</t></is></c>
+            <c t="inlineStr"><is><t>next</t></is></c>
+            <c r="XFE1" t="inlineStr"><is><t>invalid-explicit</t></is></c>
+            <c t="inlineStr"><is><t>poisoned</t></is></c>
+            <c r="C1" t="inlineStr"><is><t>resynced-again</t></is></c>
+        </row></sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(
+            parsed
+                .cells
+                .iter()
+                .map(|cell| (cell.row, cell.col, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, MAX_XLSX_COLUMN_INDEX, "last"),
+                (0, 0, "resynced"),
+                (0, 1, "next"),
+                (0, 2, "resynced-again"),
+            ]
+        );
+    }
+
+    #[test]
+    fn worksheet_outline_levels_are_bounded_to_the_ooxml_depth() {
+        let xml = r#"<worksheet><cols>
+            <col min="1" max="1" outlineLevel="0"/>
+            <col min="2" max="2" outlineLevel="7"/>
+            <col min="3" max="3" outlineLevel="8"/>
+        </cols><sheetData>
+            <row r="1" outlineLevel="0"/>
+            <row r="2" outlineLevel="7"/>
+            <row r="3" outlineLevel="8"/>
+        </sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.col_outline.into_iter().collect::<Vec<_>>(), [(1, 7)]);
+        assert_eq!(parsed.row_outline.into_iter().collect::<Vec<_>>(), [(1, 7)]);
+    }
+
+    #[test]
+    fn worksheet_rows_and_implicit_cells_fail_closed_outside_the_ooxml_grid() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1048576" ht="18" hidden="1" outlineLevel="1" collapsed="1" s="1"><c t="inlineStr"><is><t>last</t></is></c></row>
+            <row ht="19" outlineLevel="2" collapsed="1" s="1"><c r="A1" t="inlineStr"><is><t>invalid-explicit-cell</t></is></c><c t="inlineStr"><is><t>invalid-implicit-cell</t></is></c></row>
+            <row ht="20"><c t="inlineStr"><is><t>still-invalid-implicit-row</t></is></c></row>
+            <row r="1048577" ht="22" hidden="1" outlineLevel="4" collapsed="1" s="1"><c t="inlineStr"><is><t>invalid-explicit-row</t></is></c></row>
+            <row r="1" ht="21" outlineLevel="3" collapsed="1" s="1"><c t="inlineStr"><is><t>resynced</t></is></c><c r="A1048577" t="inlineStr"><is><t>invalid-cell-ref</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let styles = parse_styles(
+            r#"<styleSheet><cellXfs count="2"><xf/><xf applyAlignment="1"><alignment wrapText="1"/></xf></cellXfs></styleSheet>"#,
+            &ThemeColors::default(),
+        );
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(
+            parsed
+                .cells
+                .iter()
+                .map(|cell| (cell.row, cell.col, cell.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(MAX_XLSX_ROW_INDEX, 0, "last"), (0, 0, "resynced"),]
+        );
+        assert_eq!(
+            parsed.row_heights.keys().copied().collect::<Vec<_>>(),
+            [0, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed
+                .imported_row_axis_measures
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed.row_outline.keys().copied().collect::<Vec<_>>(),
+            [0, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed.collapsed_rows.iter().copied().collect::<Vec<_>>(),
+            [0, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed.hidden_rows.iter().copied().collect::<Vec<_>>(),
+            [MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed
+                .explicit_visible_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            parsed.row_formats.keys().copied().collect::<Vec<_>>(),
+            [0, MAX_XLSX_ROW_INDEX]
+        );
     }
 
     #[test]

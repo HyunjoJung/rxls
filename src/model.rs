@@ -5637,12 +5637,128 @@ pub enum XlsbDefaultColumnWidth {
     BaseCharacters(u16),
 }
 
+/// Exact imported worksheet-axis geometry retained for deterministic rendering.
+///
+/// This is an internal cross-crate contract for `rxls-render`. It preserves the
+/// source integer domain where the file format provides one, while the ordinary
+/// public row-height and column-width APIs continue to expose compatibility
+/// `f32` values.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportedAxisMeasure {
+    /// Physical length in twentieths of a point.
+    Twips(u32),
+    /// Physical length in hundredths of a millimetre.
+    MillimeterHundredths(u32),
+    /// A positive physical length as a reduced numerator/denominator in points.
+    PointRatio(u64, u64),
+    /// Excel character-width units, where 256 units equal one character.
+    CharacterWidth256(u32),
+    /// A positive Excel character width as a reduced numerator/denominator.
+    CharacterWidthRatio(u64, u64),
+    /// OOXML base-character width, excluding its device-pixel allowance.
+    CharacterBaseWidth256(u32),
+    /// XLSB standard-digit units, where 256 units equal one digit.
+    DigitWidth256(u32),
+    /// XLSB base-digit width, excluding its device-pixel allowance.
+    DigitBaseWidth256(u32),
+}
+
+#[cfg_attr(not(any(feature = "xlsx", feature = "ods")), allow(dead_code))]
+pub(crate) fn parse_decimal_ratio_u64(value: &str) -> Option<(u64, u64)> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('-') {
+        return None;
+    }
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let exponent_at = value.find(['e', 'E']);
+    let (mantissa, exponent) = match exponent_at {
+        Some(index) => {
+            let exponent = value.get(index + 1..)?;
+            if exponent.is_empty() || exponent.contains(['e', 'E']) {
+                return None;
+            }
+            (value.get(..index)?, exponent.parse::<i32>().ok()?)
+        }
+        None => (value, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if fraction.contains('.')
+        || (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let digits = whole.bytes().chain(fraction.bytes());
+    let total_digits = whole.len().checked_add(fraction.len())?;
+    let leading_zeros = digits.clone().take_while(|byte| *byte == b'0').count();
+    if leading_zeros == total_digits {
+        return Some((0, 1));
+    }
+    let trailing_zeros = digits.rev().take_while(|byte| *byte == b'0').count();
+    let significant_end = total_digits.checked_sub(trailing_zeros)?;
+    let mut numerator = 0_u64;
+    for byte in whole
+        .bytes()
+        .chain(fraction.bytes())
+        .skip(leading_zeros)
+        .take(significant_end.checked_sub(leading_zeros)?)
+    {
+        numerator = numerator
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+    }
+
+    let decimal_power = i64::from(exponent)
+        .checked_sub(i64::try_from(fraction.len()).ok()?)?
+        .checked_add(i64::try_from(trailing_zeros).ok()?)?;
+    let mut denominator = 1_u64;
+    if decimal_power >= 0 {
+        numerator =
+            numerator.checked_mul(10_u64.checked_pow(u32::try_from(decimal_power).ok()?)?)?;
+    } else {
+        denominator = 10_u64.checked_pow(u32::try_from(decimal_power.checked_neg()?).ok()?)?;
+    }
+    let divisor = gcd_u64(numerator, denominator);
+    Some((numerator / divisor, denominator / divisor))
+}
+
+#[cfg_attr(not(any(feature = "xlsx", feature = "ods")), allow(dead_code))]
+const fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    if left == 0 {
+        1
+    } else {
+        left
+    }
+}
+
+#[cfg_attr(not(feature = "ods"), allow(dead_code))]
+pub(crate) fn parse_decimal_scaled_u32(value: &str, scale: u32) -> Option<u32> {
+    let (numerator, denominator) = parse_decimal_ratio_u64(value)?;
+    let scaled = u128::from(numerator).checked_mul(u128::from(scale))?;
+    if scaled % u128::from(denominator) != 0 {
+        return None;
+    }
+    u32::try_from(scaled / u128::from(denominator)).ok()
+}
+
 #[cfg_attr(not(any(feature = "xlsx", feature = "xlsb")), allow(dead_code))]
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum OoxmlImplicitRowHeight {
+pub enum OoxmlImplicitRowHeight {
     #[default]
     None,
-    ApplicationDefault,
+    /// An XLSX worksheet omitted an authoritative default row height.
+    XlsxApplicationDefault,
+    /// An XLSB worksheet omitted an authoritative default row height.
+    XlsbApplicationDefault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5760,8 +5876,16 @@ pub struct Sheet {
     /// an absolute length (currently ODS). Renderers prefer these values over
     /// the compatibility character-unit projection in `col_widths`.
     pub(crate) physical_col_widths: BTreeMap<u16, f32>,
+    /// Exact imported per-column source geometry used only by renderers.
+    pub(crate) imported_column_axis_measures: BTreeMap<u16, ImportedAxisMeasure>,
+    /// Exact imported sheet-wide column geometry used only by renderers.
+    pub(crate) imported_default_column_axis_measure: Option<ImportedAxisMeasure>,
     /// Per-row heights in points, populated by readers and authoring.
     pub(crate) row_heights: BTreeMap<u32, f32>,
+    /// Exact imported per-row source geometry used only by renderers.
+    pub(crate) imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
+    /// Exact imported sheet-wide row geometry used only by renderers.
+    pub(crate) imported_default_row_axis_measure: Option<ImportedAxisMeasure>,
     /// Explicitly hidden columns.
     pub(crate) hidden_cols: BTreeSet<u16>,
     /// Explicitly hidden rows.
@@ -6161,7 +6285,11 @@ impl Default for Sheet {
             biff_application_default_col_width: false,
             biff_application_default_row_height: false,
             physical_col_widths: BTreeMap::default(),
+            imported_column_axis_measures: BTreeMap::default(),
+            imported_default_column_axis_measure: None,
             row_heights: BTreeMap::default(),
+            imported_row_axis_measures: BTreeMap::default(),
+            imported_default_row_axis_measure: None,
             hidden_cols: BTreeSet::default(),
             hidden_rows: BTreeSet::default(),
             default_hidden_row_exceptions: None,
@@ -8336,9 +8464,33 @@ impl Sheet {
         &self.physical_col_widths
     }
 
+    /// Return exact imported per-column source geometry for renderers.
+    #[doc(hidden)]
+    pub fn imported_column_axis_measures(&self) -> &BTreeMap<u16, ImportedAxisMeasure> {
+        &self.imported_column_axis_measures
+    }
+
+    /// Return exact imported sheet-wide column geometry for renderers.
+    #[doc(hidden)]
+    pub fn imported_default_column_axis_measure(&self) -> Option<ImportedAxisMeasure> {
+        self.imported_default_column_axis_measure
+    }
+
     /// Explicit row heights in points, keyed by 0-based row.
     pub fn row_heights(&self) -> &BTreeMap<u32, f32> {
         &self.row_heights
+    }
+
+    /// Return exact imported per-row source geometry for renderers.
+    #[doc(hidden)]
+    pub fn imported_row_axis_measures(&self) -> &BTreeMap<u32, ImportedAxisMeasure> {
+        &self.imported_row_axis_measures
+    }
+
+    /// Return exact imported sheet-wide row geometry for renderers.
+    #[doc(hidden)]
+    pub fn imported_default_row_axis_measure(&self) -> Option<ImportedAxisMeasure> {
+        self.imported_default_row_axis_measure
     }
 
     /// Default column width in character units when no explicit width exists.
@@ -8383,7 +8535,16 @@ impl Sheet {
     /// sheet and imported non-OOXML formats return `false`.
     #[doc(hidden)]
     pub fn has_implicit_ooxml_row_height(&self) -> bool {
-        self.ooxml_implicit_row_height == OoxmlImplicitRowHeight::ApplicationDefault
+        self.ooxml_implicit_row_height != OoxmlImplicitRowHeight::None
+    }
+
+    /// Return the exact OOXML family that supplied an implicit row default.
+    #[doc(hidden)]
+    pub fn implicit_ooxml_row_height_source(&self) -> Option<OoxmlImplicitRowHeight> {
+        match self.ooxml_implicit_row_height {
+            OoxmlImplicitRowHeight::None => None,
+            source => Some(source),
+        }
     }
 
     /// Return an evidence-bounded XLSX Normal-style font size for rendering.
@@ -10404,10 +10565,18 @@ impl Sheet {
     pub fn set_col_width(&mut self, col: u16, chars: f32) {
         self.col_widths.insert(col, chars);
         self.xlsb_col_widths_256.remove(&col);
+        self.physical_col_widths.remove(&col);
+        self.imported_column_axis_measures.remove(&col);
     }
     /// Set a row height in points.
     pub fn set_row_height(&mut self, row: u32, points: f32) {
         self.row_heights.insert(row, points);
+        self.imported_row_axis_measures.remove(&row);
+        if !self.hidden_rows.contains(&row) {
+            if let Some(exceptions) = self.default_hidden_row_exceptions.as_mut() {
+                exceptions.insert(row);
+            }
+        }
     }
     /// Hide a column by 0-based index.
     pub fn hide_column(&mut self, col: u16) {
@@ -10456,14 +10625,18 @@ impl Sheet {
         self.default_row_height = Some(points);
         self.ooxml_implicit_row_height = OoxmlImplicitRowHeight::None;
         self.biff_application_default_row_height = false;
+        self.imported_default_row_axis_measure = None;
+        self.default_hidden_row_exceptions = None;
     }
     /// Set the default column width (character units) for columns without an
     /// explicit width.
     pub fn set_default_col_width(&mut self, chars: f32) {
         self.default_col_width = Some(chars);
         self.ooxml_implicit_col_width = OoxmlImplicitColumnWidth::None;
+        self.ooxml_defaulted_base_col_width = false;
         self.xlsb_default_col_width = None;
         self.biff_application_default_col_width = false;
+        self.imported_default_column_axis_measure = None;
     }
     /// Freeze the panes above `row` and left of `col`.
     pub fn freeze_panes(&mut self, row: u32, col: u16) {
@@ -11015,6 +11188,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decimal_ratio_parser_preserves_normal_and_scientific_values_exactly() {
+        assert_eq!(parse_decimal_ratio_u64("8.43"), Some((843, 100)));
+        assert_eq!(parse_decimal_ratio_u64("  +1.2345E1  "), Some((2469, 200)));
+        assert_eq!(parse_decimal_ratio_u64(".5e1"), Some((5, 1)));
+        assert_eq!(parse_decimal_ratio_u64("00010.00"), Some((10, 1)));
+        assert_eq!(parse_decimal_ratio_u64("0.000"), Some((0, 1)));
+        assert_eq!(
+            parse_decimal_ratio_u64("18446744073709551615"),
+            Some((u64::MAX, 1))
+        );
+    }
+
+    #[test]
+    fn decimal_ratio_parser_rejects_invalid_or_unrepresentable_values() {
+        for value in [
+            "",
+            " ",
+            "+",
+            "-1",
+            ".",
+            "1.2.3",
+            "1e",
+            "1e2e3",
+            "NaN",
+            "inf",
+            "18446744073709551616",
+            "1e-20",
+            "1e2147483648",
+        ] {
+            assert_eq!(
+                parse_decimal_ratio_u64(value),
+                None,
+                "unexpected exact ratio for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_scaled_parser_requires_an_integral_scaled_result() {
+        assert_eq!(parse_decimal_scaled_u32("12.85", 20), Some(257));
+        assert_eq!(parse_decimal_scaled_u32("1.2345e2", 20), Some(2_469));
+        assert_eq!(parse_decimal_scaled_u32("8.43", 256), None);
+        assert_eq!(parse_decimal_scaled_u32("4294967295", 1), Some(u32::MAX));
+        assert_eq!(parse_decimal_scaled_u32("4294967296", 1), None);
+    }
+
+    #[test]
+    fn authored_row_heights_invalidate_default_hidden_source_state() {
+        let mut sheet = Sheet::new("hidden defaults");
+        sheet.default_hidden_row_exceptions = Some(BTreeSet::from([1]));
+
+        sheet.set_row_height(2, 12.0);
+        assert_eq!(
+            sheet.default_hidden_row_exceptions(),
+            Some(&BTreeSet::from([1, 2]))
+        );
+
+        sheet.hide_row(3);
+        sheet.set_row_height(3, 12.0);
+        assert_eq!(
+            sheet.default_hidden_row_exceptions(),
+            Some(&BTreeSet::from([1, 2])),
+            "an explicitly hidden row must remain hidden"
+        );
+
+        sheet.set_default_row_height(14.0);
+        assert_eq!(sheet.default_hidden_row_exceptions(), None);
+    }
+
+    #[test]
     fn render_style_range_sweep_is_exact_deduplicated_and_coordinate_ordered() {
         let mut sheet = Sheet::new("style identity");
         for row in 0..128_u32 {
@@ -11404,6 +11647,22 @@ mod tests {
         assert!(!sheet.has_implicit_ooxml_row_height());
         assert_eq!(sheet.default_column_width(), Some(9.5));
         assert_eq!(sheet.visual_dimensions(), Some((3, 2, 11, 12)));
+    }
+
+    #[test]
+    fn authored_default_column_width_clears_imported_ooxml_provenance() {
+        let mut sheet = Sheet::new("geometry");
+        sheet.ooxml_implicit_col_width = OoxmlImplicitColumnWidth::ApplicationDefault;
+        sheet.ooxml_defaulted_base_col_width = true;
+        sheet.imported_default_column_axis_measure =
+            Some(ImportedAxisMeasure::DigitBaseWidth256(8 * 256));
+
+        sheet.set_default_col_width(9.5);
+
+        assert_eq!(sheet.default_column_width(), Some(9.5));
+        assert_eq!(sheet.implicit_ooxml_column_width(), None);
+        assert!(!sheet.ooxml_uses_defaulted_base_column_width());
+        assert_eq!(sheet.imported_default_column_axis_measure(), None);
     }
 
     #[test]

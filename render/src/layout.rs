@@ -7,8 +7,9 @@ use std::sync::Arc;
 use rxls::{
     Border, BorderStyle, Cell, CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint,
     ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell, DrawingAnchorBehavior,
-    DrawingMetadata, DrawingObjectKind, DvOp, Font, FormatPattern, FormatScript, HAlign, Sheet,
-    Sparkline, SparklineKind, StyleFidelity, VAlign, Workbook, XlsbDefaultColumnWidth,
+    DrawingMetadata, DrawingObjectKind, DvOp, Font, FormatPattern, FormatScript, HAlign,
+    ImportedAxisMeasure, OoxmlImplicitRowHeight, Sheet, Sparkline, SparklineKind, StyleFidelity,
+    VAlign, Workbook, XlsbDefaultColumnWidth,
 };
 
 use crate::error::{LimitKind, RenderError};
@@ -35,8 +36,8 @@ const DEFAULT_COLUMN_CHARACTERS: f32 = 10.0;
 /// LibreOffice Calc's import geometry adds two device pixels to explicit
 /// Excel character widths. Missing-width fallback keeps the ECMA five-pixel
 /// allowance because it is derived from the verified default font instead.
-const IMPORTED_COLUMN_PADDING_PIXELS: f64 = 2.0;
-const DEFAULT_COLUMN_PADDING_PIXELS: f64 = 5.0;
+const IMPORTED_COLUMN_PADDING_PIXELS: u16 = 2;
+const DEFAULT_COLUMN_PADDING_PIXELS: u16 = 5;
 /// Calc's 8.5-character application default when an OOXML worksheet omits
 /// sheet-format width metadata, encoded in 1/256 digit-width units.
 const OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256: u32 =
@@ -63,7 +64,7 @@ const CALC_NORMAL_ROW_HEIGHT_ADJUSTMENT_TWIPS: i128 = 17;
 const TWIPS_PER_POINT: i128 = 20;
 /// OOXML `baseColWidth` excludes the four margin pixels and one gridline pixel
 /// included when deriving a default column width.
-const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: f64 = 5.0;
+const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: u16 = 5;
 /// XLSB `coldx` and `dxGCol` store 256 units per standard-font digit.
 const XLSB_DIGIT_WIDTH_SCALE: u32 = 256;
 /// Calc converts XLSB digit widths through integer twips at 96 CSS pixels/inch.
@@ -640,6 +641,12 @@ struct AxisMeasurement {
     typography: TypographyStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxisEndpointPolicy {
+    PerTrackFixed,
+    SourceNative,
+}
+
 /// Immutable, per-operation effective-style capture. Every selected grid
 /// coordinate (plus an intersecting merge anchor) resolves worksheet, axis,
 /// table-region, and direct-cell layers exactly once before typography
@@ -800,6 +807,20 @@ pub(crate) fn measure_sheet_axes_for_ranges(
     ranges: &[RenderRange],
     options: &RenderOptions,
 ) -> Result<Vec<MeasuredAxes>, RenderError> {
+    measure_sheet_axes_for_ranges_with_policy(
+        sheet,
+        ranges,
+        options,
+        AxisEndpointPolicy::PerTrackFixed,
+    )
+}
+
+fn measure_sheet_axes_for_ranges_with_policy(
+    sheet: &Sheet,
+    ranges: &[RenderRange],
+    options: &RenderOptions,
+    endpoint_policy: AxisEndpointPolicy,
+) -> Result<Vec<MeasuredAxes>, RenderError> {
     let mut validated = Vec::with_capacity(ranges.len());
     for &range in ranges {
         let range = range.validate()?;
@@ -870,19 +891,21 @@ pub(crate) fn measure_sheet_axes_for_ranges(
         let mut style_snapshot = RenderStyleSnapshot::new(sheet);
         style_snapshot.capture_range(sheet, range, options)?;
         let mut warnings = Warnings::default();
-        let measured = measure_sheet_axes_inner(
+        let measured = measure_sheet_axes_inner_with_policy(
             sheet,
             range,
             &style_snapshot,
             options,
             Some(&candidates),
             &mut warnings,
+            endpoint_policy,
         )?;
         measurements.push((measured.rows, measured.columns));
     }
     Ok(measurements)
 }
 
+#[cfg(test)]
 fn measure_sheet_axes_inner(
     sheet: &Sheet,
     range: RenderRange,
@@ -890,6 +913,27 @@ fn measure_sheet_axes_inner(
     options: &RenderOptions,
     automatic_candidates: Option<&[DisplayCell<'_>]>,
     warnings: &mut Warnings,
+) -> Result<AxisMeasurement, RenderError> {
+    measure_sheet_axes_inner_with_policy(
+        sheet,
+        range,
+        style_snapshot,
+        options,
+        automatic_candidates,
+        warnings,
+        AxisEndpointPolicy::PerTrackFixed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_sheet_axes_inner_with_policy(
+    sheet: &Sheet,
+    range: RenderRange,
+    style_snapshot: &RenderStyleSnapshot,
+    options: &RenderOptions,
+    automatic_candidates: Option<&[DisplayCell<'_>]>,
+    warnings: &mut Warnings,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<AxisMeasurement, RenderError> {
     let range = range.validate()?;
     let row_count = u64::from(range.last_row) - u64::from(range.first_row) + 1;
@@ -913,8 +957,29 @@ fn measure_sheet_axes_inner(
             offset: x,
             size,
         });
-        x = x.checked_add(size).ok_or(RenderError::CoordinateOverflow)?;
-        enforce_dimension(x, options)?;
+        if endpoint_policy == AxisEndpointPolicy::PerTrackFixed {
+            x = x.checked_add(size).ok_or(RenderError::CoordinateOverflow)?;
+            enforce_dimension(x, options)?;
+        }
+    }
+    if endpoint_policy == AxisEndpointPolicy::SourceNative {
+        let prefix = source_native_column_prefix(
+            sheet,
+            range.first_col,
+            maximum_digit_width,
+            options,
+            warnings,
+        )?;
+        apply_source_native_axis_endpoints(
+            &mut columns,
+            prefix,
+            maximum_digit_width,
+            options,
+            |column| imported_column_axis_measure(sheet, column, options),
+        )?;
+        for slot in &columns {
+            column_widths.insert(slot.index, slot.size);
+        }
     }
 
     let mut row_sizes = BTreeMap::new();
@@ -923,6 +988,34 @@ fn measure_sheet_axes_inner(
             continue;
         }
         row_sizes.insert(row, row_height(sheet, row, options, warnings));
+    }
+    if endpoint_policy == AxisEndpointPolicy::SourceNative {
+        let prefix = source_native_row_prefix(
+            sheet,
+            range.first_row,
+            maximum_digit_width,
+            options,
+            warnings,
+        )?;
+        let mut native_rows = row_sizes
+            .iter()
+            .map(|(&row, &size)| MeasuredAxisSlot {
+                index: row,
+                offset: Fixed::ZERO,
+                size,
+            })
+            .collect::<Vec<_>>();
+        apply_source_native_axis_endpoints(
+            &mut native_rows,
+            prefix,
+            maximum_digit_width,
+            options,
+            |row| imported_row_axis_measure(sheet, row, options),
+        )?;
+        row_sizes = native_rows
+            .into_iter()
+            .map(|slot| (slot.index, slot.size))
+            .collect();
     }
     expand_automatic_row_heights(
         sheet,
@@ -1194,6 +1287,7 @@ pub fn build_sheet_scene(
         options,
         None,
         UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
     )
 }
 
@@ -1208,6 +1302,7 @@ pub(crate) fn build_single_page_sheet_scene(
         options,
         None,
         UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
+        AxisEndpointPolicy::SourceNative,
     )
 }
 
@@ -1223,6 +1318,7 @@ pub(crate) fn build_sheet_scene_with_geometry(
         options,
         Some(geometry),
         UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
     )
 }
 
@@ -1232,6 +1328,7 @@ fn build_sheet_scene_inner(
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
     terminal_column_policy: UsedDrawingTerminalColumnPolicy,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
@@ -1243,6 +1340,7 @@ fn build_sheet_scene_inner(
                 &style_snapshot,
                 options,
                 terminal_column_policy,
+                endpoint_policy,
             )?)
         }
         RenderSelection::Range(_) => None,
@@ -1386,8 +1484,15 @@ fn build_sheet_scene_inner(
             },
         });
     }
-    let measured =
-        measure_sheet_axes_inner(sheet, range, &style_snapshot, options, None, &mut warnings)?;
+    let measured = measure_sheet_axes_inner_with_policy(
+        sheet,
+        range,
+        &style_snapshot,
+        options,
+        None,
+        &mut warnings,
+        endpoint_policy,
+    )?;
     let mut row_slots = measured.rows;
     let mut col_slots = measured.columns;
     if let Some(geometry) = geometry {
@@ -1410,6 +1515,7 @@ fn build_sheet_scene_inner(
         used_selection,
         options,
         geometry,
+        endpoint_policy,
         &mut warnings,
     )?;
     offset_axis_slots(&mut col_slots, viewport.cell.x)?;
@@ -1842,6 +1948,7 @@ fn render_used_extent(
     style_snapshot: &RenderStyleSnapshot,
     options: &RenderOptions,
     terminal_column_policy: UsedDrawingTerminalColumnPolicy,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<UsedRenderExtent, RenderError> {
     let mut extent = UsedRenderExtent::default();
     let mut retained_cells = BTreeMap::<u32, BTreeSet<u16>>::new();
@@ -1910,6 +2017,7 @@ fn render_used_extent(
             maximum_digit_width,
             single_page_column_bounds.as_ref(),
             options,
+            endpoint_policy,
         )?;
         include_render_coordinate(
             &mut extent.range,
@@ -1940,6 +2048,7 @@ fn render_used_extent(
             maximum_digit_width,
             single_page_column_bounds.as_ref(),
             options,
+            endpoint_policy,
         )?;
         include_render_coordinate(
             &mut extent.range,
@@ -1968,6 +2077,7 @@ fn render_used_extent(
             maximum_digit_width,
             single_page_column_bounds.as_ref(),
             options,
+            endpoint_policy,
         )?;
         include_render_coordinate(
             &mut extent.range,
@@ -2025,6 +2135,7 @@ fn add_empty_absolute_anchor_warnings(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drawing_used_to(
     sheet: &Sheet,
     from: (u32, u16),
@@ -2033,6 +2144,7 @@ fn drawing_used_to(
     maximum_digit_width: Option<Fixed>,
     single_page_column_bounds: Option<&CalcOoxmlSinglePageColumnBounds>,
     options: &RenderOptions,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<(u32, u16), RenderError> {
     if let Some((width, height)) = metadata
         .filter(|metadata| {
@@ -2045,7 +2157,15 @@ fn drawing_used_to(
             .and_then(|metadata| metadata.from_offset_emu)
             .unwrap_or((0, 0));
         return Ok((
-            fixed_size_used_row(sheet, from.0, from_row_offset, height, options)?,
+            fixed_size_used_row(
+                sheet,
+                from.0,
+                from_row_offset,
+                height,
+                maximum_digit_width,
+                options,
+                endpoint_policy,
+            )?,
             fixed_size_used_column(
                 sheet,
                 from.1,
@@ -2053,6 +2173,7 @@ fn drawing_used_to(
                 width,
                 maximum_digit_width,
                 options,
+                endpoint_policy,
             )?,
         ));
     }
@@ -2106,6 +2227,7 @@ fn fixed_size_used_column(
     width_emu: u64,
     maximum_digit_width: Fixed,
     options: &RenderOptions,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<u16, RenderError> {
     let target = emu_to_fixed(from_offset_emu)?
         .checked_add(emu_size_to_fixed(width_emu)?)
@@ -2117,6 +2239,17 @@ fn fixed_size_used_column(
     let mut candidate = from;
     let mut last = from;
     let mut warnings = Warnings::default();
+    let mut native_cursor = if endpoint_policy == AxisEndpointPolicy::SourceNative {
+        Some(SourceAxisCursor::new(source_native_column_prefix(
+            sheet,
+            from,
+            maximum_digit_width,
+            options,
+            &mut warnings,
+        )?)?)
+    } else {
+        None
+    };
     while let Some(column) = next_visible_column(sheet, candidate, options) {
         enforce(
             LimitKind::Columns,
@@ -2127,15 +2260,20 @@ fn fixed_size_used_column(
             break;
         }
         last = column;
-        boundary = boundary
-            .checked_add(column_width(
-                sheet,
-                column,
+        let fallback = column_width(sheet, column, maximum_digit_width, options, &mut warnings);
+        boundary = if let Some(cursor) = native_cursor.as_mut() {
+            let contribution = source_axis_contribution(
+                imported_column_axis_measure(sheet, column, options),
+                fallback,
                 maximum_digit_width,
-                options,
-                &mut warnings,
-            ))
+            )
             .ok_or(RenderError::CoordinateOverflow)?;
+            cursor.advance(contribution)?.2
+        } else {
+            boundary
+                .checked_add(fallback)
+                .ok_or(RenderError::CoordinateOverflow)?
+        };
         if boundary >= target || column == MAX_WORKSHEET_COLUMN {
             break;
         }
@@ -2149,7 +2287,9 @@ fn fixed_size_used_row(
     from: u32,
     from_offset_emu: i64,
     height_emu: u64,
+    maximum_digit_width: Fixed,
     options: &RenderOptions,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<u32, RenderError> {
     let target = emu_to_fixed(from_offset_emu)?
         .checked_add(emu_size_to_fixed(height_emu)?)
@@ -2161,6 +2301,17 @@ fn fixed_size_used_row(
     let mut candidate = from;
     let mut last = from;
     let mut warnings = Warnings::default();
+    let mut native_cursor = if endpoint_policy == AxisEndpointPolicy::SourceNative {
+        Some(SourceAxisCursor::new(source_native_row_prefix(
+            sheet,
+            from,
+            maximum_digit_width,
+            options,
+            &mut warnings,
+        )?)?)
+    } else {
+        None
+    };
     while let Some(row) = next_visible_row(sheet, candidate, options) {
         enforce(
             LimitKind::Rows,
@@ -2171,9 +2322,20 @@ fn fixed_size_used_row(
             break;
         }
         last = row;
-        boundary = boundary
-            .checked_add(row_height(sheet, row, options, &mut warnings))
+        let fallback = row_height(sheet, row, options, &mut warnings);
+        boundary = if let Some(cursor) = native_cursor.as_mut() {
+            let contribution = source_axis_contribution(
+                imported_row_axis_measure(sheet, row, options),
+                fallback,
+                maximum_digit_width,
+            )
             .ok_or(RenderError::CoordinateOverflow)?;
+            cursor.advance(contribution)?.2
+        } else {
+            boundary
+                .checked_add(fallback)
+                .ok_or(RenderError::CoordinateOverflow)?
+        };
         if boundary >= target || row == MAX_WORKSHEET_ROW {
             break;
         }
@@ -2202,24 +2364,6 @@ fn calc_ooxml_single_page_column_bounds(
     if digit_twips == 0 {
         return None;
     }
-    let default_width_twips = digit_twips
-        .checked_mul(17)
-        .and_then(|value| value.checked_add(1))
-        .map(|value| value / 2)?;
-    let column_width_twips = |column: u16| -> Option<u64> {
-        let Some(characters) = sheet.column_widths().get(&column).copied() else {
-            return Some(default_width_twips);
-        };
-        if !characters.is_finite() || characters <= 0.0 {
-            return None;
-        }
-        let width = f64::from(characters) * digit_twips as f64;
-        let rounded = width.round();
-        if !rounded.is_finite() || rounded <= 0.0 || rounded > u64::MAX as f64 {
-            return None;
-        }
-        Some(rounded as u64)
-    };
 
     // Marker coordinates are absolute from column A. Build one schema-bounded
     // prefix table per render, then resolve every drawing endpoint by binary
@@ -2229,7 +2373,11 @@ fn calc_ooxml_single_page_column_bounds(
         Vec::with_capacity(usize::from(MAX_WORKSHEET_COLUMN).saturating_add(1));
     for column in 0..=MAX_WORKSHEET_COLUMN {
         if options.include_hidden || !sheet.hidden_columns().contains(&column) {
-            cumulative = cumulative.checked_add(column_width_twips(column)?)?;
+            cumulative = cumulative.checked_add(calc_ooxml_wrap_column_twips(
+                sheet,
+                column,
+                digit_twips,
+            )?)?;
         }
         cumulative_twips.push(cumulative);
     }
@@ -2692,6 +2840,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             maximum_digit_width,
             None,
             options,
+            AxisEndpointPolicy::PerTrackFixed,
         )?;
         if anchor_range_intersects_render_ranges(image.from, to, ranges) {
             include(image.from, to);
@@ -2712,6 +2861,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             maximum_digit_width,
             None,
             options,
+            AxisEndpointPolicy::PerTrackFixed,
         )?;
         if anchor_range_intersects_render_ranges(chart.from, to, ranges) {
             include(chart.from, to);
@@ -2733,6 +2883,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             maximum_digit_width,
             None,
             options,
+            AxisEndpointPolicy::PerTrackFixed,
         )?;
         if anchor_range_intersects_render_ranges(from, to, ranges) {
             include(from, to);
@@ -2789,6 +2940,7 @@ pub(crate) fn render_single_page_used_scene_range(
         &style_snapshot,
         options,
         UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
+        AxisEndpointPolicy::SourceNative,
     )?;
     Ok(extent.range.unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
@@ -2810,6 +2962,7 @@ pub(crate) fn render_used_print_range(
         &style_snapshot,
         options,
         UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
     )?
     .range
     .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0));
@@ -2951,6 +3104,429 @@ fn axis_slots_end<I>(slots: &[MeasuredAxisSlot<I>]) -> Result<Fixed, RenderError
     last.offset
         .checked_add(last.size)
         .ok_or(RenderError::CoordinateOverflow)
+}
+
+/// Reduced positive rational in 1/1024-CSS-pixel units.
+///
+/// A common fixed denominator is insufficient once valid source decimals and
+/// scientific notation are retained exactly. Addition reduces through the
+/// denominator GCD before multiplying, so every overflow remains checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AxisRational {
+    numerator: i128,
+    denominator: i128,
+}
+
+impl AxisRational {
+    const ZERO: Self = Self {
+        numerator: 0,
+        denominator: 1,
+    };
+
+    fn new(numerator: i128, denominator: i128) -> Option<Self> {
+        if numerator < 0 || denominator <= 0 {
+            return None;
+        }
+        if numerator == 0 {
+            return Some(Self::ZERO);
+        }
+        let divisor = positive_gcd(numerator, denominator);
+        Some(Self {
+            numerator: numerator.checked_div(divisor)?,
+            denominator: denominator.checked_div(divisor)?,
+        })
+    }
+
+    fn from_fixed(value: Fixed) -> Option<Self> {
+        Self::new(i128::from(value.raw()), 1).filter(|value| value.numerator > 0)
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        let shared = positive_gcd(self.denominator, other.denominator);
+        let left_scale = other.denominator.checked_div(shared)?;
+        let right_scale = self.denominator.checked_div(shared)?;
+        let numerator = self
+            .numerator
+            .checked_mul(left_scale)?
+            .checked_add(other.numerator.checked_mul(right_scale)?)?;
+        let denominator = self.denominator.checked_mul(left_scale)?;
+        Self::new(numerator, denominator)
+    }
+
+    fn checked_mul_u64(self, multiplier: u64) -> Option<Self> {
+        if multiplier == 0 || self.numerator == 0 {
+            return Some(Self::ZERO);
+        }
+        let multiplier = i128::from(multiplier);
+        let shared = positive_gcd(multiplier, self.denominator);
+        Self::new(
+            self.numerator
+                .checked_mul(multiplier.checked_div(shared)?)?,
+            self.denominator.checked_div(shared)?,
+        )
+    }
+
+    fn rounded_raw(self) -> Option<i128> {
+        let whole = self.numerator.checked_div(self.denominator)?;
+        let remainder = self.numerator.checked_rem(self.denominator)?;
+        let half_up = self
+            .denominator
+            .checked_div(2)?
+            .checked_add(self.denominator.checked_rem(2)?)?;
+        whole.checked_add(i128::from(remainder >= half_up))
+    }
+
+    fn is_at_least_one(self) -> bool {
+        self.numerator >= self.denominator
+    }
+}
+
+fn positive_gcd(mut left: i128, mut right: i128) -> i128 {
+    debug_assert!(left >= 0);
+    debug_assert!(right > 0);
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
+}
+
+/// Cumulative source-space axis cursor seeded at the global visible prefix.
+///
+/// Boundaries are rounded half-up in the global coordinate system, then
+/// translated back to local scene coordinates. This preserves the rounding
+/// phase for nonzero selections without exposing a potentially large prefix to
+/// the local dimension limit.
+struct SourceAxisCursor {
+    exact: AxisRational,
+    origin_raw: i128,
+    previous_raw: i128,
+}
+
+impl SourceAxisCursor {
+    fn new(prefix: AxisRational) -> Result<Self, RenderError> {
+        let origin_raw = prefix
+            .rounded_raw()
+            .ok_or(RenderError::CoordinateOverflow)?;
+        Ok(Self {
+            exact: prefix,
+            origin_raw,
+            previous_raw: origin_raw,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        contribution: AxisRational,
+    ) -> Result<(Fixed, Fixed, Fixed), RenderError> {
+        let offset_raw = self
+            .previous_raw
+            .checked_sub(self.origin_raw)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        self.exact = self
+            .exact
+            .checked_add(contribution)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let boundary_raw = self
+            .exact
+            .rounded_raw()
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let size_raw = boundary_raw
+            .checked_sub(self.previous_raw)
+            .filter(|size| *size > 0)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let local_boundary_raw = boundary_raw
+            .checked_sub(self.origin_raw)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        self.previous_raw = boundary_raw;
+        Ok((
+            Fixed::from_raw(
+                i64::try_from(offset_raw).map_err(|_| RenderError::CoordinateOverflow)?,
+            ),
+            Fixed::from_raw(i64::try_from(size_raw).map_err(|_| RenderError::CoordinateOverflow)?),
+            Fixed::from_raw(
+                i64::try_from(local_boundary_raw).map_err(|_| RenderError::CoordinateOverflow)?,
+            ),
+        ))
+    }
+}
+
+fn imported_column_axis_measure(
+    sheet: &Sheet,
+    column: u16,
+    options: &RenderOptions,
+) -> Option<ImportedAxisMeasure> {
+    let has_explicit_width = sheet.column_widths().contains_key(&column)
+        || sheet.physical_column_widths().contains_key(&column)
+        || sheet.xlsb_column_widths_256().contains_key(&column);
+    if has_explicit_width {
+        sheet.imported_column_axis_measures().get(&column).copied()
+    } else {
+        sheet.imported_default_column_axis_measure().or_else(|| {
+            (options.font_pack.is_some() && sheet.implicit_ooxml_column_width() == Some(None)).then(
+                || {
+                    if sheet.ooxml_uses_defaulted_base_column_width() {
+                        ImportedAxisMeasure::DigitBaseWidth256(8 * XLSB_DIGIT_WIDTH_SCALE)
+                    } else {
+                        ImportedAxisMeasure::DigitWidth256(
+                            OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256,
+                        )
+                    }
+                },
+            )
+        })
+    }
+}
+
+fn imported_default_row_axis_measure(
+    sheet: &Sheet,
+    options: &RenderOptions,
+) -> Option<ImportedAxisMeasure> {
+    sheet.imported_default_row_axis_measure().or_else(|| {
+        (sheet.implicit_ooxml_row_height_source()
+            == Some(OoxmlImplicitRowHeight::XlsxApplicationDefault))
+        .then(|| {
+            verified_ooxml_normal_font_size(sheet, options)
+                .and_then(|(points, _)| calc_ooxml_row_height_twips_from_points(points))
+                .map(ImportedAxisMeasure::Twips)
+                .unwrap_or(ImportedAxisMeasure::MillimeterHundredths(500))
+        })
+    })
+}
+
+fn imported_row_axis_measure(
+    sheet: &Sheet,
+    row: u32,
+    options: &RenderOptions,
+) -> Option<ImportedAxisMeasure> {
+    if sheet.row_heights().contains_key(&row) {
+        sheet.imported_row_axis_measures().get(&row).copied()
+    } else {
+        imported_default_row_axis_measure(sheet, options)
+    }
+}
+
+fn character_width_256_to_twips(
+    width_256: u32,
+    maximum_digit_width: Fixed,
+    screen_padding_pixels: u16,
+) -> Option<i128> {
+    character_width_ratio_to_pixels(
+        u64::from(width_256),
+        u64::from(XLSB_DIGIT_WIDTH_SCALE),
+        maximum_digit_width,
+        screen_padding_pixels,
+    )?
+    .checked_mul(TWIPS_PER_CSS_PIXEL)
+}
+
+fn character_width_ratio_to_pixels(
+    numerator: u64,
+    denominator: u64,
+    maximum_digit_width: Fixed,
+    screen_padding_pixels: u16,
+) -> Option<i128> {
+    if numerator == 0 || denominator == 0 || maximum_digit_width.raw() <= 0 {
+        return None;
+    }
+    let digit_pixels = i128::from(maximum_digit_width.raw())
+        .checked_div(i128::from(FIXED_UNITS_PER_PIXEL))?
+        .max(1);
+    let bias = 128_i128.checked_div(digit_pixels)?;
+    let numerator = i128::from(numerator);
+    let denominator = i128::from(denominator);
+    numerator
+        .checked_mul(i128::from(XLSB_DIGIT_WIDTH_SCALE))?
+        .checked_add(bias.checked_mul(denominator)?)?
+        .checked_mul(digit_pixels)?
+        .checked_div(denominator.checked_mul(i128::from(XLSB_DIGIT_WIDTH_SCALE))?)?
+        .checked_add(i128::from(screen_padding_pixels))
+        .filter(|pixels| *pixels > 0)
+}
+
+fn imported_axis_measure_rational(
+    measure: ImportedAxisMeasure,
+    maximum_digit_width: Fixed,
+) -> Option<AxisRational> {
+    let twips = match measure {
+        ImportedAxisMeasure::Twips(twips) => {
+            return AxisRational::new(
+                i128::from(twips).checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?,
+                TWIPS_PER_CSS_PIXEL,
+            )
+        }
+        ImportedAxisMeasure::MillimeterHundredths(mm100) => {
+            return AxisRational::new(
+                i128::from(mm100)
+                    .checked_mul(24)?
+                    .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?,
+                635,
+            );
+        }
+        ImportedAxisMeasure::PointRatio(numerator, denominator) => {
+            return AxisRational::new(
+                i128::from(numerator)
+                    .checked_mul(4)?
+                    .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?,
+                i128::from(denominator).checked_mul(3)?,
+            );
+        }
+        ImportedAxisMeasure::CharacterWidth256(width) => character_width_256_to_twips(
+            width,
+            maximum_digit_width,
+            IMPORTED_COLUMN_PADDING_PIXELS,
+        )?,
+        ImportedAxisMeasure::CharacterWidthRatio(numerator, denominator) => {
+            let pixels = character_width_ratio_to_pixels(
+                numerator,
+                denominator,
+                maximum_digit_width,
+                IMPORTED_COLUMN_PADDING_PIXELS,
+            )?;
+            return AxisRational::new(pixels.checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?, 1);
+        }
+        ImportedAxisMeasure::CharacterBaseWidth256(width) => character_width_256_to_twips(
+            width,
+            maximum_digit_width,
+            IMPORTED_COLUMN_PADDING_PIXELS.checked_add(OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS)?,
+        )?,
+        ImportedAxisMeasure::DigitWidth256(width) => {
+            xlsb_digits_to_twips(width, maximum_digit_width, 0)?
+        }
+        ImportedAxisMeasure::DigitBaseWidth256(width) => {
+            xlsb_digits_to_twips(width, maximum_digit_width, XLSB_BASE_COLUMN_SCREEN_PIXELS)?
+        }
+    };
+    AxisRational::new(
+        twips.checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?,
+        TWIPS_PER_CSS_PIXEL,
+    )
+}
+
+fn source_axis_contribution(
+    measure: Option<ImportedAxisMeasure>,
+    fallback: Fixed,
+    maximum_digit_width: Fixed,
+) -> Option<AxisRational> {
+    measure
+        .and_then(|measure| imported_axis_measure_rational(measure, maximum_digit_width))
+        .filter(|measure| measure.is_at_least_one())
+        .or_else(|| AxisRational::from_fixed(fallback))
+}
+
+fn source_native_column_prefix(
+    sheet: &Sheet,
+    first_column: u16,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<AxisRational, RenderError> {
+    // Column iteration is bounded by the 16,384-column worksheet schema.
+    let mut prefix = AxisRational::ZERO;
+    for column in 0..first_column {
+        if !options.include_hidden && sheet.hidden_columns().contains(&column) {
+            continue;
+        }
+        let fallback = column_width(sheet, column, maximum_digit_width, options, warnings);
+        let contribution = source_axis_contribution(
+            imported_column_axis_measure(sheet, column, options),
+            fallback,
+            maximum_digit_width,
+        )
+        .ok_or(RenderError::CoordinateOverflow)?;
+        prefix = prefix
+            .checked_add(contribution)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    Ok(prefix)
+}
+
+fn persisted_default_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
+    sheet
+        .default_row_height()
+        .and_then(points_to_fixed)
+        .unwrap_or_else(|| fallback_row_height(sheet, options))
+}
+
+fn visible_row_prefix_count(sheet: &Sheet, first_row: u32, options: &RenderOptions) -> u64 {
+    if options.include_hidden {
+        u64::from(first_row)
+    } else if let Some(exceptions) = sheet.default_hidden_row_exceptions() {
+        exceptions
+            .range(..first_row)
+            .filter(|&&row| !sheet.hidden_rows().contains(&row))
+            .count() as u64
+    } else {
+        u64::from(first_row).saturating_sub(sheet.hidden_rows().range(..first_row).count() as u64)
+    }
+}
+
+fn source_native_row_prefix(
+    sheet: &Sheet,
+    first_row: u32,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<AxisRational, RenderError> {
+    let visible_rows = visible_row_prefix_count(sheet, first_row, options);
+    if visible_rows == 0 {
+        return Ok(AxisRational::ZERO);
+    }
+    let default_contribution = source_axis_contribution(
+        imported_default_row_axis_measure(sheet, options),
+        persisted_default_row_height(sheet, options),
+        maximum_digit_width,
+    )
+    .ok_or(RenderError::CoordinateOverflow)?;
+    // Rows can reach the million-row schema ceiling. Multiply the default
+    // contribution by the visible count and visit only sparse explicit rows.
+    let mut explicit_rows = 0_u64;
+    let mut explicit_total = AxisRational::ZERO;
+    for (&row, _) in sheet.row_heights().range(..first_row) {
+        if !options.include_hidden && row_is_hidden(sheet, row) {
+            continue;
+        }
+        explicit_rows = explicit_rows
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let contribution = source_axis_contribution(
+            imported_row_axis_measure(sheet, row, options),
+            row_height(sheet, row, options, warnings),
+            maximum_digit_width,
+        )
+        .ok_or(RenderError::CoordinateOverflow)?;
+        explicit_total = explicit_total
+            .checked_add(contribution)
+            .ok_or(RenderError::CoordinateOverflow)?;
+    }
+    let default_rows = visible_rows
+        .checked_sub(explicit_rows)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    default_contribution
+        .checked_mul_u64(default_rows)
+        .and_then(|defaults| defaults.checked_add(explicit_total))
+        .ok_or(RenderError::CoordinateOverflow)
+}
+
+fn apply_source_native_axis_endpoints<I: Copy>(
+    slots: &mut [MeasuredAxisSlot<I>],
+    prefix: AxisRational,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    mut measure: impl FnMut(I) -> Option<ImportedAxisMeasure>,
+) -> Result<(), RenderError> {
+    let mut cursor = SourceAxisCursor::new(prefix)?;
+    for slot in slots {
+        let contribution =
+            source_axis_contribution(measure(slot.index), slot.size, maximum_digit_width)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        let (offset, size, boundary) = cursor.advance(contribution)?;
+        slot.offset = offset;
+        slot.size = size;
+        enforce_dimension(boundary, options)?;
+    }
+    Ok(())
 }
 
 fn apply_axis_geometry<I: Copy + Ord>(
@@ -3120,6 +3696,19 @@ fn column_width(
             ),
             // Without verified font metrics the caller's physical fallback is
             // safer than projecting Calc's font-dependent application default.
+            Some(None)
+                if options.font_pack.is_some()
+                    && sheet.ooxml_uses_defaulted_base_column_width() =>
+            {
+                (
+                    xlsb_digits_to_fixed(
+                        8 * XLSB_DIGIT_WIDTH_SCALE,
+                        maximum_digit_width,
+                        XLSB_BASE_COLUMN_SCREEN_PIXELS,
+                    ),
+                    true,
+                )
+            }
             Some(None) if options.font_pack.is_some() => (
                 xlsb_digits_to_fixed(
                     OOXML_APPLICATION_DEFAULT_COLUMN_WIDTH_256,
@@ -3236,11 +3825,23 @@ fn row_height(sheet: &Sheet, row: u32, options: &RenderOptions, warnings: &mut W
 fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
     if sheet.biff_uses_application_default_row_height() {
         BIFF_APPLICATION_DEFAULT_ROW_HEIGHT
-    } else if sheet.has_implicit_ooxml_row_height() {
-        calc_ooxml_implicit_row_height(sheet, options)
-            .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
     } else {
-        options.default_row_height.max(Fixed::from_raw(1))
+        match sheet.implicit_ooxml_row_height_source() {
+            Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+                calc_ooxml_implicit_row_height(sheet, options)
+                    .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
+            }
+            // XLSB has a distinct application-default source. Until a bounded
+            // oracle establishes that physical value, retain the prior
+            // conservative fallback instead of borrowing XLSX font heuristics
+            // or introducing a format-specific correction.
+            Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => {
+                OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+            }
+            Some(OoxmlImplicitRowHeight::None) | None => {
+                options.default_row_height.max(Fixed::from_raw(1))
+            }
+        }
     }
 }
 
@@ -3266,7 +3867,7 @@ fn verified_ooxml_normal_font_size(sheet: &Sheet, options: &RenderOptions) -> Op
 }
 
 fn verified_implicit_xlsx(sheet: &Sheet, options: &RenderOptions) -> bool {
-    sheet.has_implicit_ooxml_row_height()
+    sheet.implicit_ooxml_row_height_source() == Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
         && verified_ooxml_normal_font_size(sheet, options).is_some()
 }
 
@@ -3335,20 +3936,27 @@ fn cell_line_layout_policy(
 }
 
 fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Option<Fixed> {
-    if !sheet.has_implicit_ooxml_row_height() {
+    if sheet.implicit_ooxml_row_height_source()
+        != Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+    {
         return None;
     }
     let (points, _) = verified_ooxml_normal_font_size(sheet, options)?;
     calc_ooxml_row_height_from_points(points)
 }
 
-fn calc_ooxml_row_height_from_points(points: u16) -> Option<Fixed> {
+fn calc_ooxml_row_height_twips_from_points(points: u16) -> Option<u32> {
     let font_twips = i128::from(points).checked_mul(TWIPS_PER_POINT)?;
     let row_twips = font_twips
         .checked_mul(CALC_NORMAL_ROW_HEIGHT_PERCENT)?
         .checked_div(CALC_NORMAL_ROW_HEIGHT_PERCENT_DENOMINATOR)?
         .checked_add(CALC_NORMAL_ROW_HEIGHT_ADJUSTMENT_TWIPS)?;
-    let raw = row_twips
+    u32::try_from(row_twips).ok().filter(|twips| *twips > 0)
+}
+
+fn calc_ooxml_row_height_from_points(points: u16) -> Option<Fixed> {
+    let row_twips = calc_ooxml_row_height_twips_from_points(points)?;
+    let raw = i128::from(row_twips)
         .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?
         .checked_add(TWIPS_PER_CSS_PIXEL / 2)?
         .checked_div(TWIPS_PER_CSS_PIXEL)?;
@@ -3948,7 +4556,7 @@ fn contains_mandatory_line_break(text: &str) -> bool {
 fn column_chars_to_fixed(
     chars: f32,
     maximum_digit_width: Fixed,
-    padding_pixels: f64,
+    padding_pixels: u16,
 ) -> Option<Fixed> {
     if !chars.is_finite() || chars <= 0.0 {
         return None;
@@ -3962,7 +4570,7 @@ fn column_chars_to_fixed(
     let pixels = (((f64::from(chars) * 256.0 + (128.0 / digit_pixels).floor()) / 256.0)
         * digit_pixels)
         .floor()
-        + padding_pixels;
+        + f64::from(padding_pixels);
     float_pixels_to_fixed(pixels)
 }
 
@@ -3971,6 +4579,22 @@ fn xlsb_digits_to_fixed(
     maximum_digit_width: Fixed,
     extra_screen_pixels: u16,
 ) -> Option<Fixed> {
+    let width_twips = xlsb_digits_to_twips(width_256, maximum_digit_width, extra_screen_pixels)?;
+    let raw = width_twips
+        .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?
+        .checked_add(TWIPS_PER_CSS_PIXEL / 2)?
+        .checked_div(TWIPS_PER_CSS_PIXEL)?;
+    if raw <= 0 {
+        return None;
+    }
+    i64::try_from(raw).ok().map(Fixed::from_raw)
+}
+
+fn xlsb_digits_to_twips(
+    width_256: u32,
+    maximum_digit_width: Fixed,
+    extra_screen_pixels: u16,
+) -> Option<i128> {
     if width_256 == 0 || maximum_digit_width.raw() <= 0 {
         return None;
     }
@@ -3985,14 +4609,7 @@ fn xlsb_digits_to_fixed(
         .checked_add(i128::from(XLSB_DIGIT_WIDTH_SCALE / 2))?
         .checked_div(i128::from(XLSB_DIGIT_WIDTH_SCALE))?
         .checked_add(i128::from(extra_screen_pixels) * TWIPS_PER_CSS_PIXEL)?;
-    let raw = width_twips
-        .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?
-        .checked_add(TWIPS_PER_CSS_PIXEL / 2)?
-        .checked_div(TWIPS_PER_CSS_PIXEL)?;
-    if raw <= 0 {
-        return None;
-    }
-    i64::try_from(raw).ok().map(Fixed::from_raw)
+    (width_twips > 0).then_some(width_twips)
 }
 
 fn points_to_fixed(points: f32) -> Option<Fixed> {
@@ -5122,6 +5739,7 @@ fn data_renderable_chart_indices(
     selected_ranges: &[RenderRange],
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    endpoint_policy: AxisEndpointPolicy,
 ) -> Result<BTreeSet<usize>, RenderError> {
     let mut ranges = selected_ranges.to_vec();
     ranges.sort_by_key(|range| {
@@ -5141,7 +5759,8 @@ fn data_renderable_chart_indices(
     // scene construction. Merely intersecting a chart anchor is insufficient:
     // a clipped or tiny chart paints a placeholder without reading its source
     // series and therefore must not consume the chart-point budget here.
-    let measurements = measure_sheet_axes_for_ranges(sheet, &ranges, options)?;
+    let measurements =
+        measure_sheet_axes_for_ranges_with_policy(sheet, &ranges, options, endpoint_policy)?;
     let style_snapshot = RenderStyleSnapshot::new(sheet);
     let mut warnings = Warnings::default();
     let mut typography = TypographyStats::default();
@@ -5169,6 +5788,7 @@ fn data_renderable_chart_indices(
             used_selection,
             options,
             geometry,
+            endpoint_policy,
             &mut warnings,
         )?;
         offset_axis_slots(&mut col_slots, viewport.cell.x)?;
@@ -5217,6 +5837,7 @@ pub(crate) fn external_render_dependency_cells(
     selected_ranges: &[RenderRange],
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    single_page_source_native: bool,
 ) -> Result<Vec<CellCoordinate>, RenderError> {
     let limits = &options.limits;
     let conditional_limit = limits
@@ -5289,8 +5910,13 @@ pub(crate) fn external_render_dependency_cells(
 
     let mut chart_points = 0_u64;
     let metadata_index = DrawingMetadataIndex::new(sheet);
+    let endpoint_policy = if single_page_source_native {
+        AxisEndpointPolicy::SourceNative
+    } else {
+        AxisEndpointPolicy::PerTrackFixed
+    };
     let renderable_charts =
-        data_renderable_chart_indices(sheet, selected_ranges, options, geometry)?;
+        data_renderable_chart_indices(sheet, selected_ranges, options, geometry, endpoint_policy)?;
     for (chart_index, chart) in sheet.charts().iter().enumerate() {
         let metadata = metadata_index.get(DrawingObjectKind::Chart, chart_index);
         if chart.series.is_empty()
@@ -6194,6 +6820,7 @@ fn drawing_layout_viewport(
     used_selection: bool,
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    endpoint_policy: AxisEndpointPolicy,
     warnings: &mut Warnings,
 ) -> Result<DrawingLayoutViewport, RenderError> {
     let absolute_extent = absolute_drawing_positive_extent(sheet)?;
@@ -6220,6 +6847,7 @@ fn drawing_layout_viewport(
         maximum_digit_width,
         options,
         geometry,
+        endpoint_policy,
         warnings,
     )?;
     if used_selection {
@@ -6261,6 +6889,7 @@ fn drawing_layout_viewport(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepared_sheet_grid_origin(
     sheet: &Sheet,
     range: RenderRange,
@@ -6268,16 +6897,24 @@ fn prepared_sheet_grid_origin(
     maximum_digit_width: Fixed,
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    endpoint_policy: AxisEndpointPolicy,
     warnings: &mut Warnings,
 ) -> Result<(Fixed, Fixed), RenderError> {
-    let (x, persisted_y) = sheet_grid_origin(sheet, range, maximum_digit_width, options, warnings)?;
+    let (x, persisted_y) = sheet_grid_origin_with_policy(
+        sheet,
+        range,
+        maximum_digit_width,
+        options,
+        endpoint_policy,
+        warnings,
+    )?;
     let Some(geometry) = geometry else {
         return Ok((x, persisted_y));
     };
     let Some(first_prepared_row) = geometry.rows.first().map(|slot| slot.index) else {
         return Ok((x, persisted_y));
     };
-    let (_, prepared_base_y) = sheet_grid_origin(
+    let (_, prepared_base_y) = sheet_grid_origin_with_policy(
         sheet,
         RenderRange::new(
             first_prepared_row,
@@ -6287,6 +6924,7 @@ fn prepared_sheet_grid_origin(
         ),
         maximum_digit_width,
         options,
+        endpoint_policy,
         warnings,
     )?;
     let prepared_y = prepared_base_y
@@ -6302,6 +6940,49 @@ fn sheet_grid_origin(
     options: &RenderOptions,
     warnings: &mut Warnings,
 ) -> Result<(Fixed, Fixed), RenderError> {
+    sheet_grid_origin_with_policy(
+        sheet,
+        range,
+        maximum_digit_width,
+        options,
+        AxisEndpointPolicy::PerTrackFixed,
+        warnings,
+    )
+}
+
+fn sheet_grid_origin_with_policy(
+    sheet: &Sheet,
+    range: RenderRange,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    endpoint_policy: AxisEndpointPolicy,
+    warnings: &mut Warnings,
+) -> Result<(Fixed, Fixed), RenderError> {
+    if endpoint_policy == AxisEndpointPolicy::SourceNative {
+        let x = source_native_column_prefix(
+            sheet,
+            range.first_col,
+            maximum_digit_width,
+            options,
+            warnings,
+        )?
+        .rounded_raw()
+        .and_then(|raw| i64::try_from(raw).ok())
+        .map(Fixed::from_raw)
+        .ok_or(RenderError::CoordinateOverflow)?;
+        let y = source_native_row_prefix(
+            sheet,
+            range.first_row,
+            maximum_digit_width,
+            options,
+            warnings,
+        )?
+        .rounded_raw()
+        .and_then(|raw| i64::try_from(raw).ok())
+        .map(Fixed::from_raw)
+        .ok_or(RenderError::CoordinateOverflow)?;
+        return Ok((x, y));
+    }
     let mut x = Fixed::ZERO;
     for column in 0..range.first_col {
         if !options.include_hidden && sheet.hidden_columns().contains(&column) {
@@ -6519,6 +7200,7 @@ pub(crate) fn absolute_drawings_intersect_range(
         maximum_digit_width,
         options,
         Some(geometry),
+        AxisEndpointPolicy::PerTrackFixed,
         &mut warnings,
     )?;
     let viewport = Rect {
@@ -13029,6 +13711,14 @@ mod tests {
             columns.iter().map(|column| column.size.raw()).sum::<i64>(),
             436_905
         );
+        assert_eq!(
+            build_single_page_sheet_scene(sheet, 0, &options)
+                .unwrap()
+                .scene
+                .width,
+            Fixed::from_raw(436_907),
+            "single-page BIFF geometry must round the cumulative 64-point source default once"
+        );
 
         let authored = {
             let mut workbook = Workbook::new();
@@ -13044,7 +13734,7 @@ mod tests {
     }
 
     #[test]
-    fn ooxml_absent_default_uses_calc_twips_without_changing_explicit_or_base_widths() {
+    fn ooxml_defaults_distinguish_absent_defaulted_base_and_explicit_widths() {
         const PINNED_NOTO_SANS_CJK_KR_11_MDW: Fixed = Fixed::from_raw(8_336);
         let imported = |sheet_format: &str| {
             imported_xlsx(
@@ -13109,10 +13799,6 @@ mod tests {
             .unwrap()
             .scene
             .width;
-        let defaulted_base_width = build_scene(&defaulted_base, 0, &outlined_options(range))
-            .unwrap()
-            .scene
-            .width;
         let explicit_8_5_width = build_scene(&explicit_8_5, 0, &outlined_options(range))
             .unwrap()
             .scene
@@ -13129,11 +13815,68 @@ mod tests {
         assert_eq!(explicit_8_5_width, Fixed::from_pixels(70));
         assert_eq!(explicit_8_width, Fixed::from_pixels(66));
         assert_eq!(base_8_width, Fixed::from_pixels(71));
-        assert_eq!(defaulted_base_width, absent_width);
         assert_eq!(
             base_8_width.checked_sub(explicit_8_width),
             Some(Fixed::from_pixels(5))
         );
+
+        let five_columns = RenderRange::new(0, 0, 0, 4);
+        let pack = synthetic_test_pack();
+        let exact_options = RenderOptions {
+            selection: RenderSelection::Range(five_columns),
+            gridlines: false,
+            default_font_family: pack.default_family().to_string(),
+            default_font_size: Fixed::from_raw(13_893),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let ordinary_total = |sheet: &Sheet| {
+            measure_sheet_axes(sheet, five_columns, &exact_options)
+                .unwrap()
+                .1
+                .iter()
+                .map(|column| column.size.raw())
+                .sum::<i64>()
+        };
+        assert_eq!(ordinary_total(&absent.sheets[0]), 353_965);
+        assert_eq!(ordinary_total(&defaulted_base.sheets[0]), 358_740);
+        assert_eq!(
+            build_single_page_sheet_scene(&absent.sheets[0], 0, &exact_options)
+                .unwrap()
+                .scene
+                .width,
+            Fixed::from_raw(353_963)
+        );
+        assert_eq!(
+            build_single_page_sheet_scene(&defaulted_base.sheets[0], 0, &exact_options)
+                .unwrap()
+                .scene
+                .width,
+            Fixed::from_raw(358_741)
+        );
+
+        let fallback_options = RenderOptions {
+            selection: RenderSelection::Range(five_columns),
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+        for sheet in [&absent.sheets[0], &defaulted_base.sheets[0]] {
+            let ordinary = measure_sheet_axes(sheet, five_columns, &fallback_options)
+                .unwrap()
+                .1
+                .iter()
+                .map(|column| column.size.raw())
+                .sum::<i64>();
+            assert_eq!(ordinary, 5 * Fixed::from_pixels(64).raw());
+            assert_eq!(
+                build_single_page_sheet_scene(sheet, 0, &fallback_options)
+                    .unwrap()
+                    .scene
+                    .width
+                    .raw(),
+                ordinary
+            );
+        }
     }
 
     #[test]
@@ -13223,6 +13966,14 @@ mod tests {
             .sum::<i64>();
         assert_eq!(implicit_total, 322_220);
         assert_eq!(ceil_pixels(Fixed::from_raw(implicit_total)), 315);
+        assert_eq!(
+            build_single_page_sheet_scene(&implicit.sheets[0], 0, &options)
+                .unwrap()
+                .scene
+                .width,
+            Fixed::from_raw(322_219),
+            "single-page XLSB geometry must round the cumulative 8.5-digit source default once"
+        );
 
         let numeric_default = imported_width_xlsb(Some((14 * 256, 42)), &[]);
         assert_eq!(
@@ -13361,6 +14112,76 @@ mod tests {
         assert_eq!(explicit_rows[0].size, Fixed::from_pixels(20));
         assert_eq!(overridden_rows[0].size, Fixed::from_pixels(16));
         assert_eq!(authored_rows[0].size, Fixed::from_pixels(37));
+    }
+
+    #[test]
+    fn ooxml_implicit_row_defaults_round_only_cumulative_single_page_boundaries() {
+        let unverified = |sheet_format: &str| {
+            imported_xlsx(
+                "<styleSheet/>",
+                &format!(r#"<worksheet>{sheet_format}<sheetData/></worksheet>"#),
+            )
+        };
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let verified_styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let verified = |sheet_format: &str| {
+            imported_xlsx(
+                &verified_styles,
+                &format!(r#"<worksheet>{sheet_format}<sheetData/></worksheet>"#),
+            )
+        };
+        let range = RenderRange::new(0, 0, 4, 0);
+        let fallback_options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+        let verified_options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+
+        for sheet_format in ["", "<sheetFormatPr/>"] {
+            let unverified = unverified(sheet_format);
+            let unverified_sheet = &unverified.sheets[0];
+            let ordinary = measure_sheet_axes(unverified_sheet, range, &fallback_options)
+                .unwrap()
+                .0
+                .iter()
+                .map(|row| row.size.raw())
+                .sum::<i64>();
+            assert_eq!(ordinary, 96_755);
+            assert_eq!(
+                build_single_page_sheet_scene(unverified_sheet, 0, &fallback_options)
+                    .unwrap()
+                    .scene
+                    .height,
+                Fixed::from_raw(96_756)
+            );
+
+            let verified = verified(sheet_format);
+            let verified_sheet = &verified.sheets[0];
+            let ordinary = measure_sheet_axes(verified_sheet, range, &verified_options)
+                .unwrap()
+                .0
+                .iter()
+                .map(|row| row.size.raw())
+                .sum::<i64>();
+            assert_eq!(ordinary, 94_210);
+            assert_eq!(
+                build_single_page_sheet_scene(verified_sheet, 0, &verified_options)
+                    .unwrap()
+                    .scene
+                    .height,
+                Fixed::from_raw(94_208)
+            );
+        }
     }
 
     #[test]
@@ -16677,11 +17498,38 @@ mod tests {
                 single_page.report.pages[0].body_range, single_page.report.source.range,
                 "{label}"
             );
-            assert_eq!(
-                shape_placeholder_rect(&single_page.pages[0].scene.nodes),
-                shape_placeholder_rect(&ordinary.scene.nodes),
-                "used-bound policy changed drawing paint geometry for {label}"
-            );
+            let single_rect = shape_placeholder_rect(&single_page.pages[0].scene.nodes)
+                .expect("single-page shape");
+            let ordinary_rect =
+                shape_placeholder_rect(&ordinary.scene.nodes).expect("ordinary shape");
+            assert_eq!(single_rect.x, ordinary_rect.x, "{label}");
+            assert_eq!(single_rect.y, ordinary_rect.y, "{label}");
+            assert_eq!(single_rect.height, ordinary_rect.height, "{label}");
+            if explicit_prefix_widths {
+                assert_eq!(
+                    single_rect.width, ordinary_rect.width,
+                    "integer-pixel explicit prefixes must not drift for {label}"
+                );
+            } else {
+                let visible_columns = if hidden_terminal_column { 5 } else { 6 };
+                assert_eq!(
+                    ordinary_rect.width,
+                    Fixed::from_raw(70_793 * visible_columns),
+                    "ordinary layout must retain per-track rounding for {label}"
+                );
+                let native_width = round_unsigned_ratio(
+                    u64::try_from(visible_columns).unwrap() * 1_037,
+                    u64::try_from(FIXED_UNITS_PER_PIXEL).unwrap(),
+                    u64::try_from(TWIPS_PER_CSS_PIXEL).unwrap(),
+                )
+                .and_then(|raw| i64::try_from(raw).ok())
+                .map(Fixed::from_raw)
+                .unwrap();
+                assert_eq!(
+                    single_rect.width, native_width,
+                    "single-page layout must round the cumulative Calc source width once for {label}"
+                );
+            }
         }
     }
 
@@ -16881,5 +17729,299 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn single_page_native_rows_use_global_hidden_prefix_and_final_dimension() {
+        let workbook = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><sheetFormatPr defaultRowHeight="12.85"/><sheetData><row r="2" hidden="1"/><row r="3"><c r="A3" t="inlineStr"><is><t>visible</t></is></c></row></sheetData></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+        let selected = RenderRange::new(2, 0, 2, 0);
+        let base = RenderOptions {
+            selection: RenderSelection::Range(selected),
+            gridlines: false,
+            default_column_width: Fixed::from_pixels(1),
+            ..RenderOptions::default()
+        };
+
+        let ordinary = build_sheet_scene(sheet, 0, &base).unwrap();
+        let single_page = build_single_page_sheet_scene(sheet, 0, &base).unwrap();
+        assert_eq!(ordinary.scene.height, Fixed::from_raw(17_545));
+        assert_eq!(
+            single_page.scene.height,
+            Fixed::from_raw(17_544),
+            "row 3 must inherit the rounding phase of visible row 1 while hidden row 2 contributes zero"
+        );
+
+        let tight = RenderOptions {
+            limits: RenderLimits {
+                max_dimension_raw: 17_544,
+                ..RenderLimits::default()
+            },
+            ..base.clone()
+        };
+        assert_eq!(
+            build_single_page_sheet_scene(sheet, 0, &tight)
+                .unwrap()
+                .scene
+                .height,
+            Fixed::from_raw(17_544)
+        );
+        assert_eq!(
+            build_sheet_scene(sheet, 0, &tight),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::Dimension,
+                limit: 17_544,
+                actual: 17_545,
+            }),
+            "the legacy path must retain its per-track limit behavior"
+        );
+
+        let full_range = RenderRange::new(0, 0, 2, 0);
+        let full = RenderOptions {
+            selection: RenderSelection::Range(full_range),
+            include_hidden: true,
+            ..base
+        };
+        let ordinary = build_sheet_scene(sheet, 0, &full).unwrap();
+        let single_page = build_single_page_sheet_scene(sheet, 0, &full).unwrap();
+        assert_eq!(ordinary.scene.height, Fixed::from_raw(52_635));
+        assert_eq!(single_page.scene.height, Fixed::from_raw(52_634));
+
+        let measured = measure_sheet_axes_for_ranges(sheet, &[full_range], &full).unwrap();
+        assert_eq!(
+            measured[0]
+                .0
+                .iter()
+                .map(|slot| slot.size)
+                .collect::<Vec<_>>(),
+            vec![Fixed::from_raw(17_545); 3],
+            "prepared paginated geometry must remain per-track Fixed"
+        );
+        let replay = build_sheet_scene_with_geometry(
+            sheet,
+            0,
+            &full,
+            SheetGeometryOverride::new(&measured[0].0, &measured[0].1),
+        )
+        .unwrap();
+        assert_eq!(replay.scene.height, Fixed::from_raw(52_635));
+    }
+
+    #[test]
+    fn single_page_native_row_baselines_precede_merged_auto_height() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let text = "한글中文한글中文한글中文한글中文한글中文";
+        let unmerged = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><sheetFormatPr defaultRowHeight="12.85" defaultColWidth="2"/><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+            ),
+        );
+        let merged = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><sheetFormatPr defaultRowHeight="12.85" defaultColWidth="2"/><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:A3"/></mergeCells></worksheet>"#
+            ),
+        );
+        let render = |workbook: &Workbook, range| {
+            build_single_page_sheet_scene(
+                &workbook.sheets[0],
+                0,
+                &RenderOptions {
+                    selection: RenderSelection::Range(range),
+                    gridlines: false,
+                    default_font_family: family.to_string(),
+                    font_pack: Some(pack.clone()),
+                    ..RenderOptions::default()
+                },
+            )
+            .unwrap()
+            .scene
+            .height
+        };
+        let required = render(&unmerged, RenderRange::new(0, 0, 0, 0));
+        let merged_height = render(&merged, RenderRange::new(0, 0, 2, 0));
+        assert!(required > Fixed::from_raw(52_634));
+        assert_eq!(
+            merged_height, required,
+            "native baseline residuals must be resolved before the merged-row deficit"
+        );
+    }
+
+    #[test]
+    fn single_page_fixed_extent_and_absolute_origin_share_native_boundaries() {
+        let workbook = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><sheetFormatPr defaultRowHeight="12.85"/><sheetData/></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+        let options = RenderOptions::default();
+        let maximum_digit_width = Fixed::from_pixels(7);
+
+        assert_eq!(
+            fixed_size_used_row(
+                sheet,
+                0,
+                0,
+                489_598,
+                maximum_digit_width,
+                &options,
+                AxisEndpointPolicy::PerTrackFixed,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            fixed_size_used_row(
+                sheet,
+                0,
+                0,
+                489_598,
+                maximum_digit_width,
+                &options,
+                AxisEndpointPolicy::SourceNative,
+            )
+            .unwrap(),
+            3,
+            "the drawing exceeds the cumulative three-row native boundary by one Fixed unit"
+        );
+
+        let range = RenderRange::new(3, 0, 3, 0);
+        let mut warnings = Warnings::default();
+        assert_eq!(
+            sheet_grid_origin_with_policy(
+                sheet,
+                range,
+                maximum_digit_width,
+                &options,
+                AxisEndpointPolicy::PerTrackFixed,
+                &mut warnings,
+            )
+            .unwrap()
+            .1,
+            Fixed::from_raw(52_635)
+        );
+        let mut warnings = Warnings::default();
+        assert_eq!(
+            sheet_grid_origin_with_policy(
+                sheet,
+                range,
+                maximum_digit_width,
+                &options,
+                AxisEndpointPolicy::SourceNative,
+                &mut warnings,
+            )
+            .unwrap()
+            .1,
+            Fixed::from_raw(52_634)
+        );
+    }
+
+    #[test]
+    fn source_axis_ratio_variants_retain_exact_units() {
+        assert_eq!(
+            imported_axis_measure_rational(
+                ImportedAxisMeasure::PointRatio(15, 1),
+                Fixed::from_pixels(7),
+            ),
+            Some(AxisRational::new(20_480, 1).unwrap())
+        );
+        assert_eq!(
+            imported_axis_measure_rational(
+                ImportedAxisMeasure::CharacterWidthRatio(843, 100),
+                Fixed::from_pixels(7),
+            ),
+            Some(AxisRational::new(61 * 1_024, 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn exact_character_widths_match_legacy_digit_pixel_quantization() {
+        for maximum_digit_width in [Fixed::from_raw(7_612), Fixed::from_raw(8_336)] {
+            for (numerator, denominator) in [(2_160_u64, 256_u64), (843, 100)] {
+                let characters = numerator as f32 / denominator as f32;
+                let expected = column_chars_to_fixed(
+                    characters,
+                    maximum_digit_width,
+                    IMPORTED_COLUMN_PADDING_PIXELS,
+                )
+                .unwrap();
+                let pixels = character_width_ratio_to_pixels(
+                    numerator,
+                    denominator,
+                    maximum_digit_width,
+                    IMPORTED_COLUMN_PADDING_PIXELS,
+                )
+                .unwrap();
+                assert_eq!(
+                    pixels * i128::from(FIXED_UNITS_PER_PIXEL),
+                    i128::from(expected.raw()),
+                    "{numerator}/{denominator} characters at {maximum_digit_width:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_native_endpoints_round_global_cumulative_boundaries_once() {
+        fn sizes(measure: ImportedAxisMeasure, count: u64, prefix_count: u64) -> Vec<(i64, i64)> {
+            let contribution =
+                imported_axis_measure_rational(measure, Fixed::from_pixels(7)).unwrap();
+            let prefix = contribution.checked_mul_u64(prefix_count).unwrap();
+            let mut cursor = SourceAxisCursor::new(prefix).unwrap();
+            (0..count)
+                .map(|_| {
+                    let (offset, size, _) = cursor.advance(contribution).unwrap();
+                    (offset.raw(), size.raw())
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            sizes(ImportedAxisMeasure::Twips(280), 3, 0),
+            [(0, 19_115), (19_115, 19_114), (38_229, 19_115)]
+        );
+        assert_eq!(
+            sizes(ImportedAxisMeasure::MillimeterHundredths(2_000), 3, 0),
+            [(0, 77_405), (77_405, 77_404), (154_809, 77_405)]
+        );
+        assert_eq!(
+            sizes(ImportedAxisMeasure::DigitWidth256(2_432), 4, 0),
+            [
+                (0, 68_130),
+                (68_130, 68_130),
+                (136_260, 68_130),
+                (204_390, 68_131),
+            ]
+        );
+        assert_eq!(
+            sizes(ImportedAxisMeasure::Twips(280), 2, 1),
+            [(0, 19_114), (19_114, 19_115)],
+            "a nonzero selection must retain the global rounding phase"
+        );
+
+        for measure in [
+            ImportedAxisMeasure::Twips(280),
+            ImportedAxisMeasure::MillimeterHundredths(2_000),
+            ImportedAxisMeasure::PointRatio(14, 1),
+            ImportedAxisMeasure::CharacterWidth256(2_048),
+            ImportedAxisMeasure::CharacterWidthRatio(843, 100),
+            ImportedAxisMeasure::CharacterBaseWidth256(2_048),
+            ImportedAxisMeasure::DigitWidth256(2_432),
+            ImportedAxisMeasure::DigitBaseWidth256(2_048),
+        ] {
+            assert!(
+                imported_axis_measure_rational(measure, Fixed::from_pixels(7))
+                    .is_some_and(AxisRational::is_at_least_one),
+                "missing exact conversion for {measure:?}"
+            );
+        }
     }
 }
