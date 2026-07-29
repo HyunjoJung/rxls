@@ -5734,6 +5734,10 @@ pub struct Sheet {
     /// Parsed sheet type for metadata when the source format exposes it.
     pub(crate) sheet_type: Option<SheetType>,
     pub(crate) cells: Vec<CellEntry>,
+    /// Worksheet extent declared by the source container. This read-side
+    /// structural range may include trailing empty rows or columns and is kept
+    /// separate from the populated-cell dimensions.
+    pub(crate) declared_dimensions: Option<(u32, u16, u32, u16)>,
     /// Lazily built compact last-write-wins coordinate index used by whole-sheet,
     /// range, and point display access. Readers finish populating `cells` before
     /// any public access; authoring writes invalidate this cache before appending
@@ -6133,6 +6137,7 @@ impl Default for Sheet {
             display_date1904: false,
             sheet_type: None,
             cells: Vec::default(),
+            declared_dimensions: None,
             display_cell_index: OnceLock::new(),
             col_widths: BTreeMap::default(),
             xlsb_col_widths_256: BTreeMap::default(),
@@ -8584,6 +8589,15 @@ impl Sheet {
             c1 = c1.max(c.col);
         }
         Some((r0, c0, r1, c1))
+    }
+
+    /// Renderer-only source used-range metadata retained by format readers.
+    ///
+    /// This structural range can contain trailing empty axes and intentionally
+    /// remains separate from [`Self::dimensions`].
+    #[doc(hidden)]
+    pub fn source_used_dimensions(&self) -> Option<(u32, u16, u32, u16)> {
+        self.declared_dimensions
     }
 
     /// Inclusive dimensions covering values, format-only blanks, and merged

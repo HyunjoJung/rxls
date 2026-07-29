@@ -69,6 +69,7 @@ const BRT_DVAL: u32 = 64;
 const BRT_BEGIN_WS_VIEW: u32 = 137;
 const BRT_END_WS_VIEW: u32 = 138;
 const BRT_WS_PROP: u32 = 147;
+const BRT_WS_DIM: u32 = 148;
 const BRT_PANE: u32 = 151;
 const BRT_BEGIN_AFILTER: u32 = 161;
 const BRT_BUNDLE_SH: u32 = 156;
@@ -367,6 +368,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             style_fidelity,
             sheet_type: Some(sheet_type),
             cells,
+            declared_dimensions: metadata.declared_dimensions,
             default_format: styles.cell_styles.first().cloned(),
             col_formats: metadata.col_formats,
             row_formats: metadata.row_formats,
@@ -1582,6 +1584,7 @@ type AutoFilter = Option<SheetRange>;
 
 #[derive(Default)]
 struct SheetReadMetadata {
+    declared_dimensions: Option<SheetRange>,
     freeze: Option<(u32, u16)>,
     autofilter: AutoFilter,
     data_validations: Vec<DataValidation>,
@@ -1750,6 +1753,11 @@ fn parse_sheet(
     let mut r = RecReader::new(b);
     while let Some((rt, p)) = r.next() {
         match rt {
+            BRT_WS_DIM => {
+                if metadata.declared_dimensions.is_none() {
+                    metadata.declared_dimensions = parse_brt_ws_dim(p);
+                }
+            }
             BRT_DVAL_LIST => {
                 pending_dval_list = wide_string(p, 0).map(|(formula, _)| formula);
             }
@@ -1932,6 +1940,27 @@ fn parse_sheet(
         }
     }
     (cells, merges, hyperlinks, metadata)
+}
+
+fn parse_brt_ws_dim(p: &[u8]) -> Option<SheetRange> {
+    if p.len() != 16 {
+        return None;
+    }
+    let (first_row, last_row, first_col, last_col) =
+        (u32le(p, 0)?, u32le(p, 4)?, u32le(p, 8)?, u32le(p, 12)?);
+    if first_row > last_row
+        || last_row > MAX_XLSB_ROW_INDEX
+        || first_col > last_col
+        || last_col > MAX_XLSB_COL_INDEX
+    {
+        return None;
+    }
+    Some((
+        first_row,
+        u16::try_from(first_col).ok()?,
+        last_row,
+        u16::try_from(last_col).ok()?,
+    ))
 }
 
 fn parse_list_part_rel_id(p: &[u8]) -> Option<String> {
@@ -3556,6 +3585,38 @@ mod tests {
     }
 
     #[test]
+    fn brt_ws_dim_is_strict_bounded_and_inclusive() {
+        let payload = [
+            0u32.to_le_bytes(),
+            3u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+            4u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(parse_brt_ws_dim(&payload), Some((0, 0, 3, 4)));
+
+        let reversed = [
+            3u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+            4u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(parse_brt_ws_dim(&reversed), None);
+
+        let out_of_grid = [
+            0u32.to_le_bytes(),
+            (MAX_XLSB_ROW_INDEX + 1).to_le_bytes(),
+            0u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(parse_brt_ws_dim(&out_of_grid), None);
+        assert_eq!(parse_brt_ws_dim(&payload[..15]), None);
+        assert_eq!(parse_brt_ws_dim(&[payload.as_slice(), &[0]].concat()), None);
+    }
+
+    #[test]
     fn xlsb_supporting_link_relationships_preserve_non_external_slots() {
         let mut workbook = rec(BRT_SUP_SELF, &[]);
         workbook.extend_from_slice(&rec(BRT_SUP_BOOK_SRC, &wstr("rIdExternal")));
@@ -3704,7 +3765,15 @@ mod tests {
         let sst = rec(BRT_SST_ITEM, &item);
 
         // sheet1.bin: RowHdr(0), CellIsst(0,0 → isst 0), CellReal(0,1 → 42.0).
-        let mut sh = rec(BRT_ROW_HDR, &[0, 0, 0, 0]);
+        let dimensions = [
+            0u32.to_le_bytes(),
+            3u32.to_le_bytes(),
+            0u32.to_le_bytes(),
+            4u32.to_le_bytes(),
+        ]
+        .concat();
+        let mut sh = rec(BRT_WS_DIM, &dimensions);
+        sh.extend_from_slice(&rec(BRT_ROW_HDR, &[0, 0, 0, 0]));
         let mut isst = vec![0u8; 8]; // col=0, styleRef/flags
         isst.extend_from_slice(&0u32.to_le_bytes()); // isst = 0
         sh.extend_from_slice(&rec(BRT_CELL_ISST, &isst));
@@ -3735,6 +3804,8 @@ mod tests {
             Some(&Cell::Text("품목".to_string()))
         );
         assert_eq!(wb.sheets[0].cell(0, 1), Some(&Cell::Number(42.0)));
+        assert_eq!(wb.sheets[0].source_used_dimensions(), Some((0, 0, 3, 4)));
+        assert_eq!(wb.sheets[0].dimensions(), Some((0, 0, 0, 1)));
         assert_eq!(wb.sheets[0].default_column_width(), None);
         assert_eq!(wb.sheets[0].implicit_ooxml_column_width(), Some(None));
         assert_eq!(

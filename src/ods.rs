@@ -5311,6 +5311,18 @@ mod tests {
     }
 
     #[test]
+    fn ods_structural_empty_repeats_do_not_declare_a_source_used_range() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Structural"><table:table-column table:number-columns-repeated="4"/><table:table-row table:number-rows-repeated="6"><table:table-cell table:number-columns-repeated="4"/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).unwrap();
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(sheet.source_used_dimensions(), None);
+        assert_eq!(sheet.dimensions(), None);
+        assert_eq!(sheet.cells().count(), 0);
+    }
+
+    #[test]
     fn repeated_valued_rows_are_replicated() {
         // A `number-rows-repeated` row carrying a value must be replicated, not
         // collapsed to one row + a skip.

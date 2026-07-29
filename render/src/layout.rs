@@ -1125,7 +1125,7 @@ pub fn build_sheet_scene(
     sheet_index: usize,
     options: &RenderOptions,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, None)
+    build_sheet_scene_inner(sheet, sheet_index, options, None, None)
 }
 
 pub(crate) fn build_sheet_scene_with_geometry(
@@ -1134,7 +1134,22 @@ pub(crate) fn build_sheet_scene_with_geometry(
     options: &RenderOptions,
     geometry: SheetGeometryOverride<'_>,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry))
+    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry), None)
+}
+
+pub(crate) fn build_sheet_scene_with_used_extent_floor(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    used_extent_floor: RenderRange,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        None,
+        Some(used_extent_floor.validate()?),
+    )
 }
 
 fn build_sheet_scene_inner(
@@ -1142,13 +1157,16 @@ fn build_sheet_scene_inner(
     sheet_index: usize,
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    used_extent_floor: Option<RenderRange>,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
     let used_extent = match options.selection {
         RenderSelection::Used => {
             style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-            Some(render_used_extent(sheet, &style_snapshot, options)?)
+            let mut extent = render_used_extent(sheet, &style_snapshot, options)?;
+            apply_used_extent_floor(&mut extent, used_extent_floor);
+            Some(extent)
         }
         RenderSelection::Range(_) => None,
     };
@@ -1689,6 +1707,20 @@ fn build_sheet_scene_inner(
 struct UsedRenderExtent {
     range: Option<RenderRange>,
     active_merges: BTreeSet<(u32, u16, u32, u16)>,
+}
+
+fn apply_used_extent_floor(extent: &mut UsedRenderExtent, used_extent_floor: Option<RenderRange>) {
+    if let Some(range) = used_extent_floor {
+        // OOXML and XLSB commonly serialize `A1` as the dimension sentinel
+        // for an otherwise empty worksheet. Preserve the established empty
+        // Used-selection behavior unless either real visual content or a
+        // larger structural extent exists.
+        if extent.range.is_none() && range == RenderRange::new(0, 0, 0, 0) {
+            return;
+        }
+        include_render_coordinate(&mut extent.range, range.first_row, range.first_col);
+        include_render_coordinate(&mut extent.range, range.last_row, range.last_col);
+    }
 }
 
 /// Resolve Calc-compatible visual content for [`RenderSelection::Used`].
@@ -2294,15 +2326,17 @@ pub(crate) fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
 }
 
 /// Resolve the exact used range recorded by a single expanded sheet scene.
-pub(crate) fn render_used_scene_range(
+pub(crate) fn render_used_scene_range_with_floor(
     sheet: &Sheet,
     options: &RenderOptions,
+    used_extent_floor: Option<RenderRange>,
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    Ok(render_used_extent(sheet, &style_snapshot, options)?
-        .range
-        .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
+    let mut extent = render_used_extent(sheet, &style_snapshot, options)?;
+    let floor = used_extent_floor.map(RenderRange::validate).transpose()?;
+    apply_used_extent_floor(&mut extent, floor);
+    Ok(extent.range.unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
 
 /// Resolve the cell range needed to paginate all used visual content.

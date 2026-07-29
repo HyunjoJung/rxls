@@ -73,6 +73,7 @@ const ARRAY: u16 = 0x0221;
 const SHRFMLA: u16 = 0x04BC;
 const STRING: u16 = 0x0207;
 const ROW: u16 = 0x0208;
+const DIMENSIONS: u16 = 0x0200;
 const COLINFO: u16 = 0x007D;
 const DEFAULTCOLWIDTH: u16 = 0x0055;
 const STANDARDWIDTH: u16 = 0x0099;
@@ -103,6 +104,9 @@ const MAX_BIFF_FONT_RECORD_BYTES: usize = 78;
 const MAX_BIFF_XF_RECORD_BYTES: usize = 20;
 const MAX_BIFF_DEFAULT_COL_WIDTH_CHARS: u16 = 255;
 const MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS: i16 = 8179;
+const MIN_BIFF_ROW_HEIGHT_TWIPS: u16 = 2;
+const MAX_BIFF_ROW_HEIGHT_TWIPS: u16 = 8192;
+const BIFF_ROW_FLAG_UNSYNCED: u32 = 1 << 6;
 const BIFF_DEFAULT_PALETTE: [Color; 56] = [
     Color::rgb(0x00, 0x00, 0x00),
     Color::rgb(0xFF, 0xFF, 0xFF),
@@ -1250,6 +1254,15 @@ impl Workbook {
                         if let Some(si) = cur_sheet {
                             if si < sheets.len() {
                                 sheets[si].tab_color = parse_sheet_ext_tab_color(data, &palette);
+                            }
+                        }
+                    }
+                }
+                DIMENSIONS => {
+                    if depth == 1 {
+                        if let Some(sheet) = cur_sheet.and_then(|si| sheets.get_mut(si)) {
+                            if sheet.declared_dimensions.is_none() {
+                                sheet.declared_dimensions = parse_biff_dimensions(data, ctx.biff8);
                             }
                         }
                     }
@@ -3336,6 +3349,44 @@ fn parse_pane_freeze(data: &[u8]) -> Option<(u32, u16)> {
     }
 }
 
+fn parse_biff_dimensions(data: &[u8], biff8: bool) -> Option<(u32, u16, u32, u16)> {
+    let maximum_row_exclusive = if biff8 { 65_536 } else { 16_384 };
+    let (first_row, last_row_exclusive, first_col, last_col_exclusive) = if biff8 {
+        if data.len() != 14 {
+            return None;
+        }
+        (
+            u32le(data, 0)?,
+            u32le(data, 4)?,
+            u16le(data, 8)?,
+            u16le(data, 10)?,
+        )
+    } else {
+        if data.len() != 10 {
+            return None;
+        }
+        (
+            u32::from(u16le(data, 0)?),
+            u32::from(u16le(data, 2)?),
+            u16le(data, 4)?,
+            u16le(data, 6)?,
+        )
+    };
+    if first_row >= last_row_exclusive
+        || last_row_exclusive > maximum_row_exclusive
+        || first_col >= last_col_exclusive
+        || last_col_exclusive > 256
+    {
+        return None;
+    }
+    Some((
+        first_row,
+        first_col,
+        last_row_exclusive - 1,
+        last_col_exclusive - 1,
+    ))
+}
+
 fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_budget: &mut usize) {
     let (Some(row), Some(height_twips), Some(options)) =
         (u16le(data, 0), u16le(data, 6), u32le(data, 12))
@@ -3344,7 +3395,11 @@ fn apply_row_outline(data: &[u8], sheet: &mut Sheet, styles: &XlsStyles, style_b
     };
     let level = (options & 0x07) as u8;
     let row = u32::from(row);
-    if height_twips > 0 {
+    // [MS-XLS] 2.4.221 Row: `fUnsynced` marks a manually assigned `miyRw`;
+    // otherwise the stored height is not an explicit per-row override.
+    if options & BIFF_ROW_FLAG_UNSYNCED != 0
+        && (MIN_BIFF_ROW_HEIGHT_TWIPS..=MAX_BIFF_ROW_HEIGHT_TWIPS).contains(&height_twips)
+    {
         sheet
             .row_heights
             .insert(row, f32::from(height_twips) / 20.0);
@@ -4468,7 +4523,7 @@ mod tests {
             out.extend_from_slice(&row.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // first described column
             out.extend_from_slice(&1u16.to_le_bytes()); // last described column + 1
-            out.extend_from_slice(&0x8000u16.to_le_bytes()); // default row height
+            out.extend_from_slice(&400u16.to_le_bytes()); // manually assigned 20 pt height
             out.extend_from_slice(&0u16.to_le_bytes()); // unused
             out.extend_from_slice(&0u16.to_le_bytes()); // unused in BIFF5+
             out.extend_from_slice(&options.to_le_bytes());
@@ -4498,7 +4553,10 @@ mod tests {
         s_bof.extend_from_slice(&[0u8; 12]);
         stream.extend_from_slice(&rec(BOF, &s_bof));
         stream.extend_from_slice(&rec(0x0081, &0u16.to_le_bytes())); // summaries above/left
-        stream.extend_from_slice(&rec(0x0208, &row_record(2, 2 | (1 << 4) | (1 << 5))));
+        stream.extend_from_slice(&rec(
+            0x0208,
+            &row_record(2, 2 | (1 << 4) | (1 << 5) | BIFF_ROW_FLAG_UNSYNCED),
+        ));
         stream.extend_from_slice(&rec(0x0208, &row_record(3, 2)));
         stream.extend_from_slice(&rec(0x007D, &col_info(1, 3, (3 << 8) | 1)));
         stream.extend_from_slice(&rec(EOF, &[]));
@@ -4511,7 +4569,7 @@ mod tests {
         assert!(sheet.collapsed_rows().contains(&2));
         assert_eq!(sheet.col_outline_levels().get(&1), Some(&3));
         assert_eq!(sheet.col_outline_levels().get(&3), Some(&3));
-        assert_eq!(sheet.row_heights().get(&2), Some(&(0x8000 as f32 / 20.0)));
+        assert_eq!(sheet.row_heights().get(&2), Some(&20.0));
         assert!(sheet.hidden_rows().contains(&2));
         assert_eq!(
             sheet.column_widths().get(&1),
@@ -6035,11 +6093,105 @@ mod tests {
         body
     }
 
-    fn test_row(row: u16, height_twips: u16) -> Vec<u8> {
+    fn test_row(row: u16, height_twips: u16, options: u32) -> Vec<u8> {
         let mut body = vec![0; 16];
         body[0..2].copy_from_slice(&row.to_le_bytes());
         body[6..8].copy_from_slice(&height_twips.to_le_bytes());
+        body[12..16].copy_from_slice(&options.to_le_bytes());
         body
+    }
+
+    fn test_dimensions(
+        biff8: bool,
+        first_row: u32,
+        last_row_exclusive: u32,
+        first_col: u16,
+        last_col_exclusive: u16,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        if biff8 {
+            body.extend_from_slice(&first_row.to_le_bytes());
+            body.extend_from_slice(&last_row_exclusive.to_le_bytes());
+        } else {
+            body.extend_from_slice(&(first_row as u16).to_le_bytes());
+            body.extend_from_slice(&(last_row_exclusive as u16).to_le_bytes());
+        }
+        body.extend_from_slice(&first_col.to_le_bytes());
+        body.extend_from_slice(&last_col_exclusive.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn biff_dimensions_are_retained_with_exclusive_end_bounds() {
+        for biff8 in [false, true] {
+            let records = vec![
+                (DIMENSIONS, test_dimensions(biff8, 0, 5, 0, 6)),
+                (LABEL, {
+                    let mut body = Vec::new();
+                    body.extend_from_slice(&0u16.to_le_bytes());
+                    body.extend_from_slice(&0u16.to_le_bytes());
+                    body.extend_from_slice(&0u16.to_le_bytes());
+                    if biff8 {
+                        body.extend_from_slice(&1u16.to_le_bytes());
+                        body.push(0);
+                    } else {
+                        body.extend_from_slice(&1u16.to_le_bytes());
+                    }
+                    body.push(b'x');
+                    body
+                }),
+            ];
+            let workbook = workbook_with_geometry_records(biff8, &records);
+            let sheet = &workbook.sheets[0];
+            assert_eq!(sheet.source_used_dimensions(), Some((0, 0, 4, 5)));
+            assert_eq!(sheet.dimensions(), Some((0, 0, 0, 0)));
+        }
+    }
+
+    #[test]
+    fn biff_dimensions_enforce_generation_specific_row_limits() {
+        let biff5_maximum = test_dimensions(false, 16_383, 16_384, 0, 1);
+        assert_eq!(
+            parse_biff_dimensions(&biff5_maximum, false),
+            Some((16_383, 0, 16_383, 0))
+        );
+        assert_eq!(
+            parse_biff_dimensions(&test_dimensions(false, 16_384, 16_385, 0, 1), false),
+            None
+        );
+
+        let biff8_maximum = test_dimensions(true, 65_535, 65_536, 0, 1);
+        assert_eq!(
+            parse_biff_dimensions(&biff8_maximum, true),
+            Some((65_535, 0, 65_535, 0))
+        );
+        assert_eq!(
+            parse_biff_dimensions(&test_dimensions(true, 65_536, 65_537, 0, 1), true),
+            None
+        );
+    }
+
+    #[test]
+    fn biff_dimensions_reject_malformed_reversed_and_out_of_grid_records() {
+        for biff8 in [false, true] {
+            let mut truncated = test_dimensions(biff8, 0, 5, 0, 6);
+            truncated.pop();
+            let records = vec![
+                (DIMENSIONS, truncated),
+                (DIMENSIONS, test_dimensions(biff8, 5, 5, 0, 6)),
+                (DIMENSIONS, test_dimensions(biff8, 0, 5, 6, 6)),
+                (DIMENSIONS, test_dimensions(biff8, 0, 5, 0, 257)),
+                (DIMENSIONS, test_dimensions(biff8, 1, 5, 2, 6)),
+                (DIMENSIONS, test_dimensions(biff8, 0, 2, 0, 2)),
+            ];
+            let workbook = workbook_with_geometry_records(biff8, &records);
+            assert_eq!(
+                workbook.sheets[0].source_used_dimensions(),
+                Some((1, 2, 4, 5)),
+                "the first valid declaration must win"
+            );
+        }
     }
 
     #[test]
@@ -6050,7 +6202,7 @@ mod tests {
             (DEFAULTCOLWIDTH, 8u16.to_le_bytes().to_vec()),
             (DEFAULTROWHEIGHT, default_row_height),
             (COLINFO, test_colinfo(2, 2, 3072)), // 12 characters
-            (ROW, test_row(3, 360)),             // 18 points
+            (ROW, test_row(3, 360, BIFF_ROW_FLAG_UNSYNCED)), // 18 points
         ];
         let workbook = workbook_with_geometry_records(true, &records);
         let sheet = &workbook.sheets[0];
@@ -6061,6 +6213,62 @@ mod tests {
         assert_eq!(sheet.row_heights().get(&3), Some(&18.0));
         assert_eq!(sheet.column_widths().len(), 1);
         assert_eq!(sheet.row_heights().len(), 1);
+    }
+
+    #[test]
+    fn biff_row_height_requires_funsynced() {
+        let records = vec![
+            (ROW, test_row(3, 360, 0)),
+            (ROW, test_row(4, 360, BIFF_ROW_FLAG_UNSYNCED)),
+        ];
+        let workbook = workbook_with_geometry_records(true, &records);
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(
+            sheet.row_heights().get(&3),
+            None,
+            "miyRw is not an explicit override while fUnsynced is clear"
+        );
+        assert_eq!(sheet.row_heights().get(&4), Some(&18.0));
+        assert_eq!(sheet.row_heights().len(), 1);
+    }
+
+    #[test]
+    fn biff_row_height_rejects_malformed_and_out_of_range_values() {
+        let mut truncated = test_row(7, 360, BIFF_ROW_FLAG_UNSYNCED);
+        truncated.truncate(15);
+        let records = vec![
+            (ROW, test_row(1, 0, BIFF_ROW_FLAG_UNSYNCED)),
+            (
+                ROW,
+                test_row(2, MIN_BIFF_ROW_HEIGHT_TWIPS - 1, BIFF_ROW_FLAG_UNSYNCED),
+            ),
+            (
+                ROW,
+                test_row(3, MIN_BIFF_ROW_HEIGHT_TWIPS, BIFF_ROW_FLAG_UNSYNCED),
+            ),
+            (
+                ROW,
+                test_row(4, MAX_BIFF_ROW_HEIGHT_TWIPS, BIFF_ROW_FLAG_UNSYNCED),
+            ),
+            (
+                ROW,
+                test_row(5, MAX_BIFF_ROW_HEIGHT_TWIPS + 1, BIFF_ROW_FLAG_UNSYNCED),
+            ),
+            (ROW, truncated),
+        ];
+        let workbook = workbook_with_geometry_records(true, &records);
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(
+            sheet.row_heights().get(&3),
+            Some(&(f32::from(MIN_BIFF_ROW_HEIGHT_TWIPS) / 20.0))
+        );
+        assert_eq!(
+            sheet.row_heights().get(&4),
+            Some(&(f32::from(MAX_BIFF_ROW_HEIGHT_TWIPS) / 20.0))
+        );
+        assert_eq!(sheet.row_heights().len(), 2);
     }
 
     #[test]
