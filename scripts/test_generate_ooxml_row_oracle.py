@@ -23,9 +23,45 @@ EXPECTED_FULL_MANIFEST_SHA256 = (
     "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
 )
 EXPECTED_DIAGNOSTIC_MANIFEST_SHA256 = (
-    "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a"
+    "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef"
 )
 EXPECTED_PAYLOAD_SHA256 = {
+    "row-missing-noto-11-auto-bold-font": (
+        "3cb0d407edf4198c9ba73101e8e364c27006e27be35bf70d57a407837b573f12"
+    ),
+    "row-missing-noto-11-auto-bold-font-wrapped": (
+        "fad3d67238db8b7c68425435d6ae9681e0913642c5811ccff1d7c1dba2f2fbfb"
+    ),
+    "row-missing-noto-11-auto-large-font": (
+        "2c50da9539d0728e438e01b6369539e54977130127b2622afaa52ba8fadbdcbc"
+    ),
+    "row-missing-noto-11-auto-long-unwrapped": (
+        "bffa9c454630fe6e754f53ff7245e8b2e18c4d3ad1ef4146747acbfc987c6141"
+    ),
+    "row-missing-noto-11-auto-wrapped-explicit": (
+        "d7c3d6da0ec43505797c2881a0c3930db8089e10ff43e4875c788da919a17785"
+    ),
+    "row-missing-noto-11-auto-wrapped-hidden": (
+        "cf8fac84379109a0a12f08177285cb81b385b579955c831d897ed45b8034d753"
+    ),
+    "row-missing-noto-11-auto-wrapped-image": (
+        "21a99a7d283e4abfdb9b293c391b12c61547e006759947177618836bca21cbfd"
+    ),
+    "row-missing-noto-11-auto-wrapped-long": (
+        "108c49917d62c4af604998f275c8c24b7bb64f25118725e53c37fa91a5b9e88f"
+    ),
+    "row-missing-noto-11-auto-wrapped-long-anchor": (
+        "cedd3e1799c19dc443a7f55985c42c5b8cdec3baccbb098d00639eaebb982c0b"
+    ),
+    "row-missing-noto-11-auto-wrapped-merged": (
+        "f2c9ac3ba3a3616843dbfe649faba32a166fe9037b37ec86394a90dac0b5fc8a"
+    ),
+    "row-missing-noto-11-auto-wrapped-rtl": (
+        "f9e8b3ffc14c6f5c2efc96e50cd22b09353a4815805480e1a01ce0ee42047f2b"
+    ),
+    "row-missing-noto-11-auto-wrapped-wide": (
+        "bc52b4dd8cea61b6d342f4e889eae1c6d8a0e66e239971917597ccd33ad687dd"
+    ),
     "row-missing-carlito-11": (
         "b86dd37fae68af9bcd5442d5bd105206491e413e4abaeab4533e723c3504d0fa"
     ),
@@ -84,22 +120,34 @@ RELEASE = load_script(RELEASE_GENERATOR, "rxls_generate_render_corpus_regression
 class OoxmlRowOracleGeneratorTests(unittest.TestCase):
     def test_exact_matrix_and_feature_counts(self) -> None:
         manifest, cases = MODULE.materialize()
-        self.assertEqual(len(cases), 12)
-        self.assertEqual(manifest["case_count"], 12)
-        self.assertEqual(manifest["format_counts"], {"xlsx": 12})
+        self.assertEqual(len(cases), 24)
+        self.assertEqual(manifest["case_count"], 24)
+        self.assertEqual(manifest["format_counts"], {"xlsx": 24})
         self.assertEqual(
             manifest["feature_counts"],
             {
+                "auto-bold-font": 1,
+                "auto-bold-font-wrapped": 1,
+                "auto-large-font": 1,
+                "auto-long-unwrapped": 1,
+                "auto-wrapped-explicit": 1,
+                "auto-wrapped-hidden": 1,
+                "auto-wrapped-image": 1,
+                "auto-wrapped-long": 1,
+                "auto-wrapped-long-anchor": 1,
+                "auto-wrapped-merged": 1,
+                "auto-wrapped-rtl": 1,
+                "auto-wrapped-wide": 1,
                 "explicit-row-height": 1,
                 "hidden-row": 1,
                 "image-drawing": 1,
                 "normal-font-carlito": 4,
-                "normal-font-noto": 8,
-                "normal-size-11": 8,
+                "normal-font-noto": 20,
+                "normal-size-11": 20,
                 "normal-size-12": 4,
-                "ooxml-implicit-row": 12,
+                "ooxml-implicit-row": 24,
                 "right-to-left-layout": 1,
-                "sheet-format-missing": 8,
+                "sheet-format-missing": 20,
                 "sheet-format-present": 4,
             },
         )
@@ -120,12 +168,7 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
         }
         expected_stress = {
             (False, "Noto Sans CJK KR", 11, toggle)
-            for toggle in (
-                "explicit-row-height",
-                "hidden-row",
-                "right-to-left-layout",
-                "image-drawing",
-            )
+            for toggle in MODULE.BASELINE_TOGGLES + MODULE.AUTOHEIGHT_TOGGLES
         }
         self.assertEqual(combinations, expected_core | expected_stress)
         for spec, _ in cases:
@@ -140,7 +183,7 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["profile"], "ooxml-row-diagnostic")
         self.assertEqual(manifest["generator"], "rxls-ooxml-row-diagnostic")
-        self.assertEqual(manifest["generator_version"], "1.0.0")
+        self.assertEqual(manifest["generator_version"], "1.1.0")
         self.assertEqual(manifest["rights_tier"], "S")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(manifest["redistribution"], "allowed")
@@ -239,12 +282,24 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                     )
                     self.assertIsNotNone(a1)
                     self.assertNotIn("s", a1.attrib)
-                    for xf in (
-                        *styles.findall("s:cellStyleXfs/s:xf", namespace),
-                        *styles.findall("s:cellXfs/s:xf", namespace),
-                    ):
+                    style_xfs = styles.findall("s:cellStyleXfs/s:xf", namespace)
+                    cell_xfs = styles.findall("s:cellXfs/s:xf", namespace)
+                    for xf in (*style_xfs, cell_xfs[0]):
                         self.assertNotIn("applyAlignment", xf.attrib)
                         self.assertIsNone(xf.find("s:alignment", namespace))
+                    if spec.toggle in MODULE.WRAPPED_TOGGLES:
+                        self.assertEqual(len(cell_xfs), 2)
+                        self.assertEqual(
+                            cell_xfs[1].find("s:alignment", namespace).attrib,
+                            {"vertical": "top", "wrapText": "1"},
+                        )
+                    else:
+                        self.assertTrue(
+                            all(
+                                xf.find("s:alignment", namespace) is None
+                                for xf in cell_xfs
+                            )
+                        )
                     external_relationships = []
                     for name in names:
                         if name.endswith(".rels"):
@@ -271,7 +326,7 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
             with ZipFile(io.BytesIO(MODULE.build_case(spec))) as archive:
                 parts = {name: archive.read(name) for name in archive.namelist()}
             with self.subTest(case=spec.case_id):
-                if spec.toggle == "image-drawing":
+                if spec.toggle in MODULE.DRAWING_TOGGLES:
                     self.assertIn("xl/media/image1.png", parts)
                     self.assertTrue(
                         parts["xl/media/image1.png"].startswith(b"\x89PNG\r\n\x1a\n")
@@ -282,7 +337,11 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                     self.assertNotEqual(
                         parts["xl/styles.xml"], baseline_parts["xl/styles.xml"]
                     )
-                elif spec.toggle != "image-drawing":
+                elif spec.toggle not in (
+                    MODULE.WRAPPED_TOGGLES
+                    | MODULE.BOLD_FONT_TOGGLES
+                    | MODULE.LARGE_FONT_TOGGLES
+                ):
                     self.assertEqual(
                         parts["xl/styles.xml"], baseline_parts["xl/styles.xml"]
                     )
@@ -294,8 +353,67 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                 )
                 self.assertEqual(' ht="21" customHeight="1"' in sheet, spec.toggle == "explicit-row-height")
                 self.assertEqual('<row r="4" hidden="1"/>' in sheet, spec.toggle == "hidden-row")
-                self.assertEqual(' rightToLeft="1"' in sheet, spec.toggle == "right-to-left-layout")
-                self.assertEqual('<drawing r:id="rIdDrawing"/>' in sheet, spec.toggle == "image-drawing")
+                self.assertEqual(
+                    ' rightToLeft="1"' in sheet,
+                    spec.toggle
+                    in {"right-to-left-layout", "auto-wrapped-rtl"},
+                )
+                self.assertEqual(
+                    '<drawing r:id="rIdDrawing"/>' in sheet,
+                    spec.toggle in MODULE.DRAWING_TOGGLES,
+                )
+
+    def test_wrapping_controls_preserve_identical_probe_content(self) -> None:
+        by_toggle = {spec.toggle: spec for spec in MODULE.CASES}
+
+        def parts(toggle: str) -> dict[str, bytes]:
+            with ZipFile(
+                io.BytesIO(MODULE.build_case(by_toggle[toggle]))
+            ) as archive:
+                return {
+                    name: archive.read(name) for name in archive.namelist()
+                }
+
+        unwrapped = parts("auto-long-unwrapped")
+        wrapped = parts("auto-wrapped-long")
+        self.assertEqual(
+            {
+                name
+                for name in unwrapped
+                if unwrapped[name] != wrapped[name]
+            },
+            {"xl/styles.xml", "xl/worksheets/sheet1.xml"},
+        )
+        namespace = {"s": MODULE.SHEET_NS}
+        unwrapped_sheet = ElementTree.fromstring(
+            unwrapped["xl/worksheets/sheet1.xml"]
+        )
+        wrapped_sheet = ElementTree.fromstring(
+            wrapped["xl/worksheets/sheet1.xml"]
+        )
+        unwrapped_cell = unwrapped_sheet.find(
+            "s:sheetData/s:row[@r='4']/s:c[@r='A4']",
+            namespace,
+        )
+        wrapped_cell = wrapped_sheet.find(
+            "s:sheetData/s:row[@r='4']/s:c[@r='A4']",
+            namespace,
+        )
+        self.assertNotIn("s", unwrapped_cell.attrib)
+        self.assertEqual(wrapped_cell.attrib["s"], "1")
+        self.assertEqual(
+            unwrapped_cell.find("s:is/s:t", namespace).text,
+            wrapped_cell.find("s:is/s:t", namespace).text,
+        )
+
+        bold = parts("auto-bold-font")
+        bold_wrapped = parts("auto-bold-font-wrapped")
+        self.assertEqual(
+            {
+                name for name in bold if bold[name] != bold_wrapped[name]
+            },
+            {"xl/styles.xml"},
+        )
 
     def test_package_validation_rejects_explicit_vertical_alignment(self) -> None:
         spec = MODULE.CASES[0]
@@ -311,6 +429,27 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 MODULE.OracleCorpusError,
                 "implicit vertical alignment contract",
+            ):
+                MODULE.build_case(spec)
+
+    def test_package_validation_rejects_false_rtl_attribute(self) -> None:
+        spec = next(
+            value
+            for value in MODULE.CASES
+            if value.toggle == "right-to-left-layout"
+        )
+        original = MODULE._worksheet
+
+        def false_rtl(value):
+            return original(value).replace(
+                ' rightToLeft="1"',
+                ' rightToLeft="0"',
+            )
+
+        with mock.patch.object(MODULE, "_worksheet", side_effect=false_rtl):
+            with self.assertRaisesRegex(
+                MODULE.OracleCorpusError,
+                "RTL feature mismatch",
             ):
                 MODULE.build_case(spec)
 

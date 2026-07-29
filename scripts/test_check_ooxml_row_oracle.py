@@ -117,10 +117,10 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
                 "renderer_binary": {"bytes": 123_456, "sha256": "d" * 64},
             },
             "discovery": {
-                "candidate_count": 12,
-                "pre_shard_selected_count": 12,
-                "selected_count": 12,
-                "shard_candidate_count": 12,
+                "candidate_count": 24,
+                "pre_shard_selected_count": 24,
+                "selected_count": 24,
+                "shard_candidate_count": 24,
                 "shard_count": 1,
                 "shard_index": 0,
                 "truncated": False,
@@ -131,16 +131,16 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             "schema": "rxls.libreoffice-render-parity.v1",
             "summary": {
                 "authored_print": None,
-                "by_classification": {"within_threshold": 12},
-                "by_status": {"compared": 12},
-                "files": 12,
+                "by_classification": {"within_threshold": 24},
+                "by_status": {"compared": 24},
+                "files": 24,
                 "input_bytes_considered": self.manifest["total_bytes"],
                 "metric_cohorts": {},
             },
         }
         for index, row in enumerate(self.manifest["files"]):
             rxls_height = 792_000 + index
-            libreoffice_height = 791_000 + index
+            libreoffice_height = 791_960 + index
             self.report["files"].append(
                 {
                     "artifacts": {"libreoffice_pages": 1, "rxls_pages": 1},
@@ -294,39 +294,42 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
 
     def test_reduces_to_exact_path_and_content_neutral_contract(self) -> None:
         output = self._reduce()
-        self.assertEqual(output["schema"], "rxls.ooxml-row-oracle.v2")
+        self.assertEqual(output["schema"], "rxls.ooxml-row-oracle.v3")
         self.assertIs(output["passed"], True)
-        self.assertEqual(output["coverage"]["case_count"], 12)
-        self.assertEqual(output["coverage"]["page_count"], 12)
+        self.assertEqual(
+            output["baseline"],
+            {
+                "case_count": 12,
+                "max_absolute_height_delta_millipoints": 40,
+                "passed": True,
+                "threshold_max_absolute_height_delta_millipoints": 50,
+            },
+        )
+        self.assertEqual(output["coverage"]["case_count"], 24)
+        self.assertEqual(output["coverage"]["page_count"], 24)
         self.assertEqual(
             output["geometry_policy"],
             self.checker.UNIQUE_GEOMETRY_POLICY,
         )
         self.assertEqual(
             output["coverage"]["sheet_format_counts"],
-            {"missing": 8, "present": 4},
+            {"missing": 20, "present": 4},
         )
         self.assertEqual(
             output["coverage"]["normal_font_counts"],
-            {"carlito": 4, "noto": 8},
+            {"carlito": 4, "noto": 20},
         )
         self.assertEqual(
             output["coverage"]["normal_size_point_counts"],
-            {"11": 8, "12": 4},
+            {"11": 20, "12": 4},
         )
         self.assertEqual(
             output["coverage"]["toggle_counts"],
-            {
-                "explicit_row_height": 1,
-                "hidden_row": 1,
-                "image_drawing": 1,
-                "none": 8,
-                "right_to_left_layout": 1,
-            },
+            self.checker.EXPECTED_TOGGLE_COUNTS,
         )
-        self.assertEqual(len(output["cohorts"]), 12)
+        self.assertEqual(len(output["cohorts"]), 24)
         self.assertTrue(
-            all(row["height_delta_millipoints"] == 1_000 for row in output["cohorts"])
+            all(row["height_delta_millipoints"] == 40 for row in output["cohorts"])
         )
         for row in output["cohorts"]:
             self.assertEqual(
@@ -370,6 +373,59 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, encoded)
 
+    def test_rejects_regressed_accepted_baseline(self) -> None:
+        report = copy.deepcopy(self.report)
+        baseline_index = next(
+            index
+            for index, row in enumerate(self.manifest["files"])
+            if "auto-" not in " ".join(row["features"])
+        )
+        page = report["files"][baseline_index]["pages"][0]
+        geometry = page["pdf_point_geometry"]
+        rxls_height = 792_000
+        libreoffice_height = 791_949
+        geometry["rxls"]["media_box"]["height_points"] = self._point(
+            rxls_height
+        )
+        geometry["libreoffice"]["media_box"]["height_points"] = self._point(
+            libreoffice_height
+        )
+        geometry["deltas_points"]["media_box_height"] = self._point(51)
+        with self.assertRaisesRegex(
+            self.checker.DiagnosticError,
+            "baseline_height_delta",
+        ):
+            self._reduce(report)
+
+    def test_automatic_height_residual_is_diagnostic_not_a_gate(self) -> None:
+        report = copy.deepcopy(self.report)
+        automatic_index = next(
+            index
+            for index, row in enumerate(self.manifest["files"])
+            if any(feature.startswith("auto-") for feature in row["features"])
+        )
+        page = report["files"][automatic_index]["pages"][0]
+        geometry = page["pdf_point_geometry"]
+        libreoffice_height = 791_960 + automatic_index
+        rxls_height = libreoffice_height + 18_020
+        geometry["rxls"]["media_box"]["height_points"] = self._point(
+            rxls_height
+        )
+        geometry["deltas_points"]["media_box_height"] = self._point(18_020)
+        output = self._reduce(report)
+        automatic = next(
+            row
+            for row in output["cohorts"]
+            if row["dimensions"]["toggle"].startswith("auto_")
+            and row["height_delta_millipoints"] == 18_020
+        )
+        self.assertEqual(
+            automatic["height_delta_millipoints"],
+            18_020,
+        )
+        self.assertIs(output["passed"], True)
+        self.assertIs(output["baseline"]["passed"], True)
+
     def test_output_is_deterministic_under_report_file_reordering(self) -> None:
         first = self._reduce()
         reordered = copy.deepcopy(self.report)
@@ -408,7 +464,7 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         report = copy.deepcopy(self.report)
         geometry = report["files"][0]["pages"][0]["pdf_point_geometry"]
         geometry["rxls"]["media_box"]["height_points"] = "1584001/2000"
-        geometry["deltas_points"]["media_box_height"] = "2001/2000"
+        geometry["deltas_points"]["media_box_height"] = "81/2000"
         with self.assertRaisesRegex(
             self.checker.DiagnosticError, "non_integral_millipoints"
         ):
@@ -900,6 +956,24 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         mutations = (
             lambda value: value["coverage"]["normal_font_counts"].update(
                 {"noto": 7}
+            ),
+            lambda value: value["baseline"].update(
+                {"max_absolute_height_delta_millipoints": 39}
+            ),
+            lambda value: value["baseline"].update({"passed": False}),
+            lambda value: value["baseline"].update(
+                {"threshold_max_absolute_height_delta_millipoints": 51}
+            ),
+            lambda value: value["baseline"].update({"case_count": 12.0}),
+            lambda value: value["baseline"].update(
+                {"max_absolute_height_delta_millipoints": 40.0}
+            ),
+            lambda value: value["baseline"].update(
+                {
+                    "threshold_max_absolute_height_delta_millipoints": (
+                        50.0
+                    )
+                }
             ),
             lambda value: value["cohorts"][0].update(
                 {"height_delta_millipoints": 999}

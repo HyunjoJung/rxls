@@ -22,14 +22,16 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 REPORT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v2"
+OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v3"
 MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
 METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 PROFILE = "ooxml-row-diagnostic"
 GENERATOR = "rxls-ooxml-row-diagnostic"
-GENERATOR_VERSION = "1.0.0"
-CASE_COUNT = 12
+GENERATOR_VERSION = "1.1.0"
+CASE_COUNT = 24
+BASELINE_CASE_COUNT = 12
+BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS = 50
 PRINT_MODE_SINGLE_PAGE = "single-page-sheets"
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
@@ -200,10 +202,35 @@ UNIQUE_GEOMETRY_POLICY = {
     "units": "millipoints",
 }
 TOGGLE_FEATURES = {
+    "auto-bold-font": "auto_bold_font",
+    "auto-bold-font-wrapped": "auto_bold_font_wrapped",
+    "auto-large-font": "auto_large_font",
+    "auto-long-unwrapped": "auto_long_unwrapped",
+    "auto-wrapped-explicit": "auto_wrapped_explicit",
+    "auto-wrapped-hidden": "auto_wrapped_hidden",
+    "auto-wrapped-image": "auto_wrapped_image",
+    "auto-wrapped-long": "auto_wrapped_long",
+    "auto-wrapped-long-anchor": "auto_wrapped_long_anchor",
+    "auto-wrapped-merged": "auto_wrapped_merged",
+    "auto-wrapped-rtl": "auto_wrapped_rtl",
+    "auto-wrapped-wide": "auto_wrapped_wide",
     "explicit-row-height": "explicit_row_height",
     "hidden-row": "hidden_row",
     "image-drawing": "image_drawing",
     "right-to-left-layout": "right_to_left_layout",
+}
+BASELINE_TOGGLE_VALUES = frozenset(
+    {
+        "explicit_row_height",
+        "hidden_row",
+        "image_drawing",
+        "none",
+        "right_to_left_layout",
+    }
+)
+EXPECTED_TOGGLE_COUNTS = {
+    "none": 8,
+    **{value: 1 for value in TOGGLE_FEATURES.values()},
 }
 
 
@@ -1068,6 +1095,7 @@ def _validate_output(value: dict[str, object]) -> None:
     _require(
         set(value)
         == {
+            "baseline",
             "cohorts",
             "coverage",
             "geometry_policy",
@@ -1138,17 +1166,10 @@ def _validate_output(value: dict[str, object]) -> None:
         "output_coverage_contract",
     )
     _require(
-        coverage.get("normal_font_counts") == {"carlito": 4, "noto": 8}
-        and coverage.get("normal_size_point_counts") == {"11": 8, "12": 4}
-        and coverage.get("sheet_format_counts") == {"missing": 8, "present": 4}
-        and coverage.get("toggle_counts")
-        == {
-            "explicit_row_height": 1,
-            "hidden_row": 1,
-            "image_drawing": 1,
-            "none": 8,
-            "right_to_left_layout": 1,
-        },
+        coverage.get("normal_font_counts") == {"carlito": 4, "noto": 20}
+        and coverage.get("normal_size_point_counts") == {"11": 20, "12": 4}
+        and coverage.get("sheet_format_counts") == {"missing": 20, "present": 4}
+        and coverage.get("toggle_counts") == EXPECTED_TOGGLE_COUNTS,
         "output_coverage_contract",
     )
     cohorts = value.get("cohorts")
@@ -1211,6 +1232,49 @@ def _validate_output(value: dict[str, object]) -> None:
     _require(
         observed_dimensions == _expected_dimensions(),
         "output_dimension_contract",
+    )
+    baseline_cohorts = [
+        row
+        for row in cohorts
+        if row["dimensions"]["toggle"] in BASELINE_TOGGLE_VALUES
+    ]
+    _require(
+        len(baseline_cohorts) == BASELINE_CASE_COUNT,
+        "output_baseline_contract",
+    )
+    maximum_baseline_delta = max(
+        abs(row["height_delta_millipoints"]) for row in baseline_cohorts
+    )
+    baseline = value.get("baseline")
+    _require(
+        isinstance(baseline, dict)
+        and set(baseline)
+        == {
+            "case_count",
+            "max_absolute_height_delta_millipoints",
+            "passed",
+            "threshold_max_absolute_height_delta_millipoints",
+        }
+        and type(baseline.get("case_count")) is int
+        and baseline.get("case_count") == BASELINE_CASE_COUNT
+        and type(
+            baseline.get("max_absolute_height_delta_millipoints")
+        )
+        is int
+        and baseline.get("max_absolute_height_delta_millipoints")
+        == maximum_baseline_delta
+        and baseline.get("passed") is True
+        and type(
+            baseline.get(
+                "threshold_max_absolute_height_delta_millipoints"
+            )
+        )
+        is int
+        and baseline.get("threshold_max_absolute_height_delta_millipoints")
+        == BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS
+        and maximum_baseline_delta
+        <= BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS,
+        "output_baseline_contract",
     )
 
     def reject_pathful(item: object) -> None:
@@ -1444,7 +1508,32 @@ def reduce_report(
     _require(seen == set(manifest_paths), "report_file_coverage")
     cohorts.sort(key=lambda row: _dimension_key(row["dimensions"]))
     dimensions = [row["dimensions"] for row in cohorts]
+    baseline_cohorts = [
+        row
+        for row in cohorts
+        if row["dimensions"]["toggle"] in BASELINE_TOGGLE_VALUES
+    ]
+    _require(
+        len(baseline_cohorts) == BASELINE_CASE_COUNT,
+        "baseline_height_delta",
+    )
+    maximum_baseline_delta = max(
+        abs(row["height_delta_millipoints"]) for row in baseline_cohorts
+    )
+    _require(
+        maximum_baseline_delta
+        <= BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS,
+        "baseline_height_delta",
+    )
     output = {
+        "baseline": {
+            "case_count": BASELINE_CASE_COUNT,
+            "max_absolute_height_delta_millipoints": maximum_baseline_delta,
+            "passed": True,
+            "threshold_max_absolute_height_delta_millipoints": (
+                BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS
+            ),
+        },
         "cohorts": cohorts,
         "coverage": {
             "case_count": CASE_COUNT,

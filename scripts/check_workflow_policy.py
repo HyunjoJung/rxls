@@ -25,7 +25,7 @@ RELEASE_VERSIONS = {
 }
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
-RENDER_ORACLE_DIAGNOSTIC_CASES = "12"
+RENDER_ORACLE_DIAGNOSTIC_CASES = "24"
 RENDER_ORACLE_FULL_REPEATS = "2"
 RENDER_ORACLE_FULL_SHARDS = "4"
 RENDER_ORACLE_MAX_PARALLEL_SHARDS = "2"
@@ -100,16 +100,16 @@ ORACLE_RENDER_STEP_SHA256 = (
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "d0a6977111dff7834d45d32af480a2856e8de63f39648cf8d75b13be3e1a3921",
     "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
-    "ac9fe9230f1c6f7739eedae3b8cc71ba453825af0e76e0a33468db089f420c4c",
+    "802e9d82f7e8d7a089a06e93d011535e1cae7d80a4ba5332958fc395cfbd1347",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
-    "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
+    "8cf408faa253deea839f48f20bd4e23d3e8d58950d2fb6ed97e547ba0cd205a8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
     "8d8442c6caf1e5c35b0e6cfc4046042d9809cdcd3a7d23a47027a9bf19f78156",
-    "4efd835342590bf4a0b46b26b1e07488fed8a17dc63eaaaf74757117ac00ebe3",
+    "5ea44fde403183edaee2838845657ed4ca3a1ffefcccf59e00aa01f8e008a86a",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
     "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "013451d9f38eff91b441ae74c3724cdd997925eed5e1d3df8ddb24243b500f1d"
+    "fd789f69c54a6f283c1130cea1c88022a3baab797e09df4bfc92dbf996b2b0a1"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -1982,8 +1982,8 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/test_check_ooxml_row_oracle.py": (
             "must test the privacy-safe OOXML row reducer before campaign execution"
         ),
-        'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "12"': (
-            "must keep the OOXML row diagnostic at exactly twelve workbooks"
+        'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "24"': (
+            "must keep the OOXML row diagnostic at exactly twenty-four workbooks"
         ),
         'test "$RXLS_BASELINE_MODE" = "verify"': (
             "diagnostic runs must never enter candidate or ratchet mode"
@@ -1997,14 +1997,14 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/generate-ooxml-row-oracle.py --verify": (
             "must verify every generated OOXML row workbook before comparison"
         ),
-        '"c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a"': (
-            "must pin the exact twelve-case OOXML row manifest bytes"
+        '"1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef"': (
+            "must pin the exact twenty-four-case OOXML row manifest bytes"
         ),
         "lane_args+=(--format xlsx --required-feature ooxml-implicit-row)": (
             "must isolate the diagnostic to the reviewed XLSX feature lane"
         ),
-        'test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "12"': (
-            "must run the diagnostic as one exact twelve-case campaign"
+        'test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "24"': (
+            "must run the diagnostic as one exact twenty-four-case campaign"
         ),
         "python3 scripts/check-ooxml-row-oracle.py \\": (
             "must reduce diagnostic geometry through the reviewed privacy gate"
@@ -2026,6 +2026,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ),
         'checker["_validate_output"](aggregate)': (
             "must revalidate the exact diagnostic output contract before upload"
+        ),
+        'assert aggregate["schema"] == "rxls.ooxml-row-oracle.v3"': (
+            "must require the expanded diagnostic aggregate schema"
+        ),
+        '"threshold_max_absolute_height_delta_millipoints": 50': (
+            "must retain the accepted twelve-case baseline regression threshold"
         ),
         "report_path.unlink()": (
             "must delete the raw diagnostic report before staging success evidence"

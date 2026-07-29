@@ -208,6 +208,22 @@ OUTPUT_CLASSIFICATIONS = (
     | COARSE_CLASSIFICATIONS
     | {UNREVIEWED_CLASSIFICATION}
 )
+DIAGNOSTIC_FEATURES = frozenset(
+    {
+        "auto-bold-font",
+        "auto-bold-font-wrapped",
+        "auto-large-font",
+        "auto-long-unwrapped",
+        "auto-wrapped-explicit",
+        "auto-wrapped-hidden",
+        "auto-wrapped-image",
+        "auto-wrapped-long",
+        "auto-wrapped-long-anchor",
+        "auto-wrapped-merged",
+        "auto-wrapped-rtl",
+        "auto-wrapped-wide",
+    }
+)
 FEATURES = frozenset(
     {
         "border",
@@ -256,12 +272,12 @@ SHARDED = {
     "parity-a": "parity-a-shard-{index}.json",
     "parity-b": "parity-b-shard-{index}.json",
 }
-CASES = {"full": 800, "ooxml-row-diagnostic": 12, "pilot": 40}
+CASES = {"full": 800, "ooxml-row-diagnostic": 24, "pilot": 40}
 LANES = {
     "full": {"authored-print": 100, "parity-a": 800, "parity-b": 800},
     "ooxml-row-diagnostic": {
         "authored-print": 0,
-        "parity-a": 12,
+        "parity-a": 24,
         "parity-b": 0,
     },
     "pilot": {"authored-print": 4, "parity-a": 40, "parity-b": 0},
@@ -1690,6 +1706,11 @@ def _validate_report(
     label: str,
     shard: int | None,
 ) -> tuple[list[dict[str, Any]], tuple[str, str]]:
+    allowed_features = (
+        FEATURES | DIAGNOSTIC_FEATURES
+        if profile == "ooxml-row-diagnostic"
+        else FEATURES
+    )
     if (
         set(value) != REPORT_KEYS
         or value.get("schema") != INPUT_SCHEMA
@@ -1774,7 +1795,7 @@ def _validate_report(
             or not isinstance(features, list)
             or len(features) > 256
             or any(
-                not isinstance(feature, str) or feature not in FEATURES
+                not isinstance(feature, str) or feature not in allowed_features
                 for feature in features
             )
             or features != sorted(set(features))
@@ -1909,6 +1930,16 @@ def _summarize_label(
     classes: Counter[str] = Counter()
     formats: dict[str, Counter[str]] = {}
     features: dict[str, Counter[str]] = {}
+    retained_features = (
+        FEATURES | DIAGNOSTIC_FEATURES
+        if profile == "ooxml-row-diagnostic"
+        else FEATURES
+    )
+    page_box_features = (
+        PAGE_BOX_GEOMETRY_FEATURES | DIAGNOSTIC_FEATURES
+        if profile == "ooxml-row-diagnostic"
+        else PAGE_BOX_GEOMETRY_FEATURES
+    )
     page_count_mismatches: Counter[tuple[int, int]] = Counter()
     geometry = _empty_geometry()
     page_box_geometry_all = _new_page_box_geometry_accumulator()
@@ -1918,7 +1949,7 @@ def _summarize_label(
     }
     page_box_geometry_by_feature = {
         feature: _new_page_box_geometry_accumulator()
-        for feature in PAGE_BOX_GEOMETRY_FEATURES
+        for feature in page_box_features
     }
     word_geometry_all = _new_text_geometry_accumulator()
     line_geometry_all = _new_text_geometry_accumulator()
@@ -1934,7 +1965,7 @@ def _summarize_label(
         statuses[status] += 1
         classes[code] += 1
         formats.setdefault(fmt, Counter())[code] += 1
-        for feature in row["features"]:
+        for feature in retained_features.intersection(row["features"]):
             features.setdefault(str(feature), Counter())[code] += 1
         if raw_code == "page_count_mismatch":
             page_count_mismatches[
@@ -1974,7 +2005,7 @@ def _summarize_label(
             _merge_page_box_geometry_workbook(
                 page_box_geometry_by_format[fmt], pages
             )
-            for feature in PAGE_BOX_GEOMETRY_FEATURES.intersection(
+            for feature in page_box_features.intersection(
                 row["features"]
             ):
                 _merge_page_box_geometry_workbook(
@@ -2406,6 +2437,7 @@ def _validate_page_box_geometry_output(
     total: int,
     metric_format_cohorts: dict[str, dict[str, object]],
     feature_workbooks: dict[str, int],
+    allowed_features: frozenset[str],
     point_geometry: dict[str, object],
 ) -> None:
     code = "output_page_box_geometry"
@@ -2479,10 +2511,10 @@ def _validate_page_box_geometry_output(
     by_feature = value["by_feature"]
     if (
         not isinstance(by_feature, dict)
-        or len(by_feature) > len(PAGE_BOX_GEOMETRY_FEATURES)
+        or len(by_feature) > len(allowed_features)
         or any(
             not isinstance(feature, str)
-            or feature not in PAGE_BOX_GEOMETRY_FEATURES
+            or feature not in allowed_features
             for feature in by_feature
         )
     ):
@@ -2769,6 +2801,16 @@ def _validate_output(value: object) -> None:
         raise SummaryError("output_contract")
 
     profile = str(value["profile"])
+    allowed_features = (
+        FEATURES | DIAGNOSTIC_FEATURES
+        if profile == "ooxml-row-diagnostic"
+        else FEATURES
+    )
+    allowed_page_box_features = (
+        PAGE_BOX_GEOMETRY_FEATURES | DIAGNOSTIC_FEATURES
+        if profile == "ooxml-row-diagnostic"
+        else PAGE_BOX_GEOMETRY_FEATURES
+    )
     for report in reports:
         total = _integer(
             report["workbooks"],
@@ -2821,7 +2863,7 @@ def _validate_output(value: object) -> None:
         group_workbooks: dict[str, dict[str, int]] = {}
         for key, allowed in (
             ("by_format", FORMATS),
-            ("by_feature", FEATURES),
+            ("by_feature", allowed_features),
         ):
             groups = report[key]
             if (
@@ -2894,6 +2936,7 @@ def _validate_output(value: object) -> None:
             total=total,
             metric_format_cohorts=word_geometry["by_format"],
             feature_workbooks=group_workbooks["by_feature"],
+            allowed_features=allowed_page_box_features,
             point_geometry=point_geometry,
         )
 

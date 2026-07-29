@@ -4978,8 +4978,8 @@ Page    2 CropBox: 0 0 841.125 595.0625
             cases, discovery = MODULE.discover_manifest(
                 manifest,
                 max_manifest_bytes=256 * 1024,
-                max_candidates=12,
-                max_files=12,
+                max_candidates=24,
+                max_files=24,
             )
             filtered, discovery = MODULE.filter_cases(
                 cases,
@@ -4992,14 +4992,14 @@ Page    2 CropBox: 0 0 841.125 595.0625
                 discovery,
                 shard_count=1,
                 shard_index=0,
-                max_files=12,
+                max_files=24,
             )
             binding = MODULE.build_manifest_binding(
                 manifest,
                 selected,
                 max_manifest_bytes=256 * 1024,
             )
-        self.assertEqual(len(selected), 12)
+        self.assertEqual(len(selected), 24)
         self.assertTrue(
             all(
                 case.path.suffix == ".xlsx"
@@ -5010,19 +5010,19 @@ Page    2 CropBox: 0 0 841.125 595.0625
         self.assertEqual(
             discovery,
             {
-                "candidate_count": 12,
-                "pre_shard_selected_count": 12,
-                "selected_count": 12,
-                "shard_candidate_count": 12,
+                "candidate_count": 24,
+                "pre_shard_selected_count": 24,
+                "selected_count": 24,
+                "shard_candidate_count": 24,
                 "shard_count": 1,
                 "shard_index": 0,
                 "truncated": False,
             },
         )
-        self.assertEqual(binding["selected_case_count"], 12)
+        self.assertEqual(binding["selected_case_count"], 24)
         self.assertEqual(
             binding["manifest_sha256"],
-            "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a",
+            "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef",
         )
 
     def test_each_case_workspace_is_removed_before_the_next_case(self) -> None:

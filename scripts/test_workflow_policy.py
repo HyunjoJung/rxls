@@ -1187,8 +1187,8 @@ steps:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
             "case_count": original.replace(
-                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "12"',
-                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "11"',
+                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "24"',
+                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "23"',
                 1,
             ),
             "candidate_mode": original.replace(
@@ -1207,7 +1207,7 @@ steps:
                 1,
             ),
             "manifest_identity": original.replace(
-                "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a",
+                "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef",
                 "0" * 64,
                 1,
             ),

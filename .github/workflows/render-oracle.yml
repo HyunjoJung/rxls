@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: Run the 40-workbook pilot, exact-SHA 800-workbook full, or 12-workbook OOXML row diagnostic campaign
+        description: Run the 40-workbook pilot, exact-SHA 800-workbook full, or 24-workbook OOXML row diagnostic campaign
         required: true
         default: pilot
         type: choice
@@ -117,7 +117,7 @@ jobs:
       LC_ALL: C.UTF-8
       MAX_PARALLEL_SHARDS: "2"
       ORACLE_IMAGE: rxls-render-oracle:lo-26.2.3
-      OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "12"
+      OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "24"
       PILOT_CASE_COUNT: "40"
       PILOT_AUTHORED_PRINT_COUNT: "4"
       PYTHONHASHSEED: "0"
@@ -284,22 +284,34 @@ jobs:
           if profile == "ooxml-row-diagnostic":
               assert manifest["format_counts"] == {"xlsx": expected_per_format}
               assert manifest["generator"] == "rxls-ooxml-row-diagnostic"
-              assert manifest["generator_version"] == "1.0.0"
+              assert manifest["generator_version"] == "1.1.0"
               assert manifest["feature_counts"] == {
+                  "auto-bold-font": 1,
+                  "auto-bold-font-wrapped": 1,
+                  "auto-large-font": 1,
+                  "auto-long-unwrapped": 1,
+                  "auto-wrapped-explicit": 1,
+                  "auto-wrapped-hidden": 1,
+                  "auto-wrapped-image": 1,
+                  "auto-wrapped-long": 1,
+                  "auto-wrapped-long-anchor": 1,
+                  "auto-wrapped-merged": 1,
+                  "auto-wrapped-rtl": 1,
+                  "auto-wrapped-wide": 1,
                   "explicit-row-height": 1,
                   "hidden-row": 1,
                   "image-drawing": 1,
                   "normal-font-carlito": 4,
-                  "normal-font-noto": 8,
-                  "normal-size-11": 8,
+                  "normal-font-noto": 20,
+                  "normal-size-11": 20,
                   "normal-size-12": 4,
-                  "ooxml-implicit-row": 12,
+                  "ooxml-implicit-row": 24,
                   "right-to-left-layout": 1,
-                  "sheet-format-missing": 8,
+                  "sheet-format-missing": 20,
                   "sheet-format-present": 4,
               }
               assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == (
-                  "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a"
+                  "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef"
               )
           else:
               assert manifest["format_counts"] == {
@@ -690,7 +702,7 @@ jobs:
               run_full_authored_print_campaign
               ;;
             ooxml-row-diagnostic)
-              test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "12"
+              test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "24"
               run_parity \
                 target/render-oracle-hosted/parity-report-a.json \
                 1 \
@@ -2169,10 +2181,22 @@ jobs:
           aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
           checker = runpy.run_path("scripts/check-ooxml-row-oracle.py")
           checker["_validate_output"](aggregate)
-          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v2"
+          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v3"
           assert aggregate["passed"] is True
-          assert aggregate["coverage"]["case_count"] == 12
-          assert aggregate["coverage"]["page_count"] == 12
+          assert aggregate["baseline"] == {
+              "case_count": 12,
+              "max_absolute_height_delta_millipoints": aggregate["baseline"][
+                  "max_absolute_height_delta_millipoints"
+              ],
+              "passed": True,
+              "threshold_max_absolute_height_delta_millipoints": 50,
+          }
+          assert (
+              aggregate["baseline"]["max_absolute_height_delta_millipoints"]
+              <= 50
+          )
+          assert aggregate["coverage"]["case_count"] == 24
+          assert aggregate["coverage"]["page_count"] == 24
           assert aggregate["identities"]["report_sha256"] == hashlib.sha256(
               report_path.read_bytes()
           ).hexdigest()

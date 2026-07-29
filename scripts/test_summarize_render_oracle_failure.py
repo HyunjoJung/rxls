@@ -2191,15 +2191,31 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
 
     def test_ooxml_row_diagnostic_summary_is_fixed_and_content_neutral(self) -> None:
         rows = []
-        for index in range(12):
+        automatic_features = (
+            "auto-bold-font",
+            "auto-bold-font-wrapped",
+            "auto-large-font",
+            "auto-long-unwrapped",
+            "auto-wrapped-explicit",
+            "auto-wrapped-hidden",
+            "auto-wrapped-image",
+            "auto-wrapped-long",
+            "auto-wrapped-long-anchor",
+            "auto-wrapped-merged",
+            "auto-wrapped-rtl",
+            "auto-wrapped-wide",
+        )
+        for index in range(24):
             features = {
-                "normal-font-noto" if index < 8 else "normal-font-carlito",
-                "normal-size-11" if index < 8 else "normal-size-12",
+                "normal-font-noto" if index < 20 else "normal-font-carlito",
+                "normal-size-11" if index < 20 else "normal-size-12",
                 "ooxml-implicit-row",
-                "sheet-format-missing" if index < 8 else "sheet-format-present",
+                "sheet-format-missing" if index < 20 else "sheet-format-present",
             }
             if index == 4:
                 features.add("explicit-row-height")
+            if index >= 12:
+                features.add(automatic_features[index - 12])
             rows.append(
                 _row(
                     index,
@@ -2232,10 +2248,20 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary["schema"], MODULE.OUTPUT_SCHEMA)
         self.assertEqual(summary["profile"], "ooxml-row-diagnostic")
-        self.assertEqual(summary["reports"][1]["workbooks"], 12)
+        self.assertEqual(summary["reports"][1]["workbooks"], 24)
         self.assertEqual(
             summary["reports"][1]["by_classification"],
-            {"measurement_geometry_stage": 1, "within_threshold": 11},
+            {"measurement_geometry_stage": 1, "within_threshold": 23},
+        )
+        self.assertTrue(
+            MODULE.DIAGNOSTIC_FEATURES.issubset(
+                summary["reports"][1]["by_feature"]
+            )
+        )
+        self.assertTrue(
+            MODULE.DIAGNOSTIC_FEATURES.issubset(
+                summary["reports"][1]["page_box_geometry"]["by_feature"]
+            )
         )
         self.assertEqual(summary["reports"][0], MODULE._empty("authored-print"))
         self.assertEqual(summary["reports"][2], MODULE._empty("parity-b"))
@@ -2250,6 +2276,40 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 baseline_mode="candidate",
                 head_sha=HEAD_SHA,
             )
+
+    def test_diagnostic_features_are_rejected_outside_diagnostic_profile(
+        self,
+    ) -> None:
+        for profile in ("pilot", "full"):
+            rows = [
+                _row(
+                    index,
+                    classification="libreoffice_timeout",
+                    features=(
+                        ("auto-long-unwrapped", "latin-text")
+                        if index == 0
+                        else ("latin-text",)
+                    ),
+                    status="error",
+                )
+                for index in range(MODULE.LANES[profile]["parity-a"])
+            ]
+            report = _report(
+                rows,
+                profile=profile,
+                label="parity-a",
+            )
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(
+                    MODULE.SummaryError,
+                    "workbook_contract",
+                ):
+                    MODULE._validate_report(
+                        report,
+                        profile=profile,
+                        label="parity-a",
+                        shard=None,
+                    )
 
     def test_partial_full_shards_are_aggregated_without_input_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
