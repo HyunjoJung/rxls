@@ -141,6 +141,21 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 )
                 for index in range(4)
             ]
+            for index, (rxls_pages, libreoffice_pages) in enumerate(
+                ((4, 3), (2, 3), (4, 3))
+            ):
+                authored_rows[index].update(
+                    {
+                        "classification": "page_count_mismatch",
+                        "libreoffice_pages": libreoffice_pages,
+                        "private_measurement": {
+                            "path": f"/srv/private/page-map-{index}.json",
+                            "text": "private page content",
+                        },
+                        "rxls_pages": rxls_pages,
+                        "status": "error",
+                    }
+                )
             _write(
                 hosted / "authored-print-report.json",
                 _report(
@@ -179,17 +194,40 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v2",
+                "rxls.render-oracle-failure-summary.v3",
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
                 parity["by_feature"]["korean-text"]["workbooks"], 20
             )
+            authored = summary["reports"][0]
+            self.assertEqual(
+                authored["by_classification"],
+                {"page_count_mismatch": 3, "within_threshold": 1},
+            )
+            self.assertEqual(
+                authored["page_count_mismatches"],
+                [
+                    {
+                        "libreoffice_pages": 3,
+                        "rxls_pages": 2,
+                        "workbooks": 1,
+                    },
+                    {
+                        "libreoffice_pages": 3,
+                        "rxls_pages": 4,
+                        "workbooks": 2,
+                    },
+                ],
+            )
+            self.assertEqual(parity["page_count_mismatches"], [])
             self.assertEqual(summary["reports"][2], MODULE._empty("parity-b"))
 
             rendered = payload.decode("utf-8")
             self.assertNotIn("/srv/private", rendered)
             self.assertNotIn("private workbook content", rendered)
+            self.assertNotIn("private page content", rendered)
+            self.assertNotIn("private_measurement", rendered)
             self.assertNotIn('"commands"', rendered)
             self.assertNotIn('"path"', rendered)
             self.assertNotIn('"sha256"', rendered)
@@ -301,6 +339,60 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                     baseline_mode="verify",
                     head_sha=HEAD_SHA,
                 )
+
+    def test_page_count_mismatch_input_is_bounded_and_fail_closed(self) -> None:
+        def valid_rows() -> list[dict[str, object]]:
+            rows = _pilot_rows()
+            rows[1].update(
+                {
+                    "classification": "page_count_mismatch",
+                    "libreoffice_pages": 3,
+                    "rxls_pages": 4,
+                    "status": "error",
+                }
+            )
+            return rows
+
+        mutations = {
+            "missing-rxls": lambda row: row.pop("rxls_pages"),
+            "missing-libreoffice": lambda row: row.pop("libreoffice_pages"),
+            "negative": lambda row: row.__setitem__("rxls_pages", -1),
+            "zero": lambda row: row.__setitem__("libreoffice_pages", 0),
+            "oversized": lambda row: row.__setitem__(
+                "rxls_pages", MODULE.MAX_PAGE_COUNT + 1
+            ),
+            "boolean": lambda row: row.__setitem__("rxls_pages", True),
+            "injected-string": lambda row: row.__setitem__(
+                "rxls_pages", "/srv/private/customer.xlsx"
+            ),
+            "injected-object": lambda row: row.__setitem__(
+                "libreoffice_pages",
+                {"path": "/srv/private/customer.xlsx", "text": "secret"},
+            ),
+            "equal-counts": lambda row: row.__setitem__("rxls_pages", 3),
+            "wrong-status": lambda row: row.__setitem__("status", "compared"),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                hosted = Path(raw)
+                rows = valid_rows()
+                mutation(rows[1])
+                _write(
+                    hosted / "parity-report-a.json",
+                    _report(rows, profile="pilot", label="parity-a"),
+                )
+                with self.assertRaisesRegex(
+                    MODULE.SummaryError, r"\Apage_count_diagnostic\Z"
+                ) as raised:
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+                message = str(raised.exception)
+                self.assertNotIn("/srv/private", message)
+                self.assertNotIn("secret", message)
 
     def test_schema_and_discovery_are_fail_closed(self) -> None:
         for mutation, code in (
@@ -470,6 +562,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             "pdfinfo_page_size_invalid": "measurement_geometry_stage",
             "pdf_raster_missing": "measurement_raster_stage",
             "semantic_bbox_output_limit": "measurement_semantic_stage",
+            "page_count_mismatch_private_customer": "measurement_stage",
             "authored_print_no_visible_pages": "authored_print_stage",
             "font_pack_required": "environment_stage",
             "manifest_local_path_unsafe": "input_stage",
@@ -511,6 +604,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 ],
                 count,
             )
+        self.assertEqual(parity["page_count_mismatches"], [])
         rendered = MODULE._json(summary).decode("ascii")
         for code in coarse_codes:
             self.assertNotIn(code, rendered)
@@ -665,6 +759,91 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             with self.subTest(document=document):
                 with self.assertRaises(MODULE.SummaryError):
                     MODULE._validate_output(document)
+
+    def test_output_page_count_diagnostic_is_bounded_and_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            rows = _pilot_rows()
+            rows[1].update(
+                {
+                    "classification": "page_count_mismatch",
+                    "libreoffice_pages": 3,
+                    "rxls_pages": 4,
+                    "status": "error",
+                }
+            )
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        MODULE._validate_output(summary)
+        parity = summary["reports"][1]
+        self.assertEqual(
+            parity["page_count_mismatches"],
+            [
+                {
+                    "libreoffice_pages": 3,
+                    "rxls_pages": 4,
+                    "workbooks": 1,
+                }
+            ],
+        )
+
+        missing = copy.deepcopy(summary)
+        missing["reports"][1].pop("page_count_mismatches")
+        negative = copy.deepcopy(summary)
+        negative["reports"][1]["page_count_mismatches"][0][
+            "rxls_pages"
+        ] = -1
+        oversized = copy.deepcopy(summary)
+        oversized["reports"][1]["page_count_mismatches"][0][
+            "libreoffice_pages"
+        ] = MODULE.MAX_PAGE_COUNT + 1
+        injected_value = copy.deepcopy(summary)
+        injected_value["reports"][1]["page_count_mismatches"][0][
+            "rxls_pages"
+        ] = "/srv/private/customer.xlsx"
+        injected_key = copy.deepcopy(summary)
+        injected_key["reports"][1]["page_count_mismatches"][0][
+            "private_path"
+        ] = "/srv/private/customer.xlsx"
+        count_drift = copy.deepcopy(summary)
+        count_drift["reports"][1]["page_count_mismatches"][0][
+            "workbooks"
+        ] = 2
+        equal_counts = copy.deepcopy(summary)
+        equal_counts["reports"][1]["page_count_mismatches"][0][
+            "rxls_pages"
+        ] = 3
+        duplicate_pair = copy.deepcopy(summary)
+        duplicate_pair["reports"][1]["page_count_mismatches"].append(
+            copy.deepcopy(
+                duplicate_pair["reports"][1]["page_count_mismatches"][0]
+            )
+        )
+        for label, document in (
+            ("missing", missing),
+            ("negative", negative),
+            ("oversized", oversized),
+            ("injected-value", injected_value),
+            ("injected-key", injected_key),
+            ("count-drift", count_drift),
+            ("equal-counts", equal_counts),
+            ("duplicate-pair", duplicate_pair),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(MODULE.SummaryError) as raised:
+                    MODULE._validate_output(document)
+                message = str(raised.exception)
+                self.assertNotIn("/srv/private", message)
+                self.assertNotIn("customer.xlsx", message)
 
     def test_head_profile_and_baseline_mode_are_validated(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

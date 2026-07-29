@@ -17,7 +17,7 @@ from typing import Any, Iterable
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v2"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v3"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -26,6 +26,7 @@ MAX_ROOT_ENTRIES = 128
 MAX_JSON_DEPTH = 128
 MAX_JSON_NODES = 2_000_000
 MAX_JSON_INTEGER_DIGITS = 128
+MAX_PAGE_COUNT = 64
 SHARDS = 4
 
 HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -58,6 +59,7 @@ REVIEWED_CLASSIFICATIONS = frozenset(
         "libreoffice_timeout",
         "manifest_sha256_mismatch",
         "manifest_size_mismatch",
+        "page_count_mismatch",
         "renderer_command_output_limit",
         "renderer_failed",
         "renderer_file_output_limit",
@@ -366,6 +368,18 @@ def _integer(value: object, code: str, maximum: int) -> int:
     return value
 
 
+def _page_count_pair(
+    value: dict[str, Any], code: str
+) -> tuple[int, int]:
+    rxls_pages = _integer(value.get("rxls_pages"), code, MAX_PAGE_COUNT)
+    libreoffice_pages = _integer(
+        value.get("libreoffice_pages"), code, MAX_PAGE_COUNT
+    )
+    if rxls_pages == 0 or libreoffice_pages == 0 or rxls_pages == libreoffice_pages:
+        raise SummaryError(code)
+    return rxls_pages, libreoffice_pages
+
+
 def _public_classification(value: str) -> str:
     if value in REVIEWED_CLASSIFICATIONS:
         return value
@@ -500,6 +514,10 @@ def _validate_report(
             format_name != "xlsx" or "print-settings" not in features
         ):
             raise SummaryError("authored_print_contract")
+        if classification == "page_count_mismatch":
+            if status != "error":
+                raise SummaryError("page_count_diagnostic")
+            _page_count_pair(row, "page_count_diagnostic")
         statuses[str(status)] += 1
         classifications[classification] += 1
     summary = value["summary"]
@@ -543,6 +561,7 @@ def _empty(label: str) -> dict[str, object]:
         "by_format": {},
         "by_status": {},
         "label": label,
+        "page_count_mismatches": [],
         "workbooks": 0,
     }
 
@@ -584,15 +603,21 @@ def _summarize_label(
     classes: Counter[str] = Counter()
     formats: dict[str, Counter[str]] = {}
     features: dict[str, Counter[str]] = {}
+    page_count_mismatches: Counter[tuple[int, int]] = Counter()
     for row in rows:
         status = str(row["status"])
-        code = _public_classification(str(row["classification"]))
+        raw_code = str(row["classification"])
+        code = _public_classification(raw_code)
         fmt = str(row["format"])
         statuses[status] += 1
         classes[code] += 1
         formats.setdefault(fmt, Counter())[code] += 1
         for feature in row["features"]:
             features.setdefault(str(feature), Counter())[code] += 1
+        if raw_code == "page_count_mismatch":
+            page_count_mismatches[
+                _page_count_pair(row, "page_count_diagnostic")
+            ] += 1
 
     def groups(values: dict[str, Counter[str]]) -> dict[str, object]:
         return {
@@ -609,6 +634,16 @@ def _summarize_label(
         "by_format": groups(formats),
         "by_status": dict(sorted(statuses.items())),
         "label": label,
+        "page_count_mismatches": [
+            {
+                "libreoffice_pages": libreoffice_pages,
+                "rxls_pages": rxls_pages,
+                "workbooks": count,
+            }
+            for (rxls_pages, libreoffice_pages), count in sorted(
+                page_count_mismatches.items()
+            )
+        ],
         "workbooks": len(rows),
     }, consumed
 
@@ -639,6 +674,7 @@ def _validate_output(value: object) -> None:
         "by_format",
         "by_status",
         "label",
+        "page_count_mismatches",
         "workbooks",
     }
     if not isinstance(value, dict) or set(value) != top:
@@ -673,6 +709,39 @@ def _validate_output(value: object) -> None:
             "output_classification",
             OUTPUT_CLASSIFICATIONS,
         )
+        page_count_mismatches = report["page_count_mismatches"]
+        if (
+            not isinstance(page_count_mismatches, list)
+            or len(page_count_mismatches) > total
+        ):
+            raise SummaryError("output_page_count_diagnostic")
+        previous_pair: tuple[int, int] | None = None
+        page_count_workbooks = 0
+        for mismatch in page_count_mismatches:
+            if (
+                not isinstance(mismatch, dict)
+                or set(mismatch)
+                != {"libreoffice_pages", "rxls_pages", "workbooks"}
+            ):
+                raise SummaryError("output_page_count_diagnostic")
+            pair = _page_count_pair(
+                mismatch, "output_page_count_diagnostic"
+            )
+            if previous_pair is not None and pair <= previous_pair:
+                raise SummaryError("output_page_count_diagnostic")
+            previous_pair = pair
+            workbooks = _integer(
+                mismatch["workbooks"],
+                "output_page_count_diagnostic",
+                total,
+            )
+            if workbooks == 0:
+                raise SummaryError("output_page_count_diagnostic")
+            page_count_workbooks += workbooks
+        if page_count_workbooks != report_classes.get(
+            "page_count_mismatch", 0
+        ):
+            raise SummaryError("output_page_count_diagnostic")
         for key, allowed in (("by_format", FORMATS), ("by_feature", FEATURES)):
             groups = report[key]
             if (
