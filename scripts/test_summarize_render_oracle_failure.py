@@ -365,6 +365,23 @@ def _pilot_rows() -> list[dict[str, object]]:
     return rows
 
 
+def _summarize_pilot(
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as raw:
+        hosted = Path(raw)
+        _write(
+            hosted / "parity-report-a.json",
+            _report(rows, profile="pilot", label="parity-a"),
+        )
+        return MODULE.summarize(
+            hosted,
+            profile="pilot",
+            baseline_mode="verify",
+            head_sha=HEAD_SHA,
+        )
+
+
 class RenderOracleFailureSummaryTests(unittest.TestCase):
     def test_pilot_summary_is_canonical_and_path_neutral(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -435,7 +452,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v7",
+                "rxls.render-oracle-failure-summary.v8",
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
@@ -652,29 +669,82 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 "row-height",
             },
         )
+        def aggregate_axis(axis: dict[str, object]) -> dict[str, object]:
+            return {
+                key: value
+                for key, value in axis.items()
+                if key != "histogram"
+            }
+
+        def histogram(axis: dict[str, object]) -> dict[str, int]:
+            counts = axis["histogram"]
+            self.assertEqual(
+                len(counts),
+                MODULE.MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS,
+            )
+            return dict(
+                zip(
+                    MODULE.PAGE_BOX_GEOMETRY_BUCKET_ORDER,
+                    counts,
+                    strict=True,
+                )
+            )
+
+        self.assertEqual(page_box["all"]["pages"], 4)
+        self.assertEqual(page_box["all"]["workbooks"], 3)
         self.assertEqual(
-            page_box["all"],
+            aggregate_axis(page_box["all"]["by_axis"]["height"]),
             {
-                "by_axis": {
-                    "height": {
-                        "max_delta_micropoints": 125_000,
-                        "min_delta_micropoints": -250_000,
-                        "nonzero_pages": 2,
-                        "sum_delta_micropoints": -125_000,
-                    },
-                    "width": {
-                        "max_delta_micropoints": 500_000,
-                        "min_delta_micropoints": -250_000,
-                        "nonzero_pages": 4,
-                        "sum_delta_micropoints": 300_000,
-                    },
-                },
-                "pages": 4,
-                "workbooks": 3,
+                "max_delta_micropoints": 125_000,
+                "min_delta_micropoints": -250_000,
+                "nonzero_pages": 2,
+                "sum_delta_micropoints": -125_000,
+            },
+        )
+        height_histogram = histogram(
+            page_box["all"]["by_axis"]["height"]
+        )
+        self.assertEqual(
+            {
+                bucket: count
+                for bucket, count in height_histogram.items()
+                if count
+            },
+            {
+                "negative_0_1_to_1_points": 1,
+                "positive_0_1_to_1_points": 1,
+                "zero": 2,
             },
         )
         self.assertEqual(
-            page_box["by_format"]["xls"]["by_axis"]["width"],
+            aggregate_axis(page_box["all"]["by_axis"]["width"]),
+            {
+                "max_delta_micropoints": 500_000,
+                "min_delta_micropoints": -250_000,
+                "nonzero_pages": 4,
+                "sum_delta_micropoints": 300_000,
+            },
+        )
+        width_histogram = histogram(
+            page_box["all"]["by_axis"]["width"]
+        )
+        self.assertEqual(
+            {
+                bucket: count
+                for bucket, count in width_histogram.items()
+                if count
+            },
+            {
+                "negative_0_1_to_1_points": 1,
+                "negative_up_to_0_1_points": 1,
+                "positive_0_1_to_1_points": 1,
+                "positive_up_to_0_1_points": 1,
+            },
+        )
+        self.assertEqual(
+            aggregate_axis(
+                page_box["by_format"]["xls"]["by_axis"]["width"]
+            ),
             {
                 "max_delta_micropoints": 500_000,
                 "min_delta_micropoints": 500_000,
@@ -683,35 +753,55 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            page_box["by_format"]["xlsx"]["by_axis"]["width"],
             {
-                "max_delta_micropoints": 100_000,
-                "min_delta_micropoints": -50_000,
-                "nonzero_pages": 2,
-                "sum_delta_micropoints": 50_000,
+                bucket: count
+                for bucket, count in histogram(
+                    page_box["by_format"]["xlsx"]["by_axis"]["width"]
+                ).items()
+                if count
+            },
+            {
+                "negative_up_to_0_1_points": 1,
+                "positive_up_to_0_1_points": 1,
             },
         )
+
+        def aggregate_cohort(
+            cohort: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                "by_axis": {
+                    axis: aggregate_axis(axis_value)
+                    for axis, axis_value in cohort["by_axis"].items()
+                },
+                "pages": cohort["pages"],
+                "workbooks": cohort["workbooks"],
+            }
+
         for feature in ("chart", "image-drawing"):
             self.assertEqual(
                 page_box["by_feature"][feature],
-                page_box["by_format"]["xlsx"],
+                aggregate_cohort(page_box["by_format"]["xlsx"]),
             )
         self.assertEqual(
             page_box["by_feature"]["column-width"],
-            page_box["by_format"]["xls"],
+            aggregate_cohort(page_box["by_format"]["xls"]),
         )
         self.assertEqual(
             page_box["by_feature"]["hidden-column"],
-            page_box["by_format"]["xlsb"],
+            aggregate_cohort(page_box["by_format"]["xlsb"]),
         )
         self.assertEqual(
             page_box["by_feature"]["hidden-row"],
-            page_box["by_format"]["xlsb"],
+            aggregate_cohort(page_box["by_format"]["xlsb"]),
         )
         self.assertEqual(
             page_box["by_feature"]["row-height"],
-            page_box["by_format"]["xls"],
+            aggregate_cohort(page_box["by_format"]["xls"]),
         )
+        for cohort in page_box["by_feature"].values():
+            for axis in cohort["by_axis"].values():
+                self.assertNotIn("histogram", axis)
         rendered = MODULE._json(summary).decode("ascii")
         for forbidden in (
             "600/1",
@@ -721,6 +811,289 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             "pdf_point_geometry",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_page_box_histogram_boundaries_and_rounding_are_exact(
+        self,
+    ) -> None:
+        suffixes = (
+            "up_to_0_1_points",
+            "0_1_to_1_points",
+            "1_to_5_points",
+            "5_to_10_points",
+            "10_to_25_points",
+            "25_to_50_points",
+            "50_to_100_points",
+        )
+        self.assertEqual(MODULE._page_box_geometry_bucket(0), "zero")
+        for sign, prefix in ((-1, "negative"), (1, "positive")):
+            self.assertEqual(
+                MODULE._page_box_geometry_bucket(sign),
+                f"{prefix}_up_to_0_1_points",
+            )
+            for index, upper in enumerate(
+                MODULE.PAGE_BOX_GEOMETRY_MAGNITUDE_UPPER_BOUNDS_MICROPOINTS
+            ):
+                with self.subTest(sign=sign, upper=upper):
+                    self.assertEqual(
+                        MODULE._page_box_geometry_bucket(
+                            sign * upper
+                        ),
+                        f"{prefix}_{suffixes[index]}",
+                    )
+                    next_suffix = (
+                        suffixes[index + 1]
+                        if index + 1 < len(suffixes)
+                        else "over_100_points"
+                    )
+                    self.assertEqual(
+                        MODULE._page_box_geometry_bucket(
+                            sign * (upper + 1)
+                        ),
+                        f"{prefix}_{next_suffix}",
+                    )
+            self.assertEqual(
+                MODULE._page_box_geometry_bucket(
+                    sign * MODULE.MAX_POINT_DELTA_MICROPOINTS
+                ),
+                f"{prefix}_over_100_points",
+            )
+        self.assertEqual(
+            MODULE._signed_ceil_micropoints(
+                Fraction(1, 2_000_000)
+            ),
+            1,
+        )
+        self.assertEqual(
+            MODULE._signed_ceil_micropoints(
+                Fraction(-1, 2_000_000)
+            ),
+            -1,
+        )
+        for value in (
+            -MODULE.MAX_POINT_DELTA_MICROPOINTS - 1,
+            MODULE.MAX_POINT_DELTA_MICROPOINTS + 1,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.SummaryError,
+                r"\Apage_box_geometry_delta_limit\Z",
+            ):
+                MODULE._page_box_geometry_bucket(value)
+
+    def test_page_box_histogram_has_fixed_cardinality_and_order(
+        self,
+    ) -> None:
+        def summary(reverse: bool) -> dict[str, object]:
+            rows = _pilot_rows()
+            for index, row in enumerate(rows):
+                if index != 1:
+                    _as_premeasurement_error(row)
+            pages = [
+                _geometry_page(
+                    crop_width_delta=Fraction(index, 1_000_000)
+                )
+                for index in range(1, 41)
+            ]
+            if reverse:
+                pages.reverse()
+            _with_geometry(rows[1], pages)
+            return _summarize_pilot(rows)
+
+        forward = summary(False)
+        reverse = summary(True)
+        self.assertEqual(forward, reverse)
+        page_box = forward["reports"][1]["page_box_geometry"]
+        axis = page_box["all"]["by_axis"]["width"]
+        self.assertEqual(
+            len(axis["histogram"]),
+            MODULE.MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS,
+        )
+        counts = dict(
+            zip(
+                MODULE.PAGE_BOX_GEOMETRY_BUCKET_ORDER,
+                axis["histogram"],
+                strict=True,
+            )
+        )
+        self.assertEqual(
+            {
+                bucket: count
+                for bucket, count in counts.items()
+                if count
+            },
+            {"positive_up_to_0_1_points": 40},
+        )
+        rendered = MODULE._json(forward).decode("ascii")
+        self.assertNotIn("/srv/private", rendered)
+        self.assertNotIn("customer-1", rendered)
+        self.assertNotIn(
+            hashlib.sha256(b"case-1").hexdigest(),
+            rendered,
+        )
+        self.assertNotIn("1/1000000", rendered)
+
+    def test_page_box_histogram_output_is_fail_closed(self) -> None:
+        rows = _pilot_rows()
+        for index, row in enumerate(rows):
+            if index != 1:
+                _as_premeasurement_error(row)
+        rows[1]["features"] = sorted(
+            ("column-width", "latin-text", "number-cell")
+        )
+        _with_geometry(
+            rows[1],
+            [
+                _geometry_page(
+                    crop_width_delta=Fraction(-1, 20)
+                ),
+                _geometry_page(crop_width_delta=Fraction(1, 5)),
+                _geometry_page(crop_width_delta=Fraction(1, 2)),
+            ],
+        )
+        summary = _summarize_pilot(rows)
+        bucket_index = {
+            bucket: index
+            for index, bucket in enumerate(
+                MODULE.PAGE_BOX_GEOMETRY_BUCKET_ORDER
+            )
+        }
+
+        def all_width(document: dict[str, object]) -> dict[str, object]:
+            return document["reports"][1]["page_box_geometry"][
+                "all"
+            ]["by_axis"]["width"]
+
+        def format_width(
+            document: dict[str, object],
+        ) -> dict[str, object]:
+            return document["reports"][1]["page_box_geometry"][
+                "by_format"
+            ]["xls"]["by_axis"]["width"]
+
+        malformed: list[tuple[str, dict[str, object]]] = []
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["page_box_geometry"]["histogram"][
+            "bucket_order"
+        ][0] = "private_case_bucket"
+        malformed.append(("policy-bucket", value))
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["page_box_geometry"]["histogram"][
+            "max_buckets_per_axis"
+        ] = True
+        malformed.append(("policy-bool", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["histogram"][
+            bucket_index["negative_up_to_0_1_points"]
+        ] = True
+        malformed.append(("count-bool", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["histogram"].pop()
+        malformed.append(("bucket-removed", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["histogram"].append(0)
+        malformed.append(("bucket-appended", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["histogram"][bucket_index["zero"]] += 1
+        malformed.append(("count-total", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["nonzero_pages"] -= 1
+        malformed.append(("nonzero-count", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["min_delta_micropoints"] = -2_000_000
+        malformed.append(("minimum-band", value))
+
+        value = copy.deepcopy(summary)
+        all_width(value)["sum_delta_micropoints"] = 500_000
+        format_width(value)["sum_delta_micropoints"] = 500_000
+        malformed.append(("infeasible-band-sum", value))
+
+        value = copy.deepcopy(summary)
+        axis = all_width(value)
+        axis["histogram"][
+            bucket_index["positive_0_1_to_1_points"]
+        ] -= 1
+        axis["histogram"][
+            bucket_index["positive_up_to_0_1_points"]
+        ] += 1
+        axis["sum_delta_micropoints"] = 500_000
+        malformed.append(("format-partition", value))
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["page_box_geometry"]["by_feature"][
+            "column-width"
+        ]["by_axis"]["width"]["histogram"] = list(
+            all_width(value)["histogram"]
+        )
+        malformed.append(("feature-histogram", value))
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["page_box_geometry"]["by_format"].pop(
+            "xls"
+        )
+        malformed.append(("format-coverage", value))
+
+        value = copy.deepcopy(summary)
+        value["schema"] = "rxls.render-oracle-failure-summary.v7"
+        malformed.append(("old-schema", value))
+
+        for label, document in malformed:
+            with self.subTest(label=label):
+                with self.assertRaises(MODULE.SummaryError):
+                    MODULE._validate_output(document)
+
+    def test_empty_page_box_histograms_are_fixed_and_private_policy_isolated(
+        self,
+    ) -> None:
+        summary = MODULE.summarize(
+            Path("/definitely/missing"),
+            profile="full",
+            baseline_mode="candidate",
+            head_sha=HEAD_SHA,
+        )
+        expected_policy = copy.deepcopy(
+            MODULE.PAGE_BOX_GEOMETRY_POLICY
+        )
+        page_boxes = [
+            report["page_box_geometry"]
+            for report in summary["reports"]
+        ]
+        for page_box in page_boxes:
+            self.assertEqual(page_box["by_feature"], {})
+            self.assertEqual(page_box["by_format"], {})
+            for axis in page_box["all"]["by_axis"].values():
+                self.assertEqual(
+                    axis["histogram"],
+                    [0]
+                    * MODULE.MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS,
+                )
+        self.assertIsNot(
+            page_boxes[0]["histogram"],
+            MODULE.PAGE_BOX_GEOMETRY_POLICY["histogram"],
+        )
+        self.assertIsNot(
+            page_boxes[0]["histogram"],
+            page_boxes[1]["histogram"],
+        )
+        page_boxes[0]["histogram"]["bucket_order"][0] = (
+            "private_case_bucket"
+        )
+        self.assertEqual(
+            MODULE.PAGE_BOX_GEOMETRY_POLICY,
+            expected_policy,
+        )
+        self.assertEqual(
+            page_boxes[1]["histogram"],
+            expected_policy["histogram"],
+        )
+        with self.assertRaises(MODULE.SummaryError):
+            MODULE._validate_output(summary)
 
     def test_geometry_evidence_shapes_are_fail_closed(self) -> None:
         def rows() -> list[dict[str, object]]:
@@ -1586,6 +1959,67 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 "by_format": by_format,
             }
 
+        zero_page = {
+            "crop_box_height": Fraction(),
+            "crop_box_width": Fraction(),
+        }
+
+        def page_box_geometry(
+            format_counts: dict[str, int],
+        ) -> dict[str, object]:
+            all_accumulator = (
+                MODULE._new_page_box_geometry_accumulator()
+            )
+            by_format: dict[str, object] = {}
+            for format_name, count in format_counts.items():
+                accumulator = (
+                    MODULE._new_page_box_geometry_accumulator()
+                )
+                for _ in range(count):
+                    MODULE._merge_page_box_geometry_workbook(
+                        accumulator, [zero_page]
+                    )
+                    MODULE._merge_page_box_geometry_workbook(
+                        all_accumulator, [zero_page]
+                    )
+                by_format[format_name] = (
+                    MODULE._finish_page_box_geometry_cohort(
+                        accumulator,
+                        include_histogram=True,
+                    )
+                )
+            total = sum(format_counts.values())
+            by_feature: dict[str, object] = {}
+            for feature in MODULE.PAGE_BOX_GEOMETRY_FEATURES:
+                accumulator = (
+                    MODULE._new_page_box_geometry_accumulator()
+                )
+                for _ in range(total):
+                    MODULE._merge_page_box_geometry_workbook(
+                        accumulator, [zero_page]
+                    )
+                by_feature[feature] = (
+                    MODULE._finish_page_box_geometry_cohort(
+                        accumulator,
+                        include_histogram=False,
+                    )
+                )
+            return {
+                **copy.deepcopy(MODULE.PAGE_BOX_GEOMETRY_POLICY),
+                "all": MODULE._finish_page_box_geometry_cohort(
+                    all_accumulator,
+                    include_histogram=True,
+                ),
+                "by_feature": by_feature,
+                "by_format": by_format,
+            }
+
+        def point_geometry(total: int) -> dict[str, object]:
+            value = MODULE._empty_geometry()
+            value["pages"] = total
+            value["workbooks"] = total
+            return value
+
         classifications = sorted(MODULE.OUTPUT_CLASSIFICATIONS)
         self.assertIn("page_count_mismatch", classifications)
         ordinary_classifications = [
@@ -1661,7 +2095,11 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                         "compared": len(ordinary_classifications),
                         "error": mismatch_count,
                     },
+                    "geometry": point_geometry(total),
                     "line_geometry": geometry(format_counts),
+                    "page_box_geometry": page_box_geometry(
+                        format_counts
+                    ),
                     "page_count_mismatches": [
                         {
                             "libreoffice_pages": libreoffice_pages,
@@ -1692,7 +2130,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         payload = MODULE._json(document)
         self.assertLessEqual(
             len(payload),
-            MODULE.MAX_OUTPUT_BYTES - 96 * 1024,
+            MODULE.MAX_OUTPUT_BYTES - 48 * 1024,
         )
         with tempfile.TemporaryDirectory() as raw:
             output = Path(raw) / MODULE.OUTPUT_NAME

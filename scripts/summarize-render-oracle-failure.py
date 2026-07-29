@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v7"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v8"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -345,6 +345,7 @@ PAGE_BOX_GEOMETRY_KEYS = {
     "by_feature",
     "by_format",
     "delta_direction",
+    "histogram",
     "rounding",
     "units",
 }
@@ -353,15 +354,89 @@ PAGE_BOX_GEOMETRY_COHORT_KEYS = {
     "pages",
     "workbooks",
 }
-PAGE_BOX_GEOMETRY_AXIS_KEYS = {
+PAGE_BOX_GEOMETRY_AGGREGATE_AXIS_KEYS = {
     "max_delta_micropoints",
     "min_delta_micropoints",
     "nonzero_pages",
     "sum_delta_micropoints",
 }
+PAGE_BOX_GEOMETRY_HISTOGRAM_AXIS_KEYS = (
+    PAGE_BOX_GEOMETRY_AGGREGATE_AXIS_KEYS | {"histogram"}
+)
+PAGE_BOX_GEOMETRY_BUCKET_ORDER = (
+    "negative_over_100_points",
+    "negative_50_to_100_points",
+    "negative_25_to_50_points",
+    "negative_10_to_25_points",
+    "negative_5_to_10_points",
+    "negative_1_to_5_points",
+    "negative_0_1_to_1_points",
+    "negative_up_to_0_1_points",
+    "zero",
+    "positive_up_to_0_1_points",
+    "positive_0_1_to_1_points",
+    "positive_1_to_5_points",
+    "positive_5_to_10_points",
+    "positive_10_to_25_points",
+    "positive_25_to_50_points",
+    "positive_50_to_100_points",
+    "positive_over_100_points",
+)
+PAGE_BOX_GEOMETRY_MAGNITUDE_UPPER_BOUNDS_MICROPOINTS = (
+    100_000,
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+)
+PAGE_BOX_GEOMETRY_BUCKET_INTERVALS = {
+    "negative_over_100_points": (
+        -MAX_POINT_DELTA_MICROPOINTS,
+        -100_000_001,
+    ),
+    "negative_50_to_100_points": (-100_000_000, -50_000_001),
+    "negative_25_to_50_points": (-50_000_000, -25_000_001),
+    "negative_10_to_25_points": (-25_000_000, -10_000_001),
+    "negative_5_to_10_points": (-10_000_000, -5_000_001),
+    "negative_1_to_5_points": (-5_000_000, -1_000_001),
+    "negative_0_1_to_1_points": (-1_000_000, -100_001),
+    "negative_up_to_0_1_points": (-100_000, -1),
+    "zero": (0, 0),
+    "positive_up_to_0_1_points": (1, 100_000),
+    "positive_0_1_to_1_points": (100_001, 1_000_000),
+    "positive_1_to_5_points": (1_000_001, 5_000_000),
+    "positive_5_to_10_points": (5_000_001, 10_000_000),
+    "positive_10_to_25_points": (10_000_001, 25_000_000),
+    "positive_25_to_50_points": (25_000_001, 50_000_000),
+    "positive_50_to_100_points": (50_000_001, 100_000_000),
+    "positive_over_100_points": (
+        100_000_001,
+        MAX_POINT_DELTA_MICROPOINTS,
+    ),
+}
+MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS = len(
+    PAGE_BOX_GEOMETRY_BUCKET_ORDER
+)
 PAGE_BOX_GEOMETRY_POLICY = {
     "box": "pdf_crop_box",
     "delta_direction": "rxls_minus_libreoffice",
+    "histogram": {
+        "absolute_limit_micropoints": (
+            MAX_POINT_DELTA_MICROPOINTS
+        ),
+        "bucket_order": list(PAGE_BOX_GEOMETRY_BUCKET_ORDER),
+        "cohorts": "all_and_by_format",
+        "encoding": "fixed_signed_magnitude_bands",
+        "magnitude_upper_bounds_micropoints": list(
+            PAGE_BOX_GEOMETRY_MAGNITUDE_UPPER_BOUNDS_MICROPOINTS
+        ),
+        "max_buckets_per_axis": (
+            MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS
+        ),
+        "ranges": "lower_exclusive_upper_inclusive_by_magnitude",
+    },
     "rounding": "away_from_zero",
     "units": "micropoints",
 }
@@ -738,6 +813,14 @@ def _ceil_micropoints(value: Fraction) -> int:
 def _signed_ceil_micropoints(value: Fraction) -> int:
     rounded = _ceil_micropoints(value)
     return -rounded if value < 0 else rounded
+
+
+def _page_box_geometry_bucket(delta_micropoints: int) -> str:
+    for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER:
+        lower, upper = PAGE_BOX_GEOMETRY_BUCKET_INTERVALS[bucket]
+        if lower <= delta_micropoints <= upper:
+            return bucket
+    raise SummaryError("page_box_geometry_delta_limit")
 
 
 def _ceil_millipoints(value: Fraction) -> int:
@@ -1305,6 +1388,12 @@ def _new_page_box_geometry_accumulator() -> dict[str, object]:
     return {
         "by_axis": {
             axis: {
+                "histogram": Counter(
+                    {
+                        bucket: 0
+                        for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER
+                    }
+                ),
                 "max_delta_micropoints": None,
                 "min_delta_micropoints": None,
                 "nonzero_pages": 0,
@@ -1330,6 +1419,8 @@ def _merge_page_box_geometry_workbook(
                 page[f"crop_box_{axis}"]
             )
             aggregate = axes[axis]
+            bucket = _page_box_geometry_bucket(value)
+            aggregate["histogram"][bucket] += 1
             aggregate["sum_delta_micropoints"] += value
             aggregate["nonzero_pages"] += int(value != 0)
             aggregate["min_delta_micropoints"] = (
@@ -1348,24 +1439,134 @@ def _merge_page_box_geometry_workbook(
             )
 
 
+def _validate_page_box_histogram_aggregates(
+    histogram: Counter[str],
+    *,
+    pages: int,
+    minimum: int | None,
+    maximum: int | None,
+    nonzero_pages: int,
+    total_delta: int,
+    code: str,
+) -> None:
+    if (
+        set(histogram) != set(PAGE_BOX_GEOMETRY_BUCKET_ORDER)
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for count in histogram.values()
+        )
+        or sum(histogram.values()) != pages
+        or pages - histogram["zero"] != nonzero_pages
+    ):
+        raise SummaryError(code)
+    nonempty = [
+        bucket
+        for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER
+        if histogram[bucket] > 0
+    ]
+    if pages == 0:
+        if (
+            nonempty
+            or minimum is not None
+            or maximum is not None
+            or nonzero_pages != 0
+            or total_delta != 0
+        ):
+            raise SummaryError(code)
+        return
+    if (
+        minimum is None
+        or maximum is None
+        or minimum > maximum
+        or _page_box_geometry_bucket(minimum) != nonempty[0]
+        or _page_box_geometry_bucket(maximum) != nonempty[-1]
+    ):
+        raise SummaryError(code)
+    if minimum == maximum:
+        if (
+            len(nonempty) != 1
+            or histogram[nonempty[0]] != pages
+            or total_delta != minimum * pages
+        ):
+            raise SummaryError(code)
+        return
+    if pages < 2:
+        raise SummaryError(code)
+    remaining = histogram.copy()
+    for value in (minimum, maximum):
+        bucket = _page_box_geometry_bucket(value)
+        remaining[bucket] -= 1
+        if remaining[bucket] < 0:
+            raise SummaryError(code)
+    minimum_sum = minimum + maximum
+    maximum_sum = minimum + maximum
+    for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER:
+        count = remaining[bucket]
+        if count == 0:
+            continue
+        lower, upper = PAGE_BOX_GEOMETRY_BUCKET_INTERVALS[bucket]
+        lower = max(lower, minimum)
+        upper = min(upper, maximum)
+        if lower > upper:
+            raise SummaryError(code)
+        minimum_sum += lower * count
+        maximum_sum += upper * count
+    if not minimum_sum <= total_delta <= maximum_sum:
+        raise SummaryError(code)
+
+
 def _finish_page_box_geometry_cohort(
     accumulator: dict[str, object],
+    *,
+    include_histogram: bool,
 ) -> dict[str, object]:
+    pages = int(accumulator["pages"])
+    by_axis: dict[str, dict[str, object]] = {}
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        aggregate = accumulator["by_axis"][axis]
+        histogram = aggregate["histogram"]
+        _validate_page_box_histogram_aggregates(
+            histogram,
+            pages=pages,
+            minimum=aggregate["min_delta_micropoints"],
+            maximum=aggregate["max_delta_micropoints"],
+            nonzero_pages=aggregate["nonzero_pages"],
+            total_delta=aggregate["sum_delta_micropoints"],
+            code="page_box_geometry_aggregate",
+        )
+        axis_value = {
+            "max_delta_micropoints": aggregate[
+                "max_delta_micropoints"
+            ],
+            "min_delta_micropoints": aggregate[
+                "min_delta_micropoints"
+            ],
+            "nonzero_pages": aggregate["nonzero_pages"],
+            "sum_delta_micropoints": aggregate[
+                "sum_delta_micropoints"
+            ],
+        }
+        if include_histogram:
+            axis_value["histogram"] = [
+                histogram[bucket]
+                for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER
+            ]
+        by_axis[axis] = axis_value
     return {
-        "by_axis": {
-            axis: dict(accumulator["by_axis"][axis])
-            for axis in PAGE_BOX_GEOMETRY_AXES
-        },
-        "pages": int(accumulator["pages"]),
+        "by_axis": by_axis,
+        "pages": pages,
         "workbooks": int(accumulator["workbooks"]),
     }
 
 
 def _empty_page_box_geometry() -> dict[str, object]:
     return {
-        **PAGE_BOX_GEOMETRY_POLICY,
+        **copy.deepcopy(PAGE_BOX_GEOMETRY_POLICY),
         "all": _finish_page_box_geometry_cohort(
-            _new_page_box_geometry_accumulator()
+            _new_page_box_geometry_accumulator(),
+            include_histogram=True,
         ),
         "by_feature": {},
         "by_format": {},
@@ -1855,13 +2056,15 @@ def _summarize_label(
             },
         },
         "page_box_geometry": {
-            **PAGE_BOX_GEOMETRY_POLICY,
+            **copy.deepcopy(PAGE_BOX_GEOMETRY_POLICY),
             "all": _finish_page_box_geometry_cohort(
-                page_box_geometry_all
+                page_box_geometry_all,
+                include_histogram=True,
             ),
             "by_feature": {
                 feature: _finish_page_box_geometry_cohort(
-                    accumulator
+                    accumulator,
+                    include_histogram=False,
                 )
                 for feature, accumulator in sorted(
                     page_box_geometry_by_feature.items()
@@ -1870,7 +2073,8 @@ def _summarize_label(
             },
             "by_format": {
                 format_name: _finish_page_box_geometry_cohort(
-                    accumulator
+                    accumulator,
+                    include_histogram=True,
                 )
                 for format_name, accumulator in sorted(
                     page_box_geometry_by_format.items()
@@ -1999,6 +2203,7 @@ def _validate_page_box_geometry_cohort(
     value: object,
     *,
     workbook_limit: int,
+    include_histogram: bool,
 ) -> dict[str, object]:
     code = "output_page_box_geometry"
     if (
@@ -2023,14 +2228,37 @@ def _validate_page_box_geometry_cohort(
         or set(by_axis) != set(PAGE_BOX_GEOMETRY_AXES)
     ):
         raise SummaryError(code)
-    axes: dict[str, dict[str, int | None]] = {}
+    expected_axis_keys = (
+        PAGE_BOX_GEOMETRY_HISTOGRAM_AXIS_KEYS
+        if include_histogram
+        else PAGE_BOX_GEOMETRY_AGGREGATE_AXIS_KEYS
+    )
+    axes: dict[str, dict[str, object]] = {}
     for axis in PAGE_BOX_GEOMETRY_AXES:
         raw_axis = by_axis[axis]
         if (
             not isinstance(raw_axis, dict)
-            or set(raw_axis) != PAGE_BOX_GEOMETRY_AXIS_KEYS
+            or set(raw_axis) != expected_axis_keys
         ):
             raise SummaryError(code)
+        histogram: Counter[str] | None = None
+        if include_histogram:
+            raw_histogram = raw_axis["histogram"]
+            if (
+                not isinstance(raw_histogram, list)
+                or len(raw_histogram)
+                != MAX_PAGE_BOX_GEOMETRY_HISTOGRAM_BUCKETS
+            ):
+                raise SummaryError(code)
+            histogram = Counter()
+            for expected_bucket, count in zip(
+                PAGE_BOX_GEOMETRY_BUCKET_ORDER,
+                raw_histogram,
+                strict=True,
+            ):
+                histogram[expected_bucket] = _integer(
+                    count, code, pages
+                )
         nonzero_pages = _integer(
             raw_axis["nonzero_pages"], code, pages
         )
@@ -2062,8 +2290,10 @@ def _validate_page_box_geometry_cohort(
                 minimum > maximum
                 or (nonzero_pages == 0)
                 != (minimum == maximum == total_delta == 0)
-                or (minimum > 0 or maximum < 0)
-                and nonzero_pages != pages
+                or (
+                    (minimum > 0 or maximum < 0)
+                    and nonzero_pages != pages
+                )
             ):
                 raise SummaryError(code)
             if pages == 1:
@@ -2082,14 +2312,29 @@ def _validate_page_box_geometry_cohort(
                 )
                 if not minimum_sum <= total_delta <= maximum_sum:
                     raise SummaryError(code)
-            if nonzero_pages < pages and not minimum <= 0 <= maximum:
+            if (
+                nonzero_pages < pages
+                and not minimum <= 0 <= maximum
+            ):
                 raise SummaryError(code)
+        if histogram is not None:
+            _validate_page_box_histogram_aggregates(
+                histogram,
+                pages=pages,
+                minimum=minimum,
+                maximum=maximum,
+                nonzero_pages=nonzero_pages,
+                total_delta=total_delta,
+                code=code,
+            )
         axes[axis] = {
             "max_delta_micropoints": maximum,
             "min_delta_micropoints": minimum,
             "nonzero_pages": nonzero_pages,
             "sum_delta_micropoints": total_delta,
         }
+        if histogram is not None:
+            axes[axis]["histogram"] = histogram
     return {
         "by_axis": axes,
         "pages": pages,
@@ -2115,6 +2360,9 @@ def _page_box_partition_matches(
             for axis_value in cohort_axes
             if axis_value["min_delta_micropoints"] is not None
         ]
+        merged_histogram: Counter[str] = Counter()
+        for axis_value in cohort_axes:
+            merged_histogram.update(axis_value["histogram"])
         if (
             sum(
                 int(axis_value["nonzero_pages"])
@@ -2146,6 +2394,7 @@ def _page_box_partition_matches(
                 )
                 != all_axis["max_delta_micropoints"]
             )
+            or merged_histogram != all_axis["histogram"]
         ):
             return False
     return True
@@ -2155,7 +2404,7 @@ def _validate_page_box_geometry_output(
     value: object,
     *,
     total: int,
-    format_workbooks: dict[str, int],
+    metric_format_cohorts: dict[str, dict[str, object]],
     feature_workbooks: dict[str, int],
     point_geometry: dict[str, object],
 ) -> None:
@@ -2163,14 +2412,19 @@ def _validate_page_box_geometry_output(
     if (
         not isinstance(value, dict)
         or set(value) != PAGE_BOX_GEOMETRY_KEYS
-        or any(
-            value.get(key) != expected
-            for key, expected in PAGE_BOX_GEOMETRY_POLICY.items()
+        or not type_exact_equal(
+            {
+                key: value.get(key)
+                for key in PAGE_BOX_GEOMETRY_POLICY
+            },
+            PAGE_BOX_GEOMETRY_POLICY,
         )
     ):
         raise SummaryError(code)
     all_cohort = _validate_page_box_geometry_cohort(
-        value["all"], workbook_limit=total
+        value["all"],
+        workbook_limit=total,
+        include_histogram=True,
     )
     if (
         all_cohort["workbooks"] != point_geometry["workbooks"]
@@ -2196,24 +2450,25 @@ def _validate_page_box_geometry_output(
     by_format = value["by_format"]
     if (
         not isinstance(by_format, dict)
-        or len(by_format) > len(FORMATS)
-        or any(
-            not isinstance(format_name, str)
-            or format_name not in FORMATS
-            for format_name in by_format
-        )
+        or set(by_format) != set(metric_format_cohorts)
     ):
         raise SummaryError(code)
     format_cohorts = {
         format_name: _validate_page_box_geometry_cohort(
             raw_cohort,
-            workbook_limit=format_workbooks.get(format_name, 0),
+            workbook_limit=int(
+                metric_format_cohorts[format_name]["workbooks"]
+            ),
+            include_histogram=True,
         )
         for format_name, raw_cohort in by_format.items()
     }
     if any(
-        cohort["workbooks"] == 0
-        for cohort in format_cohorts.values()
+        cohort["workbooks"]
+        != metric_format_cohorts[format_name]["workbooks"]
+        or cohort["pages"]
+        != metric_format_cohorts[format_name]["pages"]
+        for format_name, cohort in format_cohorts.items()
     ):
         raise SummaryError(code)
     if not _page_box_partition_matches(
@@ -2236,6 +2491,7 @@ def _validate_page_box_geometry_output(
         cohort = _validate_page_box_geometry_cohort(
             raw_cohort,
             workbook_limit=feature_workbooks.get(feature, 0),
+            include_histogram=False,
         )
         if (
             cohort["workbooks"] == 0
@@ -2611,13 +2867,6 @@ def _validate_output(value: object) -> None:
             ):
                 raise SummaryError("output_group")
         format_workbooks = group_workbooks["by_format"]
-        _validate_page_box_geometry_output(
-            report["page_box_geometry"],
-            total=total,
-            format_workbooks=format_workbooks,
-            feature_workbooks=group_workbooks["by_feature"],
-            point_geometry=point_geometry,
-        )
         word_geometry = _validate_text_geometry_output(
             report["word_geometry"], total, format_workbooks
         )
@@ -2640,6 +2889,13 @@ def _validate_output(value: object) -> None:
             )
         ):
             raise SummaryError("output_text_geometry")
+        _validate_page_box_geometry_output(
+            report["page_box_geometry"],
+            total=total,
+            metric_format_cohorts=word_geometry["by_format"],
+            feature_workbooks=group_workbooks["by_feature"],
+            point_geometry=point_geometry,
+        )
 
 
 def summarize(
