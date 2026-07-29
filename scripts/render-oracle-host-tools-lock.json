@@ -853,5 +853,28 @@
     },
     "version": "3.13.14"
   },
-  "schema": "rxls.render-oracle-host-tools-lock.v1"
+  "schema": "rxls.render-oracle-host-tools-lock.v2",
+  "ubuntu_apt": {
+    "architecture": "amd64",
+    "bootstrap_packages": [
+      {
+        "name": "libcairo2:amd64",
+        "version": "1.18.0-3build1"
+      },
+      {
+        "name": "poppler-utils",
+        "version": "24.02.0-1ubuntu9.9"
+      }
+    ],
+    "components": [
+      "main",
+      "universe"
+    ],
+    "snapshot": "20260718T000000Z",
+    "suites": [
+      "noble",
+      "noble-updates",
+      "noble-security"
+    ]
+  }
 }

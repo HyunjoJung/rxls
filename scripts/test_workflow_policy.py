@@ -402,9 +402,19 @@ steps:
             "python": original.replace('python-version: "3.13.14"', 'python-version: "3.13"'),
             "pip": original.replace("            --require-hashes \\\n", ""),
             "apt": original.replace(
-                'sudo apt-get install --yes --no-install-recommends '
-                '"${SYSTEM_PACKAGES[@]}"',
-                "sudo apt-get install --yes --no-install-recommends poppler-utils",
+                'sudo apt-get "${APT_OPTIONS[@]}" install \\',
+                "sudo apt-get install \\",
+                1,
+            ),
+            "apt_live_source_parts": original.replace(
+                '-o "Dir::Etc::sourceparts=-"',
+                '-o "Dir::Etc::sourceparts=/etc/apt/sources.list.d"',
+                1,
+            ),
+            "apt_snapshot_generator": original.replace(
+                "python3 scripts/render-oracle-host-tools.py apt-sources \\",
+                "printf '%s\\n' 'deb https://archive.ubuntu.com/ubuntu noble main' \\",
+                1,
             ),
             "identity": original.replace(
                 'assert document["image_identity_status"] == "pinned_match"',
@@ -1518,8 +1528,18 @@ steps:
         original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
             original.replace(
-                "          mkdir -p target\n",
-                "          sudo apt-get update\n          mkdir -p target\n",
+                '-o "Dir::Etc::sourceparts=-"',
+                '-o "Dir::Etc::sourceparts=/etc/apt/sources.list.d"',
+                1,
+            ),
+            original.replace(
+                "python3 scripts/render-oracle-host-tools.py apt-sources \\",
+                "printf '%s\\n' 'deb https://archive.ubuntu.com/ubuntu noble main' \\",
+                1,
+            ),
+            original.replace(
+                'sudo apt-get "${APT_OPTIONS[@]}" update',
+                "sudo apt-get update",
                 1,
             ),
             original.replace("--scope poppler", "--scope all"),

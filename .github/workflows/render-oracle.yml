@@ -204,17 +204,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
+          APT_ROOT="$PWD/target/render-oracle-apt"
+          mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          python3 scripts/render-oracle-host-tools.py apt-sources \
+            > "$APT_ROOT/ubuntu.sources"
+          APT_OPTIONS=(
+            -o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=-"
+            -o "Dir::State::lists=$APT_ROOT/lists"
+            -o "Dir::Cache::archives=$APT_ROOT/cache/archives"
+            -o "Acquire::Retries=3"
+          )
           if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
-            sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils
+            SYSTEM_PACKAGE_TEXT="$(
+              python3 scripts/render-oracle-host-tools.py apt-specs --scope bootstrap
+            )"
           else
             SYSTEM_PACKAGE_TEXT="$(
               python3 scripts/render-oracle-host-tools.py apt-specs --scope all
             )"
-            mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
-            [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
-            sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"
           fi
+          mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+          [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install \
+            --yes \
+            --no-install-recommends \
+            --allow-downgrades \
+            "${SYSTEM_PACKAGES[@]}"
           python3 -m pip install \
             --disable-pip-version-check \
             --force-reinstall \

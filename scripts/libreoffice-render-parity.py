@@ -748,7 +748,7 @@ def _locked_poppler_tool_contract() -> dict[str, dict[str, object]]:
     """Return the exact hosted Poppler executable contract for this platform."""
     document = _bounded_json_object(
         HOST_TOOLS_LOCK_PATH,
-        schema="rxls.render-oracle-host-tools-lock.v1",
+        schema="rxls.render-oracle-host-tools-lock.v2",
     )
     target = _exact_keys(
         document.get("platform"), {"machine", "system"}, "poppler_lock_platform"

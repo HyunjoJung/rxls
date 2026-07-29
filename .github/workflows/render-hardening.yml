@@ -66,8 +66,28 @@ jobs:
           if [[ "$EXPECTED_IDENTITY" != "null" ]]; then
             exit 0
           fi
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils
+          APT_ROOT="$PWD/target/render-oracle-apt"
+          mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          python3 scripts/render-oracle-host-tools.py apt-sources \
+            > "$APT_ROOT/ubuntu.sources"
+          APT_OPTIONS=(
+            -o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=-"
+            -o "Dir::State::lists=$APT_ROOT/lists"
+            -o "Dir::Cache::archives=$APT_ROOT/cache/archives"
+            -o "Acquire::Retries=3"
+          )
+          SYSTEM_PACKAGE_TEXT="$(
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope bootstrap
+          )"
+          mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+          [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install \
+            --yes \
+            --no-install-recommends \
+            --allow-downgrades \
+            "${SYSTEM_PACKAGES[@]}"
           python3 -m pip install \
             --disable-pip-version-check \
             --force-reinstall \
@@ -86,15 +106,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p target
+          APT_ROOT="$PWD/target/render-oracle-apt"
+          mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          python3 scripts/render-oracle-host-tools.py apt-sources \
+            > "$APT_ROOT/ubuntu.sources"
+          APT_OPTIONS=(
+            -o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=-"
+            -o "Dir::State::lists=$APT_ROOT/lists"
+            -o "Dir::Cache::archives=$APT_ROOT/cache/archives"
+            -o "Acquire::Retries=3"
+          )
           python3 scripts/test_render_oracle_host_tools.py
           SYSTEM_PACKAGE_TEXT="$(
             python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler
           )"
           mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
           [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install \
+            --yes \
+            --no-install-recommends \
+            --allow-downgrades \
+            "${SYSTEM_PACKAGES[@]}"
           python3 scripts/render-oracle-host-tools.py verify \
             --scope poppler \
             --output target/poppler-identity.json

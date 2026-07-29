@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from datetime import datetime
 import hashlib
 import importlib.metadata
 import json
@@ -21,11 +22,12 @@ from typing import Any, Callable, Sequence
 ROOT = Path(__file__).resolve().parent
 DEFAULT_LOCK = ROOT / "render-oracle-host-tools-lock.json"
 REQUIREMENTS = ROOT / "render-oracle-host-requirements.txt"
-LOCK_SCHEMA = "rxls.render-oracle-host-tools-lock.v1"
+LOCK_SCHEMA = "rxls.render-oracle-host-tools-lock.v2"
 EVIDENCE_SCHEMA = "rxls.render-oracle-host-tools-evidence.v1"
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 DEBIAN_PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?\Z")
 DEBIAN_VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+:~_-]*\Z")
+UBUNTU_SNAPSHOT_RE = re.compile(r"20[0-9]{6}T[0-9]{6}Z\Z")
 REQUIREMENT_RE = re.compile(
     r"(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)=="
     r"(?P<version>[A-Za-z0-9][A-Za-z0-9_.+!~-]*) "
@@ -42,6 +44,7 @@ EXPECTED_LOCK_KEYS = {
     "poppler",
     "python",
     "schema",
+    "ubuntu_apt",
 }
 
 
@@ -362,6 +365,49 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
     poppler = exact_keys(row["poppler"], {"executables"}, "lock_poppler")
     if poppler["executables"] != ["pdffonts", "pdfinfo", "pdftoppm", "pdftotext"]:
         raise HostToolError("lock_poppler")
+    ubuntu_apt = exact_keys(
+        row["ubuntu_apt"],
+        {
+            "architecture",
+            "bootstrap_packages",
+            "components",
+            "snapshot",
+            "suites",
+        },
+        "lock_ubuntu_apt",
+    )
+    if (
+        ubuntu_apt["architecture"] != "amd64"
+        or ubuntu_apt["components"] != ["main", "universe"]
+        or ubuntu_apt["suites"]
+        != ["noble", "noble-updates", "noble-security"]
+    ):
+        raise HostToolError("lock_ubuntu_apt")
+    snapshot = safe_text(ubuntu_apt["snapshot"], "lock_ubuntu_snapshot")
+    if UBUNTU_SNAPSHOT_RE.fullmatch(snapshot) is None:
+        raise HostToolError("lock_ubuntu_snapshot")
+    try:
+        datetime.strptime(snapshot, "%Y%m%dT%H%M%SZ")
+    except ValueError as error:
+        raise HostToolError("lock_ubuntu_snapshot") from error
+    bootstrap_packages = ubuntu_apt["bootstrap_packages"]
+    if not isinstance(bootstrap_packages, list) or len(bootstrap_packages) != 2:
+        raise HostToolError("lock_ubuntu_bootstrap_packages")
+    bootstrap_pairs: list[tuple[str, str]] = []
+    for item in bootstrap_packages:
+        package = exact_keys(
+            item, {"name", "version"}, "lock_ubuntu_bootstrap_package"
+        )
+        name = safe_text(package["name"], "lock_ubuntu_bootstrap_package")
+        version = safe_text(package["version"], "lock_ubuntu_bootstrap_package")
+        if (
+            DEBIAN_PACKAGE_RE.fullmatch(name) is None
+            or DEBIAN_VERSION_RE.fullmatch(version) is None
+        ):
+            raise HostToolError("lock_ubuntu_bootstrap_package")
+        bootstrap_pairs.append((name, version))
+    if bootstrap_pairs != sorted(bootstrap_pairs) or len(set(bootstrap_pairs)) != 2:
+        raise HostToolError("lock_ubuntu_bootstrap_packages")
     python = exact_keys(
         row["python"],
         {"distributions", "implementation", "requirements", "version"},
@@ -408,6 +454,18 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
     expected = row["expected_identity"]
     if expected is not None:
         validate_identity(expected, row)
+        expected_bootstrap_pairs = {
+            (
+                expected["cairo"]["library"]["package_name"],
+                expected["cairo"]["library"]["package_version"],
+            ),
+            *{
+                (item["package_name"], item["package_version"])
+                for item in expected["poppler"]["executables"]
+            },
+        }
+        if set(bootstrap_pairs) != expected_bootstrap_pairs:
+            raise HostToolError("lock_ubuntu_bootstrap_identity")
     return row
 
 
@@ -761,6 +819,11 @@ def validate_scoped_identity(
 
 
 def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
+    if scope == "bootstrap":
+        return [
+            f"{item['name']}={item['version']}"
+            for item in lock["ubuntu_apt"]["bootstrap_packages"]
+        ]
     expected = lock["expected_identity"]
     if expected is None:
         raise HostToolError("host_identity_pin_required")
@@ -788,6 +851,24 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     if not packages or len(packages) > MAX_LIBRARIES:
         raise HostToolError("apt_packages")
     return [f"{name}={packages[name]}" for name in sorted(packages)]
+
+
+def apt_sources(lock: dict[str, Any]) -> str:
+    """Return the exact isolated Ubuntu snapshot source contract."""
+
+    ubuntu_apt = lock["ubuntu_apt"]
+    snapshot = ubuntu_apt["snapshot"]
+    suites = " ".join(ubuntu_apt["suites"])
+    components = " ".join(ubuntu_apt["components"])
+    architecture = ubuntu_apt["architecture"]
+    return (
+        "Types: deb\n"
+        f"URIs: https://snapshot.ubuntu.com/ubuntu/{snapshot}\n"
+        f"Suites: {suites}\n"
+        f"Components: {components}\n"
+        f"Architectures: {architecture}\n"
+        "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+    )
 
 
 def write_evidence(path: Path, document: dict[str, Any]) -> None:
@@ -904,7 +985,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--bootstrap-identities", action="store_true")
 
     apt = subparsers.add_parser("apt-specs")
-    apt.add_argument("--scope", choices=("all", "poppler"), default="all")
+    apt.add_argument(
+        "--scope", choices=("all", "bootstrap", "poppler"), default="all"
+    )
+
+    apt_source = subparsers.add_parser("apt-sources")
+    apt_source.set_defaults(action="apt-sources")
 
     pin = subparsers.add_parser("pin")
     pin.add_argument("--evidence", type=Path, required=True)
@@ -947,6 +1033,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             lock, _ = load_lock(args.lock)
             for spec in apt_specs(lock, args.scope):
                 print(spec)
+            return 0
+        if args.action == "apt-sources":
+            lock, _ = load_lock(args.lock)
+            print(apt_sources(lock), end="")
             return 0
         pinned = pin_from_evidence(args.lock, args.evidence)
         print(canonical_json_bytes(pinned).decode("utf-8"), end="")

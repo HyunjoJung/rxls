@@ -33,18 +33,31 @@ def digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
-def package_fact(name: str) -> dict[str, object]:
+def package_fact(
+    name: str,
+    package_name: str = "fixture-package",
+    package_version: str = "1.2.3-1ubuntu1",
+) -> dict[str, object]:
     return {
         "bytes": 17,
         "name": name,
-        "package_name": "fixture-package",
-        "package_version": "1.2.3-1ubuntu1",
+        "package_name": package_name,
+        "package_version": package_version,
         "sha256": digest(name),
     }
 
 
 def fixture_identity(lock: dict) -> dict:
-    cairo_libraries = [package_fact("libc.so.6"), package_fact("libcairo.so.2")]
+    bootstrap = {
+        row["name"]: row["version"]
+        for row in lock["ubuntu_apt"]["bootstrap_packages"]
+    }
+    cairo_library = package_fact(
+        "libcairo.so.2",
+        "libcairo2:amd64",
+        bootstrap["libcairo2:amd64"],
+    )
+    cairo_libraries = [package_fact("libc.so.6"), cairo_library]
     cairo_libraries.sort(key=lambda row: row["name"])
     poppler_libraries = [package_fact("libc.so.6"), package_fact("libpoppler.so.1")]
     poppler_libraries.sort(key=lambda row: row["name"])
@@ -55,7 +68,7 @@ def fixture_identity(lock: dict) -> dict:
                 "bytes": 31,
                 "name": name,
                 "package_name": "poppler-utils",
-                "package_version": "24.02.0-1ubuntu9",
+                "package_version": bootstrap["poppler-utils"],
                 "sha256": digest(name),
                 "version": f"{name} version 24.02.0",
             }
@@ -75,7 +88,7 @@ def fixture_identity(lock: dict) -> dict:
         )
     return {
         "cairo": {
-            "library": package_fact("libcairo.so.2"),
+            "library": cairo_library,
             "native_libraries": cairo_libraries,
             "version": "1.18.4",
         },
@@ -105,6 +118,8 @@ def fixture_identity(lock: dict) -> dict:
 class RenderOracleHostToolsTests(unittest.TestCase):
     def test_checked_in_lock_has_exact_python_and_hashed_full_closure(self) -> None:
         lock, _ = MODULE.load_lock()
+        self.assertEqual(lock["schema"], "rxls.render-oracle-host-tools-lock.v2")
+        self.assertEqual(lock["ubuntu_apt"]["snapshot"], "20260718T000000Z")
         self.assertEqual(lock["python"]["version"], "3.13.14")
         self.assertEqual(lock["python"]["implementation"], "cpython")
         if lock["expected_identity"] is not None:
@@ -155,6 +170,40 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             with self.subTest(mutate=mutate):
                 with self.assertRaises(MODULE.HostToolError):
                     MODULE.validate_lock(candidate, requirements)
+
+    def test_lock_rejects_mutable_or_mismatched_ubuntu_acquisition(self) -> None:
+        lock, _ = MODULE.load_lock()
+        requirements = MODULE.REQUIREMENTS.read_bytes()
+        mutations = []
+        for snapshot in ("latest", "20261340T250000Z"):
+            candidate = json.loads(json.dumps(lock))
+            candidate["ubuntu_apt"]["snapshot"] = snapshot
+            mutations.append(candidate)
+        candidate = json.loads(json.dumps(lock))
+        candidate["ubuntu_apt"]["components"].append("multiverse")
+        mutations.append(candidate)
+        candidate = json.loads(json.dumps(lock))
+        candidate["ubuntu_apt"]["bootstrap_packages"][0]["version"] = "mutable"
+        mutations.append(candidate)
+        for candidate in mutations:
+            with self.subTest(candidate=candidate["ubuntu_apt"]):
+                with self.assertRaises(MODULE.HostToolError):
+                    MODULE.validate_lock(candidate, requirements)
+
+    def test_apt_sources_are_exact_snapshot_only(self) -> None:
+        lock, _ = MODULE.load_lock()
+        self.assertEqual(
+            MODULE.apt_sources(lock),
+            """Types: deb
+URIs: https://snapshot.ubuntu.com/ubuntu/20260718T000000Z
+Suites: noble noble-updates noble-security
+Components: main universe
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+""",
+        )
+        self.assertNotIn("archive.ubuntu.com", MODULE.apt_sources(lock))
+        self.assertNotIn("security.ubuntu.com", MODULE.apt_sources(lock))
 
     def test_identity_rejects_paths_reordering_and_library_collisions(self) -> None:
         lock, _ = MODULE.load_lock()
@@ -306,6 +355,13 @@ class RenderOracleHostToolsTests(unittest.TestCase):
 
     def test_apt_specs_are_sorted_exact_versions_and_require_a_pin(self) -> None:
         lock, _ = MODULE.load_lock()
+        self.assertEqual(
+            MODULE.apt_specs(lock, "bootstrap"),
+            [
+                "libcairo2:amd64=1.18.0-3build1",
+                "poppler-utils=24.02.0-1ubuntu9.9",
+            ],
+        )
         lock["expected_identity"] = None
         with self.assertRaisesRegex(
             MODULE.HostToolError, "host_identity_pin_required"
@@ -315,7 +371,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         specs = MODULE.apt_specs(lock, "all")
         self.assertEqual(specs, sorted(specs))
         self.assertIn("fixture-package=1.2.3-1ubuntu1", specs)
-        self.assertIn("poppler-utils=24.02.0-1ubuntu9", specs)
+        self.assertIn("poppler-utils=24.02.0-1ubuntu9.9", specs)
         self.assertTrue(
             all(
                 MODULE.DEBIAN_VERSION_RE.fullmatch(row.split("=", 1)[1])

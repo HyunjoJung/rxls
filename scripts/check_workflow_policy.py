@@ -99,7 +99,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "d0a6977111dff7834d45d32af480a2856e8de63f39648cf8d75b13be3e1a3921",
-    "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
+    "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
     "802e9d82f7e8d7a089a06e93d011535e1cae7d80a4ba5332958fc395cfbd1347",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
@@ -124,10 +124,10 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "294363ed5adbb994010471b3da906513e5560c95c0aacde4f775f145d946004e"
+    "3375dd35aa51121d2e5c6349c05ec046e8ffd3e5028d7f5c7611de22694bf183"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
+    "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -1641,6 +1641,83 @@ def _audit_exact_workflow_sha256(
         )
 
 
+def _audit_snapshot_apt_block(
+    path: Path,
+    block: str,
+    label: str,
+    scopes: tuple[str, ...],
+    errors: list[str],
+) -> None:
+    """Require one isolated, immutable Ubuntu snapshot acquisition."""
+
+    required_once = {
+        'APT_ROOT="$PWD/target/render-oracle-apt"': (
+            "must use the reviewed job-local APT root"
+        ),
+        'mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"': (
+            "must create only isolated package-index and archive caches"
+        ),
+        "python3 scripts/render-oracle-host-tools.py apt-sources \\": (
+            "must generate sources from the validated host-tools lock"
+        ),
+        '> "$APT_ROOT/ubuntu.sources"': (
+            "must store the generated snapshot source inside the job-local root"
+        ),
+        '-o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"': (
+            "must use only the generated snapshot source"
+        ),
+        '-o "Dir::Etc::sourceparts=-"': (
+            "must disable every runner-provided source part"
+        ),
+        '-o "Dir::State::lists=$APT_ROOT/lists"': (
+            "must isolate package indices from the runner image"
+        ),
+        '-o "Dir::Cache::archives=$APT_ROOT/cache/archives"': (
+            "must isolate downloaded package archives"
+        ),
+        '-o "Acquire::Retries=3"': (
+            "must use only bounded snapshot acquisition retries"
+        ),
+    }
+    for snippet, message in required_once.items():
+        if block.count(snippet) != 1:
+            errors.append(f"{path}: {label} {message}")
+    for scope in scopes:
+        command = (
+            "python3 scripts/render-oracle-host-tools.py "
+            f"apt-specs --scope {scope}"
+        )
+        if block.count(command) != 1:
+            errors.append(
+                f"{path}: {label} must request the exact {scope!r} package closure"
+            )
+
+    commands = _normalized_active_commands(block)
+    apt_commands = [command for command in commands if command.startswith("sudo apt-get ")]
+    if apt_commands != [
+        'sudo apt-get "${APT_OPTIONS[@]}" update',
+        (
+            'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
+            "--no-install-recommends --allow-downgrades "
+            '"${SYSTEM_PACKAGES[@]}"'
+        ),
+    ]:
+        errors.append(
+            f"{path}: {label} must update and install only through the isolated "
+            "snapshot options"
+        )
+    forbidden = (
+        "archive.ubuntu.com",
+        "azure.archive.ubuntu.com",
+        "security.ubuntu.com",
+        "apt-mirrors.txt",
+        "apt-get upgrade",
+        "apt-get dist-upgrade",
+    )
+    if any(value in block for value in forbidden):
+        errors.append(f"{path}: {label} cannot fall back to a live package source")
+
+
 def _checkout_step_is_exact(
     step_indent: int,
     block: list[str],
@@ -1950,6 +2027,21 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "target/render-oracle-hosted/build.stderr",
         errors,
     )
+    host_acquisition = _single_yaml_block(
+        path,
+        active,
+        "- name: Acquire exact comparison dependencies",
+        6,
+        "host comparison acquisition step",
+        errors,
+    )
+    _audit_snapshot_apt_block(
+        path,
+        host_acquisition,
+        "host comparison acquisition",
+        ("bootstrap", "all"),
+        errors,
+    )
     required = {
         '      - "scripts/render_parity_geometry_gate.py"': (
             "must trigger when the shared render-parity geometry gate changes"
@@ -1972,6 +2064,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ),
         "scripts/render-oracle-host-tools.py apt-specs --scope all": (
             "normal installs must use the pinned native package closure"
+        ),
+        "scripts/render-oracle-host-tools.py apt-specs --scope bootstrap": (
+            "bootstrap installs must use the snapshot-pinned top-level tools"
+        ),
+        "scripts/render-oracle-host-tools.py apt-sources": (
+            "native packages must come from the locked Ubuntu snapshot"
         ),
         "--output target/render-oracle-hosted/host-tools.json": (
             "must emit path-neutral hosted identity evidence"
@@ -2746,30 +2844,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             f"{path}: failure upload cannot include raw reports, corpora, or wildcards"
         )
 
-    apt_lines = [line for line in text.splitlines() if "apt-get " in line]
-    bootstrap_matches = re.finditer(
-        r'if \[\[ "\$RXLS_IDENTITY_BOOTSTRAP" == "1" \]\]; then\n'
-        r'(?P<body>(?:\s+[^\n]*\n)+?)\s+fi',
-        text,
-    )
-    bootstrap_bodies = [match.group("body") for match in bootstrap_matches]
-    unpinned_installs = [
-        line
-        for line in apt_lines
-        if "install" in line and '"${SYSTEM_PACKAGES[@]}"' not in line
-    ]
-    unpinned_is_bootstrap_only = any(
-        all(line.strip() in body for line in unpinned_installs)
-        for body in bootstrap_bodies
-    )
-    if (
-        len(apt_lines) != 3
-        or len(unpinned_installs) != 1
-        or not unpinned_is_bootstrap_only
-        or text.count('"${SYSTEM_PACKAGES[@]}"') != 1
+    apt_lines = [line for line in active.splitlines() if "apt-get " in line]
+    if len(apt_lines) != 2 or any(
+        '"${APT_OPTIONS[@]}"' not in line for line in apt_lines
     ):
         errors.append(
-            f"{path}: apt must use bootstrap-only top-level packages or the exact pinned closure"
+            f"{path}: apt must be confined to the exact snapshot acquisition step"
         )
     if "bootstrap_identities:" not in text or "--bootstrap-identities" not in text:
         errors.append(f"{path}: missing deliberate identity bootstrap path")
@@ -2836,9 +2916,8 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         'if [[ "$EXPECTED_IDENTITY" != "null" ]]; then': (
             "host bootstrap must run only while the reviewed identity is absent"
         ),
-        "sudo apt-get update": "host bootstrap must refresh its package source",
-        "sudo apt-get install --yes --no-install-recommends libcairo2 poppler-utils": (
-            "host bootstrap must install only the declared comparison tools"
+        "scripts/render-oracle-host-tools.py apt-specs --scope bootstrap": (
+            "host bootstrap must use the exact snapshot-pinned tools"
         ),
         'echo "Review and pin the uploaded host identity before this gate can pass." >&2': (
             "host bootstrap must explain the deliberate failure"
@@ -2862,6 +2941,13 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
             errors.append(f"{path}: {message}")
     if host_bootstrap_commands.count("exit 1") != 1:
         errors.append(f"{path}: unpinned host identity capture must fail closed")
+    _audit_snapshot_apt_block(
+        path,
+        host_bootstrap,
+        "host identity bootstrap",
+        ("bootstrap",),
+        errors,
+    )
 
     strict_host = _single_yaml_block(
         path,
@@ -2876,7 +2962,11 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler": (
             "strict PDF gate must install the pinned Poppler closure"
         ),
-        'sudo apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"': (
+        (
+            'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
+            "--no-install-recommends --allow-downgrades "
+            '"${SYSTEM_PACKAGES[@]}"'
+        ): (
             "strict PDF gate must install only exact locked package specs"
         ),
         (
@@ -2886,6 +2976,13 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     }.items():
         if command not in strict_commands:
             errors.append(f"{path}: {message}")
+    _audit_snapshot_apt_block(
+        path,
+        strict_host,
+        "strict Poppler verification",
+        ("poppler",),
+        errors,
+    )
     bootstrap_index = pdf_job.find("Capture an unpinned host identity and fail closed")
     strict_index = pdf_job.find("Verify the pinned Poppler PDF gate")
     if bootstrap_index < 0 or strict_index < 0 or bootstrap_index >= strict_index:
@@ -3066,22 +3163,12 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     apt_lines = [line for line in active.splitlines() if "apt-get " in line]
     if (
         len(apt_lines) != 4
-        or sum("apt-get update" in line for line in apt_lines) != 2
-        or sum(
-            'apt-get install --yes --no-install-recommends "${SYSTEM_PACKAGES[@]}"'
-            in line
-            for line in apt_lines
-        )
-        != 1
-        or sum(
-            "apt-get install --yes --no-install-recommends libcairo2 poppler-utils"
-            in line
-            for line in apt_lines
-        )
-        != 1
+        or any('"${APT_OPTIONS[@]}"' not in line for line in apt_lines)
+        or active.count("scripts/render-oracle-host-tools.py apt-sources") != 2
+        or "libcairo2 poppler-utils" in active
     ):
         errors.append(
-            f"{path}: PDF apt inputs must be the fail-closed bootstrap or exact lock"
+            f"{path}: PDF apt inputs must use only the isolated locked snapshot"
         )
     if "poppler-version.txt" in active or "command -v pdfinfo |" in active:
         errors.append(f"{path}: path-bearing Poppler evidence is forbidden")
