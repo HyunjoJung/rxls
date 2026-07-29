@@ -68,8 +68,10 @@ on:
       - "scripts/render-oracle-host-requirements.txt"
       - "scripts/render-oracle-host-tools-lock.json"
       - "scripts/render-oracle-host-tools.py"
+      - "scripts/render_parity_geometry_gate.py"
       - "scripts/run-render-oracle-container.py"
       - "scripts/smoke-render-oracle-runtime.py"
+      - "scripts/strict_json_contract.py"
       - "scripts/summarize-render-oracle-failure.py"
       - "scripts/test_compare_render_parity_runs.py"
       - "scripts/test_check_authored_print_parity.py"
@@ -2065,7 +2067,7 @@ jobs:
                   },
               ),
               "repeatability.json": (
-                  "rxls.libreoffice-render-repeatability.v1",
+                  "rxls.libreoffice-render-repeatability.v2",
                   {
                       "coverage",
                       "drift",
@@ -2133,7 +2135,7 @@ jobs:
           aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
           checker = runpy.run_path("scripts/check-ooxml-row-oracle.py")
           checker["_validate_output"](aggregate)
-          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v1"
+          assert aggregate["schema"] == "rxls.ooxml-row-oracle.v2"
           assert aggregate["passed"] is True
           assert aggregate["coverage"]["case_count"] == 12
           assert aggregate["coverage"]["page_count"] == 12

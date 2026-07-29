@@ -8,11 +8,13 @@ workbooks are paired only by their SHA-256 identity; host paths are deliberately
 ignored and never copied to the result.
 
 Everything owned by rxls (renderer metadata, scene hashes, page mapping,
-semantic counts, and page dimensions) must be exact.  The only tolerated
-variation is integer visual evidence derived from the LibreOffice oracle.  The
-gate publishes sorted, path-neutral distributions of absolute PPM deltas for
-plain similarity, blurred-luma similarity, and the three mask F1 scores.  The
-20,000 PPM defaults are deliberately bounded just above the clean locked
+semantic counts, page dimensions, and content-private unique-text geometry)
+must be exact.  The only tolerated variation is integer visual evidence derived
+from the LibreOffice oracle.  The gate publishes sorted, path-neutral
+distributions of absolute PPM deltas for plain similarity, blurred-luma
+similarity, and the three mask F1 scores.  The diagnostic unique-text geometry
+is validated and compared exactly, but is not part of the acceptance score.
+The 20,000 PPM defaults are deliberately bounded just above the clean locked
 40-workbook profile maxima (11,447 visual PPM and 16,828 mask PPM).
 
 Exit status is 0 for a pass, 1 for an identity/stability/threshold failure, and
@@ -24,17 +26,25 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 from typing import Any, Sequence
 
+try:
+    from strict_json_contract import type_exact_equal
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.strict_json_contract import type_exact_equal
+
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.libreoffice-render-repeatability.v1"
+OUTPUT_SCHEMA = "rxls.libreoffice-render-repeatability.v2"
+HARNESS_PATH = Path(__file__).with_name("libreoffice-render-parity.py")
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_REPORT_BYTES = 512 * 1024 * 1024
 MAX_FILES = 1_000_000
@@ -43,11 +53,113 @@ MAX_JSON_NODES = 2_000_000
 MAX_JSON_INTEGER_DIGITS = 128
 DEFAULT_MAX_DRIFT_PPM = 20_000
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+CLASSIFICATION_RE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
+REPORT_STATUSES = frozenset({"compared", "different", "error", "skipped"})
 
 SIMILARITY_METRIC = "similarity_ppm"
 BLUR_METRIC = "blurred_luma_similarity_ppm"
 MASK_METRICS = ("edge_f1_ppm", "foreground_f1_ppm", "text_ink_f1_ppm")
 DRIFT_METRICS = (SIMILARITY_METRIC, BLUR_METRIC, *MASK_METRICS)
+UNIQUE_TEXT_GEOMETRY_METRICS = (
+    "text_box_unique_geometry",
+    "text_line_box_unique_geometry",
+)
+UNIQUE_TEXT_GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+UNIQUE_TEXT_GEOMETRY_PAGE_KEYS = frozenset(
+    {
+        "delta_histograms_millipoints",
+        "exact_delta_summaries_millipoints",
+        "libreoffice_unique_items",
+        "matched_items",
+        "rxls_unique_items",
+    }
+)
+UNIQUE_TEXT_GEOMETRY_EXACT_SUMMARY_KEYS = frozenset(
+    {
+        "count",
+        "max_delta_millipoints",
+        "min_delta_millipoints",
+        "negative_overflow_items",
+        "positive_overflow_items",
+        "sum_delta_millipoints",
+    }
+)
+UNIQUE_TEXT_GEOMETRY_BUCKET_KEYS = frozenset(
+    {"count", "delta_millipoints"}
+)
+MAX_UNIQUE_TEXT_GEOMETRY_ITEMS = 250_000
+MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS = 1_000_000_000
+MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES = 2_000
+MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS = 50_000
+UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS = 2
+UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS = 1_000
+UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS = 500
+UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS = 10_000
+UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS = 2_000
+UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS = 12_000
+MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS = 21
+UNIQUE_TEXT_GEOMETRY_ALLOWED_BUCKETS = frozenset(
+    range(-UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS,
+          UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS + 1)
+) | frozenset(
+    value
+    for magnitude in (500, 1_000)
+    for value in (-magnitude, magnitude)
+) | frozenset(
+    value
+    for magnitude in range(
+        UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS,
+        UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS + 1,
+        UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS,
+    )
+    for value in (-magnitude, magnitude)
+) | {
+    -UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+    UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+}
+UNIQUE_TEXT_GEOMETRY_POLICY = {
+    "content_retained": False,
+    "coordinates": "pdf_points_y_down",
+    "delta_direction": "rxls_minus_libreoffice",
+    "diagnostic_only": True,
+    "exact_delta_absolute_limit_millipoints": (
+        MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+    ),
+    "exact_summary": "count_sum_min_max_and_signed_overflow_counts",
+    "histogram": {
+        "exact_absolute_limit_millipoints": 2,
+        "max_buckets_per_axis": 21,
+        "middle_absolute_limit_millipoints": 1_000,
+        "middle_bucket_width_millipoints": 500,
+        "outer_absolute_limit_millipoints": 10_000,
+        "outer_bucket_width_millipoints": 2_000,
+        "overflow_bucket_absolute_millipoints": 12_000,
+        "rounding": (
+            "nearest_width_multiple_half_away_from_zero_"
+            "with_nonzero_sign_preserved"
+        ),
+    },
+    "max_geometry_pages_per_report": (
+        MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES
+    ),
+    "max_histogram_buckets_per_report": (
+        MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+    ),
+    "max_items_per_side_per_page": MAX_UNIQUE_TEXT_GEOMETRY_ITEMS,
+    "matching": "exact_normalized_token_tuple_unique_on_both_sides",
+    "rounding": "nearest_millipoint_half_away_from_zero_exact_rational",
+    "shard_budget": "equal_floor_partition_by_declared_shard_count",
+    "units": "millipoints",
+}
 
 PAGE_DIMENSION_KEYS = (
     "canvas_size",
@@ -160,6 +272,41 @@ class ValidatedReport:
     page_count: int
 
 
+def _load_metric_cohort_contract() -> Any:
+    """Load the producer's canonical bounded cohort reducer once."""
+    name = "rxls_render_parity_repeatability_metric_contract"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(name, HARNESS_PATH)
+    if spec is None or spec.loader is None:
+        raise MalformedReport("metric_cohorts_contract")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, RuntimeError) as error:
+        sys.modules.pop(name, None)
+        raise MalformedReport("metric_cohorts_contract") from error
+    return module
+
+
+def _recompute_metric_cohorts(
+    rows: Sequence[dict[str, Any]],
+) -> dict[str, object]:
+    """Recompute producer-owned cohort summaries without comparing oracle scores."""
+    contract = _load_metric_cohort_contract()
+    try:
+        return contract.metric_cohorts(rows)
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        contract.HarnessError,
+    ) as error:
+        raise MalformedReport("summary_metric_cohorts") from error
+
+
 def canonical_bytes(value: object) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -266,6 +413,16 @@ def _integer(value: object, code: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _bounded_signed_integer(value: object, code: str, *, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or abs(value) > maximum
+    ):
+        raise MalformedReport(code)
+    return value
+
+
 def _ppm(value: object, code: str) -> int:
     number = _integer(value, code)
     if number > 1_000_000:
@@ -297,12 +454,37 @@ def read_report(path: Path, remaining_bytes: int) -> LoadedReport:
     byte_limit = min(MAX_REPORT_BYTES, remaining_bytes)
     if byte_limit <= 0:
         raise MalformedReport("report_bytes_limit")
+    descriptor = -1
     try:
-        with path.open("rb") as source:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or not 0 < metadata.st_size <= byte_limit
+        ):
+            raise MalformedReport("report_bytes_limit")
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            opened = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or opened.st_size != metadata.st_size
+            ):
+                raise MalformedReport("report_unreadable")
             payload = source.read(byte_limit + 1)
     except OSError as error:
         raise MalformedReport("report_unreadable") from error
-    if not payload or len(payload) > byte_limit:
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) != metadata.st_size or len(payload) > byte_limit:
         raise MalformedReport("report_bytes_limit")
     document = _strict_json_loads(payload)
     if not isinstance(document, dict):
@@ -323,7 +505,7 @@ def _validate_renderer_identity(configuration: dict[str, Any], preflight: dict[s
     rxls_command = preflight.get("rxls_command")
     if not isinstance(rxls_command, dict):
         raise MalformedReport("preflight_renderer_identity")
-    if rxls_command.get("binary_identity") != identity:
+    if not type_exact_equal(rxls_command.get("binary_identity"), identity):
         raise MalformedReport("preflight_renderer_identity")
 
 
@@ -358,6 +540,270 @@ def _validate_renderer_metrics(metrics: dict[str, Any], code: str) -> None:
         _integer(metrics.get(key), code)
 
 
+def _unique_text_geometry_bucket(delta_millipoints: int) -> int:
+    magnitude = abs(delta_millipoints)
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS:
+        return delta_millipoints
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        bucket = max(width, (magnitude + width // 2) // width * width)
+    elif magnitude <= UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        bucket = (magnitude + width // 2) // width * width
+    else:
+        bucket = UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS
+    return -bucket if delta_millipoints < 0 else bucket
+
+
+def _unique_text_geometry_bucket_interval(
+    bucket_millipoints: int,
+) -> tuple[int, int]:
+    magnitude = abs(bucket_millipoints)
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS:
+        lower = magnitude
+        upper = magnitude
+    elif magnitude <= UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        lower = (
+            UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS + 1
+            if magnitude == width
+            else magnitude - width // 2
+        )
+        upper = min(
+            UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS,
+            magnitude + width // 2 - 1,
+        )
+    elif magnitude <= UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        lower = max(
+            UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS + 1,
+            magnitude - width // 2,
+        )
+        upper = min(
+            UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS,
+            magnitude + width // 2 - 1,
+        )
+    elif magnitude == UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS:
+        lower = UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS + 1
+        upper = MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+    else:
+        raise MalformedReport("page_unique_text_geometry")
+    return (-upper, -lower) if bucket_millipoints < 0 else (lower, upper)
+
+
+def _unique_text_geometry_sum_bounds(
+    histogram: dict[int, int],
+    minimum: int,
+    maximum: int,
+    code: str,
+) -> tuple[int, int]:
+    minimum_bucket = _unique_text_geometry_bucket(minimum)
+    maximum_bucket = _unique_text_geometry_bucket(maximum)
+    if (
+        minimum < maximum
+        and minimum_bucket == maximum_bucket
+        and histogram[minimum_bucket] < 2
+    ):
+        raise MalformedReport(code)
+    lower_total = 0
+    upper_total = 0
+    effective: dict[int, tuple[int, int]] = {}
+    for bucket, count in histogram.items():
+        bucket_lower, bucket_upper = (
+            _unique_text_geometry_bucket_interval(bucket)
+        )
+        lower = max(bucket_lower, minimum)
+        upper = min(bucket_upper, maximum)
+        if lower > upper:
+            raise MalformedReport(code)
+        effective[bucket] = (lower, upper)
+        lower_total += lower * count
+        upper_total += upper * count
+    lower_total += maximum - effective[maximum_bucket][0]
+    upper_total -= effective[minimum_bucket][1] - minimum
+    if lower_total > upper_total:
+        raise MalformedReport(code)
+    return lower_total, upper_total
+
+
+def _validate_unique_text_geometry(value: object) -> dict[str, Any]:
+    code = "page_unique_text_geometry"
+    if (
+        not isinstance(value, dict)
+        or set(value) != UNIQUE_TEXT_GEOMETRY_PAGE_KEYS
+    ):
+        raise MalformedReport(code)
+    rxls_unique = _integer(
+        value["rxls_unique_items"],
+        code,
+    )
+    libreoffice_unique = _integer(
+        value["libreoffice_unique_items"],
+        code,
+    )
+    matched = _integer(value["matched_items"], code)
+    if (
+        rxls_unique > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+        or libreoffice_unique > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+        or matched > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+        or matched > min(rxls_unique, libreoffice_unique)
+    ):
+        raise MalformedReport(code)
+
+    raw_histograms = value["delta_histograms_millipoints"]
+    raw_summaries = value["exact_delta_summaries_millipoints"]
+    if (
+        not isinstance(raw_histograms, dict)
+        or set(raw_histograms) != set(UNIQUE_TEXT_GEOMETRY_AXES)
+        or not isinstance(raw_summaries, dict)
+        or set(raw_summaries) != set(UNIQUE_TEXT_GEOMETRY_AXES)
+    ):
+        raise MalformedReport(code)
+
+    exact_sums: dict[str, int] = {}
+    for axis in UNIQUE_TEXT_GEOMETRY_AXES:
+        raw_histogram = raw_histograms[axis]
+        if (
+            not isinstance(raw_histogram, list)
+            or len(raw_histogram)
+            > min(matched, MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS)
+        ):
+            raise MalformedReport(code)
+        previous_delta: int | None = None
+        population = 0
+        histogram: dict[int, int] = {}
+        for raw_bucket in raw_histogram:
+            if (
+                not isinstance(raw_bucket, dict)
+                or set(raw_bucket) != UNIQUE_TEXT_GEOMETRY_BUCKET_KEYS
+            ):
+                raise MalformedReport(code)
+            delta = raw_bucket["delta_millipoints"]
+            if (
+                isinstance(delta, bool)
+                or not isinstance(delta, int)
+                or delta not in UNIQUE_TEXT_GEOMETRY_ALLOWED_BUCKETS
+                or (previous_delta is not None and delta <= previous_delta)
+            ):
+                raise MalformedReport(code)
+            count = _integer(raw_bucket["count"], code, minimum=1)
+            if count > matched:
+                raise MalformedReport(code)
+            population += count
+            if population > matched:
+                raise MalformedReport(code)
+            histogram[delta] = count
+            previous_delta = delta
+        if population != matched:
+            raise MalformedReport(code)
+
+        raw_summary = raw_summaries[axis]
+        if (
+            not isinstance(raw_summary, dict)
+            or set(raw_summary) != UNIQUE_TEXT_GEOMETRY_EXACT_SUMMARY_KEYS
+        ):
+            raise MalformedReport(code)
+        if _integer(raw_summary["count"], code) != matched:
+            raise MalformedReport(code)
+        total = _bounded_signed_integer(
+            raw_summary["sum_delta_millipoints"],
+            code,
+            maximum=(
+                matched * MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+            ),
+        )
+        negative_overflow = _integer(
+            raw_summary["negative_overflow_items"], code
+        )
+        positive_overflow = _integer(
+            raw_summary["positive_overflow_items"], code
+        )
+        if (
+            negative_overflow > matched
+            or positive_overflow > matched
+            or negative_overflow + positive_overflow > matched
+            or histogram.get(
+                -UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            != negative_overflow
+            or histogram.get(
+                UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            != positive_overflow
+        ):
+            raise MalformedReport(code)
+
+        raw_minimum = raw_summary["min_delta_millipoints"]
+        raw_maximum = raw_summary["max_delta_millipoints"]
+        if matched == 0:
+            if (
+                raw_minimum is not None
+                or raw_maximum is not None
+                or total != 0
+                or negative_overflow != 0
+                or positive_overflow != 0
+            ):
+                raise MalformedReport(code)
+            exact_sums[axis] = total
+            continue
+
+        minimum = _bounded_signed_integer(
+            raw_minimum,
+            code,
+            maximum=MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS,
+        )
+        maximum = _bounded_signed_integer(
+            raw_maximum,
+            code,
+            maximum=MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS,
+        )
+        if (
+            minimum > maximum
+            or (matched == 1 and not minimum == maximum == total)
+            or (negative_overflow > 0)
+            != (minimum < -UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS)
+            or (positive_overflow > 0)
+            != (maximum > UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS)
+            or _unique_text_geometry_bucket(minimum)
+            != raw_histogram[0]["delta_millipoints"]
+            or _unique_text_geometry_bucket(maximum)
+            != raw_histogram[-1]["delta_millipoints"]
+        ):
+            raise MalformedReport(code)
+        sum_lower, sum_upper = _unique_text_geometry_sum_bounds(
+            histogram, minimum, maximum, code
+        )
+        if not sum_lower <= total <= sum_upper:
+            raise MalformedReport(code)
+        exact_sums[axis] = total
+    if (
+        abs(
+            exact_sums["width"]
+            - (exact_sums["x_max"] - exact_sums["x_min"])
+        )
+        > matched
+        or abs(
+            2 * exact_sums["center_x"]
+            - exact_sums["x_min"]
+            - exact_sums["x_max"]
+        )
+        > matched
+        or abs(
+            exact_sums["height"]
+            - (exact_sums["y_max"] - exact_sums["y_min"])
+        )
+        > matched
+        or abs(
+            2 * exact_sums["center_y"]
+            - exact_sums["y_min"]
+            - exact_sums["y_max"]
+        )
+        > matched
+    ):
+        raise MalformedReport(code)
+    return value
+
+
 def _validate_page(page: object) -> dict[str, Any]:
     if not isinstance(page, dict):
         raise MalformedReport("page_not_object")
@@ -379,6 +825,34 @@ def _validate_page(page: object) -> dict[str, Any]:
     _integer(page["metric_work_units"], "page_dimension_evidence", minimum=1)
     _validate_semantic_metrics(page, "page_semantic_evidence")
     _validate_renderer_metrics(page, "page_renderer_evidence")
+    if any(key not in page for key in UNIQUE_TEXT_GEOMETRY_METRICS):
+        raise MalformedReport("page_unique_text_geometry_pair")
+    for key, prefix in (
+        ("text_box_unique_geometry", "text_box"),
+        ("text_line_box_unique_geometry", "text_line_box"),
+    ):
+        geometry = _validate_unique_text_geometry(page[key])
+        rxls_items = _integer(
+            page.get(f"{prefix}_rxls_items"),
+            "page_unique_text_geometry",
+        )
+        libreoffice_items = _integer(
+            page.get(f"{prefix}_libreoffice_items"),
+            "page_unique_text_geometry",
+        )
+        paired_items = _integer(
+            page.get(f"{prefix}_matched_items"),
+            "page_unique_text_geometry",
+        )
+        if (
+            rxls_items > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+            or libreoffice_items > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+            or paired_items > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+            or geometry["rxls_unique_items"] > rxls_items
+            or geometry["libreoffice_unique_items"] > libreoffice_items
+            or geometry["matched_items"] > paired_items
+        ):
+            raise MalformedReport("page_unique_text_geometry")
     return page
 
 
@@ -407,7 +881,7 @@ def _validate_aggregate(metrics: object, page_count: int) -> dict[str, Any]:
     return metrics
 
 
-def _validate_comparable_row(row: dict[str, Any]) -> int:
+def _validate_comparable_row(row: dict[str, Any]) -> tuple[int, int]:
     renderer = row.get("renderer")
     scenes = row.get("scenes")
     artifacts = row.get("artifacts")
@@ -430,8 +904,16 @@ def _validate_comparable_row(row: dict[str, Any]) -> int:
     if _integer(artifacts.get("rxls_pages"), "artifact_evidence") != len(pages):
         raise MalformedReport("artifact_page_count")
     page_mapping: list[tuple[int, int, int]] = []
+    histogram_buckets = 0
     for raw_page in pages:
         page = _validate_page(raw_page)
+        histogram_buckets += sum(
+            len(
+                page[key]["delta_histograms_millipoints"][axis]
+            )
+            for key in UNIQUE_TEXT_GEOMETRY_METRICS
+            for axis in UNIQUE_TEXT_GEOMETRY_AXES
+        )
         page_mapping.append(
             (
                 int(page["source_sheet_index"]),
@@ -471,7 +953,7 @@ def _validate_comparable_row(row: dict[str, Any]) -> int:
             raise MalformedReport("page_mapping")
         local_index += 1
     _validate_aggregate(row.get("metrics"), len(pages))
-    return len(pages)
+    return len(pages), histogram_buckets
 
 
 def validate_report(loaded: LoadedReport) -> ValidatedReport:
@@ -504,6 +986,15 @@ def validate_report(loaded: LoadedReport) -> ValidatedReport:
     ):
         raise MalformedReport("report_payload")
     _validate_renderer_identity(configuration, preflight)
+    metric_policy = configuration.get("metric_policy")
+    if (
+        not isinstance(metric_policy, dict)
+        or not type_exact_equal(
+            metric_policy.get("unique_text_geometry"),
+            UNIQUE_TEXT_GEOMETRY_POLICY,
+        )
+    ):
+        raise MalformedReport("metric_policy_unique_text_geometry")
 
     if set(discovery) != {
         "candidate_count",
@@ -557,6 +1048,7 @@ def validate_report(loaded: LoadedReport) -> ValidatedReport:
     statuses: dict[str, int] = {}
     classifications: dict[str, int] = {}
     page_count = 0
+    geometry_histogram_buckets = 0
     for row in rows:
         if not isinstance(row, dict):
             raise MalformedReport("file_row")
@@ -570,18 +1062,44 @@ def validate_report(loaded: LoadedReport) -> ValidatedReport:
         classification = _text(
             row.get("classification"), "file_classification", maximum=256
         )
+        if (
+            status not in REPORT_STATUSES
+            or CLASSIFICATION_RE.fullmatch(classification) is None
+        ):
+            raise MalformedReport("file_status_or_classification")
         if status in {"compared", "different"}:
-            page_count += _validate_comparable_row(row)
+            row_pages, row_buckets = _validate_comparable_row(row)
+            page_count += row_pages
+            geometry_histogram_buckets += row_buckets
+            if (
+                page_count > MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES
+                or geometry_histogram_buckets
+                > MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+            ):
+                raise MalformedReport(
+                    "unique_text_geometry_report_limit"
+                )
         elif "metrics" in row or "pages" in row:
             raise MalformedReport("incomparable_row_metrics")
         files[digest] = row
         statuses[status] = statuses.get(status, 0) + 1
         classifications[classification] = classifications.get(classification, 0) + 1
 
-    if summary.get("by_status") != dict(sorted(statuses.items())):
+    if not type_exact_equal(
+        summary.get("by_status"),
+        dict(sorted(statuses.items())),
+    ):
         raise MalformedReport("summary_status_counts")
-    if summary.get("by_classification") != dict(sorted(classifications.items())):
+    if not type_exact_equal(
+        summary.get("by_classification"),
+        dict(sorted(classifications.items())),
+    ):
         raise MalformedReport("summary_classification_counts")
+    if not type_exact_equal(
+        summary.get("metric_cohorts"),
+        _recompute_metric_cohorts(rows),
+    ):
+        raise MalformedReport("summary_metric_cohorts")
     return ValidatedReport(loaded=loaded, files=files, page_count=page_count)
 
 
@@ -599,7 +1117,13 @@ def _non_oracle_subset(metrics: dict[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in metrics.items()
         if key not in ORACLE_VISUAL_METRIC_KEYS
+        and key not in UNIQUE_TEXT_GEOMETRY_METRICS
     }
+
+
+def _unique_text_geometry_subset(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Return validated path-neutral geometry that must repeat exactly."""
+    return {key: metrics[key] for key in UNIQUE_TEXT_GEOMETRY_METRICS}
 
 
 def _distribution(values: list[int]) -> dict[str, Any]:
@@ -665,6 +1189,18 @@ def _identity_result(
     right = candidate.loaded.document
     left_inputs = sorted(baseline.files)
     right_inputs = sorted(candidate.files)
+    left_configuration_sha256 = canonical_sha256(left["configuration"])
+    right_configuration_sha256 = canonical_sha256(right["configuration"])
+    left_preflight_sha256 = canonical_sha256(left["preflight"])
+    right_preflight_sha256 = canonical_sha256(right["preflight"])
+    left_input_set_sha256 = canonical_sha256(left_inputs)
+    right_input_set_sha256 = canonical_sha256(right_inputs)
+    left_baseline_configuration_sha256 = (
+        _baseline_configuration_sha256(left["configuration"])
+    )
+    right_baseline_configuration_sha256 = (
+        _baseline_configuration_sha256(right["configuration"])
+    )
     left_baseline_input_sha256, left_baseline_input_count = (
         _baseline_input_identity(baseline.files)
     )
@@ -674,13 +1210,12 @@ def _identity_result(
     return {
         "baseline_contract": {
             "configuration": {
-                "baseline_sha256": _baseline_configuration_sha256(
-                    left["configuration"]
+                "baseline_sha256": left_baseline_configuration_sha256,
+                "candidate_sha256": right_baseline_configuration_sha256,
+                "equal": (
+                    left_baseline_configuration_sha256
+                    == right_baseline_configuration_sha256
                 ),
-                "candidate_sha256": _baseline_configuration_sha256(
-                    right["configuration"]
-                ),
-                "equal": left["configuration"] == right["configuration"],
             },
             "input_set": {
                 "baseline_count": left_baseline_input_count,
@@ -695,27 +1230,32 @@ def _identity_result(
             },
         },
         "configuration": {
-            "baseline_sha256": canonical_sha256(left["configuration"]),
-            "candidate_sha256": canonical_sha256(right["configuration"]),
-            "equal": left["configuration"] == right["configuration"],
+            "baseline_sha256": left_configuration_sha256,
+            "candidate_sha256": right_configuration_sha256,
+            "equal": left_configuration_sha256 == right_configuration_sha256,
         },
         "input_set": {
             "baseline_count": len(left_inputs),
-            "baseline_sha256": canonical_sha256(left_inputs),
+            "baseline_sha256": left_input_set_sha256,
             "candidate_count": len(right_inputs),
-            "candidate_sha256": canonical_sha256(right_inputs),
-            "equal": left_inputs == right_inputs,
+            "candidate_sha256": right_input_set_sha256,
+            "equal": (
+                len(left_inputs) == len(right_inputs)
+                and left_input_set_sha256 == right_input_set_sha256
+            ),
         },
         "preflight": {
-            "baseline_sha256": canonical_sha256(left["preflight"]),
-            "candidate_sha256": canonical_sha256(right["preflight"]),
-            "equal": left["preflight"] == right["preflight"],
+            "baseline_sha256": left_preflight_sha256,
+            "candidate_sha256": right_preflight_sha256,
+            "equal": left_preflight_sha256 == right_preflight_sha256,
         },
         "renderer_binary": {
             "baseline": left["configuration"]["renderer_binary"],
             "candidate": right["configuration"]["renderer_binary"],
-            "equal": left["configuration"]["renderer_binary"]
-            == right["configuration"]["renderer_binary"],
+            "equal": type_exact_equal(
+                left["configuration"]["renderer_binary"],
+                right["configuration"]["renderer_binary"],
+            ),
         },
     }
 
@@ -745,6 +1285,11 @@ def compare_reports(
         failures.add("renderer_binary_mismatch")
     if not identity["input_set"]["equal"]:
         failures.add("input_set_mismatch")
+    if not type_exact_equal(
+        baseline.loaded.document["summary"]["input_bytes_considered"],
+        candidate.loaded.document["summary"]["input_bytes_considered"],
+    ):
+        failures.add("summary_input_bytes_mismatch")
 
     deltas: dict[str, list[int]] = {key: [] for key in DRIFT_METRICS}
     compared_pages = 0
@@ -761,7 +1306,7 @@ def compare_reports(
                 ("scenes", "scene_evidence_mismatch"),
                 ("artifacts", "artifact_evidence_mismatch"),
             ):
-                if left.get(key) != right.get(key):
+                if not type_exact_equal(left.get(key), right.get(key)):
                     failures.add(failure)
 
             excluded = {
@@ -776,7 +1321,7 @@ def compare_reports(
             }
             left_evidence = {key: value for key, value in left.items() if key not in excluded}
             right_evidence = {key: value for key, value in right.items() if key not in excluded}
-            if left_evidence != right_evidence:
+            if not type_exact_equal(left_evidence, right_evidence):
                 failures.add("file_evidence_mismatch")
 
             left_pages = left.get("pages")
@@ -792,17 +1337,25 @@ def compare_reports(
                 continue
             if set(left_metrics) != set(right_metrics):
                 failures.add("metric_shape_mismatch")
-            if _semantic_subset(left_metrics) != _semantic_subset(right_metrics):
+            if not type_exact_equal(
+                _semantic_subset(left_metrics),
+                _semantic_subset(right_metrics),
+            ):
                 failures.add("semantic_counts_mismatch")
-            if _metric_subset(left_metrics, AGGREGATE_DIMENSION_KEYS) != _metric_subset(
-                right_metrics, AGGREGATE_DIMENSION_KEYS
+            if not type_exact_equal(
+                _metric_subset(left_metrics, AGGREGATE_DIMENSION_KEYS),
+                _metric_subset(right_metrics, AGGREGATE_DIMENSION_KEYS),
             ):
                 failures.add("page_dimensions_mismatch")
-            if _metric_subset(left_metrics, RENDERER_METRIC_KEYS) != _metric_subset(
-                right_metrics, RENDERER_METRIC_KEYS
+            if not type_exact_equal(
+                _metric_subset(left_metrics, RENDERER_METRIC_KEYS),
+                _metric_subset(right_metrics, RENDERER_METRIC_KEYS),
             ):
                 failures.add("renderer_metric_evidence_mismatch")
-            if _non_oracle_subset(left_metrics) != _non_oracle_subset(right_metrics):
+            if not type_exact_equal(
+                _non_oracle_subset(left_metrics),
+                _non_oracle_subset(right_metrics),
+            ):
                 failures.add("non_oracle_metric_evidence_mismatch")
             for key in DRIFT_METRICS:
                 deltas[key].append(abs(int(left_metrics[key]) - int(right_metrics[key])))
@@ -819,17 +1372,30 @@ def compare_reports(
                     )
                 ):
                     failures.add("page_mapping_mismatch")
-                if _semantic_subset(left_page) != _semantic_subset(right_page):
+                if not type_exact_equal(
+                    _semantic_subset(left_page),
+                    _semantic_subset(right_page),
+                ):
                     failures.add("semantic_counts_mismatch")
-                if _metric_subset(left_page, PAGE_DIMENSION_KEYS) != _metric_subset(
-                    right_page, PAGE_DIMENSION_KEYS
+                if not type_exact_equal(
+                    _metric_subset(left_page, PAGE_DIMENSION_KEYS),
+                    _metric_subset(right_page, PAGE_DIMENSION_KEYS),
                 ):
                     failures.add("page_dimensions_mismatch")
-                if _metric_subset(left_page, RENDERER_METRIC_KEYS) != _metric_subset(
-                    right_page, RENDERER_METRIC_KEYS
+                if not type_exact_equal(
+                    _metric_subset(left_page, RENDERER_METRIC_KEYS),
+                    _metric_subset(right_page, RENDERER_METRIC_KEYS),
                 ):
                     failures.add("renderer_metric_evidence_mismatch")
-                if _non_oracle_subset(left_page) != _non_oracle_subset(right_page):
+                if not type_exact_equal(
+                    _unique_text_geometry_subset(left_page),
+                    _unique_text_geometry_subset(right_page),
+                ):
+                    failures.add("unique_text_geometry_evidence_mismatch")
+                if not type_exact_equal(
+                    _non_oracle_subset(left_page),
+                    _non_oracle_subset(right_page),
+                ):
                     failures.add("non_oracle_metric_evidence_mismatch")
                 for key in DRIFT_METRICS:
                     deltas[key].append(abs(int(left_page[key]) - int(right_page[key])))
@@ -877,6 +1443,9 @@ def compare_reports(
             "input_pairing": "sha256",
             "observations": "workbook_aggregate_and_page",
             "paths_or_content_retained": False,
+            "unique_text_geometry": (
+                "schema_validated_exact_same_sha_diagnostic_non_scoring"
+            ),
         },
         "reports": {
             "baseline": {

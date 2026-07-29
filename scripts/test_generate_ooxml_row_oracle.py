@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from xml.etree import ElementTree
 from zipfile import ZIP_STORED, ZipFile
 
@@ -232,6 +233,18 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                         font.find("s:sz", namespace).attrib["val"],
                         str(spec.font_size),
                     )
+                    a1 = sheet.find(
+                        "s:sheetData/s:row[@r='1']/s:c[@r='A1']",
+                        namespace,
+                    )
+                    self.assertIsNotNone(a1)
+                    self.assertNotIn("s", a1.attrib)
+                    for xf in (
+                        *styles.findall("s:cellStyleXfs/s:xf", namespace),
+                        *styles.findall("s:cellXfs/s:xf", namespace),
+                    ):
+                        self.assertNotIn("applyAlignment", xf.attrib)
+                        self.assertIsNone(xf.find("s:alignment", namespace))
                     external_relationships = []
                     for name in names:
                         if name.endswith(".rels"):
@@ -283,6 +296,23 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                 self.assertEqual('<row r="4" hidden="1"/>' in sheet, spec.toggle == "hidden-row")
                 self.assertEqual(' rightToLeft="1"' in sheet, spec.toggle == "right-to-left-layout")
                 self.assertEqual('<drawing r:id="rIdDrawing"/>' in sheet, spec.toggle == "image-drawing")
+
+    def test_package_validation_rejects_explicit_vertical_alignment(self) -> None:
+        spec = MODULE.CASES[0]
+        original = MODULE._styles
+
+        def explicit_alignment(value):
+            return original(value).replace(
+                '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>',
+                '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="bottom"/></xf></cellXfs>',
+            )
+
+        with mock.patch.object(MODULE, "_styles", side_effect=explicit_alignment):
+            with self.assertRaisesRegex(
+                MODULE.OracleCorpusError,
+                "implicit vertical alignment contract",
+            ):
+                MODULE.build_case(spec)
 
     def test_generate_verify_replace_and_tamper_detection(self) -> None:
         MODULE.OUTPUT_BASE.mkdir(parents=True, exist_ok=True)

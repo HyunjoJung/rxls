@@ -108,8 +108,8 @@ ORACLE_RENDER_STEP_SHA256 = (
     "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "e9ea02f8b502584fa3a7ae7a9fd57c4db25f7ed79558f9d36b2581c2861a0f18",
-    "fc038e866e71d3c98fde9591d627097c8b06577f505e57f74da7abc78cd31df9",
+    "6bc906ede4cd0618808e81f98ae8a819e9967b98f7474c3f97ad6ed054115d8a",
+    "4efd835342590bf4a0b46b26b1e07488fed8a17dc63eaaaf74757117ac00ebe3",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
     "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
@@ -124,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "d37d5a4ca0a8faed840d73386ea5c34de9c9b5e12ad2bbf8707f4164687d7ad4"
+    "77174d8dbdec197009f4abfc0297678c0a8fb4045ac423b1d959274fd5e89230"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "2af9c290281e2840d64d458f982e55cea4dd47b9a370899f5c5929d18065670d"
@@ -1951,6 +1951,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         errors,
     )
     required = {
+        '      - "scripts/render_parity_geometry_gate.py"': (
+            "must trigger when the shared render-parity geometry gate changes"
+        ),
+        '      - "scripts/strict_json_contract.py"': (
+            "must trigger when the shared type-exact JSON contract changes"
+        ),
         f'python-version: "{RENDER_ORACLE_PYTHON_VERSION}"': (
             "must pin the complete Python patch version"
         ),

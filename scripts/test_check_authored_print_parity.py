@@ -6,8 +6,11 @@ from __future__ import annotations
 import copy
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +27,43 @@ def load_module():
 
 
 MODULE = load_module()
+GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+
+
+def unique_geometry(matched: int) -> dict[str, object]:
+    histogram = (
+        [{"count": matched, "delta_millipoints": 0}]
+        if matched
+        else []
+    )
+    summary = {
+        "count": matched,
+        "max_delta_millipoints": 0 if matched else None,
+        "min_delta_millipoints": 0 if matched else None,
+        "negative_overflow_items": 0,
+        "positive_overflow_items": 0,
+        "sum_delta_millipoints": 0,
+    }
+    return {
+        "delta_histograms_millipoints": {
+            axis: copy.deepcopy(histogram) for axis in GEOMETRY_AXES
+        },
+        "exact_delta_summaries_millipoints": {
+            axis: copy.deepcopy(summary) for axis in GEOMETRY_AXES
+        },
+        "libreoffice_unique_items": matched,
+        "matched_items": matched,
+        "rxls_unique_items": matched,
+    }
 
 
 def point_geometry(
@@ -152,6 +192,7 @@ def report_document() -> dict[str, object]:
                 "text_box_f1_ppm": 1_000_000,
                 "text_box_median_error_millipoints": 0,
                 "text_box_p95_error_millipoints": 0,
+                "text_box_unique_geometry": unique_geometry(2),
                 "text_line_box_candidate_items": 1,
                 "text_line_box_rxls_items": 1,
                 "text_line_box_libreoffice_items": 1,
@@ -169,6 +210,7 @@ def report_document() -> dict[str, object]:
                 "text_line_box_f1_ppm": 1_000_000,
                 "text_line_box_median_error_millipoints": 0,
                 "text_line_box_p95_error_millipoints": 0,
+                "text_line_box_unique_geometry": unique_geometry(1),
                 "pdf_point_geometry": point_geometry(),
             }
             for index in range(4)
@@ -270,6 +312,9 @@ def report_document() -> dict[str, object]:
                     "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
                 ),
                 "text_box_geometry": "nominal_poppler_layout_not_ink_bounds",
+                "unique_text_geometry": copy.deepcopy(
+                    MODULE.UNIQUE_TEXT_GEOMETRY_POLICY
+                ),
                 "implementation": {
                     "kind": "numpy_integer_exact_v1",
                     "version": "2.4.2",
@@ -287,6 +332,15 @@ def report_document() -> dict[str, object]:
             "font_pack": {"pack_sha256": "3" * 64},
             "oracle_lock": identity,
         },
+        "discovery": {
+            "candidate_count": 2,
+            "pre_shard_selected_count": 2,
+            "selected_count": 2,
+            "shard_candidate_count": 2,
+            "shard_count": 1,
+            "shard_index": 0,
+            "truncated": False,
+        },
         "summary": {
             "files": 2,
             "by_status": {"compared": 2},
@@ -302,6 +356,289 @@ def report_document() -> dict[str, object]:
 
 
 class AuthoredPrintGateTests(unittest.TestCase):
+    def test_requires_complete_unsharded_discovery(self) -> None:
+        mutations = (
+            (
+                "shard_count",
+                lambda value: value.update({"shard_count": 2}),
+                "campaign_incomplete",
+            ),
+            (
+                "truncated",
+                lambda value: value.update({"truncated": True}),
+                "campaign_incomplete",
+            ),
+            (
+                "selected_count",
+                lambda value: value.update({"selected_count": 1}),
+                "campaign_coverage",
+            ),
+            (
+                "candidate_count",
+                lambda value: value.update({"candidate_count": 1}),
+                "campaign_coverage",
+            ),
+            (
+                "bool_shard_index",
+                lambda value: value.update({"shard_index": False}),
+                "campaign_incomplete",
+            ),
+        )
+        for name, mutate, code in mutations:
+            with self.subTest(name=name):
+                report = report_document()
+                mutate(report["discovery"])
+                with self.assertRaisesRegex(MODULE.GateError, code):
+                    MODULE.evaluate(
+                        report,
+                        report_sha256="a" * 64,
+                        report_bytes=1234,
+                        expected_workbooks=2,
+                    )
+
+        report = report_document()
+        del report["discovery"]["pre_shard_selected_count"]
+        with self.assertRaisesRegex(MODULE.GateError, "discovery_shape"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+    def test_exact_integer_contracts_reject_bool_aliases(self) -> None:
+        report = report_document()
+        report["configuration"]["metric_policy"][
+            "mask_match_tolerance_pixels"
+        ] = True
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["files"][0]["authored_print"]["paper_code"] = True
+        with self.assertRaisesRegex(MODULE.GateError, "source_attestation"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+    def test_report_reader_is_bounded_regular_and_race_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            report = root / "report.json"
+            report.write_bytes(b"{}")
+            link = root / "report-link.json"
+            link.symlink_to(report)
+            with self.assertRaisesRegex(MODULE.GateError, "report_unreadable"):
+                MODULE._read(link)
+            with self.assertRaisesRegex(MODULE.GateError, "report_unreadable"):
+                MODULE._read(root)
+            fifo = root / "report.fifo"
+            MODULE.os.mkfifo(fifo)
+            real_open = MODULE.os.open
+            nonblocking = MODULE.os.O_NONBLOCK
+
+            def guarded_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                self.assertNotEqual(flags & nonblocking, 0)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE.os, "open", side_effect=guarded_open
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_unreadable"
+            ):
+                MODULE._read(fifo)
+
+            report.write_bytes(b"0123456789")
+            real_read = MODULE.os.read
+            returned = 0
+
+            def observed_read(descriptor: int, count: int) -> bytes:
+                nonlocal returned
+                chunk = real_read(descriptor, count)
+                returned += len(chunk)
+                return chunk
+
+            with mock.patch.object(
+                MODULE, "MAX_REPORT_BYTES", 4
+            ), mock.patch.object(
+                MODULE.os, "read", side_effect=observed_read
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_size"
+            ):
+                MODULE._read(report)
+            self.assertEqual(returned, 5)
+
+            for mutation in ("growth", "swap"):
+                with self.subTest(mutation=mutation):
+                    report.write_bytes(b"{}")
+                    replacement = root / "replacement.json"
+                    replacement.write_bytes(b"{}")
+                    changed = False
+
+                    def adversarial_read(
+                        descriptor: int, count: int
+                    ) -> bytes:
+                        nonlocal changed
+                        chunk = real_read(descriptor, count)
+                        if chunk and not changed:
+                            changed = True
+                            if mutation == "growth":
+                                report.write_bytes(b"{} ")
+                            else:
+                                replacement.replace(report)
+                        return chunk
+
+                    with mock.patch.object(
+                        MODULE.os,
+                        "read",
+                        side_effect=adversarial_read,
+                    ), self.assertRaisesRegex(
+                        MODULE.GateError, "report_unreadable"
+                    ):
+                        MODULE._read(report)
+
+    def test_report_reader_strict_json_is_bounded_before_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "report.json"
+            preflight_payloads = (
+                (
+                    b"[" * (MODULE.MAX_JSON_DEPTH + 1)
+                    + b"]" * (MODULE.MAX_JSON_DEPTH + 1)
+                ),
+                b'{"value":1.25}',
+                b'{"value":1e10000}',
+                b'{"value":' + b"9" * 5_000 + b"}",
+            )
+            for payload in preflight_payloads:
+                with self.subTest(payload_size=len(payload)):
+                    path.write_bytes(payload)
+                    with mock.patch.object(
+                        MODULE.json,
+                        "loads",
+                        side_effect=AssertionError("decoder must not run"),
+                    ), self.assertRaisesRegex(
+                        MODULE.GateError, "report_json"
+                    ):
+                        MODULE._read(path)
+
+            with mock.patch.object(
+                MODULE, "MAX_JSON_NODES", 3
+            ), mock.patch.object(
+                MODULE.json,
+                "loads",
+                side_effect=AssertionError("decoder must not run"),
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_json"
+            ):
+                path.write_bytes(b"[0,0,0,0]")
+                MODULE._read(path)
+
+            for payload, code in (
+                (b'{"value":NaN}', "report_json"),
+                (b'{"value":1,"value":2}', "duplicate_json_key"),
+            ):
+                with self.subTest(code=code):
+                    path.write_bytes(payload)
+                    with self.assertRaisesRegex(MODULE.GateError, code):
+                        MODULE._read(path)
+
+            path.write_bytes(b"{}")
+            with mock.patch.object(
+                MODULE.json, "loads", side_effect=RecursionError
+            ), self.assertRaisesRegex(MODULE.GateError, "report_json"):
+                MODULE._read(path)
+
+            hostile = (
+                b"[" * (MODULE.MAX_JSON_DEPTH + 1)
+                + b"]" * (MODULE.MAX_JSON_DEPTH + 1)
+            )
+            path.write_bytes(hostile)
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(path),
+                    "--expected-workbooks",
+                    "2",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("report_json", process.stderr)
+            self.assertNotIn("Traceback", process.stderr)
+
+    def test_unique_text_geometry_policy_drift_is_rejected(self) -> None:
+        report = report_document()
+        geometry_policy = report["configuration"]["metric_policy"][
+            "unique_text_geometry"
+        ]
+        self.assertEqual(
+            geometry_policy["exact_delta_absolute_limit_millipoints"],
+            1_000_000_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_items_per_side_per_page"],
+            250_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_geometry_pages_per_report"],
+            2_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_histogram_buckets_per_report"],
+            50_000,
+        )
+        self.assertEqual(
+            geometry_policy["histogram"],
+            {
+                "exact_absolute_limit_millipoints": 2,
+                "max_buckets_per_axis": 21,
+                "middle_absolute_limit_millipoints": 1_000,
+                "middle_bucket_width_millipoints": 500,
+                "outer_absolute_limit_millipoints": 10_000,
+                "outer_bucket_width_millipoints": 2_000,
+                "overflow_bucket_absolute_millipoints": 12_000,
+                "rounding": (
+                    "nearest_width_multiple_half_away_from_zero_"
+                    "with_nonzero_sign_preserved"
+                ),
+            },
+        )
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "histogram"
+        ]["rounding"] = "nearest_width_multiple"
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        report = report_document()
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "max_histogram_buckets_per_report"
+        ] = 50_001
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
     def test_exact_page_count_boxes_and_both_scale_modes_pass(self) -> None:
         result = MODULE.evaluate(
             report_document(),
@@ -411,6 +748,7 @@ class AuthoredPrintGateTests(unittest.TestCase):
         page["text_box_f1_ppm"] = 0
         page["text_box_median_error_millipoints"] = None
         page["text_box_p95_error_millipoints"] = None
+        page["text_box_unique_geometry"] = unique_geometry(0)
         pixels = sum(item["pixels"] for item in report["files"][0]["pages"])
         absolute = sum(
             item["absolute_error_sum"] for item in report["files"][0]["pages"]
@@ -496,6 +834,94 @@ class AuthoredPrintGateTests(unittest.TestCase):
         )
         self.assertIn("semantic_population_empty", result["failures"])
         self.assertIn("edge_population_empty", result["failures"])
+
+    def test_unique_text_geometry_is_required_and_exact(self) -> None:
+        report = report_document()
+        del report["files"][0]["pages"][0]["text_box_unique_geometry"]
+        with self.assertRaisesRegex(
+            MODULE.GateError, "unique_text_geometry_pair"
+        ):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
+
+        for kind in ("exact_summary", "cross_axis"):
+            with self.subTest(kind=kind):
+                report = report_document()
+                geometry = report["files"][0]["pages"][0][
+                    "text_box_unique_geometry"
+                ]
+                if kind == "exact_summary":
+                    geometry["exact_delta_summaries_millipoints"]["x_min"][
+                        "count"
+                    ] = 1
+                else:
+                    geometry["delta_histograms_millipoints"]["center_x"][0][
+                        "delta_millipoints"
+                    ] = 1
+                    summary = geometry[
+                        "exact_delta_summaries_millipoints"
+                    ]["center_x"]
+                    summary["min_delta_millipoints"] = 1
+                    summary["max_delta_millipoints"] = 1
+                    summary["sum_delta_millipoints"] = 2
+                with self.assertRaisesRegex(
+                    MODULE.GateError, "unique_text_geometry_page"
+                ):
+                    MODULE.evaluate(
+                        report,
+                        report_sha256="a" * 64,
+                        report_bytes=1234,
+                        expected_workbooks=2,
+                    )
+
+    def test_unique_text_geometry_report_caps_are_enforced(self) -> None:
+        contract = MODULE.validate_report_geometry.__globals__["CONTRACT"]
+        with self.subTest(limit="pages"), mock.patch.object(
+            contract,
+            "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
+            7,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.GateError, "unique_text_geometry_report_limit"
+            ):
+                MODULE.evaluate(
+                    report_document(),
+                    report_sha256="a" * 64,
+                    report_bytes=1234,
+                    expected_workbooks=2,
+                )
+
+        with self.subTest(limit="histogram_buckets"), mock.patch.object(
+            contract,
+            "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
+            127,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.GateError, "unique_text_geometry_report_limit"
+            ):
+                MODULE.evaluate(
+                    report_document(),
+                    report_sha256="a" * 64,
+                    report_bytes=1234,
+                    expected_workbooks=2,
+                )
+
+    def test_unique_text_geometry_policy_rejects_bool_integer_alias(self) -> None:
+        report = report_document()
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "diagnostic_only"
+        ] = 1
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            MODULE.evaluate(
+                report,
+                report_sha256="a" * 64,
+                report_bytes=1234,
+                expected_workbooks=2,
+            )
 
     def test_self_consistent_input_substitution_is_rejected_by_manifest_binding(
         self,

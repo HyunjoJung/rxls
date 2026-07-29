@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -87,6 +88,32 @@ def semantic_metrics(seed: int) -> dict[str, int]:
     }
 
 
+def unique_text_geometry(delta_millipoints: int = 0) -> dict[str, object]:
+    bucket = MODULE._unique_text_geometry_bucket(delta_millipoints)
+    overflow_limit = MODULE.UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS
+    summary = {
+        "count": 1,
+        "max_delta_millipoints": delta_millipoints,
+        "min_delta_millipoints": delta_millipoints,
+        "negative_overflow_items": int(delta_millipoints < -overflow_limit),
+        "positive_overflow_items": int(delta_millipoints > overflow_limit),
+        "sum_delta_millipoints": delta_millipoints,
+    }
+    return {
+        "delta_histograms_millipoints": {
+            axis: [{"count": 1, "delta_millipoints": bucket}]
+            for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES
+        },
+        "exact_delta_summaries_millipoints": {
+            axis: copy.deepcopy(summary)
+            for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES
+        },
+        "libreoffice_unique_items": 1,
+        "matched_items": 1,
+        "rxls_unique_items": 1,
+    }
+
+
 def page_metrics(index: int) -> dict[str, object]:
     return {
         "blurred_luma_similarity_ppm": 920_000 - index,
@@ -101,7 +128,15 @@ def page_metrics(index: int) -> dict[str, object]:
         "source_pdf_page_index": 0,
         "oracle_output_page_index": 0,
         "similarity_ppm": 900_000 - index,
+        "text_box_libreoffice_items": 1,
+        "text_box_matched_items": 1,
+        "text_box_rxls_items": 1,
+        "text_box_unique_geometry": unique_text_geometry(),
         "text_ink_f1_ppm": 760_000 - index,
+        "text_line_box_libreoffice_items": 1,
+        "text_line_box_matched_items": 1,
+        "text_line_box_rxls_items": 1,
+        "text_line_box_unique_geometry": unique_text_geometry(),
         **renderer_metrics(index),
         **semantic_metrics(index),
     }
@@ -169,6 +204,11 @@ def report(*, private_prefix: str = "/private/baseline") -> dict[str, object]:
     return {
         "configuration": {
             "dpi": 96,
+            "metric_policy": {
+                "unique_text_geometry": copy.deepcopy(
+                    MODULE.UNIQUE_TEXT_GEOMETRY_POLICY
+                )
+            },
             "print_mode": "single-page-sheets",
             "renderer_binary": identity,
             "secret_configuration_path": "/never/publish/configuration",
@@ -198,7 +238,7 @@ def report(*, private_prefix: str = "/private/baseline") -> dict[str, object]:
             "by_status": {"compared": 2},
             "files": 2,
             "input_bytes_considered": 2_001,
-            "metric_cohorts": {},
+            "metric_cohorts": MODULE._recompute_metric_cohorts(rows),
         },
     }
 
@@ -220,9 +260,15 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         self.candidate["files"].reverse()
 
     def compare(self, baseline=None, candidate=None, **thresholds):
+        baseline = copy.deepcopy(baseline or self.baseline)
+        candidate = copy.deepcopy(candidate or self.candidate)
+        for document in (baseline, candidate):
+            document["summary"]["metric_cohorts"] = (
+                MODULE._recompute_metric_cohorts(document["files"])
+            )
         return MODULE.compare_reports(
-            validated(baseline or self.baseline),
-            validated(candidate or self.candidate),
+            validated(baseline),
+            validated(candidate),
             **thresholds,
         )
 
@@ -266,6 +312,322 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         self.assertIn("configuration_mismatch", result["failures"])
         self.assertIn("preflight_mismatch", result["failures"])
         self.assertIn("renderer_binary_mismatch", result["failures"])
+
+    def test_type_aliases_cannot_claim_canonical_identity_equality(self) -> None:
+        baseline = copy.deepcopy(self.baseline)
+        candidate = copy.deepcopy(self.candidate)
+        baseline["configuration"]["identity_alias_probe"] = False
+        candidate["configuration"]["identity_alias_probe"] = 0
+        result = self.compare(baseline=baseline, candidate=candidate)
+        configuration = result["identity"]["configuration"]
+        self.assertNotEqual(
+            configuration["baseline_sha256"],
+            configuration["candidate_sha256"],
+        )
+        self.assertFalse(configuration["equal"])
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("configuration_mismatch", result["failures"])
+
+        candidate = copy.deepcopy(self.candidate)
+        candidate["preflight"]["oracle_lock"]["configured"] = 1
+        result = self.compare(candidate=candidate)
+        preflight = result["identity"]["preflight"]
+        self.assertNotEqual(
+            preflight["baseline_sha256"],
+            preflight["candidate_sha256"],
+        )
+        self.assertFalse(preflight["equal"])
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("preflight_mismatch", result["failures"])
+
+        baseline = copy.deepcopy(self.baseline)
+        candidate = copy.deepcopy(self.candidate)
+        baseline["files"][0]["renderer"]["identity_alias_probe"] = False
+        candidate_by_sha = {
+            row["sha256"]: row for row in candidate["files"]
+        }
+        candidate_by_sha[f"{1:064x}"]["renderer"][
+            "identity_alias_probe"
+        ] = 0
+        result = self.compare(baseline=baseline, candidate=candidate)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("renderer_evidence_mismatch", result["failures"])
+
+    def test_summary_evidence_is_bound_without_collapsing_visual_thresholds(
+        self,
+    ) -> None:
+        candidate = copy.deepcopy(self.candidate)
+        candidate["summary"]["input_bytes_considered"] += 1
+        result = self.compare(candidate=candidate)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn(
+            "summary_input_bytes_mismatch",
+            result["failures"],
+        )
+
+        tampered = copy.deepcopy(self.baseline)
+        tampered["summary"]["metric_cohorts"] = {"tampered": True}
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport,
+            "summary_metric_cohorts",
+        ):
+            validated(tampered)
+
+        candidate = copy.deepcopy(self.candidate)
+        by_sha = {row["sha256"]: row for row in candidate["files"]}
+        changed = by_sha[f"{1:064x}"]
+        for metrics in (changed["metrics"], changed["pages"][0]):
+            metrics["similarity_ppm"] -= 1
+        result = self.compare(candidate=candidate)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["failures"], [])
+
+    def test_unique_text_geometry_policy_is_exact_and_fail_closed(self) -> None:
+        missing = copy.deepcopy(self.baseline)
+        del missing["configuration"]["metric_policy"]["unique_text_geometry"]
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "metric_policy_unique_text_geometry"
+        ):
+            validated(missing)
+
+        drifted = copy.deepcopy(self.baseline)
+        drifted["configuration"]["metric_policy"]["unique_text_geometry"][
+            "histogram"
+        ]["exact_absolute_limit_millipoints"] = 3
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "metric_policy_unique_text_geometry"
+        ):
+            validated(drifted)
+
+        report_limit_drift = copy.deepcopy(self.baseline)
+        report_limit_drift["configuration"]["metric_policy"][
+            "unique_text_geometry"
+        ]["max_histogram_buckets_per_report"] += 1
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "metric_policy_unique_text_geometry"
+        ):
+            validated(report_limit_drift)
+        self.assertEqual(
+            MODULE.UNIQUE_TEXT_GEOMETRY_POLICY["shard_budget"],
+            "equal_floor_partition_by_declared_shard_count",
+        )
+
+    def test_unique_text_geometry_report_budget_is_aggregate(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
+                1,
+            ),
+            self.assertRaisesRegex(
+                MODULE.MalformedReport,
+                "unique_text_geometry_report_limit",
+            ),
+        ):
+            validated(copy.deepcopy(self.baseline))
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
+                31,
+            ),
+            self.assertRaisesRegex(
+                MODULE.MalformedReport,
+                "unique_text_geometry_report_limit",
+            ),
+        ):
+            validated(copy.deepcopy(self.baseline))
+
+    def test_every_compared_page_requires_paired_unique_text_geometry(self) -> None:
+        for missing_keys in (
+            ("text_box_unique_geometry",),
+            ("text_line_box_unique_geometry",),
+            (
+                "text_box_unique_geometry",
+                "text_line_box_unique_geometry",
+            ),
+        ):
+            document = copy.deepcopy(self.baseline)
+            page = document["files"][0]["pages"][0]
+            for key in missing_keys:
+                del page[key]
+            with self.subTest(missing_keys=missing_keys), self.assertRaisesRegex(
+                MODULE.MalformedReport, "page_unique_text_geometry_pair"
+            ):
+                validated(document)
+
+    def test_unique_text_geometry_validates_exact_bounded_page_contract(self) -> None:
+        document = copy.deepcopy(self.baseline)
+        geometry = document["files"][0]["pages"][0][
+            "text_box_unique_geometry"
+        ]
+        allowed = sorted(MODULE.UNIQUE_TEXT_GEOMETRY_ALLOWED_BUCKETS)
+        self.assertEqual(len(allowed), MODULE.MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS)
+        matched = len(allowed)
+        geometry["rxls_unique_items"] = matched
+        geometry["libreoffice_unique_items"] = matched
+        geometry["matched_items"] = matched
+        page = document["files"][0]["pages"][0]
+        page["text_box_rxls_items"] = matched
+        page["text_box_libreoffice_items"] = matched
+        page["text_box_matched_items"] = matched
+        for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES:
+            geometry["delta_histograms_millipoints"][axis] = [
+                {"count": 1, "delta_millipoints": delta}
+                for delta in allowed
+            ]
+            geometry["exact_delta_summaries_millipoints"][axis] = {
+                "count": matched,
+                "max_delta_millipoints": 10_001,
+                "min_delta_millipoints": -10_001,
+                "negative_overflow_items": 1,
+                "positive_overflow_items": 1,
+                "sum_delta_millipoints": 0,
+            }
+        validated(document)
+
+        empty = copy.deepcopy(self.baseline)
+        empty_geometry = empty["files"][0]["pages"][0][
+            "text_box_unique_geometry"
+        ]
+        empty_geometry["rxls_unique_items"] = 0
+        empty_geometry["libreoffice_unique_items"] = 0
+        empty_geometry["matched_items"] = 0
+        for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES:
+            empty_geometry["delta_histograms_millipoints"][axis] = []
+            empty_geometry["exact_delta_summaries_millipoints"][axis] = {
+                "count": 0,
+                "max_delta_millipoints": None,
+                "min_delta_millipoints": None,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": 0,
+            }
+        validated(empty)
+
+        malformed_mutations = {
+            "content_field": lambda value: value.__setitem__(
+                "normalized_text", "private"
+            ),
+            "axis_set": lambda value: value[
+                "delta_histograms_millipoints"
+            ].pop("height"),
+            "bucket_universe": lambda value: value[
+                "delta_histograms_millipoints"
+            ]["x_min"][10].__setitem__("delta_millipoints", 3),
+            "bucket_order": lambda value: value[
+                "delta_histograms_millipoints"
+            ]["x_min"].reverse(),
+            "bucket_population": lambda value: value[
+                "delta_histograms_millipoints"
+            ]["x_min"].pop(),
+            "exact_sum_bound": lambda value: value[
+                "exact_delta_summaries_millipoints"
+            ]["x_min"].__setitem__(
+                "sum_delta_millipoints",
+                matched
+                * MODULE.MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+                + 1,
+            ),
+            "overflow_count": lambda value: value[
+                "exact_delta_summaries_millipoints"
+            ]["x_min"].__setitem__("positive_overflow_items", 0),
+            "extrema_bucket": lambda value: value[
+                "exact_delta_summaries_millipoints"
+            ]["x_min"].__setitem__("min_delta_millipoints", -9_999),
+        }
+        for name, mutate in malformed_mutations.items():
+            malformed = copy.deepcopy(document)
+            malformed_geometry = malformed["files"][0]["pages"][0][
+                "text_box_unique_geometry"
+            ]
+            mutate(malformed_geometry)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                MODULE.MalformedReport, "page_unique_text_geometry"
+            ):
+                validated(malformed)
+
+    def test_unique_text_geometry_rejects_impossible_sum_and_item_counts(
+        self,
+    ) -> None:
+        impossible = copy.deepcopy(self.baseline)
+        page = impossible["files"][0]["pages"][0]
+        geometry = page["text_box_unique_geometry"]
+        geometry["rxls_unique_items"] = 2
+        geometry["libreoffice_unique_items"] = 2
+        geometry["matched_items"] = 2
+        page["text_box_rxls_items"] = 2
+        page["text_box_libreoffice_items"] = 2
+        page["text_box_matched_items"] = 2
+        for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES:
+            geometry["delta_histograms_millipoints"][axis] = [
+                {"count": 1, "delta_millipoints": -500},
+                {"count": 1, "delta_millipoints": 500},
+            ]
+            geometry["exact_delta_summaries_millipoints"][axis] = {
+                "count": 2,
+                "max_delta_millipoints": 749,
+                "min_delta_millipoints": -3,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": (
+                    1_498 if axis == "x_min" else 746
+                ),
+            }
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "page_unique_text_geometry"
+        ):
+            validated(impossible)
+
+        impossible_axis = copy.deepcopy(self.baseline)
+        axis_geometry = impossible_axis["files"][0]["pages"][0][
+            "text_line_box_unique_geometry"
+        ]
+        axis_geometry["delta_histograms_millipoints"]["center_x"] = [
+            {"count": 1, "delta_millipoints": 1}
+        ]
+        axis_geometry["exact_delta_summaries_millipoints"]["center_x"] = {
+            "count": 1,
+            "max_delta_millipoints": 1,
+            "min_delta_millipoints": 1,
+            "negative_overflow_items": 0,
+            "positive_overflow_items": 0,
+            "sum_delta_millipoints": 1,
+        }
+        with self.assertRaisesRegex(
+            MODULE.MalformedReport, "page_unique_text_geometry"
+        ):
+            validated(impossible_axis)
+
+        for field in (
+            "text_box_rxls_items",
+            "text_box_libreoffice_items",
+            "text_box_matched_items",
+        ):
+            drifted = copy.deepcopy(self.baseline)
+            drifted["files"][0]["pages"][0][field] = 0
+            with self.subTest(field=field), self.assertRaisesRegex(
+                MODULE.MalformedReport, "page_unique_text_geometry"
+            ):
+                validated(drifted)
+
+    def test_unique_text_geometry_is_exact_same_sha_evidence_not_a_score(self) -> None:
+        candidate = copy.deepcopy(self.candidate)
+        candidate["files"][0]["pages"][0][
+            "text_box_unique_geometry"
+        ] = unique_text_geometry(1)
+        result = self.compare(candidate=candidate)
+        self.assertEqual(result["status"], "fail")
+        self.assertIn(
+            "unique_text_geometry_evidence_mismatch", result["failures"]
+        )
+        self.assertNotIn("non_oracle_metric_evidence_mismatch", result["failures"])
+        self.assertNotIn("similarity_drift_threshold", result["failures"])
+        self.assertEqual(
+            result["metric_policy"]["unique_text_geometry"],
+            "schema_validated_exact_same_sha_diagnostic_non_scoring",
+        )
 
     def test_baseline_contract_hashes_match_baseline_derivation_domains(self) -> None:
         result = self.compare()
@@ -460,6 +822,9 @@ class CompareRenderParityRunsTests(unittest.TestCase):
 
             drifted = copy.deepcopy(self.candidate)
             drifted["files"][0]["metrics"]["similarity_ppm"] -= 1
+            drifted["summary"]["metric_cohorts"] = (
+                MODULE._recompute_metric_cohorts(drifted["files"])
+            )
             candidate.write_bytes(MODULE.canonical_bytes(drifted))
             failed = subprocess.run(
                 [*command, "--max-similarity-drift-ppm", "0"],
@@ -493,6 +858,24 @@ class CompareRenderParityRunsTests(unittest.TestCase):
             path.write_text('{"value": NaN}', encoding="utf-8")
             with self.assertRaisesRegex(MODULE.MalformedReport, "nonfinite_number"):
                 MODULE.read_report(path, 1_000)
+
+            target = Path(raw) / "target.json"
+            target.write_text("{}\n", encoding="utf-8")
+            link = Path(raw) / "link.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(
+                MODULE.MalformedReport,
+                "report_bytes_limit",
+            ):
+                MODULE.read_report(link, 1_000)
+
+            fifo = Path(raw) / "report.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(
+                MODULE.MalformedReport,
+                "report_bytes_limit",
+            ):
+                MODULE.read_report(fifo, 1_000)
 
     def test_cli_rejects_hostile_json_numbers_and_depth_with_stable_errors(
         self,

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 from typing import Any
@@ -254,16 +255,69 @@ def parse_json_bytes(payload: bytes, code: str) -> object:
         raise BaselineError(f"{code}_invalid_json") from error
 
 
+def _stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_bounded_regular_file(path: Path, code: str) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise BaselineError(f"{code}_unreadable")
+        remaining = MAX_DOCUMENT_BYTES + 1
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except BaselineError:
+        raise
+    except OSError as error:
+        raise BaselineError(f"{code}_unreadable") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or _stat_signature(before) != _stat_signature(after)
+        or _stat_signature(after) != _stat_signature(current)
+    ):
+        raise BaselineError(f"{code}_unreadable")
+    payload = b"".join(chunks)
+    if not payload or len(payload) > MAX_DOCUMENT_BYTES:
+        raise BaselineError(f"{code}_limit")
+    if len(payload) != after.st_size:
+        raise BaselineError(f"{code}_unreadable")
+    return payload
+
+
 def read_json_with_identity(
     path: Path,
     code: str,
 ) -> tuple[dict[str, Any], dict[str, object]]:
-    try:
-        payload = path.read_bytes()
-    except OSError as error:
-        raise BaselineError(f"{code}_unreadable") from error
-    if not payload or len(payload) > MAX_DOCUMENT_BYTES:
-        raise BaselineError(f"{code}_limit")
+    payload = _read_bounded_regular_file(path, code)
     document = parse_json_bytes(payload, code)
     if not isinstance(document, dict):
         raise BaselineError(f"{code}_not_object")
@@ -452,12 +506,7 @@ def _manifest_lattice_sha256(files: object) -> str | None:
 def campaign_from_manifest(
     path: Path, *, require_hosted_full_800: bool = False
 ) -> dict[str, Any]:
-    try:
-        payload = path.read_bytes()
-    except OSError as error:
-        raise BaselineError("campaign_manifest_unreadable") from error
-    if len(payload) > MAX_DOCUMENT_BYTES:
-        raise BaselineError("campaign_manifest_limit")
+    payload = _read_bounded_regular_file(path, "campaign_manifest")
     manifest = parse_json_bytes(payload, "campaign_manifest")
     if not isinstance(manifest, dict):
         raise BaselineError("campaign_manifest_not_object")

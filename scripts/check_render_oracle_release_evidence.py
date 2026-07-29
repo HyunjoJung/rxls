@@ -25,6 +25,11 @@ from urllib.request import (
 )
 import zipfile
 
+try:
+    from strict_json_contract import type_exact_equal
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.strict_json_contract import type_exact_equal
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ORACLE_LOCK = ROOT / "scripts" / "render-oracle-container" / "lock.json"
@@ -1056,9 +1061,11 @@ def authenticate_candidate_run_artifact(
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
-    _require(path.is_file() and not path.is_symlink(), "evidence_file_type")
-    payload = path.read_bytes()
-    _require(0 < len(payload) <= MAX_FILE_BYTES, "evidence_file_size")
+    payload = _regular_file_payload(
+        path,
+        MAX_FILE_BYTES,
+        "evidence_file",
+    )
     document = _strict_json_loads(payload, "evidence_invalid_json")
     _require(isinstance(document, dict), "evidence_not_object")
     return document, payload
@@ -1446,14 +1453,46 @@ def _validate_bootstrap_receipt(receipt: object) -> str:
 
 
 def _regular_file_payload(path: Path, maximum: int, code: str) -> bytes:
+    descriptor = -1
     try:
         metadata = path.lstat()
         _require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink(), f"{code}_type")
         _require(0 < metadata.st_size <= maximum, f"{code}_size")
-        payload = path.read_bytes()
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            opened = os.fstat(source.fileno())
+            _require(
+                stat.S_ISREG(opened.st_mode)
+                and (opened.st_dev, opened.st_ino)
+                == (metadata.st_dev, metadata.st_ino)
+                and opened.st_size == metadata.st_size,
+                f"{code}_changed",
+            )
+            payload = source.read(maximum + 1)
+        final = path.lstat()
+        _require(
+            stat.S_ISREG(final.st_mode)
+            and not path.is_symlink()
+            and (final.st_dev, final.st_ino, final.st_size)
+            == (opened.st_dev, opened.st_ino, opened.st_size),
+            f"{code}_changed",
+        )
+    except EvidenceError:
+        raise
     except OSError as error:
         raise EvidenceError(f"{code}_unreadable") from error
-    _require(len(payload) == metadata.st_size, f"{code}_changed")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _require(
+        len(payload) == metadata.st_size and len(payload) <= maximum,
+        f"{code}_changed",
+    )
     return payload
 
 
@@ -2007,11 +2046,17 @@ def _validate_fidelity_gate(value: dict[str, Any]) -> dict[str, object]:
         "fidelity_failed",
     )
     _require(
-        value.get("thresholds") == EXPECTED_FIDELITY_THRESHOLDS,
+        type_exact_equal(
+            value.get("thresholds"),
+            EXPECTED_FIDELITY_THRESHOLDS,
+        ),
         "fidelity_thresholds",
     )
     _require(
-        value.get("policy") == EXPECTED_FIDELITY_POLICY,
+        type_exact_equal(
+            value.get("policy"),
+            EXPECTED_FIDELITY_POLICY,
+        ),
         "fidelity_policy",
     )
 
@@ -2312,7 +2357,10 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
         "authored_failed",
     )
     _require(
-        value.get("thresholds") == EXPECTED_AUTHORED_THRESHOLDS,
+        type_exact_equal(
+            value.get("thresholds"),
+            EXPECTED_AUTHORED_THRESHOLDS,
+        ),
         "authored_thresholds",
     )
     _require(
@@ -2632,7 +2680,7 @@ def _validate_repeatability(value: dict[str, Any]) -> None:
             "thresholds_ppm",
         }
         and value.get("schema")
-        == "rxls.libreoffice-render-repeatability.v1",
+        == "rxls.libreoffice-render-repeatability.v2",
         "repeatability_schema",
     )
     thresholds = value.get("thresholds_ppm")
@@ -2823,13 +2871,18 @@ def _validate_repeatability(value: dict[str, Any]) -> None:
         "repeatability_reports",
     )
     _require(
-        value.get("metric_policy")
-        == {
+        type_exact_equal(
+            value.get("metric_policy"),
+            {
             "distribution": "sorted_absolute_paired_integer_ppm_deltas",
             "input_pairing": "sha256",
             "observations": "workbook_aggregate_and_page",
             "paths_or_content_retained": False,
+            "unique_text_geometry": (
+                "schema_validated_exact_same_sha_diagnostic_non_scoring"
+            ),
         },
+        ),
         "repeatability_policy",
     )
 

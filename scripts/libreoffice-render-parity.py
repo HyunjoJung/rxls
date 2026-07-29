@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import copy
 from dataclasses import dataclass
 from fractions import Fraction
 import hashlib
@@ -134,6 +135,22 @@ SVG_CLIP_REFERENCE_RE = re.compile(
 SVG_PATH_COMMANDS = frozenset("MmLlHhVvCcSsQqTtZz")
 MAX_SVG_PATH_TOKENS = 2_000_000
 MAX_TEXT_BOX_MATCH_WORK = 25_000_000
+# The baseline gate is the strictest raw-report consumer at 64 MiB.
+MAX_EVIDENCE_REPORT_BYTES = 64 * 1024 * 1024
+MAX_EVIDENCE_REPORT_JSON_NODES = 2_000_000
+MAX_EVIDENCE_JSON_INTEGER_DIGITS = 128
+MAX_RENDER_PARITY_SHARDS = 256
+MAX_UNIQUE_TEXT_GEOMETRY_ITEMS = 250_000
+MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS = 1_000_000_000
+MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES = 2_000
+MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS = 50_000
+UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS = 2
+UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS = 1_000
+UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS = 500
+UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS = 10_000
+UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS = 2_000
+UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS = 12_000
+MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS = 21
 # Keep Poppler geometry inside the same absolute safety envelope as accepted
 # PDF page dimensions.  Boxes may overhang a crop by any amount within this
 # envelope; validity depends on a positive-area intersection with the page,
@@ -254,7 +271,12 @@ class SemanticTextBox:
     """One in-memory text label and its page-space box in PDF points."""
 
     tokens: tuple[str, ...]
-    bbox_points: tuple[float, float, float, float]
+    bbox_points: tuple[
+        float | Fraction,
+        float | Fraction,
+        float | Fraction,
+        float | Fraction,
+    ]
 
 
 @dataclass(frozen=True)
@@ -1962,9 +1984,9 @@ def discover_manifest(
         if not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256):
             expected_sha256 = None
         expected_bytes = row.get("bytes")
-        if not render_corpus and not isinstance(expected_bytes, int):
+        if not render_corpus and type(expected_bytes) is not int:
             expected_bytes = row.get("byte_length")
-        if not isinstance(expected_bytes, int) or expected_bytes < 0:
+        if type(expected_bytes) is not int or expected_bytes < 0:
             expected_bytes = None
         rights_tier = row.get("rights_tier")
         if rights_tier not in {"S", "U", "Q"}:
@@ -4675,6 +4697,23 @@ def parse_pdftotext_pages(
     return tuple(normalized_pages)
 
 
+def _bounded_bbox_decimal_fraction(value: object, code: str) -> Fraction:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or re.fullmatch(PDFINFO_DECIMAL, value) is None
+    ):
+        raise HarnessError(code)
+    try:
+        result = Fraction(value)
+    except (ValueError, ZeroDivisionError, OverflowError) as error:
+        raise HarnessError(code) from error
+    if abs(result) > MAX_BBOX_COORDINATE_MAGNITUDE_POINTS:
+        raise HarnessError(code)
+    return result
+
+
 def parse_pdftotext_bbox_pages(
     payload: bytes,
     *,
@@ -4727,40 +4766,34 @@ def parse_pdftotext_bbox_pages(
         width: Fraction,
         height: Fraction,
         code: str,
-    ) -> tuple[float, float, float, float]:
-        x_min = _parse_finite_number(element.attrib.get("xMin"), code)
-        y_min = _parse_finite_number(element.attrib.get("yMin"), code)
-        x_max = _parse_finite_number(element.attrib.get("xMax"), code)
-        y_max = _parse_finite_number(element.attrib.get("yMax"), code)
-        width_float = float(width)
-        height_float = float(height)
+    ) -> tuple[Fraction, Fraction, Fraction, Fraction]:
+        def coordinate(value: object) -> Fraction:
+            return _bounded_bbox_decimal_fraction(value, code)
+
+        x_min = coordinate(element.attrib.get("xMin"))
+        y_min = coordinate(element.attrib.get("yMin"))
+        x_max = coordinate(element.attrib.get("xMax"))
+        y_max = coordinate(element.attrib.get("yMax"))
         if (
             x_max <= x_min
             or y_max <= y_min
-            or any(
-                abs(coordinate) > MAX_BBOX_COORDINATE_MAGNITUDE_POINTS
-                for coordinate in (x_min, y_min, x_max, y_max)
-            )
         ):
             raise HarnessError(code)
         clamped = (
-            min(width_float, max(0.0, x_min)),
-            min(height_float, max(0.0, y_min)),
-            min(width_float, max(0.0, x_max)),
-            min(height_float, max(0.0, y_max)),
+            min(width, max(Fraction(), x_min)),
+            min(height, max(Fraction(), y_min)),
+            min(width, max(Fraction(), x_max)),
+            min(height, max(Fraction(), y_max)),
         )
         if clamped[2] <= clamped[0] or clamped[3] <= clamped[1]:
             raise HarnessError(code)
         return clamped
 
     def page_dimension(value: object) -> Fraction:
-        if (
-            not isinstance(value, str)
-            or re.fullmatch(PDFINFO_DECIMAL, value) is None
-        ):
-            raise HarnessError("semantic_bbox_page_geometry")
-        result = Fraction(value)
-        if result <= 0 or result > MAX_BBOX_COORDINATE_MAGNITUDE_POINTS:
+        result = _bounded_bbox_decimal_fraction(
+            value, "semantic_bbox_page_geometry"
+        )
+        if result <= 0:
             raise HarnessError("semantic_bbox_page_geometry")
         return result
 
@@ -5044,7 +5077,9 @@ def _paired_text_box_metrics(
             abs(left - right)
             for left, right in zip(box.bbox_points, candidate_box)
         )
-        error_millipoints = int(math.floor(error_points * 1000.0 + 0.5))
+        error_millipoints = abs(
+            _symmetric_signed_millipoints(error_points)
+        )
         histogram[error_millipoints] += 1
         matched += 1
     return _text_box_numeric_evidence(
@@ -5086,6 +5121,448 @@ def text_line_box_metrics(
         libreoffice.lines,
         prefix="text_line_box",
         max_match_work=max_match_work,
+    )
+
+
+UNIQUE_TEXT_GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+UNIQUE_TEXT_GEOMETRY_POLICY = {
+    "content_retained": False,
+    "coordinates": "pdf_points_y_down",
+    "delta_direction": "rxls_minus_libreoffice",
+    "diagnostic_only": True,
+    "exact_delta_absolute_limit_millipoints": (
+        MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+    ),
+    "exact_summary": (
+        "count_sum_min_max_and_signed_overflow_counts"
+    ),
+    "histogram": {
+        "exact_absolute_limit_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS
+        ),
+        "max_buckets_per_axis": MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS,
+        "middle_absolute_limit_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS
+        ),
+        "middle_bucket_width_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        ),
+        "outer_absolute_limit_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS
+        ),
+        "outer_bucket_width_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        ),
+        "overflow_bucket_absolute_millipoints": (
+            UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS
+        ),
+        "rounding": (
+            "nearest_width_multiple_half_away_from_zero_"
+            "with_nonzero_sign_preserved"
+        ),
+    },
+    "max_geometry_pages_per_report": (
+        MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES
+    ),
+    "max_histogram_buckets_per_report": (
+        MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+    ),
+    "max_items_per_side_per_page": MAX_UNIQUE_TEXT_GEOMETRY_ITEMS,
+    "matching": "exact_normalized_token_tuple_unique_on_both_sides",
+    "rounding": "nearest_millipoint_half_away_from_zero_exact_rational",
+    "shard_budget": "equal_floor_partition_by_declared_shard_count",
+    "units": "millipoints",
+}
+
+
+def _unique_text_geometry_result_complexity(
+    result: dict[str, object],
+) -> tuple[int, int]:
+    """Count the bounded diagnostic surface retained by one result."""
+    raw_pages = result.get("pages")
+    if raw_pages is None:
+        return 0, 0
+    if not isinstance(raw_pages, list):
+        raise HarnessError("text_unique_geometry_report_shape")
+    geometry_pages = 0
+    histogram_buckets = 0
+    keys = (
+        "text_box_unique_geometry",
+        "text_line_box_unique_geometry",
+    )
+    expected_axes = set(UNIQUE_TEXT_GEOMETRY_AXES)
+    for page in raw_pages:
+        if not isinstance(page, dict):
+            raise HarnessError("text_unique_geometry_report_shape")
+        presence = tuple(key in page for key in keys)
+        if presence == (False, False):
+            continue
+        if presence != (True, True):
+            raise HarnessError("text_unique_geometry_report_shape")
+        geometry_pages += 1
+        for key in keys:
+            geometry = page[key]
+            if not isinstance(geometry, dict):
+                raise HarnessError("text_unique_geometry_report_shape")
+            histograms = geometry.get("delta_histograms_millipoints")
+            if (
+                not isinstance(histograms, dict)
+                or set(histograms) != expected_axes
+            ):
+                raise HarnessError("text_unique_geometry_report_shape")
+            for rows in histograms.values():
+                if not isinstance(rows, list):
+                    raise HarnessError(
+                        "text_unique_geometry_report_shape"
+                    )
+                histogram_buckets += len(rows)
+    return geometry_pages, histogram_buckets
+
+
+def _bounded_geometry_result(
+    result: dict[str, object],
+) -> dict[str, object]:
+    """Retain only path-neutral identity after the report budget is exhausted."""
+    return {
+        key: result[key]
+        for key in (
+            "bytes",
+            "features",
+            "format",
+            "path",
+            "rights_tier",
+            "sha256",
+        )
+        if key in result
+    }
+
+
+def _identity_only_result(
+    case: InputCase,
+    size: int | None,
+    *,
+    stat_error: str | None = None,
+    max_input_bytes: int,
+    status: str,
+    classification: str,
+) -> dict[str, object]:
+    """Create a consumer-valid, verified identity row without rendering."""
+    if size is None and stat_error is None:
+        size, stat_error = _safe_stat(case.path)
+    base = _base_result(case, size)
+    if stat_error is not None:
+        return _classified(base, "skipped", stat_error)
+    assert size is not None
+    if size > max_input_bytes:
+        return _classified(base, "skipped", "input_limit")
+    if case.expected_bytes is not None and size != case.expected_bytes:
+        return _classified(
+            base,
+            "error",
+            "manifest_size_mismatch",
+        )
+    try:
+        digest = _sha256_file(case.path, max_input_bytes)
+    except (OSError, HarnessError):
+        return _classified(base, "skipped", "unreadable_input")
+    if (
+        case.expected_sha256 is not None
+        and digest != case.expected_sha256
+    ):
+        return _classified(
+            {**base, "sha256": digest},
+            "error",
+            "manifest_sha256_mismatch",
+        )
+    return _classified(
+        {**base, "sha256": digest},
+        status,
+        classification,
+    )
+
+
+def _retained_metric_evidence(
+    status: str,
+    aggregate: dict[str, object],
+    pages: list[dict[str, object]],
+) -> dict[str, object]:
+    """Retain measurements only for consumer-defined comparable statuses."""
+    if status not in {"compared", "different"}:
+        return {}
+    return {"metrics": aggregate, "pages": pages}
+
+
+def _geometry_report_budget(
+    discovery: dict[str, object],
+) -> tuple[int, int]:
+    """Partition retained diagnostic evidence deterministically per shard."""
+    shard_count = discovery.get("shard_count", 1)
+    if (
+        isinstance(shard_count, bool)
+        or not isinstance(shard_count, int)
+        or shard_count <= 0
+        or shard_count > MAX_RENDER_PARITY_SHARDS
+    ):
+        raise HarnessError("shard_count")
+    return (
+        MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES // shard_count,
+        (
+            MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+            // shard_count
+        ),
+    )
+
+
+def _json_structural_nodes(value: object) -> int:
+    """Count exactly the containers and commas scanned by strict readers."""
+    nodes = 0
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            nodes += max(1, len(current))
+            if nodes > MAX_EVIDENCE_REPORT_JSON_NODES:
+                raise HarnessError("report_json_complexity")
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            nodes += max(1, len(current))
+            if nodes > MAX_EVIDENCE_REPORT_JSON_NODES:
+                raise HarnessError("report_json_complexity")
+            pending.extend(current)
+        elif (
+            type(current) is int
+            and len(str(abs(current)))
+            > MAX_EVIDENCE_JSON_INTEGER_DIGITS
+        ):
+            raise HarnessError("report_integer_limit")
+    return nodes
+
+
+def validate_evidence_report_limits(
+    evidence: dict[str, object],
+) -> tuple[int, int]:
+    """Prove producer output fits every strict downstream report reader."""
+    nodes = _json_structural_nodes(evidence)
+    payload_bytes = len(_canonical_json_bytes(evidence))
+    if payload_bytes > MAX_EVIDENCE_REPORT_BYTES:
+        raise HarnessError("report_bytes_limit")
+    return payload_bytes, nodes
+
+
+def write_report_atomic(path: Path, rendered: str) -> None:
+    """Replace a report only after its complete payload is durably staged."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _symmetric_signed_millipoints(value: float | Fraction) -> int:
+    """Round signed PDF-point deltas to millipoints, half away from zero."""
+    if isinstance(value, Fraction):
+        exact = value
+    else:
+        if not math.isfinite(value):
+            raise HarnessError("text_unique_geometry_non_finite")
+        exact = Fraction.from_float(value)
+    if (
+        abs(exact) * 1000
+        > MAX_UNIQUE_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+    ):
+        raise HarnessError("text_unique_geometry_delta_limit")
+    scaled = abs(exact) * 1000
+    magnitude, remainder = divmod(scaled.numerator, scaled.denominator)
+    if remainder * 2 >= scaled.denominator:
+        magnitude += 1
+    return -magnitude if value < 0 else magnitude
+
+
+def _unique_text_geometry_bucket(delta_millipoints: int) -> int:
+    """Bound diagnostic cardinality while retaining sub-point exact deltas."""
+    magnitude = abs(delta_millipoints)
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS:
+        return delta_millipoints
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        bucket = max(width, (magnitude + width // 2) // width * width)
+        return -bucket if delta_millipoints < 0 else bucket
+    if magnitude <= UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = UNIQUE_TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        bucket = (magnitude + width // 2) // width * width
+        return -bucket if delta_millipoints < 0 else bucket
+    return (
+        -UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS
+        if delta_millipoints < 0
+        else UNIQUE_TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS
+    )
+
+
+def _unique_text_geometry_metrics(
+    rxls_boxes: Sequence[SemanticTextBox],
+    libreoffice_boxes: Sequence[SemanticTextBox],
+    *,
+    max_items: int = MAX_UNIQUE_TEXT_GEOMETRY_ITEMS,
+) -> dict[str, object]:
+    """Compare boxes whose exact normalized token tuple is unique on both sides."""
+    if (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items <= 0
+        or max_items > MAX_UNIQUE_TEXT_GEOMETRY_ITEMS
+        or len(rxls_boxes) > max_items
+        or len(libreoffice_boxes) > max_items
+    ):
+        raise HarnessError("text_unique_geometry_item_limit")
+
+    rxls_counts = Counter(box.tokens for box in rxls_boxes)
+    libreoffice_counts = Counter(box.tokens for box in libreoffice_boxes)
+    rxls_unique = {
+        box.tokens: box
+        for box in rxls_boxes
+        if rxls_counts[box.tokens] == 1
+    }
+    libreoffice_unique = {
+        box.tokens: box
+        for box in libreoffice_boxes
+        if libreoffice_counts[box.tokens] == 1
+    }
+    histograms = {axis: Counter() for axis in UNIQUE_TEXT_GEOMETRY_AXES}
+    exact_summaries = {
+        axis: {
+            "count": 0,
+            "max_delta_millipoints": None,
+            "min_delta_millipoints": None,
+            "negative_overflow_items": 0,
+            "positive_overflow_items": 0,
+            "sum_delta_millipoints": 0,
+        }
+        for axis in UNIQUE_TEXT_GEOMETRY_AXES
+    }
+    matched = 0
+    for tokens, rxls_box in rxls_unique.items():
+        libreoffice_box = libreoffice_unique.get(tokens)
+        if libreoffice_box is None:
+            continue
+        rxls_x_min, rxls_y_min, rxls_x_max, rxls_y_max = rxls_box.bbox_points
+        lo_x_min, lo_y_min, lo_x_max, lo_y_max = libreoffice_box.bbox_points
+        deltas = {
+            "x_min": rxls_x_min - lo_x_min,
+            "x_max": rxls_x_max - lo_x_max,
+            "y_min": rxls_y_min - lo_y_min,
+            "y_max": rxls_y_max - lo_y_max,
+            "center_x": (
+                (rxls_x_min + rxls_x_max) - (lo_x_min + lo_x_max)
+            )
+            / 2,
+            "center_y": (
+                (rxls_y_min + rxls_y_max) - (lo_y_min + lo_y_max)
+            )
+            / 2,
+            "width": (rxls_x_max - rxls_x_min) - (lo_x_max - lo_x_min),
+            "height": (rxls_y_max - rxls_y_min) - (lo_y_max - lo_y_min),
+        }
+        for axis in UNIQUE_TEXT_GEOMETRY_AXES:
+            delta = _symmetric_signed_millipoints(deltas[axis])
+            summary = exact_summaries[axis]
+            summary["count"] += 1
+            summary["sum_delta_millipoints"] += delta
+            summary["min_delta_millipoints"] = (
+                delta
+                if summary["min_delta_millipoints"] is None
+                else min(summary["min_delta_millipoints"], delta)
+            )
+            summary["max_delta_millipoints"] = (
+                delta
+                if summary["max_delta_millipoints"] is None
+                else max(summary["max_delta_millipoints"], delta)
+            )
+            summary["negative_overflow_items"] += int(
+                delta < -UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS
+            )
+            summary["positive_overflow_items"] += int(
+                delta > UNIQUE_TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS
+            )
+            histograms[axis][_unique_text_geometry_bucket(delta)] += 1
+        matched += 1
+
+    if matched > max_items or any(
+        sum(histogram.values()) != matched for histogram in histograms.values()
+    ) or any(
+        len(histogram) > MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS
+        for histogram in histograms.values()
+    ) or any(
+        summary["count"] != matched
+        for summary in exact_summaries.values()
+    ):
+        raise HarnessError("text_unique_geometry_item_limit")
+    return {
+        "rxls_unique_items": len(rxls_unique),
+        "libreoffice_unique_items": len(libreoffice_unique),
+        "matched_items": matched,
+        "delta_histograms_millipoints": {
+            axis: [
+                {"delta_millipoints": delta, "count": count}
+                for delta, count in sorted(histograms[axis].items())
+            ]
+            for axis in UNIQUE_TEXT_GEOMETRY_AXES
+        },
+        "exact_delta_summaries_millipoints": exact_summaries,
+    }
+
+
+def text_box_unique_geometry_metrics(
+    rxls: PdfTextPage,
+    libreoffice: PdfTextPage,
+    *,
+    max_items: int = MAX_UNIQUE_TEXT_GEOMETRY_ITEMS,
+) -> dict[str, object]:
+    """Return page-only signed geometry diagnostics for unique word tokens."""
+    return _unique_text_geometry_metrics(
+        rxls.words,
+        libreoffice.words,
+        max_items=max_items,
+    )
+
+
+def text_line_box_unique_geometry_metrics(
+    rxls: PdfTextPage,
+    libreoffice: PdfTextPage,
+    *,
+    max_items: int = MAX_UNIQUE_TEXT_GEOMETRY_ITEMS,
+) -> dict[str, object]:
+    """Return page-only signed geometry diagnostics for unique line tokens."""
+    return _unique_text_geometry_metrics(
+        rxls.lines,
+        libreoffice.lines,
+        max_items=max_items,
     )
 
 
@@ -7749,6 +8226,16 @@ def evaluate_case(
                 resolved_rxls_text_box_pages[page_offset],
                 libreoffice_text_box_pages[page_offset],
             )
+            text_box_unique_geometry = text_box_unique_geometry_metrics(
+                resolved_rxls_text_box_pages[page_offset],
+                libreoffice_text_box_pages[page_offset],
+            )
+            text_line_box_unique_geometry = (
+                text_line_box_unique_geometry_metrics(
+                    resolved_rxls_text_box_pages[page_offset],
+                    libreoffice_text_box_pages[page_offset],
+                )
+            )
             point_geometry = pdf_point_geometry_metrics(
                 resolved_rxls_raster_rows[page_offset],
                 lo_rows[page_offset],
@@ -7764,6 +8251,10 @@ def evaluate_case(
                     **semantic,
                     **text_boxes,
                     **text_line_boxes,
+                    "text_box_unique_geometry": text_box_unique_geometry,
+                    "text_line_box_unique_geometry": (
+                        text_line_box_unique_geometry
+                    ),
                     **point_geometry,
                 }
             )
@@ -7796,8 +8287,11 @@ def evaluate_case(
         classification,
         renderer=bundle.renderer,
         scenes=scene_evidence,
-        metrics=aggregate,
-        pages=page_results,
+        **_retained_metric_evidence(
+            status,
+            aggregate,
+            page_results,
+        ),
         artifacts={
             "rxls_pages": len(resolved_rxls_pngs),
             "libreoffice_pages": len(lo_pngs),
@@ -8054,6 +8548,45 @@ def metric_cohorts(results: Sequence[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def authored_print_summary(
+    results: Sequence[dict[str, object]],
+    print_mode: str,
+) -> dict[str, object] | None:
+    """Recompute the exact authored-print aggregate for producers and mergers."""
+    if print_mode != PRINT_MODE_AUTHORED:
+        return None
+    authored_rows = [
+        result["authored_print"]
+        for result in results
+        if isinstance(result.get("authored_print"), dict)
+    ]
+    modes = Counter(str(row.get("scale_mode")) for row in authored_rows)
+    return {
+        "attested_workbooks": len(authored_rows),
+        "by_scale_mode": dict(sorted(modes.items())),
+        "expected_page_box_pixels": {"height": 1056, "width": 816},
+        "header_footer_workbooks": sum(
+            row.get("header_footer") is True for row in authored_rows
+        ),
+        "manual_break_workbooks": sum(
+            int(row.get("manual_row_breaks", 0)) > 0
+            and int(row.get("manual_col_breaks", 0)) > 0
+            for row in authored_rows
+        ),
+        "margin_workbooks": sum(
+            row.get("margins") is True for row in authored_rows
+        ),
+        "paper_size_workbooks": sum(
+            row.get("paper_code") == 1 for row in authored_rows
+        ),
+        "repeated_title_workbooks": sum(
+            row.get("repeated_rows") is True
+            and row.get("repeated_cols") is True
+            for row in authored_rows
+        ),
+    }
+
+
 def run_harness(
     cases: Sequence[InputCase],
     *,
@@ -8083,9 +8616,15 @@ def run_harness(
     )
     results = []
     total_input_bytes = 0
+    geometry_pages = 0
+    geometry_histogram_buckets = 0
+    geometry_budget_exhausted = False
+    geometry_page_budget, geometry_histogram_bucket_budget = (
+        _geometry_report_budget(discovery)
+    )
     with tempfile.TemporaryDirectory(prefix="rxls-render-parity-") as raw_work:
         for index, case in enumerate(cases):
-            size, _ = _safe_stat(case.path)
+            size, stat_error = _safe_stat(case.path)
             if size is not None and total_input_bytes + size > config.caps.max_total_input_bytes:
                 results.append(
                     _classified(
@@ -8097,20 +8636,51 @@ def run_harness(
                 continue
             if size is not None:
                 total_input_bytes += size
+            if geometry_budget_exhausted:
+                results.append(
+                    _identity_only_result(
+                        case,
+                        size,
+                        stat_error=stat_error,
+                        max_input_bytes=config.caps.max_input_bytes,
+                        status="error",
+                        classification=(
+                            "text_box_unique_geometry_report_limit"
+                        ),
+                    )
+                )
+                continue
             with tempfile.TemporaryDirectory(
                 prefix=f"case-{index:04d}-",
                 dir=raw_work,
             ) as raw_case:
-                results.append(
-                    evaluate_case(
-                        case,
-                        index=index,
-                        work_root=Path(raw_case),
-                        config=config,
-                        backends=backends,
-                        runner=runner,
-                    )
+                result = evaluate_case(
+                    case,
+                    index=index,
+                    work_root=Path(raw_case),
+                    config=config,
+                    backends=backends,
+                    runner=runner,
                 )
+            result_pages, result_buckets = (
+                _unique_text_geometry_result_complexity(result)
+            )
+            if (
+                geometry_pages + result_pages
+                > geometry_page_budget
+                or geometry_histogram_buckets + result_buckets
+                > geometry_histogram_bucket_budget
+            ):
+                result = _classified(
+                    _bounded_geometry_result(result),
+                    "error",
+                    "text_box_unique_geometry_report_limit",
+                )
+                geometry_budget_exhausted = True
+            else:
+                geometry_pages += result_pages
+                geometry_histogram_buckets += result_buckets
+            results.append(result)
 
     counts: dict[str, int] = {}
     classifications: dict[str, int] = {}
@@ -8124,31 +8694,7 @@ def run_harness(
         config=config,
     )
     effective_oracle_evidence = oracle_evidence or container_oracle_evidence
-    authored_rows = [
-        result["authored_print"]
-        for result in results
-        if isinstance(result.get("authored_print"), dict)
-    ]
-    authored_print_summary = None
-    if config.print_mode == PRINT_MODE_AUTHORED:
-        modes = Counter(str(row.get("scale_mode")) for row in authored_rows)
-        authored_print_summary = {
-            "attested_workbooks": len(authored_rows),
-            "by_scale_mode": dict(sorted(modes.items())),
-            "expected_page_box_pixels": {"height": 1056, "width": 816},
-            "header_footer_workbooks": sum(row.get("header_footer") is True for row in authored_rows),
-            "manual_break_workbooks": sum(
-                int(row.get("manual_row_breaks", 0)) > 0
-                and int(row.get("manual_col_breaks", 0)) > 0
-                for row in authored_rows
-            ),
-            "margin_workbooks": sum(row.get("margins") is True for row in authored_rows),
-            "paper_size_workbooks": sum(row.get("paper_code") == 1 for row in authored_rows),
-            "repeated_title_workbooks": sum(
-                row.get("repeated_rows") is True and row.get("repeated_cols") is True
-                for row in authored_rows
-            ),
-        }
+    authored_summary = authored_print_summary(results, config.print_mode)
     evidence = {
         "schema": EVIDENCE_SCHEMA,
         "mode": "dry_run" if config.dry_run else "compare",
@@ -8211,6 +8757,9 @@ def run_harness(
                 "text_box_geometry": "nominal_poppler_layout_not_ink_bounds",
                 "text_box_error_units": "millipoints",
                 "text_box_content_retained": False,
+                "unique_text_geometry": copy.deepcopy(
+                    UNIQUE_TEXT_GEOMETRY_POLICY
+                ),
                 "bounding_boxes_are_inclusive": True,
                 "aggregate_pages_are_stacked_vertically": True,
                 "centroid_units_per_pixel": 1000,
@@ -8253,13 +8802,14 @@ def run_harness(
             "by_status": dict(sorted(counts.items())),
             "by_classification": dict(sorted(classifications.items())),
             "metric_cohorts": metric_cohorts(results),
-            "authored_print": authored_print_summary,
+            "authored_print": authored_summary,
         },
         "files": results,
     }
     has_error = counts.get("error", 0) > 0 or counts.get("different", 0) > 0
     incomparable = counts.get("skipped", 0) > 0
     exit_code = 1 if has_error or (config.fail_on_incomparable and incomparable) else 0
+    validate_evidence_report_limits(evidence)
     return evidence, exit_code
 
 
@@ -8450,6 +9000,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--locale must be a locale identifier, not a path or command")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         parser.error("--shard-index must be in [0, --shard-count)")
+    if args.shard_count > MAX_RENDER_PARITY_SHARDS:
+        parser.error(
+            f"--shard-count must be at most {MAX_RENDER_PARITY_SHARDS}"
+        )
     return args
 
 
@@ -8605,8 +9159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence, exit_code = run_harness(cases, discovery=discovery, config=config)
         rendered = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
         if args.report:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(rendered, encoding="utf-8")
+            write_report_atomic(args.report, rendered)
         else:
             sys.stdout.write(rendered)
         return exit_code

@@ -471,6 +471,21 @@ def _validate_package(spec: CaseSpec, payload: bytes) -> None:
         or size.attrib.get("val") != str(spec.font_size)
     ):
         raise OracleCorpusError("Normal font mismatch")
+    a1 = sheet.find("s:sheetData/s:row[@r='1']/s:c[@r='A1']", namespace)
+    style_xfs = styles.findall("s:cellStyleXfs/s:xf", namespace)
+    cell_xfs = styles.findall("s:cellXfs/s:xf", namespace)
+    if (
+        a1 is None
+        or "s" in a1.attrib
+        or len(style_xfs) != 1
+        or len(cell_xfs) != 1
+        or any(
+            "applyAlignment" in xf.attrib
+            or xf.find("s:alignment", namespace) is not None
+            for xf in (*style_xfs, *cell_xfs)
+        )
+    ):
+        raise OracleCorpusError("implicit vertical alignment contract")
     row_four = sheet.find("s:sheetData/s:row[@r='4']", namespace)
     expected_row = {
         "explicit-row-height": {"customHeight": "1", "ht": "21", "r": "4"},

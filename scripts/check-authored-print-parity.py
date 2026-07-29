@@ -14,10 +14,27 @@ from collections import Counter
 from fractions import Fraction
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any, Sequence
+
+try:
+    from render_parity_geometry_gate import (
+        GeometryContractError,
+        validate_report_geometry,
+    )
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.render_parity_geometry_gate import (
+        GeometryContractError,
+        validate_report_geometry,
+    )
+try:
+    from strict_json_contract import type_exact_equal
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.strict_json_contract import type_exact_equal
 
 
 EVIDENCE_SCHEMA = "rxls.libreoffice-render-parity.v1"
@@ -31,6 +48,9 @@ CONTAINER_LIBREOFFICE_ARTIFACT_SHA256 = (
 )
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 MAX_REPORT_BYTES = 256 * 1024 * 1024
+MAX_JSON_DEPTH = 128
+MAX_JSON_NODES = 2_000_000
+MAX_JSON_INTEGER_DIGITS = 128
 MAX_WORKBOOKS = 10_000
 MAX_PAGES = 100_000
 PAGE_MEDIAN_MAX_MILLIPOINTS = 1_000
@@ -76,10 +96,41 @@ PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
 )
 PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
 PDF_XHTML_CROSSCHECK_MAX_MICROPOINTS = 1_000
+UNIQUE_TEXT_GEOMETRY_POLICY = {
+    "content_retained": False,
+    "coordinates": "pdf_points_y_down",
+    "delta_direction": "rxls_minus_libreoffice",
+    "diagnostic_only": True,
+    "exact_delta_absolute_limit_millipoints": 1_000_000_000,
+    "exact_summary": "count_sum_min_max_and_signed_overflow_counts",
+    "histogram": {
+        "exact_absolute_limit_millipoints": 2,
+        "max_buckets_per_axis": 21,
+        "middle_absolute_limit_millipoints": 1_000,
+        "middle_bucket_width_millipoints": 500,
+        "outer_absolute_limit_millipoints": 10_000,
+        "outer_bucket_width_millipoints": 2_000,
+        "overflow_bucket_absolute_millipoints": 12_000,
+        "rounding": (
+            "nearest_width_multiple_half_away_from_zero_with_nonzero_sign_preserved"
+        ),
+    },
+    "max_geometry_pages_per_report": 2_000,
+    "max_histogram_buckets_per_report": 50_000,
+    "max_items_per_side_per_page": 250_000,
+    "matching": "exact_normalized_token_tuple_unique_on_both_sides",
+    "rounding": "nearest_millipoint_half_away_from_zero_exact_rational",
+    "shard_budget": "equal_floor_partition_by_declared_shard_count",
+    "units": "millipoints",
+}
 
 
 class GateError(RuntimeError):
     """The report is malformed or violates the authored-print contract."""
+
+
+class _StrictJSONError(ValueError):
+    pass
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -91,17 +142,152 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
     return result
 
 
-def _read(path: Path) -> tuple[dict[str, Any], str, int]:
+def _reject_json_constant(_value: str) -> object:
+    raise _StrictJSONError("non_finite_number")
+
+
+def _reject_json_number(_value: str) -> object:
+    raise _StrictJSONError("non_integral_number")
+
+
+def _parse_json_integer(token: str) -> int:
+    digits = token[1:] if token.startswith("-") else token
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise _StrictJSONError("integer_limit")
+    return int(token)
+
+
+def _preflight_json_text(text: str) -> None:
+    closers: list[str] = []
+    structural_nodes = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        if character in "[{":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise _StrictJSONError("json_complexity")
+            closers.append("]" if character == "[" else "}")
+            if len(closers) > MAX_JSON_DEPTH:
+                raise _StrictJSONError("json_depth")
+        elif character in "]}":
+            if not closers or closers.pop() != character:
+                raise _StrictJSONError("json_structure")
+        elif character == ",":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise _StrictJSONError("json_complexity")
+        elif character == "-" or "0" <= character <= "9":
+            start = index
+            if character == "-":
+                index += 1
+            digit_start = index
+            while index < len(text) and "0" <= text[index] <= "9":
+                index += 1
+            if index == digit_start:
+                index = start + 1
+                continue
+            if index - digit_start > MAX_JSON_INTEGER_DIGITS:
+                raise _StrictJSONError("integer_limit")
+            if index < len(text) and text[index] in ".eE":
+                raise _StrictJSONError("non_integral_number")
+            continue
+        index += 1
+    if closers:
+        raise _StrictJSONError("json_structure")
+
+
+def _stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_bounded_regular_file(path: Path, maximum: int) -> bytes:
+    descriptor: int | None = None
     try:
-        size = path.stat().st_size
-        payload = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise GateError("report_unreadable")
+        remaining = maximum + 1
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except GateError:
+        raise
     except OSError as error:
         raise GateError("report_unreadable") from error
-    if not 0 < size <= MAX_REPORT_BYTES or len(payload) != size:
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or _stat_signature(before) != _stat_signature(after)
+        or _stat_signature(after) != _stat_signature(current)
+    ):
+        raise GateError("report_unreadable")
+    payload = b"".join(chunks)
+    if not payload or len(payload) > maximum:
         raise GateError("report_size")
+    if len(payload) != after.st_size:
+        raise GateError("report_unreadable")
+    return payload
+
+
+def _read(path: Path) -> tuple[dict[str, Any], str, int]:
+    payload = _read_bounded_regular_file(path, MAX_REPORT_BYTES)
+    size = len(payload)
     try:
-        document = json.loads(payload, object_pairs_hook=_reject_duplicate_pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        text = payload.decode("utf-8")
+        _preflight_json_text(text)
+        document = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+            parse_float=_reject_json_number,
+            parse_int=_parse_json_integer,
+        )
+    except GateError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _StrictJSONError,
+        RecursionError,
+        ValueError,
+    ) as error:
         raise GateError("report_json") from error
     if not isinstance(document, dict):
         raise GateError("report_shape")
@@ -120,6 +306,68 @@ def _integer(
     if maximum is not None and value > maximum:
         raise GateError(code)
     return value
+
+
+def _validate_complete_discovery(value: object, file_count: int) -> None:
+    required = {
+        "candidate_count",
+        "pre_shard_selected_count",
+        "selected_count",
+        "shard_candidate_count",
+        "shard_count",
+        "shard_index",
+        "truncated",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise GateError("discovery_shape")
+    shard_count = _integer(
+        value.get("shard_count"),
+        "campaign_incomplete",
+        minimum=1,
+        maximum=256,
+    )
+    shard_index = _integer(
+        value.get("shard_index"),
+        "campaign_incomplete",
+        maximum=255,
+    )
+    if (
+        shard_count != 1
+        or shard_index != 0
+        or value.get("truncated") is not False
+    ):
+        raise GateError("campaign_incomplete")
+    selected = _integer(
+        value.get("selected_count"),
+        "campaign_coverage",
+        minimum=1,
+        maximum=MAX_WORKBOOKS,
+    )
+    pre_shard = _integer(
+        value.get("pre_shard_selected_count"),
+        "campaign_coverage",
+        minimum=1,
+        maximum=MAX_WORKBOOKS,
+    )
+    shard_candidates = _integer(
+        value.get("shard_candidate_count"),
+        "campaign_coverage",
+        minimum=1,
+        maximum=MAX_WORKBOOKS,
+    )
+    candidates = _integer(
+        value.get("candidate_count"),
+        "campaign_coverage",
+        minimum=1,
+        maximum=MAX_WORKBOOKS,
+    )
+    if (
+        selected != file_count
+        or pre_shard != selected
+        or shard_candidates != selected
+        or candidates < selected
+    ):
+        raise GateError("campaign_coverage")
 
 
 def _sha(value: object, code: str) -> str:
@@ -768,6 +1016,7 @@ def _metric_policy(configuration: dict[str, Any]) -> None:
         not isinstance(policy, dict)
         or policy.get("contract_schema") != METRIC_CONTRACT_SCHEMA
         or policy.get("contract_version") != 2
+        or type(policy.get("mask_match_tolerance_pixels")) is not int
         or policy.get("mask_match_tolerance_pixels") != 1
         or policy.get("edge_luma_delta") != 32
         or policy.get("semantic_content_retained") is not False
@@ -789,6 +1038,10 @@ def _metric_policy(configuration: dict[str, Any]) -> None:
         != "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
         or policy.get("text_box_geometry")
         != "nominal_poppler_layout_not_ink_bounds"
+        or not type_exact_equal(
+            policy.get("unique_text_geometry"),
+            UNIQUE_TEXT_GEOMETRY_POLICY,
+        )
         or not isinstance(implementation, dict)
         or implementation.get("kind") != "numpy_integer_exact_v1"
         or not isinstance(implementation.get("version"), str)
@@ -818,6 +1071,7 @@ def _attestation(row: dict[str, Any]) -> str:
     if (
         evidence.get("expected_page_width_pixels") != EXPECTED_PAGE_WIDTH
         or evidence.get("expected_page_height_pixels") != EXPECTED_PAGE_HEIGHT
+        or type(evidence.get("paper_code")) is not int
         or evidence.get("paper_code") != 1
         or evidence.get("header_footer") is not True
         or evidence.get("margins") is not True
@@ -1022,11 +1276,22 @@ def evaluate(
         or not 1 <= len(files) <= MAX_WORKBOOKS
         or len(files) != expected_workbooks
         or not isinstance(summary, dict)
-        or summary.get("files") != len(files)
-        or summary.get("by_status") != {"compared": len(files)}
-        or summary.get("by_classification") != {"within_threshold": len(files)}
+        or not type_exact_equal(summary.get("files"), len(files))
+        or not type_exact_equal(
+            summary.get("by_status"),
+            {"compared": len(files)},
+        )
+        or not type_exact_equal(
+            summary.get("by_classification"),
+            {"within_threshold": len(files)},
+        )
     ):
         raise GateError("workbook_coverage")
+    _validate_complete_discovery(report.get("discovery"), len(files))
+    try:
+        validate_report_geometry(files)
+    except GeometryContractError as error:
+        raise GateError(str(error)) from error
     manifest_binding = _configuration_manifest_binding(
         configuration,
         files,

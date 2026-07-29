@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import copy
 from fractions import Fraction
 import hashlib
 import json
@@ -14,11 +15,16 @@ import re
 import stat
 import sys
 import tempfile
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
+
+try:
+    from strict_json_contract import type_exact_equal
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.strict_json_contract import type_exact_equal
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v5"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v6"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -41,6 +47,15 @@ RAW_REPORT_RE = re.compile(
     r"authored-print-report|authored-print-shard-)"
 )
 STATUSES = frozenset({"compared", "different", "error", "skipped"})
+METRIC_BEARING_STATUSES = frozenset({"compared", "different"})
+PREIDENTITY_CLASSIFICATION_STATUSES = {
+    "corpus_input_budget_exceeded": "skipped",
+    "input_limit": "skipped",
+    "manifest_size_mismatch": "error",
+    "missing_input": "skipped",
+    "symlink_input": "skipped",
+    "unreadable_input": "skipped",
+}
 FORMATS = frozenset({"ods", "xls", "xlsb", "xlsx"})
 UNREVIEWED_CLASSIFICATION = "unreviewed_classification"
 # This is deliberately a finite public vocabulary. It covers the stable terminal
@@ -307,6 +322,184 @@ GEOMETRY_DELTA_KEYS = {
     "max_absolute_micropoints",
     "nonzero_pages",
 }
+TEXT_GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+TEXT_GEOMETRY_POLICY = {
+    "content_retained": False,
+    "coordinates": "pdf_points_y_down",
+    "delta_direction": "rxls_minus_libreoffice",
+    "diagnostic_only": True,
+    "exact_delta_absolute_limit_millipoints": 1_000_000_000,
+    "exact_summary": "count_sum_min_max_and_signed_overflow_counts",
+    "histogram": {
+        "exact_absolute_limit_millipoints": 2,
+        "max_buckets_per_axis": 21,
+        "middle_absolute_limit_millipoints": 1_000,
+        "middle_bucket_width_millipoints": 500,
+        "outer_absolute_limit_millipoints": 10_000,
+        "outer_bucket_width_millipoints": 2_000,
+        "overflow_bucket_absolute_millipoints": 12_000,
+        "rounding": (
+            "nearest_width_multiple_half_away_from_zero_"
+            "with_nonzero_sign_preserved"
+        ),
+    },
+    "max_geometry_pages_per_report": 2_000,
+    "max_histogram_buckets_per_report": 50_000,
+    "max_items_per_side_per_page": 250_000,
+    "matching": "exact_normalized_token_tuple_unique_on_both_sides",
+    "rounding": "nearest_millipoint_half_away_from_zero_exact_rational",
+    "shard_budget": "equal_floor_partition_by_declared_shard_count",
+    "units": "millipoints",
+}
+TEXT_GEOMETRY_PAGE_KEYS = {
+    "delta_histograms_millipoints",
+    "exact_delta_summaries_millipoints",
+    "libreoffice_unique_items",
+    "matched_items",
+    "rxls_unique_items",
+}
+TEXT_GEOMETRY_EXACT_SUMMARY_KEYS = {
+    "count",
+    "max_delta_millipoints",
+    "min_delta_millipoints",
+    "negative_overflow_items",
+    "positive_overflow_items",
+    "sum_delta_millipoints",
+}
+TEXT_GEOMETRY_BUCKET_KEYS = {"count", "delta_millipoints"}
+TEXT_GEOMETRY_OUTPUT_KEYS = {"all", "by_format"}
+TEXT_GEOMETRY_COHORT_KEYS = {
+    "by_axis",
+    "libreoffice_unique_items",
+    "matched_items",
+    "pages",
+    "rxls_unique_items",
+    "workbooks",
+}
+TEXT_GEOMETRY_AXIS_KEYS = {
+    "exact",
+    "histogram",
+}
+MAX_TEXT_GEOMETRY_UNIQUE_ITEMS = 250_000
+MAX_TEXT_GEOMETRY_HISTOGRAM_BUCKETS = 21
+MAX_TEXT_GEOMETRY_REPORT_PAGES = 2_000
+MAX_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS = 50_000
+MAX_TEXT_GEOMETRY_DELTA_MILLIPOINTS = 1_000_000_000
+TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS = 2
+TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS = 1_000
+TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS = 500
+TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS = 10_000
+TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS = 2_000
+TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS = 12_000
+TEXT_GEOMETRY_ALLOWED_BUCKETS = frozenset(
+    range(-2, 3)
+) | frozenset(
+    value
+    for magnitude in (500, 1_000)
+    for value in (-magnitude, magnitude)
+) | frozenset(
+    value
+    for magnitude in range(2_000, 10_001, 2_000)
+    for value in (-magnitude, magnitude)
+) | {
+    -TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+    TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+}
+
+
+def _text_geometry_bucket(delta_millipoints: int) -> int:
+    magnitude = abs(delta_millipoints)
+    if magnitude <= TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS:
+        return delta_millipoints
+    if magnitude <= TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS:
+        width = TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        bucket = max(width, (magnitude + width // 2) // width * width)
+    elif magnitude <= TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        bucket = (magnitude + width // 2) // width * width
+    else:
+        bucket = TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS
+    return -bucket if delta_millipoints < 0 else bucket
+
+
+def _text_geometry_bucket_interval(
+    bucket_millipoints: int,
+) -> tuple[int, int]:
+    magnitude = abs(bucket_millipoints)
+    if magnitude <= TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS:
+        lower = magnitude
+        upper = magnitude
+    elif magnitude <= TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS:
+        width = TEXT_GEOMETRY_MIDDLE_BUCKET_MILLIPOINTS
+        lower = (
+            TEXT_GEOMETRY_EXACT_LIMIT_MILLIPOINTS + 1
+            if magnitude == width
+            else magnitude - width // 2
+        )
+        upper = min(
+            TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS,
+            magnitude + width // 2 - 1,
+        )
+    elif magnitude <= TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = TEXT_GEOMETRY_OUTER_BUCKET_MILLIPOINTS
+        lower = max(
+            TEXT_GEOMETRY_MIDDLE_LIMIT_MILLIPOINTS + 1,
+            magnitude - width // 2,
+        )
+        upper = min(
+            TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS,
+            magnitude + width // 2 - 1,
+        )
+    elif magnitude == TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS:
+        lower = TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS + 1
+        upper = MAX_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+    else:
+        raise SummaryError("text_geometry_bucket")
+    return (-upper, -lower) if bucket_millipoints < 0 else (lower, upper)
+
+
+def _text_geometry_exact_sum_bounds(
+    histogram: Counter[int],
+    minimum: int,
+    maximum: int,
+    code: str,
+) -> tuple[int, int]:
+    minimum_bucket = _text_geometry_bucket(minimum)
+    maximum_bucket = _text_geometry_bucket(maximum)
+    if (
+        minimum < maximum
+        and minimum_bucket == maximum_bucket
+        and histogram[minimum_bucket] < 2
+    ):
+        raise SummaryError(code)
+    lower_total = 0
+    upper_total = 0
+    effective_intervals: dict[int, tuple[int, int]] = {}
+    for bucket, count in histogram.items():
+        bucket_lower, bucket_upper = _text_geometry_bucket_interval(bucket)
+        lower = max(bucket_lower, minimum)
+        upper = min(bucket_upper, maximum)
+        if lower > upper:
+            raise SummaryError(code)
+        effective_intervals[bucket] = (lower, upper)
+        lower_total += lower * count
+        upper_total += upper * count
+    maximum_lower = effective_intervals[maximum_bucket][0]
+    minimum_upper = effective_intervals[minimum_bucket][1]
+    lower_total += maximum - maximum_lower
+    upper_total -= minimum_upper - minimum
+    if lower_total > upper_total:
+        raise SummaryError(code)
+    return lower_total, upper_total
 
 
 class SummaryError(RuntimeError):
@@ -418,6 +611,16 @@ def _integer(value: object, code: str, maximum: int) -> int:
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 0 <= value <= maximum
+    ):
+        raise SummaryError(code)
+    return value
+
+
+def _signed_integer(value: object, code: str, maximum: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not -maximum <= value <= maximum
     ):
         raise SummaryError(code)
     return value
@@ -649,6 +852,407 @@ def _row_point_geometry(
     return parsed_pages, mismatch_pages
 
 
+def _text_geometry_exact_summary(
+    value: object,
+    *,
+    matched: int,
+    histogram: Counter[int],
+    code: str,
+) -> dict[str, int | None]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != TEXT_GEOMETRY_EXACT_SUMMARY_KEYS
+    ):
+        raise SummaryError(code)
+    count = _integer(value["count"], code, matched)
+    if count != matched:
+        raise SummaryError(code)
+    total = _signed_integer(
+        value["sum_delta_millipoints"],
+        code,
+        matched * MAX_TEXT_GEOMETRY_DELTA_MILLIPOINTS,
+    )
+    negative_overflow = _integer(
+        value["negative_overflow_items"], code, matched
+    )
+    positive_overflow = _integer(
+        value["positive_overflow_items"], code, matched
+    )
+    if (
+        histogram.get(-TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0)
+        != negative_overflow
+        or histogram.get(TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0)
+        != positive_overflow
+    ):
+        raise SummaryError(code)
+
+    raw_minimum = value["min_delta_millipoints"]
+    raw_maximum = value["max_delta_millipoints"]
+    if matched == 0:
+        if (
+            raw_minimum is not None
+            or raw_maximum is not None
+            or total != 0
+            or negative_overflow != 0
+            or positive_overflow != 0
+        ):
+            raise SummaryError(code)
+        minimum = None
+        maximum = None
+    else:
+        minimum = _signed_integer(
+            raw_minimum, code, MAX_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+        )
+        maximum = _signed_integer(
+            raw_maximum, code, MAX_TEXT_GEOMETRY_DELTA_MILLIPOINTS
+        )
+        if (
+            minimum > maximum
+            or _text_geometry_bucket(minimum) != min(histogram)
+            or _text_geometry_bucket(maximum) != max(histogram)
+            or (
+                matched == 1
+                and not minimum == maximum == total
+            )
+            or (negative_overflow > 0)
+            != (minimum < -TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS)
+            or (positive_overflow > 0)
+            != (maximum > TEXT_GEOMETRY_OUTER_LIMIT_MILLIPOINTS)
+        ):
+            raise SummaryError(code)
+        sum_lower, sum_upper = _text_geometry_exact_sum_bounds(
+            histogram, minimum, maximum, code
+        )
+        if not sum_lower <= total <= sum_upper:
+            raise SummaryError(code)
+    return {
+        "count": count,
+        "max_delta_millipoints": maximum,
+        "min_delta_millipoints": minimum,
+        "negative_overflow_items": negative_overflow,
+        "positive_overflow_items": positive_overflow,
+        "sum_delta_millipoints": total,
+    }
+
+
+def _validate_text_geometry_axis_identities(
+    summaries: dict[str, dict[str, int | None]],
+    matched: int,
+    code: str,
+) -> None:
+    sums = {
+        axis: int(summary["sum_delta_millipoints"])
+        for axis, summary in summaries.items()
+    }
+    if (
+        abs(sums["width"] - (sums["x_max"] - sums["x_min"]))
+        > matched
+        or abs(
+            2 * sums["center_x"] - sums["x_min"] - sums["x_max"]
+        )
+        > matched
+        or abs(sums["height"] - (sums["y_max"] - sums["y_min"]))
+        > matched
+        or abs(
+            2 * sums["center_y"] - sums["y_min"] - sums["y_max"]
+        )
+        > matched
+    ):
+        raise SummaryError(code)
+
+
+def _page_unique_text_geometry(
+    value: object,
+) -> dict[str, object]:
+    code = "text_geometry_page"
+    if not isinstance(value, dict) or set(value) != TEXT_GEOMETRY_PAGE_KEYS:
+        raise SummaryError(code)
+    rxls_unique = _integer(
+        value["rxls_unique_items"],
+        code,
+        MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+    )
+    libreoffice_unique = _integer(
+        value["libreoffice_unique_items"],
+        code,
+        MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+    )
+    matched = _integer(
+        value["matched_items"],
+        code,
+        MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+    )
+    if matched > min(rxls_unique, libreoffice_unique):
+        raise SummaryError(code)
+
+    raw_histograms = value["delta_histograms_millipoints"]
+    raw_exact_summaries = value["exact_delta_summaries_millipoints"]
+    if (
+        not isinstance(raw_histograms, dict)
+        or set(raw_histograms) != set(TEXT_GEOMETRY_AXES)
+        or not isinstance(raw_exact_summaries, dict)
+        or set(raw_exact_summaries) != set(TEXT_GEOMETRY_AXES)
+    ):
+        raise SummaryError(code)
+    histograms: dict[str, Counter[int]] = {}
+    exact_summaries: dict[str, dict[str, int | None]] = {}
+    for axis in TEXT_GEOMETRY_AXES:
+        raw_histogram = raw_histograms[axis]
+        if (
+            not isinstance(raw_histogram, list)
+            or len(raw_histogram) > MAX_TEXT_GEOMETRY_HISTOGRAM_BUCKETS
+        ):
+            raise SummaryError(code)
+        histogram: Counter[int] = Counter()
+        previous_delta: int | None = None
+        count = 0
+        for bucket in raw_histogram:
+            if (
+                not isinstance(bucket, dict)
+                or set(bucket) != TEXT_GEOMETRY_BUCKET_KEYS
+            ):
+                raise SummaryError(code)
+            delta = _signed_integer(
+                bucket["delta_millipoints"],
+                code,
+                TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+            )
+            if (
+                delta not in TEXT_GEOMETRY_ALLOWED_BUCKETS
+                or (previous_delta is not None and delta <= previous_delta)
+            ):
+                raise SummaryError(code)
+            previous_delta = delta
+            bucket_count = _integer(bucket["count"], code, matched)
+            if bucket_count == 0:
+                raise SummaryError(code)
+            histogram[delta] = bucket_count
+            count += bucket_count
+        if count != matched:
+            raise SummaryError(code)
+        histograms[axis] = histogram
+        exact_summaries[axis] = _text_geometry_exact_summary(
+            raw_exact_summaries[axis],
+            matched=matched,
+            histogram=histogram,
+            code=code,
+        )
+    _validate_text_geometry_axis_identities(
+        exact_summaries, matched, code
+    )
+    return {
+        "exact_summaries": exact_summaries,
+        "histograms": histograms,
+        "libreoffice_unique_items": libreoffice_unique,
+        "matched_items": matched,
+        "rxls_unique_items": rxls_unique,
+    }
+
+
+def _row_unique_text_geometry(
+    row: dict[str, Any],
+) -> list[tuple[dict[str, object], dict[str, object]]] | None:
+    pages = row.get("pages")
+    if not isinstance(pages, list):
+        return None
+    keys = (
+        "text_box_unique_geometry",
+        "text_line_box_unique_geometry",
+    )
+    presence = [
+        tuple(key in page for key in keys)
+        if isinstance(page, dict)
+        else (False, False)
+        for page in pages
+    ]
+    if any(pair != (True, True) for pair in presence):
+        raise SummaryError("text_geometry_page")
+    result = []
+    for page in pages:
+        word = _page_unique_text_geometry(page[keys[0]])
+        line = _page_unique_text_geometry(page[keys[1]])
+        for geometry, prefix in (
+            (word, "text_box"),
+            (line, "text_line_box"),
+        ):
+            rxls_items = _integer(
+                page.get(f"{prefix}_rxls_items"),
+                "text_geometry_page",
+                MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+            )
+            libreoffice_items = _integer(
+                page.get(f"{prefix}_libreoffice_items"),
+                "text_geometry_page",
+                MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+            )
+            paired_items = _integer(
+                page.get(f"{prefix}_matched_items"),
+                "text_geometry_page",
+                MAX_TEXT_GEOMETRY_UNIQUE_ITEMS,
+            )
+            if (
+                geometry["rxls_unique_items"] > rxls_items
+                or geometry["libreoffice_unique_items"]
+                > libreoffice_items
+                or geometry["matched_items"] > paired_items
+            ):
+                raise SummaryError("text_geometry_page")
+        result.append((word, line))
+    return result
+
+
+def _text_geometry_complexity(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[int, int]:
+    """Count the strict diagnostic surface in one complete report fragment."""
+    pages = 0
+    histogram_buckets = 0
+    for row in rows:
+        geometry_pages = _row_unique_text_geometry(row)
+        if geometry_pages is None:
+            continue
+        pages += len(geometry_pages)
+        histogram_buckets += sum(
+            len(geometry["histograms"][axis])
+            for pair in geometry_pages
+            for geometry in pair
+            for axis in TEXT_GEOMETRY_AXES
+        )
+    return pages, histogram_buckets
+
+
+def _new_text_geometry_accumulator() -> dict[str, object]:
+    return {
+        "exact_summaries": {
+            axis: {
+                "count": 0,
+                "max_delta_millipoints": None,
+                "min_delta_millipoints": None,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": 0,
+            }
+            for axis in TEXT_GEOMETRY_AXES
+        },
+        "histograms": {
+            axis: Counter() for axis in TEXT_GEOMETRY_AXES
+        },
+        "libreoffice_unique_items": 0,
+        "matched_items": 0,
+        "pages": 0,
+        "rxls_unique_items": 0,
+        "workbooks": 0,
+    }
+
+
+def _merge_text_geometry_page(
+    accumulator: dict[str, object], page: dict[str, object]
+) -> None:
+    accumulator["pages"] += 1
+    for key in (
+        "libreoffice_unique_items",
+        "matched_items",
+        "rxls_unique_items",
+    ):
+        accumulator[key] += page[key]
+    histograms = accumulator["histograms"]
+    page_histograms = page["histograms"]
+    exact_summaries = accumulator["exact_summaries"]
+    page_exact_summaries = page["exact_summaries"]
+    for axis in TEXT_GEOMETRY_AXES:
+        histograms[axis].update(page_histograms[axis])
+        if (
+            len(histograms[axis])
+            > MAX_TEXT_GEOMETRY_HISTOGRAM_BUCKETS
+        ):
+            raise SummaryError("text_geometry_bucket_limit")
+        exact = exact_summaries[axis]
+        page_exact = page_exact_summaries[axis]
+        exact["count"] += page_exact["count"]
+        exact["sum_delta_millipoints"] += page_exact[
+            "sum_delta_millipoints"
+        ]
+        exact["negative_overflow_items"] += page_exact[
+            "negative_overflow_items"
+        ]
+        exact["positive_overflow_items"] += page_exact[
+            "positive_overflow_items"
+        ]
+        page_minimum = page_exact["min_delta_millipoints"]
+        page_maximum = page_exact["max_delta_millipoints"]
+        if page_minimum is not None:
+            exact["min_delta_millipoints"] = (
+                page_minimum
+                if exact["min_delta_millipoints"] is None
+                else min(exact["min_delta_millipoints"], page_minimum)
+            )
+            exact["max_delta_millipoints"] = (
+                page_maximum
+                if exact["max_delta_millipoints"] is None
+                else max(exact["max_delta_millipoints"], page_maximum)
+            )
+
+
+def _finish_text_geometry_cohort(
+    accumulator: dict[str, object],
+) -> dict[str, object]:
+    matched = int(accumulator["matched_items"])
+    by_axis: dict[str, object] = {}
+    for axis in TEXT_GEOMETRY_AXES:
+        histogram = accumulator["histograms"][axis]
+        exact = accumulator["exact_summaries"][axis]
+        if len(histogram) > MAX_TEXT_GEOMETRY_HISTOGRAM_BUCKETS:
+            raise SummaryError("text_geometry_bucket_limit")
+        ordered = sorted(histogram.items())
+        count = sum(bucket_count for _, bucket_count in ordered)
+        if (
+            count != matched
+            or exact["count"] != matched
+            or histogram.get(
+                -TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            != exact["negative_overflow_items"]
+            or histogram.get(
+                TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            != exact["positive_overflow_items"]
+        ):
+            raise SummaryError("text_geometry_aggregate")
+        by_axis[axis] = {
+            "exact": dict(exact),
+            "histogram": [
+                {
+                    "count": bucket_count,
+                    "delta_millipoints": delta,
+                }
+                for delta, bucket_count in ordered
+            ],
+        }
+    return {
+        "by_axis": by_axis,
+        "libreoffice_unique_items": int(
+            accumulator["libreoffice_unique_items"]
+        ),
+        "matched_items": matched,
+        "pages": int(accumulator["pages"]),
+        "rxls_unique_items": int(accumulator["rxls_unique_items"]),
+        "workbooks": int(accumulator["workbooks"]),
+    }
+
+
+def _empty_text_geometry_cohort() -> dict[str, object]:
+    return _finish_text_geometry_cohort(
+        _new_text_geometry_accumulator()
+    )
+
+
+def _empty_text_geometry() -> dict[str, object]:
+    return {
+        "all": _empty_text_geometry_cohort(),
+        "by_format": {},
+    }
+
+
 def _empty_geometry() -> dict[str, object]:
     return {
         "by_delta": {
@@ -713,22 +1317,47 @@ def _count_map(
 
 
 def _read(path: Path, remaining: int) -> tuple[dict[str, Any], int]:
+    byte_limit = min(MAX_REPORT_BYTES, remaining)
+    if byte_limit <= 0:
+        raise SummaryError("report_type_or_size")
+    descriptor = -1
     try:
         metadata = path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode)
             or path.is_symlink()
-            or not 0 < metadata.st_size <= min(MAX_REPORT_BYTES, remaining)
+            or not 0 < metadata.st_size <= byte_limit
         ):
             raise SummaryError("report_type_or_size")
-        payload = path.read_bytes()
-        if len(payload) != metadata.st_size:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            opened = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or opened.st_size != metadata.st_size
+            ):
+                raise SummaryError("report_type_or_size")
+            payload = source.read(byte_limit + 1)
+        if (
+            len(payload) != metadata.st_size
+            or len(payload) > byte_limit
+        ):
             raise SummaryError("report_type_or_size")
         value = _strict_json_loads(payload)
     except SummaryError:
         raise
     except OSError as error:
         raise SummaryError("report_unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(value, dict):
         raise SummaryError("report_shape")
     return value, len(payload)
@@ -751,6 +1380,15 @@ def _validate_report(
         or not isinstance(value.get("summary"), dict)
     ):
         raise SummaryError("report_schema")
+    metric_policy = value["configuration"].get("metric_policy")
+    if (
+        not isinstance(metric_policy, dict)
+        or not type_exact_equal(
+            metric_policy.get("unique_text_geometry"),
+            TEXT_GEOMETRY_POLICY,
+        )
+    ):
+        raise SummaryError("metric_policy")
     rows = value["files"]
     limit = LANES[profile][label]
     if len(rows) > limit:
@@ -765,18 +1403,21 @@ def _validate_report(
         "shard_candidate_count": len(rows),
         "truncated": False,
     }
-    if any(discovery.get(key) != expected_value for key, expected_value in expected.items()):
+    if any(
+        not type_exact_equal(discovery.get(key), expected_value)
+        for key, expected_value in expected.items()
+    ):
         raise SummaryError("discovery_coverage")
     if shard is None:
         if (
-            discovery.get("shard_count") != 1
-            or discovery.get("shard_index") != 0
+            not type_exact_equal(discovery.get("shard_count"), 1)
+            or not type_exact_equal(discovery.get("shard_index"), 0)
             or len(rows) != limit
         ):
             raise SummaryError("discovery_merged")
     elif (
-        discovery.get("shard_count") != SHARDS
-        or discovery.get("shard_index") != shard
+        not type_exact_equal(discovery.get("shard_count"), SHARDS)
+        or not type_exact_equal(discovery.get("shard_index"), shard)
     ):
         raise SummaryError("discovery_shard")
 
@@ -790,6 +1431,19 @@ def _validate_report(
         format_name = row.get("format")
         features = row.get("features")
         digest = row.get("sha256")
+        digest_is_valid = (
+            isinstance(digest, str)
+            and HASH_RE.fullmatch(digest) is not None
+        )
+        digest_is_preidentity_omission = (
+            "sha256" not in row
+            and isinstance(classification, str)
+            and isinstance(status, str)
+            and PREIDENTITY_CLASSIFICATION_STATUSES.get(
+                classification
+            )
+            == status
+        )
         if (
             not isinstance(status, str)
             or status not in STATUSES
@@ -804,8 +1458,10 @@ def _validate_report(
                 for feature in features
             )
             or features != sorted(set(features))
-            or not isinstance(digest, str)
-            or HASH_RE.fullmatch(digest) is None
+            or not (
+                digest_is_valid
+                or digest_is_preidentity_omission
+            )
         ):
             raise SummaryError("workbook_contract")
         if label == "authored-print" and (
@@ -825,7 +1481,14 @@ def _validate_report(
         statuses[str(status)] += 1
         classifications[classification] += 1
     summary = value["summary"]
-    if summary.get("files") != len(rows):
+    if (
+        _integer(
+            summary.get("files"),
+            "summary_count",
+            limit,
+        )
+        != len(rows)
+    ):
         raise SummaryError("summary_count")
     if _count_map(summary.get("by_status"), len(rows), "summary_status", STATUSES) != dict(
         sorted(statuses.items())
@@ -866,7 +1529,9 @@ def _empty(label: str) -> dict[str, object]:
         "by_status": {},
         "geometry": _empty_geometry(),
         "label": label,
+        "line_geometry": _empty_text_geometry(),
         "page_count_mismatches": [],
+        "word_geometry": _empty_text_geometry(),
         "workbooks": 0,
     }
 
@@ -890,16 +1555,31 @@ def _summarize_label(
         fragment, fragment_identity = _validate_report(
             document, profile=profile, label=label, shard=shard
         )
+        fragment_pages, fragment_histogram_buckets = (
+            _text_geometry_complexity(fragment)
+        )
+        budget_divisor = SHARDS if shard is not None else 1
+        if (
+            fragment_pages
+            > MAX_TEXT_GEOMETRY_REPORT_PAGES // budget_divisor
+            or fragment_histogram_buckets
+            > (
+                MAX_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+                // budget_divisor
+            )
+        ):
+            raise SummaryError("text_geometry_report_limit")
         consumed += size
         if identity is None:
             identity = fragment_identity
         elif identity != fragment_identity:
             raise SummaryError("fragment_identity")
         for row in fragment:
-            digest = str(row["sha256"])
-            if digest in seen:
-                raise SummaryError("duplicate_workbook")
-            seen.add(digest)
+            digest = row.get("sha256")
+            if isinstance(digest, str):
+                if digest in seen:
+                    raise SummaryError("duplicate_workbook")
+                seen.add(digest)
             rows.append(row)
     if len(rows) > LANES[profile][label]:
         raise SummaryError("report_coverage")
@@ -910,6 +1590,12 @@ def _summarize_label(
     features: dict[str, Counter[str]] = {}
     page_count_mismatches: Counter[tuple[int, int]] = Counter()
     geometry = _empty_geometry()
+    word_geometry_all = _new_text_geometry_accumulator()
+    line_geometry_all = _new_text_geometry_accumulator()
+    word_geometry_by_format: dict[str, dict[str, object]] = {}
+    line_geometry_by_format: dict[str, dict[str, object]] = {}
+    text_geometry_pages = 0
+    text_geometry_histogram_buckets = 0
     for row in rows:
         status = str(row["status"])
         raw_code = str(row["classification"])
@@ -924,7 +1610,32 @@ def _summarize_label(
             page_count_mismatches[
                 _page_count_pair(row, "page_count_diagnostic")
             ] += 1
-        row_geometry = _row_point_geometry(row)
+        # Retained command diagnostics on terminal rows are incomparable and
+        # are deliberately stripped from every public metric aggregate.
+        if status in METRIC_BEARING_STATUSES:
+            row_geometry = _row_point_geometry(row)
+            text_geometry = _row_unique_text_geometry(row)
+        else:
+            row_geometry = None
+            text_geometry = None
+        if status in METRIC_BEARING_STATUSES and (
+            row_geometry is None or text_geometry is None
+        ):
+            raise SummaryError("metric_geometry_missing")
+        if text_geometry is not None:
+            text_geometry_pages += len(text_geometry)
+            text_geometry_histogram_buckets += sum(
+                len(geometry["histograms"][axis])
+                for pair in text_geometry
+                for geometry in pair
+                for axis in TEXT_GEOMETRY_AXES
+            )
+            if (
+                text_geometry_pages > MAX_TEXT_GEOMETRY_REPORT_PAGES
+                or text_geometry_histogram_buckets
+                > MAX_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+            ):
+                raise SummaryError("text_geometry_report_limit")
         if row_geometry is not None:
             pages, mismatch_pages = row_geometry
             geometry["workbooks"] += 1
@@ -953,6 +1664,29 @@ def _summarize_label(
                 ]
                 for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
             )
+        if text_geometry is not None:
+            word_format = word_geometry_by_format.setdefault(
+                fmt, _new_text_geometry_accumulator()
+            )
+            line_format = line_geometry_by_format.setdefault(
+                fmt, _new_text_geometry_accumulator()
+            )
+            for accumulator in (
+                word_geometry_all,
+                line_geometry_all,
+                word_format,
+                line_format,
+            ):
+                accumulator["workbooks"] += 1
+            for word_page, line_page in text_geometry:
+                _merge_text_geometry_page(
+                    word_geometry_all, word_page
+                )
+                _merge_text_geometry_page(word_format, word_page)
+                _merge_text_geometry_page(
+                    line_geometry_all, line_page
+                )
+                _merge_text_geometry_page(line_format, line_page)
 
     def groups(values: dict[str, Counter[str]]) -> dict[str, object]:
         return {
@@ -970,6 +1704,15 @@ def _summarize_label(
         "by_status": dict(sorted(statuses.items())),
         "geometry": geometry,
         "label": label,
+        "line_geometry": {
+            "all": _finish_text_geometry_cohort(line_geometry_all),
+            "by_format": {
+                fmt: _finish_text_geometry_cohort(accumulator)
+                for fmt, accumulator in sorted(
+                    line_geometry_by_format.items()
+                )
+            },
+        },
         "page_count_mismatches": [
             {
                 "libreoffice_pages": libreoffice_pages,
@@ -980,6 +1723,15 @@ def _summarize_label(
                 page_count_mismatches.items()
             )
         ],
+        "word_geometry": {
+            "all": _finish_text_geometry_cohort(word_geometry_all),
+            "by_format": {
+                fmt: _finish_text_geometry_cohort(accumulator)
+                for fmt, accumulator in sorted(
+                    word_geometry_by_format.items()
+                )
+            },
+        },
         "workbooks": len(rows),
     }, consumed
 
@@ -1071,10 +1823,221 @@ def _validate_geometry_output(value: object, total: int) -> None:
         raise SummaryError(code)
 
 
+def _validate_text_geometry_cohort(
+    value: object, total: int
+) -> dict[str, object]:
+    code = "output_text_geometry"
+    if (
+        not isinstance(value, dict)
+        or set(value) != TEXT_GEOMETRY_COHORT_KEYS
+    ):
+        raise SummaryError(code)
+    workbooks = _integer(value["workbooks"], code, total)
+    pages = _integer(
+        value["pages"], code, workbooks * MAX_PAGE_COUNT
+    )
+    if (
+        (workbooks == 0) != (pages == 0)
+        or pages < workbooks
+    ):
+        raise SummaryError(code)
+    item_limit = pages * MAX_TEXT_GEOMETRY_UNIQUE_ITEMS
+    rxls_unique = _integer(
+        value["rxls_unique_items"], code, item_limit
+    )
+    libreoffice_unique = _integer(
+        value["libreoffice_unique_items"], code, item_limit
+    )
+    matched = _integer(value["matched_items"], code, item_limit)
+    if matched > min(rxls_unique, libreoffice_unique):
+        raise SummaryError(code)
+
+    by_axis = value["by_axis"]
+    if (
+        not isinstance(by_axis, dict)
+        or set(by_axis) != set(TEXT_GEOMETRY_AXES)
+    ):
+        raise SummaryError(code)
+    histograms: dict[str, Counter[int]] = {}
+    exact_summaries: dict[str, dict[str, int | None]] = {}
+    for axis in TEXT_GEOMETRY_AXES:
+        axis_value = by_axis[axis]
+        if (
+            not isinstance(axis_value, dict)
+            or set(axis_value) != TEXT_GEOMETRY_AXIS_KEYS
+        ):
+            raise SummaryError(code)
+        raw_histogram = axis_value["histogram"]
+        if (
+            not isinstance(raw_histogram, list)
+            or len(raw_histogram)
+            > MAX_TEXT_GEOMETRY_HISTOGRAM_BUCKETS
+        ):
+            raise SummaryError(code)
+        histogram: Counter[int] = Counter()
+        previous_delta: int | None = None
+        histogram_count = 0
+        for bucket in raw_histogram:
+            if (
+                not isinstance(bucket, dict)
+                or set(bucket) != TEXT_GEOMETRY_BUCKET_KEYS
+            ):
+                raise SummaryError(code)
+            delta = _signed_integer(
+                bucket["delta_millipoints"],
+                code,
+                TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
+            )
+            if (
+                delta not in TEXT_GEOMETRY_ALLOWED_BUCKETS
+                or (previous_delta is not None and delta <= previous_delta)
+            ):
+                raise SummaryError(code)
+            previous_delta = delta
+            bucket_count = _integer(
+                bucket["count"], code, matched
+            )
+            if bucket_count == 0:
+                raise SummaryError(code)
+            histogram[delta] = bucket_count
+            histogram_count += bucket_count
+        if histogram_count != matched:
+            raise SummaryError(code)
+        histograms[axis] = histogram
+        exact_summaries[axis] = _text_geometry_exact_summary(
+            axis_value["exact"],
+            matched=matched,
+            histogram=histogram,
+            code=code,
+        )
+    _validate_text_geometry_axis_identities(
+        exact_summaries, matched, code
+    )
+    return {
+        "exact_summaries": exact_summaries,
+        "histograms": histograms,
+        "libreoffice_unique_items": libreoffice_unique,
+        "matched_items": matched,
+        "pages": pages,
+        "rxls_unique_items": rxls_unique,
+        "workbooks": workbooks,
+    }
+
+
+def _validate_text_geometry_output(
+    value: object,
+    total: int,
+    format_workbooks: dict[str, int],
+) -> dict[str, object]:
+    code = "output_text_geometry"
+    if (
+        not isinstance(value, dict)
+        or set(value) != TEXT_GEOMETRY_OUTPUT_KEYS
+    ):
+        raise SummaryError(code)
+    all_cohort = _validate_text_geometry_cohort(
+        value["all"], total
+    )
+    by_format = value["by_format"]
+    if (
+        not isinstance(by_format, dict)
+        or len(by_format) > len(FORMATS)
+        or any(
+            not isinstance(format_name, str)
+            or format_name not in FORMATS
+            for format_name in by_format
+        )
+    ):
+        raise SummaryError(code)
+
+    cohorts: dict[str, dict[str, object]] = {}
+    for format_name, raw_cohort in by_format.items():
+        cohort = _validate_text_geometry_cohort(
+            raw_cohort,
+            format_workbooks.get(format_name, 0),
+        )
+        if cohort["workbooks"] == 0:
+            raise SummaryError(code)
+        cohorts[format_name] = cohort
+    scalar_keys = (
+        "libreoffice_unique_items",
+        "matched_items",
+        "pages",
+        "rxls_unique_items",
+        "workbooks",
+    )
+    if any(
+        sum(int(cohort[key]) for cohort in cohorts.values())
+        != all_cohort[key]
+        for key in scalar_keys
+    ):
+        raise SummaryError(code)
+    for axis in TEXT_GEOMETRY_AXES:
+        merged: Counter[int] = Counter()
+        merged_count = 0
+        merged_sum = 0
+        merged_negative_overflow = 0
+        merged_positive_overflow = 0
+        merged_minimum: int | None = None
+        merged_maximum: int | None = None
+        for cohort in cohorts.values():
+            merged.update(cohort["histograms"][axis])
+            exact = cohort["exact_summaries"][axis]
+            merged_count += int(exact["count"])
+            merged_sum += int(exact["sum_delta_millipoints"])
+            merged_negative_overflow += int(
+                exact["negative_overflow_items"]
+            )
+            merged_positive_overflow += int(
+                exact["positive_overflow_items"]
+            )
+            if exact["min_delta_millipoints"] is not None:
+                merged_minimum = (
+                    int(exact["min_delta_millipoints"])
+                    if merged_minimum is None
+                    else min(
+                        merged_minimum,
+                        int(exact["min_delta_millipoints"]),
+                    )
+                )
+                merged_maximum = (
+                    int(exact["max_delta_millipoints"])
+                    if merged_maximum is None
+                    else max(
+                        merged_maximum,
+                        int(exact["max_delta_millipoints"]),
+                    )
+                )
+        all_exact = all_cohort["exact_summaries"][axis]
+        if (
+            merged != all_cohort["histograms"][axis]
+            or merged_count != all_exact["count"]
+            or merged_sum != all_exact["sum_delta_millipoints"]
+            or merged_minimum != all_exact["min_delta_millipoints"]
+            or merged_maximum != all_exact["max_delta_millipoints"]
+            or merged_negative_overflow
+            != all_exact["negative_overflow_items"]
+            or merged_positive_overflow
+            != all_exact["positive_overflow_items"]
+        ):
+            raise SummaryError(code)
+    return {
+        "all": all_cohort,
+        "by_format": cohorts,
+    }
+
+
 def _validate_output(value: object) -> None:
     """Ensure no unreviewed key or path-like string reached the final JSON."""
 
-    top = {"baseline_mode", "head_sha", "profile", "reports", "schema"}
+    top = {
+        "baseline_mode",
+        "geometry_policy",
+        "head_sha",
+        "profile",
+        "reports",
+        "schema",
+    }
     report_keys = {
         "by_classification",
         "by_feature",
@@ -1082,7 +2045,9 @@ def _validate_output(value: object) -> None:
         "by_status",
         "geometry",
         "label",
+        "line_geometry",
         "page_count_mismatches",
+        "word_geometry",
         "workbooks",
     }
     if not isinstance(value, dict) or set(value) != top:
@@ -1090,6 +2055,10 @@ def _validate_output(value: object) -> None:
     reports = value.get("reports")
     if (
         value.get("schema") != OUTPUT_SCHEMA
+        or not type_exact_equal(
+            value.get("geometry_policy"),
+            TEXT_GEOMETRY_POLICY,
+        )
         or not isinstance(value.get("profile"), str)
         or value.get("profile") not in CASES
         or not isinstance(value.get("baseline_mode"), str)
@@ -1193,6 +2162,32 @@ def _validate_output(value: object) -> None:
                 or dict(sorted(grouped_classes.items())) != report_classes
             ):
                 raise SummaryError("output_group")
+        format_workbooks = {
+            format_name: int(group["workbooks"])
+            for format_name, group in report["by_format"].items()
+        }
+        word_geometry = _validate_text_geometry_output(
+            report["word_geometry"], total, format_workbooks
+        )
+        line_geometry = _validate_text_geometry_output(
+            report["line_geometry"], total, format_workbooks
+        )
+        if (
+            word_geometry["all"]["workbooks"]
+            != line_geometry["all"]["workbooks"]
+            or word_geometry["all"]["pages"]
+            != line_geometry["all"]["pages"]
+            or set(word_geometry["by_format"])
+            != set(line_geometry["by_format"])
+            or any(
+                word_geometry["by_format"][format_name]["workbooks"]
+                != line_geometry["by_format"][format_name]["workbooks"]
+                or word_geometry["by_format"][format_name]["pages"]
+                != line_geometry["by_format"][format_name]["pages"]
+                for format_name in word_geometry["by_format"]
+            )
+        ):
+            raise SummaryError("output_text_geometry")
 
 
 def summarize(
@@ -1221,6 +2216,7 @@ def summarize(
         reports.append(report)
     result = {
         "baseline_mode": baseline_mode,
+        "geometry_policy": copy.deepcopy(TEXT_GEOMETRY_POLICY),
         "head_sha": head_sha,
         "profile": profile,
         "reports": reports,

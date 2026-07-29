@@ -4,18 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from fractions import Fraction
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 from typing import Iterable
 
+try:
+    from strict_json_contract import type_exact_equal
+except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
+    from scripts.strict_json_contract import type_exact_equal
+
 
 REPORT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v1"
+OUTPUT_SCHEMA = "rxls.ooxml-row-oracle.v2"
 MANIFEST_BINDING_SCHEMA = "rxls.render-parity-manifest-binding.v1"
 METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
@@ -33,6 +40,30 @@ MAX_MANIFEST_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 128
 MAX_JSON_NODES = 2_000_000
 MAX_INTEGER_DIGITS = 128
+MAX_UNIQUE_GEOMETRY_ITEMS = 250_000
+MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS = 1_000_000_000
+MAX_UNIQUE_GEOMETRY_REPORT_PAGES = 2_000
+MAX_UNIQUE_GEOMETRY_REPORT_HISTOGRAM_BUCKETS = 50_000
+UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS = 10_000
+UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS = 12_000
+UNIQUE_GEOMETRY_BUCKETS = frozenset(
+    {
+        *range(-2, 3),
+        *(
+            sign * magnitude
+            for sign in (-1, 1)
+            for magnitude in (500, 1_000)
+        ),
+        *(
+            sign * magnitude
+            for sign in (-1, 1)
+            for magnitude in range(2_000, 10_001, 2_000)
+        ),
+        -UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS,
+        UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS,
+    }
+)
+MAX_UNIQUE_GEOMETRY_BUCKETS = 21
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 POINT_RE = re.compile(r"^-?[0-9]+/[1-9][0-9]*$")
@@ -111,6 +142,63 @@ PDF_POINT_DELTA_KEYS = frozenset(
         "xhtml_width",
     }
 )
+UNIQUE_GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+UNIQUE_GEOMETRY_KEYS = frozenset(
+    {
+        "rxls_unique_items",
+        "libreoffice_unique_items",
+        "matched_items",
+        "delta_histograms_millipoints",
+        "exact_delta_summaries_millipoints",
+    }
+)
+UNIQUE_GEOMETRY_POLICY = {
+    "content_retained": False,
+    "coordinates": "pdf_points_y_down",
+    "delta_direction": "rxls_minus_libreoffice",
+    "diagnostic_only": True,
+    "exact_delta_absolute_limit_millipoints": (
+        MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS
+    ),
+    "exact_summary": "count_sum_min_max_and_signed_overflow_counts",
+    "histogram": {
+        "exact_absolute_limit_millipoints": 2,
+        "max_buckets_per_axis": MAX_UNIQUE_GEOMETRY_BUCKETS,
+        "middle_absolute_limit_millipoints": 1_000,
+        "middle_bucket_width_millipoints": 500,
+        "outer_absolute_limit_millipoints": (
+            UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS
+        ),
+        "outer_bucket_width_millipoints": 2_000,
+        "overflow_bucket_absolute_millipoints": (
+            UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS
+        ),
+        "rounding": (
+            "nearest_width_multiple_half_away_from_zero_"
+            "with_nonzero_sign_preserved"
+        ),
+    },
+    "max_geometry_pages_per_report": (
+        MAX_UNIQUE_GEOMETRY_REPORT_PAGES
+    ),
+    "max_histogram_buckets_per_report": (
+        MAX_UNIQUE_GEOMETRY_REPORT_HISTOGRAM_BUCKETS
+    ),
+    "max_items_per_side_per_page": MAX_UNIQUE_GEOMETRY_ITEMS,
+    "matching": "exact_normalized_token_tuple_unique_on_both_sides",
+    "rounding": "nearest_millipoint_half_away_from_zero_exact_rational",
+    "shard_budget": "equal_floor_partition_by_declared_shard_count",
+    "units": "millipoints",
+}
 TOGGLE_FEATURES = {
     "explicit-row-height": "explicit_row_height",
     "hidden-row": "hidden_row",
@@ -201,12 +289,68 @@ def _preflight_json_text(text: str) -> None:
     _require(not closers, "json_structure")
 
 
-def _load_json(path: Path, maximum: int, code: str) -> tuple[dict[str, object], bytes]:
+def _stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    maximum: int,
+    code: str,
+) -> bytes:
+    descriptor: int | None = None
     try:
-        _require(path.is_file() and not path.is_symlink(), code)
-        size = path.stat().st_size
-        _require(0 < size <= maximum, f"{code}_limit")
-        payload = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        before = os.fstat(descriptor)
+        _require(stat.S_ISREG(before.st_mode), code)
+        remaining = maximum + 1
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except DiagnosticError:
+        raise
+    except OSError as error:
+        raise DiagnosticError(code) from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    _require(
+        stat.S_ISREG(current.st_mode)
+        and _stat_signature(before) == _stat_signature(after)
+        and _stat_signature(after) == _stat_signature(current),
+        code,
+    )
+    payload = b"".join(chunks)
+    _require(0 < len(payload) <= maximum, f"{code}_limit")
+    _require(len(payload) == after.st_size, code)
+    return payload
+
+
+def _load_json(path: Path, maximum: int, code: str) -> tuple[dict[str, object], bytes]:
+    payload = _read_bounded_regular_file(path, maximum, code)
+    try:
         text = payload.decode("utf-8")
         _preflight_json_text(text)
         value = json.loads(
@@ -246,6 +390,18 @@ def _positive_int(value: object, code: str, maximum: int = 2**63 - 1) -> int:
         isinstance(value, int)
         and not isinstance(value, bool)
         and 0 < value <= maximum,
+        code,
+    )
+    return value
+
+
+def _nonnegative_int(
+    value: object, code: str, maximum: int = 2**63 - 1
+) -> int:
+    _require(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= maximum,
         code,
     )
     return value
@@ -333,7 +489,8 @@ def _validate_manifest(
 ) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
     _require(set(manifest) == MANIFEST_KEYS, "manifest_keys")
     _require(
-        manifest.get("schema_version") == 1
+        type(manifest.get("schema_version")) is int
+        and manifest.get("schema_version") == 1
         and manifest.get("profile") == PROFILE
         and manifest.get("generator") == GENERATOR
         and manifest.get("generator_version") == GENERATOR_VERSION
@@ -557,6 +714,318 @@ def _millipoints(value: Fraction) -> int:
     return converted.numerator
 
 
+def _unique_geometry_bucket(delta_millipoints: int) -> int:
+    magnitude = abs(delta_millipoints)
+    if magnitude <= 2:
+        return delta_millipoints
+    if magnitude <= 1_000:
+        width = 500
+        bucket = max(width, (magnitude + width // 2) // width * width)
+        return -bucket if delta_millipoints < 0 else bucket
+    if magnitude <= UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = 2_000
+        bucket = (magnitude + width // 2) // width * width
+        return -bucket if delta_millipoints < 0 else bucket
+    return (
+        -UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS
+        if delta_millipoints < 0
+        else UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS
+    )
+
+
+def _unique_geometry_bucket_interval(
+    bucket_millipoints: int,
+) -> tuple[int, int]:
+    magnitude = abs(bucket_millipoints)
+    if magnitude <= 2:
+        lower = magnitude
+        upper = magnitude
+    elif magnitude <= 1_000:
+        width = 500
+        lower = 3 if magnitude == width else magnitude - width // 2
+        upper = min(1_000, magnitude + width // 2 - 1)
+    elif magnitude <= UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS:
+        width = 2_000
+        lower = max(1_001, magnitude - width // 2)
+        upper = min(
+            UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS,
+            magnitude + width // 2 - 1,
+        )
+    else:
+        _require(
+            magnitude == UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS,
+            "unique_geometry_bucket",
+        )
+        lower = UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS + 1
+        upper = MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS
+    return (-upper, -lower) if bucket_millipoints < 0 else (lower, upper)
+
+
+def _unique_geometry_sum_bounds(
+    histogram: dict[int, int],
+    minimum: int,
+    maximum: int,
+    code: str,
+) -> tuple[int, int]:
+    minimum_bucket = _unique_geometry_bucket(minimum)
+    maximum_bucket = _unique_geometry_bucket(maximum)
+    _require(
+        not (
+            minimum < maximum
+            and minimum_bucket == maximum_bucket
+            and histogram[minimum_bucket] < 2
+        ),
+        code,
+    )
+    lower_total = 0
+    upper_total = 0
+    effective: dict[int, tuple[int, int]] = {}
+    for bucket, count in histogram.items():
+        bucket_lower, bucket_upper = _unique_geometry_bucket_interval(bucket)
+        lower = max(bucket_lower, minimum)
+        upper = min(bucket_upper, maximum)
+        _require(lower <= upper, code)
+        effective[bucket] = (lower, upper)
+        lower_total += lower * count
+        upper_total += upper * count
+    lower_total += maximum - effective[maximum_bucket][0]
+    upper_total -= effective[minimum_bucket][1] - minimum
+    _require(lower_total <= upper_total, code)
+    return lower_total, upper_total
+
+
+def _validate_unique_geometry_axis_identities(
+    summaries: dict[str, dict[str, int | None]],
+    matched: int,
+    code: str,
+) -> None:
+    sums = {
+        axis: int(summary["sum_delta_millipoints"])
+        for axis, summary in summaries.items()
+    }
+    _require(
+        abs(sums["width"] - (sums["x_max"] - sums["x_min"]))
+        <= matched
+        and abs(
+            2 * sums["center_x"] - sums["x_min"] - sums["x_max"]
+        )
+        <= matched
+        and abs(sums["height"] - (sums["y_max"] - sums["y_min"]))
+        <= matched
+        and abs(
+            2 * sums["center_y"] - sums["y_min"] - sums["y_max"]
+        )
+        <= matched,
+        code,
+    )
+
+
+def _unique_geometry(value: object, code: str) -> dict[str, object]:
+    _require(
+        isinstance(value, dict) and set(value) == UNIQUE_GEOMETRY_KEYS,
+        f"{code}_contract",
+    )
+    rxls_unique = _nonnegative_int(
+        value.get("rxls_unique_items"),
+        f"{code}_count",
+        MAX_UNIQUE_GEOMETRY_ITEMS,
+    )
+    libreoffice_unique = _nonnegative_int(
+        value.get("libreoffice_unique_items"),
+        f"{code}_count",
+        MAX_UNIQUE_GEOMETRY_ITEMS,
+    )
+    matched = _nonnegative_int(
+        value.get("matched_items"),
+        f"{code}_count",
+        MAX_UNIQUE_GEOMETRY_ITEMS,
+    )
+    _require(
+        matched <= min(rxls_unique, libreoffice_unique),
+        f"{code}_count",
+    )
+    raw_histograms = value.get("delta_histograms_millipoints")
+    raw_summaries = value.get("exact_delta_summaries_millipoints")
+    _require(
+        isinstance(raw_histograms, dict)
+        and set(raw_histograms) == set(UNIQUE_GEOMETRY_AXES),
+        f"{code}_axes",
+    )
+    _require(
+        isinstance(raw_summaries, dict)
+        and set(raw_summaries) == set(UNIQUE_GEOMETRY_AXES),
+        f"{code}_exact_summary",
+    )
+    histograms: dict[str, list[dict[str, int]]] = {}
+    summaries: dict[str, dict[str, int | None]] = {}
+    for axis in UNIQUE_GEOMETRY_AXES:
+        raw_rows = raw_histograms.get(axis)
+        _require(
+            isinstance(raw_rows, list)
+            and len(raw_rows)
+            <= min(matched, MAX_UNIQUE_GEOMETRY_BUCKETS),
+            f"{code}_histogram",
+        )
+        rows: list[dict[str, int]] = []
+        previous: int | None = None
+        population = 0
+        for raw_row in raw_rows:
+            _require(
+                isinstance(raw_row, dict)
+                and set(raw_row) == {"delta_millipoints", "count"},
+                f"{code}_histogram",
+            )
+            delta = raw_row.get("delta_millipoints")
+            _require(
+                isinstance(delta, int)
+                and not isinstance(delta, bool)
+                and delta in UNIQUE_GEOMETRY_BUCKETS,
+                f"{code}_histogram",
+            )
+            count = _positive_int(
+                raw_row.get("count"),
+                f"{code}_histogram",
+                MAX_UNIQUE_GEOMETRY_ITEMS,
+            )
+            _require(
+                previous is None or delta > previous,
+                f"{code}_histogram_order",
+            )
+            population += count
+            _require(population <= matched, f"{code}_histogram_population")
+            previous = delta
+            rows.append({"delta_millipoints": delta, "count": count})
+        _require(population == matched, f"{code}_histogram_population")
+        histograms[axis] = rows
+
+        raw_summary = raw_summaries.get(axis)
+        _require(
+            isinstance(raw_summary, dict)
+            and set(raw_summary)
+            == {
+                "count",
+                "max_delta_millipoints",
+                "min_delta_millipoints",
+                "negative_overflow_items",
+                "positive_overflow_items",
+                "sum_delta_millipoints",
+            },
+            f"{code}_exact_summary",
+        )
+        count = _nonnegative_int(
+            raw_summary.get("count"),
+            f"{code}_exact_summary",
+            MAX_UNIQUE_GEOMETRY_ITEMS,
+        )
+        negative_overflow = _nonnegative_int(
+            raw_summary.get("negative_overflow_items"),
+            f"{code}_exact_summary",
+            MAX_UNIQUE_GEOMETRY_ITEMS,
+        )
+        positive_overflow = _nonnegative_int(
+            raw_summary.get("positive_overflow_items"),
+            f"{code}_exact_summary",
+            MAX_UNIQUE_GEOMETRY_ITEMS,
+        )
+        total = raw_summary.get("sum_delta_millipoints")
+        minimum = raw_summary.get("min_delta_millipoints")
+        maximum = raw_summary.get("max_delta_millipoints")
+        _require(
+            count == matched
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and abs(total)
+            <= matched * MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS
+            and negative_overflow + positive_overflow <= matched,
+            f"{code}_exact_summary",
+        )
+        if matched == 0:
+            _require(
+                minimum is None
+                and maximum is None
+                and total == 0
+                and negative_overflow == 0
+                and positive_overflow == 0,
+                f"{code}_exact_summary",
+            )
+        else:
+            _require(
+                isinstance(minimum, int)
+                and not isinstance(minimum, bool)
+                and isinstance(maximum, int)
+                and not isinstance(maximum, bool)
+                and -MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS
+                <= minimum
+                <= maximum
+                <= MAX_UNIQUE_GEOMETRY_EXACT_DELTA_MILLIPOINTS
+                and matched * minimum <= total <= matched * maximum,
+                f"{code}_exact_summary",
+            )
+            _require(
+                (negative_overflow > 0)
+                == (minimum < -UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS)
+                and (positive_overflow > 0)
+                == (maximum > UNIQUE_GEOMETRY_OUTER_LIMIT_MILLIPOINTS),
+                f"{code}_exact_summary",
+            )
+            if matched == 1:
+                _require(
+                    minimum == maximum == total,
+                    f"{code}_exact_summary",
+                )
+
+        histogram_counts = {
+            row["delta_millipoints"]: row["count"] for row in rows
+        }
+        _require(
+            histogram_counts.get(
+                -UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            == negative_overflow
+            and histogram_counts.get(
+                UNIQUE_GEOMETRY_OVERFLOW_MILLIPOINTS, 0
+            )
+            == positive_overflow,
+            f"{code}_exact_summary",
+        )
+        if matched > 0:
+            _require(
+                _unique_geometry_bucket(minimum)
+                == rows[0]["delta_millipoints"]
+                and _unique_geometry_bucket(maximum)
+                == rows[-1]["delta_millipoints"],
+                f"{code}_exact_summary",
+            )
+            sum_lower, sum_upper = _unique_geometry_sum_bounds(
+                histogram_counts,
+                minimum,
+                maximum,
+                f"{code}_exact_summary",
+            )
+            _require(
+                sum_lower <= total <= sum_upper,
+                f"{code}_exact_summary",
+            )
+        summaries[axis] = {
+            "count": count,
+            "max_delta_millipoints": maximum,
+            "min_delta_millipoints": minimum,
+            "negative_overflow_items": negative_overflow,
+            "positive_overflow_items": positive_overflow,
+            "sum_delta_millipoints": total,
+        }
+    _validate_unique_geometry_axis_identities(
+        summaries, matched, f"{code}_exact_summary"
+    )
+    return {
+        "rxls_unique_items": rxls_unique,
+        "libreoffice_unique_items": libreoffice_unique,
+        "matched_items": matched,
+        "delta_histograms_millipoints": histograms,
+        "exact_delta_summaries_millipoints": summaries,
+    }
+
+
 def _extract_height(page: object) -> tuple[int, int, int]:
     _require(isinstance(page, dict), "page_geometry")
     point = page.get("pdf_point_geometry")
@@ -597,10 +1066,25 @@ def _count_dimensions(
 
 def _validate_output(value: dict[str, object]) -> None:
     _require(
-        set(value) == {"cohorts", "coverage", "identities", "passed", "schema"}
+        set(value)
+        == {
+            "cohorts",
+            "coverage",
+            "geometry_policy",
+            "identities",
+            "passed",
+            "schema",
+        }
         and value.get("schema") == OUTPUT_SCHEMA
         and value.get("passed") is True,
         "output_contract",
+    )
+    _require(
+        type_exact_equal(
+            value.get("geometry_policy"),
+            UNIQUE_GEOMETRY_POLICY,
+        ),
+        "output_geometry_policy",
     )
     identities = value.get("identities")
     _require(
@@ -649,6 +1133,7 @@ def _validate_output(value: dict[str, object]) -> None:
             "toggle_counts",
         }
         and coverage.get("case_count") == CASE_COUNT
+        and type(coverage.get("page_count")) is int
         and coverage.get("page_count") == CASE_COUNT,
         "output_coverage_contract",
     )
@@ -679,9 +1164,13 @@ def _validate_output(value: dict[str, object]) -> None:
                 "libreoffice_height_millipoints",
                 "page_count",
                 "rxls_height_millipoints",
+                "unique_line_geometry",
+                "unique_word_geometry",
                 "workbook_count",
             }
+            and type(row.get("page_count")) is int
             and row.get("page_count") == 1
+            and type(row.get("workbook_count")) is int
             and row.get("workbook_count") == 1,
             "output_cohort_contract",
         )
@@ -717,6 +1206,8 @@ def _validate_output(value: dict[str, object]) -> None:
             ),
             "output_height_contract",
         )
+        _unique_geometry(row.get("unique_word_geometry"), "unique_word_geometry")
+        _unique_geometry(row.get("unique_line_geometry"), "unique_line_geometry")
     _require(
         observed_dimensions == _expected_dimensions(),
         "output_dimension_contract",
@@ -739,7 +1230,13 @@ def _validate_output(value: dict[str, object]) -> None:
                 "pathful_output_value",
             )
 
-    reject_pathful(value)
+    reject_pathful(
+        {
+            key: item
+            for key, item in value.items()
+            if key != "geometry_policy"
+        }
+    )
 
 
 def reduce_report(
@@ -780,6 +1277,13 @@ def reduce_report(
         and metric_policy.get("semantic_content_retained") is False
         and metric_policy.get("text_box_content_retained") is False,
         "metric_policy",
+    )
+    _require(
+        type_exact_equal(
+            metric_policy.get("unique_text_geometry"),
+            UNIQUE_GEOMETRY_POLICY,
+        ),
+        "metric_policy_unique_text_geometry",
     )
     renderer = configuration.get("renderer_binary")
     _require(
@@ -832,7 +1336,9 @@ def reduce_report(
         and discovery.get("pre_shard_selected_count") == CASE_COUNT
         and discovery.get("selected_count") == CASE_COUNT
         and discovery.get("shard_candidate_count") == CASE_COUNT
+        and type(discovery.get("shard_count")) is int
         and discovery.get("shard_count") == 1
+        and type(discovery.get("shard_index")) is int
         and discovery.get("shard_index") == 0
         and discovery.get("truncated") is False,
         "discovery_contract",
@@ -851,6 +1357,8 @@ def reduce_report(
     _require(isinstance(files, list) and len(files) == CASE_COUNT, "report_files")
     seen: set[str] = set()
     cohorts: list[dict[str, object]] = []
+    geometry_pages = 0
+    geometry_histogram_buckets = 0
     for raw in files:
         _require(isinstance(raw, dict), "report_file")
         path = raw.get("path")
@@ -868,7 +1376,58 @@ def reduce_report(
         )
         pages = raw.get("pages")
         _require(isinstance(pages, list) and len(pages) == 1, "page_count")
-        rxls_height, libreoffice_height, delta = _extract_height(pages[0])
+        page = pages[0]
+        rxls_height, libreoffice_height, delta = _extract_height(page)
+        _require(isinstance(page, dict), "page_geometry")
+        unique_word_geometry = _unique_geometry(
+            page.get("text_box_unique_geometry"),
+            "text_box_unique_geometry",
+        )
+        unique_line_geometry = _unique_geometry(
+            page.get("text_line_box_unique_geometry"),
+            "text_line_box_unique_geometry",
+        )
+        geometry_pages += 1
+        geometry_histogram_buckets += sum(
+            len(geometry["delta_histograms_millipoints"][axis])
+            for geometry in (
+                unique_word_geometry,
+                unique_line_geometry,
+            )
+            for axis in UNIQUE_GEOMETRY_AXES
+        )
+        _require(
+            geometry_pages <= MAX_UNIQUE_GEOMETRY_REPORT_PAGES
+            and geometry_histogram_buckets
+            <= MAX_UNIQUE_GEOMETRY_REPORT_HISTOGRAM_BUCKETS,
+            "unique_geometry_report_limit",
+        )
+        for geometry, prefix in (
+            (unique_word_geometry, "text_box"),
+            (unique_line_geometry, "text_line_box"),
+        ):
+            rxls_items = _nonnegative_int(
+                page.get(f"{prefix}_rxls_items"),
+                f"{prefix}_unique_geometry_count",
+                MAX_UNIQUE_GEOMETRY_ITEMS,
+            )
+            libreoffice_items = _nonnegative_int(
+                page.get(f"{prefix}_libreoffice_items"),
+                f"{prefix}_unique_geometry_count",
+                MAX_UNIQUE_GEOMETRY_ITEMS,
+            )
+            paired_items = _nonnegative_int(
+                page.get(f"{prefix}_matched_items"),
+                f"{prefix}_unique_geometry_count",
+                MAX_UNIQUE_GEOMETRY_ITEMS,
+            )
+            _require(
+                geometry["rxls_unique_items"] <= rxls_items
+                and geometry["libreoffice_unique_items"]
+                <= libreoffice_items
+                and geometry["matched_items"] <= paired_items,
+                f"{prefix}_unique_geometry_count",
+            )
         cohorts.append(
             {
                 "dimensions": expected["dimension"],
@@ -876,6 +1435,8 @@ def reduce_report(
                 "libreoffice_height_millipoints": libreoffice_height,
                 "page_count": 1,
                 "rxls_height_millipoints": rxls_height,
+                "unique_line_geometry": unique_line_geometry,
+                "unique_word_geometry": unique_word_geometry,
                 "workbook_count": 1,
             }
         )
@@ -895,6 +1456,7 @@ def reduce_report(
             "sheet_format_counts": _count_dimensions(dimensions, "sheet_format"),
             "toggle_counts": _count_dimensions(dimensions, "toggle"),
         },
+        "geometry_policy": copy.deepcopy(UNIQUE_GEOMETRY_POLICY),
         "identities": {
             **oracle,
             "feature_map_sha256": binding["feature_map_sha256"],

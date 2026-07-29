@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -714,7 +715,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "max_absolute_delta_ppm": 0,
         }
         repeatability = {
-            "schema": "rxls.libreoffice-render-repeatability.v1",
+            "schema": "rxls.libreoffice-render-repeatability.v2",
             "status": "pass",
             "failures": [],
             "coverage": {
@@ -785,6 +786,10 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "input_pairing": "sha256",
                 "observations": "workbook_aggregate_and_page",
                 "paths_or_content_retained": False,
+                "unique_text_geometry": (
+                    "schema_validated_exact_same_sha_"
+                    "diagnostic_non_scoring"
+                ),
             },
             "reports": {
                 "baseline": {"bytes": 1234, "sha256": "5" * 64},
@@ -1810,6 +1815,45 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     self.checker._read_json(path)
                 self.assertNotIn(str(path), str(raised.exception))
 
+    def test_json_ingestion_is_bounded_to_verified_regular_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.json"
+            target.write_text("{}\n", encoding="utf-8")
+
+            link = root / "link.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                r"\Aevidence_file_type\Z",
+            ):
+                self.checker._read_json(link)
+
+            fifo = root / "report.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                r"\Aevidence_file_type\Z",
+            ):
+                self.checker._read_json(fifo)
+
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b"12345")
+            with (
+                mock.patch.object(
+                    self.checker,
+                    "MAX_FILE_BYTES",
+                    4,
+                ),
+                self.assertRaisesRegex(
+                    self.checker.EvidenceError,
+                    r"\Aevidence_file_size\Z",
+                ),
+            ):
+                self.checker._read_json(oversized)
+
     def test_json_preflight_rejects_complexity_and_depth_before_decode(
         self,
     ) -> None:
@@ -1972,6 +2016,13 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "coverage",
                 lambda document: document["coverage"].update({"pages": 2}),
                 "repeatability_coverage",
+            ),
+            (
+                "policy-bool-int-alias",
+                lambda document: document["metric_policy"].update(
+                    {"paths_or_content_retained": 0}
+                ),
+                "repeatability_policy",
             ),
         )
         for name, mutate, error in direct_mutations:
@@ -2672,10 +2723,24 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 ),
                 "fidelity_policy",
             ),
+            "fidelity_policy_bool_int_alias": (
+                "fidelity-a.json",
+                lambda value: value["policy"].update(
+                    {"minimum_hard_feature_workbooks": True}
+                ),
+                "fidelity_policy",
+            ),
             "fidelity_threshold": (
                 "fidelity-a.json",
                 lambda value: value["thresholds"].update(
                     {"core_similarity_min_ppm": 979_999}
+                ),
+                "fidelity_thresholds",
+            ),
+            "fidelity_threshold_bool_int_alias": (
+                "fidelity-a.json",
+                lambda value: value["thresholds"].update(
+                    {"pdf_point_geometry_exact": 1}
                 ),
                 "fidelity_thresholds",
             ),
@@ -2702,6 +2767,13 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "authored-print-gate.json",
                 lambda value: value["thresholds"].update(
                     {"similarity_mean_min_ppm": 949_999}
+                ),
+                "authored_thresholds",
+            ),
+            "authored_threshold_bool_int_alias": (
+                "authored-print-gate.json",
+                lambda value: value["thresholds"].update(
+                    {"pdf_point_geometry_exact": 1}
                 ),
                 "authored_thresholds",
             ),

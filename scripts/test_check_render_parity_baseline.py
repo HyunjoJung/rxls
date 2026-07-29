@@ -346,6 +346,92 @@ def campaign_manifest(source: dict[str, object]) -> dict[str, object]:
 
 
 class RenderParityBaselineTests(unittest.TestCase):
+    def test_json_readers_are_bounded_regular_and_race_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            document = root / "document.json"
+            document.write_bytes(b"{}")
+            link = root / "document-link.json"
+            link.symlink_to(document)
+            with self.assertRaisesRegex(
+                MODULE.BaselineError, "evidence_unreadable"
+            ):
+                MODULE.read_json(link, "evidence")
+            with self.assertRaisesRegex(
+                MODULE.BaselineError, "evidence_unreadable"
+            ):
+                MODULE.read_json(root, "evidence")
+            with self.assertRaisesRegex(
+                MODULE.BaselineError, "campaign_manifest_unreadable"
+            ):
+                MODULE.campaign_from_manifest(link)
+            fifo = root / "document.fifo"
+            MODULE.os.mkfifo(fifo)
+            real_open = MODULE.os.open
+            nonblocking = MODULE.os.O_NONBLOCK
+
+            def guarded_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                self.assertNotEqual(flags & nonblocking, 0)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE.os, "open", side_effect=guarded_open
+            ), self.assertRaisesRegex(
+                MODULE.BaselineError, "evidence_unreadable"
+            ):
+                MODULE.read_json(fifo, "evidence")
+
+            document.write_bytes(b"0123456789")
+            real_read = MODULE.os.read
+            returned = 0
+
+            def observed_read(descriptor: int, count: int) -> bytes:
+                nonlocal returned
+                chunk = real_read(descriptor, count)
+                returned += len(chunk)
+                return chunk
+
+            with mock.patch.object(
+                MODULE, "MAX_DOCUMENT_BYTES", 4
+            ), mock.patch.object(
+                MODULE.os, "read", side_effect=observed_read
+            ), self.assertRaisesRegex(
+                MODULE.BaselineError, "evidence_limit"
+            ):
+                MODULE.read_json(document, "evidence")
+            self.assertEqual(returned, 5)
+
+            for mutation in ("growth", "swap"):
+                with self.subTest(mutation=mutation):
+                    document.write_bytes(b"{}")
+                    replacement = root / "replacement.json"
+                    replacement.write_bytes(b"{}")
+                    changed = False
+
+                    def adversarial_read(
+                        descriptor: int, count: int
+                    ) -> bytes:
+                        nonlocal changed
+                        chunk = real_read(descriptor, count)
+                        if chunk and not changed:
+                            changed = True
+                            if mutation == "growth":
+                                document.write_bytes(b"{} ")
+                            else:
+                                replacement.replace(document)
+                        return chunk
+
+                    with mock.patch.object(
+                        MODULE.os,
+                        "read",
+                        side_effect=adversarial_read,
+                    ), self.assertRaisesRegex(
+                        MODULE.BaselineError, "evidence_unreadable"
+                    ):
+                        MODULE.read_json(document, "evidence")
+
     def test_baseline_excludes_paths_and_retains_identity_and_warning_counts(self) -> None:
         baseline = MODULE.derive_baseline(evidence())
         rendered = json.dumps(baseline, sort_keys=True)

@@ -1153,6 +1153,29 @@ steps:
                     )
                 )
 
+    def test_render_oracle_tracks_shared_gate_dependencies(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        dependencies = {
+            "scripts/render_parity_geometry_gate.py": (
+                "shared render-parity geometry gate"
+            ),
+            "scripts/strict_json_contract.py": (
+                "shared type-exact JSON contract"
+            ),
+        }
+        for dependency, expected_error in dependencies.items():
+            trigger = f'      - "{dependency}"\n'
+            with self.subTest(dependency=dependency):
+                self.assertEqual(original.count(trigger), 1)
+                weakened = original.replace(trigger, "", 1)
+                errors = self.policy.audit_render_oracle_workflow(
+                    Path("render-oracle.yml"), weakened
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in errors),
+                    errors,
+                )
+
     def test_render_oracle_rejects_weakened_ooxml_row_diagnostic_contract(
         self,
     ) -> None:

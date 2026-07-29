@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import copy
 import importlib.util
 import json
@@ -30,6 +31,43 @@ def load_module():
 
 
 MODULE = load_module()
+GEOMETRY_AXES = (
+    "x_min",
+    "x_max",
+    "y_min",
+    "y_max",
+    "center_x",
+    "center_y",
+    "width",
+    "height",
+)
+
+
+def unique_geometry(matched: int) -> dict[str, object]:
+    histogram = (
+        [{"count": matched, "delta_millipoints": 0}]
+        if matched
+        else []
+    )
+    summary = {
+        "count": matched,
+        "max_delta_millipoints": 0 if matched else None,
+        "min_delta_millipoints": 0 if matched else None,
+        "negative_overflow_items": 0,
+        "positive_overflow_items": 0,
+        "sum_delta_millipoints": 0,
+    }
+    return {
+        "delta_histograms_millipoints": {
+            axis: copy.deepcopy(histogram) for axis in GEOMETRY_AXES
+        },
+        "exact_delta_summaries_millipoints": {
+            axis: copy.deepcopy(summary) for axis in GEOMETRY_AXES
+        },
+        "libreoffice_unique_items": matched,
+        "matched_items": matched,
+        "rxls_unique_items": matched,
+    }
 
 
 def point_geometry(
@@ -116,6 +154,7 @@ def page_row(
         ],
         "text_box_median_error_millipoints": box_error,
         "text_box_p95_error_millipoints": box_error,
+        "text_box_unique_geometry": unique_geometry(box_count),
         "text_line_box_candidate_items": 1,
         "text_line_box_rxls_items": 1,
         "text_line_box_libreoffice_items": 1,
@@ -133,6 +172,7 @@ def page_row(
         ],
         "text_line_box_median_error_millipoints": box_error,
         "text_line_box_p95_error_millipoints": box_error,
+        "text_line_box_unique_geometry": unique_geometry(1),
         "pdf_point_geometry": point_geometry(),
     }
 
@@ -253,13 +293,29 @@ def report_document(count: int = 4) -> dict[str, object]:
                     "exact_normalized_tokens_nearest_unique_one_to_one_same_bbox_level_symmetric_counts"
                 ),
                 "text_box_geometry": "nominal_poppler_layout_not_ink_bounds",
+                "unique_text_geometry": copy.deepcopy(
+                    MODULE.UNIQUE_TEXT_GEOMETRY_POLICY
+                ),
                 "implementation": {
                     "kind": "numpy_integer_exact_v1",
                     "version": "2.3.1",
                 },
             },
         },
-        "summary": {"files": count, "by_status": {"compared": count}},
+        "discovery": {
+            "candidate_count": count,
+            "pre_shard_selected_count": count,
+            "selected_count": count,
+            "shard_candidate_count": count,
+            "shard_count": 1,
+            "shard_index": 0,
+            "truncated": False,
+        },
+        "summary": {
+            "files": count,
+            "by_status": {"compared": count},
+            "by_classification": {"within_threshold": count},
+        },
         "files": files,
     }
     report["configuration"]["manifest_binding"] = MODULE._mapping_binding(
@@ -363,6 +419,105 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         )
         self.assertEqual(result["metrics"]["text_box_match_coverage_ppm"], 1_000_000)
         self.assertEqual(result["coverage"]["libreoffice_pdf_font_objects"], 8)
+
+    def test_only_compared_within_threshold_rows_enter_passing_cohorts(
+        self,
+    ) -> None:
+        mutations = (
+            ("different", "below_similarity_threshold"),
+            ("compared", "below_similarity_threshold"),
+            ("different", "within_threshold"),
+        )
+        for status, classification in mutations:
+            with self.subTest(
+                status=status,
+                classification=classification,
+            ):
+                report = report_document()
+                report["files"][0]["status"] = status
+                report["files"][0]["classification"] = classification
+                statuses = Counter(
+                    item["status"] for item in report["files"]
+                )
+                classifications = Counter(
+                    item["classification"] for item in report["files"]
+                )
+                report["summary"]["by_status"] = dict(sorted(statuses.items()))
+                report["summary"]["by_classification"] = dict(
+                    sorted(classifications.items())
+                )
+
+                result = self.evaluate_small(report)
+
+                self.assertFalse(result["passed"])
+                self.assertEqual(
+                    result["coverage"]["broad_workbooks"],
+                    3,
+                )
+                self.assertIn(
+                    "broad_coverage_incomplete",
+                    result["failures"],
+                )
+
+    def test_summary_classification_counts_are_exact(self) -> None:
+        report = report_document()
+        report["summary"]["by_classification"] = {
+            "below_similarity_threshold": 1,
+            "within_threshold": 3,
+        }
+        with self.assertRaisesRegex(
+            MODULE.GateError,
+            "summary_classification_counts",
+        ):
+            self.evaluate_small(report)
+
+    def test_requires_complete_unsharded_discovery(self) -> None:
+        mutations = (
+            (
+                "shard_count",
+                lambda value: value.update({"shard_count": 2}),
+                "campaign_incomplete",
+            ),
+            (
+                "truncated",
+                lambda value: value.update({"truncated": True}),
+                "campaign_incomplete",
+            ),
+            (
+                "selected_count",
+                lambda value: value.update({"selected_count": 3}),
+                "campaign_coverage",
+            ),
+            (
+                "candidate_count",
+                lambda value: value.update({"candidate_count": 3}),
+                "campaign_coverage",
+            ),
+            (
+                "bool_shard_count",
+                lambda value: value.update({"shard_count": True}),
+                "campaign_incomplete",
+            ),
+        )
+        for name, mutate, code in mutations:
+            with self.subTest(name=name):
+                report = report_document()
+                mutate(report["discovery"])
+                with self.assertRaisesRegex(MODULE.GateError, code):
+                    self.evaluate_small(report)
+
+        report = report_document()
+        del report["discovery"]["shard_index"]
+        with self.assertRaisesRegex(MODULE.GateError, "discovery_shape"):
+            self.evaluate_small(report)
+
+    def test_metric_policy_rejects_bool_integer_alias(self) -> None:
+        report = report_document()
+        report["configuration"]["metric_policy"][
+            "mask_match_tolerance_pixels"
+        ] = True
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            self.evaluate_small(report)
 
     def test_pinned_container_identity_and_attestations_pass(self) -> None:
         result = self.evaluate_small(container_report_document())
@@ -552,6 +707,7 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
             page["text_box_f1_ppm"] = 666_667
             page["text_box_libreoffice_unmatched_items"] = 1
             page["text_box_error_histogram_millipoints"][0]["count"] = 2
+            page["text_box_unique_geometry"] = unique_geometry(2)
             result = self.evaluate_small(report)
             self.assertIn(failure, result["failures"])
             self.assertIn(
@@ -751,6 +907,55 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
             self.evaluate_small(report)
 
         report = report_document()
+        geometry_policy = report["configuration"]["metric_policy"][
+            "unique_text_geometry"
+        ]
+        self.assertEqual(
+            geometry_policy["exact_delta_absolute_limit_millipoints"],
+            1_000_000_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_items_per_side_per_page"],
+            250_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_geometry_pages_per_report"],
+            2_000,
+        )
+        self.assertEqual(
+            geometry_policy["max_histogram_buckets_per_report"],
+            50_000,
+        )
+        self.assertEqual(
+            geometry_policy["histogram"],
+            {
+                "exact_absolute_limit_millipoints": 2,
+                "max_buckets_per_axis": 21,
+                "middle_absolute_limit_millipoints": 1_000,
+                "middle_bucket_width_millipoints": 500,
+                "outer_absolute_limit_millipoints": 10_000,
+                "outer_bucket_width_millipoints": 2_000,
+                "overflow_bucket_absolute_millipoints": 12_000,
+                "rounding": (
+                    "nearest_width_multiple_half_away_from_zero_"
+                    "with_nonzero_sign_preserved"
+                ),
+            },
+        )
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "histogram"
+        ]["rounding"] = "nearest_width_multiple"
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            self.evaluate_small(report)
+
+        report = report_document()
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "max_geometry_pages_per_report"
+        ] = 2_001
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
+            self.evaluate_small(report)
+
+        report = report_document()
         report["configuration"]["measurement_toolchain"]["pdftoppm_sha256"] = (
             "9" * 64
         )
@@ -764,6 +969,69 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         page = report["files"][0]["pages"][0]
         page["text_box_p95_error_millipoints"] = 101
         with self.assertRaisesRegex(MODULE.GateError, "quantile_inconsistent"):
+            self.evaluate_small(report)
+
+    def test_unique_text_geometry_is_required_and_exact(self) -> None:
+        report = report_document()
+        del report["files"][0]["pages"][0]["text_box_unique_geometry"]
+        with self.assertRaisesRegex(
+            MODULE.GateError, "unique_text_geometry_pair"
+        ):
+            self.evaluate_small(report)
+
+        for kind in ("exact_summary", "cross_axis"):
+            with self.subTest(kind=kind):
+                report = report_document()
+                geometry = report["files"][0]["pages"][0][
+                    "text_box_unique_geometry"
+                ]
+                if kind == "exact_summary":
+                    geometry["exact_delta_summaries_millipoints"]["x_min"][
+                        "count"
+                    ] = 2
+                else:
+                    geometry["delta_histograms_millipoints"]["center_x"][0][
+                        "delta_millipoints"
+                    ] = 1
+                    summary = geometry[
+                        "exact_delta_summaries_millipoints"
+                    ]["center_x"]
+                    summary["min_delta_millipoints"] = 1
+                    summary["max_delta_millipoints"] = 1
+                    summary["sum_delta_millipoints"] = 3
+                with self.assertRaisesRegex(
+                    MODULE.GateError, "unique_text_geometry_page"
+                ):
+                    self.evaluate_small(report)
+
+    def test_unique_text_geometry_report_caps_are_enforced(self) -> None:
+        contract = MODULE.validate_report_geometry.__globals__["CONTRACT"]
+        with self.subTest(limit="pages"), mock.patch.object(
+            contract,
+            "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
+            3,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.GateError, "unique_text_geometry_report_limit"
+            ):
+                self.evaluate_small(report_document())
+
+        with self.subTest(limit="histogram_buckets"), mock.patch.object(
+            contract,
+            "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
+            63,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.GateError, "unique_text_geometry_report_limit"
+            ):
+                self.evaluate_small(report_document())
+
+    def test_unique_text_geometry_policy_rejects_bool_integer_alias(self) -> None:
+        report = report_document()
+        report["configuration"]["metric_policy"]["unique_text_geometry"][
+            "diagnostic_only"
+        ] = 1
+        with self.assertRaisesRegex(MODULE.GateError, "metric_policy"):
             self.evaluate_small(report)
 
     def test_summary_counts_duplicate_json_and_size_caps_fail_closed(self) -> None:
@@ -781,6 +1049,150 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
                 MODULE.GateError, "report_size_limit"
             ):
                 MODULE._read_report(path)
+
+    def test_report_reader_is_bounded_regular_and_race_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            report = root / "report.json"
+            report.write_bytes(b"{}")
+            link = root / "report-link.json"
+            link.symlink_to(report)
+            with self.assertRaisesRegex(MODULE.GateError, "report_unreadable"):
+                MODULE._read_report(link)
+            with self.assertRaisesRegex(MODULE.GateError, "report_unreadable"):
+                MODULE._read_report(root)
+            fifo = root / "report.fifo"
+            MODULE.os.mkfifo(fifo)
+            real_open = MODULE.os.open
+            nonblocking = MODULE.os.O_NONBLOCK
+
+            def guarded_open(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                self.assertNotEqual(flags & nonblocking, 0)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                MODULE.os, "open", side_effect=guarded_open
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_unreadable"
+            ):
+                MODULE._read_report(fifo)
+
+            report.write_bytes(b"0123456789")
+            real_read = MODULE.os.read
+            returned = 0
+
+            def observed_read(descriptor: int, count: int) -> bytes:
+                nonlocal returned
+                chunk = real_read(descriptor, count)
+                returned += len(chunk)
+                return chunk
+
+            with mock.patch.object(
+                MODULE, "MAX_REPORT_BYTES", 4
+            ), mock.patch.object(
+                MODULE.os, "read", side_effect=observed_read
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_size_limit"
+            ):
+                MODULE._read_report(report)
+            self.assertEqual(returned, 5)
+
+            for mutation in ("growth", "swap"):
+                with self.subTest(mutation=mutation):
+                    report.write_bytes(b"{}")
+                    replacement = root / "replacement.json"
+                    replacement.write_bytes(b"{}")
+                    changed = False
+
+                    def adversarial_read(
+                        descriptor: int, count: int
+                    ) -> bytes:
+                        nonlocal changed
+                        chunk = real_read(descriptor, count)
+                        if chunk and not changed:
+                            changed = True
+                            if mutation == "growth":
+                                report.write_bytes(b"{} ")
+                            else:
+                                replacement.replace(report)
+                        return chunk
+
+                    with mock.patch.object(
+                        MODULE.os,
+                        "read",
+                        side_effect=adversarial_read,
+                    ), self.assertRaisesRegex(
+                        MODULE.GateError, "report_unreadable"
+                    ):
+                        MODULE._read_report(report)
+
+    def test_report_reader_strict_json_is_bounded_before_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "report.json"
+            preflight_payloads = (
+                (
+                    b"[" * (MODULE.MAX_JSON_DEPTH + 1)
+                    + b"]" * (MODULE.MAX_JSON_DEPTH + 1)
+                ),
+                b'{"value":1.25}',
+                b'{"value":1e10000}',
+                b'{"value":' + b"9" * 5_000 + b"}",
+            )
+            for payload in preflight_payloads:
+                with self.subTest(payload_size=len(payload)):
+                    path.write_bytes(payload)
+                    with mock.patch.object(
+                        MODULE.json,
+                        "loads",
+                        side_effect=AssertionError("decoder must not run"),
+                    ), self.assertRaisesRegex(
+                        MODULE.GateError, "report_invalid_json"
+                    ):
+                        MODULE._read_report(path)
+
+            with mock.patch.object(
+                MODULE, "MAX_JSON_NODES", 3
+            ), mock.patch.object(
+                MODULE.json,
+                "loads",
+                side_effect=AssertionError("decoder must not run"),
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_invalid_json"
+            ):
+                path.write_bytes(b"[0,0,0,0]")
+                MODULE._read_report(path)
+
+            path.write_bytes(b'{"value":NaN}')
+            with self.assertRaisesRegex(
+                MODULE.GateError, "report_invalid_json"
+            ):
+                MODULE._read_report(path)
+
+            path.write_bytes(b"{}")
+            with mock.patch.object(
+                MODULE.json, "loads", side_effect=RecursionError
+            ), self.assertRaisesRegex(
+                MODULE.GateError, "report_invalid_json"
+            ):
+                MODULE._read_report(path)
+
+            hostile = (
+                b"[" * (MODULE.MAX_JSON_DEPTH + 1)
+                + b"]" * (MODULE.MAX_JSON_DEPTH + 1)
+            )
+            path.write_bytes(hostile)
+            process = subprocess.run(
+                [sys.executable, str(SCRIPT), str(path)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("report_invalid_json", process.stderr)
+            self.assertNotIn("Traceback", process.stderr)
 
 
 if __name__ == "__main__":

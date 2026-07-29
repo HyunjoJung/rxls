@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import copy
+from fractions import Fraction
 import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -2772,6 +2774,13 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertNotIn(str(root), rendered)
         self.assertNotIn("/private/tools", rendered)
         self.assertIn("SinglePageSheets", rendered)
+        evidence["configuration"]["metric_policy"]["unique_text_geometry"][
+            "diagnostic_only"
+        ] = False
+        self.assertIs(
+            MODULE.UNIQUE_TEXT_GEOMETRY_POLICY["diagnostic_only"],
+            True,
+        )
 
     def test_mocked_execution_validates_both_outputs_then_classifies_missing_backends(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2866,6 +2875,18 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
             1_000_000,
         )
         self.assertEqual(
+            result["pages"][0]["text_box_unique_geometry"]["matched_items"],
+            2,
+        )
+        self.assertEqual(
+            result["pages"][0]["text_line_box_unique_geometry"][
+                "matched_items"
+            ],
+            1,
+        )
+        self.assertNotIn("text_box_unique_geometry", result["metrics"])
+        self.assertNotIn("text_line_box_unique_geometry", result["metrics"])
+        self.assertEqual(
             len(
                 [
                     command
@@ -2951,21 +2972,38 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
                 min_similarity_ppm=None,
                 fail_on_incomparable=False,
             )
-            evidence, _ = MODULE.run_harness(
-                [
-                    MODULE.InputCase(first, "first.xlsx", 4),
-                    MODULE.InputCase(second, "second.xlsx", 4),
-                ],
-                discovery={"candidate_count": 2, "selected_count": 2, "truncated": False},
-                config=config,
-                backends=MODULE.Backends(False, False, False),
-                runner=NoCallRunner(),
-            )
+            original_sha256_file = MODULE._sha256_file
+
+            def bounded_sha256_file(path, limit):
+                if path in {first, second}:
+                    raise AssertionError("input budget performed I/O")
+                return original_sha256_file(path, limit)
+
+            with mock.patch.object(
+                MODULE,
+                "_sha256_file",
+                side_effect=bounded_sha256_file,
+            ):
+                evidence, _ = MODULE.run_harness(
+                    [
+                        MODULE.InputCase(first, "first.xlsx", 4),
+                        MODULE.InputCase(second, "second.xlsx", 4),
+                    ],
+                    discovery={
+                        "candidate_count": 2,
+                        "selected_count": 2,
+                        "truncated": False,
+                    },
+                    config=config,
+                    backends=MODULE.Backends(False, False, False),
+                    runner=NoCallRunner(),
+                )
 
         self.assertEqual(evidence["files"][0]["classification"], "input_limit")
         self.assertEqual(
             evidence["files"][1]["classification"], "corpus_input_budget_exceeded"
         )
+        self.assertNotIn("sha256", evidence["files"][1])
 
     def test_corpus_discovery_is_sorted_bounded_and_relative(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3119,6 +3157,43 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertEqual(cases[0].rights_tier, "S")
         self.assertEqual(cases[0].features, ("korean-text", "wrapped-text"))
         self.assertEqual(cases[0].expected_bytes, len(b"generated fixture"))
+
+    def test_manifest_boolean_byte_counts_are_not_integer_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            payload = root / "book.xlsx"
+            payload.write_bytes(b"x")
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": "rxls.render-corpus-manifest.v1",
+                        "files": [
+                            {
+                                "bytes": True,
+                                "eligible": True,
+                                "local_path": "book.xlsx",
+                                "render_selected": True,
+                                "sha256": hashlib.sha256(
+                                    b"x"
+                                ).hexdigest(),
+                                "source_id": "fixture",
+                                "source_path": "book.xlsx",
+                                "status": "ready",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cases, _ = MODULE.discover_manifest(
+                manifest,
+                max_manifest_bytes=16_384,
+                max_candidates=10,
+                max_files=10,
+            )
+        self.assertEqual(len(cases), 1)
+        self.assertIsNone(cases[0].expected_bytes)
 
     def test_deterministic_shards_are_disjoint_complete_and_capped(self) -> None:
         cases = [
@@ -4308,6 +4383,12 @@ Page    2 CropBox: 0 0 841.125 595.0625
         )
         self.assertEqual(pages[0].words[0].bbox_points, (0.0, 0.0, 200.0, 100.0))
         self.assertEqual(pages[0].lines[0].bbox_points, (0.0, 0.0, 200.0, 100.0))
+        self.assertTrue(
+            all(
+                isinstance(value, Fraction)
+                for value in pages[0].words[0].bbox_points
+            )
+        )
 
     def test_pdftotext_bbox_parser_rejects_fully_outside_boxes(self) -> None:
         coordinates = (
@@ -4375,6 +4456,43 @@ Page    2 CropBox: 0 0 841.125 595.0625
                     max_codepoints=16,
                     max_tokens=4,
                 )
+
+    def test_pdftotext_bbox_parser_caps_decimal_lexemes(self) -> None:
+        huge = "9" * 5_000
+        coordinate_payload = (
+            '<html><body><doc><page width="200" height="100">'
+            '<flow><block><line xMin="10" yMin="20" xMax="30" yMax="40">'
+            f'<word xMin="10" yMin="20" xMax="{huge}" '
+            'yMax="40">A</word></line></block></flow></page></doc>'
+            "</body></html>"
+        ).encode()
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "semantic_bbox_word_geometry",
+        ):
+            MODULE.parse_pdftotext_bbox_pages(
+                coordinate_payload,
+                expected_pages=1,
+                max_bytes=8192,
+                max_codepoints=16,
+                max_tokens=4,
+            )
+
+        page_payload = (
+            f'<html><body><doc><page width="{huge}" height="100"/>'
+            "</doc></body></html>"
+        ).encode()
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "semantic_bbox_page_geometry",
+        ):
+            MODULE.parse_pdftotext_bbox_pages(
+                page_payload,
+                expected_pages=1,
+                max_bytes=8192,
+                max_codepoints=16,
+                max_tokens=4,
+            )
 
     def test_pdftotext_bbox_streaming_caps_elements_lines_and_words(self) -> None:
         empty_elements = (
@@ -4520,6 +4638,250 @@ Page    2 CropBox: 0 0 841.125 595.0625
             line_metrics["text_line_box_match_coverage_ppm"],
             1_000_000,
         )
+
+    def test_unique_text_geometry_is_signed_bounded_and_content_private(
+        self,
+    ) -> None:
+        rxls = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                MODULE.SemanticTextBox(
+                    ("secret-A",),
+                    (10.0006, 19.9984, 29.9994, 50.0024),
+                ),
+                MODULE.SemanticTextBox(
+                    ("secret-B",),
+                    (39.998, 60.0, 59.998, 80.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-rxls",),
+                    (0.0, 0.0, 1.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-rxls",),
+                    (2.0, 0.0, 3.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-libreoffice",),
+                    (4.0, 0.0, 5.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("rxls-only",),
+                    (6.0, 0.0, 7.0, 1.0),
+                ),
+            ),
+        )
+        libreoffice = MODULE.PdfTextPage(
+            200.0,
+            100.0,
+            (
+                MODULE.SemanticTextBox(
+                    ("secret-A",),
+                    (10.0, 20.0, 30.0, 50.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("secret-B",),
+                    (40.0, 60.0, 60.0, 80.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-rxls",),
+                    (0.0, 0.0, 1.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-libreoffice",),
+                    (2.0, 0.0, 3.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("duplicate-libreoffice",),
+                    (4.0, 0.0, 5.0, 1.0),
+                ),
+                MODULE.SemanticTextBox(
+                    ("libreoffice-only",),
+                    (6.0, 0.0, 7.0, 1.0),
+                ),
+            ),
+        )
+
+        metrics = MODULE.text_box_unique_geometry_metrics(rxls, libreoffice)
+
+        self.assertEqual(
+            set(metrics),
+            {
+                "rxls_unique_items",
+                "libreoffice_unique_items",
+                "matched_items",
+                "delta_histograms_millipoints",
+                "exact_delta_summaries_millipoints",
+            },
+        )
+        self.assertEqual(metrics["rxls_unique_items"], 4)
+        self.assertEqual(metrics["libreoffice_unique_items"], 4)
+        self.assertEqual(metrics["matched_items"], 2)
+        histograms = metrics["delta_histograms_millipoints"]
+        self.assertEqual(tuple(histograms), MODULE.UNIQUE_TEXT_GEOMETRY_AXES)
+        self.assertEqual(
+            histograms,
+            {
+                "x_min": [
+                    {"delta_millipoints": -2, "count": 1},
+                    {"delta_millipoints": 1, "count": 1},
+                ],
+                "x_max": [
+                    {"delta_millipoints": -2, "count": 1},
+                    {"delta_millipoints": -1, "count": 1},
+                ],
+                "y_min": [
+                    {"delta_millipoints": -2, "count": 1},
+                    {"delta_millipoints": 0, "count": 1},
+                ],
+                "y_max": [
+                    {"delta_millipoints": 0, "count": 1},
+                    {"delta_millipoints": 2, "count": 1},
+                ],
+                "center_x": [
+                    {"delta_millipoints": -2, "count": 1},
+                    {"delta_millipoints": 0, "count": 1},
+                ],
+                "center_y": [
+                    {"delta_millipoints": 0, "count": 2},
+                ],
+                "width": [
+                    {"delta_millipoints": -1, "count": 1},
+                    {"delta_millipoints": 0, "count": 1},
+                ],
+                "height": [
+                    {"delta_millipoints": 0, "count": 1},
+                    {"delta_millipoints": 500, "count": 1},
+                ],
+            },
+        )
+        exact_summaries = metrics["exact_delta_summaries_millipoints"]
+        self.assertEqual(tuple(exact_summaries), MODULE.UNIQUE_TEXT_GEOMETRY_AXES)
+        self.assertEqual(
+            exact_summaries["x_min"],
+            {
+                "count": 2,
+                "max_delta_millipoints": 1,
+                "min_delta_millipoints": -2,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": -1,
+            },
+        )
+        self.assertEqual(
+            exact_summaries["height"],
+            {
+                "count": 2,
+                "max_delta_millipoints": 4,
+                "min_delta_millipoints": 0,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": 4,
+            },
+        )
+        serialized = json.dumps(metrics, sort_keys=True)
+        for token in (
+            "secret-A",
+            "secret-B",
+            "duplicate-rxls",
+            "duplicate-libreoffice",
+            "rxls-only",
+            "libreoffice-only",
+        ):
+            self.assertNotIn(token, serialized)
+
+        self.assertEqual(MODULE._symmetric_signed_millipoints(0.0005), 1)
+        self.assertEqual(MODULE._symmetric_signed_millipoints(-0.0005), -1)
+        self.assertEqual(MODULE._symmetric_signed_millipoints(0.00049), 0)
+        self.assertEqual(MODULE._symmetric_signed_millipoints(-0.00049), 0)
+        self.assertEqual(
+            MODULE._symmetric_signed_millipoints(Fraction(1, 2000)),
+            1,
+        )
+        self.assertEqual(
+            MODULE._symmetric_signed_millipoints(Fraction(-1, 2000)),
+            -1,
+        )
+        below_positive_tie = math.nextafter(0.9995, -math.inf)
+        below_negative_tie = math.nextafter(-0.9995, math.inf)
+        self.assertEqual(
+            MODULE._symmetric_signed_millipoints(below_positive_tie),
+            999,
+        )
+        self.assertEqual(
+            MODULE._symmetric_signed_millipoints(below_negative_tie),
+            -999,
+        )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "text_unique_geometry_delta_limit",
+        ):
+            MODULE._symmetric_signed_millipoints(1e308)
+        self.assertEqual(
+            MODULE._symmetric_signed_millipoints(
+                Fraction(1_000_000)
+            ),
+            1_000_000_000,
+        )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "text_unique_geometry_delta_limit",
+        ):
+            MODULE._symmetric_signed_millipoints(
+                Fraction(1_000_000_001, 1000)
+            )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "text_unique_geometry_delta_limit",
+        ):
+            MODULE._symmetric_signed_millipoints(Fraction(10**10_000))
+        self.assertEqual(MODULE._unique_text_geometry_bucket(2), 2)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(5), 500)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(10), 500)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(11), 500)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(-11), -500)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(50), 500)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(999), 1_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(1_004), 2_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(1_005), 2_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(-1_005), -2_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(1_500), 2_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(-1_500), -2_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(10_001), 12_000)
+        self.assertEqual(MODULE._unique_text_geometry_bucket(-10_001), -12_000)
+        possible_buckets = {
+            MODULE._unique_text_geometry_bucket(value)
+            for value in range(-10_001, 10_002)
+        }
+        self.assertEqual(
+            len(possible_buckets),
+            MODULE.MAX_UNIQUE_TEXT_GEOMETRY_BUCKETS,
+        )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "text_unique_geometry_item_limit",
+        ):
+            MODULE.text_box_unique_geometry_metrics(
+                rxls,
+                libreoffice,
+                max_items=5,
+            )
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "text_unique_geometry_item_limit",
+        ):
+            MODULE.text_box_unique_geometry_metrics(
+                rxls,
+                libreoffice,
+                max_items=MODULE.MAX_UNIQUE_TEXT_GEOMETRY_ITEMS + 1,
+            )
+
+        line_metrics = MODULE.text_line_box_unique_geometry_metrics(
+            MODULE.PdfTextPage(200.0, 100.0, (), rxls.words[:2]),
+            MODULE.PdfTextPage(200.0, 100.0, (), libreoffice.words[:2]),
+        )
+        self.assertEqual(line_metrics["matched_items"], 2)
 
     def test_aggregate_text_box_histogram_derives_exact_quantiles(self) -> None:
         pages = []
@@ -4717,6 +5079,501 @@ Page    2 CropBox: 0 0 841.125 595.0625
                     runner=NoCallRunner(),
                 )
             self.assertTrue(all(not path.exists() for path in observed))
+
+    def test_report_geometry_budget_stops_work_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cases = []
+            expected_digests = []
+            for index in range(3):
+                source = root / f"{index}.xlsx"
+                payload = f"fixture-{index}".encode()
+                source.write_bytes(payload)
+                expected_digest = hashlib.sha256(payload).hexdigest()
+                expected_digests.append(expected_digest)
+                cases.append(
+                    MODULE.InputCase(
+                        source,
+                        source.name,
+                        len(payload),
+                        expected_sha256=expected_digest,
+                        expected_bytes=len(payload),
+                    )
+                )
+
+            geometry = {
+                "delta_histograms_millipoints": {
+                    axis: [{"count": 1, "delta_millipoints": 0}]
+                    for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES
+                }
+            }
+            calls = 0
+
+            def fake_evaluate(
+                case,
+                *,
+                index,
+                work_root,
+                config,
+                backends,
+                runner,
+            ):
+                nonlocal calls
+                calls += 1
+                return {
+                    "bytes": case.size,
+                    "classification": "within_threshold",
+                    "format": "xlsx",
+                    "pages": [
+                        {
+                            "text_box_unique_geometry": copy.deepcopy(
+                                geometry
+                            ),
+                            "text_line_box_unique_geometry": copy.deepcopy(
+                                geometry
+                            ),
+                        }
+                    ],
+                    "path": case.label,
+                    "sha256": case.expected_sha256,
+                    "status": "compared",
+                }
+
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
+                    2,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "evaluate_case",
+                    side_effect=fake_evaluate,
+                ),
+            ):
+                evidence, exit_code = MODULE.run_harness(
+                    cases,
+                    discovery={
+                        "candidate_count": 3,
+                        "selected_count": 3,
+                        "shard_count": 2,
+                        "shard_index": 0,
+                        "truncated": False,
+                    },
+                    config=config,
+                    backends=MODULE.Backends(False, False, False),
+                    runner=NoCallRunner(),
+                )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            [row["classification"] for row in evidence["files"]],
+            [
+                "within_threshold",
+                "text_box_unique_geometry_report_limit",
+                "text_box_unique_geometry_report_limit",
+            ],
+        )
+        self.assertNotIn("pages", evidence["files"][1])
+        self.assertNotIn("pages", evidence["files"][2])
+        self.assertEqual(
+            [row["sha256"] for row in evidence["files"]],
+            expected_digests,
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "changed.xlsx"
+            source.write_bytes(b"changed")
+            mismatch = MODULE._identity_only_result(
+                MODULE.InputCase(
+                    source,
+                    source.name,
+                    len(b"changed"),
+                    expected_sha256="1" * 64,
+                ),
+                len(b"changed"),
+                max_input_bytes=1024,
+                status="error",
+                classification="text_box_unique_geometry_report_limit",
+            )
+        self.assertEqual(
+            mismatch["classification"],
+            "manifest_sha256_mismatch",
+        )
+        self.assertEqual(
+            mismatch["sha256"],
+            hashlib.sha256(b"changed").hexdigest(),
+        )
+
+    def test_identity_only_mode_preserves_pre_render_classifications(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "fixture.xlsx"
+            source.write_bytes(b"1234")
+            case = MODULE.InputCase(
+                source,
+                source.name,
+                4,
+                expected_bytes=4,
+            )
+
+            oversized = MODULE._identity_only_result(
+                case,
+                4,
+                max_input_bytes=3,
+                status="error",
+                classification="text_box_unique_geometry_report_limit",
+            )
+            self.assertEqual(
+                (oversized["status"], oversized["classification"]),
+                ("skipped", "input_limit"),
+            )
+            self.assertNotIn("sha256", oversized)
+
+            missing = MODULE._identity_only_result(
+                MODULE.InputCase(
+                    root / "missing.xlsx",
+                    "missing.xlsx",
+                    None,
+                ),
+                None,
+                stat_error="missing_input",
+                max_input_bytes=10,
+                status="error",
+                classification="text_box_unique_geometry_report_limit",
+            )
+            self.assertEqual(
+                (missing["status"], missing["classification"]),
+                ("skipped", "missing_input"),
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "_sha256_file",
+                side_effect=MODULE.HarnessError("input_limit"),
+            ):
+                unreadable = MODULE._identity_only_result(
+                    case,
+                    4,
+                    max_input_bytes=10,
+                    status="error",
+                    classification=(
+                        "text_box_unique_geometry_report_limit"
+                    ),
+                )
+            self.assertEqual(
+                (unreadable["status"], unreadable["classification"]),
+                ("skipped", "unreadable_input"),
+            )
+            self.assertNotIn("sha256", unreadable)
+
+    def test_incomparable_measurements_are_not_retained(self) -> None:
+        aggregate = {"similarity_ppm": 0}
+        pages = [{"private": "not retained"}]
+        self.assertEqual(
+            MODULE._retained_metric_evidence(
+                "skipped",
+                aggregate,
+                pages,
+            ),
+            {},
+        )
+        for status in ("compared", "different"):
+            self.assertEqual(
+                MODULE._retained_metric_evidence(
+                    status,
+                    aggregate,
+                    pages,
+                ),
+                {"metrics": aggregate, "pages": pages},
+            )
+
+    def test_histogram_budget_rejects_the_triggering_result(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "fixture.xlsx"
+            source.write_bytes(b"x")
+            case = MODULE.InputCase(
+                source,
+                source.name,
+                1,
+                expected_sha256="1" * 64,
+            )
+            geometry = {
+                "delta_histograms_millipoints": {
+                    axis: [{"count": 1, "delta_millipoints": 0}]
+                    for axis in MODULE.UNIQUE_TEXT_GEOMETRY_AXES
+                }
+            }
+
+            def fake_evaluate(*_args, **_kwargs):
+                return {
+                    "bytes": 1,
+                    "classification": "within_threshold",
+                    "format": "xlsx",
+                    "pages": [
+                        {
+                            "text_box_unique_geometry": copy.deepcopy(
+                                geometry
+                            ),
+                            "text_line_box_unique_geometry": copy.deepcopy(
+                                geometry
+                            ),
+                        }
+                    ],
+                    "path": case.label,
+                    "sha256": "1" * 64,
+                    "status": "compared",
+                }
+
+            config = MODULE.HarnessConfig(
+                rxls_command=("rxls-render",),
+                libreoffice="soffice",
+                svg_rasterizer_command=None,
+                caps=MODULE.Caps(),
+                dpi=96,
+                locale="C.UTF-8",
+                dry_run=False,
+                min_similarity_ppm=None,
+                fail_on_incomparable=False,
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
+                    15,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "evaluate_case",
+                    side_effect=fake_evaluate,
+                ),
+            ):
+                evidence, exit_code = MODULE.run_harness(
+                    [case],
+                    discovery={
+                        "candidate_count": 1,
+                        "selected_count": 1,
+                        "truncated": False,
+                    },
+                    config=config,
+                    backends=MODULE.Backends(False, False, False),
+                    runner=NoCallRunner(),
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            evidence["files"][0]["classification"],
+            "text_box_unique_geometry_report_limit",
+        )
+        self.assertNotIn("pages", evidence["files"][0])
+
+    def test_geometry_report_budget_is_exactly_partitioned_by_shard(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_PAGES",
+                5,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_UNIQUE_TEXT_GEOMETRY_REPORT_HISTOGRAM_BUCKETS",
+                11,
+            ),
+        ):
+            self.assertEqual(
+                MODULE._geometry_report_budget({"shard_count": 2}),
+                (2, 5),
+            )
+        for shard_count in (
+            True,
+            0,
+            -1,
+            "2",
+            MODULE.MAX_RENDER_PARITY_SHARDS + 1,
+        ):
+            with (
+                self.subTest(shard_count=shard_count),
+                self.assertRaisesRegex(MODULE.HarnessError, "shard_count"),
+            ):
+                MODULE._geometry_report_budget(
+                    {"shard_count": shard_count}
+                )
+
+    def test_whole_report_limits_count_tuples_and_atomic_write(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_EVIDENCE_REPORT_JSON_NODES",
+                2,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_canonical_json_bytes",
+                side_effect=AssertionError("serialized before node cap"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.HarnessError,
+                "report_json_complexity",
+            ),
+        ):
+            MODULE.validate_evidence_report_limits({"rows": (1, 2)})
+
+        with (
+            mock.patch.object(MODULE, "MAX_EVIDENCE_REPORT_BYTES", 1),
+            self.assertRaisesRegex(
+                MODULE.HarnessError,
+                "report_bytes_limit",
+            ),
+        ):
+            MODULE.validate_evidence_report_limits({"ok": True})
+
+        with self.assertRaisesRegex(
+            MODULE.HarnessError,
+            "report_integer_limit",
+        ):
+            MODULE.validate_evidence_report_limits(
+                {
+                    "oversized": (
+                        10 ** MODULE.MAX_EVIDENCE_JSON_INTEGER_DIGITS
+                    )
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "report.json"
+            target.write_text("old", encoding="utf-8")
+            MODULE.write_report_atomic(target, '{"complete":true}\n')
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                '{"complete":true}\n',
+            )
+            self.assertEqual(list(root.glob(".report.json.*.tmp")), [])
+
+    def test_full_lane_geometry_envelope_has_strict_reader_reserve(self) -> None:
+        axes = MODULE.UNIQUE_TEXT_GEOMETRY_AXES
+
+        def geometry(bucket_count: int) -> dict[str, object]:
+            buckets = [
+                {"count": 1, "delta_millipoints": index}
+                for index in range(bucket_count)
+            ]
+            summary = {
+                "count": bucket_count,
+                "max_delta_millipoints": (
+                    bucket_count - 1 if bucket_count else None
+                ),
+                "min_delta_millipoints": 0 if bucket_count else None,
+                "negative_overflow_items": 0,
+                "positive_overflow_items": 0,
+                "sum_delta_millipoints": sum(range(bucket_count)),
+            }
+            return {
+                "delta_histograms_millipoints": {
+                    axis: copy.deepcopy(buckets) for axis in axes
+                },
+                "exact_delta_summaries_millipoints": {
+                    axis: copy.deepcopy(summary) for axis in axes
+                },
+                "libreoffice_unique_items": bucket_count,
+                "matched_items": bucket_count,
+                "rxls_unique_items": bucket_count,
+            }
+
+        def page(bucket_count: int) -> dict[str, object]:
+            return {
+                **{
+                    f"metric_{index:03d}": index
+                    for index in range(300)
+                },
+                "text_box_unique_geometry": geometry(bucket_count),
+                "text_line_box_unique_geometry": geometry(bucket_count),
+            }
+
+        one_bucket_page = page(1)
+        two_bucket_page = page(2)
+        pages = [
+            *([two_bucket_page] * 1_125),
+            *([one_bucket_page] * 875),
+        ]
+        features = [f"feature-{index:02d}" for index in range(33)]
+        rows = []
+        offset = 0
+        for index in range(800):
+            page_count = 3 if index < 400 else 2
+            row_pages = pages[offset : offset + page_count]
+            offset += page_count
+            rows.append(
+                {
+                    "bytes": 1,
+                    "classification": "within_threshold",
+                    "features": features,
+                    "format": "xlsx",
+                    "metrics": {
+                        f"aggregate_{metric:03d}": metric
+                        for metric in range(100)
+                    },
+                    "pages": row_pages,
+                    "path": (
+                        f"{index:04d}-"
+                        + "x" * (512 - len(f"{index:04d}-"))
+                    ),
+                    "rights_tier": "S",
+                    "sha256": f"{index + 1:064x}",
+                    "status": "compared",
+                }
+            )
+        evidence = {
+            "configuration": {
+                "metric_policy": {
+                    "unique_text_geometry": copy.deepcopy(
+                        MODULE.UNIQUE_TEXT_GEOMETRY_POLICY
+                    )
+                }
+            },
+            "discovery": {"selected_count": 800},
+            "files": rows,
+            "mode": "compare",
+            "preflight": {"locked": True},
+            "schema": MODULE.EVIDENCE_SCHEMA,
+            "summary": {"files": 800},
+        }
+        pages_count = 0
+        bucket_count = 0
+        for row in rows:
+            row_pages, row_buckets = (
+                MODULE._unique_text_geometry_result_complexity(row)
+            )
+            pages_count += row_pages
+            bucket_count += row_buckets
+        payload_bytes, nodes = MODULE.validate_evidence_report_limits(
+            evidence
+        )
+
+        self.assertEqual(pages_count, 2_000)
+        self.assertEqual(bucket_count, 50_000)
+        self.assertLessEqual(
+            nodes,
+            MODULE.MAX_EVIDENCE_REPORT_JSON_NODES - 500_000,
+        )
+        self.assertLessEqual(
+            payload_bytes,
+            MODULE.MAX_EVIDENCE_REPORT_BYTES - 8 * 1024 * 1024,
+        )
 
 
 if __name__ == "__main__":
