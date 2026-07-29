@@ -5785,6 +5785,11 @@ pub struct Sheet {
     /// OOXML-only provenance used to distinguish an absent application default
     /// from an explicit `defaultColWidth` and from `baseColWidth`.
     pub(crate) ooxml_implicit_col_width: OoxmlImplicitColumnWidth,
+    /// Whether a present XLSX `sheetFormatPr` omitted `baseColWidth`, causing
+    /// Calc's importer to apply the element's defaulted eight-digit base plus
+    /// five screen pixels instead of the separate 8.5-digit constructor
+    /// default used when the entire element is absent.
+    pub(crate) ooxml_defaulted_base_col_width: bool,
     /// OOXML-only provenance used to distinguish an absent application default
     /// from an explicit `defaultRowHeight` / XLSB `miyDefRwHeight`.
     pub(crate) ooxml_implicit_row_height: OoxmlImplicitRowHeight,
@@ -6167,6 +6172,7 @@ impl Default for Sheet {
             default_row_height: None,
             default_col_width: None,
             ooxml_implicit_col_width: OoxmlImplicitColumnWidth::None,
+            ooxml_defaulted_base_col_width: false,
             ooxml_implicit_row_height: OoxmlImplicitRowHeight::None,
             xlsx_normal_font_size_pt: None,
             merges: Vec::default(),
@@ -8353,6 +8359,16 @@ impl Sheet {
             OoxmlImplicitColumnWidth::ApplicationDefault => Some(None),
             OoxmlImplicitColumnWidth::BaseCharacters(chars) => Some(Some(chars)),
         }
+    }
+
+    /// Whether XLSX import applied `sheetFormatPr`'s defaulted base width.
+    ///
+    /// This is an internal cross-crate provenance contract used to reproduce
+    /// Calc's distinct wrapping width without changing the compatibility
+    /// character-width projection.
+    #[doc(hidden)]
+    pub fn ooxml_uses_defaulted_base_column_width(&self) -> bool {
+        self.ooxml_defaulted_base_col_width
     }
 
     /// Default row height in points when no explicit height exists.

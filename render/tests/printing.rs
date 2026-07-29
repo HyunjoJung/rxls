@@ -704,6 +704,19 @@ fn prepared_print_pages_fail_closed_after_selected_source_geometry_changes() {
         })
     );
 
+    let mut filtered = Workbook::new();
+    let sheet = filtered.add_sheet("Filter identity");
+    sheet.write(0, 0, "Header");
+    sheet.set_page_setup(PageSetup::new().with_print_area((0, 0, 0, 0)));
+    let filter_prepared = prepare_print_document(&filtered, 0, &options).unwrap();
+    filtered.sheets[0].autofilter(0, 0, 0, 0);
+    assert_eq!(
+        build_print_page(&filtered, &filter_prepared, 0),
+        Err(RenderError::Backend {
+            reason: "prepared_print_source_changed",
+        })
+    );
+
     for formula in ["$A$2>0", "$A2>0"] {
         let mut conditional = Workbook::new();
         let sheet = conditional.add_sheet("Conditional identity");

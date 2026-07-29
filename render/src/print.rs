@@ -1409,7 +1409,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v12");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v13");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1427,6 +1427,7 @@ fn print_source_identity(
     update_debug(&mut digest, sheet.blank_cell_styles());
     update_debug(&mut digest, sheet.tables());
     update_debug(&mut digest, sheet.table_header_styles());
+    update_debug(&mut digest, &sheet.autofilter_range());
     update_debug(&mut digest, sheet.column_widths());
     update_debug(&mut digest, sheet.xlsb_column_widths_256());
     update_debug(&mut digest, &sheet.xlsb_default_column_width());
@@ -1441,6 +1442,7 @@ fn print_source_identity(
     update_debug(&mut digest, sheet.physical_column_widths());
     update_debug(&mut digest, &sheet.default_column_width());
     update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
+    update_debug(&mut digest, &sheet.ooxml_uses_defaulted_base_column_width());
     update_debug(&mut digest, sheet.row_heights());
     update_debug(&mut digest, &sheet.default_row_height());
     update_debug(&mut digest, &sheet.has_implicit_ooxml_row_height());

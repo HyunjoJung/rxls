@@ -164,6 +164,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_row_height,
             default_col_width,
             base_col_width,
+            defaulted_base_col_width,
             collapsed_rows,
             outline_summary_below,
             outline_summary_right,
@@ -322,6 +323,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_row_height,
             default_col_width,
             ooxml_implicit_col_width,
+            ooxml_defaulted_base_col_width: defaulted_base_col_width,
             ooxml_implicit_row_height,
             xlsx_normal_font_size_pt: is_worksheet
                 .then_some(styles.xlsx_normal_font_size_pt)
@@ -5407,6 +5409,7 @@ struct ParsedSheet {
     default_row_height: Option<f32>,
     default_col_width: Option<f32>,
     base_col_width: Option<f32>,
+    defaulted_base_col_width: bool,
     collapsed_rows: BTreeSet<u32>,
     outline_summary_below: Option<bool>,
     outline_summary_right: Option<bool>,
@@ -5672,10 +5675,26 @@ fn parse_sheet(
                 b"sheetFormatPr" => {
                     parsed.default_row_height =
                         attr(&e, b"defaultRowHeight").and_then(|s| s.parse::<f32>().ok());
-                    parsed.default_col_width =
-                        attr(&e, b"defaultColWidth").and_then(|s| s.parse::<f32>().ok());
-                    parsed.base_col_width =
-                        attr(&e, b"baseColWidth").and_then(|s| s.parse::<f32>().ok());
+                    parsed.default_col_width = attr(&e, b"defaultColWidth")
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .filter(|width| width.is_finite() && *width > 0.0);
+                    // ECMA-376 defaults baseColWidth to 8 when the element is
+                    // present. Keep that import branch separate from the
+                    // 8.5-character constructor default used when the entire
+                    // element is absent, without changing the compatibility
+                    // character-width projection.
+                    let base_col_width = attr(&e, b"baseColWidth");
+                    parsed.defaulted_base_col_width = base_col_width
+                        .as_deref()
+                        .is_none_or(|value| value.parse::<i32>().is_err());
+                    parsed.base_col_width = match base_col_width {
+                        Some(value) => value
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|width| *width > 0)
+                            .map(|width| width as f32),
+                        None => None,
+                    };
                     parsed.default_rows_hidden = attr(&e, b"zeroHeight")
                         .as_deref()
                         .and_then(parse_bool_attr)
@@ -7789,14 +7808,28 @@ mod tests {
         let absent = parse("");
         assert_eq!(absent.default_col_width, None);
         assert_eq!(absent.base_col_width, None);
+        assert!(!absent.defaulted_base_col_width);
+
+        let defaulted_base = parse(r#"<sheetFormatPr/>"#);
+        assert_eq!(defaulted_base.default_col_width, None);
+        assert_eq!(defaulted_base.base_col_width, None);
+        assert!(defaulted_base.defaulted_base_col_width);
+
+        let ignored_non_positive =
+            parse(r#"<sheetFormatPr baseColWidth="0" defaultColWidth="-1"/>"#);
+        assert_eq!(ignored_non_positive.default_col_width, None);
+        assert_eq!(ignored_non_positive.base_col_width, None);
+        assert!(!ignored_non_positive.defaulted_base_col_width);
 
         let explicit = parse(r#"<sheetFormatPr baseColWidth="8" defaultColWidth="8.43"/>"#);
         assert_eq!(explicit.default_col_width, Some(8.43));
         assert_eq!(explicit.base_col_width, Some(8.0));
+        assert!(!explicit.defaulted_base_col_width);
 
         let base = parse(r#"<sheetFormatPr baseColWidth="10"/>"#);
         assert_eq!(base.default_col_width, None);
         assert_eq!(base.base_col_width, Some(10.0));
+        assert!(!base.defaulted_base_col_width);
     }
 
     #[test]

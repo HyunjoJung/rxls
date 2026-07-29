@@ -80,6 +80,11 @@ const XLSB_BASE_COLUMN_SCREEN_PIXELS: u16 = 5;
 /// Calc's default 20-twip top and bottom margins each truncate to one device
 /// pixel through the 67/1000 optimal-height scale.
 const AUTO_ROW_VERTICAL_PADDING_PIXELS: i64 = 2;
+/// Calc's default left and right EditEngine cell margins are each 20 twips.
+const CALC_CELL_HORIZONTAL_MARGIN_TWIPS: u64 = 20;
+/// Calc removes one additional device pixel for the cell grid line before
+/// converting the wrapping paper size to Map100thMM.
+const CALC_CELL_GRID_PIXELS: u64 = 1;
 
 /// Inclusive zero-based worksheet rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -976,6 +981,7 @@ pub(crate) fn build_auxiliary_text_node(
         rect: bounds,
         is_merged: false,
         line_layout_policy: CellLineLayoutPolicy::Native,
+        calc_wrap_space: None,
         style: None,
         conditional: ConditionalPaint::default(),
         text,
@@ -1006,6 +1012,24 @@ struct MergeLayout {
     anchor: CellCoordinate,
     rect: Rect,
     has_adjustable_row: bool,
+    calc_wrap_space: Option<CalcWrapSpace>,
+}
+
+/// Calc EditEngine's wrapping coordinate space for an exactly recoverable
+/// OOXML column span.
+///
+/// The paper width is deliberately typed and retained in Map100thMM instead
+/// of being mixed with physical `Fixed` pixels used for glyph painting.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CalcWrapSpace {
+    paper_width_mm100: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CalcLineLayoutEvidence {
+    is_plain_text: bool,
+    has_adjustable_row: bool,
+    wrap_space_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1014,6 +1038,7 @@ struct Region {
     rect: Rect,
     is_merged: bool,
     line_layout_policy: CellLineLayoutPolicy,
+    calc_wrap_space: Option<CalcWrapSpace>,
     style: Option<CellStyle>,
     conditional: ConditionalPaint,
     text: String,
@@ -1475,6 +1500,11 @@ fn build_sheet_scene_inner(
             has_adjustable_row: merge_rows
                 .iter()
                 .any(|slot| !sheet.row_heights().contains_key(&slot.index)),
+            calc_wrap_space: if calc_line_layout_available {
+                calc_ooxml_merge_wrap_space(sheet, c0, c1, maximum_digit_width, options)?
+            } else {
+                None
+            },
         };
         if layout.anchor != layout.owner {
             warnings.add(
@@ -1526,13 +1556,19 @@ fn build_sheet_scene_inner(
                 row: row.index,
                 col: col.index,
             };
-            let (source, rect, is_merged, has_adjustable_row) =
+            let (source, rect, is_merged, has_adjustable_row, calc_wrap_space) =
                 if let Some(&merge_index) = merge_cover.get(&coordinate) {
                     let merge = &merge_layouts[merge_index];
                     if coordinate != merge.owner {
                         continue;
                     }
-                    (merge.anchor, merge.rect, true, merge.has_adjustable_row)
+                    (
+                        merge.anchor,
+                        merge.rect,
+                        true,
+                        merge.has_adjustable_row,
+                        merge.calc_wrap_space,
+                    )
                 } else {
                     (
                         coordinate,
@@ -1544,6 +1580,16 @@ fn build_sheet_scene_inner(
                         },
                         false,
                         !sheet.row_heights().contains_key(&coordinate.row),
+                        if calc_line_layout_available {
+                            calc_ooxml_cell_wrap_space(
+                                sheet,
+                                col.index,
+                                maximum_digit_width,
+                                options,
+                            )?
+                        } else {
+                            None
+                        },
                     )
                 };
             let display_cell = display_cells.get(&source);
@@ -1593,19 +1639,27 @@ fn build_sheet_scene_inner(
                         None
                     }
                 });
+            let line_layout_policy = cell_line_layout_policy(
+                sheet,
+                source,
+                style.as_ref(),
+                rich_text.as_deref(),
+                CalcLineLayoutEvidence {
+                    is_plain_text: display_cell
+                        .is_some_and(|cell| matches!(cell.value, Cell::Text(_))),
+                    has_adjustable_row,
+                    wrap_space_available: calc_line_layout_available && calc_wrap_space.is_some(),
+                },
+                options,
+            );
             regions.push(Region {
                 source,
                 rect,
                 is_merged,
-                line_layout_policy: cell_line_layout_policy(
-                    sheet,
-                    source,
-                    style.as_ref(),
-                    rich_text.as_deref(),
-                    has_adjustable_row,
-                    calc_line_layout_available,
-                    options,
-                ),
+                line_layout_policy,
+                calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
+                    .then_some(calc_wrap_space)
+                    .flatten(),
                 style,
                 conditional: ConditionalPaint::default(),
                 text,
@@ -2208,6 +2262,207 @@ fn round_unsigned_ratio(value: u64, numerator: u64, denominator: u64) -> Option<
         .checked_add(u128::from(denominator / 2))?
         .checked_div(u128::from(denominator))?;
     u64::try_from(rounded).ok()
+}
+
+fn calc_wrap_space_from_column_twips(
+    widths: impl IntoIterator<Item = u64>,
+) -> Result<Option<CalcWrapSpace>, RenderError> {
+    let mut document_pixels = 0_u64;
+    let mut columns = 0_u64;
+    for twips in widths {
+        if twips == 0 {
+            return Ok(None);
+        }
+        let Some(column_pixels) = twips
+            .checked_mul(CALC_OPTIMAL_HEIGHT_SAMPLE_PIXELS)
+            .and_then(|value| value.checked_div(CALC_OPTIMAL_HEIGHT_SAMPLE_TWIPS))
+        else {
+            return Ok(None);
+        };
+        if column_pixels == 0 {
+            return Ok(None);
+        }
+        let Some(next_pixels) = document_pixels.checked_add(column_pixels) else {
+            return Ok(None);
+        };
+        document_pixels = next_pixels;
+        let Some(next_columns) = columns.checked_add(1) else {
+            return Ok(None);
+        };
+        columns = next_columns;
+    }
+    if columns == 0 {
+        return Ok(None);
+    }
+    let Some(margin_pixels) = CALC_CELL_HORIZONTAL_MARGIN_TWIPS
+        .checked_mul(CALC_OPTIMAL_HEIGHT_SAMPLE_PIXELS)
+        .and_then(|value| value.checked_div(CALC_OPTIMAL_HEIGHT_SAMPLE_TWIPS))
+    else {
+        return Ok(None);
+    };
+    let Some(inset_pixels) = margin_pixels
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(CALC_CELL_GRID_PIXELS))
+    else {
+        return Ok(None);
+    };
+    let Some(paper_pixels) = document_pixels.checked_sub(inset_pixels) else {
+        return Ok(None);
+    };
+    if paper_pixels == 0 {
+        return Ok(None);
+    }
+    let Some(paper_width_mm100) =
+        round_unsigned_ratio(paper_pixels, MM100_PER_INCH, CALC_DEVICE_DPI)
+    else {
+        return Ok(None);
+    };
+    Ok(
+        (paper_width_mm100 > 0 && i64::try_from(paper_width_mm100).is_ok())
+            .then_some(CalcWrapSpace { paper_width_mm100 }),
+    )
+}
+
+fn calc_ooxml_wrap_digit_twips(maximum_digit_width: Fixed) -> Option<u64> {
+    let raw = u64::try_from(maximum_digit_width.raw()).ok()?;
+    raw.checked_mul(u64::try_from(TWIPS_PER_CSS_PIXEL).ok()?)
+        .and_then(|value| value.checked_div(FIXED_UNITS_PER_PIXEL as u64))
+        .filter(|width| *width > 0)
+}
+
+fn calc_ooxml_wrap_column_twips(sheet: &Sheet, column: u16, digit_twips: u64) -> Option<u64> {
+    if sheet.physical_column_widths().contains_key(&column)
+        || sheet.xlsb_column_widths_256().contains_key(&column)
+        || sheet.xlsb_default_column_width().is_some()
+        || sheet.default_column_width().is_some()
+        || sheet.implicit_ooxml_column_width() != Some(None)
+    {
+        return None;
+    }
+    if let Some(characters) = sheet.column_widths().get(&column).copied() {
+        if !characters.is_finite() || characters <= 0.0 {
+            return None;
+        }
+        let character_twips = (f64::from(characters) * digit_twips as f64).round();
+        if !character_twips.is_finite()
+            || character_twips <= 0.0
+            || character_twips > u64::MAX as f64
+        {
+            return None;
+        }
+        Some(character_twips as u64)
+    } else if sheet.ooxml_uses_defaulted_base_column_width() {
+        digit_twips.checked_mul(8).and_then(|value| {
+            u64::try_from(TWIPS_PER_CSS_PIXEL)
+                .ok()?
+                .checked_mul(5)
+                .and_then(|padding| value.checked_add(padding))
+        })
+    } else {
+        digit_twips
+            .checked_mul(17)
+            .and_then(|value| value.checked_add(1))
+            .map(|value| value / 2)
+            .filter(|width| *width > 0)
+    }
+}
+
+fn calc_ooxml_wrap_space(
+    sheet: &Sheet,
+    columns: impl IntoIterator<Item = u16>,
+    maximum_digit_width: Fixed,
+) -> Result<Option<CalcWrapSpace>, RenderError> {
+    let Some(digit_twips) = calc_ooxml_wrap_digit_twips(maximum_digit_width) else {
+        return Ok(None);
+    };
+    let widths = columns
+        .into_iter()
+        .map(|column| calc_ooxml_wrap_column_twips(sheet, column, digit_twips))
+        .collect::<Option<Vec<_>>>();
+    let Some(widths) = widths else {
+        return Ok(None);
+    };
+    calc_wrap_space_from_column_twips(widths)
+}
+
+fn calc_ooxml_cell_wrap_space(
+    sheet: &Sheet,
+    column: u16,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+) -> Result<Option<CalcWrapSpace>, RenderError> {
+    if options.include_hidden && sheet.hidden_columns().contains(&column) {
+        return Ok(None);
+    }
+    calc_ooxml_wrap_space(sheet, [column], maximum_digit_width)
+}
+
+fn calc_ooxml_merge_wrap_space(
+    sheet: &Sheet,
+    first: u16,
+    last: u16,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+) -> Result<Option<CalcWrapSpace>, RenderError> {
+    if first > last || first > MAX_WORKSHEET_COLUMN {
+        return Ok(None);
+    }
+    let last = last.min(MAX_WORKSHEET_COLUMN);
+    if sheet.hidden_columns().contains(&first)
+        || (options.include_hidden && sheet.hidden_columns().range(first..=last).next().is_some())
+    {
+        // Calc's optimal-height path uses the hidden anchor's original
+        // width, while cell painting uses its current zero width. The exact
+        // shared wrapper cannot represent that split. Likewise, include_hidden
+        // is a renderer-only view that has no Calc-equivalent paper width.
+        return Ok(None);
+    }
+    calc_ooxml_wrap_space(
+        sheet,
+        (first..=last).filter(|column| !sheet.hidden_columns().contains(column)),
+        maximum_digit_width,
+    )
+}
+
+impl CalcWrapSpace {
+    /// Return an opaque width for the shared bounded wrapper. Both the paper
+    /// and candidate widths use Map100thMM raw units at this API seam.
+    fn line_width(self) -> Result<Fixed, RenderError> {
+        i64::try_from(self.paper_width_mm100)
+            .map(Fixed::from_raw)
+            .map_err(|_| RenderError::CoordinateOverflow)
+    }
+
+    fn physical_width_mm100(width: Fixed) -> Result<Fixed, RenderError> {
+        let raw = u64::try_from(width.raw()).map_err(|_| RenderError::CoordinateOverflow)?;
+        let denominator = CALC_DEVICE_DPI
+            .checked_mul(FIXED_UNITS_PER_PIXEL as u64)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let width_mm100 = round_unsigned_ratio(raw, MM100_PER_INCH, denominator)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        i64::try_from(width_mm100)
+            .map(Fixed::from_raw)
+            .map_err(|_| RenderError::CoordinateOverflow)
+    }
+
+    fn measure_physical_width(width: Fixed, font_size: Fixed) -> Result<Fixed, RenderError> {
+        if font_size.raw() <= 0 {
+            return Err(RenderError::Typography {
+                reason: "invalid_calc_wrap_font_size",
+            });
+        }
+        let font_raw =
+            u64::try_from(font_size.raw()).map_err(|_| RenderError::CoordinateOverflow)?;
+        let device_em_pixels = round_unsigned_ratio(font_raw, 1, FIXED_UNITS_PER_PIXEL as u64)
+            .filter(|pixels| *pixels > 0)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let device_em_raw = device_em_pixels
+            .checked_mul(FIXED_UNITS_PER_PIXEL as u64)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let device_width = scale_ratio(width, device_em_raw, font_size.raw())?;
+        Self::physical_width_mm100(device_width)
+    }
 }
 
 fn round_signed_ratio(value: i128, numerator: i128, denominator: i128) -> Result<i64, RenderError> {
@@ -3024,22 +3279,38 @@ fn has_conditional_text_layout_overlay(sheet: &Sheet) -> bool {
     })
 }
 
+fn cell_has_auto_filter_button(sheet: &Sheet, source: CellCoordinate) -> bool {
+    let is_header = |(first_row, first_col, _last_row, last_col)| {
+        source.row == first_row && source.col >= first_col && source.col <= last_col
+    };
+    sheet.autofilter_range().is_some_and(is_header)
+        || sheet.tables().iter().any(|table| is_header(table.range))
+}
+
 fn cell_line_layout_policy(
     sheet: &Sheet,
     source: CellCoordinate,
     style: Option<&CellStyle>,
     rich_text: Option<&[rxls::TextRun]>,
-    has_adjustable_row: bool,
-    calc_line_layout_available: bool,
+    evidence: CalcLineLayoutEvidence,
     options: &RenderOptions,
 ) -> CellLineLayoutPolicy {
     let verified = || {
-        if !has_adjustable_row || rich_text.is_some() || !calc_line_layout_available {
+        if !evidence.is_plain_text
+            || !evidence.has_adjustable_row
+            || rich_text.is_some()
+            || !evidence.wrap_space_available
+            || cell_has_auto_filter_button(sheet, source)
+        {
             return None;
         }
         let style = style?;
         let alignment = style.align.as_ref()?;
-        if !alignment.wrap || alignment.rotation != 0 || alignment.shrink_to_fit {
+        if !alignment.wrap
+            || alignment.rotation != 0
+            || alignment.shrink_to_fit
+            || alignment.indent != 0
+        {
             return None;
         }
         let exact_points = sheet.verified_xlsx_cell_font_size_pt(source.row, source.col)?;
@@ -3404,7 +3675,7 @@ fn expand_automatic_row_heights(
         if merged.is_none() && (cell.row < range.first_row || cell.row > range.last_row) {
             continue;
         }
-        let (visible_rows, adjustable_row, width, is_merged) =
+        let (visible_rows, adjustable_row, width, is_merged, calc_wrap_space) =
             if let Some((r0, c0, r1, c1)) = merged {
                 let visible_rows = row_sizes
                     .range(r0.max(range.first_row)..=r1.min(range.last_row))
@@ -3429,7 +3700,12 @@ fn expand_automatic_row_heights(
                 else {
                     continue;
                 };
-                (visible_rows, adjustable_row, width, true)
+                let calc_wrap_space = if calc_line_layout_available {
+                    calc_ooxml_merge_wrap_space(sheet, c0, c1, maximum_digit_width, options)?
+                } else {
+                    None
+                };
+                (visible_rows, adjustable_row, width, true, calc_wrap_space)
             } else {
                 if !row_sizes.contains_key(&cell.row)
                     || sheet.row_heights().contains_key(&cell.row)
@@ -3445,7 +3721,17 @@ fn expand_automatic_row_heights(
                     warnings,
                     column_widths,
                 );
-                (vec![cell.row], cell.row, width, false)
+                (
+                    vec![cell.row],
+                    cell.row,
+                    width,
+                    false,
+                    if calc_line_layout_available {
+                        calc_ooxml_cell_wrap_space(sheet, cell.col, maximum_digit_width, options)?
+                    } else {
+                        None
+                    },
+                )
             };
 
         let style = style_snapshot
@@ -3518,6 +3804,18 @@ fn expand_automatic_row_heights(
                     == text)
                     .then_some(sanitized)
             });
+            let line_layout_policy = cell_line_layout_policy(
+                sheet,
+                source,
+                style.as_ref(),
+                rich_text.as_deref(),
+                CalcLineLayoutEvidence {
+                    is_plain_text: matches!(cell.value, Cell::Text(_)),
+                    has_adjustable_row: true,
+                    wrap_space_available: calc_line_layout_available && calc_wrap_space.is_some(),
+                },
+                options,
+            );
             let region = Region {
                 source,
                 rect: Rect {
@@ -3527,15 +3825,10 @@ fn expand_automatic_row_heights(
                     height: Fixed::from_raw(1),
                 },
                 is_merged,
-                line_layout_policy: cell_line_layout_policy(
-                    sheet,
-                    source,
-                    style.as_ref(),
-                    rich_text.as_deref(),
-                    true,
-                    calc_line_layout_available,
-                    options,
-                ),
+                line_layout_policy,
+                calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
+                    .then_some(calc_wrap_space)
+                    .flatten(),
                 style,
                 conditional: ConditionalPaint::default(),
                 text,
@@ -9480,6 +9773,18 @@ fn prepare_styled_text(
     let horizontal_padding =
         outlined_horizontal_padding(pack, styles[0].request(), primary_size, region, options)?;
     let available_width = inner_width(region.rect.width, horizontal_padding)?;
+    let calc_wrap_space = match region.line_layout_policy {
+        CellLineLayoutPolicy::Native => None,
+        CellLineLayoutPolicy::CalcEditEngine => {
+            Some(region.calc_wrap_space.ok_or(RenderError::Typography {
+                reason: "missing_calc_wrap_space",
+            })?)
+        }
+    };
+    let line_available_width = match calc_wrap_space {
+        Some(space) => space.line_width()?,
+        None => available_width,
+    };
     let scalar_count = region.text.chars().count() as u64;
     let work = scalar_count
         .checked_mul(2)
@@ -9507,7 +9812,7 @@ fn prepare_styled_text(
         &region.text,
         wrap,
         region.line_layout_policy,
-        available_width,
+        line_available_width,
         remaining_lines,
         work,
         |range| {
@@ -9520,7 +9825,11 @@ fn prepare_styled_text(
                 direction,
                 options,
             )?;
-            styled_shaped_width(pack, &shaped, &styles, 1, 1)
+            let width = styled_shaped_width(pack, &shaped, &styles, 1, 1)?;
+            match calc_wrap_space {
+                Some(_) => CalcWrapSpace::measure_physical_width(width, primary_size),
+                None => Ok(width),
+            }
         },
     )?;
 
@@ -11810,6 +12119,203 @@ mod tests {
     }
 
     #[test]
+    fn calc_wrap_space_replays_per_column_device_truncation() {
+        let imported = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><cols><col min="1" max="1" width="24" customWidth="1"/></cols><sheetData/></worksheet>"#,
+        );
+        let sheet = &imported.sheets[0];
+        assert_eq!(calc_ooxml_wrap_column_twips(sheet, 0, 122), Some(2_928));
+        assert_eq!(calc_ooxml_wrap_column_twips(sheet, 1, 122), Some(1_037));
+        assert_eq!(
+            calc_ooxml_wrap_space(sheet, [0], Fixed::from_raw(8_329))
+                .unwrap()
+                .unwrap()
+                .paper_width_mm100,
+            5_106
+        );
+        assert_eq!(
+            calc_ooxml_wrap_space(sheet, [0], Fixed::ZERO).unwrap(),
+            None
+        );
+        let half_twip = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><cols><col min="1" max="1" width="8.25" customWidth="1"/></cols><sheetData/></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_wrap_column_twips(&half_twip.sheets[0], 0, 122),
+            Some(1_007)
+        );
+        let unsupported_default = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><sheetFormatPr defaultColWidth="8.5"/><sheetData/></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_wrap_column_twips(&unsupported_default.sheets[0], 0, 122),
+            None
+        );
+
+        let narrow = calc_wrap_space_from_column_twips([1_037]).unwrap().unwrap();
+        let merged = calc_wrap_space_from_column_twips([1_037, 1_037])
+            .unwrap()
+            .unwrap();
+        // Calc imports an explicit OOXML width directly in default-font digit
+        // units, without the ECMA screen-width projection used for painting.
+        let wide = calc_wrap_space_from_column_twips([2_928]).unwrap().unwrap();
+        assert_eq!(narrow.paper_width_mm100, 1_746); // 66 device pixels
+        assert_eq!(merged.paper_width_mm100, 3_572); // 135 device pixels
+        assert_eq!(wide.paper_width_mm100, 5_106); // 193 device pixels
+        assert_eq!(
+            CalcWrapSpace::physical_width_mm100(Fixed::from_pixels(191))
+                .unwrap()
+                .raw(),
+            5_054
+        );
+
+        let separately_truncated = calc_wrap_space_from_column_twips([1_010, 1_010])
+            .unwrap()
+            .unwrap();
+        let trunc_after_sum = calc_wrap_space_from_column_twips([2_020]).unwrap().unwrap();
+        assert_eq!(separately_truncated.paper_width_mm100, 3_466); // 131 pixels
+        assert_eq!(trunc_after_sum.paper_width_mm100, 3_493); // 132 pixels
+
+        assert_eq!(calc_wrap_space_from_column_twips([0]).unwrap(), None);
+    }
+
+    #[test]
+    fn calc_wrap_space_locks_narrow_merged_and_wide_endpoints() {
+        const TEXT: &str = concat!(
+            "한국어 자동 줄바꿈 English 日本語 中文 0123456789 ",
+            "한국어 자동 줄바꿈 English 日本語 中文 0123456789 ",
+            "한국어 자동 줄바꿈 English 日本語 中文 0123456789"
+        );
+        let measure_physical = |range: Range<usize>| {
+            let value = TEXT.get(range).ok_or(RenderError::Typography {
+                reason: "invalid_line_break_range",
+            })?;
+            let raw = value.chars().try_fold(0_i64, |total, ch| {
+                let advance = match ch {
+                    '한' | '국' | '자' | '줄' | '바' => 13_817,
+                    '어' | '동' | '꿈' => 13_818,
+                    'E' => 7_780,
+                    'n' | 'g' => 8_500,
+                    'l' | 'i' => 3_500,
+                    's' => 7_500,
+                    'h' => 11_740,
+                    '日' | '本' | '語' | '中' | '文' => 15_019,
+                    '0' | '1' | '2' | '7' => 8_335,
+                    '3' | '4' | '5' | '6' | '8' | '9' => 8_336,
+                    ' ' => 3_364,
+                    _ => {
+                        return Err(RenderError::Typography {
+                            reason: "unexpected_locked_probe_character",
+                        })
+                    }
+                };
+                total
+                    .checked_add(advance)
+                    .ok_or(RenderError::CoordinateOverflow)
+            })?;
+            CalcWrapSpace::measure_physical_width(Fixed::from_raw(raw), Fixed::from_raw(15_019))
+        };
+
+        for (columns, expected) in [
+            (
+                vec![1_037],
+                vec![
+                    10, 17, 27, 35, 48, 52, 59, 63, 73, 80, 90, 98, 111, 115, 122, 126, 136, 143,
+                    153, 161, 174, 178, 185, 188,
+                ],
+            ),
+            (
+                vec![1_037, 1_037],
+                vec![27, 52, 73, 98, 115, 136, 161, 178, 188],
+            ),
+            (vec![2_928], vec![38, 63, 101, 126, 164, 188]),
+        ] {
+            let space = calc_wrap_space_from_column_twips(columns).unwrap().unwrap();
+            let lines = wrap_text_lines(
+                TEXT,
+                true,
+                CellLineLayoutPolicy::CalcEditEngine,
+                space.line_width().unwrap(),
+                100,
+                1_000,
+                measure_physical,
+            )
+            .unwrap();
+            assert_eq!(
+                lines.iter().map(|line| line.source.end).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn calc_merge_wrap_space_uses_full_source_span_and_rejects_hidden_anchor_ambiguity() {
+        let maximum_digit_width = Fixed::from_raw(8_329);
+        let options = RenderOptions::default();
+        let visible = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><sheetData/><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_merge_wrap_space(&visible.sheets[0], 0, 1, maximum_digit_width, &options,)
+                .unwrap(),
+            calc_wrap_space_from_column_twips([1_037, 1_037]).unwrap()
+        );
+
+        let hidden_anchor = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><cols><col min="1" max="1" hidden="1"/></cols><sheetData/><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_merge_wrap_space(
+                &hidden_anchor.sheets[0],
+                0,
+                1,
+                maximum_digit_width,
+                &options,
+            )
+            .unwrap(),
+            None
+        );
+
+        let hidden_tail = imported_xlsx(
+            "<styleSheet/>",
+            r#"<worksheet><cols><col min="2" max="2" hidden="1"/></cols><sheetData/><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_merge_wrap_space(
+                &hidden_tail.sheets[0],
+                0,
+                1,
+                maximum_digit_width,
+                &options,
+            )
+            .unwrap(),
+            calc_wrap_space_from_column_twips([1_037]).unwrap()
+        );
+        let include_hidden = RenderOptions {
+            include_hidden: true,
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            calc_ooxml_merge_wrap_space(
+                &hidden_tail.sheets[0],
+                0,
+                1,
+                maximum_digit_width,
+                &include_hidden,
+            )
+            .unwrap(),
+            None
+        );
+
+        assert_eq!(calc_wrap_space_from_column_twips([u64::MAX]).unwrap(), None);
+    }
+
+    #[test]
     fn calc_suppressed_space_does_not_advance_paint_or_decoration() {
         let pack = synthetic_test_pack();
         let mut options = outlined_options(RenderRange::new(0, 0, 0, 0));
@@ -11831,6 +12337,9 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            calc_wrap_space: Some(CalcWrapSpace {
+                paper_width_mm100: 1,
+            }),
             style: Some(style),
             conditional: ConditionalPaint::default(),
             text: text.to_string(),
@@ -11850,6 +12359,14 @@ mod tests {
         let prefix_width = styled_shaped_width(&pack, &prefix, &styles, 1, 1).unwrap();
         assert!(full_width > prefix_width);
         region.rect.width = full_width;
+        region.calc_wrap_space = Some(CalcWrapSpace {
+            paper_width_mm100: u64::try_from(
+                CalcWrapSpace::measure_physical_width(full_width, points_to_fixed(11.0).unwrap())
+                    .unwrap()
+                    .raw(),
+            )
+            .unwrap(),
+        });
 
         let mut statistics = TypographyStats::default();
         let prepared =
@@ -12538,6 +13055,7 @@ mod tests {
             )
         };
         let absent = imported("");
+        let defaulted_base = imported(r#"<sheetFormatPr/>"#);
         let explicit_8_5 = imported(r#"<sheetFormatPr defaultColWidth="8.5"/>"#);
         let explicit_8 = imported(r#"<sheetFormatPr defaultColWidth="8"/>"#);
         let base_8 = imported(r#"<sheetFormatPr baseColWidth="8"/>"#);
@@ -12545,6 +13063,20 @@ mod tests {
 
         assert_eq!(absent.sheets[0].default_column_width(), None);
         assert_eq!(absent.sheets[0].implicit_ooxml_column_width(), Some(None));
+        assert!(!absent.sheets[0].ooxml_uses_defaulted_base_column_width());
+        assert_eq!(
+            defaulted_base.sheets[0].implicit_ooxml_column_width(),
+            Some(None)
+        );
+        assert!(defaulted_base.sheets[0].ooxml_uses_defaulted_base_column_width());
+        assert_eq!(
+            calc_ooxml_wrap_column_twips(&absent.sheets[0], 0, 122),
+            Some(1_037)
+        );
+        assert_eq!(
+            calc_ooxml_wrap_column_twips(&defaulted_base.sheets[0], 0, 122),
+            Some(1_051)
+        );
         assert_eq!(explicit_8_5.sheets[0].default_column_width(), Some(8.5));
         assert_eq!(explicit_8_5.sheets[0].implicit_ooxml_column_width(), None);
         assert_eq!(base_8.sheets[0].default_column_width(), None);
@@ -12577,6 +13109,10 @@ mod tests {
             .unwrap()
             .scene
             .width;
+        let defaulted_base_width = build_scene(&defaulted_base, 0, &outlined_options(range))
+            .unwrap()
+            .scene
+            .width;
         let explicit_8_5_width = build_scene(&explicit_8_5, 0, &outlined_options(range))
             .unwrap()
             .scene
@@ -12593,6 +13129,7 @@ mod tests {
         assert_eq!(explicit_8_5_width, Fixed::from_pixels(70));
         assert_eq!(explicit_8_width, Fixed::from_pixels(66));
         assert_eq!(base_8_width, Fixed::from_pixels(71));
+        assert_eq!(defaulted_base_width, absent_width);
         assert_eq!(
             base_8_width.checked_sub(explicit_8_width),
             Some(Fixed::from_pixels(5))
@@ -12862,14 +13399,58 @@ mod tests {
                 CellCoordinate { row: 0, col: 0 },
                 Some(&style),
                 None,
-                true,
-                true,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: true,
+                },
                 &options,
             ),
             CellLineLayoutPolicy::CalcEditEngine
         );
+        assert_eq!(
+            cell_line_layout_policy(
+                sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&style),
+                None,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: false,
+                },
+                &options,
+            ),
+            CellLineLayoutPolicy::Native
+        );
+        let mut indented_style = style.clone();
+        indented_style.align.as_mut().unwrap().indent = 1;
+        assert_eq!(
+            cell_line_layout_policy(
+                sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&indented_style),
+                None,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: true,
+                },
+                &options,
+            ),
+            CellLineLayoutPolicy::Native
+        );
 
         let (rows, columns) = measure_sheet_axes(sheet, range, &options).unwrap();
+        let mut digit_warnings = Warnings::default();
+        let mut digit_statistics = TypographyStats::default();
+        let maximum_digit_width = maximum_digit_width(
+            &RenderStyleSnapshot::new(sheet),
+            &options,
+            &mut digit_warnings,
+            &mut digit_statistics,
+        )
+        .unwrap();
         let region = Region {
             source: CellCoordinate { row: 0, col: 0 },
             rect: Rect {
@@ -12880,7 +13461,8 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
-            style: Some(style),
+            calc_wrap_space: calc_ooxml_wrap_space(sheet, [0], maximum_digit_width).unwrap(),
+            style: Some(style.clone()),
             conditional: ConditionalPaint::default(),
             text: TEXT.to_string(),
             rich_text: None,
@@ -12910,9 +13492,14 @@ mod tests {
             .unwrap();
         let expected_height = calc_automatic_cell_height(&prepared.lines).unwrap();
         assert_eq!(rows[0].size, expected_height);
+        assert_eq!(
+            prepared.available_width,
+            inner_width(region.rect.width, prepared.horizontal_padding).unwrap()
+        );
 
         let automatic_scene = build_scene(&automatic, 0, &options).unwrap();
-        let automatic_baselines = glyph_run(&automatic_scene.scene, TEXT)
+        let automatic_run = glyph_run(&automatic_scene.scene, TEXT);
+        let automatic_baselines = automatic_run
             .cluster_metrics
             .iter()
             .map(|metric| metric.baseline_y.raw())
@@ -12923,6 +13510,67 @@ mod tests {
         for (window, expected) in automatic_baselines.windows(2).zip(line_heights) {
             assert_eq!(window[1] - window[0], expected.raw());
         }
+        let mut painted_partitions = BTreeMap::<i64, (u64, u64)>::new();
+        for (cluster, metrics) in automatic_run
+            .clusters
+            .iter()
+            .zip(&automatic_run.cluster_metrics)
+        {
+            let partition = painted_partitions
+                .entry(metrics.baseline_y.raw())
+                .or_insert((cluster.source_start, cluster.source_end));
+            partition.0 = partition.0.min(cluster.source_start);
+            partition.1 = partition.1.max(cluster.source_end);
+        }
+        assert_eq!(
+            painted_partitions.into_values().collect::<Vec<_>>(),
+            prepared
+                .lines
+                .iter()
+                .map(|line| {
+                    (
+                        u64::try_from(line.source.start).unwrap(),
+                        u64::try_from(line.source.end).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let merged = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><cols><col min="1" max="2" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#
+            ),
+        );
+        let painted_source_partitions = |selection: RenderRange| {
+            let scene = build_scene(
+                &merged,
+                0,
+                &RenderOptions {
+                    selection: RenderSelection::Range(selection),
+                    ..options.clone()
+                },
+            )
+            .unwrap();
+            let mut partitions = BTreeMap::<i64, (u64, u64)>::new();
+            for (cluster, metrics) in glyph_run(&scene.scene, TEXT)
+                .clusters
+                .iter()
+                .zip(&glyph_run(&scene.scene, TEXT).cluster_metrics)
+            {
+                let partition = partitions
+                    .entry(metrics.baseline_y.raw())
+                    .or_insert((cluster.source_start, cluster.source_end));
+                partition.0 = partition.0.min(cluster.source_start);
+                partition.1 = partition.1.max(cluster.source_end);
+            }
+            partitions.into_values().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            painted_source_partitions(RenderRange::new(0, 0, 0, 0)),
+            painted_source_partitions(RenderRange::new(0, 0, 0, 1)),
+            "selection clipping must not change a merged cell's source paper"
+        );
 
         let explicit = workbook(r#" ht="42" customHeight="1""#);
         let explicit_sheet = &explicit.sheets[0];
@@ -12935,8 +13583,11 @@ mod tests {
                 CellCoordinate { row: 0, col: 0 },
                 Some(&explicit_style),
                 None,
-                false,
-                true,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: false,
+                    wrap_space_available: true,
+                },
                 &options,
             ),
             CellLineLayoutPolicy::Native
@@ -12960,6 +13611,62 @@ mod tests {
             native_step.raw()
         );
 
+        let huge_width = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><cols><col min="1" max="1" width="10000000000000000" customWidth="1"/></cols><sheetData><row r="1" ht="42" customHeight="1"><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c></row></sheetData></worksheet>"#
+            ),
+        );
+        let huge_width_scene = build_scene(&huge_width, 0, &options).unwrap();
+        assert_eq!(
+            huge_width_scene.scene.height,
+            points_to_fixed(42.0).unwrap()
+        );
+
+        assert_eq!(
+            cell_line_layout_policy(
+                sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&style),
+                None,
+                CalcLineLayoutEvidence {
+                    is_plain_text: false,
+                    has_adjustable_row: true,
+                    wrap_space_available: true,
+                },
+                &options,
+            ),
+            CellLineLayoutPolicy::Native,
+            "numeric and other non-text cells cannot enter Calc's text wrapper"
+        );
+        let filtered = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><cols><col min="1" max="1" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c></row></sheetData><autoFilter ref="A1:A10"/></worksheet>"#
+            ),
+        );
+        let filtered_sheet = &filtered.sheets[0];
+        let filtered_style = filtered_sheet
+            .resolved_cell_style(0, 0)
+            .expect("filtered wrapped style");
+        assert_eq!(
+            cell_line_layout_policy(
+                filtered_sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&filtered_style),
+                None,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: true,
+                },
+                &options,
+            ),
+            CellLineLayoutPolicy::Native,
+            "Calc reserves the filter-button width in header cells"
+        );
+        build_scene(&filtered, 0, &options).unwrap();
+
         let conditional_styles = format!(
             r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><alignment textRotation="30"/></dxf></dxfs></styleSheet>"#
         );
@@ -12982,8 +13689,11 @@ mod tests {
                 CellCoordinate { row: 0, col: 0 },
                 Some(&conditional_style),
                 None,
-                true,
-                calc_line_layout_available,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: calc_line_layout_available,
+                },
                 &options,
             ),
             CellLineLayoutPolicy::Native
