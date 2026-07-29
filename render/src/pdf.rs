@@ -194,8 +194,14 @@ impl PdfFontRegistry {
     fn register_node(
         &mut self,
         node: &GlyphRunNode,
+        page_bounds: Option<Rect>,
         mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
     ) -> Result<Vec<PdfGlyphReference>, RenderError> {
+        let placement_clip = if node.rotation_degrees.rem_euclid(360) == 0 {
+            page_bounds
+        } else {
+            None
+        };
         let mut references = Vec::with_capacity(node.clusters.len().max(1));
         if node.clusters.is_empty() {
             if !node.text.is_empty() {
@@ -269,12 +275,23 @@ impl PdfFontRegistry {
             {
                 paint_end += 1;
             }
+            let placement = placements[index]
+                .map(|placement| placement_including_ink(placement, cluster_bounds[index]))
+                .transpose()?
+                .map(|placement| {
+                    placement_within_unrotated_page_bottom(
+                        placement,
+                        cluster_bounds[index],
+                        placement_clip,
+                    )
+                })
+                .transpose()?;
             references.push(self.register_glyph(
                 node,
                 cluster.command_start..cluster.command_end,
                 source,
                 paint_cursor..paint_end,
-                placements[index],
+                placement,
                 trace.as_deref_mut(),
             )?);
         }
@@ -308,30 +325,27 @@ impl PdfFontRegistry {
         let bounds = glyph_bounds(commands);
         let (origin_x, origin_y, width, height, reverse_y, local_bounds) = match (placement, bounds)
         {
-            (Some(placement), bounds) => {
-                let placement = placement_including_ink(placement, bounds)?;
-                (
-                    placement.origin_x,
-                    placement.origin_y,
-                    placement.width,
-                    placement.height,
-                    placement.reverse_y,
-                    Some(PdfGlyphBounds {
-                        min_x: Fixed::ZERO,
-                        min_y: if placement.reverse_y {
-                            Fixed::ZERO
-                        } else {
-                            Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE))
-                        },
-                        max_x: placement.width,
-                        max_y: if placement.reverse_y {
-                            Fixed::from_pixels(i64::from(TYPE3_TEXT_SCALE))
-                        } else {
-                            Fixed::ZERO
-                        },
-                    }),
-                )
-            }
+            (Some(placement), _) => (
+                placement.origin_x,
+                placement.origin_y,
+                placement.width,
+                placement.height,
+                placement.reverse_y,
+                Some(PdfGlyphBounds {
+                    min_x: Fixed::ZERO,
+                    min_y: if placement.reverse_y {
+                        Fixed::ZERO
+                    } else {
+                        Fixed::from_pixels(-i64::from(TYPE3_TEXT_SCALE))
+                    },
+                    max_x: placement.width,
+                    max_y: if placement.reverse_y {
+                        Fixed::from_pixels(i64::from(TYPE3_TEXT_SCALE))
+                    } else {
+                        Fixed::ZERO
+                    },
+                }),
+            ),
             (None, Some(bounds)) => {
                 let width = bounds
                     .max_x
@@ -754,15 +768,13 @@ fn build_pdf_page(
     let mut content = BoundedContent::new(max_bytes);
     content.push("q\n")?;
     content.push(&format!("0.75 0 0 -0.75 0 {} cm\n", height_points))?;
-    push_clip(
-        &mut content,
-        Rect {
-            x: Fixed::ZERO,
-            y: Fixed::ZERO,
-            width: scene.width,
-            height: scene.height,
-        },
-    )?;
+    let page_bounds = Rect {
+        x: Fixed::ZERO,
+        y: Fixed::ZERO,
+        width: scene.width,
+        height: scene.height,
+    };
+    push_clip(&mut content, page_bounds)?;
     push_rgb_fill(&mut content, scene.background)?;
     content.push(&format!(
         "0 0 {} {} re f\n",
@@ -777,17 +789,13 @@ fn build_pdf_page(
         &mut content,
         &scene.nodes,
         scene.height,
+        page_bounds,
         font_registry,
         &mut subset_fonts,
         &mut links,
         &mut images,
         &mut uses_standard_font,
-        Some(Rect {
-            x: Fixed::ZERO,
-            y: Fixed::ZERO,
-            width: scene.width,
-            height: scene.height,
-        }),
+        Some(page_bounds),
         trace,
         0,
     )?;
@@ -808,6 +816,7 @@ fn push_scene_nodes(
     content: &mut BoundedContent,
     nodes: &[SceneNode],
     scene_height: Fixed,
+    page_bounds: Rect,
     font_registry: &mut PdfFontRegistry,
     subset_fonts: &mut BTreeSet<usize>,
     links: &mut Vec<PdfLink>,
@@ -838,6 +847,7 @@ fn push_scene_nodes(
                     content,
                     &group.nodes,
                     scene_height,
+                    page_bounds,
                     font_registry,
                     subset_fonts,
                     links,
@@ -915,6 +925,7 @@ fn push_scene_nodes(
                     node,
                     font_registry,
                     subset_fonts,
+                    page_bounds,
                     effective_clip,
                     glyph_trace.as_mut(),
                 )?;
@@ -1090,6 +1101,7 @@ fn push_glyph_run(
     node: &GlyphRunNode,
     font_registry: &mut PdfFontRegistry,
     subset_fonts: &mut BTreeSet<usize>,
+    page_bounds: Rect,
     effective_clip: Option<Rect>,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
 ) -> Result<bool, RenderError> {
@@ -1098,7 +1110,7 @@ fn push_glyph_run(
             reason: "invalid_glyph_metadata",
         });
     }
-    let glyphs = font_registry.register_node(node, trace.as_deref_mut())?;
+    let glyphs = font_registry.register_node(node, Some(page_bounds), trace.as_deref_mut())?;
     content.push("q\n")?;
     push_clip(content, node.clip_bounds)?;
     if let Some(trace) = trace.as_deref_mut() {
@@ -1673,6 +1685,53 @@ fn placement_including_ink(
             .checked_sub(top)
             .ok_or(RenderError::CoordinateOverflow)?
             .max(Fixed::from_raw(1)),
+        reverse_y: placement.reverse_y,
+    })
+}
+
+fn placement_within_unrotated_page_bottom(
+    placement: PdfGlyphPlacement,
+    ink: Option<PdfGlyphBounds>,
+    page_bounds: Option<Rect>,
+) -> Result<PdfGlyphPlacement, RenderError> {
+    let (Some(ink), Some(page_bounds)) = (ink, page_bounds) else {
+        return Ok(placement);
+    };
+    if page_bounds.height <= Fixed::ZERO {
+        return Ok(placement);
+    }
+    let page_bottom = page_bounds
+        .y
+        .checked_add(page_bounds.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let page_inner_bottom = page_bottom
+        .checked_sub(Fixed::from_raw(1))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let placement_top = placement
+        .origin_y
+        .checked_sub(placement.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+
+    // Poppler discards marked Type3 text whose text origin lies just beyond a
+    // page boundary, even when the complete glyph outline remains visible.
+    // Trim only a nominal descent overhang: the adjusted placement must still
+    // enclose the complete outline, so rebuilding the CharProc around it
+    // preserves the exact scene-space paint.
+    let bottom = if placement.origin_y >= page_bottom && ink.max_y <= page_inner_bottom {
+        page_inner_bottom
+    } else {
+        placement.origin_y
+    };
+    if bottom <= placement_top {
+        return Ok(placement);
+    }
+    Ok(PdfGlyphPlacement {
+        origin_x: placement.origin_x,
+        origin_y: bottom,
+        width: placement.width,
+        height: bottom
+            .checked_sub(placement_top)
+            .ok_or(RenderError::CoordinateOverflow)?,
         reverse_y: placement.reverse_y,
     })
 }
@@ -3035,6 +3094,56 @@ mod tests {
         document
     }
 
+    fn final_line_nominal_descent_document() -> PrintDocument {
+        let text = "FINAL-LINE";
+        let commands = sized_rectangle_commands(12, 68, 64, 10);
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("final-line").write(0, 0, "seed");
+        let mut document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        document.pages.truncate(1);
+        document.pages[0].scene = Scene {
+            title: "type3-final-line".to_string(),
+            width: Fixed::from_pixels(100),
+            height: Fixed::from_pixels(80),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: text.to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(100),
+                    height: Fixed::from_pixels(80),
+                },
+                clusters: vec![GlyphCluster {
+                    source_start: 0,
+                    source_end: text.len() as u64,
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                }],
+                cluster_metrics: vec![GlyphClusterMetrics {
+                    origin_x: Fixed::from_pixels(12),
+                    advance_x: Fixed::from_pixels(64),
+                    baseline_y: Fixed::from_pixels(78),
+                    ascent: Fixed::from_pixels(12),
+                    descent: Fixed::from_raw(-2 * FIXED_UNITS_PER_PIXEL - 640),
+                }],
+                paints: vec![GlyphPaint {
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                    color: Rgb::BLACK,
+                }],
+                commands,
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+            })],
+        };
+        document
+    }
+
     fn unequal_height_rtl_outline_document() -> PrintDocument {
         let text = "אב גד";
         // Both words share the same visual baseline/bottom edge, but their ink
@@ -4193,7 +4302,7 @@ mod tests {
         let mut registry = PdfFontRegistry::new(u64::MAX, u64::MAX);
         registry.glyph_count = MAX_TYPE3_GLYPH_PROGRAMS;
         assert!(matches!(
-            registry.register_node(&glyph_node, None),
+            registry.register_node(&glyph_node, None, None),
             Err(RenderError::LimitExceeded {
                 kind: LimitKind::BackendCommands,
                 limit: MAX_TYPE3_GLYPH_PROGRAMS,
@@ -4265,7 +4374,7 @@ mod tests {
         };
         assert!(node.metadata_is_valid());
         let mut registry = PdfFontRegistry::new(10_000, 10 << 20);
-        let references = registry.register_node(&node, None).unwrap();
+        let references = registry.register_node(&node, None, None).unwrap();
         assert_eq!(registry.subsets.len(), 2);
         assert_eq!(registry.subsets[0].glyphs.len(), 255);
         assert_eq!(registry.subsets[1].glyphs.len(), 1);
@@ -4327,6 +4436,40 @@ mod tests {
         if let Some(text) = poppler_text(&pdf) {
             assert!(text.contains("TOP"), "{text:?}");
             assert!(text.contains("BOTTOM"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn type3_poppler_retains_visible_final_line_when_nominal_descent_crosses_page_clip() {
+        let document = final_line_nominal_descent_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/ActualText <FEFF00460049004E0041004C002D004C0049004E0045>"));
+        assert!(source.contains("79.9990234375 Tm <01> Tj"));
+
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("FINAL-LINE"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["FINAL-LINE"]);
+            assert_poppler_bbox_close(
+                poppler_word_bbox(&xml, "FINAL-LINE"),
+                [
+                    9.0,
+                    49.5,
+                    57.0,
+                    fixed_as_f64(Fixed::from_raw(80 * FIXED_UNITS_PER_PIXEL - 1))
+                        * PDF_POINTS_PER_CSS_PIXEL_NUMERATOR as f64
+                        / PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR as f64,
+                ],
+            );
+        }
+        if let Some(raster) = poppler_raster(&pdf, "final-line") {
+            assert_raster_rgb(&raster, 20, 67, [255, 255, 255]);
+            assert_raster_rgb(&raster, 20, 68, [0, 0, 0]);
+            assert_raster_rgb(&raster, 20, 77, [0, 0, 0]);
+            assert_raster_rgb(&raster, 20, 78, [255, 255, 255]);
         }
     }
 
