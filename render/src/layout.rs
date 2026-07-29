@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rxls::{
     Border, BorderStyle, Cell, CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint,
     ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell, DrawingAnchorBehavior,
-    DrawingMetadata, DrawingObjectKind, DvOp, FormatPattern, FormatScript, HAlign, Sheet,
+    DrawingMetadata, DrawingObjectKind, DvOp, Font, FormatPattern, FormatScript, HAlign, Sheet,
     Sparkline, SparklineKind, StyleFidelity, VAlign, Workbook, XlsbDefaultColumnWidth,
 };
 
@@ -49,7 +49,17 @@ const BIFF_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_pixels(17);
 /// The pinned Calc oracle resolves an OOXML worksheet without an authoritative
 /// default row height to 0.5 cm (14.173228 points / 18.897638 CSS pixels).
 /// Fixed-point layout rounds that imported-only value to the nearest 1/1024 px.
+/// This remains the conservative fallback when the workbook's Normal font
+/// cannot be resolved exactly from a verified pack.
 const OOXML_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(19_351);
+/// LibreOffice 26.2.3.2
+/// `sc/source/core/data/column2.cxx::lcl_GetAttribHeight` derives an automatic
+/// row from 118% of the pattern font's integer-twip height, then adds the two
+/// default 20-twip margins and subtracts its 23-twip standard-row adjustment.
+const CALC_NORMAL_ROW_HEIGHT_PERCENT: i128 = 118;
+const CALC_NORMAL_ROW_HEIGHT_PERCENT_DENOMINATOR: i128 = 100;
+const CALC_NORMAL_ROW_HEIGHT_ADJUSTMENT_TWIPS: i128 = 17;
+const TWIPS_PER_POINT: i128 = 20;
 /// OOXML `baseColWidth` excludes the four margin pixels and one gridline pixel
 /// included when deriving a default column width.
 const OOXML_BASE_COLUMN_EXTRA_PADDING_PIXELS: f64 = 5.0;
@@ -2922,10 +2932,60 @@ fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
     if sheet.biff_uses_application_default_row_height() {
         BIFF_APPLICATION_DEFAULT_ROW_HEIGHT
     } else if sheet.has_implicit_ooxml_row_height() {
-        OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+        calc_ooxml_implicit_row_height(sheet, options)
+            .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
     } else {
         options.default_row_height.max(Fixed::from_raw(1))
     }
+}
+
+fn verified_ooxml_normal_font_size(sheet: &Sheet, options: &RenderOptions) -> Option<(u16, Fixed)> {
+    // The model retains this source size only for imported XLSX worksheets
+    // whose first cell XF and named/built-in Normal style agree exactly.
+    // Fractional, invalid, ambiguous, authored, XLSB, BIFF, and ODS sources
+    // therefore stay on the existing physical fallback.
+    let source_points = sheet.verified_xlsx_normal_font_size_pt()?;
+    let pack = options.font_pack.as_ref()?;
+    let font = sheet.default_cell_style()?.font.as_ref()?;
+    let family = font.name.as_deref()?;
+    let points = font.size_pt.filter(|points| *points == source_points)?;
+    let resolution = pack.resolve(FontRequest {
+        family,
+        weight: if font.bold { 700 } else { 400 },
+        italic: font.italic,
+    });
+    if !resolution.exact_family || !resolution.exact_style {
+        return None;
+    }
+    Some((points, points_to_fixed(f32::from(points))?))
+}
+
+fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Option<Fixed> {
+    if !sheet.has_implicit_ooxml_row_height() {
+        return None;
+    }
+    let (points, _) = verified_ooxml_normal_font_size(sheet, options)?;
+    let font_twips = i128::from(points).checked_mul(TWIPS_PER_POINT)?;
+    let row_twips = font_twips
+        .checked_mul(CALC_NORMAL_ROW_HEIGHT_PERCENT)?
+        .checked_div(CALC_NORMAL_ROW_HEIGHT_PERCENT_DENOMINATOR)?
+        .checked_add(CALC_NORMAL_ROW_HEIGHT_ADJUSTMENT_TWIPS)?;
+    let raw = row_twips
+        .checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?
+        .checked_add(TWIPS_PER_CSS_PIXEL / 2)?
+        .checked_div(TWIPS_PER_CSS_PIXEL)?;
+    i64::try_from(raw)
+        .ok()
+        .filter(|raw| *raw > 0)
+        .map(Fixed::from_raw)
+}
+
+fn same_row_height_font(left: &Font, right: &Font) -> bool {
+    left.name == right.name
+        && left.size_pt == right.size_pt
+        && left.bold == right.bold
+        && left.italic == right.italic
+        && left.script == right.script
 }
 
 fn row_is_hidden(sheet: &Sheet, row: u32) -> bool {
@@ -2958,6 +3018,8 @@ fn expand_automatic_row_heights(
     let Some(pack) = options.font_pack.as_ref() else {
         return Ok(());
     };
+    let verified_normal_font = verified_ooxml_normal_font_size(sheet, options)
+        .and_then(|_| sheet.default_cell_style()?.font.as_ref());
 
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
@@ -3085,10 +3147,17 @@ fn expand_automatic_row_heights(
             .and_then(|points| points_to_fixed(points as f32))
             .unwrap_or(options.default_font_size);
         let rich_text = cell.rich_text.filter(|runs| !runs.is_empty());
+        let default_plain_font = verified_normal_font.is_some_and(|normal_font| {
+            style
+                .as_ref()
+                .and_then(|style| style.font.as_ref())
+                .is_some_and(|font| same_row_height_font(font, normal_font))
+        });
         if !alignment.is_some_and(|alignment| alignment.wrap)
             && !contains_mandatory_line_break(cell.formatted)
             && rich_text.is_none()
-            && font_size <= options.default_font_size
+            && (default_plain_font
+                || (verified_normal_font.is_none() && font_size <= options.default_font_size))
         {
             continue;
         }
@@ -12141,6 +12210,317 @@ mod tests {
         assert_eq!(explicit_rows[0].size, Fixed::from_pixels(20));
         assert_eq!(overridden_rows[0].size, Fixed::from_pixels(16));
         assert_eq!(authored_rows[0].size, Fixed::from_pixels(37));
+    }
+
+    #[test]
+    fn verified_ooxml_normal_font_drives_calc_implicit_row_twips() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let imported = |family: &str, points: u16, worksheet: &str| {
+            imported_xlsx(
+                &format!(
+                    r#"<styleSheet><fonts count="1"><font><sz val="{points}"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+                ),
+                worksheet,
+            )
+        };
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>plain</t></is></c></row></sheetData></worksheet>"#;
+        let explicit_default_column_worksheet = r#"<worksheet><sheetFormatPr defaultColWidth="8.5"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>plain</t></is></c></row></sheetData></worksheet>"#;
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family.clone(),
+            font_pack: Some(pack.clone()),
+            ..RenderOptions::default()
+        };
+
+        for (points, expected_twips, expected_raw) in [(11, 276_i64, 18_842_i64), (12, 300, 20_480)]
+        {
+            for source in [worksheet, explicit_default_column_worksheet] {
+                let workbook = imported(&family, points, source);
+                let sheet = &workbook.sheets[0];
+                assert!(sheet.has_implicit_ooxml_row_height());
+                assert_eq!(sheet.verified_xlsx_normal_font_size_pt(), Some(points));
+                assert_eq!(
+                    calc_ooxml_implicit_row_height(sheet, &options),
+                    Some(Fixed::from_raw(expected_raw))
+                );
+                let (rows, _) = measure_sheet_axes(sheet, range, &options).unwrap();
+                assert_eq!(rows[0].size, Fixed::from_raw(expected_raw));
+                assert_eq!(
+                    rows[0].size.raw(),
+                    (expected_twips * FIXED_UNITS_PER_PIXEL
+                        + i64::try_from(TWIPS_PER_CSS_PIXEL / 2).unwrap())
+                        / i64::try_from(TWIPS_PER_CSS_PIXEL).unwrap()
+                );
+            }
+        }
+
+        for source_size in ["0", "-1", "11.5", "409.55", "410", "1e309"] {
+            let workbook = imported_xlsx(
+                &format!(
+                    r#"<styleSheet><fonts count="1"><font><sz val="{source_size}"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+                ),
+                worksheet,
+            );
+            assert_eq!(
+                workbook.sheets[0].verified_xlsx_normal_font_size_pt(),
+                None,
+                "{source_size}"
+            );
+            assert_eq!(
+                calc_ooxml_implicit_row_height(&workbook.sheets[0], &options),
+                None,
+                "{source_size}"
+            );
+            assert_eq!(
+                fallback_row_height(&workbook.sheets[0], &options),
+                OOXML_APPLICATION_DEFAULT_ROW_HEIGHT,
+                "{source_size}"
+            );
+        }
+
+        let mismatched_normal = imported_xlsx(
+            &format!(
+                r#"<styleSheet><fonts count="2"><font><sz val="12"/><name val="{family}"/></font><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="1"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            ),
+            worksheet,
+        );
+        assert_eq!(
+            mismatched_normal.sheets[0].verified_xlsx_normal_font_size_pt(),
+            None
+        );
+        assert_eq!(
+            calc_ooxml_implicit_row_height(&mismatched_normal.sheets[0], &options),
+            None
+        );
+
+        let unavailable_style = imported_xlsx(
+            &format!(
+                r#"<styleSheet><fonts count="1"><font><sz val="12"/><name val="{family}"/><b/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            ),
+            worksheet,
+        );
+        assert_eq!(
+            unavailable_style.sheets[0].verified_xlsx_normal_font_size_pt(),
+            Some(12)
+        );
+        assert_eq!(
+            verified_ooxml_normal_font_size(&unavailable_style.sheets[0], &options),
+            None,
+            "an exact family with a substituted style is not verified"
+        );
+
+        let substituted = imported("Unavailable Normal", 12, worksheet);
+        assert_eq!(
+            calc_ooxml_implicit_row_height(&substituted.sheets[0], &options),
+            None
+        );
+        assert_eq!(
+            fallback_row_height(&substituted.sheets[0], &options),
+            OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+        );
+
+        let mut authored = Workbook::new();
+        authored
+            .add_sheet("authored")
+            .set_default_format(&Format::new().set_font_name(&family).set_font_size(12));
+        assert_eq!(
+            verified_ooxml_normal_font_size(&authored.sheets[0], &options),
+            None,
+            "authored and non-OOXML sheets must retain their prior auto-height path"
+        );
+
+        let mut xlsb = Workbook::open(include_bytes!(
+            "../../tests/fixtures/xlsb/reader-basic.xlsb"
+        ))
+        .expect("imported XLSB fixture");
+        assert!(xlsb.sheets[0].has_implicit_ooxml_row_height());
+        xlsb.sheets[0].set_default_col_width(8.5);
+        assert_eq!(
+            verified_ooxml_normal_font_size(&xlsb.sheets[0], &options),
+            None,
+            "mutable XLSB width provenance must not masquerade as XLSX"
+        );
+
+        let verified = imported(&family, 12, worksheet);
+        let mut mutated_default = verified.clone();
+        mutated_default.sheets[0]
+            .set_default_format(&Format::new().set_font_name(&family).set_font_size(12));
+        assert_eq!(
+            mutated_default.sheets[0].verified_xlsx_normal_font_size_pt(),
+            None
+        );
+        assert_eq!(
+            calc_ooxml_implicit_row_height(&mutated_default.sheets[0], &options),
+            None,
+            "authoring a new default format invalidates retained source-font evidence"
+        );
+        let explicit_default_row = imported(
+            &family,
+            12,
+            r#"<worksheet><sheetFormatPr defaultRowHeight="15"/><sheetData/></worksheet>"#,
+        );
+        assert_eq!(
+            calc_ooxml_implicit_row_height(&explicit_default_row.sheets[0], &options),
+            None,
+            "an explicit default row height must not be recalibrated"
+        );
+        let without_pack = RenderOptions {
+            font_pack: None,
+            ..options
+        };
+        assert_eq!(
+            calc_ooxml_implicit_row_height(&verified.sheets[0], &without_pack),
+            None
+        );
+        assert_eq!(
+            measure_sheet_axes(&verified.sheets[0], range, &without_pack)
+                .unwrap()
+                .0[0]
+                .size,
+            OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn verified_normal_size_suppresses_only_default_plain_single_line_expansion() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="2"><font><sz val="12"/><name val="{family}"/></font><font><sz val="14"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="3"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/><xf fontId="0" xfId="0"><alignment wrapText="1"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetFormatPr defaultRowHeight="15" customHeight="1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>plain Normal</t></is></c></row><row r="2"><c r="A2" s="1" t="inlineStr"><is><t>larger plain</t></is></c></row><row r="3"><c r="A3" s="2" t="inlineStr"><is><t>wrapped</t></is></c></row><row r="4" ht="21" customHeight="1"><c r="A4" s="2" t="inlineStr"><is><t>explicit wrapped</t></is></c></row><row r="5" hidden="1"><c r="A5" s="2" t="inlineStr"><is><t>hidden wrapped</t></is></c></row></sheetData></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let workbook_with_explicit_column = imported_xlsx(
+            &styles,
+            &worksheet.replace(
+                r#"defaultRowHeight="15""#,
+                r#"defaultRowHeight="15" defaultColWidth="8.5""#,
+            ),
+        );
+        let range = RenderRange::new(0, 0, 4, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let (rows, _) = measure_sheet_axes(&workbook.sheets[0], range, &options).unwrap();
+        let (rows_with_explicit_column, _) =
+            measure_sheet_axes(&workbook_with_explicit_column.sheets[0], range, &options).unwrap();
+
+        assert_eq!(rows[0].size, Fixed::from_pixels(20));
+        assert!(rows[1].size > Fixed::from_pixels(20));
+        assert!(rows[2].size > Fixed::from_pixels(20));
+        assert_eq!(rows[3].size, Fixed::from_pixels(28));
+        assert!(rows.iter().all(|row| row.index != 4));
+        assert_eq!(
+            rows_with_explicit_column, rows,
+            "column defaults must not change automatic row-font identity"
+        );
+
+        let included = RenderOptions {
+            include_hidden: true,
+            ..options
+        };
+        let (rows, _) = measure_sheet_axes(&workbook.sheets[0], range, &included).unwrap();
+        assert!(rows[4].size > Fixed::from_pixels(20));
+    }
+
+    #[test]
+    fn verified_normal_auto_height_skip_requires_the_same_effective_font() {
+        let pack = synthetic_test_pack();
+        let styles = r#"<styleSheet><fonts count="2"><font><sz val="12"/><name val="Wide Sans"/></font><font><sz val="12"/><name val="RTL Sans"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let workbook = |style_index: u8| {
+            imported_xlsx(
+                styles,
+                &format!(
+                    r#"<worksheet><sheetFormatPr defaultRowHeight="15"/><sheetData><row r="1"><c r="A1" s="{style_index}" t="inlineStr"><is><t>plain</t></is></c></row></sheetData></worksheet>"#
+                ),
+            )
+        };
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: "Wide Sans".to_string(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let measure = |workbook: &Workbook| {
+            let sheet = &workbook.sheets[0];
+            let mut snapshot = RenderStyleSnapshot::new(sheet);
+            snapshot.capture_range(sheet, range, &options).unwrap();
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &options,
+                None,
+                &mut Warnings::default(),
+            )
+            .unwrap()
+        };
+
+        let default_font = measure(&workbook(0));
+        let alternate_font = measure(&workbook(1));
+        assert!(
+            alternate_font.typography.shaped_runs > default_font.typography.shaped_runs,
+            "a same-size alternate family must still be measured for automatic height"
+        );
+        assert_eq!(default_font.rows[0].size, Fixed::from_pixels(20));
+        assert!(alternate_font.rows[0].size >= Fixed::from_pixels(20));
+    }
+
+    #[test]
+    fn verified_ooxml_implicit_rows_keep_sparse_origin_and_explicit_hidden_geometry() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="4" ht="21" customHeight="1"/><row r="5" hidden="1"/><row r="8"><c r="A8"><v>8</v></c></row></sheetData></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 7, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let (rows, _) = measure_sheet_axes(sheet, range, &options).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.index, row.size))
+                .collect::<Vec<_>>(),
+            [
+                (0, Fixed::from_raw(18_842)),
+                (1, Fixed::from_raw(18_842)),
+                (2, Fixed::from_raw(18_842)),
+                (3, Fixed::from_pixels(28)),
+                (5, Fixed::from_raw(18_842)),
+                (6, Fixed::from_raw(18_842)),
+                (7, Fixed::from_raw(18_842)),
+            ]
+        );
+        let mut warnings = Warnings::default();
+        assert_eq!(
+            sheet_grid_origin(
+                sheet,
+                RenderRange::new(7, 0, 7, 0),
+                Fixed::from_pixels(7),
+                &options,
+                &mut warnings,
+            )
+            .unwrap()
+            .1,
+            Fixed::from_raw(18_842 * 5 + 28 * FIXED_UNITS_PER_PIXEL)
+        );
     }
 
     #[test]

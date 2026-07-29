@@ -1409,7 +1409,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v9");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v10");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1444,6 +1444,7 @@ fn print_source_identity(
     update_debug(&mut digest, sheet.row_heights());
     update_debug(&mut digest, &sheet.default_row_height());
     update_debug(&mut digest, &sheet.has_implicit_ooxml_row_height());
+    update_debug(&mut digest, &sheet.verified_xlsx_normal_font_size_pt());
     update_debug(&mut digest, sheet.hidden_columns());
     update_debug(&mut digest, sheet.hidden_rows());
     update_debug(&mut digest, &sheet.default_hidden_row_exceptions());

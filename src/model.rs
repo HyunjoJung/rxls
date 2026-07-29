@@ -5783,6 +5783,11 @@ pub struct Sheet {
     /// OOXML-only provenance used to distinguish an absent application default
     /// from an explicit `defaultRowHeight` / XLSB `miyDefRwHeight`.
     pub(crate) ooxml_implicit_row_height: OoxmlImplicitRowHeight,
+    /// Exact integral XLSX Normal-style font size retained only when
+    /// `cellXfs[0]` and the named/built-in Normal `cellStyleXf` resolve to the
+    /// same source font. Other formats and ambiguous/invalid XLSX style tables
+    /// retain `None`.
+    pub(crate) xlsx_normal_font_size_pt: Option<u16>,
     /// Merged ranges `(r0, c0, r1, c1)` set when **authoring** (via
     /// [`Sheet::merge`]). The writer emits these as `<mergeCells>` and omits
     /// cells under them for OOXML conformance.
@@ -6158,6 +6163,7 @@ impl Default for Sheet {
             default_col_width: None,
             ooxml_implicit_col_width: OoxmlImplicitColumnWidth::None,
             ooxml_implicit_row_height: OoxmlImplicitRowHeight::None,
+            xlsx_normal_font_size_pt: None,
             merges: Vec::default(),
             read_merges: Vec::default(),
             read_hyperlinks: Vec::default(),
@@ -8359,6 +8365,19 @@ impl Sheet {
         self.ooxml_implicit_row_height == OoxmlImplicitRowHeight::ApplicationDefault
     }
 
+    /// Return an evidence-bounded XLSX Normal-style font size for rendering.
+    ///
+    /// The value is retained only for imported XLSX worksheets whose first
+    /// cell XF and named/built-in Normal style reference the same source font
+    /// with an exact integral point size accepted by Office. It therefore also
+    /// acts as durable XLSX provenance independent of mutable row/column
+    /// defaults. Ambiguous, fractional, invalid, and non-XLSX sources return
+    /// `None`.
+    #[doc(hidden)]
+    pub fn verified_xlsx_normal_font_size_pt(&self) -> Option<u16> {
+        self.xlsx_normal_font_size_pt
+    }
+
     /// Explicitly hidden columns, as 0-based indexes.
     pub fn hidden_columns(&self) -> &BTreeSet<u16> {
         &self.hidden_cols
@@ -10326,6 +10345,7 @@ impl Sheet {
     /// Column, row, and explicit cell formats merge over this base style.
     pub fn set_default_format(&mut self, format: &Format) {
         self.default_format = Some(format.as_cell_style().clone());
+        self.xlsx_normal_font_size_pt = None;
         self.refresh_authored_display_texts();
     }
     /// Set the format for the header row cells of the named table.

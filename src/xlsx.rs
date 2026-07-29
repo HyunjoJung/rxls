@@ -323,6 +323,9 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_col_width,
             ooxml_implicit_col_width,
             ooxml_implicit_row_height,
+            xlsx_normal_font_size_pt: is_worksheet
+                .then_some(styles.xlsx_normal_font_size_pt)
+                .flatten(),
             collapsed_rows,
             outline_summary_below: outline_summary_below.unwrap_or(true),
             outline_summary_right: outline_summary_right.unwrap_or(true),
@@ -433,6 +436,11 @@ const MAX_XLSX_STYLE_RECORDS: usize = 65_536;
 const MAX_XLSX_CUSTOM_NUMBER_FORMATS: usize = 65_536;
 const MAX_XLSX_FORMAT_CODE_BYTES: usize = 4_096;
 const MAX_XLSX_INDEXED_COLORS: usize = 256;
+// [MS-OI29500] Part 1 §18.4.11: Office accepts SpreadsheetML font sizes from
+// 1 through 409.55 points. The verified renderer sidecar is deliberately
+// narrower because the public Font model uses whole points: only exact
+// integral source values through 409 are eligible.
+const MAX_VERIFIED_XLSX_FONT_SIZE_POINTS: u16 = 409;
 
 /// Per-style number format, derived from `styles.xml`.
 #[derive(Default)]
@@ -447,6 +455,9 @@ struct Styles {
     differential_styles: Vec<DifferentialStyle>,
     /// Common public style subset per `cellXfs` index.
     cell_styles: Vec<CellStyle>,
+    /// Exact integral Normal-style font size retained only when the first cell
+    /// XF and named/built-in Normal style resolve to the same source font.
+    xlsx_normal_font_size_pt: Option<u16>,
     /// Sparse direct-format overlays per `cellXfs` style index.
     cell_style_overlays: Vec<CellStyleOverlay>,
     /// Imported custom table region styles keyed by `<tableStyle name>`.
@@ -531,6 +542,43 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
             None
         }
     })
+}
+
+fn unique_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+) -> std::result::Result<Option<String>, ()> {
+    let mut value = None;
+    for attribute in e.attributes() {
+        let attribute = attribute.map_err(|_| ())?;
+        if local(attribute.key.as_ref()) != key {
+            continue;
+        }
+        if value.is_some() {
+            return Err(());
+        }
+        value = Some(
+            attribute
+                .decoded_and_normalized_value_with(
+                    XmlVersion::Implicit1_0,
+                    e.decoder(),
+                    1,
+                    quick_xml::escape::resolve_xml_entity,
+                )
+                .map_err(|_| ())?
+                .into_owned(),
+        );
+    }
+    Ok(value)
+}
+
+fn unique_parsed_attr<T: std::str::FromStr>(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+) -> std::result::Result<Option<T>, ()> {
+    unique_attr(e, key)?
+        .map(|value| value.parse::<T>().map_err(|_| ()))
+        .transpose()
 }
 
 fn parse_color(value: &str) -> Option<Color> {
@@ -1065,11 +1113,16 @@ fn parse_styles(xml: &str, theme: &ThemeColors) -> Styles {
             _ => {}
         }
     }
+    let (fonts, exact_font_sizes, font_table_complete) =
+        parse_font_table(xml, theme, &styles.indexed_colors, &mut styles.losses);
+    styles.xlsx_normal_font_size_pt =
+        verified_xlsx_normal_font_size(xml, &fonts, &exact_font_sizes, font_table_complete);
     let (cell_styles, cell_style_overlays) = parse_cell_styles(
         xml,
         theme,
         &styles.indexed_colors,
         &styles.custom,
+        &fonts,
         &mut styles.losses,
     );
     styles.cell_styles = cell_styles;
@@ -1718,72 +1771,568 @@ fn parse_font_table(
     theme: &ThemeColors,
     indexed: &[Color],
     losses: &mut Vec<StyleLoss>,
-) -> Vec<Font> {
+) -> (Vec<Font>, Vec<Option<u16>>, bool) {
+    #[derive(Clone, Copy)]
+    enum ExactSize {
+        Absent,
+        Valid(u16),
+        Invalid,
+    }
+
+    impl ExactSize {
+        fn observe(self, value: Option<u16>) -> Self {
+            match self {
+                Self::Absent => value.map_or(Self::Invalid, Self::Valid),
+                Self::Valid(_) | Self::Invalid => Self::Invalid,
+            }
+        }
+
+        fn invalidate(self) -> Self {
+            Self::Invalid
+        }
+
+        fn value(self) -> Option<u16> {
+            match self {
+                Self::Valid(value) => Some(value),
+                Self::Absent | Self::Invalid => None,
+            }
+        }
+    }
+
     let mut reader = Reader::from_str(xml);
+    let mut depth = 0_usize;
+    let mut saw_root = false;
+    let mut root_open = false;
     let mut in_fonts = false;
+    let mut fonts_depth = None;
+    let mut saw_fonts = false;
+    let mut font_records_seen = 0_usize;
+    let mut provenance_complete = true;
     let mut current: Option<Font> = None;
+    let mut current_font_depth = None;
+    let mut current_exact_size = ExactSize::Absent;
+    let mut current_saw_name = false;
+    let mut current_saw_bold = false;
+    let mut current_saw_italic = false;
+    let mut current_saw_vert_align = false;
     let mut fonts = Vec::new();
+    let mut exact_sizes = Vec::new();
+    let retain_font = |fonts: &mut Vec<Font>,
+                       exact_sizes: &mut Vec<Option<u16>>,
+                       font: Font,
+                       exact_size: Option<u16>,
+                       losses: &mut Vec<StyleLoss>| {
+        let previous_len = fonts.len();
+        retain_xlsx_style_record(fonts, font, losses);
+        if fonts.len() > previous_len {
+            exact_sizes.push(exact_size);
+        }
+    };
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
-                b"fonts" => in_fonts = true,
-                b"font" if in_fonts => {
-                    if current.is_some() {
-                        retain_xlsx_style_record(
-                            &mut fonts,
-                            current.take().unwrap_or_default(),
-                            losses,
-                        );
+            Ok(event @ (Event::Start(_) | Event::Empty(_))) => {
+                let (e, is_empty) = match event {
+                    Event::Start(e) => (e, false),
+                    Event::Empty(e) => (e, true),
+                    _ => unreachable!(),
+                };
+                let qualified_name = e.name();
+                let name = local(qualified_name.as_ref());
+                let element_depth = depth;
+                if element_depth == 0 {
+                    if saw_root || name != b"styleSheet" {
+                        provenance_complete = false;
                     }
-                    if fonts.len() >= MAX_XLSX_STYLE_RECORDS {
-                        add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
-                        current = None;
-                        continue;
+                    saw_root = true;
+                    root_open = !is_empty;
+                }
+                match name {
+                    b"fonts" => {
+                        let is_direct_table = element_depth == 1 && root_open;
+                        if !is_direct_table || saw_fonts || in_fonts || current.is_some() {
+                            provenance_complete = false;
+                        }
+                        saw_fonts = true;
+                        in_fonts = is_direct_table && !is_empty;
+                        fonts_depth = in_fonts.then_some(element_depth);
                     }
-                    current = Some(Font::default());
-                    if e.is_empty() {
-                        retain_xlsx_style_record(
-                            &mut fonts,
-                            current.take().unwrap_or_default(),
-                            losses,
-                        );
+                    b"font" if in_fonts => {
+                        let is_direct_record =
+                            fonts_depth.is_some_and(|table| element_depth == table + 1);
+                        if !is_direct_record {
+                            provenance_complete = false;
+                        } else {
+                            if current.is_some() {
+                                provenance_complete = false;
+                                retain_font(
+                                    &mut fonts,
+                                    &mut exact_sizes,
+                                    current.take().unwrap_or_default(),
+                                    current_exact_size.value().filter(|_| current_saw_name),
+                                    losses,
+                                );
+                            }
+                            font_records_seen = font_records_seen.saturating_add(1);
+                            if font_records_seen > MAX_XLSX_STYLE_RECORDS {
+                                provenance_complete = false;
+                                add_differential_loss(losses, StyleLossKind::LimitExceeded, 1);
+                                current = None;
+                                current_font_depth = None;
+                            } else {
+                                current = Some(Font::default());
+                                current_font_depth = Some(element_depth);
+                                current_exact_size = ExactSize::Absent;
+                                current_saw_name = false;
+                                current_saw_bold = false;
+                                current_saw_italic = false;
+                                current_saw_vert_align = false;
+                                if is_empty {
+                                    retain_font(
+                                        &mut fonts,
+                                        &mut exact_sizes,
+                                        current.take().unwrap_or_default(),
+                                        current_exact_size.value().filter(|_| current_saw_name),
+                                        losses,
+                                    );
+                                    current_font_depth = None;
+                                }
+                            }
+                        }
                     }
+                    b"name" if current.is_some() => {
+                        if current_font_depth.is_none_or(|font| element_depth != font + 1) {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        if current_saw_name {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current_saw_name = true;
+                        let source = match unique_attr(&e, b"val") {
+                            Ok(Some(value)) if !value.is_empty() => Some(value),
+                            Ok(None) => {
+                                current_exact_size = current_exact_size.invalidate();
+                                None
+                            }
+                            Ok(Some(value)) => {
+                                current_exact_size = current_exact_size.invalidate();
+                                Some(value)
+                            }
+                            Err(()) => {
+                                current_exact_size = current_exact_size.invalidate();
+                                attr(&e, b"val")
+                            }
+                        };
+                        current.as_mut().expect("font").name = source;
+                    }
+                    b"sz" if current.is_some() => {
+                        if current_font_depth.is_none_or(|font| element_depth != font + 1) {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        let source = match unique_attr(&e, b"val") {
+                            Ok(value) => value,
+                            Err(()) => {
+                                current_exact_size = current_exact_size.invalidate();
+                                attr(&e, b"val")
+                            }
+                        };
+                        if !matches!(current_exact_size, ExactSize::Invalid) {
+                            current_exact_size = current_exact_size
+                                .observe(source.as_deref().and_then(exact_integral_xlsx_font_size));
+                        }
+                        current.as_mut().expect("font").size_pt = source
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
+                    }
+                    b"color" if current.is_some() => {
+                        current.as_mut().expect("font").color = color_attr(&e, theme, indexed);
+                    }
+                    b"b" if current.is_some() => {
+                        if current_font_depth.is_none_or(|font| element_depth != font + 1)
+                            || current_saw_bold
+                        {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current_saw_bold = true;
+                        let enabled = match unique_attr(&e, b"val") {
+                            Ok(None) => true,
+                            Ok(Some(value)) => matches!(value.as_str(), "1" | "true" | "on"),
+                            Err(()) => false,
+                        };
+                        if !enabled {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current.as_mut().expect("font").bold = true;
+                    }
+                    b"i" if current.is_some() => {
+                        if current_font_depth.is_none_or(|font| element_depth != font + 1)
+                            || current_saw_italic
+                        {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current_saw_italic = true;
+                        let enabled = match unique_attr(&e, b"val") {
+                            Ok(None) => true,
+                            Ok(Some(value)) => matches!(value.as_str(), "1" | "true" | "on"),
+                            Err(()) => false,
+                        };
+                        if !enabled {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current.as_mut().expect("font").italic = true;
+                    }
+                    b"u" if current.is_some() => current.as_mut().expect("font").underline = true,
+                    b"strike" if current.is_some() => {
+                        current.as_mut().expect("font").strikethrough = true;
+                    }
+                    b"vertAlign" if current.is_some() => {
+                        if current_font_depth.is_none_or(|font| element_depth != font + 1)
+                            || current_saw_vert_align
+                        {
+                            current_exact_size = current_exact_size.invalidate();
+                        }
+                        current_saw_vert_align = true;
+                        let source = match unique_attr(&e, b"val") {
+                            Ok(value) => value,
+                            Err(()) => {
+                                current_exact_size = current_exact_size.invalidate();
+                                attr(&e, b"val")
+                            }
+                        };
+                        current.as_mut().expect("font").script = match source.as_deref() {
+                            Some("superscript") => FormatScript::Superscript,
+                            Some("subscript") => FormatScript::Subscript,
+                            Some("baseline") => FormatScript::None,
+                            _ => {
+                                current_exact_size = current_exact_size.invalidate();
+                                FormatScript::None
+                            }
+                        };
+                    }
+                    _ => {}
                 }
-                b"name" if current.is_some() => {
-                    current.as_mut().expect("font").name = attr(&e, b"val");
+                if !is_empty {
+                    depth = depth.saturating_add(1);
                 }
-                b"sz" if current.is_some() => {
-                    current.as_mut().expect("font").size_pt = attr(&e, b"val")
-                        .and_then(|value| value.parse::<f32>().ok())
-                        .map(|value| value.round().clamp(1.0, f32::from(u16::MAX)) as u16);
-                }
-                b"color" if current.is_some() => {
-                    current.as_mut().expect("font").color = color_attr(&e, theme, indexed);
-                }
-                b"b" if current.is_some() => current.as_mut().expect("font").bold = true,
-                b"i" if current.is_some() => current.as_mut().expect("font").italic = true,
-                b"u" if current.is_some() => current.as_mut().expect("font").underline = true,
-                b"strike" if current.is_some() => {
-                    current.as_mut().expect("font").strikethrough = true;
-                }
-                b"vertAlign" if current.is_some() => {
-                    current.as_mut().expect("font").script = match attr(&e, b"val").as_deref() {
-                        Some("superscript") => FormatScript::Superscript,
-                        Some("subscript") => FormatScript::Subscript,
-                        _ => FormatScript::None,
-                    };
-                }
-                _ => {}
-            },
-            Ok(Event::End(e)) if local(e.name().as_ref()) == b"font" && current.is_some() => {
-                retain_xlsx_style_record(&mut fonts, current.take().unwrap_or_default(), losses);
             }
-            Ok(Event::End(e)) if local(e.name().as_ref()) == b"fonts" => in_fonts = false,
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::End(e)) => {
+                if depth == 0 {
+                    provenance_complete = false;
+                    continue;
+                }
+                depth -= 1;
+                let qualified_name = e.name();
+                let name = local(qualified_name.as_ref());
+                let element_depth = depth;
+                if element_depth == 0 {
+                    if name != b"styleSheet" || !root_open {
+                        provenance_complete = false;
+                    }
+                    root_open = false;
+                }
+                match name {
+                    b"font" if current.is_some() && current_font_depth == Some(element_depth) => {
+                        retain_font(
+                            &mut fonts,
+                            &mut exact_sizes,
+                            current.take().unwrap_or_default(),
+                            current_exact_size.value().filter(|_| current_saw_name),
+                            losses,
+                        );
+                        current_font_depth = None;
+                    }
+                    b"font" if in_fonts => {
+                        provenance_complete = false;
+                    }
+                    b"fonts" => {
+                        if !in_fonts || fonts_depth != Some(element_depth) || current.is_some() {
+                            provenance_complete = false;
+                        }
+                        in_fonts = false;
+                        fonts_depth = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => {
+                if depth != 0
+                    || !saw_root
+                    || root_open
+                    || in_fonts
+                    || fonts_depth.is_some()
+                    || current.is_some()
+                    || current_font_depth.is_some()
+                {
+                    provenance_complete = false;
+                }
+                break;
+            }
+            Err(_) => {
+                provenance_complete = false;
+                exact_sizes.fill(None);
+                break;
+            }
             _ => {}
         }
     }
-    fonts
+    (fonts, exact_sizes, provenance_complete)
+}
+
+fn exact_integral_xlsx_font_size(value: &str) -> Option<u16> {
+    if value.is_empty() || value.len() > 64 {
+        return None;
+    }
+    let (mantissa, exponent) = match value.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            if exponent.contains(['e', 'E']) {
+                return None;
+            }
+            (mantissa, exponent.parse::<i32>().ok()?)
+        }
+        None => (value, 0),
+    };
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    if mantissa.is_empty() || mantissa.starts_with('-') {
+        return None;
+    }
+
+    let mut digits = 0_u128;
+    let mut saw_digit = false;
+    let mut saw_decimal = false;
+    let mut fractional_digits = 0_i32;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                digits = digits
+                    .checked_mul(10)?
+                    .checked_add(u128::from(byte - b'0'))?;
+                if saw_decimal {
+                    fractional_digits = fractional_digits.checked_add(1)?;
+                }
+            }
+            b'.' if !saw_decimal => saw_decimal = true,
+            _ => return None,
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+
+    let decimal_scale = fractional_digits.checked_sub(exponent)?;
+    let integral = if decimal_scale >= 0 {
+        let divisor = 10_u128.checked_pow(decimal_scale as u32)?;
+        if digits % divisor != 0 {
+            return None;
+        }
+        digits / divisor
+    } else {
+        digits.checked_mul(10_u128.checked_pow(decimal_scale.unsigned_abs())?)?
+    };
+    let points = u16::try_from(integral).ok()?;
+    (1..=MAX_VERIFIED_XLSX_FONT_SIZE_POINTS)
+        .contains(&points)
+        .then_some(points)
+}
+
+fn verified_xlsx_normal_font_size(
+    xml: &str,
+    fonts: &[Font],
+    exact_sizes: &[Option<u16>],
+    font_table_complete: bool,
+) -> Option<u16> {
+    if !font_table_complete {
+        return None;
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0_usize;
+    let mut in_cell_style_xfs = false;
+    let mut in_cell_xfs = false;
+    let mut in_cell_styles = false;
+    let mut cell_style_xfs_depth = None;
+    let mut cell_xfs_depth = None;
+    let mut cell_styles_depth = None;
+    let mut saw_cell_style_xfs = false;
+    let mut saw_cell_xfs = false;
+    let mut saw_cell_styles = false;
+    let mut cell_style_xf_font_ids = Vec::<Option<usize>>::new();
+    let mut cell_xf_count = 0_usize;
+    let mut cell_style_count = 0_usize;
+    let mut first_cell_xf_font_id = None;
+    let mut first_cell_xf_style_id = None;
+    let mut saw_first_cell_xf = false;
+    let mut normal_xf_id = None;
+    let mut saw_normal_style = false;
+    let mut normal_is_ambiguous = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(event @ (Event::Start(_) | Event::Empty(_))) => {
+                let (e, is_empty) = match event {
+                    Event::Start(e) => (e, false),
+                    Event::Empty(e) => (e, true),
+                    _ => unreachable!(),
+                };
+                let element_depth = depth;
+                match local(e.name().as_ref()) {
+                    b"cellStyleXfs" => {
+                        if element_depth != 1
+                            || saw_cell_style_xfs
+                            || in_cell_style_xfs
+                            || in_cell_xfs
+                            || in_cell_styles
+                        {
+                            return None;
+                        }
+                        saw_cell_style_xfs = true;
+                        in_cell_style_xfs = !is_empty;
+                        cell_style_xfs_depth = in_cell_style_xfs.then_some(element_depth);
+                    }
+                    b"cellXfs" => {
+                        if element_depth != 1
+                            || saw_cell_xfs
+                            || in_cell_style_xfs
+                            || in_cell_xfs
+                            || in_cell_styles
+                        {
+                            return None;
+                        }
+                        saw_cell_xfs = true;
+                        in_cell_xfs = !is_empty;
+                        cell_xfs_depth = in_cell_xfs.then_some(element_depth);
+                    }
+                    b"cellStyles" => {
+                        if element_depth != 1
+                            || saw_cell_styles
+                            || in_cell_style_xfs
+                            || in_cell_xfs
+                            || in_cell_styles
+                        {
+                            return None;
+                        }
+                        saw_cell_styles = true;
+                        in_cell_styles = !is_empty;
+                        cell_styles_depth = in_cell_styles.then_some(element_depth);
+                    }
+                    b"xf" if in_cell_style_xfs => {
+                        if cell_style_xfs_depth.is_none_or(|table| element_depth != table + 1) {
+                            return None;
+                        }
+                        if cell_style_xf_font_ids.len() >= MAX_XLSX_STYLE_RECORDS {
+                            return None;
+                        }
+                        cell_style_xf_font_ids
+                            .push(unique_parsed_attr::<usize>(&e, b"fontId").ok()?);
+                    }
+                    b"xf" if in_cell_xfs => {
+                        if cell_xfs_depth.is_none_or(|table| element_depth != table + 1) {
+                            return None;
+                        }
+                        if cell_xf_count >= MAX_XLSX_STYLE_RECORDS {
+                            return None;
+                        }
+                        cell_xf_count += 1;
+                        if !saw_first_cell_xf {
+                            saw_first_cell_xf = true;
+                            first_cell_xf_font_id =
+                                unique_parsed_attr::<usize>(&e, b"fontId").ok()?;
+                            first_cell_xf_style_id =
+                                unique_parsed_attr::<usize>(&e, b"xfId").ok()?;
+                        }
+                    }
+                    b"cellStyle" if in_cell_styles => {
+                        if cell_styles_depth.is_none_or(|table| element_depth != table + 1) {
+                            return None;
+                        }
+                        if cell_style_count >= MAX_XLSX_STYLE_RECORDS {
+                            return None;
+                        }
+                        cell_style_count += 1;
+                        let builtin_id = unique_parsed_attr::<u32>(&e, b"builtinId").ok()?;
+                        let name = unique_attr(&e, b"name").ok()?;
+                        let named_normal = name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("Normal"));
+                        if named_normal && builtin_id.is_some_and(|id| id != 0) {
+                            normal_is_ambiguous = true;
+                        }
+                        let is_normal =
+                            builtin_id == Some(0) || (builtin_id.is_none() && named_normal);
+                        if is_normal {
+                            let candidate = unique_parsed_attr::<usize>(&e, b"xfId").ok()?;
+                            if candidate.is_none() || saw_normal_style {
+                                normal_is_ambiguous = true;
+                            } else {
+                                normal_xf_id = candidate;
+                            }
+                            saw_normal_style = true;
+                        }
+                    }
+                    _ => {}
+                }
+                if !is_empty {
+                    depth = depth.checked_add(1)?;
+                }
+            }
+            Ok(Event::End(e)) => {
+                depth = depth.checked_sub(1)?;
+                match local(e.name().as_ref()) {
+                    b"cellStyleXfs" => {
+                        if !in_cell_style_xfs || cell_style_xfs_depth != Some(depth) {
+                            return None;
+                        }
+                        in_cell_style_xfs = false;
+                        cell_style_xfs_depth = None;
+                    }
+                    b"cellXfs" => {
+                        if !in_cell_xfs || cell_xfs_depth != Some(depth) {
+                            return None;
+                        }
+                        in_cell_xfs = false;
+                        cell_xfs_depth = None;
+                    }
+                    b"cellStyles" => {
+                        if !in_cell_styles || cell_styles_depth != Some(depth) {
+                            return None;
+                        }
+                        in_cell_styles = false;
+                        cell_styles_depth = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => {
+                if depth != 0
+                    || in_cell_style_xfs
+                    || in_cell_xfs
+                    || in_cell_styles
+                    || cell_style_xfs_depth.is_some()
+                    || cell_xfs_depth.is_some()
+                    || cell_styles_depth.is_some()
+                {
+                    return None;
+                }
+                break;
+            }
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    if normal_is_ambiguous {
+        return None;
+    }
+    let normal_style_id = normal_xf_id?;
+    if first_cell_xf_style_id != Some(normal_style_id) {
+        return None;
+    }
+    let first_font_id = first_cell_xf_font_id?;
+    let normal_font_id = cell_style_xf_font_ids.get(normal_style_id)?.as_ref()?;
+    let first_font = fonts.get(first_font_id)?;
+    let normal_font = fonts.get(*normal_font_id)?;
+    let first_points = exact_sizes.get(first_font_id).copied().flatten()?;
+    let normal_points = exact_sizes.get(*normal_font_id).copied().flatten()?;
+    (first_points == normal_points && first_font == normal_font).then_some(first_points)
 }
 
 fn format_pattern(value: Option<&str>) -> FormatPattern {
@@ -2104,9 +2653,9 @@ fn parse_cell_styles(
     theme: &ThemeColors,
     indexed: &[Color],
     custom: &HashMap<u16, String>,
+    fonts: &[Font],
     losses: &mut Vec<StyleLoss>,
 ) -> (Vec<CellStyle>, Vec<CellStyleOverlay>) {
-    let fonts = parse_font_table(xml, theme, indexed, losses);
     let fills = parse_fill_table(xml, theme, indexed, losses);
     let borders = parse_border_table(xml, theme, indexed, losses);
     let mut reader = Reader::from_str(xml);
@@ -2125,8 +2674,8 @@ fn parse_cell_styles(
                         continue;
                     }
                     current = Some((
-                        cell_style_from_xf(&e, &fonts, &fills, &borders, custom),
-                        cell_style_overlay_from_xf(&e, &fonts, &fills, &borders, custom),
+                        cell_style_from_xf(&e, fonts, &fills, &borders, custom),
+                        cell_style_overlay_from_xf(&e, fonts, &fills, &borders, custom),
                         attr(&e, b"applyAlignment")
                             .as_deref()
                             .and_then(parse_bool_attr),
@@ -2163,8 +2712,8 @@ fn parse_cell_styles(
                     retain_cell_xf_style(
                         &mut styles,
                         &mut overlays,
-                        cell_style_from_xf(&e, &fonts, &fills, &borders, custom),
-                        cell_style_overlay_from_xf(&e, &fonts, &fills, &borders, custom),
+                        cell_style_from_xf(&e, fonts, &fills, &borders, custom),
+                        cell_style_overlay_from_xf(&e, fonts, &fills, &borders, custom),
                         losses,
                     );
                 }
@@ -7882,6 +8431,211 @@ mod tests {
         assert_eq!(
             styles.cell_style_overlays[2].style.num_fmt.as_deref(),
             Some("[h]:mm:ss")
+        );
+    }
+
+    #[test]
+    fn xlsx_normal_font_provenance_requires_exact_integral_source_agreement() {
+        let styles = |first_size: &str,
+                      normal_size: &str,
+                      first_family: &str,
+                      normal_family: &str,
+                      normal_descriptor: &str| {
+            parse_styles(
+                &format!(
+                    r#"<styleSheet><fonts count="2"><font><sz val="{first_size}"/><name val="{first_family}"/></font><font><sz val="{normal_size}"/><name val="{normal_family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="1"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle {normal_descriptor} xfId="0"/></cellStyles></styleSheet>"#
+                ),
+                &ThemeColors::default(),
+            )
+        };
+
+        for (value, expected) in [
+            ("1", 1),
+            ("00011", 11),
+            ("11.0", 11),
+            ("1.1e1", 11),
+            ("4.09E2", 409),
+        ] {
+            assert_eq!(
+                styles(value, value, "Verified", "Verified", r#"name="Normal""#)
+                    .xlsx_normal_font_size_pt,
+                Some(expected),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            styles("12", "12", "Verified", "Verified", r#"builtinId="0""#).xlsx_normal_font_size_pt,
+            Some(12),
+            "built-in Normal provenance must not depend on an English name"
+        );
+
+        for value in [
+            "0",
+            "-1",
+            "11.5",
+            "409.00000000000000001",
+            "409.55",
+            "410",
+            "1e309",
+            "NaN",
+        ] {
+            assert_eq!(
+                styles(value, value, "Verified", "Verified", r#"name="Normal""#)
+                    .xlsx_normal_font_size_pt,
+                None,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            styles("12", "11", "Verified", "Verified", r#"name="Normal""#).xlsx_normal_font_size_pt,
+            None,
+            "the first cell XF and Normal style must agree on source size"
+        );
+        assert_eq!(
+            styles("11", "11", "First", "Normal", r#"name="Normal""#).xlsx_normal_font_size_pt,
+            None,
+            "the first cell XF and Normal style must resolve to the same font"
+        );
+        assert_eq!(
+            parse_styles(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Verified"/></font></fonts><cellXfs count="1"><xf fontId="0"/></cellXfs></styleSheet>"#,
+                &ThemeColors::default(),
+            )
+            .xlsx_normal_font_size_pt,
+            None,
+            "a missing named/built-in Normal style is ambiguous"
+        );
+        assert_eq!(
+            parse_styles(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><sz val="12"/><name val="Verified"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+                &ThemeColors::default(),
+            )
+            .xlsx_normal_font_size_pt,
+            None,
+            "duplicate source size declarations are ambiguous"
+        );
+        assert_eq!(
+            parse_styles(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="2"><cellStyle name="Normal" xfId="0"/><cellStyle builtinId="0" xfId="0"/></cellStyles></styleSheet>"#,
+                &ThemeColors::default(),
+            )
+            .xlsx_normal_font_size_pt,
+            None,
+            "duplicate Normal declarations are ambiguous"
+        );
+        assert_eq!(
+            parse_styles(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" builtinId="1" xfId="0"/></cellStyles></styleSheet>"#,
+                &ThemeColors::default(),
+            )
+            .xlsx_normal_font_size_pt,
+            None,
+            "a contradictory built-in identifier must not identify Normal"
+        );
+    }
+
+    #[test]
+    fn xlsx_normal_font_provenance_fails_closed_on_malformed_metadata() {
+        let invalid_documents = [
+            (
+                "malformed built-in identifier",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" builtinId="bogus" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "duplicate source-size attribute",
+                r#"<styleSheet><fonts><font><sz val="11" val="12"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "duplicate Normal-style reference",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0" xfId="1"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "duplicate local-name Normal-style reference",
+                r#"<styleSheet xmlns:p="urn:test"><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0" p:xfId="1"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "duplicate font table",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><fonts/><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "nested font table",
+                r#"<styleSheet><fonts><fonts/><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "font table below an extension",
+                r#"<styleSheet><ext><fonts><font><sz val="11"/><name val="Verified"/></font></fonts></ext><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "font record below an extension",
+                r#"<styleSheet><fonts><ext><font><sz val="11"/><name val="Verified"/></font></ext></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "font properties below an extension",
+                r#"<styleSheet><fonts><font><ext><sz val="11"/><name val="Verified"/></ext></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "duplicate cell XF table",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellXfs/><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "nested cell-style XF table",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><cellStyleXfs><xf fontId="0"/></cellStyleXfs></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "cell-style XF below an extension",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><ext><xf fontId="0"/></ext></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "cell XF below an extension",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><ext><xf fontId="0" xfId="0"/></ext></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "Normal style below an extension",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><ext><cellStyle name="Normal" xfId="0"/></ext></cellStyles></styleSheet>"#,
+            ),
+            (
+                "cell XF table below an extension",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><ext><cellXfs><xf fontId="0" xfId="0"/></cellXfs></ext><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#,
+            ),
+            (
+                "truncated Normal-style table",
+                r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/>"#,
+            ),
+        ];
+
+        for (case, xml) in invalid_documents {
+            assert_eq!(
+                parse_styles(xml, &ThemeColors::default()).xlsx_normal_font_size_pt,
+                None,
+                "{case}"
+            );
+        }
+
+        let truncated_fonts =
+            r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font>"#;
+        let mut losses = Vec::new();
+        let (_, _, complete) =
+            parse_font_table(truncated_fonts, &ThemeColors::default(), &[], &mut losses);
+        assert!(!complete, "an open font table must not retain provenance");
+    }
+
+    #[test]
+    fn xlsx_normal_font_provenance_rejects_over_limit_font_tables() {
+        let overflow = "<font/>".repeat(MAX_XLSX_STYLE_RECORDS);
+        let xml = format!(
+            r#"<styleSheet><fonts><font><sz val="11"/><name val="Verified"/></font>{overflow}</fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellXfs><xf fontId="0" xfId="0"/></cellXfs><cellStyles><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>"#
+        );
+        let mut losses = Vec::new();
+        let (fonts, exact_sizes, complete) =
+            parse_font_table(&xml, &ThemeColors::default(), &[], &mut losses);
+
+        assert_eq!(fonts.len(), MAX_XLSX_STYLE_RECORDS);
+        assert_eq!(exact_sizes.first(), Some(&Some(11)));
+        assert!(!complete);
+        assert_eq!(
+            verified_xlsx_normal_font_size(&xml, &fonts, &exact_sizes, complete),
+            None,
+            "retained leading records must not be trusted after table truncation"
         );
     }
 
