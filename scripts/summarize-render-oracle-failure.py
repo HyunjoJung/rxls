@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -17,7 +18,7 @@ from typing import Any, Iterable
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v4"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v5"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -27,6 +28,9 @@ MAX_JSON_DEPTH = 128
 MAX_JSON_NODES = 2_000_000
 MAX_JSON_INTEGER_DIGITS = 128
 MAX_PAGE_COUNT = 64
+MAX_POINT_RATIONAL_DIGITS = 32
+MAX_POINT_ABSOLUTE_VALUE = 1_000_000
+MAX_POINT_DELTA_MICROPOINTS = MAX_POINT_ABSOLUTE_VALUE * 1_000_000
 SHARDS = 4
 
 HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -265,6 +269,44 @@ DISCOVERY_KEYS = {
     "shard_index",
     "truncated",
 }
+PDF_POINT_DELTA_KEYS = (
+    "crop_box_height",
+    "crop_box_width",
+    "libreoffice_xhtml_page_size_height",
+    "libreoffice_xhtml_page_size_width",
+    "media_box_height",
+    "media_box_width",
+    "rxls_xhtml_page_size_height",
+    "rxls_xhtml_page_size_width",
+    "xhtml_height",
+    "xhtml_width",
+)
+PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
+    {
+        "crop_box_height",
+        "crop_box_width",
+        "media_box_height",
+        "media_box_width",
+        "xhtml_height",
+        "xhtml_width",
+    }
+)
+PDF_XHTML_CROSSCHECK_DELTA_KEYS = frozenset(PDF_POINT_DELTA_KEYS) - (
+    PDF_DIRECT_POINT_DELTA_KEYS
+)
+PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
+GEOMETRY_KEYS = {
+    "by_delta",
+    "max_direct_absolute_delta_micropoints",
+    "max_internal_xhtml_crosscheck_micropoints",
+    "mismatch_pages",
+    "pages",
+    "workbooks",
+}
+GEOMETRY_DELTA_KEYS = {
+    "max_absolute_micropoints",
+    "nonzero_pages",
+}
 
 
 class SummaryError(RuntimeError):
@@ -379,6 +421,249 @@ def _integer(value: object, code: str, maximum: int) -> int:
     ):
         raise SummaryError(code)
     return value
+
+
+def _point_fraction(
+    value: object, code: str, *, positive: bool
+) -> Fraction:
+    if not isinstance(value, str):
+        raise SummaryError(code)
+    match = re.fullmatch(r"(-?)(0|[1-9][0-9]*)/([1-9][0-9]*)", value)
+    if match is None:
+        raise SummaryError(code)
+    numerator_digits = match.group(2)
+    denominator_digits = match.group(3)
+    if (
+        len(numerator_digits) > MAX_POINT_RATIONAL_DIGITS
+        or len(denominator_digits) > MAX_POINT_RATIONAL_DIGITS
+    ):
+        raise SummaryError(code)
+    numerator = int(numerator_digits)
+    if match.group(1):
+        numerator = -numerator
+    result = Fraction(numerator, int(denominator_digits))
+    if value != f"{result.numerator}/{result.denominator}":
+        raise SummaryError(code)
+    if positive:
+        if not 0 < result <= MAX_POINT_ABSOLUTE_VALUE:
+            raise SummaryError(code)
+    elif abs(result) > MAX_POINT_ABSOLUTE_VALUE:
+        raise SummaryError(code)
+    return result
+
+
+def _point_side(
+    value: object, code: str
+) -> dict[str, tuple[Fraction, Fraction]]:
+    if not isinstance(value, dict) or set(value) != {
+        "crop_box",
+        "media_box",
+        "page_size",
+    }:
+        raise SummaryError(code)
+    result: dict[str, tuple[Fraction, Fraction]] = {}
+    for name in ("page_size", "media_box", "crop_box"):
+        dimensions = value.get(name)
+        if not isinstance(dimensions, dict) or set(dimensions) != {
+            "height_points",
+            "width_points",
+        }:
+            raise SummaryError(code)
+        result[name] = (
+            _point_fraction(
+                dimensions["width_points"], code, positive=True
+            ),
+            _point_fraction(
+                dimensions["height_points"], code, positive=True
+            ),
+        )
+    return result
+
+
+def _ceil_micropoints(value: Fraction) -> int:
+    absolute = abs(value)
+    return (
+        absolute.numerator * 1_000_000
+        + absolute.denominator
+        - 1
+    ) // absolute.denominator
+
+
+def _ceil_millipoints(value: Fraction) -> int:
+    absolute = abs(value)
+    return (
+        absolute.numerator * 1000 + absolute.denominator - 1
+    ) // absolute.denominator
+
+
+def _page_point_geometry(
+    page: object,
+) -> tuple[dict[str, Fraction], bool]:
+    code = "geometry_page"
+    if not isinstance(page, dict):
+        raise SummaryError(code)
+    evidence = page.get("pdf_point_geometry")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "deltas_points",
+        "libreoffice",
+        "rxls",
+        "xhtml",
+    }:
+        raise SummaryError(code)
+    rxls = _point_side(evidence["rxls"], code)
+    libreoffice = _point_side(evidence["libreoffice"], code)
+    xhtml = evidence["xhtml"]
+    if not isinstance(xhtml, dict) or set(xhtml) != {
+        "libreoffice",
+        "rxls",
+    }:
+        raise SummaryError(code)
+    xhtml_values: dict[str, tuple[Fraction, Fraction]] = {}
+    for side in ("rxls", "libreoffice"):
+        dimensions = xhtml[side]
+        if not isinstance(dimensions, dict) or set(dimensions) != {
+            "height_points",
+            "width_points",
+        }:
+            raise SummaryError(code)
+        xhtml_values[side] = (
+            _point_fraction(
+                dimensions["width_points"], code, positive=True
+            ),
+            _point_fraction(
+                dimensions["height_points"], code, positive=True
+            ),
+        )
+
+    expected: dict[str, Fraction] = {}
+    for box in ("media_box", "crop_box"):
+        for offset, axis in enumerate(("width", "height")):
+            expected[f"{box}_{axis}"] = (
+                rxls[box][offset] - libreoffice[box][offset]
+            )
+    for side in ("rxls", "libreoffice"):
+        geometry = rxls if side == "rxls" else libreoffice
+        for offset, axis in enumerate(("width", "height")):
+            expected[f"{side}_xhtml_page_size_{axis}"] = (
+                xhtml_values[side][offset]
+                - geometry["page_size"][offset]
+            )
+    for offset, axis in enumerate(("width", "height")):
+        expected[f"xhtml_{axis}"] = (
+            xhtml_values["rxls"][offset]
+            - xhtml_values["libreoffice"][offset]
+        )
+
+    deltas = evidence["deltas_points"]
+    if not isinstance(deltas, dict) or set(deltas) != set(
+        PDF_POINT_DELTA_KEYS
+    ):
+        raise SummaryError(code)
+    parsed = {
+        key: _point_fraction(deltas[key], code, positive=False)
+        for key in PDF_POINT_DELTA_KEYS
+    }
+    if parsed != expected:
+        raise SummaryError("geometry_delta")
+    mismatch = any(
+        parsed[key] != 0 for key in PDF_DIRECT_POINT_DELTA_KEYS
+    ) or any(
+        abs(parsed[key]) > PDF_XHTML_CROSSCHECK_MAX_POINTS
+        for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+    )
+    return parsed, mismatch
+
+
+def _row_point_geometry(
+    row: dict[str, Any],
+) -> tuple[list[dict[str, Fraction]], int] | None:
+    has_pages = "pages" in row
+    has_metrics = "metrics" in row
+    if not has_pages and not has_metrics:
+        return None
+    if not has_pages or not has_metrics:
+        raise SummaryError("geometry_row")
+    pages = row["pages"]
+    metrics = row["metrics"]
+    if (
+        not isinstance(pages, list)
+        or not 0 < len(pages) <= MAX_PAGE_COUNT
+        or not isinstance(metrics, dict)
+    ):
+        raise SummaryError("geometry_row")
+    parsed_pages: list[dict[str, Fraction]] = []
+    mismatch_pages = 0
+    for page_offset, page in enumerate(pages):
+        if (
+            not isinstance(page, dict)
+            or _integer(
+                page.get("oracle_output_page_index"),
+                "geometry_page_index",
+                len(pages) - 1,
+            )
+            != page_offset
+        ):
+            raise SummaryError("geometry_page_index")
+        parsed, mismatch = _page_point_geometry(page)
+        parsed_pages.append(parsed)
+        mismatch_pages += int(mismatch)
+    direct_max = max(
+        (
+            abs(page[key])
+            for page in parsed_pages
+            for key in PDF_DIRECT_POINT_DELTA_KEYS
+        ),
+        default=Fraction(),
+    )
+    crosscheck_max = max(
+        (
+            abs(page[key])
+            for page in parsed_pages
+            for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+        ),
+        default=Fraction(),
+    )
+    expected_metrics = {
+        "pages": len(pages),
+        "pdf_point_geometry_mismatches": mismatch_pages,
+        "max_pdf_point_geometry_delta_millipoints": (
+            _ceil_millipoints(direct_max)
+        ),
+        "max_pdf_xhtml_crosscheck_delta_micropoints": (
+            _ceil_micropoints(crosscheck_max)
+        ),
+    }
+    maxima = {
+        "pages": len(pages),
+        "pdf_point_geometry_mismatches": len(pages),
+        "max_pdf_point_geometry_delta_millipoints": (
+            MAX_POINT_ABSOLUTE_VALUE * 1000
+        ),
+        "max_pdf_xhtml_crosscheck_delta_micropoints": (
+            MAX_POINT_DELTA_MICROPOINTS
+        ),
+    }
+    for key, expected in expected_metrics.items():
+        if _integer(metrics.get(key), "geometry_aggregate", maxima[key]) != expected:
+            raise SummaryError("geometry_aggregate")
+    return parsed_pages, mismatch_pages
+
+
+def _empty_geometry() -> dict[str, object]:
+    return {
+        "by_delta": {
+            key: {
+                "max_absolute_micropoints": 0,
+                "nonzero_pages": 0,
+            }
+            for key in PDF_POINT_DELTA_KEYS
+        },
+        "max_direct_absolute_delta_micropoints": 0,
+        "max_internal_xhtml_crosscheck_micropoints": 0,
+        "mismatch_pages": 0,
+        "pages": 0,
+        "workbooks": 0,
+    }
 
 
 def _page_count_pair(
@@ -579,6 +864,7 @@ def _empty(label: str) -> dict[str, object]:
         "by_feature": {},
         "by_format": {},
         "by_status": {},
+        "geometry": _empty_geometry(),
         "label": label,
         "page_count_mismatches": [],
         "workbooks": 0,
@@ -623,6 +909,7 @@ def _summarize_label(
     formats: dict[str, Counter[str]] = {}
     features: dict[str, Counter[str]] = {}
     page_count_mismatches: Counter[tuple[int, int]] = Counter()
+    geometry = _empty_geometry()
     for row in rows:
         status = str(row["status"])
         raw_code = str(row["classification"])
@@ -637,6 +924,35 @@ def _summarize_label(
             page_count_mismatches[
                 _page_count_pair(row, "page_count_diagnostic")
             ] += 1
+        row_geometry = _row_point_geometry(row)
+        if row_geometry is not None:
+            pages, mismatch_pages = row_geometry
+            geometry["workbooks"] += 1
+            geometry["pages"] += len(pages)
+            geometry["mismatch_pages"] += mismatch_pages
+            for page in pages:
+                for key in PDF_POINT_DELTA_KEYS:
+                    value = _ceil_micropoints(page[key])
+                    delta = geometry["by_delta"][key]
+                    if value != 0:
+                        delta["nonzero_pages"] += 1
+                    delta["max_absolute_micropoints"] = max(
+                        delta["max_absolute_micropoints"], value
+                    )
+            geometry["max_direct_absolute_delta_micropoints"] = max(
+                geometry["by_delta"][key][
+                    "max_absolute_micropoints"
+                ]
+                for key in PDF_DIRECT_POINT_DELTA_KEYS
+            )
+            geometry[
+                "max_internal_xhtml_crosscheck_micropoints"
+            ] = max(
+                geometry["by_delta"][key][
+                    "max_absolute_micropoints"
+                ]
+                for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+            )
 
     def groups(values: dict[str, Counter[str]]) -> dict[str, object]:
         return {
@@ -652,6 +968,7 @@ def _summarize_label(
         "by_feature": groups(features),
         "by_format": groups(formats),
         "by_status": dict(sorted(statuses.items())),
+        "geometry": geometry,
         "label": label,
         "page_count_mismatches": [
             {
@@ -683,6 +1000,77 @@ def _validate_namespace(root: Path) -> None:
         raise SummaryError("unexpected_report_name")
 
 
+def _validate_geometry_output(value: object, total: int) -> None:
+    code = "output_geometry"
+    if not isinstance(value, dict) or set(value) != GEOMETRY_KEYS:
+        raise SummaryError(code)
+    workbooks = _integer(value["workbooks"], code, total)
+    pages = _integer(value["pages"], code, total * MAX_PAGE_COUNT)
+    if (
+        (workbooks == 0) != (pages == 0)
+        or pages < workbooks
+        or pages > workbooks * MAX_PAGE_COUNT
+    ):
+        raise SummaryError(code)
+    mismatch_pages = _integer(value["mismatch_pages"], code, pages)
+    direct_max = _integer(
+        value["max_direct_absolute_delta_micropoints"],
+        code,
+        MAX_POINT_DELTA_MICROPOINTS,
+    )
+    crosscheck_max = _integer(
+        value["max_internal_xhtml_crosscheck_micropoints"],
+        code,
+        MAX_POINT_DELTA_MICROPOINTS,
+    )
+    by_delta = value["by_delta"]
+    if not isinstance(by_delta, dict) or set(by_delta) != set(
+        PDF_POINT_DELTA_KEYS
+    ):
+        raise SummaryError(code)
+    parsed: dict[str, tuple[int, int]] = {}
+    for key in PDF_POINT_DELTA_KEYS:
+        row = by_delta[key]
+        if not isinstance(row, dict) or set(row) != GEOMETRY_DELTA_KEYS:
+            raise SummaryError(code)
+        nonzero_pages = _integer(row["nonzero_pages"], code, pages)
+        maximum = _integer(
+            row["max_absolute_micropoints"],
+            code,
+            MAX_POINT_DELTA_MICROPOINTS,
+        )
+        if (nonzero_pages == 0) != (maximum == 0):
+            raise SummaryError(code)
+        parsed[key] = (nonzero_pages, maximum)
+
+    if direct_max != max(
+        (parsed[key][1] for key in PDF_DIRECT_POINT_DELTA_KEYS),
+        default=0,
+    ) or crosscheck_max != max(
+        (parsed[key][1] for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS),
+        default=0,
+    ):
+        raise SummaryError(code)
+    direct_counts = [
+        parsed[key][0] for key in PDF_DIRECT_POINT_DELTA_KEYS
+    ]
+    over_limit_crosscheck_counts = [
+        parsed[key][0]
+        for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+        if parsed[key][1] > 1000
+    ]
+    minimum_mismatches = max(
+        [*direct_counts, int(bool(over_limit_crosscheck_counts))],
+        default=0,
+    )
+    maximum_mismatches = min(
+        pages,
+        sum(direct_counts) + sum(over_limit_crosscheck_counts),
+    )
+    if not minimum_mismatches <= mismatch_pages <= maximum_mismatches:
+        raise SummaryError(code)
+
+
 def _validate_output(value: object) -> None:
     """Ensure no unreviewed key or path-like string reached the final JSON."""
 
@@ -692,6 +1080,7 @@ def _validate_output(value: object) -> None:
         "by_feature",
         "by_format",
         "by_status",
+        "geometry",
         "label",
         "page_count_mismatches",
         "workbooks",
@@ -728,6 +1117,7 @@ def _validate_output(value: object) -> None:
             "output_classification",
             OUTPUT_CLASSIFICATIONS,
         )
+        _validate_geometry_output(report["geometry"], total)
         page_count_mismatches = report["page_count_mismatches"]
         if (
             not isinstance(page_count_mismatches, list)

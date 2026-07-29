@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import Counter
 import copy
 from contextlib import redirect_stderr
+from fractions import Fraction
 import hashlib
 import importlib.util
 import io
@@ -55,6 +56,133 @@ def _row(
         "sha256": hashlib.sha256(f"case-{index}".encode()).hexdigest(),
         "status": status,
     }
+
+
+def _point_text(value: Fraction) -> str:
+    return f"{value.numerator}/{value.denominator}"
+
+
+def _geometry_page(
+    *,
+    crop_width_delta: Fraction = Fraction(),
+    xhtml_internal_width_delta: Fraction = Fraction(),
+) -> dict[str, object]:
+    width = Fraction(600)
+    height = Fraction(450)
+
+    def side(
+        *,
+        crop_width: Fraction = width,
+    ) -> dict[str, object]:
+        def dimensions(
+            item_width: Fraction, item_height: Fraction
+        ) -> dict[str, str]:
+            return {
+                "height_points": _point_text(item_height),
+                "width_points": _point_text(item_width),
+            }
+
+        return {
+            "crop_box": dimensions(crop_width, height),
+            "media_box": dimensions(width, height),
+            "page_size": dimensions(width, height),
+        }
+
+    libreoffice = side()
+    rxls = side(crop_width=width + crop_width_delta)
+    xhtml_width = width + xhtml_internal_width_delta
+    xhtml = {
+        name: {
+            "height_points": _point_text(height),
+            "width_points": _point_text(xhtml_width),
+        }
+        for name in ("libreoffice", "rxls")
+    }
+    deltas = {
+        "crop_box_height": Fraction(),
+        "crop_box_width": crop_width_delta,
+        "libreoffice_xhtml_page_size_height": Fraction(),
+        "libreoffice_xhtml_page_size_width": xhtml_internal_width_delta,
+        "media_box_height": Fraction(),
+        "media_box_width": Fraction(),
+        "rxls_xhtml_page_size_height": Fraction(),
+        "rxls_xhtml_page_size_width": xhtml_internal_width_delta,
+        "xhtml_height": Fraction(),
+        "xhtml_width": Fraction(),
+    }
+    return {
+        "pdf_point_geometry": {
+            "deltas_points": {
+                key: _point_text(value)
+                for key, value in sorted(deltas.items())
+            },
+            "libreoffice": libreoffice,
+            "rxls": rxls,
+            "xhtml": xhtml,
+        }
+    }
+
+
+def _ceil_scaled(value: Fraction, scale: int) -> int:
+    absolute = abs(value)
+    return (
+        absolute.numerator * scale + absolute.denominator - 1
+    ) // absolute.denominator
+
+
+def _with_geometry(
+    row: dict[str, object],
+    pages: list[dict[str, object]],
+) -> dict[str, object]:
+    direct = MODULE.PDF_DIRECT_POINT_DELTA_KEYS
+    crosscheck = MODULE.PDF_XHTML_CROSSCHECK_DELTA_KEYS
+    parsed = [
+        {
+            key: Fraction(value)
+            for key, value in page["pdf_point_geometry"][
+                "deltas_points"
+            ].items()
+        }
+        for page in pages
+    ]
+    mismatch_pages = sum(
+        any(values[key] != 0 for key in direct)
+        or any(
+            abs(values[key]) > Fraction(1, 1000)
+            for key in crosscheck
+        )
+        for values in parsed
+    )
+    direct_max = max(
+        (
+            abs(values[key])
+            for values in parsed
+            for key in direct
+        ),
+        default=Fraction(),
+    )
+    crosscheck_max = max(
+        (
+            abs(values[key])
+            for values in parsed
+            for key in crosscheck
+        ),
+        default=Fraction(),
+    )
+    for page_offset, page in enumerate(pages):
+        page["oracle_output_page_index"] = page_offset
+    row["pages"] = pages
+    row["metrics"] = {
+        "pages": len(pages),
+        "max_pdf_point_geometry_delta_millipoints": _ceil_scaled(
+            direct_max, 1000
+        ),
+        "max_pdf_xhtml_crosscheck_delta_micropoints": _ceil_scaled(
+            crosscheck_max, 1_000_000
+        ),
+        "pdf_point_geometry_mismatches": mismatch_pages,
+    }
+    return row
 
 
 def _lane_limit(profile: str, label: str) -> int:
@@ -194,7 +322,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v4",
+                "rxls.render-oracle-failure-summary.v5",
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
@@ -231,6 +359,347 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             self.assertNotIn('"commands"', rendered)
             self.assertNotIn('"path"', rendered)
             self.assertNotIn('"sha256"', rendered)
+
+    def test_geometry_summary_is_aggregate_only_and_boundary_exact(self) -> None:
+        rows = _pilot_rows()
+        _with_geometry(
+            rows[1],
+            [
+                _geometry_page(
+                    xhtml_internal_width_delta=Fraction(1, 1000)
+                )
+            ],
+        )
+        _with_geometry(
+            rows[2],
+            [
+                _geometry_page(
+                    xhtml_internal_width_delta=Fraction(1001, 1_000_000)
+                )
+            ],
+        )
+        _with_geometry(
+            rows[3],
+            [_geometry_page(crop_width_delta=Fraction(1, 2))],
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        geometry = summary["reports"][1]["geometry"]
+        self.assertEqual(geometry["workbooks"], 3)
+        self.assertEqual(geometry["pages"], 3)
+        self.assertEqual(geometry["mismatch_pages"], 2)
+        self.assertEqual(
+            geometry["max_direct_absolute_delta_micropoints"],
+            500_000,
+        )
+        self.assertEqual(
+            geometry["max_internal_xhtml_crosscheck_micropoints"],
+            1001,
+        )
+        self.assertEqual(
+            set(geometry["by_delta"]), set(MODULE.PDF_POINT_DELTA_KEYS)
+        )
+        self.assertEqual(
+            geometry["by_delta"]["crop_box_width"],
+            {
+                "max_absolute_micropoints": 500_000,
+                "nonzero_pages": 1,
+            },
+        )
+        for key in (
+            "libreoffice_xhtml_page_size_width",
+            "rxls_xhtml_page_size_width",
+        ):
+            self.assertEqual(
+                geometry["by_delta"][key],
+                {
+                    "max_absolute_micropoints": 1001,
+                    "nonzero_pages": 2,
+                },
+            )
+        self.assertEqual(
+            geometry["by_delta"]["media_box_height"],
+            {
+                "max_absolute_micropoints": 0,
+                "nonzero_pages": 0,
+            },
+        )
+        rendered = MODULE._json(summary).decode("ascii")
+        for forbidden in (
+            "600/1",
+            "450/1",
+            "1001/1000000",
+            "pdf_point_geometry",
+            "deltas_points",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_geometry_evidence_shapes_are_fail_closed(self) -> None:
+        def rows() -> list[dict[str, object]]:
+            value = _pilot_rows()
+            _with_geometry(value[1], [_geometry_page()])
+            return value
+
+        mutations = {
+            "point-extra": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ].__setitem__("private_path", "/srv/private/book.xlsx"),
+            "delta-extra": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["deltas_points"].__setitem__("private_delta", "0/1"),
+            "delta-missing": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["deltas_points"].pop("crop_box_width"),
+            "side-extra": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["rxls"].__setitem__("private_box", {}),
+            "dimension-extra": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["rxls"]["media_box"].__setitem__(
+                "private_path", "/srv/private/book.xlsx"
+            ),
+            "xhtml-extra": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["xhtml"].__setitem__("private_side", {}),
+            "page-not-object": lambda row: row["pages"].__setitem__(
+                0, "/srv/private/book.xlsx"
+            ),
+            "pages-not-list": lambda row: row.__setitem__(
+                "pages", "/srv/private/book.xlsx"
+            ),
+            "metrics-not-object": lambda row: row.__setitem__(
+                "metrics", "/srv/private/book.xlsx"
+            ),
+            "partial-row": lambda row: row.pop("metrics"),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                hosted = Path(raw)
+                value = rows()
+                mutation(value[1])
+                _write(
+                    hosted / "parity-report-a.json",
+                    _report(value, profile="pilot", label="parity-a"),
+                )
+                with self.assertRaises(MODULE.SummaryError) as raised:
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+                message = str(raised.exception)
+                self.assertNotIn("/srv/private", message)
+                self.assertNotIn("book.xlsx", message)
+
+    def test_geometry_deltas_and_row_aggregates_are_recomputed(self) -> None:
+        def rows() -> list[dict[str, object]]:
+            value = _pilot_rows()
+            _with_geometry(
+                value[1],
+                [_geometry_page(crop_width_delta=Fraction(1, 2))],
+            )
+            return value
+
+        mutations = {
+            "delta-drift": lambda row: row["pages"][0][
+                "pdf_point_geometry"
+            ]["deltas_points"].__setitem__("crop_box_width", "1/3"),
+            "mismatch-drift": lambda row: row["metrics"].__setitem__(
+                "pdf_point_geometry_mismatches", 0
+            ),
+            "direct-max-drift": lambda row: row["metrics"].__setitem__(
+                "max_pdf_point_geometry_delta_millipoints", 499
+            ),
+            "crosscheck-max-drift": lambda row: row["metrics"].__setitem__(
+                "max_pdf_xhtml_crosscheck_delta_micropoints", 1
+            ),
+            "page-count-drift": lambda row: row["metrics"].__setitem__(
+                "pages", 2
+            ),
+            "boolean-aggregate": lambda row: row["metrics"].__setitem__(
+                "pdf_point_geometry_mismatches", True
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                hosted = Path(raw)
+                value = rows()
+                mutation(value[1])
+                _write(
+                    hosted / "parity-report-a.json",
+                    _report(value, profile="pilot", label="parity-a"),
+                )
+                with self.assertRaises(MODULE.SummaryError):
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+
+    def test_geometry_pages_are_bound_to_canonical_output_order(self) -> None:
+        def rows() -> list[dict[str, object]]:
+            value = _pilot_rows()
+            _with_geometry(
+                value[1],
+                [
+                    _geometry_page(),
+                    _geometry_page(crop_width_delta=Fraction(1, 2)),
+                ],
+            )
+            return value
+
+        mutations = {
+            "missing-index": lambda row: row["pages"][0].pop(
+                "oracle_output_page_index"
+            ),
+            "duplicate-index": lambda row: row["pages"][1].__setitem__(
+                "oracle_output_page_index", 0
+            ),
+            "reordered-pages": lambda row: row["pages"].reverse(),
+            "boolean-index": lambda row: row["pages"][0].__setitem__(
+                "oracle_output_page_index", False
+            ),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                hosted = Path(raw)
+                value = rows()
+                mutation(value[1])
+                _write(
+                    hosted / "parity-report-a.json",
+                    _report(value, profile="pilot", label="parity-a"),
+                )
+                with self.assertRaisesRegex(
+                    MODULE.SummaryError, "geometry_page_index"
+                ):
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+
+    def test_geometry_rationals_are_bounded_canonical_and_path_neutral(
+        self,
+    ) -> None:
+        def rows() -> list[dict[str, object]]:
+            value = _pilot_rows()
+            _with_geometry(value[1], [_geometry_page()])
+            return value
+
+        replacements = {
+            "numerator-limit": (
+                "9" * (MODULE.MAX_POINT_RATIONAL_DIGITS + 1) + "/1"
+            ),
+            "denominator-limit": (
+                "1/" + "9" * (MODULE.MAX_POINT_RATIONAL_DIGITS + 1)
+            ),
+            "noncanonical": "2/2",
+            "zero-dimension": "0/1",
+            "negative-dimension": "-1/1",
+            "dimension-limit": (
+                f"{MODULE.MAX_POINT_ABSOLUTE_VALUE + 1}/1"
+            ),
+            "secret": "/srv/private/customer-payroll.xlsx",
+        }
+        for label, replacement in replacements.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                hosted = Path(raw)
+                value = rows()
+                value[1]["pages"][0]["pdf_point_geometry"]["rxls"][
+                    "crop_box"
+                ]["width_points"] = replacement
+                _write(
+                    hosted / "parity-report-a.json",
+                    _report(value, profile="pilot", label="parity-a"),
+                )
+                with self.assertRaises(MODULE.SummaryError) as raised:
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+                message = str(raised.exception)
+                self.assertNotIn("/srv/private", message)
+                self.assertNotIn("customer-payroll", message)
+
+    def test_geometry_summary_is_invariant_to_order_and_private_fields(
+        self,
+    ) -> None:
+        rows_a = _pilot_rows()
+        _with_geometry(
+            rows_a[1],
+            [_geometry_page(crop_width_delta=Fraction(1, 2))],
+        )
+        _with_geometry(
+            rows_a[2],
+            [
+                _geometry_page(
+                    xhtml_internal_width_delta=Fraction(1, 1000)
+                )
+            ],
+        )
+        rows_b = copy.deepcopy(rows_a)
+        rows_b.reverse()
+        for index, row in enumerate(rows_b):
+            row["path"] = f"/private/tenant/secret-{index}.xlsx"
+            row["sha256"] = hashlib.sha256(
+                f"replacement-{index}".encode()
+            ).hexdigest()
+            row["commands"] = {
+                "stderr": f"private workbook content {index}"
+            }
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            _write(
+                first / "parity-report-a.json",
+                _report(rows_a, profile="pilot", label="parity-a"),
+            )
+            _write(
+                second / "parity-report-a.json",
+                _report(rows_b, profile="pilot", label="parity-a"),
+            )
+            summary_a = MODULE.summarize(
+                first,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+            summary_b = MODULE.summarize(
+                second,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        self.assertEqual(summary_a, summary_b)
+        rendered = MODULE._json(summary_b).decode("ascii")
+        for forbidden in (
+            "/private/tenant",
+            "private workbook content",
+            "replacement-",
+            '"sha256"',
+            '"path"',
+        ):
+            self.assertNotIn(forbidden, rendered)
 
     def test_missing_reports_emit_only_fixed_empty_labels(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -771,6 +1240,30 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                         head_sha=HEAD_SHA,
                     )
 
+            with mock.patch.object(MODULE, "MAX_OUTPUT_BYTES", 1):
+                with self.assertRaisesRegex(
+                    MODULE.SummaryError, "output_size"
+                ):
+                    MODULE.summarize(
+                        hosted,
+                        profile="pilot",
+                        baseline_mode="verify",
+                        head_sha=HEAD_SHA,
+                    )
+
+            symlinked = root / "symlinked"
+            symlinked.mkdir()
+            (symlinked / "parity-report-a.json").symlink_to(report)
+            with self.assertRaisesRegex(
+                MODULE.SummaryError, "report_type_or_size"
+            ):
+                MODULE.summarize(
+                    symlinked,
+                    profile="pilot",
+                    baseline_mode="verify",
+                    head_sha=HEAD_SHA,
+                )
+
             output = root / MODULE.OUTPUT_NAME
             target = root / "actual.json"
             target.write_text("{}\n", encoding="utf-8")
@@ -811,12 +1304,30 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         ]["by_classification"]
         latin_classes["within_threshold"] -= 1
         latin_classes[MODULE.UNREVIEWED_CLASSIFICATION] = 1
+        geometry_injected = copy.deepcopy(summary)
+        geometry_injected["reports"][1]["geometry"]["private_path"] = (
+            "/private/workbook.xlsx"
+        )
+        delta_injected = copy.deepcopy(summary)
+        delta_injected["reports"][1]["geometry"]["by_delta"][
+            "private_delta"
+        ] = {
+            "max_absolute_micropoints": 0,
+            "nonzero_pages": 0,
+        }
+        geometry_drift = copy.deepcopy(summary)
+        geometry_drift["reports"][1]["geometry"][
+            "max_direct_absolute_delta_micropoints"
+        ] = 1
         for document in (
             injected,
             drifted,
             unreviewed_stage,
             format_conflict,
             feature_conflict,
+            geometry_injected,
+            delta_injected,
+            geometry_drift,
         ):
             with self.subTest(document=document):
                 with self.assertRaises(MODULE.SummaryError):

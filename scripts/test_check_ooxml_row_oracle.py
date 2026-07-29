@@ -8,6 +8,7 @@ from hashlib import sha256
 import importlib.util
 import json
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check-ooxml-row-oracle.py"
 GENERATOR = ROOT / "scripts" / "generate-ooxml-row-oracle.py"
+PARITY_HARNESS = ROOT / "scripts" / "libreoffice-render-parity.py"
 LOCAL = ROOT / "local"
 
 
@@ -106,7 +108,7 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
                     "runtime": "docker",
                     "schema": "rxls.render-oracle-container-identity.v2",
                 },
-                "print_mode": "single_page",
+                "print_mode": "single-page-sheets",
                 "renderer_binary": {"bytes": 123_456, "sha256": "d" * 64},
             },
             "discovery": {
@@ -316,6 +318,19 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
                 mutation(report)
                 with self.assertRaises(self.checker.DiagnosticError):
                     self._reduce(report)
+
+    def test_accepts_only_the_harness_canonical_single_page_mode(self) -> None:
+        parity = runpy.run_path(str(PARITY_HARNESS))
+        self.assertEqual(
+            self.checker.PRINT_MODE_SINGLE_PAGE,
+            parity["PRINT_MODE_SINGLE_PAGE"],
+        )
+        report = copy.deepcopy(self.report)
+        report["configuration"]["print_mode"] = "single_page"
+        with self.assertRaisesRegex(
+            self.checker.DiagnosticError, "report_configuration"
+        ):
+            self._reduce(report)
 
     def test_rejects_stale_or_unattested_font_pack_state(self) -> None:
         for mutation in (

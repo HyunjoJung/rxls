@@ -23,6 +23,7 @@ PROFILE = "ooxml-row-diagnostic"
 GENERATOR = "rxls-ooxml-row-diagnostic"
 GENERATOR_VERSION = "1.0.0"
 CASE_COUNT = 12
+PRINT_MODE_SINGLE_PAGE = "single-page-sheets"
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -761,7 +762,7 @@ def reduce_report(
     _require(
         isinstance(configuration, dict)
         and set(configuration) == REPORT_CONFIGURATION_KEYS
-        and configuration.get("print_mode") == "single_page"
+        and configuration.get("print_mode") == PRINT_MODE_SINGLE_PAGE
         and configuration.get("min_similarity_ppm") is None
         and configuration.get("lane_filter")
         == {
