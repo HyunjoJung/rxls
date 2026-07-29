@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import io
 import json
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 import zipfile
 
@@ -18,6 +22,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check_render_oracle_release_evidence.py"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "render-package-release.yml"
+CORPUS_GENERATOR = ROOT / "scripts" / "generate-render-corpus.py"
 
 
 def _load():
@@ -26,6 +31,18 @@ def _load():
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_corpus_generator():
+    spec = importlib.util.spec_from_file_location(
+        "rxls_release_evidence_corpus_generator",
+        CORPUS_GENERATOR,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -68,6 +85,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.checker = _load()
+        cls.corpus_generator = _load_corpus_generator()
         cls.head_sha = "a" * 40
 
     def _write(self, path: Path, value: object) -> bytes:
@@ -125,9 +143,6 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         artifact = root / "artifact"
         artifact.mkdir()
         baseline = root / "reviewed-baseline.json"
-        reviewed = {"schema": "rxls.render-parity-baseline.v2", "fixture": True}
-        self._write(baseline, reviewed)
-        reviewed_sha = self.checker._canonical_sha256(reviewed)
         wrapper = root / "run-render-oracle-container.py"
         wrapper_payload = b"#!/usr/bin/env python3\n# authenticated test wrapper\n"
         wrapper.write_bytes(wrapper_payload)
@@ -200,12 +215,154 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "schema": "rxls.render-parity-campaign.v1",
             "kind": "project_generated_hosted_full",
             "profile": "full",
+            "generator": "rxls-synthetic-render-corpus",
+            "generator_version": "1.3.0",
             "case_count": 800,
-            "format_counts": {"ods": 200, "xls": 200, "xlsb": 200, "xlsx": 200},
-            "feature_counts": {},
-            "manifest_sha256": "b" * 64,
-            "input_set_sha256": "c" * 64,
+            "format_counts": copy.deepcopy(
+                self.checker.EXPECTED_FORMAT_COUNTS
+            ),
+            "feature_counts": copy.deepcopy(
+                self.checker.EXPECTED_FEATURE_COUNTS
+            ),
+            "manifest_sha256": (
+                self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256
+            ),
+            "input_set_sha256": (
+                self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+            ),
         }
+        def score_distribution(count: int, value: int = 900_000) -> dict[str, int]:
+            return {
+                "count": count,
+                "max": value,
+                "mean": value,
+                "min": value,
+                "p10": value,
+            }
+
+        def delta_distribution(count: int, value: int = 0) -> dict[str, int]:
+            return {
+                "count": count,
+                "max": value,
+                "mean": value,
+                "min": value,
+                "p50": value,
+                "p90": value,
+            }
+
+        baseline_checker = self.checker._load_baseline_checker()
+
+        def cohort(count: int) -> dict[str, object]:
+            return {
+                "comparable_workbooks": count,
+                "deltas": {
+                    metric: delta_distribution(count)
+                    for metric in sorted(
+                        baseline_checker.EXPECTED_DELTA_METRICS
+                    )
+                },
+                "scores": {
+                    metric: score_distribution(count)
+                    for metric in sorted(
+                        baseline_checker.EXPECTED_SCORE_METRICS
+                    )
+                },
+                "workbooks": count,
+            }
+
+        def histogram_cohort(count: int) -> dict[str, object]:
+            return {
+                "deltas": {
+                    metric: [[0, count]]
+                    for metric in sorted(
+                        baseline_checker.EXPECTED_DELTA_METRICS
+                    )
+                },
+                "scores": {
+                    metric: [[900_000, count]]
+                    for metric in sorted(
+                        baseline_checker.EXPECTED_SCORE_METRICS
+                    )
+                },
+            }
+
+        group_counts: dict[tuple[str, tuple[str, ...]], int] = {}
+        for case in self.corpus_generator.profile_specs("full"):
+            key = (case.format, tuple(case.features))
+            group_counts[key] = group_counts.get(key, 0) + 1
+        groups = [
+            {
+                "comparable_workbooks": count,
+                "deltas": histogram_cohort(count)["deltas"],
+                "features": list(features),
+                "format": format_name,
+                "scores": histogram_cohort(count)["scores"],
+                "workbooks": count,
+            }
+            for (format_name, features), count in sorted(
+                group_counts.items()
+            )
+        ]
+        self.assertEqual(len(groups), 96)
+        self.assertEqual(
+            baseline_checker.group_topology_sha256(groups),
+            baseline_checker.HOSTED_FULL_GROUP_TOPOLOGY_SHA256,
+        )
+
+        candidate_template = {
+            "campaign": campaign,
+            "classifications": {"within_threshold": 800},
+            "cohorts": {
+                "all": cohort(800),
+                "by_feature": {
+                    feature: cohort(count)
+                    for feature, count in (
+                        self.checker.EXPECTED_FEATURE_COUNTS.items()
+                    )
+                },
+                "by_format": {
+                    "ods": cohort(200),
+                    "xls": cohort(200),
+                    "xlsb": cohort(200),
+                    "xlsx": cohort(200),
+                },
+            },
+            "comparable_files": 800,
+            "configuration_sha256": "d" * 64,
+            "input_files": 800,
+            "input_set_sha256": (
+                self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+            ),
+            "groups": groups,
+            "histograms": {
+                "all": histogram_cohort(800),
+                "by_feature": {
+                    feature: histogram_cohort(count)
+                    for feature, count in (
+                        self.checker.EXPECTED_FEATURE_COUNTS.items()
+                    )
+                },
+                "by_format": {
+                    name: histogram_cohort(count)
+                    for name, count in (
+                        self.checker.EXPECTED_FORMAT_COUNTS.items()
+                    )
+                },
+            },
+            "schema": "rxls.render-parity-observed-candidate.v1",
+            "statuses": {"compared": 800},
+            "warning_counts": {},
+        }
+        reviewed = baseline_checker.conservative_adoption_baseline(
+            candidate_template,
+            candidate_template,
+            max_score_drift_ppm={
+                metric: 0
+                for metric in baseline_checker.ADOPTION_SCORE_METRICS
+            },
+        )
+        self._write(baseline, reviewed)
+        reviewed_sha = self.checker._canonical_sha256(reviewed)
         warning_policy = {
             "candidate_code_count": 0,
             "candidate_counts_sha256": "d" * 64,
@@ -214,34 +371,21 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "reviewed_codes_sha256": "f" * 64,
             "unclassified_codes": [],
         }
+        report_identities = [
+            {"bytes": 1234, "sha256": "5" * 64},
+            {"bytes": 1234, "sha256": "6" * 64},
+        ]
         candidates = []
         gates = []
         for label in ("a", "b"):
-            candidate = {
-                "schema": "rxls.render-parity-baseline.v2",
-                "input_files": 800,
-                "input_set_sha256": "c" * 64,
-                "warning_counts": {},
-                "campaign": campaign,
-            }
+            index = "ab".index(label)
+            candidate = copy.deepcopy(candidate_template)
             candidate_payload = self._write(
                 artifact / f"baseline-candidate-{label}.json", candidate
             )
             if baseline_mode == "verify":
-                gate = {
-                    "schema": "rxls.render-parity-baseline-check.v1",
-                    "passed": True,
-                    "failures": [],
-                    "baseline_sha256": reviewed_sha,
-                    "candidate_sha256": self.checker._canonical_sha256(candidate),
-                    "warning_policy": warning_policy,
-                    "campaign": {
-                        "case_count": 800,
-                        "kind": "project_generated_hosted_full",
-                        "manifest_sha256": "b" * 64,
-                        "sha256": self.checker._canonical_sha256(campaign),
-                    },
-                }
+                gate = baseline_checker.compare(reviewed, candidate)
+                warning_policy = gate["warning_policy"]
             else:
                 gate = {
                     "schema": "rxls.render-parity-baseline-check.v1",
@@ -249,6 +393,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     "created": True,
                     "passed": True,
                 }
+            gate["source_evidence"] = report_identities[index]
             gate_payload = self._write(
                 artifact / f"baseline-gate-{label}.json", gate
             )
@@ -256,22 +401,146 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             gates.append((gate, gate_payload))
 
         fidelities = []
+        font_pack_sha256 = "f" * 64
+        host_tools_identity = {"platform": {"machine": "x86_64"}}
+        host_tools_identity_sha256 = self.checker._canonical_sha256(
+            host_tools_identity
+        )
+        poppler_sha256 = {
+            "pdffonts": "1" * 64,
+            "pdfinfo": "2" * 64,
+            "pdftoppm": "3" * 64,
+            "pdftotext": "4" * 64,
+        }
+
+        def text_metrics() -> dict[str, int]:
+            return {
+                "ambiguous": 0,
+                "f1_ppm": 999_000,
+                "libreoffice_items": 1000,
+                "libreoffice_unmatched": 1,
+                "matched": 999,
+                "median_error_millipoints": 0,
+                "p95_error_millipoints": 1,
+                "precision_ppm": 999_000,
+                "recall_ppm": 999_000,
+                "rxls_items": 1000,
+                "rxls_unmatched": 1,
+            }
+
+        def hard_feature_metrics(count: int) -> dict[str, object]:
+            return {
+                "edge_f1_ppm": 990_000,
+                "edge_libreoffice_pixels": 1000,
+                "edge_rxls_pixels": 1000,
+                "semantic_codepoint_libreoffice_items": 1000,
+                "semantic_codepoint_precision_ppm": 999_000,
+                "semantic_codepoint_recall_ppm": 999_000,
+                "semantic_codepoint_rxls_items": 1000,
+                "similarity_mean_ppm": 990_000,
+                "text_box": text_metrics(),
+                "text_line_box": text_metrics(),
+                "workbooks": count,
+            }
+
         for label in ("a", "b"):
+            index = "ab".index(label)
             fidelity = {
                 "schema": "rxls.render-fidelity-targets.v1",
                 "passed": True,
                 "failures": [],
-                "coverage": {"report_workbooks": 800},
+                "coverage": {
+                    "broad_workbooks": 800,
+                    "core_text_box_ambiguous": 0,
+                    "core_text_box_candidates": 1000,
+                    "core_text_box_libreoffice_items": 1000,
+                    "core_text_box_libreoffice_unmatched": 1,
+                    "core_text_box_matches": 999,
+                    "core_text_box_unmatched": 1,
+                    "core_text_line_box_ambiguous": 0,
+                    "core_text_line_box_candidates": 1000,
+                    "core_text_line_box_libreoffice_items": 1000,
+                    "core_text_line_box_libreoffice_unmatched": 1,
+                    "core_text_line_box_matches": 999,
+                    "core_text_line_box_unmatched": 1,
+                    "core_workbooks": 118,
+                    "format_workbooks": copy.deepcopy(
+                        self.checker.EXPECTED_FORMAT_COUNTS
+                    ),
+                    "hard_feature_workbooks": copy.deepcopy(
+                        self.checker.EXPECTED_HARD_FEATURE_COUNTS
+                    ),
+                    "libreoffice_pdf_font_objects": 800,
+                    "native_pdf_documents": 800,
+                    "native_pdf_font_objects": 800,
+                    "pages": 800,
+                    "report_workbooks": 800,
+                    "status_counts": {"compared": 800},
+                },
                 "evidence": {
+                    "bytes": report_identities[index]["bytes"],
+                    "feature_map_sha256": "e" * 64,
+                    "font_pack_sha256": font_pack_sha256,
+                    "host_tools_identity_sha256": (
+                        host_tools_identity_sha256
+                    ),
+                    "input_set_sha256": (
+                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                    ),
+                    "manifest_sha256": (
+                        self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256
+                    ),
                     "oracle_build_contract_sha256": contract[
                         "build_contract_sha256"
                     ],
                     "oracle_image_config_digest": config_digest,
                     "oracle_image_manifest_digest": manifest_digest,
+                    "oracle_libreoffice_artifact_sha256": (
+                        self.checker.LIBREOFFICE_ARTIFACT_SHA256
+                    ),
                     "oracle_lock_file_sha256": contract["lock_file_sha256"],
+                    **{
+                        f"{name}_sha256": digest
+                        for name, digest in poppler_sha256.items()
+                    },
+                    "renderer_sha256": "4" * 64,
+                    "sha256": report_identities[index]["sha256"],
                 },
-                "metrics": {"similarity_ppm": 999_000},
-                "thresholds": {"similarity_ppm": 950_000},
+                "metrics": {
+                    "broad_similarity_mean_ppm": 990_000,
+                    "core_edge_f1_ppm": 990_000,
+                    "core_semantic_codepoint_precision_ppm": 999_000,
+                    "core_semantic_codepoint_recall_ppm": 999_000,
+                    "core_similarity_mean_ppm": 990_000,
+                    "hard_feature_cohorts": {
+                        name: hard_feature_metrics(count)
+                        for name, count in (
+                            self.checker.EXPECTED_HARD_FEATURE_COUNTS.items()
+                        )
+                    },
+                    "page_box_max_millipoints": 2,
+                    "page_box_median_millipoints": 0,
+                    "page_box_p95_millipoints": 1,
+                    "pdf_point_geometry_mismatches": 0,
+                    "pdf_xhtml_crosscheck_max_micropoints": 0,
+                    "text_box_f1_ppm": 999_000,
+                    "text_box_match_coverage_ppm": 999_000,
+                    "text_box_median_error_millipoints": 0,
+                    "text_box_p95_error_millipoints": 1,
+                    "text_box_precision_ppm": 999_000,
+                    "text_box_recall_ppm": 999_000,
+                    "text_line_box_f1_ppm": 999_000,
+                    "text_line_box_median_error_millipoints": 0,
+                    "text_line_box_p95_error_millipoints": 1,
+                    "text_line_box_precision_ppm": 999_000,
+                    "text_line_box_recall_ppm": 999_000,
+                },
+                "policy": copy.deepcopy(
+                    self.checker.EXPECTED_FIDELITY_POLICY
+                ),
+                "thresholds": copy.deepcopy(
+                    self.checker.EXPECTED_FIDELITY_THRESHOLDS
+                ),
             }
             payload = self._write(artifact / f"fidelity-{label}.json", fidelity)
             fidelities.append((fidelity, payload))
@@ -279,27 +548,176 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "schema": "rxls.authored-print-parity.v1",
             "passed": True,
             "failures": [],
-            "coverage": {"workbooks": 100, "pages": 400},
+            "coverage": {
+                "by_scale_mode": {"fit": 50, "scale": 50},
+                "edge_libreoffice_pixels": 1000,
+                "edge_rxls_pixels": 1000,
+                "libreoffice_pdf_font_objects": 100,
+                "native_pdf_documents": 100,
+                "native_pdf_font_objects": 100,
+                "page_count_histogram": {"4": 100},
+                "pages": 400,
+                "semantic_codepoint_libreoffice_items": 1000,
+                "semantic_codepoint_rxls_items": 1000,
+                "text_box_candidates": 1000,
+                "text_box_libreoffice_items": 1000,
+                "text_box_matches": 999,
+                "text_line_box_candidates": 1000,
+                "text_line_box_libreoffice_items": 1000,
+                "text_line_box_matches": 999,
+                "workbooks": 100,
+            },
             "evidence": {
+                "feature_map_sha256": "a" * 64,
+                "font_pack_sha256": font_pack_sha256,
+                "host_tools_identity_sha256": host_tools_identity_sha256,
+                "input_set_sha256": "9" * 64,
+                "manifest_sha256": (
+                    self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256
+                ),
                 "oracle_build_contract_sha256": contract[
                     "build_contract_sha256"
                 ],
                 "oracle_image_config_digest": config_digest,
                 "oracle_image_manifest_digest": manifest_digest,
+                "oracle_libreoffice_artifact_sha256": (
+                    self.checker.LIBREOFFICE_ARTIFACT_SHA256
+                ),
                 "oracle_lock_file_sha256": contract["lock_file_sha256"],
+                **{
+                    f"{name}_sha256": digest
+                    for name, digest in poppler_sha256.items()
+                },
+                "renderer_sha256": "4" * 64,
+                "report_bytes": 4321,
                 "report_sha256": "1" * 64,
             },
-            "expected": {"workbooks": 100},
-            "metrics": {"similarity_ppm": 999_000},
-            "thresholds": {"similarity_ppm": 950_000},
+            "expected": {
+                "page_box_pixels": {"height": 1056, "width": 816},
+                "page_box_points": {"height": "792/1", "width": "612/1"},
+                "pages_per_workbook": 4,
+                "workbooks_by_scale_mode": {"fit": 50, "scale": 50},
+            },
+            "metrics": {
+                "edge_f1_ppm": 990_000,
+                "page_box_max_millipoints": 2,
+                "page_box_median_millipoints": 0,
+                "page_box_p95_millipoints": 1,
+                "pdf_point_geometry_mismatches": 0,
+                "pdf_xhtml_crosscheck_max_micropoints": 0,
+                "semantic_codepoint_precision_ppm": 999_000,
+                "semantic_codepoint_recall_ppm": 999_000,
+                "similarity_mean_ppm": 990_000,
+                "text_box_ambiguous": 0,
+                "text_box_f1_ppm": 999_000,
+                "text_box_libreoffice_unmatched": 1,
+                "text_box_match_coverage_ppm": 999_000,
+                "text_box_median_error_millipoints": 0,
+                "text_box_p95_error_millipoints": 1,
+                "text_box_precision_ppm": 999_000,
+                "text_box_recall_ppm": 999_000,
+                "text_box_unmatched": 1,
+                "text_line_box_ambiguous": 0,
+                "text_line_box_f1_ppm": 999_000,
+                "text_line_box_libreoffice_unmatched": 1,
+                "text_line_box_median_error_millipoints": 0,
+                "text_line_box_p95_error_millipoints": 1,
+                "text_line_box_precision_ppm": 999_000,
+                "text_line_box_recall_ppm": 999_000,
+                "text_line_box_unmatched": 1,
+            },
+            "thresholds": copy.deepcopy(
+                self.checker.EXPECTED_AUTHORED_THRESHOLDS
+            ),
         }
         authored_payload = self._write(artifact / "authored-print-gate.json", authored)
+        repeated_deltas = {
+            "absolute_deltas_ppm": [0] * 801,
+            "count": 801,
+            "max_absolute_delta_ppm": 0,
+        }
         repeatability = {
             "schema": "rxls.libreoffice-render-repeatability.v1",
             "status": "pass",
             "failures": [],
-            "coverage": {"workbooks": 800},
-            "thresholds_ppm": {"maximum": 20_000},
+            "coverage": {
+                "pages": 1,
+                "visual_observations_per_metric": 801,
+                "workbooks": 800,
+            },
+            "drift": {
+                "blurred_luma_similarity": repeated_deltas,
+                "mask_f1": {
+                    "edge": repeated_deltas,
+                    "foreground": repeated_deltas,
+                    "max_absolute_delta_ppm": 0,
+                    "text_ink": repeated_deltas,
+                },
+                "similarity": repeated_deltas,
+            },
+            "identity": {
+                "baseline_contract": {
+                    "configuration": {
+                        "baseline_sha256": "d" * 64,
+                        "candidate_sha256": "d" * 64,
+                        "equal": True,
+                    },
+                    "input_set": {
+                        "baseline_count": 800,
+                        "baseline_sha256": (
+                            self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                        ),
+                        "candidate_count": 800,
+                        "candidate_sha256": (
+                            self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                        ),
+                        "equal": True,
+                    },
+                },
+                "configuration": {
+                    "baseline_sha256": "7" * 64,
+                    "candidate_sha256": "7" * 64,
+                    "equal": True,
+                },
+                "input_set": {
+                    "baseline_count": 800,
+                    "baseline_sha256": (
+                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                    ),
+                    "candidate_count": 800,
+                    "candidate_sha256": (
+                        self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                    ),
+                    "equal": True,
+                },
+                "preflight": {
+                    "baseline_sha256": "9" * 64,
+                    "candidate_sha256": "9" * 64,
+                    "equal": True,
+                },
+                "renderer_binary": {
+                    "baseline": {"bytes": 123, "sha256": "4" * 64},
+                    "candidate": {"bytes": 123, "sha256": "4" * 64},
+                    "equal": True,
+                },
+            },
+            "metric_policy": {
+                "distribution": (
+                    "sorted_absolute_paired_integer_ppm_deltas"
+                ),
+                "input_pairing": "sha256",
+                "observations": "workbook_aggregate_and_page",
+                "paths_or_content_retained": False,
+            },
+            "reports": {
+                "baseline": {"bytes": 1234, "sha256": "5" * 64},
+                "candidate": {"bytes": 1234, "sha256": "6" * 64},
+            },
+            "thresholds_ppm": {
+                "blurred_luma_similarity_max_absolute_drift": 20_000,
+                "mask_f1_max_absolute_drift": 20_000,
+                "similarity_max_absolute_drift": 20_000,
+            },
         }
         repeatability_payload = self._write(
             artifact / "repeatability.json", repeatability
@@ -400,9 +818,13 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         }
         self._write(artifact / "build.json", build)
         host_tools = {
+            "schema": "rxls.render-oracle-host-tools-evidence.v1",
             "identity_status": "pinned_match",
-            "captured_identity_sha256": "3" * 64,
-            "expected_identity_sha256": "3" * 64,
+            "scope": "all",
+            "identity": host_tools_identity,
+            "captured_identity_sha256": host_tools_identity_sha256,
+            "expected_identity_sha256": host_tools_identity_sha256,
+            "lock_file_sha256": "b" * 64,
         }
         self._write(artifact / "host-tools.json", host_tools)
         renderer = {"bytes": 123, "sha256": "4" * 64}
@@ -418,6 +840,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             fidelity, fidelity_payload = fidelities[index]
             baseline_candidates.append(
                 {
+                    "bytes": len(candidate_payload),
                     "campaign_sha256": self.checker._canonical_sha256(campaign),
                     "sha256": self.checker._sha256(candidate_payload),
                     "warning_counts": {},
@@ -428,6 +851,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     "baseline_sha256": (
                         reviewed_sha if baseline_mode == "verify" else None
                     ),
+                    "bytes": len(gate_payload),
                     "candidate_sha256": self.checker._canonical_sha256(candidate),
                     "failures": [],
                     "passed": True,
@@ -439,9 +863,21 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             )
             evidence_runs.append(
                 {
+                    "baseline_candidate_bytes": len(candidate_payload),
+                    "baseline_candidate_sha256": self.checker._sha256(
+                        candidate_payload
+                    ),
+                    "baseline_gate_bytes": len(gate_payload),
+                    "baseline_gate_sha256": self.checker._sha256(
+                        gate_payload
+                    ),
+                    "campaign_sha256": self.checker._canonical_sha256(
+                        campaign
+                    ),
+                    "fidelity_gate_bytes": len(fidelity_payload),
                     "fidelity_gate_sha256": self.checker._sha256(fidelity_payload),
-                    "report_bytes": 1234,
-                    "report_sha256": str(index + 5) * 64,
+                    "report_bytes": report_identities[index]["bytes"],
+                    "report_sha256": report_identities[index]["sha256"],
                 }
             )
             fidelity_summaries.append(
@@ -460,7 +896,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         }
         repeatability_summary["sha256"] = self.checker._sha256(repeatability_payload)
         summary = {
-            "schema": "rxls.render-oracle-hosted-campaign.v6",
+            "schema": "rxls.render-oracle-hosted-campaign.v7",
             "head_sha": self.head_sha,
             "baseline_mode": baseline_mode,
             "campaign": {
@@ -470,18 +906,62 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "shard_count": 4,
                 "parallel_shards": 2,
                 "shard_case_counts": [200, 200, 200, 200],
+                "shard_format_counts": [
+                    {"ods": 50, "xls": 50, "xlsb": 50, "xlsx": 50}
+                    for _ in range(4)
+                ],
+                "sha256": self.checker._canonical_sha256(campaign),
             },
-            "summary": {"files": 800, "by_status": {"compared": 800}},
+            "summary": {
+                "by_classification": {"within_threshold": 800},
+                "by_status": {"compared": 800},
+                "files": 800,
+                "input_bytes_considered": 800,
+                "warning_counts": {},
+            },
             "corpus": {
+                "acquired_corpus_included": False,
                 "profile": "full",
                 "case_count": 800,
+                "feature_counts": copy.deepcopy(
+                    self.checker.EXPECTED_FEATURE_COUNTS
+                ),
+                "format_counts": copy.deepcopy(
+                    self.checker.EXPECTED_FORMAT_COUNTS
+                ),
+                "generator": "rxls-synthetic-render-corpus",
+                "generator_version": "1.3.0",
+                "group_topology_sha256": (
+                    self.checker.EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
+                ),
+                "input_set_sha256": (
+                    self.checker.EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+                ),
+                "license": "MIT",
+                "manifest_sha256": (
+                    self.checker.EXPECTED_HOSTED_FULL_MANIFEST_SHA256
+                ),
+                "render_redistributable": True,
                 "rights_tier": "S",
                 "redistribution": "allowed",
+                "schema_version": 1,
+                "scope": "project_generated_hosted_acceptance",
+                "source_redistributable": True,
             },
             "renderer": renderer,
-            "font_pack": {},
+            "font_pack": {
+                "alias_count": 10,
+                "attestation_required": True,
+                "configured": True,
+                "font_count": 26,
+                "fonts_conf_sha256": "7" * 64,
+                "license": "SIL-OFL-1.1",
+                "pack_sha256": font_pack_sha256,
+                "pdf_identities_sha256": "8" * 64,
+                "pdf_identity_count": 34,
+            },
             "host_tools": host_tools,
-            "metrics": {},
+            "metrics": copy.deepcopy(candidates[1][0]["cohorts"]),
             "container": {
                 "build_contract_sha256": build["build_contract_sha256"],
                 "identity_status": "pinned_match",
@@ -490,7 +970,9 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "manifest_digest": build["built_manifest_digest"],
                 "expected_manifest_digest": build["built_manifest_digest"],
                 "lock_file_sha256": build["lock_file_sha256"],
-                "oracle_artifact_sha256": "9" * 64,
+                "oracle_artifact_sha256": (
+                    self.checker.LIBREOFFICE_ARTIFACT_SHA256
+                ),
                 "oracle_version": "26.2.3.2",
                 "source_commit": build["source_commit"],
                 "wrapper_sha256": build["wrapper_sha256"],
@@ -513,6 +995,77 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         }
         self._write(artifact / "hosted-summary.json", summary)
         return artifact, baseline, lock, wrapper
+
+    def _rebind_candidate(self, artifact: Path, label: str) -> None:
+        index = "ab".index(label)
+        candidate_path = artifact / f"baseline-candidate-{label}.json"
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        candidate_payload = self._write(candidate_path, candidate)
+        gate_path = artifact / f"baseline-gate-{label}.json"
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        if "created" in gate:
+            gate["baseline_sha256"] = self.checker._canonical_sha256(candidate)
+        else:
+            gate["candidate_sha256"] = self.checker._canonical_sha256(candidate)
+            gate["campaign"] = {
+                "case_count": candidate["campaign"]["case_count"],
+                "kind": candidate["campaign"]["kind"],
+                "manifest_sha256": candidate["campaign"]["manifest_sha256"],
+                "sha256": self.checker._canonical_sha256(candidate["campaign"]),
+            }
+        gate_payload = self._write(gate_path, gate)
+        summary_path = artifact / "hosted-summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary_candidate = summary["baseline_ratcheting"]["candidate_baselines"][
+            index
+        ]
+        summary_candidate.update(
+            {
+                "bytes": len(candidate_payload),
+                "campaign_sha256": self.checker._canonical_sha256(
+                    candidate["campaign"]
+                ),
+                "sha256": self.checker._sha256(candidate_payload),
+                "warning_counts": candidate["warning_counts"],
+            }
+        )
+        summary_gate = summary["baseline_ratcheting"]["gates"][index]
+        summary_gate.update(
+            {
+                "bytes": len(gate_payload),
+                "candidate_sha256": self.checker._canonical_sha256(candidate),
+                "sha256": self.checker._sha256(gate_payload),
+            }
+        )
+        summary["evidence_runs"][index].update(
+            {
+                "baseline_candidate_bytes": len(candidate_payload),
+                "baseline_candidate_sha256": self.checker._sha256(
+                    candidate_payload
+                ),
+                "baseline_gate_bytes": len(gate_payload),
+                "baseline_gate_sha256": self.checker._sha256(gate_payload),
+                "campaign_sha256": self.checker._canonical_sha256(
+                    candidate["campaign"]
+                ),
+            }
+        )
+        if index == 1:
+            summary["metrics"] = candidate["cohorts"]
+            summary["summary"]["by_classification"] = candidate[
+                "classifications"
+            ]
+            summary["summary"]["by_status"] = candidate["statuses"]
+            summary["summary"]["warning_counts"] = candidate["warning_counts"]
+        self._write(summary_path, summary)
+
+    def _rebind_repeatability(self, artifact: Path) -> None:
+        repeatability_path = artifact / "repeatability.json"
+        payload = repeatability_path.read_bytes()
+        summary_path = artifact / "hosted-summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["repeatability"]["sha256"] = hashlib.sha256(payload).hexdigest()
+        self._write(summary_path, summary)
 
     def test_accepts_exact_full_ratchet_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -565,6 +1118,170 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         self.assertEqual(report["baseline_mode"], "candidate")
         self.assertEqual(report["campaign"], "full")
         self.assertIsNone(report["reviewed_baseline_sha256"])
+
+    def test_live_authenticates_successful_exact_sha_candidate_artifact(
+        self,
+    ) -> None:
+        run_id = 101
+        attempt = 2
+        artifact_id = 303
+        artifact_name = (
+            f"render-oracle-{self.head_sha}-{run_id}-{attempt}-full-candidate"
+        )
+        digest = "sha256:" + "d" * 64
+        run_url = (
+            "https://api.github.com/repos/HyunjoJung/rxls/"
+            f"actions/runs/{run_id}"
+        )
+        artifacts_url = run_url + "/artifacts?per_page=100"
+        run = {
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "head_sha": self.head_sha,
+            "id": run_id,
+            "path": ".github/workflows/fuzz.yml",
+            "repository": {
+                "full_name": "HyunjoJung/rxls",
+                "id": 1_297_467_060,
+            },
+            "run_attempt": attempt,
+            "status": "completed",
+        }
+        artifact = {
+            "digest": digest,
+            "expired": False,
+            "id": artifact_id,
+            "name": artifact_name,
+            "size_in_bytes": 4096,
+            "workflow_run": {"head_sha": self.head_sha, "id": run_id},
+        }
+        run_payload = json.dumps(run).encode()
+        artifacts_payload = json.dumps(
+            {"artifacts": [artifact], "total_count": 1}
+        ).encode()
+        authenticated = self.checker.authenticate_candidate_run_artifact(
+            repository="HyunjoJung/rxls",
+            head_sha=self.head_sha,
+            workflow_run_id=run_id,
+            workflow_run_attempt=attempt,
+            artifact_id=artifact_id,
+            artifact_name=artifact_name,
+            artifact_size_bytes=4096,
+            artifact_digest=digest,
+            token="github-test-token",
+            run_opener=_FakeOpener(
+                _FakeResponse(
+                    run_payload,
+                    status=200,
+                    headers={"Content-Length": str(len(run_payload))},
+                    url=run_url,
+                )
+            ),
+            artifacts_opener=_FakeOpener(
+                _FakeResponse(
+                    artifacts_payload,
+                    status=200,
+                    headers={
+                        "Content-Length": str(len(artifacts_payload))
+                    },
+                    url=artifacts_url,
+                )
+            ),
+        )
+        self.assertEqual(authenticated["head_sha"], self.head_sha)
+        self.assertEqual(authenticated["artifact_digest"], digest)
+
+    def test_live_authentication_rejects_run_and_artifact_tampering(self) -> None:
+        run_id = 101
+        attempt = 2
+        artifact_id = 303
+        artifact_name = (
+            f"render-oracle-{self.head_sha}-{run_id}-{attempt}-full-candidate"
+        )
+        digest = "sha256:" + "d" * 64
+        run_url = (
+            "https://api.github.com/repos/HyunjoJung/rxls/"
+            f"actions/runs/{run_id}"
+        )
+        artifacts_url = run_url + "/artifacts?per_page=100"
+        base_run = {
+            "conclusion": "success",
+            "event": "workflow_dispatch",
+            "head_sha": self.head_sha,
+            "id": run_id,
+            "path": ".github/workflows/render-oracle.yml",
+            "repository": {
+                "full_name": "HyunjoJung/rxls",
+                "id": 1_297_467_060,
+            },
+            "run_attempt": attempt,
+            "status": "completed",
+        }
+        base_artifact = {
+            "digest": digest,
+            "expired": False,
+            "id": artifact_id,
+            "name": artifact_name,
+            "size_in_bytes": 4096,
+            "workflow_run": {"head_sha": self.head_sha, "id": run_id},
+        }
+        cases = (
+            ("head_sha", "b" * 40, None, None),
+            ("conclusion", "failure", None, None),
+            ("event", "pull_request", None, None),
+            ("path", ".github/workflows/ci.yml", None, None),
+            (None, None, "expired", True),
+            (None, None, "digest", "sha256:" + "e" * 64),
+            (None, None, "id", artifact_id + 1),
+        )
+        for run_key, run_value, artifact_key, artifact_value in cases:
+            run = copy.deepcopy(base_run)
+            artifact = copy.deepcopy(base_artifact)
+            if run_key is not None:
+                run[run_key] = run_value
+            if artifact_key is not None:
+                artifact[artifact_key] = artifact_value
+            run_payload = json.dumps(run).encode()
+            artifacts_payload = json.dumps(
+                {"artifacts": [artifact], "total_count": 1}
+            ).encode()
+            with self.subTest(
+                run_key=run_key,
+                artifact_key=artifact_key,
+            ), self.assertRaises(self.checker.EvidenceError):
+                self.checker.authenticate_candidate_run_artifact(
+                    repository="HyunjoJung/rxls",
+                    head_sha=self.head_sha,
+                    workflow_run_id=run_id,
+                    workflow_run_attempt=attempt,
+                    artifact_id=artifact_id,
+                    artifact_name=artifact_name,
+                    artifact_size_bytes=4096,
+                    artifact_digest=digest,
+                    token="github-test-token",
+                    run_opener=_FakeOpener(
+                        _FakeResponse(
+                            run_payload,
+                            status=200,
+                            headers={
+                                "Content-Length": str(len(run_payload))
+                            },
+                            url=run_url,
+                        )
+                    ),
+                    artifacts_opener=_FakeOpener(
+                        _FakeResponse(
+                            artifacts_payload,
+                            status=200,
+                            headers={
+                                "Content-Length": str(
+                                    len(artifacts_payload)
+                                )
+                            },
+                            url=artifacts_url,
+                        )
+                    ),
+                )
 
     def test_candidate_and_verify_modes_fail_closed_on_cross_mode_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -929,6 +1646,9 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
     def test_path_neutral_rejects_key_variants_traversal_and_artifact_names(
         self,
     ) -> None:
+        mac_home_key = "/" + "/".join(
+            ("Users", "alice", "Secret", "client.xlsx")
+        )
         rejected = (
             {"source_path": "redacted"},
             {"host-path": "redacted"},
@@ -944,6 +1664,8 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "secret.pdf",
             "secret.png",
             "secret.svg",
+            {mac_home_key: 2},
+            {"token_ghp_SUPERSECRET": 2},
         )
         for value in rejected:
             with self.subTest(value=value), self.assertRaises(
@@ -953,11 +1675,1194 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
 
         self.checker._path_neutral(
             {
-                "schema": "rxls.render-oracle-hosted-campaign.v6",
+                "schema": "rxls.render-oracle-hosted-campaign.v7",
                 "sha256": "a" * 64,
                 "media_type": "application/pdf",
+                "paths_or_content_retained": False,
             }
         )
+        for key in (
+            "Paths_or_content_retained",
+            "path_s_or_content_retained",
+            "paths-or-content-retained",
+            "paths_or_content_retained_",
+            "not_paths_or_content_retained",
+            "source_paths_retained",
+        ):
+            with self.subTest(key=key), self.assertRaises(
+                self.checker.EvidenceError
+            ):
+                self.checker._path_neutral({key: False})
+        with self.assertRaisesRegex(
+            self.checker.EvidenceError,
+            "path_retention_attestation",
+        ):
+            self.checker._path_neutral(
+                {"paths_or_content_retained": True}
+            )
+
+    def test_strict_json_ingestion_rejects_hostile_numbers_depth_and_duplicates(
+        self,
+    ) -> None:
+        malformed_payloads = (
+            (b'{"value":1,"value":2}', "duplicate_json_key"),
+            (b'{"value":NaN}', "evidence_invalid_json"),
+            (b'{"value":1.5}', "evidence_invalid_json"),
+            (b'{"value":1e10000}', "evidence_invalid_json"),
+            (
+                b'{"value":' + (b"6" * 5_000) + b"}",
+                "evidence_invalid_json",
+            ),
+            (
+                b"[" * (self.checker.MAX_JSON_DEPTH + 1)
+                + b"]" * (self.checker.MAX_JSON_DEPTH + 1),
+                "evidence_invalid_json",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (payload, error_code) in enumerate(malformed_payloads):
+                path = root / f"evidence-{index}.json"
+                path.write_bytes(payload)
+                with self.subTest(
+                    error_code=error_code,
+                ), self.assertRaisesRegex(
+                    self.checker.EvidenceError,
+                    f"^{error_code}$",
+                ) as raised:
+                    self.checker._read_json(path)
+                self.assertNotIn(str(path), str(raised.exception))
+
+    def test_json_preflight_rejects_complexity_and_depth_before_decode(
+        self,
+    ) -> None:
+        preflight_payloads = (
+            b"[" * (self.checker.MAX_JSON_DEPTH + 1)
+            + b"]" * (self.checker.MAX_JSON_DEPTH + 1),
+            b'{"value":1.25}',
+            b'{"value":1e10000}',
+            b'{"value":' + (b"5" * 5_000) + b"}",
+        )
+        for payload in preflight_payloads:
+            with self.subTest(payload_size=len(payload)), mock.patch.object(
+                self.checker.json,
+                "loads",
+                side_effect=AssertionError("decoder must not run"),
+            ), self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "^evidence_invalid_json$",
+            ):
+                self.checker._strict_json_loads(
+                    payload,
+                    "evidence_invalid_json",
+                )
+
+        with mock.patch.object(
+            self.checker,
+            "MAX_JSON_NODES",
+            3,
+        ), mock.patch.object(
+            self.checker.json,
+            "loads",
+            side_effect=AssertionError("decoder must not run"),
+        ), self.assertRaisesRegex(
+            self.checker.EvidenceError,
+            "^evidence_invalid_json$",
+        ):
+            self.checker._strict_json_loads(
+                b"[0,0,0,0]",
+                "evidence_invalid_json",
+            )
+
+    def test_path_neutral_traversal_is_iterative_for_deep_values(self) -> None:
+        value: object = "safe"
+        for _ in range(5_000):
+            value = [value]
+        self.checker._path_neutral(value)
+
+        rejected: object = "/private/workbook"
+        for _ in range(5_000):
+            rejected = [rejected]
+        with self.assertRaisesRegex(
+            self.checker.EvidenceError,
+            "^absolute_path$",
+        ):
+            self.checker._path_neutral(rejected)
+
+    def test_cli_reports_json_failures_as_one_path_neutral_line(self) -> None:
+        head_sha = "a" * 40
+        arguments = [
+            str(CHECKER),
+            "--download-repository",
+            "HyunjoJung/rxls",
+            "--github-artifact-id",
+            "3",
+            "--artifact-name",
+            f"render-oracle-{head_sha}-1-1-full-candidate",
+            "--artifact-size-bytes",
+            "1",
+            "--baseline-mode",
+            "candidate",
+            "--campaign",
+            "full",
+            "--head-sha",
+            head_sha,
+            "--workflow-run-id",
+            "1",
+            "--workflow-run-attempt",
+            "1",
+            "--artifact-digest",
+            "sha256:" + ("b" * 64),
+        ]
+        malformed_payloads = (
+            b'{"value":1e10000}',
+            b'{"value":' + (b"4" * 5_000) + b"}",
+            b"[" * (self.checker.MAX_JSON_DEPTH + 1)
+            + b"]" * (self.checker.MAX_JSON_DEPTH + 1),
+        )
+        for payload in malformed_payloads:
+            stderr = io.StringIO()
+
+            def reject_evidence(*_args, **_kwargs):
+                return self.checker._strict_json_loads(
+                    payload,
+                    "evidence_invalid_json",
+                )
+
+            with self.subTest(payload_size=len(payload)), mock.patch.object(
+                sys,
+                "argv",
+                arguments,
+            ), mock.patch.object(
+                self.checker,
+                "download_artifact_archive",
+            ), mock.patch.object(
+                self.checker,
+                "extract_authenticated_artifact",
+            ), mock.patch.object(
+                self.checker,
+                "validate",
+                side_effect=reject_evidence,
+            ), mock.patch.object(
+                sys,
+                "stderr",
+                stderr,
+            ):
+                self.assertEqual(self.checker.main(), 1)
+            self.assertEqual(
+                stderr.getvalue().splitlines(),
+                ["render release prerequisites: evidence_invalid_json"],
+            )
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_repeatability_evidence_is_strict_and_cross_bound(self) -> None:
+        direct_mutations = (
+            (
+                "threshold",
+                lambda document: document["thresholds_ppm"].update(
+                    {"similarity_max_absolute_drift": 20_001}
+                ),
+                "repeatability_thresholds",
+            ),
+            (
+                "unsorted",
+                lambda document: document["drift"]["similarity"].update(
+                    {
+                        "absolute_deltas_ppm": [1, 0] + [0] * 799,
+                        "max_absolute_delta_ppm": 1,
+                    }
+                ),
+                "repeatability_distribution",
+            ),
+            (
+                "oversized",
+                lambda document: document["drift"]["similarity"].update(
+                    {
+                        "absolute_deltas_ppm": [0] * 800 + [20_001],
+                        "max_absolute_delta_ppm": 20_001,
+                    }
+                ),
+                "repeatability_distribution",
+            ),
+            (
+                "identity",
+                lambda document: document["identity"]["input_set"].update(
+                    {"equal": False}
+                ),
+                "repeatability_identity",
+            ),
+            (
+                "coverage",
+                lambda document: document["coverage"].update({"pages": 2}),
+                "repeatability_coverage",
+            ),
+        )
+        for name, mutate, error in direct_mutations:
+            with self.subTest(
+                name=name
+            ), tempfile.TemporaryDirectory() as temporary:
+                artifact, _, _, _ = self._fixture(Path(temporary))
+                repeatability = json.loads(
+                    (artifact / "repeatability.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                mutate(repeatability)
+                with self.assertRaisesRegex(
+                    self.checker.EvidenceError,
+                    error,
+                ):
+                    self.checker._validate_repeatability(repeatability)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, baseline, lock, wrapper = self._fixture(Path(temporary))
+            repeatability_path = artifact / "repeatability.json"
+            repeatability = json.loads(
+                repeatability_path.read_text(encoding="utf-8")
+            )
+            repeatability["reports"]["baseline"]["sha256"] = "f" * 64
+            self._write(repeatability_path, repeatability)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "repeatability_source_report_binding",
+            ):
+                self.checker.validate(
+                    artifact,
+                    self.head_sha,
+                    baseline,
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+    def test_repeatability_baseline_contract_and_observed_drift_are_bound(
+        self,
+    ) -> None:
+        observed = {
+            "blurred_luma_similarity_ppm": 101,
+            "edge_f1_ppm": 303,
+            "foreground_f1_ppm": 404,
+            "similarity_ppm": 202,
+            "text_ink_f1_ppm": 505,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            repeatability_path = artifact / "repeatability.json"
+            repeatability = json.loads(
+                repeatability_path.read_text(encoding="utf-8")
+            )
+
+            def set_observed(distribution: dict[str, object], value: int) -> None:
+                distribution["absolute_deltas_ppm"] = [0] * 800 + [value]
+                distribution["max_absolute_delta_ppm"] = value
+
+            set_observed(
+                repeatability["drift"]["blurred_luma_similarity"],
+                observed["blurred_luma_similarity_ppm"],
+            )
+            set_observed(
+                repeatability["drift"]["similarity"],
+                observed["similarity_ppm"],
+            )
+            masks = repeatability["drift"]["mask_f1"]
+            set_observed(masks["edge"], observed["edge_f1_ppm"])
+            set_observed(
+                masks["foreground"],
+                observed["foreground_f1_ppm"],
+            )
+            set_observed(masks["text_ink"], observed["text_ink_f1_ppm"])
+            masks["max_absolute_delta_ppm"] = max(
+                observed["edge_f1_ppm"],
+                observed["foreground_f1_ppm"],
+                observed["text_ink_f1_ppm"],
+            )
+            self._write(repeatability_path, repeatability)
+            self._rebind_repeatability(artifact)
+
+            self.checker._validate_repeatability(repeatability)
+            self.assertEqual(
+                self.checker._repeatability_score_drift_limits(
+                    repeatability
+                ),
+                observed,
+            )
+            candidates = [
+                json.loads(
+                    (artifact / f"baseline-candidate-{label}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for label in ("a", "b")
+            ]
+            renderer = json.loads(
+                (artifact / "renderer.json").read_text(encoding="utf-8")
+            )
+            fidelity_results = [
+                self.checker._validate_fidelity_gate(
+                    json.loads(
+                        (
+                            artifact / f"fidelity-{label}.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                )
+                for label in ("a", "b")
+            ]
+            self.checker._validate_repeatability_bindings(
+                repeatability,
+                candidates,
+                renderer,
+                fidelity_results,
+            )
+
+            changed_configuration = copy.deepcopy(repeatability)
+            changed_configuration["identity"]["baseline_contract"][
+                "configuration"
+            ].update(
+                {
+                    "baseline_sha256": "e" * 64,
+                    "candidate_sha256": "e" * 64,
+                }
+            )
+            self.checker._validate_repeatability(changed_configuration)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "repeatability_configuration_binding",
+            ):
+                self.checker._validate_repeatability_bindings(
+                    changed_configuration,
+                    candidates,
+                    renderer,
+                    fidelity_results,
+                )
+
+            changed_input = copy.deepcopy(repeatability)
+            changed_input["identity"]["baseline_contract"]["input_set"].update(
+                {
+                    "baseline_sha256": "e" * 64,
+                    "candidate_sha256": "e" * 64,
+                }
+            )
+            self.checker._validate_repeatability(changed_input)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "repeatability_input_binding",
+            ):
+                self.checker._validate_repeatability_bindings(
+                    changed_input,
+                    candidates,
+                    renderer,
+                    fidelity_results,
+                )
+
+            baseline_checker = self.checker._load_baseline_checker()
+            adoption = baseline_checker.conservative_adoption_baseline
+            with mock.patch.object(
+                baseline_checker,
+                "conservative_adoption_baseline",
+                wraps=adoption,
+            ) as adopt:
+                _, receipt = (
+                    self.checker.build_adoption_baseline_and_receipt(
+                        artifact,
+                        head_sha=self.head_sha,
+                        workflow_run_id=101,
+                        workflow_run_attempt=2,
+                        artifact_id=303,
+                        artifact_name=(
+                            f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                        ),
+                        artifact_size_bytes=4096,
+                        artifact_digest="sha256:" + "a" * 64,
+                        artifact_repository="HyunjoJung/rxls",
+                        oracle_lock=lock,
+                        oracle_wrapper=wrapper,
+                    )
+                )
+            self.assertEqual(
+                adopt.call_args.kwargs["max_score_drift_ppm"],
+                observed,
+            )
+            self.assertEqual(
+                receipt["policy"]["observed_score_drift_maximum_ppm"],
+                observed,
+            )
+
+    def test_candidate_corpus_bindings_are_authoritative_and_nonzero(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            candidate_path = artifact / "baseline-candidate-a.json"
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            candidate["campaign"]["manifest_sha256"] = "0" * 64
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "candidate_invalid:baseline_campaign_hosted_full_identity",
+            ):
+                self.checker._validate_candidate(candidate)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, _, _ = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            candidate = json.loads(
+                (artifact / "baseline-candidate-a.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            candidate["cohorts"]["all"]["workbooks"] = 1
+            candidate["cohorts"]["all"]["comparable_workbooks"] = 1
+            for metric_kind in ("scores", "deltas"):
+                for distribution in candidate["cohorts"]["all"][
+                    metric_kind
+                ].values():
+                    distribution["count"] = 1
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "candidate_invalid:campaign_all_cohort",
+            ):
+                self.checker._validate_candidate(candidate)
+
+        mutations = (
+            "summary_manifest",
+            "summary_feature_counts",
+            "fidelity_manifest",
+            "fidelity_input",
+            "fidelity_feature_map",
+        )
+        for mutation in mutations:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as temporary:
+                artifact, _, lock, wrapper = self._fixture(
+                    Path(temporary),
+                    baseline_mode="candidate",
+                )
+                if mutation.startswith("summary_"):
+                    path = artifact / "hosted-summary.json"
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                    if mutation == "summary_manifest":
+                        document["corpus"]["manifest_sha256"] = "f" * 64
+                    else:
+                        document["corpus"]["feature_counts"] = {
+                            "unicode-text": 799
+                        }
+                    self._write(path, document)
+                else:
+                    path = artifact / "fidelity-a.json"
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                    key = mutation.removeprefix("fidelity_") + "_sha256"
+                    document["evidence"][key] = "f" * 64
+                    self._write(path, document)
+
+                with self.assertRaises(self.checker.EvidenceError):
+                    self.checker.validate(
+                        artifact,
+                        self.head_sha,
+                        None,
+                        baseline_mode="candidate",
+                        oracle_lock=lock,
+                        oracle_wrapper=wrapper,
+                    )
+
+    def test_builds_order_neutral_path_neutral_adoption_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            candidate_b_path = artifact / "baseline-candidate-b.json"
+            candidate_b = json.loads(
+                candidate_b_path.read_text(encoding="utf-8")
+            )
+            baseline_checker = self.checker._load_baseline_checker()
+            for group in candidate_b["groups"]:
+                group["scores"]["similarity_ppm"] = [
+                    [899_600, group["workbooks"]]
+                ]
+            (
+                candidate_b["cohorts"],
+                candidate_b["histograms"],
+            ) = baseline_checker._certificate_views_from_groups(
+                candidate_b["groups"]
+            )
+            self._write(candidate_b_path, candidate_b)
+            self._rebind_candidate(artifact, "b")
+            repeatability_path = artifact / "repeatability.json"
+            repeatability = json.loads(
+                repeatability_path.read_text(encoding="utf-8")
+            )
+            similarity_drift = repeatability["drift"]["similarity"]
+            similarity_drift["absolute_deltas_ppm"] = [400] * 801
+            similarity_drift["max_absolute_delta_ppm"] = 400
+            self._write(repeatability_path, repeatability)
+            self._rebind_repeatability(artifact)
+            self.checker.validate(
+                artifact,
+                self.head_sha,
+                None,
+                baseline_mode="candidate",
+                oracle_lock=lock,
+                oracle_wrapper=wrapper,
+            )
+            adopted_payload, receipt = (
+                self.checker.build_adoption_baseline_and_receipt(
+                    artifact,
+                    head_sha=self.head_sha,
+                    workflow_run_id=101,
+                    workflow_run_attempt=2,
+                    artifact_id=303,
+                    artifact_name=(
+                        f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                    ),
+                    artifact_size_bytes=4096,
+                    artifact_digest="sha256:" + "a" * 64,
+                    artifact_repository="HyunjoJung/rxls",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+            )
+
+        adopted = json.loads(adopted_payload)
+        self.assertEqual(
+            adopted["cohorts"]["all"]["scores"]["similarity_ppm"]["p10"],
+            899_600,
+        )
+        self.assertEqual(
+            receipt["adopted_baseline_sha256"],
+            hashlib.sha256(adopted_payload).hexdigest(),
+        )
+        self.assertEqual(receipt["previous_baseline_sha256"], None)
+        self.assertEqual(receipt["head_sha"], self.head_sha)
+        self.assertEqual(receipt["workflow"], {"run_attempt": 2, "run_id": 101})
+        self.assertEqual(len(receipt["candidate_sha256"]), 2)
+        self.assertEqual(
+            receipt["candidate_sha256"],
+            sorted(receipt["candidate_sha256"]),
+        )
+        self.assertEqual(
+            receipt["policy"]["id"],
+            "rxls.repeatability-bounded-ratchet-envelope.v1",
+        )
+        self.assertEqual(
+            receipt["policy"]["observed_score_drift_maximum_ppm"][
+                "similarity_ppm"
+            ],
+            400,
+        )
+        self.checker._path_neutral(receipt)
+
+    def test_adoption_rejects_unbounded_candidate_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            candidate_b_path = artifact / "baseline-candidate-b.json"
+            candidate_b = json.loads(
+                candidate_b_path.read_text(encoding="utf-8")
+            )
+            baseline_checker = self.checker._load_baseline_checker()
+            metric = "max_page_width_delta_pixels"
+            for group in candidate_b["groups"]:
+                group["deltas"][metric] = [[1, group["workbooks"]]]
+            (
+                candidate_b["cohorts"],
+                candidate_b["histograms"],
+            ) = baseline_checker._certificate_views_from_groups(
+                candidate_b["groups"]
+            )
+            self._write(candidate_b_path, candidate_b)
+            self._rebind_candidate(artifact, "b")
+            self.checker.validate(
+                artifact,
+                self.head_sha,
+                None,
+                baseline_mode="candidate",
+                oracle_lock=lock,
+                oracle_wrapper=wrapper,
+            )
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_unbounded_group_drift",
+            ):
+                self.checker.build_adoption_baseline_and_receipt(
+                    artifact,
+                    head_sha=self.head_sha,
+                    workflow_run_id=101,
+                    workflow_run_attempt=2,
+                    artifact_id=303,
+                    artifact_name=(
+                        f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                    ),
+                    artifact_size_bytes=4096,
+                    artifact_digest="sha256:" + "a" * 64,
+                    artifact_repository="HyunjoJung/rxls",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+    def test_adoption_rejects_score_drift_above_observed_maximum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            candidate_b_path = artifact / "baseline-candidate-b.json"
+            candidate_b = json.loads(
+                candidate_b_path.read_text(encoding="utf-8")
+            )
+            baseline_checker = self.checker._load_baseline_checker()
+            metric = "similarity_ppm"
+            for group in candidate_b["groups"]:
+                group["scores"][metric] = [
+                    [899_999, group["workbooks"]]
+                ]
+            (
+                candidate_b["cohorts"],
+                candidate_b["histograms"],
+            ) = baseline_checker._certificate_views_from_groups(
+                candidate_b["groups"]
+            )
+            self._write(candidate_b_path, candidate_b)
+            self._rebind_candidate(artifact, "b")
+
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_group_drift_threshold",
+            ):
+                self.checker.build_adoption_baseline_and_receipt(
+                    artifact,
+                    head_sha=self.head_sha,
+                    workflow_run_id=101,
+                    workflow_run_attempt=2,
+                    artifact_id=303,
+                    artifact_name=(
+                        f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                    ),
+                    artifact_size_bytes=4096,
+                    artifact_digest="sha256:" + "a" * 64,
+                    artifact_repository="HyunjoJung/rxls",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+    def test_exact_clean_checkout_and_atomic_no_clobber_are_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            seed = root / "seed.txt"
+            seed.write_text("seed\n", encoding="utf-8")
+            for command in (
+                ["git", "init", "--quiet"],
+                ["git", "config", "user.name", "test"],
+                ["git", "config", "user.email", "test@example.invalid"],
+                ["git", "add", "seed.txt"],
+                ["git", "commit", "--quiet", "-m", "seed"],
+            ):
+                subprocess.run(command, cwd=root, check=True)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            destination = scripts / "render-parity-baseline-full.json"
+            self.assertEqual(
+                self.checker.validate_adoption_checkout(
+                    destination,
+                    head_sha,
+                    repository_root=root,
+                ).resolve(strict=False),
+                destination.resolve(strict=False),
+            )
+
+            dirty = root / "dirty.txt"
+            dirty.write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_checkout_dirty",
+            ):
+                self.checker.validate_adoption_checkout(
+                    destination,
+                    head_sha,
+                    repository_root=root,
+                )
+            dirty.unlink()
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_checkout_head",
+            ):
+                self.checker.validate_adoption_checkout(
+                    destination,
+                    "f" * 40,
+                    repository_root=root,
+                )
+
+            payload = b'{\n  "schema": "test"\n}\n'
+            self.checker.write_new_atomic(destination, payload)
+            self.assertEqual(destination.read_bytes(), payload)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_destination_exists",
+            ):
+                self.checker.write_new_atomic(destination, b"replacement")
+            self.assertEqual(destination.read_bytes(), payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            seed = root / "seed.txt"
+            seed.write_text("seed\n", encoding="utf-8")
+            destination = scripts / "render-parity-baseline-full.json"
+            destination.symlink_to(seed)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_destination_exists",
+            ):
+                self.checker.validate_adoption_checkout(
+                    destination,
+                    "a" * 40,
+                    repository_root=root,
+                )
+
+    def test_adoption_pair_is_no_clobber_and_rolls_back_partial_install(
+        self,
+    ) -> None:
+        baseline_payload = b'{\n  "schema": "baseline"\n}\n'
+        receipt_payload = b'{\n  "schema": "receipt"\n}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.json"
+            receipt = root / "receipt.json"
+
+            self.checker.write_adoption_pair_atomic(
+                baseline,
+                baseline_payload,
+                receipt,
+                receipt_payload,
+            )
+            self.assertEqual(baseline.read_bytes(), baseline_payload)
+            self.assertEqual(receipt.read_bytes(), receipt_payload)
+
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_destination_exists",
+            ):
+                self.checker.write_adoption_pair_atomic(
+                    baseline,
+                    b"replacement baseline",
+                    receipt,
+                    b"replacement receipt",
+                )
+            self.assertEqual(baseline.read_bytes(), baseline_payload)
+            self.assertEqual(receipt.read_bytes(), receipt_payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.json"
+            receipt = root / "receipt.json"
+            real_write = self.checker.write_new_atomic
+            writes = 0
+
+            def fail_second_write(path: Path, payload: bytes) -> None:
+                nonlocal writes
+                writes += 1
+                if writes == 2:
+                    raise self.checker.EvidenceError("injected")
+                real_write(path, payload)
+
+            with mock.patch.object(
+                self.checker,
+                "write_new_atomic",
+                side_effect=fail_second_write,
+            ), self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "injected",
+            ):
+                self.checker.write_adoption_pair_atomic(
+                    baseline,
+                    baseline_payload,
+                    receipt,
+                    receipt_payload,
+                )
+            self.assertFalse(baseline.exists())
+            self.assertFalse(receipt.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.json"
+            receipt = root / "receipt.json"
+            existing = b"existing baseline"
+            baseline.write_bytes(existing)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_destination_exists",
+            ):
+                self.checker.write_adoption_pair_atomic(
+                    baseline,
+                    baseline_payload,
+                    receipt,
+                    receipt_payload,
+                )
+            self.assertEqual(baseline.read_bytes(), existing)
+            self.assertFalse(receipt.exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.json"
+            receipt = root / "receipt.json"
+            with mock.patch.object(
+                self.checker,
+                "_fsync_directory",
+                side_effect=[
+                    None,
+                    OSError("injected fsync failure"),
+                    None,
+                    None,
+                ],
+            ) as fsync_directory, self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "adoption_write",
+            ):
+                self.checker.write_adoption_pair_atomic(
+                    baseline,
+                    baseline_payload,
+                    receipt,
+                    receipt_payload,
+                )
+            self.assertEqual(fsync_directory.call_count, 4)
+            self.assertFalse(baseline.exists())
+            self.assertFalse(receipt.exists())
+
+    def test_verify_gate_is_recomputed_even_when_receipts_are_rebound(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, baseline, lock, wrapper = self._fixture(Path(temporary))
+            gate_path = artifact / "baseline-gate-a.json"
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            gate["campaign"]["sha256"] = "f" * 64
+            gate_payload = self._write(gate_path, gate)
+
+            summary_path = artifact / "hosted-summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["baseline_ratcheting"]["gates"][0].update(
+                {
+                    "bytes": len(gate_payload),
+                    "sha256": hashlib.sha256(gate_payload).hexdigest(),
+                }
+            )
+            summary["evidence_runs"][0].update(
+                {
+                    "baseline_gate_bytes": len(gate_payload),
+                    "baseline_gate_sha256": hashlib.sha256(
+                        gate_payload
+                    ).hexdigest(),
+                }
+            )
+            self._write(summary_path, summary)
+
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "baseline_gate_recomputed",
+            ):
+                self.checker.validate(
+                    artifact,
+                    self.head_sha,
+                    baseline,
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+    def test_deep_gate_and_summary_contracts_reject_adversarial_mutations(
+        self,
+    ) -> None:
+        mutations = {
+            "fidelity_policy": (
+                "fidelity-a.json",
+                lambda value: value["policy"].update(
+                    {"minimum_core_workbooks": 11}
+                ),
+                "fidelity_policy",
+            ),
+            "fidelity_threshold": (
+                "fidelity-a.json",
+                lambda value: value["thresholds"].update(
+                    {"core_similarity_min_ppm": 979_999}
+                ),
+                "fidelity_thresholds",
+            ),
+            "fidelity_metric": (
+                "fidelity-a.json",
+                lambda value: value["metrics"].update(
+                    {"core_similarity_mean_ppm": 979_999}
+                ),
+                "fidelity_metric_threshold",
+            ),
+            "fidelity_text_ratio": (
+                "fidelity-a.json",
+                lambda value: value["metrics"].update(
+                    {"text_box_precision_ppm": 1_000_000}
+                ),
+                "fidelity_text_threshold",
+            ),
+            "fidelity_source_bytes": (
+                "fidelity-a.json",
+                lambda value: value["evidence"].update({"bytes": 1235}),
+                "baseline_gate_recomputed",
+            ),
+            "authored_threshold": (
+                "authored-print-gate.json",
+                lambda value: value["thresholds"].update(
+                    {"similarity_mean_min_ppm": 949_999}
+                ),
+                "authored_thresholds",
+            ),
+            "authored_geometry_order": (
+                "authored-print-gate.json",
+                lambda value: value["metrics"].update(
+                    {
+                        "page_box_median_millipoints": 2,
+                        "page_box_p95_millipoints": 1,
+                    }
+                ),
+                "authored_geometry",
+            ),
+            "authored_report_bytes": (
+                "authored-print-gate.json",
+                lambda value: value["evidence"].update({"report_bytes": 0}),
+                "authored_source_report_bytes",
+            ),
+            "evidence_candidate_bytes": (
+                "hosted-summary.json",
+                lambda value: value["evidence_runs"][0].update(
+                    {
+                        "baseline_candidate_bytes": (
+                            value["evidence_runs"][0][
+                                "baseline_candidate_bytes"
+                            ]
+                            + 1
+                        )
+                    }
+                ),
+                "summary_fidelity_identity",
+            ),
+            "evidence_campaign_sha": (
+                "hosted-summary.json",
+                lambda value: value["evidence_runs"][0].update(
+                    {"campaign_sha256": "f" * 64}
+                ),
+                "summary_fidelity_identity",
+            ),
+            "summary_metrics": (
+                "hosted-summary.json",
+                lambda value: value["metrics"]["all"]["scores"][
+                    "similarity_ppm"
+                ].update({"mean": 899_999}),
+                "summary_metrics",
+            ),
+            "summary_shard_formats": (
+                "hosted-summary.json",
+                lambda value: value["campaign"][
+                    "shard_format_counts"
+                ][0].update({"xlsx": 49}),
+                "summary_shard_formats",
+            ),
+            "summary_font_key": (
+                "hosted-summary.json",
+                lambda value: value["font_pack"].update(
+                    {"private_note": "secret"}
+                ),
+                "summary_font_pack",
+            ),
+            "summary_input_set": (
+                "hosted-summary.json",
+                lambda value: value["corpus"].update(
+                    {"input_set_sha256": "f" * 64}
+                ),
+                "summary_corpus",
+            ),
+            "summary_group_topology": (
+                "hosted-summary.json",
+                lambda value: value["corpus"].update(
+                    {"group_topology_sha256": "f" * 64}
+                ),
+                "summary_corpus",
+            ),
+            "host_tools_key": (
+                "host-tools.json",
+                lambda value: value.update({"private_note": "secret"}),
+                "host_identity_schema",
+            ),
+            "build_label_key": (
+                "build.json",
+                lambda value: value["reproducibility"]["identities"][0][
+                    "labels"
+                ].update({"private_note": "secret"}),
+                "build_reproducibility_identities",
+            ),
+        }
+        for name, (filename, mutate, error) in mutations.items():
+            with self.subTest(
+                name=name
+            ), tempfile.TemporaryDirectory() as temporary:
+                artifact, baseline, lock, wrapper = self._fixture(
+                    Path(temporary)
+                )
+                path = artifact / filename
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutate(value)
+                self._write(path, value)
+                with self.assertRaisesRegex(
+                    self.checker.EvidenceError,
+                    error,
+                ):
+                    self.checker.validate(
+                        artifact,
+                        self.head_sha,
+                        baseline,
+                        oracle_lock=lock,
+                        oracle_wrapper=wrapper,
+                    )
+
+    def test_repeatability_maxima_and_transitive_source_receipts_are_exact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, baseline, lock, wrapper = self._fixture(Path(temporary))
+            repeatability_path = artifact / "repeatability.json"
+            repeatability = json.loads(
+                repeatability_path.read_text(encoding="utf-8")
+            )
+            repeatability["drift"]["similarity"][
+                "max_absolute_delta_ppm"
+            ] = 1
+            self._write(repeatability_path, repeatability)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "repeatability_distribution",
+            ):
+                self.checker.validate(
+                    artifact,
+                    self.head_sha,
+                    baseline,
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, baseline, lock, wrapper = self._fixture(Path(temporary))
+            repeatability_path = artifact / "repeatability.json"
+            repeatability = json.loads(
+                repeatability_path.read_text(encoding="utf-8")
+            )
+            repeatability["reports"]["candidate"]["bytes"] += 1
+            self._write(repeatability_path, repeatability)
+            self._rebind_repeatability(artifact)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "repeatability_source_report_binding",
+            ):
+                self.checker.validate(
+                    artifact,
+                    self.head_sha,
+                    baseline,
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+    def test_adoption_reuses_full_validation_and_interrupts_roll_back(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, lock, wrapper = self._fixture(
+                Path(temporary),
+                baseline_mode="candidate",
+            )
+            authored_path = artifact / "authored-print-gate.json"
+            authored = json.loads(
+                authored_path.read_text(encoding="utf-8")
+            )
+            authored["thresholds"]["similarity_mean_min_ppm"] = 0
+            self._write(authored_path, authored)
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "authored_thresholds",
+            ):
+                self.checker.build_adoption_baseline_and_receipt(
+                    artifact,
+                    head_sha=self.head_sha,
+                    workflow_run_id=101,
+                    workflow_run_attempt=2,
+                    artifact_id=303,
+                    artifact_name=(
+                        f"render-oracle-{self.head_sha}-101-2-full-candidate"
+                    ),
+                    artifact_size_bytes=4096,
+                    artifact_digest="sha256:" + "a" * 64,
+                    artifact_repository="HyunjoJung/rxls",
+                    oracle_lock=lock,
+                    oracle_wrapper=wrapper,
+                )
+
+        for exception in (KeyboardInterrupt(), SystemExit(17)):
+            with self.subTest(
+                exception=type(exception).__name__
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                destination = root / "baseline.json"
+                with mock.patch.object(
+                    self.checker,
+                    "_fsync_directory",
+                    side_effect=[exception, None],
+                ):
+                    with self.assertRaises(type(exception)):
+                        self.checker.write_new_atomic(
+                            destination,
+                            b"baseline\n",
+                        )
+                self.assertFalse(destination.exists())
+                self.assertEqual(list(root.glob(".*.tmp")), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.json"
+            receipt = root / "receipt.json"
+            original = self.checker.write_new_atomic
+            calls = 0
+
+            def interrupt_second(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise SystemExit(23)
+                original(path, payload)
+
+            with mock.patch.object(
+                self.checker,
+                "write_new_atomic",
+                side_effect=interrupt_second,
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    self.checker.write_adoption_pair_atomic(
+                        baseline,
+                        b"baseline\n",
+                        receipt,
+                        b"receipt\n",
+                    )
+            self.assertEqual(raised.exception.code, 23)
+            self.assertFalse(baseline.exists())
+            self.assertFalse(receipt.exists())
 
     def test_rejects_unauthenticated_v3_build_and_summary_vectors(self) -> None:
         mutations = (

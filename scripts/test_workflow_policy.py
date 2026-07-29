@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -456,9 +458,9 @@ steps:
                 '                  "wrapper_sha256": renderer["sha256"],',
                 1,
             ),
-            "summary_schema_v5": original.replace(
+            "summary_schema_v6": original.replace(
+                "rxls.render-oracle-hosted-campaign.v7",
                 "rxls.render-oracle-hosted-campaign.v6",
-                "rxls.render-oracle-hosted-campaign.v5",
                 1,
             ),
         }
@@ -840,9 +842,76 @@ steps:
                 "target/render-oracle-upload",
                 "target/render-oracle-hosted",
             ),
-            "path_key_variants_allowed": original.replace(
-                'normalized_key.endswith("path")',
-                'normalized_key == "path"',
+            "failure_sanitizer_removed": original.replace(
+                "python3 scripts/summarize-render-oracle-failure.py",
+                "python3 scripts/unreviewed-failure-summary.py",
+            ),
+            "failure_sanitizer_test_removed": original.replace(
+                "          python3 scripts/test_summarize_render_oracle_failure.py\n",
+                "",
+            ),
+            "failure_condition_weakened": original.replace(
+                "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' }}",
+                "if: always()",
+            ),
+            "failure_input_root_widened": original.replace(
+                "--input-root target/render-oracle-hosted",
+                "--input-root .",
+            ),
+            "failure_artifact_unbound": original.replace(
+                (
+                    "name: render-oracle-failure-${{ github.event_name == "
+                    "'workflow_call' && inputs.source_sha || "
+                    "github.event.pull_request.head.sha || github.sha }}-"
+                    "${{ github.run_id }}-${{ github.run_attempt }}"
+                ),
+                "name: render-oracle-failure-${{ github.run_id }}",
+            ),
+            "failure_raw_report_uploaded": original.replace(
+                (
+                    "path: target/render-oracle-failure/"
+                    "render-oracle-failure-summary.json"
+                ),
+                "path: target/render-oracle-hosted/parity-report-a.json",
+            ),
+            "failure_upload_before_sanitizer": original.replace(
+                "steps.render_oracle_failure_summary.outcome == 'success'",
+                "steps.render_oracle_failure_summary.outcome != 'cancelled'",
+            ),
+            "bootstrap_path_substring_allowed": original.replace(
+                'assert "path" not in normalized_key',
+                'assert not normalized_key.startswith("path")',
+                1,
+            ),
+            "aggregate_path_substring_allowed": original.replace(
+                'or "path" not in normalized_key',
+                'or not normalized_key.endswith("path")',
+                1,
+            ),
+            "retention_exception_near_match": original.replace(
+                '== ("metric_policy", "paths_or_content_retained")',
+                '== ("metric_policy", "path_or_content_retained")',
+                1,
+            ),
+            "retention_exception_true_allowed": original.replace(
+                "                          and item is False\n",
+                "                          and item in (False, True)\n",
+                1,
+            ),
+            "retention_exception_non_bool_allowed": original.replace(
+                "                          and item is False\n",
+                "                          and item == False\n",
+                1,
+            ),
+            "retention_exception_wrong_artifact": original.replace(
+                'aggregate_path.name == "repeatability.json"',
+                'aggregate_path.name.endswith(".json")',
+                1,
+            ),
+            "retention_exception_list_alias": original.replace(
+                "item, (*key_path, index), allow_retention_policy",
+                "item, key_path, allow_retention_policy",
+                1,
             ),
             "path_traversal_allowed": original.replace(
                 "                  assert traversal.search(value) is None\n",
@@ -876,6 +945,63 @@ steps:
                     )
                 )
 
+    def test_render_oracle_path_guards_reject_substring_keys(self) -> None:
+        workflow = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        blocks = []
+        cursor = 0
+        for terminator in (
+            "\n\n          root = pathlib.Path",
+            "\n\n          baseline_gate_keys =",
+        ):
+            start = workflow.index(
+                "          def reject_path_bearing_strings", cursor
+            )
+            end = workflow.index(terminator, start)
+            namespace = {
+                "re": re,
+                "traversal": re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])"),
+                "artifact_extension": re.compile(
+                    r"\.(?:xls|xlsx|xlsb|xlsm|ods|fods|pdf|png|svg)\Z",
+                    re.IGNORECASE,
+                ),
+            }
+            exec(textwrap.dedent(workflow[start:end]), namespace)
+            blocks.append(namespace["reject_path_bearing_strings"])
+            cursor = end
+
+        self.assertEqual(len(blocks), 2)
+        for guard in blocks:
+            for adversarial_key in (
+                "source_path_sha256",
+                "host_path_digest",
+            ):
+                with self.subTest(
+                    guard=guard.__code__.co_firstlineno,
+                    adversarial_key=adversarial_key,
+                ):
+                    with self.assertRaises(AssertionError):
+                        guard({adversarial_key: 0})
+
+        bootstrap_guard, aggregate_guard = blocks
+        approved = {
+            "metric_policy": {"paths_or_content_retained": False}
+        }
+        with self.assertRaises(AssertionError):
+            bootstrap_guard(approved)
+        with self.assertRaises(AssertionError):
+            aggregate_guard(approved)
+        aggregate_guard(approved, allow_retention_policy=True)
+        for near_match in (
+            {"metric_policy": {"paths_or_content_retained": True}},
+            {"metric_policy": [{"paths_or_content_retained": False}]},
+            {"other_policy": {"paths_or_content_retained": False}},
+        ):
+            with self.subTest(near_match=near_match):
+                with self.assertRaises(AssertionError):
+                    aggregate_guard(
+                        near_match, allow_retention_policy=True
+                    )
+
     def test_render_oracle_pr_campaigns_are_same_repo_label_guarded(self) -> None:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         pilot_label = "rxls-render-oracle-pilot"
@@ -906,7 +1032,7 @@ steps:
         self.assertEqual(original.count(f"ref: {head_expression}"), 1)
         self.assertEqual(original.count(f"EXPECTED_SHA: {head_expression}"), 3)
         self.assertEqual(original.count(f"EXPECTED_SOURCE_SHA: {head_expression}"), 1)
-        self.assertEqual(original.count(f"EXPECTED_HEAD_SHA: {head_expression}"), 1)
+        self.assertEqual(original.count(f"EXPECTED_HEAD_SHA: {head_expression}"), 2)
         self.assertEqual(original.count(hardened_verifier), 2)
         self.assertEqual(
             original.count(f"RXLS_ORACLE_CAMPAIGN: {campaign_expression}"),
@@ -1037,6 +1163,36 @@ steps:
             text,
         )
         self.assertNotIn("            local/render-corpus-generated", text)
+        self.assertIn(
+            "python3 scripts/summarize-render-oracle-failure.py",
+            text,
+        )
+        self.assertIn(
+            "python3 scripts/test_summarize_render_oracle_failure.py",
+            text,
+        )
+        self.assertIn(
+            "path: target/render-oracle-failure/"
+            "render-oracle-failure-summary.json",
+            text,
+        )
+        self.assertIn(
+            "steps.render_oracle_failure_summary.outcome == 'success'",
+            text,
+        )
+        self.assertIn(
+            '== ("metric_policy", "paths_or_content_retained")',
+            text,
+        )
+        self.assertIn("and item is False", text)
+        self.assertIn(
+            'aggregate_path.name == "repeatability.json"',
+            text,
+        )
+        self.assertNotIn(
+            "path: target/render-oracle-hosted/parity-report-a.json",
+            text,
+        )
 
     def test_render_hardening_rejects_mutable_apt_and_path_bearing_evidence(self) -> None:
         original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")

@@ -97,7 +97,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "00f31f7b101fe7fb51bc806ff0f129179c530099a65bcf8741d379db35472a3d",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
-    "b0b95564d98d64e5771728e694291f18579e05adff2dfecfc3e183a2fc4d110f",
+    "d53ad2c2290873aeb95e2df3f0b699f43aeef2d8bd9e6b3873ab836e9274bb88",
     "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
     "455b842e761235cf52cc695d818461372c5b1c99132d9c6df12224ca82af42bb",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
@@ -106,10 +106,12 @@ ORACLE_RENDER_STEP_SHA256 = (
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "e8023111e76759005c88ec8df8501e1ea29a50353b6f4293d93e0b342ec25e03",
     "ea232316be10caebe65ece1a648b9c695f2421a35848e8ff6e81fb31fae29f2a",
-    "5968d6e76ec19932c896dc2f729202e47edffbe2a569e55ed615b9533bf564e6",
-    "cfd190b74e56b641c4b323faee053ee93628ee4aca151609c88407c15677e836",
+    "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
+    "545f539672d2261b445c6ed318509fbd7132c701d6a9401b42e10e459d26743e",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "1935efa03e2e2dc9c56b935874953e10ff7e14565522937fd28e8ccb5f46a483",
+    "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
+    "b50f2f8062ab74765147148258b18e8adffbc84ac41a7da12d5e63f4edb5f09c",
 )
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "82dcaaf5e601cb509cf5312a5caf66a1f08e651165b53a3758e346938a32b7f4",
@@ -120,7 +122,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "745b85c9975a11c208d4f056786d2642b12b16ec8168f417333d0968140aa46b"
+    "89782a8d20354c3d927d9b41e9d3bdc3cd7a0035b155011f808856aa753e0331"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
@@ -1835,6 +1837,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             ORACLE_SETUP_PYTHON_ACTION,
             ORACLE_BUILDX_ACTION,
             ORACLE_UPLOAD_ARTIFACT_ACTION,
+            ORACLE_UPLOAD_ARTIFACT_ACTION,
         ),
         ORACLE_RENDER_STEP_SHA256,
         errors,
@@ -1941,14 +1944,37 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "if: ${{ success() }}": (
             "must never upload aggregates after a failed validator or gate"
         ),
-        'normalized_key.startswith("path")': (
-            "must structurally reject path-bearing key variants before staging"
+        'assert "path" not in normalized_key': (
+            "bootstrap evidence must reject every key containing path"
         ),
-        'normalized_key.endswith("path")': (
-            "must reject source_path, host_path, and equivalent key variants"
+        'or "path" not in normalized_key': (
+            "aggregate evidence must reject source_path_sha256, "
+            "host_path_digest, and equivalent key variants"
         ),
         'assert "\\\\" not in value': (
             "must reject backslash-bearing path strings before staging"
+        ),
+        (
+            "approved_retention_policy = (\n"
+            "                          allow_retention_policy\n"
+            "                          and child_path\n"
+            '                          == ("metric_policy", '
+            '"paths_or_content_retained")\n'
+            "                          and item is False\n"
+            "                      )"
+        ): (
+            "must allow only the exact false repeatability retention assertion"
+        ),
+        (
+            "allow_retention_policy=(\n"
+            '                          aggregate_path.name == "repeatability.json"\n'
+            "                      )"
+        ): (
+            "must scope the retention-key exception to repeatability evidence"
+        ),
+        "item, (*key_path, index), allow_retention_policy": (
+            "must preserve list position so the retention exception applies "
+            "only at the exact direct key path"
         ),
         "traversal.search(value) is None": (
             "must reject relative path traversal before staging"
@@ -2151,8 +2177,38 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'authored_gate["evidence"][f"{name}_sha256"] == digest': (
             "must bind authored-print evidence to every pinned Poppler executable"
         ),
-        '"schema": "rxls.render-oracle-hosted-campaign.v6"': (
+        '"schema": "rxls.render-oracle-hosted-campaign.v7"': (
             "must emit the aggregate-only hosted campaign contract"
+        ),
+        '"rxls.render-parity-observed-candidate.v1"': (
+            "hosted baseline candidates must retain raw-derived histograms"
+        ),
+        '"source_evidence"': (
+            "baseline gates must bind the exact source report receipt"
+        ),
+        'gate["evidence"]["bytes"] == len(report_payload)': (
+            "fidelity gates must bind the exact source report byte count"
+        ),
+        '"baseline_candidate_bytes": len(': (
+            "hosted evidence runs must bind baseline candidate bytes"
+        ),
+        '"baseline_gate_bytes": len(gate_payload)': (
+            "hosted evidence runs must bind baseline gate bytes"
+        ),
+        '"fidelity_gate_bytes": len(gate_payload)': (
+            "hosted evidence runs must bind fidelity gate bytes"
+        ),
+        '"402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"': (
+            "full hosted evidence must bind the authoritative manifest bytes"
+        ),
+        '"410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"': (
+            "full hosted evidence must bind the authoritative input set"
+        ),
+        '"559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"': (
+            "observed candidates must bind the exact correlated group topology"
+        ),
+        "reject_path_bearing_strings(\n                          key,": (
+            "aggregate privacy validation must inspect dictionary keys as data"
         ),
         '"baseline_mode": baseline_mode': (
             "aggregate evidence must bind candidate/verify baseline mode"
@@ -2218,6 +2274,29 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             "must reject late tracked or untracked source-tree drift"
         ),
         "compression-level: 9": "must bound aggregate artifact transfer size",
+        "python3 scripts/summarize-render-oracle-failure.py \\": (
+            "must reduce failed detailed reports through the reviewed sanitizer"
+        ),
+        "python3 scripts/test_summarize_render_oracle_failure.py": (
+            "must test the failure sanitizer before any campaign can invoke it"
+        ),
+        "--input-root target/render-oracle-hosted \\": (
+            "failure diagnostics may read only the fixed hosted report root"
+        ),
+        "--output target/render-oracle-failure/render-oracle-failure-summary.json": (
+            "must stage only the canonical sanitized failure summary"
+        ),
+        (
+            "name: render-oracle-failure-"
+            f"{ORACLE_SOURCE_SHA_EXPRESSION}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        ): (
+            "failure diagnostics must bind their artifact to the exact source SHA, "
+            "run ID, and attempt"
+        ),
+        "steps.render_oracle_failure_summary.outcome == 'success'": (
+            "must upload failure diagnostics only after successful sanitization"
+        ),
     }
     for snippet, message in required.items():
         if snippet not in active:
@@ -2385,6 +2464,77 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         }
         if uploaded != allowed_artifacts:
             errors.append(f"{path}: hosted artifacts must use the exact aggregate-only allowlist")
+
+    failure_summary = _single_yaml_block(
+        path,
+        active,
+        "- name: Summarize failed Render Oracle reports",
+        6,
+        "Render Oracle failure-summary step",
+        errors,
+    )
+    failure_summary_required = {
+        "id: render_oracle_failure_summary",
+        "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' }}",
+        "shell: bash",
+        f"EXPECTED_HEAD_SHA: {ORACLE_SOURCE_SHA_EXPRESSION}",
+        "set -euo pipefail",
+        "python3 scripts/summarize-render-oracle-failure.py \\",
+        "--input-root target/render-oracle-hosted \\",
+        '--profile "$RXLS_ORACLE_CAMPAIGN" \\',
+        '--baseline-mode "$RXLS_BASELINE_MODE" \\',
+        '--head-sha "$EXPECTED_HEAD_SHA" \\',
+        "--output target/render-oracle-failure/render-oracle-failure-summary.json",
+        "cat target/render-oracle-failure/render-oracle-failure-summary.json \\",
+        '>> "$GITHUB_STEP_SUMMARY"',
+    }
+    if any(value not in failure_summary for value in failure_summary_required):
+        errors.append(
+            f"{path}: failed reports must pass through the exact bounded "
+            "path-neutral summary command"
+        )
+
+    failure_upload = _single_yaml_block(
+        path,
+        active,
+        "- name: Upload sanitized Render Oracle failure summary",
+        6,
+        "Render Oracle failure-summary upload",
+        errors,
+    )
+    failure_upload_required = {
+        (
+            "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && "
+            "steps.render_oracle_failure_summary.outcome == 'success' }}"
+        ),
+        f"uses: {ORACLE_UPLOAD_ARTIFACT_ACTION}",
+        (
+            "name: render-oracle-failure-"
+            f"{ORACLE_SOURCE_SHA_EXPRESSION}-"
+            "${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "path: target/render-oracle-failure/render-oracle-failure-summary.json",
+        "compression-level: 9",
+        "if-no-files-found: error",
+        "retention-days: 14",
+    }
+    if any(value not in failure_upload for value in failure_upload_required):
+        errors.append(
+            f"{path}: failure upload must contain only the exact-SHA sanitized "
+            "summary artifact"
+        )
+    if (
+        failure_upload.count(
+            "path: target/render-oracle-failure/render-oracle-failure-summary.json"
+        )
+        != 1
+        or "target/render-oracle-hosted/" in failure_upload
+        or "local/" in failure_upload
+        or "*.json" in failure_upload
+    ):
+        errors.append(
+            f"{path}: failure upload cannot include raw reports, corpora, or wildcards"
+        )
 
     apt_lines = [line for line in text.splitlines() if "apt-get " in line]
     bootstrap_matches = re.finditer(

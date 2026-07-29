@@ -38,6 +38,9 @@ OUTPUT_SCHEMA = "rxls.libreoffice-render-repeatability.v1"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_REPORT_BYTES = 512 * 1024 * 1024
 MAX_FILES = 1_000_000
+MAX_JSON_DEPTH = 128
+MAX_JSON_NODES = 2_000_000
+MAX_JSON_INTEGER_DIGITS = 128
 DEFAULT_MAX_DRIFT_PPM = 20_000
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -178,6 +181,85 @@ def _reject_json_constant(_value: str) -> object:
     raise MalformedReport("report_nonfinite_number")
 
 
+def _reject_json_number(_value: str) -> object:
+    raise MalformedReport("report_nonintegral_number")
+
+
+def _parse_json_integer(token: str) -> int:
+    digits = token[1:] if token.startswith("-") else token
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise MalformedReport("report_integer_limit")
+    return int(token)
+
+
+def _preflight_json_text(text: str) -> None:
+    closers: list[str] = []
+    structural_nodes = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        if character in "[{":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise MalformedReport("report_json_complexity")
+            closers.append("]" if character == "[" else "}")
+            if len(closers) > MAX_JSON_DEPTH:
+                raise MalformedReport("report_json_depth")
+        elif character in "]}":
+            if not closers or closers.pop() != character:
+                raise MalformedReport("report_invalid_json")
+        elif character == ",":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise MalformedReport("report_json_complexity")
+        elif character == "-" or "0" <= character <= "9":
+            start = index
+            if character == "-":
+                index += 1
+            digit_start = index
+            while index < len(text) and "0" <= text[index] <= "9":
+                index += 1
+            if index == digit_start:
+                index = start + 1
+                continue
+            if index - digit_start > MAX_JSON_INTEGER_DIGITS:
+                raise MalformedReport("report_integer_limit")
+            if index < len(text) and text[index] in ".eE":
+                raise MalformedReport("report_nonintegral_number")
+            continue
+        index += 1
+    if closers:
+        raise MalformedReport("report_invalid_json")
+
+
+def _strict_json_loads(payload: bytes) -> object:
+    try:
+        text = payload.decode("utf-8")
+        _preflight_json_text(text)
+        return json.loads(
+            text,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_reject_json_number,
+            parse_int=_parse_json_integer,
+        )
+    except MalformedReport:
+        raise
+    except (RecursionError, ValueError, UnicodeDecodeError) as error:
+        raise MalformedReport("report_invalid_json") from error
+
+
 def _integer(value: object, code: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise MalformedReport(code)
@@ -222,14 +304,7 @@ def read_report(path: Path, remaining_bytes: int) -> LoadedReport:
         raise MalformedReport("report_unreadable") from error
     if not payload or len(payload) > byte_limit:
         raise MalformedReport("report_bytes_limit")
-    try:
-        document = json.loads(
-            payload,
-            object_pairs_hook=_strict_object,
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
-        raise MalformedReport("report_invalid_json") from error
+    document = _strict_json_loads(payload)
     if not isinstance(document, dict):
         raise MalformedReport("report_not_object")
     return LoadedReport(
@@ -536,6 +611,53 @@ def _distribution(values: list[int]) -> dict[str, Any]:
     }
 
 
+def _baseline_configuration_sha256(configuration: dict[str, Any]) -> str:
+    identity = {
+        "dpi": configuration.get("dpi"),
+        "font_pack": configuration.get("font_pack"),
+        "locale": configuration.get("locale"),
+        "measurement_toolchain": configuration.get("measurement_toolchain"),
+        "metric_policy": configuration.get("metric_policy"),
+        "oracle_lock": configuration.get("oracle_lock"),
+        "renderer_binary": configuration.get("renderer_binary"),
+    }
+    return canonical_sha256(identity)
+
+
+def _baseline_input_identity(files: dict[str, dict[str, Any]]) -> tuple[str, int]:
+    identities = []
+    for digest, row in files.items():
+        features = row.get("features", [])
+        format_name = row.get("format")
+        rights_tier = row.get("rights_tier")
+        if (
+            not isinstance(features, list)
+            or not all(isinstance(feature, str) and feature for feature in features)
+            or features != sorted(set(features))
+            or not isinstance(format_name, str)
+            or not format_name
+            or rights_tier not in {None, "S", "U", "Q"}
+        ):
+            raise MalformedReport("baseline_input_identity")
+        identities.append(
+            {
+                "features": features,
+                "format": format_name,
+                "rights_tier": rights_tier,
+                "sha256": digest,
+            }
+        )
+    identities.sort(
+        key=lambda row: (
+            row["sha256"],
+            row["format"],
+            row["rights_tier"] or "",
+            row["features"],
+        )
+    )
+    return canonical_sha256(identities), len(identities)
+
+
 def _identity_result(
     baseline: ValidatedReport, candidate: ValidatedReport
 ) -> dict[str, Any]:
@@ -543,7 +665,35 @@ def _identity_result(
     right = candidate.loaded.document
     left_inputs = sorted(baseline.files)
     right_inputs = sorted(candidate.files)
+    left_baseline_input_sha256, left_baseline_input_count = (
+        _baseline_input_identity(baseline.files)
+    )
+    right_baseline_input_sha256, right_baseline_input_count = (
+        _baseline_input_identity(candidate.files)
+    )
     return {
+        "baseline_contract": {
+            "configuration": {
+                "baseline_sha256": _baseline_configuration_sha256(
+                    left["configuration"]
+                ),
+                "candidate_sha256": _baseline_configuration_sha256(
+                    right["configuration"]
+                ),
+                "equal": left["configuration"] == right["configuration"],
+            },
+            "input_set": {
+                "baseline_count": left_baseline_input_count,
+                "baseline_sha256": left_baseline_input_sha256,
+                "candidate_count": right_baseline_input_count,
+                "candidate_sha256": right_baseline_input_sha256,
+                "equal": (
+                    left_baseline_input_count == right_baseline_input_count
+                    and left_baseline_input_sha256
+                    == right_baseline_input_sha256
+                ),
+            },
+        },
         "configuration": {
             "baseline_sha256": canonical_sha256(left["configuration"]),
             "candidate_sha256": canonical_sha256(right["configuration"]),

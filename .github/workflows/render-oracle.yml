@@ -67,6 +67,7 @@ on:
       - "scripts/render-oracle-host-tools.py"
       - "scripts/run-render-oracle-container.py"
       - "scripts/smoke-render-oracle-runtime.py"
+      - "scripts/summarize-render-oracle-failure.py"
       - "scripts/test_compare_render_parity_runs.py"
       - "scripts/test_check_authored_print_parity.py"
       - "scripts/test_check_render_fidelity_targets.py"
@@ -78,6 +79,7 @@ on:
       - "scripts/test_render_oracle_container.py"
       - "scripts/test_render_oracle_runtime_smoke.py"
       - "scripts/test_render_oracle_host_tools.py"
+      - "scripts/test_summarize_render_oracle_failure.py"
       - "scripts/test_workflow_policy.py"
       - "scripts/render-oracle-container/**"
       - "src/**"
@@ -180,6 +182,7 @@ jobs:
           python3 scripts/test_render_oracle_container.py
           python3 scripts/test_render_oracle_runtime_smoke.py
           python3 scripts/test_render_oracle_host_tools.py
+          python3 scripts/test_summarize_render_oracle_failure.py
           python3 scripts/test_fetch_render_fonts.py
           python3 scripts/test_generate_render_corpus.py
           bash -n scripts/render-oracle-container/oracle-entrypoint.sh
@@ -686,17 +689,27 @@ jobs:
               if isinstance(value, dict):
                   for key, item in value.items():
                       normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
-                      assert not (
-                          normalized_key.startswith("path")
-                          or normalized_key.endswith("path")
-                          or normalized_key.endswith("paths")
-                      )
+                      assert "path" not in normalized_key
+                      reject_path_bearing_strings(key)
                       reject_path_bearing_strings(item)
               elif isinstance(value, list):
                   for item in value:
                       reject_path_bearing_strings(item)
               elif isinstance(value, str):
                   lowered = value.lower()
+                  assert len(value) <= 16_384
+                  assert not any(
+                      character < " " or character == "\x7f"
+                      for character in value
+                  )
+                  assert not re.search(
+                      r"(?:gh[pousr]_[A-Za-z0-9_]{8,}|"
+                      r"github_pat_[A-Za-z0-9_]{8,}|"
+                      r"(?:AKIA|ASIA)[A-Z0-9]{12,}|"
+                      r"xox[baprs]-[A-Za-z0-9-]{8,})",
+                      value,
+                      re.IGNORECASE,
+                  )
                   assert not value.startswith("/")
                   assert not re.match(r"[A-Za-z]:[\\/]", value)
                   assert not lowered.startswith("file://")
@@ -820,6 +833,21 @@ jobs:
                   "schema": "rxls.render-parity-manifest-binding.v1",
                   "selected_case_count": len(mapped),
               }
+
+          def group_topology_sha256(rows):
+              counts = Counter(
+                  (row["format"], tuple(row["features"]))
+                  for row in rows
+              )
+              topology = [
+                  {
+                      "features": list(features),
+                      "format": format_name,
+                      "workbooks": count,
+                  }
+                  for (format_name, features), count in sorted(counts.items())
+              ]
+              return sha256(canonical_payload(topology))
 
           native_pdf_keys = {
               "actual_text_documents",
@@ -1043,10 +1071,24 @@ jobs:
               },
           }
           corpus_manifest_sha256 = sha256(corpus_payload)
+          if profile == "full":
+              assert corpus_manifest_sha256 == (
+                  "402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"
+              )
           corpus_binding = manifest_binding(
               corpus["files"],
               corpus_manifest_sha256,
           )
+          corpus_group_topology_sha256 = group_topology_sha256(
+              corpus["files"]
+          )
+          if profile == "full":
+              assert corpus_binding["input_set_sha256"] == (
+                  "410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"
+              )
+              assert corpus_group_topology_sha256 == (
+                  "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"
+              )
           corpus_mapping = feature_mapping(corpus["files"])
           assert corpus["profile"] == profile
           assert corpus["case_count"] == expected_cases
@@ -1096,6 +1138,35 @@ jobs:
               assert (
                   report["configuration"]["font_pack"]["pack_sha256"]
                   == font_manifest["pack_sha256"]
+              )
+              assert report["configuration"]["font_pack"] == {
+                  "alias_count": len(font_manifest.get("aliases", [])),
+                  "attestation_required": True,
+                  "configured": True,
+                  "font_count": len(font_manifest["fonts"]),
+                  "fonts_conf_sha256": font_manifest[
+                      "fonts_conf_sha256"
+                  ],
+                  "license": font_manifest["license"],
+                  "pack_sha256": font_manifest["pack_sha256"],
+                  "pdf_identities_sha256": report["configuration"][
+                      "font_pack"
+                  ]["pdf_identities_sha256"],
+                  "pdf_identity_count": report["configuration"][
+                      "font_pack"
+                  ]["pdf_identity_count"],
+              }
+              assert (
+                  report["configuration"]["font_pack"][
+                      "pdf_identity_count"
+                  ]
+                  == 34
+              )
+              assert re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  report["configuration"]["font_pack"][
+                      "pdf_identities_sha256"
+                  ],
               )
 
               adapters = [row.get("oracle_adapter") for row in report["files"]]
@@ -1205,6 +1276,7 @@ jobs:
                   == 1_000
               )
               assert gate["evidence"]["sha256"] == report_sha256
+              assert gate["evidence"]["bytes"] == len(report_payload)
               assert gate["evidence"]["renderer_sha256"] == renderer["sha256"]
               assert (
                   gate["evidence"]["font_pack_sha256"]
@@ -1247,6 +1319,7 @@ jobs:
               )
               evidence_runs.append(
                   {
+                      "fidelity_gate_bytes": len(gate_payload),
                       "fidelity_gate_sha256": sha256(gate_payload),
                       "report_bytes": len(report_payload),
                       "report_sha256": report_sha256,
@@ -1321,6 +1394,9 @@ jobs:
           assert authored_gate["evidence"]["report_sha256"] == sha256(
               authored_report_payload
           )
+          assert authored_gate["evidence"]["report_bytes"] == len(
+              authored_report_payload
+          )
           assert authored_gate["evidence"]["renderer_sha256"] == renderer["sha256"]
           assert (
               authored_gate["evidence"]["font_pack_sha256"]
@@ -1380,8 +1456,14 @@ jobs:
               assert repeatability["identity"]["input_set"]["equal"] is True
               assert repeatability["identity"]["preflight"]["equal"] is True
               assert repeatability["identity"]["renderer_binary"]["equal"] is True
-              assert repeatability["reports"]["baseline"]["sha256"] == evidence_runs[0]["report_sha256"]
-              assert repeatability["reports"]["candidate"]["sha256"] == evidence_runs[1]["report_sha256"]
+              assert repeatability["reports"]["baseline"] == {
+                  "bytes": evidence_runs[0]["report_bytes"],
+                  "sha256": evidence_runs[0]["report_sha256"],
+              }
+              assert repeatability["reports"]["candidate"] == {
+                  "bytes": evidence_runs[1]["report_bytes"],
+                  "sha256": evidence_runs[1]["report_sha256"],
+              }
               repeatability_summary = {
                   "coverage": repeatability["coverage"],
                   "sha256": sha256(repeatability_payload),
@@ -1391,11 +1473,32 @@ jobs:
 
               baseline_candidates = []
               baseline_gates = []
-              for label in ("a", "b"):
+              for index, label in enumerate(("a", "b")):
                   candidate_path = root / f"baseline-candidate-{label}.json"
                   candidate_payload = candidate_path.read_bytes()
                   candidate = json.loads(candidate_payload)
-                  assert candidate["schema"] == "rxls.render-parity-baseline.v2"
+                  assert (
+                      candidate["schema"]
+                      == "rxls.render-parity-observed-candidate.v1"
+                  )
+                  assert set(candidate["histograms"]) == {
+                      "all",
+                      "by_feature",
+                      "by_format",
+                  }
+                  assert len(candidate["groups"]) == 96
+                  assert sha256(
+                      canonical_payload(
+                          [
+                              {
+                                  "features": group["features"],
+                                  "format": group["format"],
+                                  "workbooks": group["workbooks"],
+                              }
+                              for group in candidate["groups"]
+                          ]
+                      )
+                  ) == corpus_group_topology_sha256
                   assert candidate["input_files"] == expected_cases
                   assert candidate["campaign"]["schema"] == "rxls.render-parity-campaign.v1"
                   assert candidate["campaign"]["kind"] == "project_generated_hosted_full"
@@ -1412,6 +1515,7 @@ jobs:
                   assert candidate["campaign"]["input_set_sha256"] == candidate["input_set_sha256"]
                   baseline_candidates.append(
                       {
+                          "bytes": len(candidate_payload),
                           "campaign_sha256": sha256(
                               (json.dumps(candidate["campaign"], indent=2, sort_keys=True) + "\n").encode()
                           ),
@@ -1424,6 +1528,10 @@ jobs:
                   gate_payload = gate_path.read_bytes()
                   gate = json.loads(gate_payload)
                   assert gate["schema"] == "rxls.render-parity-baseline-check.v1"
+                  assert gate["source_evidence"] == {
+                      "bytes": evidence_runs[index]["report_bytes"],
+                      "sha256": evidence_runs[index]["report_sha256"],
+                  }
                   if baseline_mode == "verify":
                       assert gate["candidate_sha256"] == sha256(candidate_payload)
                       assert gate["passed"] is True
@@ -1436,6 +1544,7 @@ jobs:
                       assert warning_policy["reviewed_code_count"] >= warning_policy["candidate_code_count"]
                       gate_summary = {
                           "baseline_sha256": gate["baseline_sha256"],
+                          "bytes": len(gate_payload),
                           "candidate_sha256": gate["candidate_sha256"],
                           "failures": gate["failures"],
                           "passed": gate["passed"],
@@ -1448,12 +1557,14 @@ jobs:
                           "created",
                           "passed",
                           "schema",
+                          "source_evidence",
                       }
                       assert gate["created"] is True
                       assert gate["passed"] is True
                       assert gate["baseline_sha256"] == sha256(candidate_payload)
                       gate_summary = {
                           "baseline_sha256": None,
+                          "bytes": len(gate_payload),
                           "candidate_sha256": sha256(candidate_payload),
                           "failures": [],
                           "passed": True,
@@ -1461,6 +1572,28 @@ jobs:
                           "warning_policy": None,
                       }
                   baseline_gates.append(gate_summary)
+                  evidence_runs[index].update(
+                      {
+                          "baseline_candidate_bytes": len(
+                              candidate_payload
+                          ),
+                          "baseline_candidate_sha256": sha256(
+                              candidate_payload
+                          ),
+                          "baseline_gate_bytes": len(gate_payload),
+                          "baseline_gate_sha256": sha256(gate_payload),
+                          "campaign_sha256": sha256(
+                              (
+                                  json.dumps(
+                                      candidate["campaign"],
+                                      indent=2,
+                                      sort_keys=True,
+                                  )
+                                  + "\n"
+                              ).encode()
+                          ),
+                      }
+                  )
 
               ratchets_passed = all(gate["passed"] for gate in baseline_gates)
               warning_policies = [
@@ -1507,6 +1640,11 @@ jobs:
                   "mode": profile,
                   "parallel_shards": 1 if profile == "pilot" else 2,
                   "repetitions": expected_repetitions,
+                  "sha256": (
+                      baseline_candidates[-1]["campaign_sha256"]
+                      if profile == "full"
+                      else sha256(corpus_payload)
+                  ),
                   "shard_case_counts": [len(rows) for rows in shard_rows],
                   "shard_count": expected_shards,
                   "shard_format_counts": [
@@ -1537,12 +1675,27 @@ jobs:
                   "case_count": corpus["case_count"],
                   "feature_counts": corpus["feature_counts"],
                   "format_counts": corpus["format_counts"],
+                  "generator": corpus["generator"],
+                  "generator_version": corpus["generator_version"],
+                  "group_topology_sha256": (
+                      corpus_group_topology_sha256
+                  ),
+                  "input_set_sha256": corpus_binding[
+                      "input_set_sha256"
+                  ],
                   "license": corpus["license"],
                   "manifest_sha256": sha256(corpus_payload),
+                  "render_redistributable": corpus[
+                      "render_redistributable"
+                  ],
                   "scope": "project_generated_hosted_acceptance",
                   "profile": corpus["profile"],
                   "redistribution": corpus["redistribution"],
                   "rights_tier": corpus["rights_tier"],
+                  "schema_version": corpus["schema_version"],
+                  "source_redistributable": corpus[
+                      "source_redistributable"
+                  ],
               },
               "evidence_runs": evidence_runs,
               "fidelity": [
@@ -1560,7 +1713,7 @@ jobs:
               "metrics": report["summary"]["metric_cohorts"],
               "renderer": renderer,
               "repeatability": repeatability_summary,
-              "schema": "rxls.render-oracle-hosted-campaign.v6",
+              "schema": "rxls.render-oracle-hosted-campaign.v7",
               "summary": {
                   "by_classification": report["summary"]["by_classification"],
                   "by_status": report["summary"]["by_status"],
@@ -1574,21 +1727,49 @@ jobs:
               json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
 
-          def reject_path_bearing_strings(value):
+          def reject_path_bearing_strings(
+              value, key_path=(), allow_retention_policy=False
+          ):
               if isinstance(value, dict):
                   for key, item in value.items():
                       normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
-                      assert not (
-                          normalized_key.startswith("path")
-                          or normalized_key.endswith("path")
-                          or normalized_key.endswith("paths")
+                      child_path = (*key_path, key)
+                      approved_retention_policy = (
+                          allow_retention_policy
+                          and child_path
+                          == ("metric_policy", "paths_or_content_retained")
+                          and item is False
                       )
-                      reject_path_bearing_strings(item)
+                      assert (
+                          approved_retention_policy
+                          or "path" not in normalized_key
+                      )
+                      reject_path_bearing_strings(
+                          key, (*key_path, "<key>"), allow_retention_policy
+                      )
+                      reject_path_bearing_strings(
+                          item, child_path, allow_retention_policy
+                      )
               elif isinstance(value, list):
-                  for item in value:
-                      reject_path_bearing_strings(item)
+                  for index, item in enumerate(value):
+                      reject_path_bearing_strings(
+                          item, (*key_path, index), allow_retention_policy
+                      )
               elif isinstance(value, str):
                   lowered = value.lower()
+                  assert len(value) <= 16_384
+                  assert not any(
+                      character < " " or character == "\x7f"
+                      for character in value
+                  )
+                  assert not re.search(
+                      r"(?:gh[pousr]_[A-Za-z0-9_]{8,}|"
+                      r"github_pat_[A-Za-z0-9_]{8,}|"
+                      r"(?:AKIA|ASIA)[A-Z0-9]{12,}|"
+                      r"xox[baprs]-[A-Za-z0-9-]{8,})",
+                      value,
+                      re.IGNORECASE,
+                  )
                   assert not value.startswith("/")
                   assert not re.match(r"[A-Za-z]:[\\/]", value)
                   assert not lowered.startswith("file://")
@@ -1607,6 +1788,7 @@ jobs:
                   "failures",
                   "passed",
                   "schema",
+                  "source_evidence",
                   "warning_policy",
               }
               if baseline_mode == "verify"
@@ -1615,6 +1797,7 @@ jobs:
                   "created",
                   "passed",
                   "schema",
+                  "source_evidence",
               }
           )
           aggregate_contracts = {
@@ -1632,13 +1815,15 @@ jobs:
                   },
               ),
               "baseline-candidate-a.json": (
-                  "rxls.render-parity-baseline.v2",
+                  "rxls.render-parity-observed-candidate.v1",
                   {
                       "campaign",
                       "classifications",
                       "cohorts",
                       "comparable_files",
                       "configuration_sha256",
+                      "groups",
+                      "histograms",
                       "input_files",
                       "input_set_sha256",
                       "schema",
@@ -1647,13 +1832,15 @@ jobs:
                   },
               ),
               "baseline-candidate-b.json": (
-                  "rxls.render-parity-baseline.v2",
+                  "rxls.render-parity-observed-candidate.v1",
                   {
                       "campaign",
                       "classifications",
                       "cohorts",
                       "comparable_files",
                       "configuration_sha256",
+                      "groups",
+                      "histograms",
                       "input_files",
                       "input_set_sha256",
                       "schema",
@@ -1695,6 +1882,7 @@ jobs:
                       "failures",
                       "metrics",
                       "passed",
+                      "policy",
                       "schema",
                       "thresholds",
                   },
@@ -1707,12 +1895,13 @@ jobs:
                       "failures",
                       "metrics",
                       "passed",
+                      "policy",
                       "schema",
                       "thresholds",
                   },
               ),
               "hosted-summary.json": (
-                  "rxls.render-oracle-hosted-campaign.v6",
+                  "rxls.render-oracle-hosted-campaign.v7",
                   {
                       "authored_print",
                       "baseline_mode",
@@ -1771,7 +1960,12 @@ jobs:
                   assert set(document) == expected_keys
                   if expected_schema is not None:
                       assert document["schema"] == expected_schema
-                  reject_path_bearing_strings(document)
+                  reject_path_bearing_strings(
+                      document,
+                      allow_retention_policy=(
+                          aggregate_path.name == "repeatability.json"
+                      ),
+                  )
           assert (root / "gate-status.txt").read_text(encoding="utf-8").strip() == "0"
           for report_path in report_paths:
               report_path.unlink()
@@ -1820,3 +2014,28 @@ jobs:
           compression-level: 9
           if-no-files-found: error
           retention-days: 30
+      - name: Summarize failed Render Oracle reports
+        id: render_oracle_failure_summary
+        if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/summarize-render-oracle-failure.py \
+            --input-root target/render-oracle-hosted \
+            --profile "$RXLS_ORACLE_CAMPAIGN" \
+            --baseline-mode "$RXLS_BASELINE_MODE" \
+            --head-sha "$EXPECTED_HEAD_SHA" \
+            --output target/render-oracle-failure/render-oracle-failure-summary.json
+          cat target/render-oracle-failure/render-oracle-failure-summary.json \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload sanitized Render Oracle failure summary
+        if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_summary.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-oracle-failure-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-oracle-failure/render-oracle-failure-summary.json
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 14

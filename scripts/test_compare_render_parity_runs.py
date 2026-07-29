@@ -12,10 +12,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "compare-render-parity-runs.py"
+BASELINE_SCRIPT = ROOT / "scripts" / "check-render-parity-baseline.py"
 
 
 def load_module():
@@ -28,6 +30,20 @@ def load_module():
 
 
 MODULE = load_module()
+
+
+def load_baseline_module():
+    spec = importlib.util.spec_from_file_location(
+        "check_render_parity_baseline_contract", BASELINE_SCRIPT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+BASELINE_MODULE = load_baseline_module()
 
 
 def renderer_metrics(seed: int) -> dict[str, object]:
@@ -119,6 +135,7 @@ def file_row(index: int, *, private_prefix: str = "/private/baseline") -> dict[s
             "libreoffice": {"returncode": 0, "status": "ok"},
             "rxls": {"returncode": 0, "status": "ok"},
         },
+        "features": ["unicode-text"],
         "format": "xlsx" if index == 0 else "ods",
         "metrics": aggregate_metrics(index),
         "pages": [page_metrics(index)],
@@ -249,6 +266,30 @@ class CompareRenderParityRunsTests(unittest.TestCase):
         self.assertIn("configuration_mismatch", result["failures"])
         self.assertIn("preflight_mismatch", result["failures"])
         self.assertIn("renderer_binary_mismatch", result["failures"])
+
+    def test_baseline_contract_hashes_match_baseline_derivation_domains(self) -> None:
+        result = self.compare()
+        contract = result["identity"]["baseline_contract"]
+        self.assertEqual(
+            contract["configuration"]["baseline_sha256"],
+            BASELINE_MODULE.configuration_identity_sha256(
+                self.baseline["configuration"]
+            ),
+        )
+        self.assertEqual(
+            contract["configuration"]["candidate_sha256"],
+            BASELINE_MODULE.configuration_identity_sha256(
+                self.candidate["configuration"]
+            ),
+        )
+        self.assertEqual(
+            contract["input_set"]["baseline_sha256"],
+            BASELINE_MODULE._input_identity(self.baseline["files"])[0],
+        )
+        self.assertEqual(
+            contract["input_set"]["candidate_sha256"],
+            BASELINE_MODULE._input_identity(self.candidate["files"])[0],
+        )
 
     def test_authored_print_summary_contract_is_explicitly_separate(self) -> None:
         missing = copy.deepcopy(self.baseline)
@@ -451,6 +492,75 @@ class CompareRenderParityRunsTests(unittest.TestCase):
 
             path.write_text('{"value": NaN}', encoding="utf-8")
             with self.assertRaisesRegex(MODULE.MalformedReport, "nonfinite_number"):
+                MODULE.read_report(path, 1_000)
+
+    def test_cli_rejects_hostile_json_numbers_and_depth_with_stable_errors(
+        self,
+    ) -> None:
+        malformed_payloads = (
+            (
+                b'{"value":' + (b"8" * 5_000) + b"}",
+                "report_integer_limit",
+            ),
+            (b'{"value":1.5}', "report_nonintegral_number"),
+            (b'{"value":1e10000}', "report_nonintegral_number"),
+            (
+                b"[" * (MODULE.MAX_JSON_DEPTH + 1)
+                + b"]" * (MODULE.MAX_JSON_DEPTH + 1),
+                "report_json_depth",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            baseline = root / "baseline.json"
+            candidate = root / "candidate.json"
+            output = root / "repeatability.json"
+            baseline.write_bytes(MODULE.canonical_bytes(self.baseline))
+            command = [
+                sys.executable,
+                str(SCRIPT),
+                str(baseline),
+                str(candidate),
+                "--output",
+                str(output),
+            ]
+            for payload, error_code in malformed_payloads:
+                candidate.write_bytes(payload)
+                output.write_bytes(b"sentinel\n")
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(error_code=error_code):
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(
+                        result.stderr.splitlines(),
+                        [f"compare-render-parity-runs: {error_code}"],
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn(str(candidate), result.stderr)
+                    self.assertEqual(output.read_bytes(), b"sentinel\n")
+
+    def test_json_preflight_rejects_structural_complexity_before_decode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "report.json"
+            path.write_bytes(b"[0,0,0,0]")
+            with mock.patch.object(
+                MODULE,
+                "MAX_JSON_NODES",
+                3,
+            ), mock.patch.object(
+                MODULE.json,
+                "loads",
+                side_effect=AssertionError("decoder must not run"),
+            ), self.assertRaisesRegex(
+                MODULE.MalformedReport,
+                "report_json_complexity",
+            ):
                 MODULE.read_report(path, 1_000)
 
 

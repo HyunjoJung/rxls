@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any
@@ -27,6 +29,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ORACLE_LOCK = ROOT / "scripts" / "render-oracle-container" / "lock.json"
 DEFAULT_ORACLE_WRAPPER = ROOT / "scripts" / "run-render-oracle-container.py"
+DEFAULT_REVIEWED_BASELINE = ROOT / "scripts" / "render-parity-baseline-full.json"
+BASELINE_CHECKER = ROOT / "scripts" / "check-render-parity-baseline.py"
 EXPECTED_FILES = frozenset(
     {
         "authored-print-gate.json",
@@ -48,11 +52,25 @@ MAX_TOTAL_BYTES = 48 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_LOCK_BYTES = 256 * 1024
 MAX_WRAPPER_BYTES = 512 * 1024
+MAX_JSON_DEPTH = 128
+MAX_JSON_NODES = 2_000_000
+MAX_JSON_INTEGER_DIGITS = 128
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 60
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
+EXPECTED_REPOSITORY_ID = 1_297_467_060
+EXPECTED_HOSTED_FULL_MANIFEST_SHA256 = (
+    "402c34b2600a280383cf0ef4941d67652827fae6d66c342962b0b2b7e520fd81"
+)
+EXPECTED_HOSTED_FULL_INPUT_SET_SHA256 = (
+    "410a8f9a6cf797039a2f193656f2990baa532cb23734bed27a5bf4b695f55ed7"
+)
+EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256 = (
+    "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"
+)
 GITHUB_API_VERSION = "2022-11-28"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+WARNING_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 ARTIFACT_EXTENSION_RE = re.compile(
@@ -60,10 +78,22 @@ ARTIFACT_EXTENSION_RE = re.compile(
     re.IGNORECASE,
 )
 PATH_TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
+SECRET_TEXT_RE = re.compile(
+    r"(?:"
+    r"gh[pousr]_[A-Za-z0-9_]{8,}"
+    r"|github_pat_[A-Za-z0-9_]{8,}"
+    r"|(?:AKIA|ASIA)[A-Z0-9]{12,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{8,}"
+    r")",
+    re.IGNORECASE,
+)
 BUILD_SCHEMA = "rxls.render-oracle-container-build.v3"
 LOCK_SCHEMA = "rxls.render-oracle-container-lock.v3"
 BOOTSTRAP_RECEIPT_SCHEMA = "rxls.render-oracle-bootstrap-receipt.v1"
-HOSTED_CAMPAIGN_SCHEMA = "rxls.render-oracle-hosted-campaign.v6"
+HOSTED_CAMPAIGN_SCHEMA = "rxls.render-oracle-hosted-campaign.v7"
+ADOPTION_RECEIPT_SCHEMA = "rxls.render-parity-baseline-adoption.v1"
+MAX_GITHUB_API_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_REPORT_BYTES = 256 * 1024 * 1024
 SOURCE_DATE_EPOCH = 1_783_900_800
 SOURCE_DATE_EPOCH_RFC3339 = "2026-07-13T00:00:00Z"
 DOCKER_V2_MANIFEST_MEDIA_TYPE = (
@@ -80,6 +110,105 @@ BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
     "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
 )
+EXPECTED_FORMAT_COUNTS = {
+    "ods": 200,
+    "xls": 200,
+    "xlsb": 200,
+    "xlsx": 200,
+}
+EXPECTED_FEATURE_COUNTS = {
+    "border": 200,
+    "cell-fill": 200,
+    "chart": 100,
+    "chinese-text": 400,
+    "column-width": 400,
+    "conditional-format": 100,
+    "date-format": 400,
+    "formula-cached": 400,
+    "hidden-column": 400,
+    "hidden-row": 400,
+    "image-drawing": 100,
+    "japanese-text": 400,
+    "korean-text": 416,
+    "latin-text": 800,
+    "merged-cells": 400,
+    "noto-ofl-font": 600,
+    "number-cell": 800,
+    "percent-format": 400,
+    "print-settings": 400,
+    "right-to-left-layout": 200,
+    "row-height": 400,
+    "rtl-text": 400,
+    "sparkline": 100,
+    "unicode-text": 752,
+    "wrapped-text": 200,
+}
+EXPECTED_HARD_FEATURE_COUNTS = {
+    "chart": 100,
+    "conditional_format": 100,
+    "image_drawing": 100,
+    "print_settings": 400,
+    "rtl": 500,
+    "sparkline": 100,
+    "wrapped_text": 200,
+}
+EXPECTED_HARD_FEATURE_COHORTS = {
+    "chart": ["chart"],
+    "conditional_format": ["conditional-format"],
+    "image_drawing": ["image-drawing"],
+    "print_settings": ["print-settings"],
+    "rtl": ["right-to-left-layout", "rtl-text"],
+    "sparkline": ["sparkline"],
+    "wrapped_text": ["wrapped-text"],
+}
+EXPECTED_CORE_EXCLUDED_FEATURES = [
+    "chart",
+    "conditional-format",
+    "image-drawing",
+    "print-settings",
+    "right-to-left-layout",
+    "rtl-text",
+    "sparkline",
+    "wrapped-text",
+]
+EXPECTED_FIDELITY_THRESHOLDS = {
+    "broad_similarity_min_ppm": 950_000,
+    "core_similarity_min_ppm": 980_000,
+    "edge_f1_min_ppm": 970_000,
+    "page_box_max_millipoints": 5_000,
+    "page_box_median_max_millipoints": 1_000,
+    "page_box_p95_max_millipoints": 2_500,
+    "pdf_point_geometry_exact": True,
+    "pdf_xhtml_crosscheck_max_micropoints": 1_000,
+    "semantic_codepoint_precision_min_ppm": 999_000,
+    "semantic_codepoint_recall_min_ppm": 999_000,
+    "text_box_match_min_ppm": 999_000,
+    "text_box_median_max_millipoints": 1_000,
+    "text_box_p95_max_millipoints": 2_500,
+}
+EXPECTED_FIDELITY_POLICY = {
+    "core_excluded_features": EXPECTED_CORE_EXCLUDED_FEATURES,
+    "hard_feature_cohorts": EXPECTED_HARD_FEATURE_COHORTS,
+    "minimum_broad_workbooks": 40,
+    "minimum_core_text_boxes": 100,
+    "minimum_core_workbooks": 10,
+    "minimum_hard_feature_workbooks": 1,
+    "oracle_formats": ["ods", "xls", "xlsb", "xlsx"],
+}
+EXPECTED_AUTHORED_THRESHOLDS = {
+    "edge_f1_min_ppm": 970_000,
+    "page_box_max_millipoints": 5_000,
+    "page_box_median_max_millipoints": 1_000,
+    "page_box_p95_max_millipoints": 2_500,
+    "pdf_point_geometry_exact": True,
+    "pdf_xhtml_crosscheck_max_micropoints": 1_000,
+    "semantic_codepoint_precision_min_ppm": 999_000,
+    "semantic_codepoint_recall_min_ppm": 999_000,
+    "similarity_mean_min_ppm": 950_000,
+    "text_box_match_min_ppm": 999_000,
+    "text_box_median_max_millipoints": 1_000,
+    "text_box_p95_max_millipoints": 2_500,
+}
 BUILD_KEYS = frozenset(
     {
         "build_contract_sha256",
@@ -147,9 +276,30 @@ class EvidenceError(ValueError):
     """Raised when hosted release evidence is absent or inconsistent."""
 
 
+class _StrictJSONError(ValueError):
+    pass
+
+
 def _require(condition: bool, code: str) -> None:
     if not condition:
         raise EvidenceError(code)
+
+
+def _load_baseline_checker() -> Any:
+    module_name = "_rxls_render_parity_baseline"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, BASELINE_CHECKER)
+    _require(spec is not None and spec.loader is not None, "baseline_checker_import")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        sys.modules.pop(module_name, None)
+        raise EvidenceError("baseline_checker_import") from error
+    return module
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -630,21 +780,283 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _reject_json_constant(value: str) -> object:
-    raise EvidenceError(f"invalid_json_constant:{value}")
+    raise _StrictJSONError(f"invalid_json_constant:{value}")
+
+
+def _reject_json_number(_value: str) -> object:
+    raise _StrictJSONError("non_integral_number")
+
+
+def _parse_json_integer(token: str) -> int:
+    digits = token[1:] if token.startswith("-") else token
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise _StrictJSONError("integer_limit")
+    return int(token)
+
+
+def _preflight_json_text(text: str) -> None:
+    closers: list[str] = []
+    structural_nodes = 0
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        if character in "[{":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise _StrictJSONError("json_complexity")
+            closers.append("]" if character == "[" else "}")
+            if len(closers) > MAX_JSON_DEPTH:
+                raise _StrictJSONError("json_depth")
+        elif character in "]}":
+            if not closers or closers.pop() != character:
+                raise _StrictJSONError("json_structure")
+        elif character == ",":
+            structural_nodes += 1
+            if structural_nodes > MAX_JSON_NODES:
+                raise _StrictJSONError("json_complexity")
+        elif character == "-" or "0" <= character <= "9":
+            start = index
+            if character == "-":
+                index += 1
+            digit_start = index
+            while index < len(text) and "0" <= text[index] <= "9":
+                index += 1
+            if index == digit_start:
+                index = start + 1
+                continue
+            if index - digit_start > MAX_JSON_INTEGER_DIGITS:
+                raise _StrictJSONError("integer_limit")
+            if index < len(text) and text[index] in ".eE":
+                raise _StrictJSONError("non_integral_number")
+            continue
+        index += 1
+    if closers:
+        raise _StrictJSONError("json_structure")
+
+
+def _strict_json_loads(payload: bytes, code: str) -> object:
+    try:
+        text = payload.decode("utf-8")
+        _preflight_json_text(text)
+        return json.loads(
+            text,
+            object_pairs_hook=_object_pairs,
+            parse_constant=_reject_json_constant,
+            parse_float=_reject_json_number,
+            parse_int=_parse_json_integer,
+        )
+    except EvidenceError:
+        raise
+    except (RecursionError, ValueError, UnicodeDecodeError) as error:
+        raise EvidenceError(code) from error
+
+
+def _github_api_json(
+    repository: str,
+    endpoint: str,
+    token: str,
+    *,
+    opener: object | None = None,
+) -> object:
+    _require(repository == EXPECTED_REPOSITORY, "artifact_repository")
+    _require(
+        0 < len(token) <= 4096
+        and all(0x21 <= ord(character) <= 0x7E for character in token),
+        "github_token",
+    )
+    _require(
+        endpoint.startswith("actions/")
+        and endpoint.isascii()
+        and not endpoint.startswith("/")
+        and ".." not in endpoint
+        and len(endpoint) <= 1024,
+        "github_api_endpoint",
+    )
+    url = f"https://api.github.com/repos/{repository}/{endpoint}"
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "rxls-render-oracle-baseline-adoption",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+        method="GET",
+    )
+    api_opener = opener if opener is not None else build_opener(_NoRedirect())
+    response: object | None = None
+    try:
+        response = api_opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS)
+        _require(_response_status(response) == 200, "github_api_status")
+        final_url_getter = getattr(response, "geturl", None)
+        if callable(final_url_getter):
+            _require(final_url_getter() == url, "github_api_final_url")
+        content_encoding = response.headers.get("Content-Encoding")
+        _require(
+            content_encoding in (None, "", "identity"),
+            "github_api_encoding",
+        )
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            _require(
+                re.fullmatch(r"[1-9][0-9]*", content_length) is not None
+                and int(content_length) <= MAX_GITHUB_API_BYTES,
+                "github_api_size",
+            )
+        payload = response.read(MAX_GITHUB_API_BYTES + 1)
+        _require(
+            isinstance(payload, bytes) and 0 < len(payload) <= MAX_GITHUB_API_BYTES,
+            "github_api_size",
+        )
+        _require(response.read(1) == b"", "github_api_size")
+    except HTTPError as error:
+        error.close()
+        raise EvidenceError("github_api_status") from error
+    except (OSError, TimeoutError, URLError) as error:
+        raise EvidenceError("github_api_request") from error
+    finally:
+        if response is not None:
+            response.close()
+    return _strict_json_loads(payload, "github_api_json")
+
+
+def authenticate_candidate_run_artifact(
+    *,
+    repository: str,
+    head_sha: str,
+    workflow_run_id: int,
+    workflow_run_attempt: int,
+    artifact_id: int,
+    artifact_name: str,
+    artifact_size_bytes: int,
+    artifact_digest: str,
+    token: str | None = None,
+    run_opener: object | None = None,
+    artifacts_opener: object | None = None,
+) -> dict[str, object]:
+    """Live-authenticate the successful exact-SHA candidate run and artifact."""
+
+    _validate_artifact_binding(
+        head_sha=head_sha,
+        campaign="full",
+        baseline_mode="candidate",
+        workflow_run_id=workflow_run_id,
+        workflow_run_attempt=workflow_run_attempt,
+        artifact_id=artifact_id,
+        artifact_name=artifact_name,
+        artifact_size_bytes=artifact_size_bytes,
+        artifact_digest=artifact_digest,
+        repository=repository,
+    )
+    credential = token if token is not None else os.environ.get("GH_TOKEN", "")
+    run = _github_api_json(
+        repository,
+        f"actions/runs/{workflow_run_id}",
+        credential,
+        opener=run_opener,
+    )
+    _require(isinstance(run, dict), "github_run")
+    run_repository = run.get("repository")
+    _require(
+        isinstance(run_repository, dict)
+        and run_repository.get("id") == EXPECTED_REPOSITORY_ID
+        and run_repository.get("full_name") == EXPECTED_REPOSITORY,
+        "github_run_repository",
+    )
+    _require(
+        _positive_int(run.get("id"))
+        and run.get("id") == workflow_run_id
+        and _positive_int(run.get("run_attempt"))
+        and run.get("run_attempt") == workflow_run_attempt
+        and run.get("head_sha") == head_sha
+        and run.get("event") == "workflow_dispatch"
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "success"
+        and run.get("path")
+        in {
+            ".github/workflows/fuzz.yml",
+            ".github/workflows/render-oracle.yml",
+        },
+        "github_run_identity",
+    )
+
+    artifact_listing = _github_api_json(
+        repository,
+        f"actions/runs/{workflow_run_id}/artifacts?per_page=100",
+        credential,
+        opener=artifacts_opener,
+    )
+    _require(
+        isinstance(artifact_listing, dict)
+        and set(artifact_listing) >= {"artifacts", "total_count"},
+        "github_artifacts",
+    )
+    artifacts = artifact_listing.get("artifacts")
+    total_count = artifact_listing.get("total_count")
+    _require(
+        type(total_count) is int
+        and 0 <= total_count <= 100
+        and isinstance(artifacts, list)
+        and len(artifacts) == total_count,
+        "github_artifacts_count",
+    )
+    matches = [
+        row
+        for row in artifacts
+        if isinstance(row, dict) and row.get("name") == artifact_name
+    ]
+    _require(len(matches) == 1, "github_artifact_uniqueness")
+    artifact = matches[0]
+    _require(
+        _positive_int(artifact.get("id"))
+        and artifact.get("id") == artifact_id
+        and artifact.get("expired") is False
+        and _positive_int(
+            artifact.get("size_in_bytes"),
+            MAX_ARTIFACT_ARCHIVE_BYTES,
+        )
+        and artifact.get("size_in_bytes") == artifact_size_bytes
+        and artifact.get("digest") == artifact_digest,
+        "github_artifact_identity",
+    )
+    workflow_run = artifact.get("workflow_run")
+    if workflow_run is not None:
+        _require(
+            isinstance(workflow_run, dict)
+            and _positive_int(workflow_run.get("id"))
+            and workflow_run.get("id") == workflow_run_id
+            and workflow_run.get("head_sha") == head_sha,
+            "github_artifact_run",
+        )
+    return {
+        "artifact_digest": artifact_digest,
+        "artifact_id": artifact_id,
+        "artifact_name": artifact_name,
+        "artifact_repository": repository,
+        "artifact_size_bytes": artifact_size_bytes,
+        "head_sha": head_sha,
+        "workflow_path": run["path"],
+        "workflow_run_attempt": workflow_run_attempt,
+        "workflow_run_id": workflow_run_id,
+    }
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
     _require(path.is_file() and not path.is_symlink(), "evidence_file_type")
     payload = path.read_bytes()
     _require(0 < len(payload) <= MAX_FILE_BYTES, "evidence_file_size")
-    try:
-        document = json.loads(
-            payload,
-            object_pairs_hook=_object_pairs,
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvidenceError("evidence_invalid_json") from error
+    document = _strict_json_loads(payload, "evidence_invalid_json")
     _require(isinstance(document, dict), "evidence_not_object")
     return document, payload
 
@@ -659,39 +1071,281 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _path_neutral(value: object) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+    stack = [value]
+    visited = 0
+    while stack:
+        item = stack.pop()
+        visited += 1
+        _require(visited <= MAX_JSON_NODES, "json_complexity")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                _require(isinstance(key, str), "path_bearing_key")
+                normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+                if key == "paths_or_content_retained":
+                    _require(child is False, "path_retention_attestation")
+                    continue
+                _require(
+                    "path" not in normalized_key,
+                    "path_bearing_key",
+                )
+                stack.append(key)
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, str):
+            lowered = item.lower()
             _require(
-                not (
-                    normalized_key.startswith("path")
-                    or normalized_key.endswith("path")
-                    or normalized_key.endswith("paths")
+                len(item) <= 16_384
+                and not any(
+                    character < " " or character == "\x7f"
+                    for character in item
                 ),
-                "path_bearing_key",
+                "unsafe_text",
             )
-            _path_neutral(item)
-    elif isinstance(value, list):
-        for item in value:
-            _path_neutral(item)
-    elif isinstance(value, str):
-        lowered = value.lower()
-        _require(not value.startswith("/"), "absolute_path")
-        _require(re.match(r"^[A-Za-z]:[\\/]", value) is None, "windows_path")
-        _require(not lowered.startswith("file://"), "file_uri")
-        _require("\\" not in value, "backslash_path")
-        _require(PATH_TRAVERSAL_RE.search(value) is None, "path_traversal")
-        _require(
-            ARTIFACT_EXTENSION_RE.search(value) is None,
-            "relative_artifact_path",
+            _require(SECRET_TEXT_RE.search(item) is None, "secret_text")
+            _require(not item.startswith("/"), "absolute_path")
+            _require(re.match(r"^[A-Za-z]:[\\/]", item) is None, "windows_path")
+            _require(not lowered.startswith("file://"), "file_uri")
+            _require("\\" not in item, "backslash_path")
+            _require(PATH_TRAVERSAL_RE.search(item) is None, "path_traversal")
+            _require(
+                ARTIFACT_EXTENSION_RE.search(item) is None,
+                "relative_artifact_path",
+            )
+            _require("local/render-corpus" not in lowered, "corpus_path")
+            _require("render-corpus-generated" not in lowered, "corpus_path")
+            _require("payload/" not in lowered, "payload_path")
+
+
+def _git(
+    repository_root: Path,
+    arguments: list[str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        _require("local/render-corpus" not in lowered, "corpus_path")
-        _require("render-corpus-generated" not in lowered, "corpus_path")
-        _require("payload/" not in lowered, "payload_path")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EvidenceError("adoption_git") from error
+
+
+def validate_adoption_checkout(
+    destination: Path,
+    head_sha: str,
+    *,
+    repository_root: Path = ROOT,
+) -> Path:
+    """Require an exact, clean candidate checkout and absent canonical output."""
+
+    _require(HEAD_SHA_RE.fullmatch(head_sha) is not None, "adoption_head_sha")
+    try:
+        root = repository_root.resolve(strict=True)
+        expected = (root / "scripts" / "render-parity-baseline-full.json")
+        provided = destination.expanduser()
+        if not provided.is_absolute():
+            provided = Path.cwd() / provided
+        provided_absolute = provided.absolute()
+        try:
+            provided_metadata = provided_absolute.lstat()
+        except FileNotFoundError:
+            provided_metadata = None
+        _require(provided_metadata is None, "adoption_destination_exists")
+        canonical = provided_absolute.resolve(strict=False)
+        _require(canonical == expected, "adoption_destination")
+        parent_metadata = expected.parent.lstat()
+        _require(
+            stat.S_ISDIR(parent_metadata.st_mode)
+            and not expected.parent.is_symlink(),
+            "adoption_destination_parent",
+        )
+    except OSError as error:
+        raise EvidenceError("adoption_destination") from error
+
+    top_level = _git(root, ["rev-parse", "--show-toplevel"])
+    _require(
+        top_level.returncode == 0
+        and Path(top_level.stdout.strip()).resolve(strict=True) == root,
+        "adoption_repository",
+    )
+    revision = _git(root, ["rev-parse", "--verify", "HEAD"])
+    _require(
+        revision.returncode == 0 and revision.stdout.strip() == head_sha,
+        "adoption_checkout_head",
+    )
+    status = _git(root, ["status", "--porcelain=v1", "--untracked-files=all"])
+    _require(
+        status.returncode == 0 and status.stdout == "",
+        "adoption_checkout_dirty",
+    )
+    relative = expected.relative_to(root).as_posix()
+    tracked = _git(root, ["ls-files", "--error-unmatch", "--", relative])
+    _require(
+        tracked.returncode == 1 and tracked.stdout == "",
+        "adoption_previous_baseline",
+    )
+    return expected
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _remove_exact_new_file(path: Path, payload: bytes) -> None:
+    metadata = path.lstat()
+    _require(
+        stat.S_ISREG(metadata.st_mode)
+        and not path.is_symlink()
+        and path.read_bytes() == payload,
+        "adoption_rollback_identity",
+    )
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def write_new_atomic(path: Path, payload: bytes) -> None:
+    """Atomically publish one new regular file without clobbering any entry."""
+
+    _require(isinstance(payload, bytes) and bool(payload), "adoption_payload")
+    temporary: Path | None = None
+    linked = False
+    interrupted = False
+    try:
+        parent_metadata = path.parent.lstat()
+        _require(
+            stat.S_ISDIR(parent_metadata.st_mode) and not path.parent.is_symlink(),
+            "adoption_destination_parent",
+        )
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise EvidenceError("adoption_destination_exists")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fchmod(output.fileno(), 0o644)
+            os.fsync(output.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        linked = True
+        _fsync_directory(path.parent)
+    except BaseException as error:
+        interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+        if linked:
+            try:
+                _remove_exact_new_file(path, payload)
+            except (EvidenceError, OSError) as rollback_error:
+                if interrupted:
+                    raise error
+                raise EvidenceError("adoption_rollback") from rollback_error
+        if isinstance(error, EvidenceError):
+            raise
+        if isinstance(error, FileExistsError):
+            raise EvidenceError("adoption_destination_exists") from error
+        if isinstance(error, OSError):
+            raise EvidenceError("adoption_write") from error
+        raise
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                if not interrupted:
+                    raise EvidenceError("adoption_cleanup") from error
+
+
+def write_adoption_pair_atomic(
+    baseline_path: Path,
+    baseline_payload: bytes,
+    receipt_path: Path,
+    receipt_payload: bytes,
+) -> None:
+    """Install a receipt before its baseline and roll it back on baseline failure."""
+
+    _require(
+        isinstance(baseline_payload, bytes)
+        and bool(baseline_payload)
+        and isinstance(receipt_payload, bytes)
+        and bool(receipt_payload),
+        "adoption_payload",
+    )
+    _require(
+        baseline_path.resolve(strict=False) != receipt_path.resolve(strict=False),
+        "adoption_receipt_destination",
+    )
+    receipt_installed = False
+    try:
+        write_new_atomic(receipt_path, receipt_payload)
+        receipt_installed = True
+        write_new_atomic(baseline_path, baseline_payload)
+    except BaseException as error:
+        interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+        if receipt_installed:
+            try:
+                _remove_exact_new_file(receipt_path, receipt_payload)
+            except (EvidenceError, OSError) as rollback_error:
+                if interrupted:
+                    raise error
+                raise EvidenceError("adoption_rollback") from rollback_error
+        if isinstance(error, EvidenceError):
+            raise
+        if isinstance(error, OSError):
+            raise EvidenceError("adoption_write") from error
+        raise
+
+
+def write_atomic(path: Path, payload: bytes) -> None:
+    """Atomically replace a diagnostic output after all validation passes."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    except OSError as error:
+        raise EvidenceError("report_write") from error
 
 
 def _hash_matches(value: object) -> bool:
     return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def _nonzero_hash_matches(value: object) -> bool:
+    return _hash_matches(value) and value != "0" * 64
 
 
 def _image_digest_matches(value: object) -> bool:
@@ -807,14 +1461,7 @@ def _release_contract(
     """Authenticate the checked-out lock and wrapper used by build evidence."""
 
     lock_payload = _regular_file_payload(lock_path, MAX_LOCK_BYTES, "oracle_lock")
-    try:
-        lock = json.loads(
-            lock_payload,
-            object_pairs_hook=_object_pairs,
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvidenceError("oracle_lock_json") from error
+    lock = _strict_json_loads(lock_payload, "oracle_lock_json")
     _require(isinstance(lock, dict) and lock.get("schema") == LOCK_SCHEMA, "oracle_lock_schema")
 
     built_image = lock.get("built_image")
@@ -874,7 +1521,11 @@ def _release_contract(
         "oracle_wrapper_identity",
     )
 
-    normalized = json.loads(json.dumps(lock))
+    normalized = _strict_json_loads(
+        json.dumps(lock).encode("utf-8"),
+        "oracle_lock_json",
+    )
+    assert isinstance(normalized, dict)
     normalized["built_image"]["bootstrap_receipt"] = None
     normalized["built_image"]["expected_id"] = None
     normalized["built_image"]["expected_manifest_digest"] = None
@@ -935,7 +1586,7 @@ def _validate_identity_row(
         "org.rxls.render-oracle.lock-sha256": build_contract_sha256,
     }
     _require(
-        all(labels.get(key) == value for key, value in expected_labels.items()),
+        labels == expected_labels,
         "build_identity_labels",
     )
 
@@ -1106,35 +1757,1177 @@ def _validate_gate_image_binding(
     )
 
 
+def _bounded_int(
+    value: object,
+    code: str,
+    *,
+    minimum: int = 0,
+    maximum: int = (1 << 63) - 1,
+) -> int:
+    _require(
+        type(value) is int and minimum <= value <= maximum,
+        code,
+    )
+    return value
+
+
+def _ppm(value: object, code: str) -> int:
+    return _bounded_int(value, code, maximum=1_000_000)
+
+
+def _ratio_ppm(numerator: int, denominator: int, *, empty: int = 0) -> int:
+    if denominator == 0:
+        return empty
+    return (numerator * 1_000_000 + denominator // 2) // denominator
+
+
+def _validate_report_identity(
+    value: object,
+    code: str,
+    *,
+    bytes_key: str = "bytes",
+    sha256_key: str = "sha256",
+) -> dict[str, object]:
+    _require(
+        isinstance(value, dict)
+        and set(value) == {bytes_key, sha256_key},
+        f"{code}_schema",
+    )
+    size = _bounded_int(
+        value[bytes_key],
+        f"{code}_bytes",
+        minimum=1,
+        maximum=MAX_SOURCE_REPORT_BYTES,
+    )
+    digest = value[sha256_key]
+    _require(_nonzero_hash_matches(digest), f"{code}_sha256")
+    return {"bytes": size, "sha256": digest}
+
+
+def _validate_host_tools(value: object) -> dict[str, Any]:
+    _require(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "captured_identity_sha256",
+            "expected_identity_sha256",
+            "identity",
+            "identity_status",
+            "lock_file_sha256",
+            "schema",
+            "scope",
+        }
+        and value.get("schema")
+        == "rxls.render-oracle-host-tools-evidence.v1"
+        and value.get("scope") == "all"
+        and value.get("identity_status") == "pinned_match",
+        "host_identity_schema",
+    )
+    identity = value["identity"]
+    captured = value["captured_identity_sha256"]
+    _require(
+        isinstance(identity, dict)
+        and bool(identity)
+        and _nonzero_hash_matches(captured)
+        and value["expected_identity_sha256"] == captured
+        and value["lock_file_sha256"]
+        and _nonzero_hash_matches(value["lock_file_sha256"])
+        and _canonical_sha256(identity) == captured,
+        "host_identity_mismatch",
+    )
+    return value
+
+
+def _validate_font_pack(value: object, expected_sha256: object) -> None:
+    _require(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "alias_count",
+            "attestation_required",
+            "configured",
+            "font_count",
+            "fonts_conf_sha256",
+            "license",
+            "pack_sha256",
+            "pdf_identities_sha256",
+            "pdf_identity_count",
+        }
+        and value["attestation_required"] is True
+        and value["configured"] is True
+        and value["alias_count"] == 10
+        and value["font_count"] == 26
+        and value["pdf_identity_count"] == 34
+        and value["license"] == "SIL-OFL-1.1"
+        and value["pack_sha256"] == expected_sha256
+        and _nonzero_hash_matches(value["fonts_conf_sha256"])
+        and _nonzero_hash_matches(value["pdf_identities_sha256"]),
+        "summary_font_pack",
+    )
+
+
+def _validate_text_box_metrics(
+    value: object,
+    code: str,
+    *,
+    minimum_matches: int = 1,
+) -> None:
+    _require(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "ambiguous",
+            "f1_ppm",
+            "libreoffice_items",
+            "libreoffice_unmatched",
+            "matched",
+            "median_error_millipoints",
+            "p95_error_millipoints",
+            "precision_ppm",
+            "recall_ppm",
+            "rxls_items",
+            "rxls_unmatched",
+        },
+        f"{code}_schema",
+    )
+    matched = _bounded_int(value["matched"], code, minimum=minimum_matches)
+    rxls_items = _bounded_int(value["rxls_items"], code, minimum=matched)
+    libreoffice_items = _bounded_int(
+        value["libreoffice_items"],
+        code,
+        minimum=matched,
+    )
+    ambiguous = _bounded_int(value["ambiguous"], code)
+    rxls_unmatched = _bounded_int(value["rxls_unmatched"], code)
+    libreoffice_unmatched = _bounded_int(
+        value["libreoffice_unmatched"],
+        code,
+    )
+    _require(
+        rxls_items == matched + ambiguous + rxls_unmatched
+        and libreoffice_items == matched + libreoffice_unmatched,
+        f"{code}_matching",
+    )
+    precision = _ratio_ppm(matched, rxls_items)
+    recall = _ratio_ppm(matched, libreoffice_items)
+    f1 = _ratio_ppm(2 * matched, rxls_items + libreoffice_items)
+    _require(
+        _ppm(value["precision_ppm"], code) == precision >= 999_000
+        and _ppm(value["recall_ppm"], code) == recall >= 999_000
+        and _ppm(value["f1_ppm"], code) == f1 >= 999_000,
+        f"{code}_score",
+    )
+    median = _bounded_int(
+        value["median_error_millipoints"],
+        code,
+        maximum=1_000,
+    )
+    p95 = _bounded_int(
+        value["p95_error_millipoints"],
+        code,
+        maximum=2_500,
+    )
+    _require(median <= p95, f"{code}_order")
+
+
+def _validate_hard_feature_metrics(
+    value: object,
+    *,
+    name: str,
+    expected_workbooks: int,
+) -> None:
+    code = f"fidelity_hard_feature:{name}"
+    _require(
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "edge_f1_ppm",
+            "edge_libreoffice_pixels",
+            "edge_rxls_pixels",
+            "semantic_codepoint_libreoffice_items",
+            "semantic_codepoint_precision_ppm",
+            "semantic_codepoint_recall_ppm",
+            "semantic_codepoint_rxls_items",
+            "similarity_mean_ppm",
+            "text_box",
+            "text_line_box",
+            "workbooks",
+        },
+        f"{code}_schema",
+    )
+    _require(value["workbooks"] == expected_workbooks, f"{code}_coverage")
+    _bounded_int(value["edge_rxls_pixels"], code, minimum=1)
+    _bounded_int(value["edge_libreoffice_pixels"], code, minimum=1)
+    _bounded_int(
+        value["semantic_codepoint_rxls_items"],
+        code,
+        minimum=1,
+    )
+    _bounded_int(
+        value["semantic_codepoint_libreoffice_items"],
+        code,
+        minimum=1,
+    )
+    _require(
+        _ppm(value["edge_f1_ppm"], code) >= 970_000
+        and _ppm(value["similarity_mean_ppm"], code) >= 950_000
+        and _ppm(value["semantic_codepoint_precision_ppm"], code)
+        >= 999_000
+        and _ppm(value["semantic_codepoint_recall_ppm"], code) >= 999_000,
+        f"{code}_threshold",
+    )
+    _validate_text_box_metrics(value["text_box"], f"{code}_text_box")
+    _validate_text_box_metrics(
+        value["text_line_box"],
+        f"{code}_text_line_box",
+    )
+
+
+def _validate_fidelity_gate(value: dict[str, Any]) -> dict[str, object]:
+    _require(
+        set(value)
+        == {
+            "coverage",
+            "evidence",
+            "failures",
+            "metrics",
+            "passed",
+            "policy",
+            "schema",
+            "thresholds",
+        }
+        and value.get("schema") == "rxls.render-fidelity-targets.v1",
+        "fidelity_schema",
+    )
+    _require(
+        value.get("passed") is True and value.get("failures") == [],
+        "fidelity_failed",
+    )
+    _require(
+        value.get("thresholds") == EXPECTED_FIDELITY_THRESHOLDS,
+        "fidelity_thresholds",
+    )
+    _require(
+        value.get("policy") == EXPECTED_FIDELITY_POLICY,
+        "fidelity_policy",
+    )
+
+    evidence = value.get("evidence")
+    evidence_keys = {
+        "bytes",
+        "feature_map_sha256",
+        "font_pack_sha256",
+        "host_tools_identity_sha256",
+        "input_set_sha256",
+        "manifest_sha256",
+        "oracle_build_contract_sha256",
+        "oracle_image_config_digest",
+        "oracle_image_manifest_digest",
+        "oracle_libreoffice_artifact_sha256",
+        "oracle_lock_file_sha256",
+        "pdffonts_sha256",
+        "pdfinfo_sha256",
+        "pdftoppm_sha256",
+        "pdftotext_sha256",
+        "renderer_sha256",
+        "sha256",
+    }
+    _require(
+        isinstance(evidence, dict) and set(evidence) == evidence_keys,
+        "fidelity_evidence_schema",
+    )
+    source_report = _validate_report_identity(
+        {"bytes": evidence["bytes"], "sha256": evidence["sha256"]},
+        "fidelity_source_report",
+    )
+    for key in evidence_keys - {
+        "bytes",
+        "oracle_image_config_digest",
+        "oracle_image_manifest_digest",
+        "sha256",
+    }:
+        _require(_nonzero_hash_matches(evidence[key]), f"fidelity_evidence:{key}")
+    _require(
+        _image_digest_matches(evidence["oracle_image_config_digest"])
+        and _image_digest_matches(evidence["oracle_image_manifest_digest"])
+        and evidence["oracle_libreoffice_artifact_sha256"]
+        == LIBREOFFICE_ARTIFACT_SHA256,
+        "fidelity_oracle_identity",
+    )
+
+    coverage = value.get("coverage")
+    _require(
+        isinstance(coverage, dict)
+        and set(coverage)
+        == {
+            "broad_workbooks",
+            "core_text_box_ambiguous",
+            "core_text_box_candidates",
+            "core_text_box_libreoffice_items",
+            "core_text_box_libreoffice_unmatched",
+            "core_text_box_matches",
+            "core_text_box_unmatched",
+            "core_text_line_box_ambiguous",
+            "core_text_line_box_candidates",
+            "core_text_line_box_libreoffice_items",
+            "core_text_line_box_libreoffice_unmatched",
+            "core_text_line_box_matches",
+            "core_text_line_box_unmatched",
+            "core_workbooks",
+            "format_workbooks",
+            "hard_feature_workbooks",
+            "libreoffice_pdf_font_objects",
+            "native_pdf_documents",
+            "native_pdf_font_objects",
+            "pages",
+            "report_workbooks",
+            "status_counts",
+        },
+        "fidelity_coverage_schema",
+    )
+    _require(
+        coverage["report_workbooks"] == 800
+        and coverage["broad_workbooks"] == 800
+        and coverage["core_workbooks"] == 118
+        and coverage["format_workbooks"] == EXPECTED_FORMAT_COUNTS
+        and coverage["status_counts"] == {"compared": 800}
+        and coverage["hard_feature_workbooks"]
+        == EXPECTED_HARD_FEATURE_COUNTS,
+        "fidelity_coverage",
+    )
+    _bounded_int(coverage["pages"], "fidelity_pages", minimum=1, maximum=1_000_000)
+    for key in (
+        "libreoffice_pdf_font_objects",
+        "native_pdf_documents",
+        "native_pdf_font_objects",
+    ):
+        _bounded_int(coverage[key], f"fidelity_coverage:{key}", minimum=1)
+    for prefix, minimum in (("core_text_box", 100), ("core_text_line_box", 1)):
+        candidates = _bounded_int(
+            coverage[f"{prefix}_candidates"],
+            f"fidelity_coverage:{prefix}",
+            minimum=minimum,
+        )
+        references = _bounded_int(
+            coverage[f"{prefix}_libreoffice_items"],
+            f"fidelity_coverage:{prefix}",
+            minimum=minimum,
+        )
+        matches = _bounded_int(
+            coverage[f"{prefix}_matches"],
+            f"fidelity_coverage:{prefix}",
+            minimum=minimum,
+        )
+        ambiguous = _bounded_int(
+            coverage[f"{prefix}_ambiguous"],
+            f"fidelity_coverage:{prefix}",
+        )
+        unmatched = _bounded_int(
+            coverage[f"{prefix}_unmatched"],
+            f"fidelity_coverage:{prefix}",
+        )
+        reference_unmatched = _bounded_int(
+            coverage[f"{prefix}_libreoffice_unmatched"],
+            f"fidelity_coverage:{prefix}",
+        )
+        _require(
+            candidates == matches + ambiguous + unmatched
+            and references == matches + reference_unmatched,
+            f"fidelity_coverage:{prefix}_matching",
+        )
+
+    metrics = value.get("metrics")
+    _require(
+        isinstance(metrics, dict)
+        and set(metrics)
+        == {
+            "broad_similarity_mean_ppm",
+            "core_edge_f1_ppm",
+            "core_semantic_codepoint_precision_ppm",
+            "core_semantic_codepoint_recall_ppm",
+            "core_similarity_mean_ppm",
+            "hard_feature_cohorts",
+            "page_box_max_millipoints",
+            "page_box_median_millipoints",
+            "page_box_p95_millipoints",
+            "pdf_point_geometry_mismatches",
+            "pdf_xhtml_crosscheck_max_micropoints",
+            "text_box_f1_ppm",
+            "text_box_match_coverage_ppm",
+            "text_box_median_error_millipoints",
+            "text_box_p95_error_millipoints",
+            "text_box_precision_ppm",
+            "text_box_recall_ppm",
+            "text_line_box_f1_ppm",
+            "text_line_box_median_error_millipoints",
+            "text_line_box_p95_error_millipoints",
+            "text_line_box_precision_ppm",
+            "text_line_box_recall_ppm",
+        },
+        "fidelity_metrics_schema",
+    )
+    _require(
+        _ppm(metrics["broad_similarity_mean_ppm"], "fidelity_metrics")
+        >= 950_000
+        and _ppm(metrics["core_similarity_mean_ppm"], "fidelity_metrics")
+        >= 980_000
+        and _ppm(metrics["core_edge_f1_ppm"], "fidelity_metrics") >= 970_000
+        and _ppm(
+            metrics["core_semantic_codepoint_precision_ppm"],
+            "fidelity_metrics",
+        )
+        >= 999_000
+        and _ppm(
+            metrics["core_semantic_codepoint_recall_ppm"],
+            "fidelity_metrics",
+        )
+        >= 999_000,
+        "fidelity_metric_threshold",
+    )
+    for metric_prefix, coverage_prefix in (
+        ("text_box", "core_text_box"),
+        ("text_line_box", "core_text_line_box"),
+    ):
+        matched = coverage[f"{coverage_prefix}_matches"]
+        candidates = coverage[f"{coverage_prefix}_candidates"]
+        references = coverage[f"{coverage_prefix}_libreoffice_items"]
+        precision = _ratio_ppm(matched, candidates)
+        recall = _ratio_ppm(matched, references)
+        f1 = _ratio_ppm(2 * matched, candidates + references)
+        _require(
+            _ppm(
+                metrics[f"{metric_prefix}_precision_ppm"],
+                f"fidelity_metrics:{metric_prefix}",
+            )
+            == precision
+            >= 999_000
+            and _ppm(
+                metrics[f"{metric_prefix}_recall_ppm"],
+                f"fidelity_metrics:{metric_prefix}",
+            )
+            == recall
+            >= 999_000
+            and _ppm(
+                metrics[f"{metric_prefix}_f1_ppm"],
+                f"fidelity_metrics:{metric_prefix}",
+            )
+            == f1
+            >= 999_000,
+            "fidelity_text_threshold",
+        )
+    _require(
+        _ppm(
+            metrics["text_box_match_coverage_ppm"],
+            "fidelity_metrics:text_box",
+        )
+        == metrics["text_box_precision_ppm"],
+        "fidelity_text_coverage",
+    )
+    text_median = _bounded_int(
+        metrics["text_box_median_error_millipoints"],
+        "fidelity_text_geometry",
+        maximum=1_000,
+    )
+    text_p95 = _bounded_int(
+        metrics["text_box_p95_error_millipoints"],
+        "fidelity_text_geometry",
+        maximum=2_500,
+    )
+    line_median = _bounded_int(
+        metrics["text_line_box_median_error_millipoints"],
+        "fidelity_line_geometry",
+        maximum=1_000,
+    )
+    line_p95 = _bounded_int(
+        metrics["text_line_box_p95_error_millipoints"],
+        "fidelity_line_geometry",
+        maximum=2_500,
+    )
+    page_median = _bounded_int(
+        metrics["page_box_median_millipoints"],
+        "fidelity_page_geometry",
+        maximum=1_000,
+    )
+    page_p95 = _bounded_int(
+        metrics["page_box_p95_millipoints"],
+        "fidelity_page_geometry",
+        maximum=2_500,
+    )
+    page_max = _bounded_int(
+        metrics["page_box_max_millipoints"],
+        "fidelity_page_geometry",
+        maximum=5_000,
+    )
+    _require(
+        text_median <= text_p95
+        and line_median <= line_p95
+        and page_median <= page_p95 <= page_max
+        and metrics["pdf_point_geometry_mismatches"] == 0
+        and _bounded_int(
+            metrics["pdf_xhtml_crosscheck_max_micropoints"],
+            "fidelity_page_geometry",
+            maximum=1_000,
+        )
+        <= 1_000,
+        "fidelity_geometry",
+    )
+    hard = metrics.get("hard_feature_cohorts")
+    _require(
+        isinstance(hard, dict) and set(hard) == set(EXPECTED_HARD_FEATURE_COUNTS),
+        "fidelity_hard_feature_schema",
+    )
+    for name, count in EXPECTED_HARD_FEATURE_COUNTS.items():
+        _validate_hard_feature_metrics(
+            hard[name],
+            name=name,
+            expected_workbooks=count,
+        )
+    return {
+        "evidence": evidence,
+        "source_report": source_report,
+    }
+
+
+def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
+    _require(
+        set(value)
+        == {
+            "coverage",
+            "evidence",
+            "expected",
+            "failures",
+            "metrics",
+            "passed",
+            "schema",
+            "thresholds",
+        }
+        and value.get("schema") == "rxls.authored-print-parity.v1",
+        "authored_schema",
+    )
+    _require(
+        value.get("passed") is True and value.get("failures") == [],
+        "authored_failed",
+    )
+    _require(
+        value.get("thresholds") == EXPECTED_AUTHORED_THRESHOLDS,
+        "authored_thresholds",
+    )
+    _require(
+        value.get("expected")
+        == {
+            "page_box_pixels": {"height": 1056, "width": 816},
+            "page_box_points": {"height": "792/1", "width": "612/1"},
+            "pages_per_workbook": 4,
+            "workbooks_by_scale_mode": {"fit": 50, "scale": 50},
+        },
+        "authored_expected",
+    )
+
+    evidence = value.get("evidence")
+    evidence_keys = {
+        "feature_map_sha256",
+        "font_pack_sha256",
+        "host_tools_identity_sha256",
+        "input_set_sha256",
+        "manifest_sha256",
+        "oracle_build_contract_sha256",
+        "oracle_image_config_digest",
+        "oracle_image_manifest_digest",
+        "oracle_libreoffice_artifact_sha256",
+        "oracle_lock_file_sha256",
+        "pdffonts_sha256",
+        "pdfinfo_sha256",
+        "pdftoppm_sha256",
+        "pdftotext_sha256",
+        "renderer_sha256",
+        "report_bytes",
+        "report_sha256",
+    }
+    _require(
+        isinstance(evidence, dict) and set(evidence) == evidence_keys,
+        "authored_evidence_schema",
+    )
+    source_report = _validate_report_identity(
+        {
+            "bytes": evidence["report_bytes"],
+            "sha256": evidence["report_sha256"],
+        },
+        "authored_source_report",
+    )
+    for key in evidence_keys - {
+        "oracle_image_config_digest",
+        "oracle_image_manifest_digest",
+        "report_bytes",
+        "report_sha256",
+    }:
+        _require(_nonzero_hash_matches(evidence[key]), f"authored_evidence:{key}")
+    _require(
+        _image_digest_matches(evidence["oracle_image_config_digest"])
+        and _image_digest_matches(evidence["oracle_image_manifest_digest"])
+        and evidence["oracle_libreoffice_artifact_sha256"]
+        == LIBREOFFICE_ARTIFACT_SHA256,
+        "authored_oracle_identity",
+    )
+
+    coverage = value.get("coverage")
+    _require(
+        isinstance(coverage, dict)
+        and set(coverage)
+        == {
+            "by_scale_mode",
+            "edge_libreoffice_pixels",
+            "edge_rxls_pixels",
+            "libreoffice_pdf_font_objects",
+            "native_pdf_documents",
+            "native_pdf_font_objects",
+            "page_count_histogram",
+            "pages",
+            "semantic_codepoint_libreoffice_items",
+            "semantic_codepoint_rxls_items",
+            "text_box_candidates",
+            "text_box_libreoffice_items",
+            "text_box_matches",
+            "text_line_box_candidates",
+            "text_line_box_libreoffice_items",
+            "text_line_box_matches",
+            "workbooks",
+        },
+        "authored_coverage_schema",
+    )
+    _require(
+        coverage["workbooks"] == 100
+        and coverage["pages"] == 400
+        and coverage["page_count_histogram"] == {"4": 100}
+        and coverage["by_scale_mode"] == {"fit": 50, "scale": 50},
+        "authored_coverage",
+    )
+    for key in (
+        "edge_libreoffice_pixels",
+        "edge_rxls_pixels",
+        "libreoffice_pdf_font_objects",
+        "native_pdf_documents",
+        "native_pdf_font_objects",
+        "semantic_codepoint_libreoffice_items",
+        "semantic_codepoint_rxls_items",
+    ):
+        _bounded_int(coverage[key], f"authored_coverage:{key}", minimum=1)
+    metrics = value.get("metrics")
+    _require(
+        isinstance(metrics, dict)
+        and set(metrics)
+        == {
+            "edge_f1_ppm",
+            "page_box_max_millipoints",
+            "page_box_median_millipoints",
+            "page_box_p95_millipoints",
+            "pdf_point_geometry_mismatches",
+            "pdf_xhtml_crosscheck_max_micropoints",
+            "semantic_codepoint_precision_ppm",
+            "semantic_codepoint_recall_ppm",
+            "similarity_mean_ppm",
+            "text_box_ambiguous",
+            "text_box_f1_ppm",
+            "text_box_libreoffice_unmatched",
+            "text_box_match_coverage_ppm",
+            "text_box_median_error_millipoints",
+            "text_box_p95_error_millipoints",
+            "text_box_precision_ppm",
+            "text_box_recall_ppm",
+            "text_box_unmatched",
+            "text_line_box_ambiguous",
+            "text_line_box_f1_ppm",
+            "text_line_box_libreoffice_unmatched",
+            "text_line_box_median_error_millipoints",
+            "text_line_box_p95_error_millipoints",
+            "text_line_box_precision_ppm",
+            "text_line_box_recall_ppm",
+            "text_line_box_unmatched",
+        },
+        "authored_metrics_schema",
+    )
+    _require(
+        _ppm(metrics["similarity_mean_ppm"], "authored_metrics") >= 950_000
+        and _ppm(metrics["edge_f1_ppm"], "authored_metrics") >= 970_000
+        and _ppm(
+            metrics["semantic_codepoint_precision_ppm"],
+            "authored_metrics",
+        )
+        >= 999_000
+        and _ppm(
+            metrics["semantic_codepoint_recall_ppm"],
+            "authored_metrics",
+        )
+        >= 999_000,
+        "authored_metric_threshold",
+    )
+    for prefix in ("text_box", "text_line_box"):
+        candidates = _bounded_int(
+            coverage[f"{prefix}_candidates"],
+            f"authored_coverage:{prefix}",
+            minimum=1,
+        )
+        references = _bounded_int(
+            coverage[f"{prefix}_libreoffice_items"],
+            f"authored_coverage:{prefix}",
+            minimum=1,
+        )
+        matches = _bounded_int(
+            coverage[f"{prefix}_matches"],
+            f"authored_coverage:{prefix}",
+            minimum=1,
+        )
+        ambiguous = _bounded_int(
+            metrics[f"{prefix}_ambiguous"],
+            f"authored_metrics:{prefix}",
+        )
+        unmatched = _bounded_int(
+            metrics[f"{prefix}_unmatched"],
+            f"authored_metrics:{prefix}",
+        )
+        reference_unmatched = _bounded_int(
+            metrics[f"{prefix}_libreoffice_unmatched"],
+            f"authored_metrics:{prefix}",
+        )
+        _require(
+            candidates == matches + ambiguous + unmatched
+            and references == matches + reference_unmatched,
+            f"authored_coverage:{prefix}_matching",
+        )
+        precision = _ratio_ppm(matches, candidates)
+        recall = _ratio_ppm(matches, references)
+        f1 = _ratio_ppm(2 * matches, candidates + references)
+        _require(
+            _ppm(
+                metrics[f"{prefix}_precision_ppm"],
+                f"authored_metrics:{prefix}",
+            )
+            == precision
+            >= 999_000
+            and _ppm(
+                metrics[f"{prefix}_recall_ppm"],
+                f"authored_metrics:{prefix}",
+            )
+            == recall
+            >= 999_000
+            and _ppm(
+                metrics[f"{prefix}_f1_ppm"],
+                f"authored_metrics:{prefix}",
+            )
+            == f1
+            >= 999_000,
+            "authored_text_threshold",
+        )
+    _require(
+        _ppm(
+            metrics["text_box_match_coverage_ppm"],
+            "authored_metrics:text_box",
+        )
+        == metrics["text_box_precision_ppm"],
+        "authored_text_coverage",
+    )
+    _require(
+        metrics["pdf_point_geometry_mismatches"] == 0,
+        "authored_point_geometry",
+    )
+    text_median = _bounded_int(
+        metrics["text_box_median_error_millipoints"],
+        "authored_text_geometry",
+        maximum=1_000,
+    )
+    text_p95 = _bounded_int(
+        metrics["text_box_p95_error_millipoints"],
+        "authored_text_geometry",
+        maximum=2_500,
+    )
+    line_median = _bounded_int(
+        metrics["text_line_box_median_error_millipoints"],
+        "authored_line_geometry",
+        maximum=1_000,
+    )
+    line_p95 = _bounded_int(
+        metrics["text_line_box_p95_error_millipoints"],
+        "authored_line_geometry",
+        maximum=2_500,
+    )
+    page_median = _bounded_int(
+        metrics["page_box_median_millipoints"],
+        "authored_page_geometry",
+        maximum=1_000,
+    )
+    page_p95 = _bounded_int(
+        metrics["page_box_p95_millipoints"],
+        "authored_page_geometry",
+        maximum=2_500,
+    )
+    page_max = _bounded_int(
+        metrics["page_box_max_millipoints"],
+        "authored_page_geometry",
+        maximum=5_000,
+    )
+    _require(
+        text_median <= text_p95
+        and line_median <= line_p95
+        and page_median <= page_p95 <= page_max
+        and _bounded_int(
+            metrics["pdf_xhtml_crosscheck_max_micropoints"],
+            "authored_page_geometry",
+            maximum=1_000,
+        )
+        <= 1_000,
+        "authored_geometry",
+    )
+    return {
+        "evidence": evidence,
+        "source_report": source_report,
+    }
+
+
+def _validate_repeatability_distribution(
+    value: object,
+    *,
+    maximum_ppm: int,
+) -> int:
+    _require(
+        isinstance(value, dict)
+        and set(value)
+        == {"absolute_deltas_ppm", "count", "max_absolute_delta_ppm"},
+        "repeatability_distribution",
+    )
+    deltas = value.get("absolute_deltas_ppm")
+    count = value.get("count")
+    maximum = value.get("max_absolute_delta_ppm")
+    _require(
+        isinstance(deltas, list)
+        and bool(deltas)
+        and type(count) is int
+        and count == len(deltas)
+        and count <= 10_000_000
+        and type(maximum) is int
+        and all(
+            type(delta) is int and 0 <= delta <= maximum_ppm
+            for delta in deltas
+        )
+        and deltas == sorted(deltas)
+        and maximum == deltas[-1],
+        "repeatability_distribution",
+    )
+    return count
+
+
+def _validate_repeatability(value: dict[str, Any]) -> None:
+    _require(
+        set(value)
+        == {
+            "coverage",
+            "drift",
+            "failures",
+            "identity",
+            "metric_policy",
+            "reports",
+            "schema",
+            "status",
+            "thresholds_ppm",
+        }
+        and value.get("schema")
+        == "rxls.libreoffice-render-repeatability.v1",
+        "repeatability_schema",
+    )
+    thresholds = value.get("thresholds_ppm")
+    _require(
+        thresholds
+        == {
+            "blurred_luma_similarity_max_absolute_drift": 20_000,
+            "mask_f1_max_absolute_drift": 20_000,
+            "similarity_max_absolute_drift": 20_000,
+        },
+        "repeatability_thresholds",
+    )
+    _require(
+        value.get("status") == "pass" and value.get("failures") == [],
+        "repeatability_failed",
+    )
+    drift = value.get("drift")
+    _require(
+        isinstance(drift, dict)
+        and set(drift)
+        == {"blurred_luma_similarity", "mask_f1", "similarity"},
+        "repeatability_drift",
+    )
+    similarity_count = _validate_repeatability_distribution(
+        drift["similarity"],
+        maximum_ppm=20_000,
+    )
+    blur_count = _validate_repeatability_distribution(
+        drift["blurred_luma_similarity"],
+        maximum_ppm=20_000,
+    )
+    masks = drift.get("mask_f1")
+    _require(
+        isinstance(masks, dict)
+        and set(masks)
+        == {
+            "edge",
+            "foreground",
+            "max_absolute_delta_ppm",
+            "text_ink",
+        },
+        "repeatability_masks",
+    )
+    mask_counts = [
+        _validate_repeatability_distribution(
+            masks[key],
+            maximum_ppm=20_000,
+        )
+        for key in ("edge", "foreground", "text_ink")
+    ]
+    mask_maximum = max(
+        masks[key]["max_absolute_delta_ppm"]
+        for key in ("edge", "foreground", "text_ink")
+    )
+    _require(
+        masks["max_absolute_delta_ppm"] == mask_maximum
+        and type(masks["max_absolute_delta_ppm"]) is int
+        and similarity_count == blur_count
+        and mask_counts == [similarity_count] * 3,
+        "repeatability_observations",
+    )
+    coverage = value.get("coverage")
+    _require(
+        isinstance(coverage, dict)
+        and set(coverage)
+        == {"pages", "visual_observations_per_metric", "workbooks"}
+        and coverage.get("workbooks") == 800
+        and type(coverage.get("pages")) is int
+        and coverage["pages"] > 0
+        and coverage.get("visual_observations_per_metric")
+        == similarity_count,
+        "repeatability_coverage",
+    )
+    _require(
+        similarity_count == coverage["workbooks"] + coverage["pages"],
+        "repeatability_coverage",
+    )
+    identity = value.get("identity")
+    _require(
+        isinstance(identity, dict)
+        and set(identity)
+        == {
+            "baseline_contract",
+            "configuration",
+            "input_set",
+            "preflight",
+            "renderer_binary",
+        },
+        "repeatability_identity",
+    )
+    for key in ("configuration", "preflight"):
+        item = identity[key]
+        _require(
+            isinstance(item, dict)
+            and set(item)
+            == {"baseline_sha256", "candidate_sha256", "equal"}
+            and item["equal"] is True
+            and _nonzero_hash_matches(item["baseline_sha256"])
+            and item["baseline_sha256"] == item["candidate_sha256"],
+            "repeatability_identity",
+        )
+    input_set = identity["input_set"]
+    _require(
+        isinstance(input_set, dict)
+        and set(input_set)
+        == {
+            "baseline_count",
+            "baseline_sha256",
+            "candidate_count",
+            "candidate_sha256",
+            "equal",
+        }
+        and input_set["equal"] is True
+        and type(input_set["baseline_count"]) is int
+        and input_set["baseline_count"] == coverage["workbooks"]
+        and input_set["candidate_count"] == input_set["baseline_count"]
+        and _nonzero_hash_matches(input_set["baseline_sha256"])
+        and input_set["candidate_sha256"] == input_set["baseline_sha256"],
+        "repeatability_identity",
+    )
+    baseline_contract = identity["baseline_contract"]
+    _require(
+        isinstance(baseline_contract, dict)
+        and set(baseline_contract) == {"configuration", "input_set"},
+        "repeatability_baseline_contract",
+    )
+    baseline_configuration = baseline_contract["configuration"]
+    _require(
+        isinstance(baseline_configuration, dict)
+        and set(baseline_configuration)
+        == {"baseline_sha256", "candidate_sha256", "equal"}
+        and baseline_configuration["equal"] is True
+        and _nonzero_hash_matches(
+            baseline_configuration["baseline_sha256"]
+        )
+        and baseline_configuration["candidate_sha256"]
+        == baseline_configuration["baseline_sha256"],
+        "repeatability_baseline_contract",
+    )
+    baseline_input_set = baseline_contract["input_set"]
+    _require(
+        isinstance(baseline_input_set, dict)
+        and set(baseline_input_set)
+        == {
+            "baseline_count",
+            "baseline_sha256",
+            "candidate_count",
+            "candidate_sha256",
+            "equal",
+        }
+        and baseline_input_set["equal"] is True
+        and type(baseline_input_set["baseline_count"]) is int
+        and baseline_input_set["baseline_count"] == coverage["workbooks"]
+        and baseline_input_set["candidate_count"]
+        == baseline_input_set["baseline_count"]
+        and _nonzero_hash_matches(
+            baseline_input_set["baseline_sha256"]
+        )
+        and baseline_input_set["candidate_sha256"]
+        == baseline_input_set["baseline_sha256"],
+        "repeatability_baseline_contract",
+    )
+    renderer_binary = identity["renderer_binary"]
+    _require(
+        isinstance(renderer_binary, dict)
+        and set(renderer_binary) == {"baseline", "candidate", "equal"}
+        and renderer_binary["equal"] is True
+        and isinstance(renderer_binary["baseline"], dict)
+        and set(renderer_binary["baseline"]) == {"bytes", "sha256"}
+        and type(renderer_binary["baseline"]["bytes"]) is int
+        and renderer_binary["baseline"]["bytes"] > 0
+        and _nonzero_hash_matches(renderer_binary["baseline"]["sha256"])
+        and renderer_binary["candidate"] == renderer_binary["baseline"],
+        "repeatability_identity",
+    )
+    reports = value.get("reports")
+    _require(
+        isinstance(reports, dict)
+        and set(reports) == {"baseline", "candidate"}
+        and all(
+            isinstance(reports[key], dict)
+            and set(reports[key]) == {"bytes", "sha256"}
+            and type(reports[key]["bytes"]) is int
+            and reports[key]["bytes"] > 0
+            and _nonzero_hash_matches(reports[key]["sha256"])
+            for key in reports
+        ),
+        "repeatability_reports",
+    )
+    _require(
+        value.get("metric_policy")
+        == {
+            "distribution": "sorted_absolute_paired_integer_ppm_deltas",
+            "input_pairing": "sha256",
+            "observations": "workbook_aggregate_and_page",
+            "paths_or_content_retained": False,
+        },
+        "repeatability_policy",
+    )
+
+
+def _validate_repeatability_bindings(
+    value: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    renderer: dict[str, Any],
+    fidelities: list[dict[str, object]],
+) -> None:
+    _require(
+        len(candidates) == 2 and len(fidelities) == 2,
+        "repeatability_candidate_count",
+    )
+    identity = value["identity"]
+    baseline_contract = identity["baseline_contract"]
+    _require(
+        baseline_contract["configuration"]["baseline_sha256"]
+        == candidates[0]["configuration_sha256"]
+        and baseline_contract["configuration"]["candidate_sha256"]
+        == candidates[1]["configuration_sha256"],
+        "repeatability_configuration_binding",
+    )
+    input_set = baseline_contract["input_set"]
+    _require(
+        input_set["baseline_sha256"] == candidates[0]["input_set_sha256"]
+        and input_set["candidate_sha256"] == candidates[1]["input_set_sha256"]
+        and input_set["baseline_count"] == candidates[0]["input_files"]
+        and input_set["candidate_count"] == candidates[1]["input_files"],
+        "repeatability_input_binding",
+    )
+    _require(
+        identity["renderer_binary"]["baseline"] == renderer
+        and identity["renderer_binary"]["candidate"] == renderer,
+        "repeatability_renderer_binding",
+    )
+    raw_input_set = identity["input_set"]
+    _require(
+        raw_input_set["baseline_count"] == 800
+        and raw_input_set["candidate_count"] == 800
+        and raw_input_set["baseline_sha256"]
+        == fidelities[0]["evidence"]["input_set_sha256"]
+        and raw_input_set["candidate_sha256"]
+        == fidelities[1]["evidence"]["input_set_sha256"],
+        "repeatability_fidelity_input_binding",
+    )
+    _require(
+        value["reports"]["baseline"] == fidelities[0]["source_report"]
+        and value["reports"]["candidate"] == fidelities[1]["source_report"],
+        "repeatability_source_report_binding",
+    )
+
+
+def _repeatability_score_drift_limits(
+    value: dict[str, Any],
+) -> dict[str, int]:
+    drift = value["drift"]
+    masks = drift["mask_f1"]
+    return {
+        "blurred_luma_similarity_ppm": drift[
+            "blurred_luma_similarity"
+        ]["max_absolute_delta_ppm"],
+        "edge_f1_ppm": masks["edge"]["max_absolute_delta_ppm"],
+        "foreground_f1_ppm": masks["foreground"][
+            "max_absolute_delta_ppm"
+        ],
+        "similarity_ppm": drift["similarity"][
+            "max_absolute_delta_ppm"
+        ],
+        "text_ink_f1_ppm": masks["text_ink"][
+            "max_absolute_delta_ppm"
+        ],
+    }
+
+
 def _validate_baseline_gate(
     gate: dict[str, Any],
+    reviewed: dict[str, Any],
     candidate: dict[str, Any],
     candidate_payload: bytes,
-    reviewed_baseline_sha256: str,
+    source_evidence: dict[str, object],
 ) -> None:
-    _require(gate.get("schema") == "rxls.render-parity-baseline-check.v1", "gate_schema")
-    _require(gate.get("passed") is True and gate.get("failures") == [], "ratchet_failed")
-    _require(gate.get("baseline_sha256") == reviewed_baseline_sha256, "baseline_identity")
+    baseline_checker = _load_baseline_checker()
+    try:
+        expected = baseline_checker.compare(reviewed, candidate)
+    except baseline_checker.BaselineError as error:
+        raise EvidenceError(f"baseline_compare:{error}") from error
+    expected["source_evidence"] = source_evidence
+    _require(gate == expected, "baseline_gate_recomputed")
     _require(
-        gate.get("candidate_sha256") == _canonical_sha256(candidate),
-        "candidate_identity",
+        gate["passed"] is True and gate["failures"] == [],
+        "ratchet_failed",
     )
-    _require(_sha256(candidate_payload) == _canonical_sha256(candidate), "candidate_encoding")
-    campaign = gate.get("campaign")
-    _require(isinstance(campaign, dict), "gate_campaign")
-    _require(campaign.get("case_count") == 800, "gate_case_count")
-    _require(campaign.get("kind") == "project_generated_hosted_full", "gate_kind")
-    _require(_hash_matches(campaign.get("manifest_sha256")), "gate_manifest_identity")
-    warning_policy = gate.get("warning_policy")
-    _require(isinstance(warning_policy, dict), "warning_policy")
-    _require(warning_policy.get("unclassified_codes") == [], "unreviewed_warning")
-    reviewed_count = warning_policy.get("reviewed_code_count")
-    candidate_count = warning_policy.get("candidate_code_count")
     _require(
-        isinstance(reviewed_count, int)
-        and isinstance(candidate_count, int)
-        and reviewed_count >= candidate_count >= 0,
-        "warning_policy_counts",
+        _sha256(candidate_payload) == _canonical_sha256(candidate),
+        "candidate_encoding",
+    )
+    _require(
+        gate["campaign"]["sha256"]
+        == _canonical_sha256(candidate["campaign"]),
+        "gate_campaign_sha256",
     )
 
 
@@ -1142,9 +2935,17 @@ def _validate_candidate_gate(
     gate: dict[str, Any],
     candidate: dict[str, Any],
     candidate_payload: bytes,
+    source_evidence: dict[str, object],
 ) -> None:
     _require(
-        set(gate) == {"baseline_sha256", "created", "passed", "schema"},
+        set(gate)
+        == {
+            "baseline_sha256",
+            "created",
+            "passed",
+            "schema",
+            "source_evidence",
+        },
         "candidate_gate_keys",
     )
     _require(
@@ -1154,6 +2955,10 @@ def _validate_candidate_gate(
     _require(
         gate.get("created") is True and gate.get("passed") is True,
         "candidate_gate_failed",
+    )
+    _require(
+        gate.get("source_evidence") == source_evidence,
+        "candidate_source_evidence",
     )
     candidate_sha256 = _canonical_sha256(candidate)
     _require(
@@ -1167,26 +2972,110 @@ def _validate_candidate_gate(
 
 
 def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
-    _require(candidate.get("schema") == "rxls.render-parity-baseline.v2", "candidate_schema")
-    _require(candidate.get("input_files") == 800, "candidate_case_count")
-    campaign = candidate.get("campaign")
-    _require(isinstance(campaign, dict), "candidate_campaign")
-    _require(campaign.get("schema") == "rxls.render-parity-campaign.v1", "campaign_schema")
-    _require(campaign.get("kind") == "project_generated_hosted_full", "campaign_kind")
+    baseline_checker = _load_baseline_checker()
+    try:
+        validated = baseline_checker.validate_observed_candidate(candidate)
+    except baseline_checker.BaselineError as error:
+        raise EvidenceError(f"candidate_invalid:{error}") from error
+    _require(validated == candidate, "candidate_normalization")
+    _require(
+        candidate.get("schema")
+        == baseline_checker.OBSERVED_CANDIDATE_SCHEMA,
+        "candidate_schema",
+    )
+    _require(
+        candidate.get("input_files") == 800,
+        "candidate_case_count",
+    )
+    _require(
+        candidate.get("comparable_files") == 800,
+        "candidate_comparable_count",
+    )
+    _require(
+        candidate.get("statuses") == {"compared": 800}
+        and candidate.get("classifications") == {"within_threshold": 800},
+        "candidate_statuses",
+    )
+    campaign = candidate["campaign"]
+    _require(
+        campaign.get("schema") == "rxls.render-parity-campaign.v1",
+        "campaign_schema",
+    )
+    _require(
+        campaign.get("kind") == "project_generated_hosted_full",
+        "campaign_kind",
+    )
     _require(campaign.get("profile") == "full", "campaign_profile")
+    _require(
+        campaign.get("generator") == "rxls-synthetic-render-corpus"
+        and campaign.get("generator_version") == "1.3.0",
+        "campaign_generator",
+    )
     _require(campaign.get("case_count") == 800, "campaign_case_count")
     _require(
-        campaign.get("format_counts")
-        == {"ods": 200, "xls": 200, "xlsb": 200, "xlsx": 200},
+        campaign.get("format_counts") == EXPECTED_FORMAT_COUNTS,
         "campaign_format_counts",
     )
-    _require(_hash_matches(campaign.get("manifest_sha256")), "campaign_manifest")
     _require(
-        campaign.get("input_set_sha256") == candidate.get("input_set_sha256")
-        and _hash_matches(candidate.get("input_set_sha256")),
+        campaign.get("feature_counts") == EXPECTED_FEATURE_COUNTS,
+        "campaign_feature_counts",
+    )
+    _require(
+        campaign.get("manifest_sha256")
+        == EXPECTED_HOSTED_FULL_MANIFEST_SHA256,
+        "campaign_manifest",
+    )
+    _require(
+        campaign.get("input_set_sha256")
+        == candidate.get("input_set_sha256")
+        == EXPECTED_HOSTED_FULL_INPUT_SET_SHA256,
         "campaign_input_identity",
     )
-    _require(isinstance(candidate.get("warning_counts"), dict), "candidate_warnings")
+    _require(
+        _nonzero_hash_matches(candidate.get("configuration_sha256")),
+        "candidate_configuration",
+    )
+    groups = candidate.get("groups")
+    _require(
+        isinstance(groups, list)
+        and len(groups) == 96
+        and baseline_checker.group_topology_sha256(groups)
+        == EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256,
+        "candidate_group_topology",
+    )
+    all_cohort = candidate["cohorts"]["all"]
+    _require(
+        all_cohort["workbooks"] == 800
+        and all_cohort["comparable_workbooks"] == 800,
+        "candidate_all_coverage",
+    )
+    for dimension in ("all", "by_feature", "by_format"):
+        rows = (
+            {"all": candidate["cohorts"]["all"]}
+            if dimension == "all"
+            else candidate["cohorts"][dimension]
+        )
+        for name, cohort in rows.items():
+            _require(
+                cohort["comparable_workbooks"] == cohort["workbooks"]
+                and set(cohort["scores"])
+                == baseline_checker.EXPECTED_SCORE_METRICS
+                and set(cohort["deltas"])
+                == baseline_checker.EXPECTED_DELTA_METRICS,
+                f"candidate_metric_coverage:{dimension}:{name}",
+            )
+    warning_counts = candidate.get("warning_counts")
+    _require(
+        isinstance(warning_counts, dict)
+        and len(warning_counts) <= 256
+        and all(
+            WARNING_CODE_RE.fullmatch(code) is not None
+            and type(count) is int
+            and 1 <= count <= 1_000_000
+            for code, count in warning_counts.items()
+        ),
+        "candidate_warnings",
+    )
     return campaign
 
 
@@ -1261,12 +3150,26 @@ def validate(
         documents[name] = document
         payloads[name] = payload
 
+    baseline_checker = _load_baseline_checker()
+    reviewed: dict[str, Any] | None = None
     if baseline_mode == "verify":
         _require(reviewed_baseline is not None, "reviewed_baseline_required")
-        reviewed, _ = _read_json(reviewed_baseline)
+        reviewed, reviewed_payload = _read_json(reviewed_baseline)
+        try:
+            normalized_reviewed = baseline_checker.validate_reviewed_ratchet(
+                reviewed
+            )
+        except baseline_checker.BaselineError as error:
+            raise EvidenceError(f"reviewed_invalid:{error}") from error
         _require(
-            reviewed.get("schema") == "rxls.render-parity-baseline.v2",
+            reviewed.get("schema")
+            == baseline_checker.RATCHET_ENVELOPE_SCHEMA
+            and normalized_reviewed == reviewed,
             "reviewed_schema",
+        )
+        _require(
+            _sha256(reviewed_payload) == _canonical_sha256(reviewed),
+            "reviewed_encoding",
         )
         reviewed_sha256: str | None = _canonical_sha256(reviewed)
     else:
@@ -1274,19 +3177,63 @@ def validate(
         reviewed_sha256 = None
     contract = _release_contract(oracle_lock, oracle_wrapper)
 
-    candidates = []
-    gates = []
+    fidelities = [
+        documents["fidelity-a.json"],
+        documents["fidelity-b.json"],
+    ]
+    fidelity_results = [
+        _validate_fidelity_gate(fidelity)
+        for fidelity in fidelities
+    ]
+    fidelity_evidence = [
+        result["evidence"]
+        for result in fidelity_results
+    ]
+    _require(
+        all(isinstance(evidence, dict) for evidence in fidelity_evidence),
+        "fidelity_evidence",
+    )
+    full_corpus_keys = {
+        "feature_map_sha256",
+        "input_set_sha256",
+        "manifest_sha256",
+    }
+    fidelity_bindings = [
+        {
+            key: evidence[key]
+            for key in full_corpus_keys
+        }
+        for evidence in fidelity_evidence
+    ]
+    _require(
+        fidelity_bindings[0] == fidelity_bindings[1],
+        "fidelity_corpus_repeatability",
+    )
+
+    authored = documents["authored-print-gate.json"]
+    authored_result = _validate_authored_gate(authored)
+    authored_evidence = authored_result["evidence"]
+    _require(isinstance(authored_evidence, dict), "authored_evidence")
+
+    candidates: list[dict[str, Any]] = []
+    candidate_campaigns: list[dict[str, Any]] = []
+    gates: list[dict[str, Any]] = []
     for label in ("a", "b"):
+        index = "ab".index(label)
         candidate = documents[f"baseline-candidate-{label}.json"]
         candidate_campaign = _validate_candidate(candidate)
         gate = documents[f"baseline-gate-{label}.json"]
+        source_report = fidelity_results[index]["source_report"]
+        _require(isinstance(source_report, dict), "fidelity_source_report")
         if baseline_mode == "verify":
+            assert reviewed is not None
             assert reviewed_sha256 is not None
             _validate_baseline_gate(
                 gate,
+                reviewed,
                 candidate,
                 payloads[f"baseline-candidate-{label}.json"],
-                reviewed_sha256,
+                source_report,
             )
             _require(
                 gate["campaign"]["manifest_sha256"]
@@ -1298,58 +3245,92 @@ def validate(
                 gate,
                 candidate,
                 payloads[f"baseline-candidate-{label}.json"],
+                source_report,
             )
         candidates.append(candidate)
+        candidate_campaigns.append(candidate_campaign)
         gates.append(gate)
-    _require(candidates[0]["campaign"] == candidates[1]["campaign"], "campaign_repeatability")
-    _require(candidates[0]["warning_counts"] == candidates[1]["warning_counts"], "warning_repeatability")
-
-    fidelities = [documents["fidelity-a.json"], documents["fidelity-b.json"]]
-    for fidelity in fidelities:
-        _require(fidelity.get("schema") == "rxls.render-fidelity-targets.v1", "fidelity_schema")
-        _require(fidelity.get("passed") is True and fidelity.get("failures") == [], "fidelity_failed")
-
-    authored = documents["authored-print-gate.json"]
-    _require(authored.get("schema") == "rxls.authored-print-parity.v1", "authored_schema")
-    _require(authored.get("passed") is True and authored.get("failures") == [], "authored_failed")
     _require(
-        authored.get("coverage", {}).get("workbooks") == 100
-        and authored.get("coverage", {}).get("pages") == 400,
-        "authored_coverage",
+        candidates[0]["campaign"] == candidates[1]["campaign"],
+        "campaign_repeatability",
+    )
+    _require(
+        candidates[0]["warning_counts"] == candidates[1]["warning_counts"],
+        "warning_repeatability",
     )
 
     repeatability = documents["repeatability.json"]
-    _require(
-        repeatability.get("schema") == "rxls.libreoffice-render-repeatability.v1",
-        "repeatability_schema",
-    )
-    _require(
-        repeatability.get("status") == "pass" and repeatability.get("failures") == [],
-        "repeatability_failed",
-    )
-    _require(
-        repeatability.get("coverage", {}).get("workbooks") == 800,
-        "repeatability_coverage",
-    )
+    _validate_repeatability(repeatability)
 
     build = documents["build.json"]
     _validate_build(build, head_sha, contract)
-    for fidelity in fidelities:
+    for evidence in fidelity_evidence:
         _validate_gate_image_binding(
-            fidelity.get("evidence"),
+            evidence,
             build,
             "fidelity",
         )
-    _validate_gate_image_binding(authored.get("evidence"), build, "authored")
-    host_tools = documents["host-tools.json"]
-    _require(host_tools.get("identity_status") == "pinned_match", "host_identity")
-    _require(
-        host_tools.get("captured_identity_sha256")
-        == host_tools.get("expected_identity_sha256"),
-        "host_identity_mismatch",
-    )
+    _validate_gate_image_binding(authored_evidence, build, "authored")
+    host_tools = _validate_host_tools(documents["host-tools.json"])
     renderer = documents["renderer.json"]
-    _require(_hash_matches(renderer.get("sha256")), "renderer_identity")
+    _require(
+        set(renderer) == {"bytes", "sha256"}
+        and type(renderer.get("bytes")) is int
+        and renderer["bytes"] > 0
+        and _nonzero_hash_matches(renderer.get("sha256")),
+        "renderer_identity",
+    )
+    _validate_repeatability_bindings(
+        repeatability,
+        candidates,
+        renderer,
+        fidelity_results,
+    )
+
+    shared_tool_keys = {
+        "font_pack_sha256",
+        "host_tools_identity_sha256",
+        "oracle_build_contract_sha256",
+        "oracle_image_config_digest",
+        "oracle_image_manifest_digest",
+        "oracle_libreoffice_artifact_sha256",
+        "oracle_lock_file_sha256",
+        "pdffonts_sha256",
+        "pdfinfo_sha256",
+        "pdftoppm_sha256",
+        "pdftotext_sha256",
+        "renderer_sha256",
+    }
+    shared_tools = {
+        key: fidelity_evidence[0][key]
+        for key in shared_tool_keys
+    }
+    _require(
+        all(
+            {
+                key: evidence[key]
+                for key in shared_tool_keys
+            }
+            == shared_tools
+            for evidence in (*fidelity_evidence[1:], authored_evidence)
+        ),
+        "gate_toolchain_repeatability",
+    )
+    _require(
+        shared_tools["renderer_sha256"] == renderer["sha256"]
+        and shared_tools["host_tools_identity_sha256"]
+        == host_tools.get("captured_identity_sha256"),
+        "gate_toolchain_binding",
+    )
+    _require(
+        authored_evidence["manifest_sha256"]
+        == fidelity_bindings[0]["manifest_sha256"]
+        and authored_evidence["input_set_sha256"]
+        != fidelity_bindings[0]["input_set_sha256"]
+        and authored_evidence["feature_map_sha256"]
+        != fidelity_bindings[0]["feature_map_sha256"],
+        "authored_corpus_binding",
+    )
 
     summary = documents["hosted-summary.json"]
     _require(
@@ -1380,9 +3361,21 @@ def validate(
         summary.get("baseline_mode") == baseline_mode,
         "summary_baseline_mode",
     )
-    campaign_summary = summary.get("campaign", {})
+    campaign_summary = summary.get("campaign")
     _require(
-        campaign_summary.get("mode") == campaign
+        isinstance(campaign_summary, dict)
+        and set(campaign_summary)
+        == {
+            "case_count",
+            "mode",
+            "parallel_shards",
+            "repetitions",
+            "sha256",
+            "shard_case_counts",
+            "shard_count",
+            "shard_format_counts",
+        }
+        and campaign_summary.get("mode") == campaign
         and campaign_summary.get("case_count") == 800
         and campaign_summary.get("repetitions") == 2
         and campaign_summary.get("shard_count") == 4
@@ -1394,20 +3387,119 @@ def validate(
         isinstance(shard_counts, list)
         and len(shard_counts) == 4
         and sum(shard_counts) == 800
-        and all(isinstance(count, int) and 180 <= count <= 220 for count in shard_counts),
+        and all(type(count) is int and 180 <= count <= 220 for count in shard_counts),
         "summary_shards",
     )
+    shard_format_counts = campaign_summary["shard_format_counts"]
     _require(
-        summary.get("summary", {}).get("files") == 800
-        and summary.get("summary", {}).get("by_status") == {"compared": 800},
+        isinstance(shard_format_counts, list)
+        and len(shard_format_counts) == 4
+        and all(
+            isinstance(row, dict)
+            and set(row) == set(EXPECTED_FORMAT_COUNTS)
+            and all(
+                type(count) is int and 40 <= count <= 60
+                for count in row.values()
+            )
+            for row in shard_format_counts
+        )
+        and [
+            sum(row.values())
+            for row in shard_format_counts
+        ]
+        == shard_counts
+        and {
+            name: sum(row[name] for row in shard_format_counts)
+            for name in EXPECTED_FORMAT_COUNTS
+        }
+        == EXPECTED_FORMAT_COUNTS,
+        "summary_shard_formats",
+    )
+    candidate_campaign = candidate_campaigns[0]
+    _require(
+        campaign_summary["sha256"]
+        == _canonical_sha256(candidate_campaign),
+        "summary_campaign_sha256",
+    )
+    report_summary = summary.get("summary")
+    _require(
+        isinstance(report_summary, dict)
+        and set(report_summary)
+        == {
+            "by_classification",
+            "by_status",
+            "files",
+            "input_bytes_considered",
+            "warning_counts",
+        }
+        and report_summary["files"] == candidates[1]["input_files"] == 800
+        and report_summary["by_status"] == candidates[1]["statuses"]
+        and report_summary["by_classification"]
+        == candidates[1]["classifications"]
+        and report_summary["warning_counts"]
+        == candidates[1]["warning_counts"]
+        and type(report_summary["input_bytes_considered"]) is int
+        and report_summary["input_bytes_considered"] > 0,
         "summary_coverage",
     )
+    summary_corpus = summary.get("corpus")
     _require(
-        summary.get("corpus", {}).get("profile") == "full"
-        and summary.get("corpus", {}).get("case_count") == 800
-        and summary.get("corpus", {}).get("rights_tier") == "S"
-        and summary.get("corpus", {}).get("redistribution") == "allowed",
+        isinstance(summary_corpus, dict)
+        and set(summary_corpus)
+        == {
+            "acquired_corpus_included",
+            "case_count",
+            "feature_counts",
+            "format_counts",
+            "generator",
+            "generator_version",
+            "group_topology_sha256",
+            "input_set_sha256",
+            "license",
+            "manifest_sha256",
+            "profile",
+            "render_redistributable",
+            "redistribution",
+            "rights_tier",
+            "schema_version",
+            "scope",
+            "source_redistributable",
+        },
+        "summary_corpus_schema",
+    )
+    _require(
+        summary_corpus
+        == {
+            "acquired_corpus_included": False,
+            "case_count": candidate_campaign["case_count"],
+            "feature_counts": candidate_campaign["feature_counts"],
+            "format_counts": candidate_campaign["format_counts"],
+            "generator": "rxls-synthetic-render-corpus",
+            "generator_version": "1.3.0",
+            "group_topology_sha256": (
+                EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
+            ),
+            "input_set_sha256": (
+                EXPECTED_HOSTED_FULL_INPUT_SET_SHA256
+            ),
+            "license": "MIT",
+            "manifest_sha256": candidate_campaign["manifest_sha256"],
+            "profile": candidate_campaign["profile"],
+            "render_redistributable": True,
+            "redistribution": "allowed",
+            "rights_tier": "S",
+            "schema_version": 1,
+            "scope": "project_generated_hosted_acceptance",
+            "source_redistributable": True,
+        },
         "summary_corpus",
+    )
+    _require(
+        fidelity_bindings[0]["manifest_sha256"]
+        == candidate_campaign["manifest_sha256"]
+        and fidelity_bindings[0]["input_set_sha256"]
+        == candidate_campaign["input_set_sha256"],
+        "candidate_fidelity_corpus_binding",
     )
     _require(summary.get("renderer") == renderer, "summary_renderer")
     _require(summary.get("host_tools") == host_tools, "summary_host_tools")
@@ -1443,9 +3535,18 @@ def validate(
         and container.get("lock_file_sha256") == build.get("lock_file_sha256")
         and container.get("source_commit") == build.get("source_commit") == head_sha
         and container.get("wrapper_sha256") == build.get("wrapper_sha256")
-        and _hash_matches(container.get("oracle_artifact_sha256"))
+        and container.get("oracle_artifact_sha256")
+        == LIBREOFFICE_ARTIFACT_SHA256
         and container.get("oracle_version") == "26.2.3.2",
         "summary_container",
+    )
+    _validate_font_pack(
+        summary.get("font_pack"),
+        shared_tools["font_pack_sha256"],
+    )
+    _require(
+        summary.get("metrics") == candidates[1]["cohorts"],
+        "summary_metrics",
     )
 
     baseline_summary = summary.get("baseline_ratcheting")
@@ -1494,6 +3595,7 @@ def validate(
         if baseline_mode == "verify":
             expected_gate_summary = {
                 "baseline_sha256": gate["baseline_sha256"],
+                "bytes": len(payloads[f"baseline-gate-{label}.json"]),
                 "candidate_sha256": gate["candidate_sha256"],
                 "failures": gate["failures"],
                 "passed": gate["passed"],
@@ -1503,6 +3605,7 @@ def validate(
         else:
             expected_gate_summary = {
                 "baseline_sha256": None,
+                "bytes": len(payloads[f"baseline-gate-{label}.json"]),
                 "candidate_sha256": _canonical_sha256(candidate),
                 "failures": [],
                 "passed": True,
@@ -1510,13 +3613,16 @@ def validate(
                 "warning_policy": None,
             }
         _require(summary_gates[index] == expected_gate_summary, "summary_gate_identity")
+        expected_candidate_summary = {
+            "bytes": len(payloads[f"baseline-candidate-{label}.json"]),
+            "campaign_sha256": _canonical_sha256(candidate["campaign"]),
+            "sha256": _sha256(
+                payloads[f"baseline-candidate-{label}.json"]
+            ),
+            "warning_counts": candidate["warning_counts"],
+        }
         _require(
-            summary_candidates[index].get("sha256")
-            == _sha256(payloads[f"baseline-candidate-{label}.json"])
-            and summary_candidates[index].get("campaign_sha256")
-            == _canonical_sha256(candidate["campaign"])
-            and summary_candidates[index].get("warning_counts")
-            == candidate["warning_counts"],
+            summary_candidates[index] == expected_candidate_summary,
             "summary_candidate_identity",
         )
     if baseline_mode == "verify":
@@ -1530,12 +3636,26 @@ def validate(
     evidence_runs = summary.get("evidence_runs")
     _require(isinstance(evidence_runs, list) and len(evidence_runs) == 2, "summary_evidence_runs")
     for index, label in enumerate(("a", "b")):
+        source_report = fidelity_results[index]["source_report"]
+        assert isinstance(source_report, dict)
+        candidate_payload = payloads[f"baseline-candidate-{label}.json"]
+        gate_payload = payloads[f"baseline-gate-{label}.json"]
+        fidelity_payload = payloads[f"fidelity-{label}.json"]
+        expected_evidence_run = {
+            "baseline_candidate_bytes": len(candidate_payload),
+            "baseline_candidate_sha256": _sha256(candidate_payload),
+            "baseline_gate_bytes": len(gate_payload),
+            "baseline_gate_sha256": _sha256(gate_payload),
+            "campaign_sha256": _canonical_sha256(
+                candidates[index]["campaign"]
+            ),
+            "fidelity_gate_bytes": len(fidelity_payload),
+            "fidelity_gate_sha256": _sha256(fidelity_payload),
+            "report_bytes": source_report["bytes"],
+            "report_sha256": source_report["sha256"],
+        }
         _require(
-            evidence_runs[index].get("fidelity_gate_sha256")
-            == _sha256(payloads[f"fidelity-{label}.json"])
-            and _hash_matches(evidence_runs[index].get("report_sha256"))
-            and isinstance(evidence_runs[index].get("report_bytes"), int)
-            and evidence_runs[index]["report_bytes"] > 0,
+            evidence_runs[index] == expected_evidence_run,
             "summary_fidelity_identity",
         )
         expected_fidelity = {
@@ -1543,6 +3663,19 @@ def validate(
             for key in ("coverage", "metrics", "passed", "thresholds")
         }
         _require(summary.get("fidelity", [])[index] == expected_fidelity, "summary_fidelity")
+    _require(
+        repeatability["reports"]["baseline"]
+        == {
+            "bytes": evidence_runs[0]["report_bytes"],
+            "sha256": evidence_runs[0]["report_sha256"],
+        }
+        and repeatability["reports"]["candidate"]
+        == {
+            "bytes": evidence_runs[1]["report_bytes"],
+            "sha256": evidence_runs[1]["report_sha256"],
+        },
+        "repeatability_report_binding",
+    )
     expected_authored = {
         key: authored[key]
         for key in ("coverage", "evidence", "expected", "metrics", "passed", "thresholds")
@@ -1562,12 +3695,16 @@ def validate(
         "bootstrap_source_commit": contract["bootstrap_source_commit"],
         "build_contract_sha256": build["build_contract_sha256"],
         "campaign": campaign,
+        "campaign_sha256": _canonical_sha256(candidate_campaign),
         "head_sha": head_sha,
         "full_cases": 800,
         "lock_file_sha256": build["lock_file_sha256"],
         "oracle_config_digest": build["built_image_id"],
         "oracle_manifest_digest": build["built_manifest_digest"],
         "ratchets": 2,
+        "repeatability_sha256": _sha256(
+            payloads["repeatability.json"]
+        ),
         "reviewed_baseline_sha256": reviewed_sha256,
         "source_commit": build["source_commit"],
         "wrapper_sha256": build["wrapper_sha256"],
@@ -1588,6 +3725,188 @@ def validate(
     return report
 
 
+def build_adoption_baseline_and_receipt(
+    artifact_dir: Path,
+    *,
+    head_sha: str,
+    workflow_run_id: int,
+    workflow_run_attempt: int,
+    artifact_id: int,
+    artifact_name: str,
+    artifact_size_bytes: int,
+    artifact_digest: str,
+    artifact_repository: str,
+    oracle_lock: Path = DEFAULT_ORACLE_LOCK,
+    oracle_wrapper: Path = DEFAULT_ORACLE_WRAPPER,
+) -> tuple[bytes, dict[str, object]]:
+    """Derive and attest the reviewed baseline after full artifact validation."""
+
+    validation_report = validate(
+        artifact_dir,
+        head_sha,
+        None,
+        campaign="full",
+        baseline_mode="candidate",
+        workflow_run_id=workflow_run_id,
+        workflow_run_attempt=workflow_run_attempt,
+        artifact_id=artifact_id,
+        artifact_name=artifact_name,
+        artifact_size_bytes=artifact_size_bytes,
+        artifact_digest=artifact_digest,
+        artifact_repository=artifact_repository,
+        oracle_lock=oracle_lock,
+        oracle_wrapper=oracle_wrapper,
+    )
+    candidate_a, candidate_a_payload = _read_json(
+        artifact_dir / "baseline-candidate-a.json"
+    )
+    candidate_b, candidate_b_payload = _read_json(
+        artifact_dir / "baseline-candidate-b.json"
+    )
+    repeatability, repeatability_payload = _read_json(
+        artifact_dir / "repeatability.json"
+    )
+    renderer, _ = _read_json(artifact_dir / "renderer.json")
+    fidelity_a, _ = _read_json(artifact_dir / "fidelity-a.json")
+    fidelity_b, _ = _read_json(artifact_dir / "fidelity-b.json")
+    _validate_candidate(candidate_a)
+    _validate_candidate(candidate_b)
+    _validate_repeatability(repeatability)
+    _require(
+        set(renderer) == {"bytes", "sha256"}
+        and type(renderer.get("bytes")) is int
+        and renderer["bytes"] > 0
+        and _nonzero_hash_matches(renderer.get("sha256")),
+        "renderer_identity",
+    )
+    fidelity_results = [
+        _validate_fidelity_gate(fidelity)
+        for fidelity in (fidelity_a, fidelity_b)
+    ]
+    _validate_repeatability_bindings(
+        repeatability,
+        [candidate_a, candidate_b],
+        renderer,
+        fidelity_results,
+    )
+    baseline_checker = _load_baseline_checker()
+    try:
+        adopted = baseline_checker.conservative_adoption_baseline(
+            candidate_a,
+            candidate_b,
+            max_score_drift_ppm=_repeatability_score_drift_limits(
+                repeatability
+            ),
+        )
+    except baseline_checker.BaselineError as error:
+        raise EvidenceError(f"baseline_adoption:{error}") from error
+    adopted_payload = baseline_checker.canonical_bytes(adopted)
+    _require(
+        adopted
+        == baseline_checker.validate_ratchet_envelope(
+            _strict_json_loads(adopted_payload, "adopted_baseline_json")
+        ),
+        "adopted_baseline_validation",
+    )
+    for candidate in (candidate_a, candidate_b):
+        _require(
+            baseline_checker.compare(adopted, candidate)["passed"] is True,
+            "adopted_baseline_candidate",
+        )
+    candidate_sha256s = sorted(
+        [
+            _sha256(candidate_a_payload),
+            _sha256(candidate_b_payload),
+        ]
+    )
+    _require(
+        adopted["source_policy"]["candidate_sha256s"]
+        == candidate_sha256s,
+        "adopted_baseline_sources",
+    )
+
+    campaign = adopted["campaign"]
+    fidelity_bindings = [
+        {
+            "feature_map_sha256": evidence.get("feature_map_sha256"),
+            "input_set_sha256": evidence.get("input_set_sha256"),
+            "manifest_sha256": evidence.get("manifest_sha256"),
+        }
+        for evidence in (
+            fidelity_results[0]["evidence"],
+            fidelity_results[1]["evidence"],
+        )
+        if isinstance(evidence, dict)
+    ]
+    _require(
+        len(fidelity_bindings) == 2
+        and fidelity_bindings[0] == fidelity_bindings[1]
+        and fidelity_bindings[0]["manifest_sha256"]
+        == campaign["manifest_sha256"]
+        and fidelity_bindings[0]["input_set_sha256"]
+        == campaign["input_set_sha256"],
+        "adoption_fidelity_binding",
+    )
+    _require(
+        repeatability.get("status") == "pass"
+        and repeatability.get("failures") == [],
+        "adoption_repeatability",
+    )
+    receipt: dict[str, object] = {
+        "adopted_baseline_sha256": _sha256(adopted_payload),
+        "artifact": {
+            "digest": artifact_digest,
+            "id": artifact_id,
+            "name": artifact_name,
+            "repository": artifact_repository,
+            "size_in_bytes": artifact_size_bytes,
+        },
+        "baseline_mode": "candidate",
+        "campaign": {
+            "case_count": campaign["case_count"],
+            "feature_map_sha256": fidelity_bindings[0]["feature_map_sha256"],
+            "input_set_sha256": campaign["input_set_sha256"],
+            "manifest_sha256": campaign["manifest_sha256"],
+            "sha256": _canonical_sha256(campaign),
+        },
+        "candidate_sha256": candidate_sha256s,
+        "head_sha": head_sha,
+        "passed": True,
+        "policy": {
+            "candidate_order_independent": True,
+            "delta_drift_metrics": [],
+            "id": baseline_checker.ADOPTION_POLICY,
+            "maximum_score_drift_ppm": (
+                baseline_checker.ADOPTION_MAX_SCORE_DRIFT_PPM
+            ),
+            "observed_score_drift_maximum_ppm": (
+                _repeatability_score_drift_limits(repeatability)
+            ),
+            "score_drift_metrics": sorted(
+                baseline_checker.ADOPTION_SCORE_METRICS
+            ),
+            "source_policy": adopted["source_policy"],
+        },
+        "previous_baseline_sha256": None,
+        "repeatability_sha256": _sha256(repeatability_payload),
+        "release_evidence": {
+            "campaign_sha256": validation_report["campaign_sha256"],
+            "source_reports": [
+                fidelity_results[0]["source_report"],
+                fidelity_results[1]["source_report"],
+            ],
+        },
+        "schema": ADOPTION_RECEIPT_SCHEMA,
+        "workflow": {
+            "run_attempt": workflow_run_attempt,
+            "run_id": workflow_run_id,
+        },
+    }
+    _require(len(receipt["candidate_sha256"]) == 2, "adoption_candidates")
+    _path_neutral(receipt)
+    return adopted_payload, receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--download-repository", required=True)
@@ -1601,8 +3920,12 @@ def main() -> int:
     parser.add_argument("--workflow-run-id", type=int, required=True)
     parser.add_argument("--workflow-run-attempt", type=int, required=True)
     parser.add_argument("--artifact-digest", required=True)
+    parser.add_argument("--adopt-baseline", type=Path)
     parser.add_argument("--write-report", type=Path)
     args = parser.parse_args()
+    adopted_payload: bytes | None = None
+    adoption_destination: Path | None = None
+    receipt_path: Path | None = None
     try:
         _validate_artifact_binding(
             head_sha=args.head_sha,
@@ -1616,6 +3939,35 @@ def main() -> int:
             artifact_digest=args.artifact_digest,
             repository=args.download_repository,
         )
+        if args.adopt_baseline is not None:
+            _require(
+                args.baseline_mode == "candidate"
+                and args.campaign == "full"
+                and args.reviewed_baseline is None,
+                "adoption_mode",
+            )
+            _require(args.write_report is not None, "adoption_receipt_required")
+            adoption_destination = validate_adoption_checkout(
+                args.adopt_baseline,
+                args.head_sha,
+            )
+            receipt_path = args.write_report.expanduser()
+            if not receipt_path.is_absolute():
+                receipt_path = Path.cwd() / receipt_path
+            _require(
+                receipt_path.resolve(strict=False) != adoption_destination,
+                "adoption_receipt_destination",
+            )
+            authenticate_candidate_run_artifact(
+                repository=args.download_repository,
+                head_sha=args.head_sha,
+                workflow_run_id=args.workflow_run_id,
+                workflow_run_attempt=args.workflow_run_attempt,
+                artifact_id=args.github_artifact_id,
+                artifact_name=args.artifact_name,
+                artifact_size_bytes=args.artifact_size_bytes,
+                artifact_digest=args.artifact_digest,
+            )
         with tempfile.TemporaryDirectory(
             prefix="rxls-render-oracle-release-"
         ) as temporary:
@@ -1649,14 +4001,55 @@ def main() -> int:
                 artifact_digest=args.artifact_digest,
                 artifact_repository=args.download_repository,
             )
-        if args.write_report is not None:
-            args.write_report.parent.mkdir(parents=True, exist_ok=True)
-            args.write_report.write_text(
-                json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            if adoption_destination is not None:
+                adopted_payload, report = build_adoption_baseline_and_receipt(
+                    artifact_dir,
+                    head_sha=args.head_sha,
+                    workflow_run_id=args.workflow_run_id,
+                    workflow_run_attempt=args.workflow_run_attempt,
+                    artifact_id=args.github_artifact_id,
+                    artifact_name=args.artifact_name,
+                    artifact_size_bytes=args.artifact_size_bytes,
+                    artifact_digest=args.artifact_digest,
+                    artifact_repository=args.download_repository,
+                )
+        if adoption_destination is not None:
+            assert (
+                adopted_payload is not None
+                and args.write_report is not None
+                and receipt_path is not None
             )
+            validate_adoption_checkout(
+                adoption_destination,
+                args.head_sha,
+            )
+            write_adoption_pair_atomic(
+                adoption_destination,
+                adopted_payload,
+                receipt_path,
+                (json.dumps(report, indent=2, sort_keys=True) + "\n").encode(
+                    "utf-8"
+                ),
+            )
+        if args.write_report is not None:
+            if adoption_destination is None:
+                write_atomic(
+                    args.write_report,
+                    (json.dumps(report, indent=2, sort_keys=True) + "\n").encode(
+                        "utf-8"
+                    ),
+                )
     except (EvidenceError, OSError) as error:
         print(f"render release prerequisites: {error}", file=sys.stderr)
         return 1
+    if adoption_destination is not None:
+        print(
+            "render baseline adoption: "
+            f"head_sha={report['head_sha']} "
+            f"run_id={report['workflow']['run_id']} "
+            f"adopted_sha256={report['adopted_baseline_sha256']} passed=true"
+        )
+        return 0
     print(
         "render release prerequisites: "
         f"head_sha={report['head_sha']} campaign={report['campaign']} "
