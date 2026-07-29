@@ -8219,7 +8219,13 @@ def run_harness(
                 "implementation": _metric_implementation_evidence(),
             },
             "font_pack": (
-                config.font_pack.evidence if config.font_pack is not None else None
+                {
+                    "attestation_required": config.require_font_pack,
+                    "configured": True,
+                    **config.font_pack.evidence,
+                }
+                if config.font_pack is not None
+                else None
             ),
             "measurement_toolchain": (
                 config.poppler_identity

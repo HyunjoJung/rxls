@@ -2764,6 +2764,11 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(evidence["files"][0]["status"], "dry_run")
+        self.assertIsNone(evidence["configuration"]["font_pack"])
+        self.assertEqual(
+            evidence["preflight"]["font_pack"],
+            {"attestation_required": False, "configured": False},
+        )
         self.assertNotIn(str(root), rendered)
         self.assertNotIn("/private/tools", rendered)
         self.assertIn("SinglePageSheets", rendered)
@@ -3597,6 +3602,15 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         self.assertEqual(
             evidence["configuration"]["font_pack"]["pack_sha256"], expected_sha
         )
+        self.assertEqual(
+            evidence["configuration"]["font_pack"],
+            evidence["preflight"]["font_pack"],
+        )
+        self.assertIs(
+            evidence["configuration"]["font_pack"]["attestation_required"],
+            True,
+        )
+        self.assertIs(evidence["configuration"]["font_pack"]["configured"], True)
         self.assertTrue(evidence["preflight"]["font_pack"]["configured"])
         self.assertIn(
             "<font-pack-manifest>",
@@ -4584,6 +4598,69 @@ Page    2 CropBox: 0 0 841.125 595.0625
         self.assertEqual(
             binding["input_set_sha256"],
             altered["input_set_sha256"],
+        )
+
+    def test_ooxml_row_diagnostic_manifest_selects_one_unsharded_xlsx_lane(
+        self,
+    ) -> None:
+        generator = __import__("runpy").run_path(
+            str(ROOT / "scripts" / "generate-ooxml-row-oracle.py")
+        )
+        (ROOT / "local").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="ooxml-row-harness-", dir=ROOT / "local"
+        ) as raw:
+            output = Path(raw) / "corpus"
+            generator["generate"](output)
+            manifest = output / "manifest.json"
+            cases, discovery = MODULE.discover_manifest(
+                manifest,
+                max_manifest_bytes=256 * 1024,
+                max_candidates=12,
+                max_files=12,
+            )
+            filtered, discovery = MODULE.filter_cases(
+                cases,
+                discovery,
+                formats=("xlsx",),
+                required_features=("ooxml-implicit-row",),
+            )
+            selected, discovery = MODULE.select_shard(
+                filtered,
+                discovery,
+                shard_count=1,
+                shard_index=0,
+                max_files=12,
+            )
+            binding = MODULE.build_manifest_binding(
+                manifest,
+                selected,
+                max_manifest_bytes=256 * 1024,
+            )
+        self.assertEqual(len(selected), 12)
+        self.assertTrue(
+            all(
+                case.path.suffix == ".xlsx"
+                and "ooxml-implicit-row" in case.features
+                for case in selected
+            )
+        )
+        self.assertEqual(
+            discovery,
+            {
+                "candidate_count": 12,
+                "pre_shard_selected_count": 12,
+                "selected_count": 12,
+                "shard_candidate_count": 12,
+                "shard_count": 1,
+                "shard_index": 0,
+                "truncated": False,
+            },
+        )
+        self.assertEqual(binding["selected_case_count"], 12)
+        self.assertEqual(
+            binding["manifest_sha256"],
+            "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a",
         )
 
     def test_each_case_workspace_is_removed_before_the_next_case(self) -> None:

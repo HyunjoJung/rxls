@@ -362,6 +362,11 @@ steps:
                 "      source_sha: ${{ github.ref }}",
                 1,
             ),
+            "diagnostic_campaign_removed": original.replace(
+                "          - ooxml-row-diagnostic\n",
+                "",
+                1,
+            ),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
@@ -945,6 +950,77 @@ steps:
                     )
                 )
 
+    def test_render_oracle_rejects_weakened_ooxml_row_diagnostic_contract(
+        self,
+    ) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "case_count": original.replace(
+                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "12"',
+                'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "11"',
+                1,
+            ),
+            "candidate_mode": original.replace(
+                '            test "$RXLS_BASELINE_MODE" = "verify"\n',
+                "",
+                1,
+            ),
+            "identity_bootstrap": original.replace(
+                '            test "$RXLS_IDENTITY_BOOTSTRAP" = "0"\n',
+                "",
+                1,
+            ),
+            "unreviewed_generator": original.replace(
+                "python3 scripts/generate-ooxml-row-oracle.py --generate",
+                "python3 scripts/unreviewed-row-generator.py --generate",
+                1,
+            ),
+            "manifest_identity": original.replace(
+                "c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a",
+                "0" * 64,
+                1,
+            ),
+            "lane_filter": original.replace(
+                "lane_args+=(--format xlsx --required-feature ooxml-implicit-row)",
+                "lane_args+=(--format xlsx)",
+                1,
+            ),
+            "unreviewed_reducer": original.replace(
+                "python3 scripts/check-ooxml-row-oracle.py \\",
+                "python3 scripts/unreviewed-row-reducer.py \\",
+                1,
+            ),
+            "release_minimizer_pollution": original.replace(
+                "env.RXLS_ORACLE_CAMPAIGN != 'ooxml-row-diagnostic'",
+                "env.RXLS_ORACLE_CAMPAIGN != 'never'",
+                1,
+            ),
+            "raw_report_retained": original.replace(
+                "          report_path.unlink()\n",
+                "",
+                1,
+            ),
+            "aggregate_revalidation_removed": original.replace(
+                '          checker["_validate_output"](aggregate)\n',
+                "",
+                1,
+            ),
+            "raw_report_uploaded": original.replace(
+                "            target/render-oracle-upload/ooxml-row-oracle.json\n",
+                "            target/render-oracle-upload/ooxml-row-oracle.json\n"
+                "            target/render-oracle-hosted/parity-report-a.json\n",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                self.assertTrue(
+                    self.policy.audit_render_oracle_workflow(
+                        Path("render-oracle.yml"), workflow
+                    )
+                )
+
     def test_render_oracle_path_guards_reject_substring_keys(self) -> None:
         workflow = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         blocks = []
@@ -1154,6 +1230,14 @@ steps:
         self.assertIn("--required-feature print-settings", text)
         self.assertIn("--require-hosted-full-800", text)
         self.assertIn('"acquired_corpus_included": False', text)
+        self.assertIn("generate-ooxml-row-oracle.py --generate", text)
+        self.assertIn("--required-feature ooxml-implicit-row", text)
+        self.assertIn("scripts/check-ooxml-row-oracle.py", text)
+        self.assertIn(
+            "target/render-oracle-upload/ooxml-row-oracle.json",
+            text,
+        )
+        self.assertIn("report_path.unlink()", text)
         self.assertNotIn(
             "            target/render-oracle-hosted/parity-report-a.json\n",
             text,

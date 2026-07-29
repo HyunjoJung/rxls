@@ -17,7 +17,7 @@ from typing import Any, Iterable
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v3"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v4"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -198,6 +198,7 @@ FEATURES = frozenset(
         "column-width",
         "conditional-format",
         "date-format",
+        "explicit-row-height",
         "formula-cached",
         "hidden-column",
         "hidden-row",
@@ -206,13 +207,20 @@ FEATURES = frozenset(
         "korean-text",
         "latin-text",
         "merged-cells",
+        "normal-font-carlito",
+        "normal-font-noto",
+        "normal-size-11",
+        "normal-size-12",
         "noto-ofl-font",
         "number-cell",
+        "ooxml-implicit-row",
         "percent-format",
         "print-settings",
         "right-to-left-layout",
         "row-height",
         "rtl-text",
+        "sheet-format-missing",
+        "sheet-format-present",
         "sparkline",
         "unicode-text",
         "wrapped-text",
@@ -229,9 +237,14 @@ SHARDED = {
     "parity-a": "parity-a-shard-{index}.json",
     "parity-b": "parity-b-shard-{index}.json",
 }
-CASES = {"full": 800, "pilot": 40}
+CASES = {"full": 800, "ooxml-row-diagnostic": 12, "pilot": 40}
 LANES = {
     "full": {"authored-print": 100, "parity-a": 800, "parity-b": 800},
+    "ooxml-row-diagnostic": {
+        "authored-print": 0,
+        "parity-a": 12,
+        "parity-b": 0,
+    },
     "pilot": {"authored-print": 4, "parity-a": 40, "parity-b": 0},
 }
 REPORT_KEYS = {
@@ -514,6 +527,12 @@ def _validate_report(
             format_name != "xlsx" or "print-settings" not in features
         ):
             raise SummaryError("authored_print_contract")
+        if profile == "ooxml-row-diagnostic" and (
+            label != "parity-a"
+            or format_name != "xlsx"
+            or "ooxml-implicit-row" not in features
+        ):
+            raise SummaryError("ooxml_row_diagnostic_contract")
         if classification == "page_count_mismatch":
             if status != "error":
                 raise SummaryError("page_count_diagnostic")
@@ -549,8 +568,8 @@ def _paths(root: Path, profile: str, label: str) -> list[tuple[Path, int | None]
     ]
     if merged_present and present_shards:
         raise SummaryError("report_fragment_ambiguity")
-    if profile == "pilot" and present_shards:
-        raise SummaryError("pilot_shard")
+    if profile != "full" and present_shards:
+        raise SummaryError("unsharded_profile")
     return [(merged, None)] if merged_present else present_shards
 
 
@@ -794,7 +813,7 @@ def summarize(
         or profile not in CASES
         or not isinstance(baseline_mode, str)
         or baseline_mode not in {"candidate", "verify"}
-        or (profile == "pilot" and baseline_mode != "verify")
+        or (profile != "full" and baseline_mode != "verify")
         or not isinstance(head_sha, str)
         or HEAD_RE.fullmatch(head_sha) is None
     ):

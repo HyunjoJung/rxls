@@ -13,13 +13,14 @@ on:
           - fuzz
           - render-oracle
       campaign:
-        description: Render Oracle campaign size (ignored for ordinary fuzz runs)
+        description: Render Oracle campaign (ignored for ordinary fuzz runs)
         required: true
         default: pilot
         type: choice
         options:
           - pilot
           - full
+          - ooxml-row-diagnostic
       baseline_mode:
         description: Verify a tracked baseline or bootstrap a hosted full candidate
         required: true

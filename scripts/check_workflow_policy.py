@@ -25,6 +25,7 @@ RELEASE_VERSIONS = {
 }
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
+RENDER_ORACLE_DIAGNOSTIC_CASES = "12"
 RENDER_ORACLE_FULL_REPEATS = "2"
 RENDER_ORACLE_FULL_SHARDS = "4"
 RENDER_ORACLE_MAX_PARALLEL_SHARDS = "2"
@@ -94,22 +95,23 @@ ORACLE_UPLOAD_ARTIFACT_ACTION = (
 ORACLE_RENDER_STEP_SHA256 = (
     "2e617cd8715b2d0189e48636dee9f3844283ea1269acbfc6b9bb53c98cb81e1a",
     "bb2ff7258a91fd630b1cb20e19c8276a625f295c6f52b38fe37fc4e2424e9933",
-    "00f31f7b101fe7fb51bc806ff0f129179c530099a65bcf8741d379db35472a3d",
+    "1266e4280f579884aef9895f70988b7a58ac80f791e5b1dae6d63bfa1b001ede",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
-    "d53ad2c2290873aeb95e2df3f0b699f43aeef2d8bd9e6b3873ab836e9274bb88",
+    "d0a6977111dff7834d45d32af480a2856e8de63f39648cf8d75b13be3e1a3921",
     "e75a72dfc22dc8524d97dcc821e2d09e89694512eab25a6155417f99f24fc617",
-    "455b842e761235cf52cc695d818461372c5b1c99132d9c6df12224ca82af42bb",
+    "e5884311c0ad309aef1d77895e5be999a32781d9bf7fc15f409649bcb691c863",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
     "d4964276024870ab039eb6a725f03a1f6fbe244ad736f86846219dbc29c6fe06",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
-    "e8023111e76759005c88ec8df8501e1ea29a50353b6f4293d93e0b342ec25e03",
-    "ea232316be10caebe65ece1a648b9c695f2421a35848e8ff6e81fb31fae29f2a",
+    "bbbd9245f202160026f44c26a86d2f0d9cf09905415e5a4d8709c645edc01fee",
+    "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "6525c1b8c25be762c6f69dfc2f2b7b6fc64bb14bc8569d0686e036bc37bb9fe2",
+    "0bba6907205954c7a1fa24b88b0ba4eb614a3fc5ce54038f53f6af1b468dd834",
+    "fc038e866e71d3c98fde9591d627097c8b06577f505e57f74da7abc78cd31df9",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
-    "1935efa03e2e2dc9c56b935874953e10ff7e14565522937fd28e8ccb5f46a483",
+    "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
     "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
     "b50f2f8062ab74765147148258b18e8adffbc84ac41a7da12d5e63f4edb5f09c",
 )
@@ -122,7 +124,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "046af537b69b464a608648b612a89223f6be74788328950c6c46217956eb8d4c"
+    "91197ae093025e6f8d992b9c750dcbb1e6a2c5c8928e11b8e401275b34909e30"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b6ad857f1de193d8c00dfb3aded9ae14ad4b19d16b5aaf71d82e461b48c72c7f"
@@ -1772,6 +1774,9 @@ def audit_fuzz_workflow(path: Path, text: str) -> list[str]:
         "      baseline_mode:\n        description: Verify a tracked baseline or bootstrap a hosted full candidate\n        required: true\n        default: verify\n        type: choice\n        options:\n          - verify\n          - candidate": (
             "oracle bridge must expose an exact candidate/verify choice"
         ),
+        "      campaign:\n        description: Render Oracle campaign (ignored for ordinary fuzz runs)\n        required: true\n        default: pilot\n        type: choice\n        options:\n          - pilot\n          - full\n          - ooxml-row-diagnostic": (
+            "oracle bridge must expose the exact pilot/full/OOXML diagnostic choice"
+        ),
         "    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'fuzz' }}": (
             "ordinary fuzz must run unchanged for PR/schedule/default manual events"
         ),
@@ -1818,7 +1823,7 @@ def audit_fuzz_workflow(path: Path, text: str) -> list[str]:
 
 
 def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
-    """Require exact identities and bounded pilot/full rendering campaigns."""
+    """Require exact identities and bounded release/diagnostic campaigns."""
 
     errors: list[str] = []
     _audit_exact_workflow_sha256(
@@ -1862,6 +1867,63 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         ),
         "--output target/render-oracle-hosted/host-tools.json": (
             "must emit path-neutral hosted identity evidence"
+        ),
+        "python3 scripts/test_generate_ooxml_row_oracle.py": (
+            "must test the isolated OOXML row generator before campaign execution"
+        ),
+        "python3 scripts/test_check_ooxml_row_oracle.py": (
+            "must test the privacy-safe OOXML row reducer before campaign execution"
+        ),
+        'OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "12"': (
+            "must keep the OOXML row diagnostic at exactly twelve workbooks"
+        ),
+        'test "$RXLS_BASELINE_MODE" = "verify"': (
+            "diagnostic runs must never enter candidate or ratchet mode"
+        ),
+        'test "$RXLS_IDENTITY_BOOTSTRAP" = "0"': (
+            "diagnostic runs must use the already pinned identities"
+        ),
+        "python3 scripts/generate-ooxml-row-oracle.py --generate": (
+            "must generate the isolated project-owned OOXML row corpus"
+        ),
+        "python3 scripts/generate-ooxml-row-oracle.py --verify": (
+            "must verify every generated OOXML row workbook before comparison"
+        ),
+        '"c94f37252d4f78e5352299b831d2620be39178c676b145cda7d076f7d3d09e8a"': (
+            "must pin the exact twelve-case OOXML row manifest bytes"
+        ),
+        "lane_args+=(--format xlsx --required-feature ooxml-implicit-row)": (
+            "must isolate the diagnostic to the reviewed XLSX feature lane"
+        ),
+        'test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "12"': (
+            "must run the diagnostic as one exact twelve-case campaign"
+        ),
+        "python3 scripts/check-ooxml-row-oracle.py \\": (
+            "must reduce diagnostic geometry through the reviewed privacy gate"
+        ),
+        "--campaign-manifest local/render-corpus-generated/ooxml-row-diagnostic/manifest.json": (
+            "must bind diagnostic evidence to the exact isolated manifest"
+        ),
+        "--output target/render-oracle-hosted/ooxml-row-oracle.json": (
+            "must emit only the reviewed diagnostic aggregate"
+        ),
+        (
+            "if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' && "
+            "env.RXLS_ORACLE_CAMPAIGN != 'ooxml-row-diagnostic' }}"
+        ): (
+            "must keep diagnostic evidence out of release baseline and ratchet aggregation"
+        ),
+        "- name: Verify and minimize OOXML row diagnostic evidence": (
+            "must independently validate and minimize the diagnostic aggregate"
+        ),
+        'checker["_validate_output"](aggregate)': (
+            "must revalidate the exact diagnostic output contract before upload"
+        ),
+        "report_path.unlink()": (
+            "must delete the raw diagnostic report before staging success evidence"
+        ),
+        '== {"ooxml-row-oracle.json"}': (
+            "diagnostic staging must contain only the aggregate geometry artifact"
         ),
         'assert document["image_identity_status"] == "pinned_match"': (
             "normal oracle builds must require pinned_match"
@@ -2329,6 +2391,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "FULL_REPEAT_COUNT": RENDER_ORACLE_FULL_REPEATS,
         "FULL_SHARD_COUNT": RENDER_ORACLE_FULL_SHARDS,
         "MAX_PARALLEL_SHARDS": RENDER_ORACLE_MAX_PARALLEL_SHARDS,
+        "OOXML_ROW_DIAGNOSTIC_CASE_COUNT": RENDER_ORACLE_DIAGNOSTIC_CASES,
     }
     for name, value in exact_assignments.items():
         assignment = re.compile(
@@ -2344,7 +2407,9 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         text,
     )
     if campaign_input is None:
-        errors.append(f"{path}: missing workflow_dispatch pilot/full campaign choice")
+        errors.append(
+            f"{path}: missing workflow_dispatch release/diagnostic campaign choice"
+        )
     else:
         body = campaign_input.group("body")
         if (
@@ -2352,9 +2417,18 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             or "default: pilot" not in body
             or len(re.findall(r"^\s+- pilot\s*$", body, re.MULTILINE)) != 1
             or len(re.findall(r"^\s+- full\s*$", body, re.MULTILINE)) != 1
+            or len(
+                re.findall(
+                    r"^\s+- ooxml-row-diagnostic\s*$",
+                    body,
+                    re.MULTILINE,
+                )
+            )
+            != 1
         ):
             errors.append(
-                f"{path}: workflow_dispatch campaign must be an exact pilot/full choice"
+                f"{path}: workflow_dispatch campaign must be the exact "
+                "pilot/full/OOXML diagnostic choice"
             )
     baseline_input = re.search(
         r"(?ms)^\s{6}baseline_mode:\s*$"
@@ -2453,6 +2527,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "target/render-oracle-upload/fidelity-b.json",
         "target/render-oracle-upload/hosted-summary.json",
         "target/render-oracle-upload/host-tools.json",
+        "target/render-oracle-upload/ooxml-row-oracle.json",
         "target/render-oracle-upload/repeatability.json",
         "target/render-oracle-upload/renderer.json",
     }

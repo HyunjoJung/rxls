@@ -194,7 +194,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v3",
+                "rxls.render-oracle-failure-summary.v4",
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
@@ -256,6 +256,68 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 "schema": MODULE.OUTPUT_SCHEMA,
             },
         )
+
+    def test_ooxml_row_diagnostic_summary_is_fixed_and_content_neutral(self) -> None:
+        rows = []
+        for index in range(12):
+            features = {
+                "normal-font-noto" if index < 8 else "normal-font-carlito",
+                "normal-size-11" if index < 8 else "normal-size-12",
+                "ooxml-implicit-row",
+                "sheet-format-missing" if index < 8 else "sheet-format-present",
+            }
+            if index == 4:
+                features.add("explicit-row-height")
+            rows.append(
+                _row(
+                    index,
+                    classification=(
+                        "pdfinfo_page_size_invalid"
+                        if index == 0
+                        else "within_threshold"
+                    ),
+                    features=tuple(features),
+                    format_name="xlsx",
+                    status="error" if index == 0 else "compared",
+                )
+            )
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(
+                    rows,
+                    profile="ooxml-row-diagnostic",
+                    label="parity-a",
+                ),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="ooxml-row-diagnostic",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        self.assertEqual(summary["schema"], MODULE.OUTPUT_SCHEMA)
+        self.assertEqual(summary["profile"], "ooxml-row-diagnostic")
+        self.assertEqual(summary["reports"][1]["workbooks"], 12)
+        self.assertEqual(
+            summary["reports"][1]["by_classification"],
+            {"measurement_geometry_stage": 1, "within_threshold": 11},
+        )
+        self.assertEqual(summary["reports"][0], MODULE._empty("authored-print"))
+        self.assertEqual(summary["reports"][2], MODULE._empty("parity-b"))
+        rendered = MODULE._json(summary).decode("ascii")
+        self.assertNotIn("/srv/private", rendered)
+        self.assertNotIn("private workbook content", rendered)
+
+        with self.assertRaisesRegex(MODULE.SummaryError, "invocation"):
+            MODULE.summarize(
+                Path("/does-not-matter"),
+                profile="ooxml-row-diagnostic",
+                baseline_mode="candidate",
+                head_sha=HEAD_SHA,
+            )
 
     def test_partial_full_shards_are_aggregated_without_input_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
