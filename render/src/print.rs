@@ -1409,7 +1409,7 @@ fn print_source_identity(
     }
 
     let mut digest = Sha256::new();
-    update_bytes(&mut digest, b"rxls.prepared-print-source.v10");
+    update_bytes(&mut digest, b"rxls.prepared-print-source.v11");
     digest.update((sheet_index as u64).to_le_bytes());
     update_bytes(&mut digest, sheet.name.as_bytes());
 
@@ -1575,6 +1575,10 @@ fn print_source_identity(
         update_debug(&mut digest, &cell.explicit_style);
         update_debug(&mut digest, &cell.rich_text);
         update_debug(&mut digest, &cell.hyperlink);
+        update_debug(
+            &mut digest,
+            &sheet.verified_xlsx_cell_font_size_pt(row, col),
+        );
         update_debug(&mut digest, &sheet.resolved_cell_style(row, col));
     }
     update_bytes(&mut digest, b"rxls.indirect-scene-dependencies.v1");
@@ -3737,6 +3741,35 @@ mod tests {
         workbook
     }
 
+    fn xlsx_font_provenance_print_workbook(source_size: &str, family: &str) -> Workbook {
+        let styles = format!(
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><sz val="{source_size}"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let mut workbook = Workbook::open(&zip_parts(&[
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Rows" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            ("xl/styles.xml", styles.as_bytes()),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>plain automatic row</t></is></c></row></sheetData></worksheet>"#,
+            ),
+        ]))
+        .unwrap();
+        workbook.sheets[0].set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 0, 0))
+                .with_paper_size(1)
+                .with_scale(100),
+        );
+        workbook
+    }
+
     fn solid_rgba_png() -> Vec<u8> {
         let mut output = Vec::new();
         {
@@ -4265,6 +4298,44 @@ mod tests {
         );
         assert!(matches!(
             build_print_page(&workbook, &prepared, 0),
+            Err(RenderError::Backend {
+                reason: "prepared_print_source_changed"
+            })
+        ));
+    }
+
+    #[test]
+    fn prepared_identity_distinguishes_exact_and_fractional_cell_font_sources() {
+        let pack = crate::font::synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let exact = xlsx_font_provenance_print_workbook("14", &family);
+        let fractional = xlsx_font_provenance_print_workbook("13.5", &family);
+        assert_eq!(
+            exact.sheets[0].resolved_cell_style(0, 0),
+            fractional.sheets[0].resolved_cell_style(0, 0),
+            "both sources round to the same public Font value"
+        );
+        assert_eq!(
+            exact.sheets[0].verified_xlsx_cell_font_size_pt(0, 0),
+            Some(14)
+        );
+        assert_eq!(
+            fractional.sheets[0].verified_xlsx_cell_font_size_pt(0, 0),
+            None
+        );
+
+        let options = PrintOptions {
+            render: RenderOptions {
+                font_pack: Some(pack),
+                default_font_family: family,
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let prepared = prepare_print_document(&exact, 0, &options).unwrap();
+        build_print_page(&exact, &prepared, 0).unwrap();
+        assert!(matches!(
+            build_print_page(&fractional, &prepared, 0),
             Err(RenderError::Backend {
                 reason: "prepared_print_source_changed"
             })

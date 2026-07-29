@@ -2117,6 +2117,11 @@ pub(crate) struct CellEntry {
     /// only by the `.xlsx` writer.
     #[cfg_attr(not(feature = "xlsx"), allow(dead_code))]
     pub(crate) style: Option<CellStyle>,
+    /// Exact integral XLSX source font size for this cell's retained XF.
+    ///
+    /// This private provenance is absent for authored cells, other container
+    /// formats, and ambiguous/fractional/invalid XLSX style records.
+    pub(crate) xlsx_font_size_pt: Option<u16>,
     /// External hyperlink target (authoring). Read only by the `.xlsx` writer.
     #[cfg_attr(not(feature = "xlsx"), allow(dead_code))]
     pub(crate) hyperlink: Option<String>,
@@ -8378,6 +8383,75 @@ impl Sheet {
         self.xlsx_normal_font_size_pt
     }
 
+    /// Return an evidence-bounded XLSX font size for one retained cell XF.
+    ///
+    /// The value exists only when the effective last-write-wins cell came from
+    /// XLSX and its cell XF directly references a complete, unambiguous font
+    /// record with an exact integral source size. Fractional, duplicated,
+    /// malformed, out-of-range, inherited, authored, and non-XLSX sources
+    /// return `None`.
+    #[doc(hidden)]
+    pub fn verified_xlsx_cell_font_size_pt(&self, row: u32, col: u16) -> Option<u16> {
+        let entry = self.effective_cell_entry(row, col)?;
+        let points = entry.xlsx_font_size_pt?;
+        if let Some(overlay) = self.direct_cell_formats.get(&(row, col)) {
+            if overlay.replace_font {
+                return Some(points);
+            }
+            // Style index zero is represented by the retained cell style alone.
+            // A nonzero cell XF has a direct-overlay entry even when it does not
+            // replace the font; in that case the worksheet default participates
+            // in resolution and its rounded public Font cannot prove the exact
+            // source size carried by this cell XF.
+            if let Some(default_font) = self
+                .default_format
+                .as_ref()
+                .and_then(|style| style.font.as_ref())
+            {
+                let retained_font = entry.style.as_ref().and_then(|style| style.font.as_ref());
+                if self.xlsx_normal_font_size_pt != Some(points)
+                    || retained_font != Some(default_font)
+                {
+                    return None;
+                }
+            }
+        }
+
+        // A non-font-replacing cell XF inherits these layers. Their public
+        // whole-point Font values cannot distinguish, for example, an exact
+        // 14pt source from a fractional 13.5pt source rounded to 14pt, so do
+        // not transfer the cell-XF evidence through any such font layer.
+        let inherited_font = self
+            .row_formats
+            .get(&row)
+            .and_then(|style| style.font.as_ref())
+            .is_some()
+            || self
+                .col_formats
+                .get(&col)
+                .and_then(|style| style.font.as_ref())
+                .is_some()
+            || self.tables.iter().any(|table| {
+                self.table_region_formats
+                    .get(&table.name)
+                    .and_then(|application| application.resolve(table, row, col))
+                    .and_then(|style| style.font)
+                    .is_some()
+                    || {
+                        let (first_row, first_col, _, last_col) = table.range;
+                        row == first_row
+                            && col >= first_col
+                            && col <= last_col
+                            && self
+                                .table_header_formats
+                                .get(&table.name)
+                                .and_then(|style| style.font.as_ref())
+                                .is_some()
+                    }
+            });
+        (!inherited_font).then_some(points)
+    }
+
     /// Explicitly hidden columns, as 0-based indexes.
     pub fn hidden_columns(&self) -> &BTreeSet<u16> {
         &self.hidden_cols
@@ -10492,6 +10566,7 @@ impl Sheet {
             value,
             text,
             style,
+            xlsx_font_size_pt: None,
             hyperlink,
         });
     }
@@ -11244,6 +11319,7 @@ mod tests {
                 value: Cell::Number(f64::from(row)),
                 text: row.to_string(),
                 style: None,
+                xlsx_font_size_pt: None,
                 hyperlink: None,
             });
         }
@@ -11437,6 +11513,80 @@ mod tests {
             sheet.resolved_cell_style(3, 1),
             "resolution must not depend on map iteration order"
         );
+    }
+
+    #[test]
+    fn xlsx_cell_font_provenance_does_not_cross_inherited_font_layers() {
+        fn source_sheet() -> Sheet {
+            let style = CellStyle::new().font_name("Source").set_font_size(14);
+            let mut sheet = Sheet::new("provenance");
+            sheet.default_format = Some(style.clone());
+            sheet.cells.push(CellEntry {
+                row: 0,
+                col: 0,
+                value: Cell::Text("value".to_string()),
+                text: "value".to_string(),
+                style: Some(style),
+                xlsx_font_size_pt: Some(14),
+                hyperlink: None,
+            });
+            sheet
+        }
+
+        let unshadowed = source_sheet();
+        assert_eq!(unshadowed.verified_xlsx_cell_font_size_pt(0, 0), Some(14));
+
+        let rounded_collision = CellStyle::new().font_name("Source").set_font_size(14);
+        let mut row = source_sheet();
+        row.row_formats.insert(0, rounded_collision.clone());
+        assert_eq!(row.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        let mut column = source_sheet();
+        column.col_formats.insert(0, rounded_collision.clone());
+        assert_eq!(column.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        let mut table = source_sheet();
+        table.tables.push(Table::new((0, 0, 1, 0), "T", ["value"]));
+        let mut definition = TableStyleDefinition::default();
+        definition.insert(TableStyleRegion::WholeTable, rounded_collision.clone(), 1);
+        table.table_region_formats.insert(
+            "T".to_string(),
+            TableStyleApplication {
+                definition,
+                ..TableStyleApplication::default()
+            },
+        );
+        assert_eq!(table.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        let mut non_replacing_direct = source_sheet();
+        non_replacing_direct
+            .direct_cell_formats
+            .insert((0, 0), CellStyleOverlay::default());
+        assert_eq!(
+            non_replacing_direct.verified_xlsx_cell_font_size_pt(0, 0),
+            None
+        );
+
+        let mut verified_default = source_sheet();
+        verified_default.xlsx_normal_font_size_pt = Some(14);
+        verified_default
+            .direct_cell_formats
+            .insert((0, 0), CellStyleOverlay::default());
+        assert_eq!(
+            verified_default.verified_xlsx_cell_font_size_pt(0, 0),
+            Some(14)
+        );
+
+        let mut direct = row;
+        direct.direct_cell_formats.insert(
+            (0, 0),
+            CellStyleOverlay {
+                style: rounded_collision,
+                replace_font: true,
+                ..CellStyleOverlay::default()
+            },
+        );
+        assert_eq!(direct.verified_xlsx_cell_font_size_pt(0, 0), Some(14));
     }
 
     #[test]

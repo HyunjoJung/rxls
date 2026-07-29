@@ -458,6 +458,12 @@ struct Styles {
     /// Exact integral Normal-style font size retained only when the first cell
     /// XF and named/built-in Normal style resolve to the same source font.
     xlsx_normal_font_size_pt: Option<u16>,
+    /// Exact integral source font size per retained `cellXfs` record.
+    ///
+    /// Entries are `None` when the XF/font provenance is inherited,
+    /// fractional, malformed, duplicated, out of range, or otherwise
+    /// ambiguous.
+    xlsx_cell_xf_font_sizes_pt: Vec<Option<u16>>,
     /// Sparse direct-format overlays per `cellXfs` style index.
     cell_style_overlays: Vec<CellStyleOverlay>,
     /// Imported custom table region styles keyed by `<tableStyle name>`.
@@ -494,6 +500,13 @@ impl Styles {
 
     fn cell_style(&self, style_idx: usize) -> Option<&CellStyle> {
         self.cell_styles.get(style_idx)
+    }
+
+    fn xlsx_cell_font_size_pt(&self, style_idx: usize) -> Option<u16> {
+        self.xlsx_cell_xf_font_sizes_pt
+            .get(style_idx)
+            .copied()
+            .flatten()
     }
 
     fn cell_style_overlay(&self, style_idx: usize) -> Option<&CellStyleOverlay> {
@@ -1117,6 +1130,8 @@ fn parse_styles(xml: &str, theme: &ThemeColors) -> Styles {
         parse_font_table(xml, theme, &styles.indexed_colors, &mut styles.losses);
     styles.xlsx_normal_font_size_pt =
         verified_xlsx_normal_font_size(xml, &fonts, &exact_font_sizes, font_table_complete);
+    styles.xlsx_cell_xf_font_sizes_pt =
+        verified_xlsx_cell_xf_font_sizes(xml, &exact_font_sizes, font_table_complete);
     let (cell_styles, cell_style_overlays) = parse_cell_styles(
         xml,
         theme,
@@ -2333,6 +2348,208 @@ fn verified_xlsx_normal_font_size(
     let first_points = exact_sizes.get(first_font_id).copied().flatten()?;
     let normal_points = exact_sizes.get(*normal_font_id).copied().flatten()?;
     (first_points == normal_points && first_font == normal_font).then_some(first_points)
+}
+
+#[derive(Clone, Copy)]
+enum XlsxCellXfFontUse {
+    Explicit(bool),
+    Implicit { style_xf_id: Option<usize> },
+}
+
+#[derive(Clone, Copy)]
+struct XlsxCellXfFontCandidate {
+    font_id: usize,
+    font_use: XlsxCellXfFontUse,
+}
+
+fn xlsx_cell_xf_font_candidate(
+    e: &quick_xml::events::BytesStart<'_>,
+) -> Option<XlsxCellXfFontCandidate> {
+    let font_id = unique_parsed_attr::<usize>(e, b"fontId").ok().flatten()?;
+    let font_use = match unique_attr(e, b"applyFont") {
+        Ok(None) => XlsxCellXfFontUse::Implicit {
+            style_xf_id: unique_parsed_attr::<usize>(e, b"xfId").ok()?,
+        },
+        Ok(Some(value)) => XlsxCellXfFontUse::Explicit(parse_bool_attr(&value)?),
+        Err(()) => return None,
+    };
+    Some(XlsxCellXfFontCandidate { font_id, font_use })
+}
+
+fn exact_xlsx_cell_xf_font_size(
+    candidate: XlsxCellXfFontCandidate,
+    exact_sizes: &[Option<u16>],
+    cell_style_xf_count: usize,
+) -> Option<u16> {
+    // LibreOffice's Xf::importXf/createPattern contract applies an omitted
+    // `applyFont` directly when `xfId` is absent. With a parent style XF, the
+    // cell font is still effective when it differs and otherwise names the
+    // same font as the parent. A missing or invalid parent cannot establish
+    // that provenance, so fail closed before using Calc's declared-height path.
+    let applies = match candidate.font_use {
+        XlsxCellXfFontUse::Explicit(applies) => applies,
+        XlsxCellXfFontUse::Implicit { style_xf_id: None } => true,
+        XlsxCellXfFontUse::Implicit {
+            style_xf_id: Some(style_xf_id),
+        } => style_xf_id < cell_style_xf_count,
+    };
+    if !applies {
+        return None;
+    }
+    exact_sizes.get(candidate.font_id).copied().flatten()
+}
+
+fn verified_xlsx_cell_xf_font_sizes(
+    xml: &str,
+    exact_sizes: &[Option<u16>],
+    font_table_complete: bool,
+) -> Vec<Option<u16>> {
+    if !font_table_complete {
+        return Vec::new();
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0_usize;
+    let mut saw_cell_style_xfs = false;
+    let mut saw_cell_xfs = false;
+    let mut in_cell_style_xfs = false;
+    let mut in_cell_xfs = false;
+    let mut cell_style_xfs_depth = None;
+    let mut cell_xfs_depth = None;
+    let mut current_style_xf_depth = None;
+    let mut current_xf_depth = None;
+    let mut cell_style_xf_count = 0_usize;
+    let mut candidates = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(event @ (Event::Start(_) | Event::Empty(_))) => {
+                let (e, is_empty) = match event {
+                    Event::Start(e) => (e, false),
+                    Event::Empty(e) => (e, true),
+                    _ => unreachable!(),
+                };
+                let element_depth = depth;
+                match local(e.name().as_ref()) {
+                    b"cellStyleXfs" => {
+                        if element_depth != 1
+                            || saw_cell_style_xfs
+                            || in_cell_style_xfs
+                            || in_cell_xfs
+                        {
+                            return Vec::new();
+                        }
+                        saw_cell_style_xfs = true;
+                        in_cell_style_xfs = !is_empty;
+                        cell_style_xfs_depth = in_cell_style_xfs.then_some(element_depth);
+                    }
+                    b"cellXfs" => {
+                        if element_depth != 1 || saw_cell_xfs || in_cell_style_xfs || in_cell_xfs {
+                            return Vec::new();
+                        }
+                        saw_cell_xfs = true;
+                        in_cell_xfs = !is_empty;
+                        cell_xfs_depth = in_cell_xfs.then_some(element_depth);
+                    }
+                    b"xf" if in_cell_style_xfs => {
+                        if cell_style_xfs_depth.is_none_or(|table| element_depth != table + 1)
+                            || current_style_xf_depth.is_some()
+                            || cell_style_xf_count >= MAX_XLSX_STYLE_RECORDS
+                        {
+                            return Vec::new();
+                        }
+                        cell_style_xf_count += 1;
+                        if !is_empty {
+                            current_style_xf_depth = Some(element_depth);
+                        }
+                    }
+                    b"xf" if in_cell_xfs => {
+                        if cell_xfs_depth.is_none_or(|table| element_depth != table + 1)
+                            || current_xf_depth.is_some()
+                            || candidates.len() >= MAX_XLSX_STYLE_RECORDS
+                        {
+                            return Vec::new();
+                        }
+                        candidates.push(xlsx_cell_xf_font_candidate(&e));
+                        if !is_empty {
+                            current_xf_depth = Some(element_depth);
+                        }
+                    }
+                    _ => {}
+                }
+                if !is_empty {
+                    let Some(next_depth) = depth.checked_add(1) else {
+                        return Vec::new();
+                    };
+                    depth = next_depth;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return Vec::new();
+                };
+                depth = next_depth;
+                match local(e.name().as_ref()) {
+                    b"xf" if in_cell_style_xfs => {
+                        if current_style_xf_depth != Some(depth) {
+                            return Vec::new();
+                        }
+                        current_style_xf_depth = None;
+                    }
+                    b"xf" if in_cell_xfs => {
+                        if current_xf_depth != Some(depth) {
+                            return Vec::new();
+                        }
+                        current_xf_depth = None;
+                    }
+                    b"cellStyleXfs" => {
+                        if !in_cell_style_xfs
+                            || cell_style_xfs_depth != Some(depth)
+                            || current_style_xf_depth.is_some()
+                        {
+                            return Vec::new();
+                        }
+                        in_cell_style_xfs = false;
+                        cell_style_xfs_depth = None;
+                    }
+                    b"cellXfs" => {
+                        if !in_cell_xfs
+                            || cell_xfs_depth != Some(depth)
+                            || current_xf_depth.is_some()
+                        {
+                            return Vec::new();
+                        }
+                        in_cell_xfs = false;
+                        cell_xfs_depth = None;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => {
+                if depth != 0
+                    || in_cell_style_xfs
+                    || in_cell_xfs
+                    || cell_style_xfs_depth.is_some()
+                    || cell_xfs_depth.is_some()
+                    || current_style_xf_depth.is_some()
+                    || current_xf_depth.is_some()
+                {
+                    return Vec::new();
+                }
+                break;
+            }
+            Err(_) => return Vec::new(),
+            _ => {}
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            candidate.and_then(|candidate| {
+                exact_xlsx_cell_xf_font_size(candidate, exact_sizes, cell_style_xf_count)
+            })
+        })
+        .collect()
 }
 
 fn format_pattern(value: Option<&str>) -> FormatPattern {
@@ -6117,6 +6334,11 @@ fn parse_sheet(
                                 break;
                             }
                             *budget -= retained_cost;
+                            // Coordinate sidecars follow the retained cell stream's
+                            // last-write-wins contract too. Clear an earlier
+                            // duplicate before installing the final cell's rich
+                            // text or direct-format overlay.
+                            parsed.rich.remove(&(row, col));
                             if ctype == "s" {
                                 if let Some(runs) = value
                                     .trim()
@@ -6131,6 +6353,7 @@ fn parse_sheet(
                             } else if ctype == "inlineStr" && !inline_runs.is_empty() {
                                 parsed.rich.insert((row, col), inline_runs.clone());
                             }
+                            parsed.direct_cell_formats.remove(&(row, col));
                             if style_idx != 0 {
                                 if let Some(overlay) = styles.cell_style_overlay(style_idx) {
                                     parsed
@@ -6845,6 +7068,7 @@ fn build_cell(
         value,
         text,
         style: styles.cell_style(style_idx).cloned(),
+        xlsx_font_size_pt: styles.xlsx_cell_font_size_pt(style_idx),
         hyperlink: None,
     })
 }
@@ -8532,6 +8756,123 @@ mod tests {
             None,
             "a contradictory built-in identifier must not identify Normal"
         );
+    }
+
+    #[test]
+    fn xlsx_cell_xf_font_provenance_rejects_rounded_and_ambiguous_sources() {
+        let styles = parse_styles(
+            r#"<styleSheet>
+                <fonts count="6">
+                    <font><sz val="11"/><name val="Normal"/></font>
+                    <font><sz val="14"/><name val="Exact"/></font>
+                    <font><sz val="13.5"/><name val="Fractional"/></font>
+                    <font><sz val="13.5"/><sz val="14"/><name val="Duplicate"/></font>
+                    <font><sz val="malformed"/><name val="Malformed"/></font>
+                    <font><sz val="410"/><name val="OutOfRange"/></font>
+                </fonts>
+                <cellXfs count="9">
+                    <xf fontId="0"/>
+                    <xf fontId="1" applyFont="1"/>
+                    <xf fontId="2" applyFont="1"/>
+                    <xf fontId="3" applyFont="1"/>
+                    <xf fontId="4" applyFont="1"/>
+                    <xf fontId="5" applyFont="1"/>
+                    <xf fontId="1" fontId="0" applyFont="1"/>
+                    <xf fontId="1" applyFont="0"/>
+                    <xf applyFont="1"/>
+                </cellXfs>
+            </styleSheet>"#,
+            &ThemeColors::default(),
+        );
+
+        assert_eq!(
+            styles.xlsx_cell_xf_font_sizes_pt,
+            [Some(11), Some(14), None, None, None, None, None, None, None,]
+        );
+    }
+
+    #[test]
+    fn xlsx_cell_xf_font_provenance_validates_implicit_parent_references() {
+        let styles = parse_styles(
+            r#"<styleSheet>
+                <fonts count="1">
+                    <font><sz val="11"/><name val="Verified"/></font>
+                </fonts>
+                <cellStyleXfs count="1">
+                    <xf fontId="0"/>
+                </cellStyleXfs>
+                <cellXfs count="6">
+                    <xf fontId="0" xfId="0"/>
+                    <xf fontId="0"/>
+                    <xf fontId="0" xfId="1"/>
+                    <xf fontId="0" xfId="malformed"/>
+                    <xf fontId="0" xfId="0" xfId="0"/>
+                    <xf fontId="0" xfId="99" applyFont="1"/>
+                </cellXfs>
+            </styleSheet>"#,
+            &ThemeColors::default(),
+        );
+
+        assert_eq!(
+            styles.xlsx_cell_xf_font_sizes_pt,
+            [Some(11), Some(11), None, None, None, Some(11)]
+        );
+
+        let missing_parent_table = parse_styles(
+            r#"<styleSheet>
+                <fonts count="1">
+                    <font><sz val="11"/><name val="Verified"/></font>
+                </fonts>
+                <cellXfs count="1">
+                    <xf fontId="0" xfId="0"/>
+                </cellXfs>
+            </styleSheet>"#,
+            &ThemeColors::default(),
+        );
+        assert_eq!(missing_parent_table.xlsx_cell_xf_font_sizes_pt, [None]);
+    }
+
+    #[test]
+    fn duplicate_cells_clear_stale_coordinate_sidecars() {
+        let base = CellStyle::new().font_name("Base").set_font_size(11);
+        let direct = CellStyle::new().font_name("Direct").set_font_size(14);
+        let styles = Styles {
+            cell_styles: vec![base, direct.clone()],
+            xlsx_cell_xf_font_sizes_pt: vec![Some(11), Some(14)],
+            cell_style_overlays: vec![
+                CellStyleOverlay::default(),
+                CellStyleOverlay {
+                    style: direct,
+                    replace_font: true,
+                    ..CellStyleOverlay::default()
+                },
+            ],
+            ..Styles::default()
+        };
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            r#"<worksheet><sheetData><row r="1">
+                <c r="A1" s="1" t="inlineStr"><is><r><rPr><b/></rPr><t>first</t></r></is></c>
+                <c r="A1" t="inlineStr"><is><t>last</t></is></c>
+            </row></sheetData></worksheet>"#,
+            &[],
+            &styles,
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.cells.len(), 2);
+        assert_eq!(
+            parsed.cells.last().map(|cell| cell.text.as_str()),
+            Some("last")
+        );
+        assert_eq!(
+            parsed.cells.last().and_then(|cell| cell.xlsx_font_size_pt),
+            Some(11)
+        );
+        assert!(!parsed.direct_cell_formats.contains_key(&(0, 0)));
+        assert!(!parsed.rich.contains_key(&(0, 0)));
     }
 
     #[test]

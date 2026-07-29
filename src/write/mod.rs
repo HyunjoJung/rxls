@@ -385,6 +385,7 @@ mod tests {
             value,
             text: String::new(),
             style: None,
+            xlsx_font_size_pt: None,
             hyperlink: None,
         }
     }

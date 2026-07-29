@@ -4293,6 +4293,7 @@ fn finish_cell(
                 value: value.clone(),
                 text: disp.clone(),
                 style: metadata.style.cloned(),
+                xlsx_font_size_pt: None,
                 hyperlink: None,
             });
             if let Some(url) = metadata.hyperlink {

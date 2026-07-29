@@ -3335,6 +3335,7 @@ fn decode_cell(
             style: (style_idx != 0)
                 .then(|| styles.cell_style(style_idx).cloned())
                 .flatten(),
+            xlsx_font_size_pt: None,
             hyperlink: None,
         });
     };

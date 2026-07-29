@@ -477,6 +477,7 @@ dependencies = [
  "ttf-parser",
  "unicode-bidi",
  "unicode-linebreak",
+ "unicode-script",
  "unicode-segmentation",
 ]
 

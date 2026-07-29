@@ -27,6 +27,7 @@ ttf-parser = "0.25.1"
 tiny-skia = "0.11.4"
 unicode-bidi = "0.3.18"
 unicode-linebreak = "0.1.5"
+unicode-script = "0.5.8"
 unicode-segmentation = "1.12.0"
 
 [dev-dependencies]

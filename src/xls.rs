@@ -3634,6 +3634,7 @@ fn push_cell(
         value,
         text,
         style: styles.clone_xf(ixfe, style_budget),
+        xlsx_font_size_pt: None,
         hyperlink: None,
     });
 }
@@ -5862,6 +5863,7 @@ mod tests {
                 value,
                 text: "cached".to_string(),
                 style: None,
+                xlsx_font_size_pt: None,
                 hyperlink: None,
             }
         }

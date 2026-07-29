@@ -24,6 +24,7 @@ use crate::scene::{
 };
 use crate::typography::wrap_text_ranges;
 use unicode_bidi::{bidi_class, BidiClass};
+use unicode_script::{Script, UnicodeScript};
 
 /// Largest supported zero-based worksheet row (Excel row 1,048,576).
 pub const MAX_WORKSHEET_ROW: u32 = 1_048_575;
@@ -2965,6 +2966,10 @@ fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Opt
         return None;
     }
     let (points, _) = verified_ooxml_normal_font_size(sheet, options)?;
+    calc_ooxml_row_height_from_points(points)
+}
+
+fn calc_ooxml_row_height_from_points(points: u16) -> Option<Fixed> {
     let font_twips = i128::from(points).checked_mul(TWIPS_PER_POINT)?;
     let row_twips = font_twips
         .checked_mul(CALC_NORMAL_ROW_HEIGHT_PERCENT)?
@@ -2978,6 +2983,207 @@ fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Opt
         .ok()
         .filter(|raw| *raw > 0)
         .map(Fixed::from_raw)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcScriptClass {
+    Western,
+    Asian,
+    Complex,
+}
+
+fn calc_uax_script_class(script: Script) -> Option<CalcScriptClass> {
+    match script {
+        Script::Common | Script::Inherited | Script::Unknown => None,
+        Script::Bopomofo
+        | Script::Han
+        | Script::Hangul
+        | Script::Hiragana
+        | Script::Katakana
+        | Script::Khitan_Small_Script
+        | Script::Tangut
+        | Script::Yi => Some(CalcScriptClass::Asian),
+        Script::Armenian
+        | Script::Braille
+        | Script::Canadian_Aboriginal
+        | Script::Cherokee
+        | Script::Coptic
+        | Script::Cypriot
+        | Script::Cyrillic
+        | Script::Georgian
+        | Script::Glagolitic
+        | Script::Gothic
+        | Script::Greek
+        | Script::Latin
+        | Script::Ogham
+        | Script::Old_Hungarian
+        | Script::Old_Italic
+        | Script::Osmanya
+        | Script::Runic
+        | Script::Shavian => Some(CalcScriptClass::Western),
+        _ => Some(CalcScriptClass::Complex),
+    }
+}
+
+// Mirrors LibreOffice `i18nutil::GetScriptClass`: compatibility code-point
+// overrides and Unicode block classifications precede the UAX #24 fallback.
+fn calc_script_class(character: char) -> Option<CalcScriptClass> {
+    let codepoint = character as u32;
+    if matches!(
+        codepoint,
+        0x0001
+            | 0x0002
+            | 0x0020
+            | 0x00a0
+            | 0x00b2
+            | 0x00b3
+            | 0x00b9
+            | 0x02c7
+            | 0x02ca
+            | 0x02cb
+            | 0x02d9
+    ) {
+        return None;
+    }
+    if (0x2c80..=0x2ce3).contains(&codepoint) {
+        return Some(CalcScriptClass::Western);
+    }
+    match codepoint {
+        // Basic Latin through Spacing Modifier Letters.
+        0x0000..=0x02ff
+        // Greek, Cyrillic, and Armenian compatibility blocks.
+        | 0x0370..=0x03ff
+        | 0x0400..=0x04ff
+        | 0x0530..=0x058f
+        // Georgian.
+        | 0x10a0..=0x10ff
+        // Cherokee through Runic.
+        | 0x13a0..=0x16ff
+        // Latin Extended Additional and Greek Extended.
+        | 0x1e00..=0x1fff
+        // Latin Extended-C and Latin Extended-D.
+        | 0x2c60..=0x2c7f
+        | 0xa720..=0xa7ff => Some(CalcScriptClass::Western),
+
+        // Hebrew through Myanmar, retaining the original ICU block set.
+        0x0590..=0x05ff
+        | 0x0600..=0x06ff
+        | 0x0700..=0x074f
+        | 0x0780..=0x07bf
+        | 0x0900..=0x097f
+        | 0x0980..=0x09ff
+        | 0x0a00..=0x0a7f
+        | 0x0a80..=0x0aff
+        | 0x0b00..=0x0b7f
+        | 0x0b80..=0x0bff
+        | 0x0c00..=0x0c7f
+        | 0x0c80..=0x0cff
+        | 0x0d00..=0x0d7f
+        | 0x0d80..=0x0dff
+        | 0x0e00..=0x0e7f
+        | 0x0e80..=0x0eff
+        | 0x0f00..=0x0fff
+        | 0x1000..=0x109f
+        // Ethiopic, Khmer, Mongolian, and Arabic presentation forms.
+        | 0x1200..=0x137f
+        | 0x1780..=0x17ff
+        | 0x1800..=0x18af
+        | 0xfb50..=0xfdff
+        | 0xfe70..=0xfeff => Some(CalcScriptClass::Complex),
+
+        // Hangul Jamo.
+        0x1100..=0x11ff
+        // CJK Radicals Supplement through Hangul Syllables, retaining the
+        // original ICU block set rather than treating every intervening scalar
+        // value as Asian.
+        | 0x2e80..=0x2eff
+        | 0x2f00..=0x2fdf
+        | 0x2ff0..=0x2fff
+        | 0x3000..=0x303f
+        | 0x3040..=0x309f
+        | 0x30a0..=0x30ff
+        | 0x3100..=0x312f
+        | 0x3130..=0x318f
+        | 0x3190..=0x319f
+        | 0x31a0..=0x31bf
+        | 0x3200..=0x32ff
+        | 0x3300..=0x33ff
+        | 0x3400..=0x4dbf
+        | 0x4e00..=0x9fff
+        | 0xa000..=0xa48f
+        | 0xa490..=0xa4cf
+        | 0xac00..=0xd7af
+        // Later compatibility blocks named explicitly by Calc.
+        | 0xf900..=0xfaff
+        | 0xfe30..=0xfe4f
+        | 0xff00..=0xffef
+        | 0x20000..=0x2a6df
+        | 0x2f800..=0x2fa1f
+        | 0x31c0..=0x31ef => Some(CalcScriptClass::Asian),
+
+        // Number Forms is explicitly weak in the compatibility table.
+        0x2150..=0x218f => None,
+        _ => calc_uax_script_class(character.script()),
+    }
+}
+
+#[cfg(test)]
+fn has_mixed_calc_script_classes(text: &str) -> bool {
+    let mut resolved = None;
+    for script in text.chars().filter_map(calc_script_class) {
+        if resolved.is_some_and(|resolved| resolved != script) {
+            return true;
+        }
+        resolved = Some(script);
+    }
+    false
+}
+
+fn account_automatic_text_bytes(
+    text: &str,
+    options: &RenderOptions,
+    stats: &mut TypographyStats,
+) -> Result<(), RenderError> {
+    stats.text_bytes = stats
+        .text_bytes
+        .checked_add(text.len() as u64)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    enforce(
+        LimitKind::TextBytes,
+        options.limits.max_text_bytes,
+        stats.text_bytes,
+    )
+}
+
+fn has_mixed_calc_script_classes_bounded(
+    text: &str,
+    options: &RenderOptions,
+    stats: &mut TypographyStats,
+) -> Result<bool, RenderError> {
+    let base_work = stats.text_work;
+    let mut scanned = 0_u64;
+    let mut resolved = None;
+    for character in text.chars() {
+        scanned = scanned
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let actual = base_work
+            .checked_add(scanned)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(LimitKind::TextRuns, options.limits.max_text_runs, actual)?;
+        let Some(script) = calc_script_class(character) else {
+            continue;
+        };
+        if resolved.is_some_and(|resolved| resolved != script) {
+            stats.text_work = actual;
+            return Ok(true);
+        }
+        resolved = Some(script);
+    }
+    stats.text_work = base_work
+        .checked_add(scanned)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(false)
 }
 
 fn same_row_height_font(left: &Font, right: &Font) -> bool {
@@ -3020,6 +3226,8 @@ fn expand_automatic_row_heights(
     };
     let verified_normal_font = verified_ooxml_normal_font_size(sheet, options)
         .and_then(|_| sheet.default_cell_style()?.font.as_ref());
+    let verified_implicit_xlsx =
+        sheet.has_implicit_ooxml_row_height() && verified_normal_font.is_some();
 
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
@@ -3040,7 +3248,7 @@ fn expand_automatic_row_heights(
 
     let mut single_row_requirements = BTreeMap::<u32, Fixed>::new();
     let mut merged_requirements = Vec::<AutoMergeHeight>::new();
-    let mut measured_cells = 0_u64;
+    let mut automatic_cells = 0_u64;
 
     let local_candidates = if automatic_candidates.is_none() {
         let display_cell_index = SparseDisplayCellIndex::new(sheet);
@@ -3153,53 +3361,84 @@ fn expand_automatic_row_heights(
                 .and_then(|style| style.font.as_ref())
                 .is_some_and(|font| same_row_height_font(font, normal_font))
         });
-        if !alignment.is_some_and(|alignment| alignment.wrap)
+        automatic_cells = automatic_cells
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(LimitKind::Cells, options.limits.max_cells, automatic_cells)?;
+        account_automatic_text_bytes(cell.formatted, options, typography)?;
+        let plain_single_line = alignment
+            .is_none_or(|alignment| !alignment.wrap && alignment.rotation == 0)
             && !contains_mandatory_line_break(cell.formatted)
-            && rich_text.is_none()
+            && rich_text.is_none();
+        let effective_script = style
+            .as_ref()
+            .and_then(|style| style.font.as_ref())
+            .map_or(FormatScript::None, |font| font.script);
+        let ordinary_implicit_plain =
+            verified_implicit_xlsx && plain_single_line && effective_script == FormatScript::None;
+        if !verified_implicit_xlsx
+            && plain_single_line
             && (default_plain_font
                 || (verified_normal_font.is_none() && font_size <= options.default_font_size))
         {
             continue;
         }
 
-        measured_cells = measured_cells
-            .checked_add(1)
-            .ok_or(RenderError::CoordinateOverflow)?;
-        enforce(LimitKind::Cells, options.limits.max_cells, measured_cells)?;
-        let (text, _) = sanitize_xml_text(cell.formatted);
-        let rich_text = rich_text.and_then(|runs| {
-            let sanitized = sanitize_rich_text(runs);
-            (sanitized
-                .iter()
-                .map(|run| run.text.as_str())
-                .collect::<String>()
-                == text)
-                .then_some(sanitized)
-        });
-        let region = Region {
-            source,
-            rect: Rect {
-                x: Fixed::ZERO,
-                y: Fixed::ZERO,
-                width,
-                height: Fixed::from_raw(1),
-            },
-            is_merged,
-            style,
-            conditional: ConditionalPaint::default(),
-            text,
-            rich_text,
-            hyperlink: None,
-            numeric_default: false,
-            text_can_overflow: false,
+        let effective_font = style.as_ref().and_then(|style| style.font.as_ref());
+        let retained_font = cell.explicit_style.and_then(|style| style.font.as_ref());
+        let declared_points = ordinary_implicit_plain
+            .then(|| sheet.verified_xlsx_cell_font_size_pt(cell.row, cell.col))
+            .flatten()
+            .filter(|points| {
+                effective_font == retained_font
+                    && effective_font.and_then(|font| font.size_pt) == Some(*points)
+            });
+        let declared_plain_height = if let Some(points) = declared_points {
+            (!has_mixed_calc_script_classes_bounded(cell.formatted, options, typography)?)
+                .then(|| calc_ooxml_row_height_from_points(points))
+                .flatten()
+        } else {
+            None
         };
-        let required = measure_automatic_cell_height(
-            pack,
-            &region,
-            sheet.sheet_view().right_to_left,
-            options,
-            typography,
-        )?;
+
+        let required = if let Some(required) = declared_plain_height {
+            required
+        } else {
+            let (text, _) = sanitize_xml_text(cell.formatted);
+            let rich_text = rich_text.and_then(|runs| {
+                let sanitized = sanitize_rich_text(runs);
+                (sanitized
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    == text)
+                    .then_some(sanitized)
+            });
+            let region = Region {
+                source,
+                rect: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width,
+                    height: Fixed::from_raw(1),
+                },
+                is_merged,
+                style,
+                conditional: ConditionalPaint::default(),
+                text,
+                rich_text,
+                hyperlink: None,
+                numeric_default: false,
+                text_can_overflow: false,
+            };
+            measure_automatic_cell_height(
+                pack,
+                &region,
+                sheet.sheet_view().right_to_left,
+                options,
+                typography,
+            )?
+        };
         if is_merged {
             merged_requirements.push(AutoMergeHeight {
                 rows: visible_rows,
@@ -8847,15 +9086,6 @@ fn measure_automatic_cell_height(
     options: &RenderOptions,
     stats: &mut TypographyStats,
 ) -> Result<Fixed, RenderError> {
-    stats.text_bytes = stats
-        .text_bytes
-        .checked_add(region.text.len() as u64)
-        .ok_or(RenderError::CoordinateOverflow)?;
-    enforce(
-        LimitKind::TextBytes,
-        options.limits.max_text_bytes,
-        stats.text_bytes,
-    )?;
     let style = text_style(region, options, sheet_right_to_left);
     let prepared = prepare_styled_text(pack, region, &style, sheet_right_to_left, options, stats)?;
     sum_fixed(
@@ -12428,6 +12658,549 @@ mod tests {
         };
         let (rows, _) = measure_sheet_axes(&workbook.sheets[0], range, &included).unwrap();
         assert!(rows[4].size > Fixed::from_pixels(20));
+    }
+
+    #[test]
+    fn implicit_xlsx_plain_rows_use_declared_font_height_across_font_facets() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="5"><font><sz val="11"/><name val="{family}"/></font><font><b/><sz val="11"/><name val="{family}"/></font><font><i/><sz val="11"/><name val="{family}"/></font><font><sz val="11"/><name val="RTL Sans"/></font><font><sz val="14"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="5"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/><xf fontId="2" xfId="0" applyFont="1"/><xf fontId="3" xfId="0" applyFont="1"/><xf fontId="4" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>regular automatic row</t></is></c></row><row r="2"><c r="A2" s="1" t="inlineStr"><is><t>bold automatic row</t></is></c></row><row r="3"><c r="A3" s="2" t="inlineStr"><is><t>italic automatic row</t></is></c></row><row r="4"><c r="A4" s="3" t="inlineStr"><is><t>שלום</t></is></c></row><row r="5"><c r="A5" s="4" t="inlineStr"><is><t>large automatic row</t></is></c></row></sheetData></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let range = RenderRange::new(0, 0, 4, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+
+        let (rows, _) = measure_sheet_axes(&workbook.sheets[0], range, &options).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.size).collect::<Vec<_>>(),
+            [
+                Fixed::from_raw(18_842),
+                Fixed::from_raw(18_842),
+                Fixed::from_raw(18_842),
+                Fixed::from_raw(18_842),
+                Fixed::from_raw(23_689),
+            ]
+        );
+        assert_eq!(
+            calc_ooxml_row_height_from_points(14),
+            Some(Fixed::from_raw(23_689)),
+            "14pt must use Calc's 347-twip declared-font row height"
+        );
+    }
+
+    #[test]
+    fn implicit_xlsx_declared_height_requires_exact_cell_font_provenance() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family.clone(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let measure = |font_record: &str, cell_xf: &str| {
+            let styles = format!(
+                r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font>{font_record}<name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/>{cell_xf}</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            );
+            let workbook = imported_xlsx(
+                &styles,
+                r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>plain automatic row</t></is></c></row></sheetData></worksheet>"#,
+            );
+            let sheet = &workbook.sheets[0];
+            let mut snapshot = RenderStyleSnapshot::new(sheet);
+            snapshot.capture_range(sheet, range, &options).unwrap();
+            let measured = measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &options,
+                None,
+                &mut Warnings::default(),
+            )
+            .unwrap();
+            (
+                sheet.verified_xlsx_cell_font_size_pt(0, 0),
+                sheet
+                    .resolved_cell_style(0, 0)
+                    .and_then(|style| style.font)
+                    .and_then(|font| font.size_pt),
+                measured,
+            )
+        };
+
+        let (provenance, rounded_points, exact) =
+            measure(r#"<sz val="14"/>"#, r#"<xf fontId="1" xfId="0"/>"#);
+        assert_eq!(provenance, Some(14));
+        assert_eq!(rounded_points, Some(14));
+        assert_eq!(exact.rows[0].size, Fixed::from_raw(23_689));
+        assert_eq!(exact.typography.shaped_runs, 0);
+
+        for (label, font_record, cell_xf, expected_rounded) in [
+            (
+                "fractional",
+                r#"<sz val="13.5"/>"#,
+                r#"<xf fontId="1" xfId="0"/>"#,
+                Some(14),
+            ),
+            (
+                "duplicate size",
+                r#"<sz val="13.5"/><sz val="14"/>"#,
+                r#"<xf fontId="1" xfId="0"/>"#,
+                Some(14),
+            ),
+            (
+                "malformed size",
+                r#"<sz val="malformed"/>"#,
+                r#"<xf fontId="1" xfId="0"/>"#,
+                None,
+            ),
+            (
+                "ambiguous cell XF",
+                r#"<sz val="14"/>"#,
+                r#"<xf fontId="1" fontId="0" xfId="0"/>"#,
+                Some(14),
+            ),
+        ] {
+            let (provenance, rounded_points, measured) = measure(font_record, cell_xf);
+            assert_eq!(provenance, None, "{label}");
+            assert_eq!(rounded_points, expected_rounded, "{label}");
+            assert!(
+                measured.typography.shaped_runs > 0,
+                "{label} must take the bounded shaped-height path"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_fractional_row_font_cannot_reuse_exact_cell_xf_provenance() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><sz val="10.5"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let workbook = imported_xlsx(
+            &styles,
+            r#"<worksheet><sheetData><row r="1" s="1" customFormat="1"><c r="A1" t="inlineStr"><is><t>plain automatic row</t></is></c></row></sheetData></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.font)
+                .and_then(|font| font.size_pt),
+            Some(11),
+            "the public model deliberately rounds the inherited 10.5pt source"
+        );
+        assert_eq!(sheet.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert!(measured.typography.shaped_runs > 0);
+    }
+
+    #[test]
+    fn later_style_zero_duplicate_clears_direct_font_provenance() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><sz val="10.5"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="3"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0"/><xf fontId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let workbook = imported_xlsx(
+            &styles,
+            r#"<worksheet><sheetData><row r="1" s="1" customFormat="1"><c r="A1" s="2" t="inlineStr"><is><t>earlier direct cell</t></is></c><c r="A1" t="inlineStr"><is><t>effective plain cell</t></is></c></row></sheetData></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet.display_cells().next().map(|cell| cell.formatted),
+            Some("effective plain cell")
+        );
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.font)
+                .and_then(|font| font.size_pt),
+            Some(11),
+            "the inherited 10.5pt row font collides after public rounding"
+        );
+        assert_eq!(sheet.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert!(measured.typography.shaped_runs > 0);
+    }
+
+    #[test]
+    fn implicit_xlsx_mixed_script_plain_row_uses_shaped_height() {
+        const MIXED_TEXT: &str = "한국어 자동 줄바꿈 English 日本語 中文 0123456789 한국어 자동 줄바꿈 English 日本語 中文 0123456789 한국어 자동 줄바꿈 English 日本語 中文 0123456789";
+
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = format!(
+            r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{MIXED_TEXT}</t></is></c></row></sheetData></worksheet>"#
+        );
+        let workbook = imported_xlsx(&styles, &worksheet);
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+
+        assert!(has_mixed_calc_script_classes(MIXED_TEXT));
+        assert!(!has_mixed_calc_script_classes("bold automatic row"));
+        assert!(!has_mixed_calc_script_classes("日本語かなカナ"));
+        assert!(!has_mixed_calc_script_classes("한국어 中文"));
+        assert!(!has_mixed_calc_script_classes("Latin Ελληνικά"));
+        assert!(!has_mixed_calc_script_classes("שלום العربية"));
+        assert!(has_mixed_calc_script_classes("123 한국어"));
+        assert!(has_mixed_calc_script_classes("Latin。"));
+        assert!(has_mixed_calc_script_classes("Latin Ａ"));
+        assert!(!has_mixed_calc_script_classes(
+            " \u{00a0}\u{00b2}\u{00b3}\u{00b9}한국어"
+        ));
+        assert!(!has_mixed_calc_script_classes(
+            "\u{0001}\u{0002}\u{02c7}\u{02ca}\u{02cb}\u{02d9}한국어"
+        ));
+        assert!(!has_mixed_calc_script_classes("Latin \u{2c80}"));
+        assert_eq!(calc_script_class('1'), Some(CalcScriptClass::Western));
+        assert_eq!(calc_script_class('１'), Some(CalcScriptClass::Asian));
+        assert_eq!(
+            calc_script_class('\u{2c80}'),
+            Some(CalcScriptClass::Western)
+        );
+        assert!(
+            measured.rows[0].size > Fixed::from_raw(18_842),
+            "mixed-script text must grow beyond Calc's 276-twip 11pt baseline"
+        );
+        assert!(
+            measured.typography.shaped_runs > 0,
+            "mixed-script text must take the shaped automatic-height path"
+        );
+    }
+
+    #[test]
+    fn declared_height_classification_and_off_range_candidates_obey_exact_limits() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let workbook = imported_xlsx(
+            &styles,
+            r#"<worksheet><sheetData><row r="1"><c r="F1" t="inlineStr"><is><t>Latin</t></is></c></row></sheetData></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 0, 0);
+        let mut options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let candidates = sheet.display_cells().collect::<Vec<_>>();
+
+        options.limits.max_cells = 1;
+        options.limits.max_text_bytes = 5;
+        options.limits.max_text_runs = 5;
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            Some(&candidates),
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert_eq!(measured.typography.text_bytes, 5);
+        assert_eq!(measured.typography.text_work, 5);
+        assert_eq!(measured.typography.shaped_runs, 0);
+
+        let mut limited = options.clone();
+        limited.limits.max_text_runs = 4;
+        assert_eq!(
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &limited,
+                Some(&candidates),
+                &mut Warnings::default(),
+            )
+            .map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::TextRuns,
+                limit: 4,
+                actual: 5,
+            })
+        );
+
+        let mut limited = options.clone();
+        limited.limits.max_text_bytes = 4;
+        assert_eq!(
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &limited,
+                Some(&candidates),
+                &mut Warnings::default(),
+            )
+            .map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::TextBytes,
+                limit: 4,
+                actual: 5,
+            })
+        );
+
+        let mut limited = options;
+        limited.limits.max_cells = 0;
+        assert_eq!(
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &limited,
+                Some(&candidates),
+                &mut Warnings::default(),
+            )
+            .map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::Cells,
+                limit: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn skipped_default_plain_candidates_are_charged_before_text_scans() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("bounded").write(0, 5, "bounded");
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 0, 0);
+        let mut options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let candidates = sheet.display_cells().collect::<Vec<_>>();
+
+        options.limits.max_cells = 1;
+        options.limits.max_text_bytes = 7;
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            Some(&candidates),
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert_eq!(measured.typography.text_bytes, 7);
+        assert_eq!(measured.typography.text_work, 0);
+        assert_eq!(measured.typography.shaped_runs, 0);
+
+        let mut limited = options.clone();
+        limited.limits.max_text_bytes = 6;
+        assert_eq!(
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &limited,
+                Some(&candidates),
+                &mut Warnings::default(),
+            )
+            .map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::TextBytes,
+                limit: 6,
+                actual: 7,
+            })
+        );
+
+        let mut limited = options;
+        limited.limits.max_cells = 0;
+        assert_eq!(
+            measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &limited,
+                Some(&candidates),
+                &mut Warnings::default(),
+            )
+            .map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::Cells,
+                limit: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn implicit_xlsx_rotation_shapes_but_shrink_uses_declared_auto_height() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="3"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment textRotation="30"/></xf><xf fontId="0" xfId="0" applyAlignment="1"><alignment shrinkToFit="1"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>rotated automatic row</t></is></c></row><row r="2"><c r="A2" s="2" t="inlineStr"><is><t>shrunk automatic row</t></is></c></row></sheetData></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 1, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+
+        assert!(
+            measured.rows[0].size > Fixed::from_raw(18_842),
+            "rotation must remain on the shaped height path"
+        );
+        assert_eq!(
+            measured.rows[1].size,
+            Fixed::from_raw(18_842),
+            "Calc's standard-height path does not exclude shrink-to-fit"
+        );
+        assert!(measured.typography.shaped_runs >= 1);
+    }
+
+    #[test]
+    fn implicit_xlsx_superscript_and_subscript_keep_measured_auto_height() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="3"><font><sz val="11"/><name val="{family}"/></font><font><vertAlign val="superscript"/><sz val="11"/><name val="{family}"/></font><font><vertAlign val="subscript"/><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="3"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/><xf fontId="2" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>superscript automatic row</t></is></c></row><row r="2"><c r="A2" s="2" t="inlineStr"><is><t>subscript automatic row</t></is></c></row></sheetData></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.font)
+                .map(|font| font.script),
+            Some(FormatScript::Superscript)
+        );
+        assert_eq!(
+            sheet
+                .resolved_cell_style(1, 0)
+                .and_then(|style| style.font)
+                .map(|font| font.script),
+            Some(FormatScript::Subscript)
+        );
+
+        let range = RenderRange::new(0, 0, 1, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+
+        assert!(
+            measured.typography.shaped_runs >= 2,
+            "superscript and subscript must not take the declared-font shortcut"
+        );
     }
 
     #[test]
