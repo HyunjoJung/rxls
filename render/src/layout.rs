@@ -120,6 +120,17 @@ pub enum RenderSelection {
     Range(RenderRange),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsedDrawingTerminalColumnPolicy {
+    Indexed,
+    CalcOoxmlSinglePage,
+}
+
+#[derive(Debug)]
+struct CalcOoxmlSinglePageColumnBounds {
+    cumulative_twips: Vec<u64>,
+}
+
 /// Hard resource ceilings applied before and during layout and serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderLimits {
@@ -1132,7 +1143,27 @@ pub fn build_sheet_scene(
     sheet_index: usize,
     options: &RenderOptions,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, None)
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        None,
+        UsedDrawingTerminalColumnPolicy::Indexed,
+    )
+}
+
+pub(crate) fn build_single_page_sheet_scene(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        None,
+        UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
+    )
 }
 
 pub(crate) fn build_sheet_scene_with_geometry(
@@ -1141,7 +1172,13 @@ pub(crate) fn build_sheet_scene_with_geometry(
     options: &RenderOptions,
     geometry: SheetGeometryOverride<'_>,
 ) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(sheet, sheet_index, options, Some(geometry))
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        Some(geometry),
+        UsedDrawingTerminalColumnPolicy::Indexed,
+    )
 }
 
 fn build_sheet_scene_inner(
@@ -1149,13 +1186,19 @@ fn build_sheet_scene_inner(
     sheet_index: usize,
     options: &RenderOptions,
     geometry: Option<SheetGeometryOverride<'_>>,
+    terminal_column_policy: UsedDrawingTerminalColumnPolicy,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
     let used_extent = match options.selection {
         RenderSelection::Used => {
             style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-            Some(render_used_extent(sheet, &style_snapshot, options)?)
+            Some(render_used_extent(
+                sheet,
+                &style_snapshot,
+                options,
+                terminal_column_policy,
+            )?)
         }
         RenderSelection::Range(_) => None,
     };
@@ -1709,11 +1752,21 @@ fn render_used_extent(
     sheet: &Sheet,
     style_snapshot: &RenderStyleSnapshot,
     options: &RenderOptions,
+    terminal_column_policy: UsedDrawingTerminalColumnPolicy,
 ) -> Result<UsedRenderExtent, RenderError> {
     let mut extent = UsedRenderExtent::default();
     let mut retained_cells = BTreeMap::<u32, BTreeSet<u16>>::new();
     let metadata_index = DrawingMetadataIndex::new(sheet);
-    let maximum_digit_width = drawing_extent_maximum_digit_width(sheet, style_snapshot, options)?;
+    let maximum_digit_width =
+        drawing_extent_maximum_digit_width(sheet, style_snapshot, options, terminal_column_policy)?;
+    let single_page_column_bounds =
+        if terminal_column_policy == UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage {
+            maximum_digit_width.and_then(|maximum_digit_width| {
+                calc_ooxml_single_page_column_bounds(sheet, maximum_digit_width, options)
+            })
+        } else {
+            None
+        };
 
     for (row, col, _) in sheet.cells() {
         include_render_coordinate(&mut extent.range, row, col);
@@ -1766,6 +1819,7 @@ fn render_used_extent(
             to,
             metadata,
             maximum_digit_width,
+            single_page_column_bounds.as_ref(),
             options,
         )?;
         include_render_coordinate(
@@ -1795,6 +1849,7 @@ fn render_used_extent(
             chart.to,
             metadata,
             maximum_digit_width,
+            single_page_column_bounds.as_ref(),
             options,
         )?;
         include_render_coordinate(
@@ -1822,6 +1877,7 @@ fn render_used_extent(
             metadata.to_cell.unwrap_or(from),
             Some(metadata),
             maximum_digit_width,
+            single_page_column_bounds.as_ref(),
             options,
         )?;
         include_render_coordinate(
@@ -1886,6 +1942,7 @@ fn drawing_used_to(
     to: (u32, u16),
     metadata: Option<&DrawingMetadata>,
     maximum_digit_width: Option<Fixed>,
+    single_page_column_bounds: Option<&CalcOoxmlSinglePageColumnBounds>,
     options: &RenderOptions,
 ) -> Result<(u32, u16), RenderError> {
     if let Some((width, height)) = metadata
@@ -1914,9 +1971,16 @@ fn drawing_used_to(
     else {
         return Ok(to);
     };
+    let terminal_column = if column_offset == 0 {
+        single_page_column_bounds
+            .and_then(|bounds| bounds.terminal_column(from.1, to.1))
+            .unwrap_or_else(|| terminal_used_column(sheet, from.1, to.1, column_offset, options))
+    } else {
+        terminal_used_column(sheet, from.1, to.1, column_offset, options)
+    };
     Ok((
         terminal_used_row(sheet, from.0, to.0, row_offset, options),
-        terminal_used_column(sheet, from.1, to.1, column_offset, options),
+        terminal_column,
     ))
 }
 
@@ -1924,12 +1988,21 @@ fn drawing_extent_maximum_digit_width(
     sheet: &Sheet,
     style_snapshot: &RenderStyleSnapshot,
     options: &RenderOptions,
+    terminal_column_policy: UsedDrawingTerminalColumnPolicy,
 ) -> Result<Option<Fixed>, RenderError> {
-    if !sheet.drawing_metadata().iter().any(|metadata| {
-        metadata.behavior != DrawingAnchorBehavior::MoveAndSize
-            && metadata.from_cell.is_some()
-            && metadata.absolute_size_emu.is_some()
-    }) {
+    let requires_single_page_terminal_width = terminal_column_policy
+        == UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage
+        && options.font_pack.is_some()
+        && sheet.implicit_ooxml_column_width() == Some(None)
+        && sheet.xlsb_default_column_width().is_none()
+        && sheet.xlsb_column_widths_256().is_empty();
+    if !requires_single_page_terminal_width
+        && !sheet.drawing_metadata().iter().any(|metadata| {
+            metadata.behavior != DrawingAnchorBehavior::MoveAndSize
+                && metadata.from_cell.is_some()
+                && metadata.absolute_size_emu.is_some()
+        })
+    {
         return Ok(None);
     }
     let mut warnings = Warnings::default();
@@ -2018,6 +2091,88 @@ fn fixed_size_used_row(
         candidate = row + 1;
     }
     Ok(last)
+}
+
+fn calc_ooxml_single_page_column_bounds(
+    sheet: &Sheet,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+) -> Option<CalcOoxmlSinglePageColumnBounds> {
+    if options.font_pack.is_none()
+        || sheet.implicit_ooxml_column_width() != Some(None)
+        || sheet.xlsb_default_column_width().is_some()
+        || !sheet.xlsb_column_widths_256().is_empty()
+    {
+        return None;
+    }
+    let Ok(maximum_digit_width_raw) = u64::try_from(maximum_digit_width.raw()) else {
+        return None;
+    };
+    let scaled_digit_width = maximum_digit_width_raw.checked_mul(15)?;
+    let digit_twips = scaled_digit_width / 1_024;
+    if digit_twips == 0 {
+        return None;
+    }
+    let default_width_twips = digit_twips
+        .checked_mul(17)
+        .and_then(|value| value.checked_add(1))
+        .map(|value| value / 2)?;
+    let column_width_twips = |column: u16| -> Option<u64> {
+        let Some(characters) = sheet.column_widths().get(&column).copied() else {
+            return Some(default_width_twips);
+        };
+        if !characters.is_finite() || characters <= 0.0 {
+            return None;
+        }
+        let width = f64::from(characters) * digit_twips as f64;
+        let rounded = width.round();
+        if !rounded.is_finite() || rounded <= 0.0 || rounded > u64::MAX as f64 {
+            return None;
+        }
+        Some(rounded as u64)
+    };
+
+    // Marker coordinates are absolute from column A. Build one schema-bounded
+    // prefix table per render, then resolve every drawing endpoint by binary
+    // search instead of rescanning the grid for each retained anchor.
+    let mut cumulative = 0_u64;
+    let mut cumulative_twips =
+        Vec::with_capacity(usize::from(MAX_WORKSHEET_COLUMN).saturating_add(1));
+    for column in 0..=MAX_WORKSHEET_COLUMN {
+        if options.include_hidden || !sheet.hidden_columns().contains(&column) {
+            cumulative = cumulative.checked_add(column_width_twips(column)?)?;
+        }
+        cumulative_twips.push(cumulative);
+    }
+    Some(CalcOoxmlSinglePageColumnBounds { cumulative_twips })
+}
+
+impl CalcOoxmlSinglePageColumnBounds {
+    fn terminal_column(&self, from: u16, to: u16) -> Option<u16> {
+        let to = usize::from(to);
+        if to <= usize::from(from) || to > self.cumulative_twips.len() {
+            return None;
+        }
+        let marker_boundary_twips = self.cumulative_twips[to.checked_sub(1)?];
+        let marker_boundary_mm100 = round_unsigned_ratio(marker_boundary_twips, 127, 72)?;
+        let closed_boundary_mm100 = marker_boundary_mm100.checked_sub(1)?;
+        let closed_boundary_twips = round_unsigned_ratio(closed_boundary_mm100, 72, 127)?;
+        let terminal = self
+            .cumulative_twips
+            .partition_point(|boundary| *boundary <= closed_boundary_twips);
+        if terminal >= self.cumulative_twips.len() {
+            return None;
+        }
+        u16::try_from(terminal).ok().map(|column| column.max(from))
+    }
+}
+
+fn round_unsigned_ratio(value: u64, numerator: u64, denominator: u64) -> Option<u64> {
+    let rounded = u128::from(value)
+        .checked_mul(u128::from(numerator))?
+        .checked_add(u128::from(denominator / 2))?
+        .checked_div(u128::from(denominator))?;
+    u64::try_from(rounded).ok()
 }
 
 fn terminal_used_column(
@@ -2189,7 +2344,12 @@ pub(crate) fn prepared_drawing_geometry_extent(
     let mut extents = Vec::new();
     let mut has_absolute = false;
     let style_snapshot = RenderStyleSnapshot::new(sheet);
-    let maximum_digit_width = drawing_extent_maximum_digit_width(sheet, &style_snapshot, options)?;
+    let maximum_digit_width = drawing_extent_maximum_digit_width(
+        sheet,
+        &style_snapshot,
+        options,
+        UsedDrawingTerminalColumnPolicy::Indexed,
+    )?;
     let mut include = |from: (u32, u16), to: (u32, u16)| {
         extents.push(RenderRange::new(
             from.0.min(MAX_WORKSHEET_ROW),
@@ -2215,6 +2375,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             )),
             metadata,
             maximum_digit_width,
+            None,
             options,
         )?;
         if anchor_range_intersects_render_ranges(image.from, to, ranges) {
@@ -2234,6 +2395,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             chart.to,
             metadata,
             maximum_digit_width,
+            None,
             options,
         )?;
         if anchor_range_intersects_render_ranges(chart.from, to, ranges) {
@@ -2254,6 +2416,7 @@ pub(crate) fn prepared_drawing_geometry_extent(
             metadata.to_cell.unwrap_or(from),
             Some(metadata),
             maximum_digit_width,
+            None,
             options,
         )?;
         if anchor_range_intersects_render_ranges(from, to, ranges) {
@@ -2300,14 +2463,18 @@ pub(crate) fn cell_style_has_visible_blank_paint(style: &CellStyle) -> bool {
     has_fill || has_border
 }
 
-/// Resolve the exact used range recorded by a single expanded sheet scene.
-pub(crate) fn render_used_scene_range(
+pub(crate) fn render_single_page_used_scene_range(
     sheet: &Sheet,
     options: &RenderOptions,
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    let extent = render_used_extent(sheet, &style_snapshot, options)?;
+    let extent = render_used_extent(
+        sheet,
+        &style_snapshot,
+        options,
+        UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
+    )?;
     Ok(extent.range.unwrap_or_else(|| RenderRange::new(0, 0, 0, 0)))
 }
 
@@ -2323,9 +2490,14 @@ pub(crate) fn render_used_print_range(
 ) -> Result<RenderRange, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     style_snapshot.capture_sparse_visual_candidates(sheet, options)?;
-    let mut range = render_used_extent(sheet, &style_snapshot, options)?
-        .range
-        .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0));
+    let mut range = render_used_extent(
+        sheet,
+        &style_snapshot,
+        options,
+        UsedDrawingTerminalColumnPolicy::Indexed,
+    )?
+    .range
+    .unwrap_or_else(|| RenderRange::new(0, 0, 0, 0));
     let Some((absolute_right, absolute_bottom)) = absolute_drawing_positive_extent(sheet)? else {
         return Ok(range);
     };
@@ -10686,6 +10858,61 @@ mod tests {
         Workbook::open(&zip.finish().unwrap().into_inner()).expect("two-cell drawing workbook")
     }
 
+    fn imported_single_page_terminal_column_drawing(
+        hidden_terminal_column: bool,
+        explicit_prefix_widths: bool,
+        from_column: u16,
+        to_column: u16,
+    ) -> Workbook {
+        let mut columns = String::new();
+        if explicit_prefix_widths {
+            columns.push_str(
+                r#"<col min="1" max="1" width="18" customWidth="1"/><col min="2" max="5" width="14" customWidth="1"/>"#,
+            );
+        }
+        if hidden_terminal_column {
+            columns.push_str(&format!(
+                r#"<col min="{to_column}" max="{to_column}" hidden="1"/>"#
+            ));
+        }
+        let columns = if columns.is_empty() {
+            String::new()
+        } else {
+            format!("<cols>{columns}</cols>")
+        };
+        let worksheet =
+            format!(r#"<worksheet>{columns}<sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#);
+        let drawing = format!(
+            r#"<wsDr><twoCellAnchor><from><col>{from_column}</col><colOff>0</colOff><row>0</row><rowOff>0</rowOff></from><to><col>{to_column}</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></to><sp><nvSpPr><cNvPr id="1" name="Terminal column"/></nvSpPr></sp></twoCellAnchor></wsDr>"#
+        );
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Drawing" r:id="rId1"/></sheets></workbook>"#
+                    .as_slice(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#
+                    .as_slice(),
+            ),
+            ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                br#"<Relationships><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#
+                    .as_slice(),
+            ),
+            ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        Workbook::open(&zip.finish().unwrap().into_inner())
+            .expect("single-page terminal-column drawing workbook")
+    }
+
     fn imported_hidden_two_cell_drawing(
         kind: DrawingObjectKind,
         move_only: bool,
@@ -10789,6 +11016,18 @@ mod tests {
             }
         }
         panic!("fixed drawing outer frame")
+    }
+
+    fn shape_placeholder_rect(nodes: &[SceneNode]) -> Option<Rect> {
+        nodes.iter().find_map(|node| match node {
+            SceneNode::Rect(RectNode {
+                rect,
+                fill: Some(color),
+                ..
+            }) if *color == Rgb::new(221, 235, 247) => Some(*rect),
+            SceneNode::ClipGroup(group) => shape_placeholder_rect(&group.nodes),
+            _ => None,
+        })
     }
 
     fn glyph_run<'a>(scene: &'a Scene, text: &str) -> &'a GlyphRunNode {
@@ -13947,6 +14186,121 @@ mod tests {
                 assert_eq!(build.report.range, expected, "{kind:?} at {offset:?}");
             }
         }
+    }
+
+    #[test]
+    fn calc_ooxml_closed_terminal_boundaries_round_trip_through_mm100_exactly() {
+        for (twips, mm100, closed_twips) in [
+            (5_185, 9_146, 5_185),
+            (6_222, 10_975, 6_221),
+            (9_028, 15_924, 9_027),
+            (10_065, 17_754, 10_065),
+        ] {
+            assert_eq!(round_unsigned_ratio(twips, 127, 72), Some(mm100));
+            assert_eq!(round_unsigned_ratio(mm100 - 1, 72, 127), Some(closed_twips));
+        }
+    }
+
+    #[test]
+    fn single_page_ooxml_zero_offset_terminal_columns_follow_calc_physical_bounds_only() {
+        let pack = synthetic_test_pack();
+        let render_options = RenderOptions {
+            gridlines: false,
+            default_font_family: pack.default_family().to_string(),
+            // The synthetic face has a 600/1000 digit advance, yielding the
+            // hosted Noto-equivalent 8_336 raw / 122-twip digit width.
+            default_font_size: Fixed::from_raw(13_893),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        for (
+            hidden_terminal_column,
+            explicit_prefix_widths,
+            ordinary_last_column,
+            single_page_last_column,
+            label,
+        ) in [
+            (true, false, 4, 6, "hidden implicit F"),
+            (false, false, 5, 5, "visible implicit F"),
+            (true, true, 4, 4, "hidden explicit-prefix F"),
+            (false, true, 5, 6, "visible explicit-prefix F"),
+        ] {
+            let workbook = imported_single_page_terminal_column_drawing(
+                hidden_terminal_column,
+                explicit_prefix_widths,
+                0,
+                6,
+            );
+            let sheet = &workbook.sheets[0];
+            assert_eq!(sheet.implicit_ooxml_column_width(), Some(None), "{label}");
+            assert_eq!(sheet.xlsb_default_column_width(), None, "{label}");
+            assert!(sheet.xlsb_column_widths_256().is_empty(), "{label}");
+            let metadata = &sheet.drawing_metadata()[0];
+            assert_eq!(metadata.from_cell, Some((0, 0)), "{label}");
+            assert_eq!(metadata.to_cell, Some((1, 6)), "{label}");
+            assert_eq!(metadata.to_offset_emu, Some((0, 0)), "{label}");
+
+            let ordinary = build_scene(&workbook, 0, &render_options).unwrap();
+            assert_eq!(
+                ordinary.report.range,
+                RenderRange::new(0, 0, 0, ordinary_last_column),
+                "ordinary Used bounds changed for {label}"
+            );
+            let single_page = build_print_document(
+                &workbook,
+                0,
+                &PrintOptions {
+                    single_page_sheets: true,
+                    render: render_options.clone(),
+                    ..PrintOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                single_page.report.source.range,
+                RenderRange::new(0, 0, 0, single_page_last_column),
+                "{label}"
+            );
+            assert_eq!(
+                single_page.report.pages[0].body_range, single_page.report.source.range,
+                "{label}"
+            );
+            assert_eq!(
+                shape_placeholder_rect(&single_page.pages[0].scene.nodes),
+                shape_placeholder_rect(&ordinary.scene.nodes),
+                "used-bound policy changed drawing paint geometry for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_page_ooxml_physical_bounds_keep_sparse_high_columns_within_span_limits() {
+        let pack = synthetic_test_pack();
+        let workbook = imported_single_page_terminal_column_drawing(false, false, 1_024, 1_030);
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                single_page_sheets: true,
+                render: RenderOptions {
+                    gridlines: false,
+                    default_font_family: pack.default_family().to_string(),
+                    default_font_size: Fixed::from_raw(13_893),
+                    font_pack: Some(pack),
+                    limits: RenderLimits {
+                        max_columns: 6,
+                        ..RenderLimits::default()
+                    },
+                    ..RenderOptions::default()
+                },
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            document.report.source.range,
+            RenderRange::new(0, 1_024, 0, 1_029)
+        );
     }
 
     #[test]

@@ -9,12 +9,13 @@ use sha2::{Digest, Sha256};
 use crate::error::{LimitKind, RenderError};
 use crate::layout::{
     absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene,
-    build_sheet_scene_with_geometry, cell_drawings_intersect_prepared_range,
-    cell_style_has_visible_blank_paint, external_render_dependency_cells,
-    measure_sheet_axes_for_ranges, prepared_drawing_geometry_extent, render_used_print_range,
-    render_used_scene_range, CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions,
-    RenderRange, RenderReport, RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex,
-    WarningCode, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    build_sheet_scene_with_geometry, build_single_page_sheet_scene,
+    cell_drawings_intersect_prepared_range, cell_style_has_visible_blank_paint,
+    external_render_dependency_cells, measure_sheet_axes_for_ranges,
+    prepared_drawing_geometry_extent, render_single_page_used_scene_range, render_used_print_range,
+    CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions, RenderRange, RenderReport,
+    RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex, WarningCode,
+    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
 use crate::scene::{
     ClipGroupNode, Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
@@ -455,17 +456,19 @@ impl DecodedMediaBudget {
         sheet_index: usize,
         base_options: &RenderOptions,
         geometry: Option<SheetGeometryOverride<'_>>,
+        single_page_used_bounds: bool,
     ) -> Result<Scene, RenderError> {
         let mut options = base_options.clone();
         options.limits.max_decoded_media_bytes = self
             .limit
             .checked_sub(self.retained)
             .ok_or(RenderError::CoordinateOverflow)?;
-        let build = match geometry {
-            Some(geometry) => {
+        let build = match (geometry, single_page_used_bounds) {
+            (None, true) => build_single_page_sheet_scene(sheet, sheet_index, &options),
+            (Some(geometry), _) => {
                 build_sheet_scene_with_geometry(sheet, sheet_index, &options, geometry)
             }
-            None => build_sheet_scene(sheet, sheet_index, &options),
+            (None, false) => build_sheet_scene(sheet, sheet_index, &options),
         };
         let build = match build {
             Ok(build) => build,
@@ -1026,7 +1029,7 @@ fn prepare_single_page_sheet_document(
         .print_gridlines()
         .unwrap_or_else(|| sheet.print_gridlines());
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
-    let build = build_sheet_scene(sheet, sheet_index, &render_options)?;
+    let build = build_single_page_sheet_scene(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
     let mut source = build.report;
     source
@@ -1634,7 +1637,9 @@ fn build_sheet_print_page_with_budget(
             };
             options.selection = RenderSelection::Used;
             let current_range = match &prepared.state {
-                PreparedPrintState::SinglePage { .. } => render_used_scene_range(sheet, &options)?,
+                PreparedPrintState::SinglePage { .. } => {
+                    render_single_page_used_scene_range(sheet, &options)?
+                }
                 PreparedPrintState::Paginated { .. } => render_used_print_range(sheet, &options)?,
             };
             if current_range != prepared.report.source.range {
@@ -1683,7 +1688,8 @@ fn build_sheet_print_page_with_budget(
     let sheet_index = prepared.report.source.sheet_index;
     let scene = match &prepared.state {
         PreparedPrintState::SinglePage { render_options } => {
-            let scene = media_budget.build_sheet_scene(sheet, sheet_index, render_options, None)?;
+            let scene =
+                media_budget.build_sheet_scene(sheet, sheet_index, render_options, None, true)?;
             let scene_nodes = scene_node_count(&scene.nodes)?;
             enforce_print_limit(
                 LimitKind::PageSceneNodes,
@@ -2190,6 +2196,7 @@ fn append_block(
         sheet_index,
         &options,
         Some(SheetGeometryOverride::new(measured_rows, measured_columns)),
+        false,
     )?;
     let mut nodes = Vec::with_capacity(scene.nodes.len());
     for node in scene.nodes {
