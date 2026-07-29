@@ -1228,6 +1228,53 @@ fn glyph_spans_are_on_distinct_lines(
     }
 }
 
+fn nominal_clusters_start_new_visual_line(
+    node: &GlyphRunNode,
+    left_index: usize,
+    right_index: usize,
+) -> bool {
+    // Layout-produced clusters on one visual line retain exact horizontal
+    // cursor continuity even when rich-text scripts displace their baselines.
+    // A wrapped line both advances by approximately one nominal cluster
+    // height and resets that cursor. Caller-authored nodes without metrics
+    // retain the legacy grouping.
+    let Some((left, right)) = node
+        .cluster_metrics
+        .get(left_index)
+        .zip(node.cluster_metrics.get(right_index))
+    else {
+        return false;
+    };
+    let baseline_delta = i128::from(right.baseline_y.raw()) - i128::from(left.baseline_y.raw());
+    if baseline_delta <= 0 {
+        return false;
+    }
+    let nominal_height = |metrics: &GlyphClusterMetrics| {
+        i128::from(metrics.ascent.raw()) - i128::from(metrics.descent.raw())
+    };
+    let larger_height = nominal_height(left).max(nominal_height(right));
+    let baseline_tolerance = i128::from(FIXED_UNITS_PER_PIXEL);
+    if baseline_delta + baseline_tolerance < larger_height {
+        return false;
+    }
+
+    let left_end = i128::from(left.origin_x.raw()) + i128::from(left.advance_x.raw());
+    let right_end = i128::from(right.origin_x.raw()) + i128::from(right.advance_x.raw());
+    let cursor_tolerance = 1_i128;
+    let logical_cursors_are_contiguous = match (
+        left.advance_x.raw().signum(),
+        right.advance_x.raw().signum(),
+    ) {
+        (1, 1) => (left_end - i128::from(right.origin_x.raw())).abs() <= cursor_tolerance,
+        (-1, -1) => (i128::from(left.origin_x.raw()) - right_end).abs() <= cursor_tolerance,
+        // Zero and mixed-direction advances do not provide an unambiguous
+        // source-order cursor. Preserve one span rather than risk splitting a
+        // same-line bidi or suppressed-whitespace transition.
+        _ => true,
+    };
+    !logical_cursors_are_contiguous
+}
+
 fn glyph_semantic_spans(
     node: &GlyphRunNode,
     glyph_count: usize,
@@ -1330,7 +1377,7 @@ fn glyph_semantic_spans(
     let mut spans = Vec::<PdfGlyphSemanticSpan>::with_capacity(semantic_ranges.len());
     let mut cluster_span = vec![None; node.clusters.len()];
     let mut semantic_index = 0_usize;
-    let mut previous_visible = None::<(usize, usize)>;
+    let mut previous_visible = None::<(usize, usize, usize)>;
     for &(start, end, cluster_index) in &source_order {
         while semantic_ranges
             .get(semantic_index)
@@ -1347,9 +1394,17 @@ fn glyph_semantic_spans(
         if !visible[cluster_index] {
             continue;
         }
-        let continue_span = previous_visible.is_some_and(|(previous_semantic, previous_end)| {
-            previous_semantic == semantic_index && previous_end == start
-        });
+        let continue_span = previous_visible.is_some_and(
+            |(previous_semantic, previous_end, previous_cluster_index)| {
+                previous_semantic == semantic_index
+                    && previous_end == start
+                    && !nominal_clusters_start_new_visual_line(
+                        node,
+                        previous_cluster_index,
+                        cluster_index,
+                    )
+            },
+        );
         let span_index = if continue_span {
             let span_index = spans.len() - 1;
             spans[span_index].source.end = end;
@@ -1363,7 +1418,7 @@ fn glyph_semantic_spans(
             span_index
         };
         cluster_span[cluster_index] = Some(span_index);
-        previous_visible = Some((semantic_index, end));
+        previous_visible = Some((semantic_index, end, cluster_index));
     }
     for (cluster_index, span_index) in cluster_span.into_iter().enumerate() {
         if let Some(span_index) = span_index {
@@ -2866,6 +2921,7 @@ impl BoundedPdf {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -2878,6 +2934,7 @@ mod tests {
         ImageNode, LineNode, PathCommand, PathNode, RectNode, TextStyle,
     };
     use crate::svg::render_scene_svg_with_trace;
+    use zip::write::SimpleFileOptions;
 
     fn rectangle_commands(left: i64, top: i64) -> Vec<PathCommand> {
         vec![
@@ -3092,6 +3149,147 @@ mod tests {
             })],
         };
         document
+    }
+
+    fn imported_xlsx_workbook(styles: &str, worksheet: &str) -> rxls::Workbook {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="styles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+            ),
+            ("xl/styles.xml", styles),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        rxls::Workbook::open(&zip.finish().unwrap().into_inner()).unwrap()
+    }
+
+    fn outlined_test_document(
+        workbook: &rxls::Workbook,
+        pack: crate::font::FontPack,
+    ) -> PrintDocument {
+        let family = pack.default_family().to_string();
+        build_print_document(
+            workbook,
+            0,
+            &PrintOptions {
+                single_page_sheets: true,
+                render: RenderOptions {
+                    gridlines: false,
+                    default_font_family: family,
+                    font_pack: Some(pack),
+                    ..RenderOptions::default()
+                },
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    const SOFT_WRAPPED_CJK: &str = "天地玄黄宇宙洪荒日月盈昃辰宿列張";
+    const RIGHT_ALIGNED_CJK: &str = "天地玄黄宇宙洪荒日月盈昃辰宿列張寒";
+
+    fn wrapped_cjk_outline_document(
+        text: &str,
+        column_width: f32,
+        alignment: Option<rxls::HAlign>,
+        reopen_xlsx: bool,
+    ) -> PrintDocument {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let workbook = if reopen_xlsx {
+            let horizontal = match alignment {
+                Some(rxls::HAlign::Left) => r#" horizontal="left""#,
+                Some(rxls::HAlign::Center) => r#" horizontal="center""#,
+                Some(rxls::HAlign::Right) => r#" horizontal="right""#,
+                None => "",
+            };
+            let styles = format!(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"{horizontal}/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            );
+            let worksheet = format!(
+                r#"<worksheet><cols><col min="1" max="1" width="{column_width}" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+            );
+            imported_xlsx_workbook(&styles, &worksheet)
+        } else {
+            let mut workbook = rxls::Workbook::new();
+            let sheet = workbook.add_sheet("wrapped-cjk");
+            sheet.set_col_width(0, column_width);
+            let mut style = rxls::CellStyle::new().font_name(family).size(11).wrap();
+            if let Some(alignment) = alignment {
+                style = style.align(alignment);
+            }
+            sheet.write_styled(0, 0, text, &style);
+            workbook
+        };
+        outlined_test_document(&workbook, pack)
+    }
+
+    fn soft_wrapped_cjk_outline_document() -> PrintDocument {
+        wrapped_cjk_outline_document(SOFT_WRAPPED_CJK, 4.0, None, false)
+    }
+
+    fn same_line_metric_control_document() -> PrintDocument {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let base = rxls::CellStyle::new().font_name(&family).size(11);
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("same-line-controls");
+        sheet.set_col_width(0, 40.0);
+        sheet.write_styled(0, 0, "漢字仮名", &base);
+        sheet.write_rich_styled(
+            1,
+            0,
+            [
+                rxls::TextRun::new(
+                    "AB",
+                    rxls::Font::new()
+                        .with_name("Wide Sans")
+                        .with_size(24)
+                        .with_script(rxls::FormatScript::Superscript),
+                ),
+                rxls::TextRun::new(
+                    "אב",
+                    rxls::Font::new()
+                        .with_name("RTL Sans")
+                        .with_size(11)
+                        .with_script(rxls::FormatScript::Subscript),
+                ),
+            ],
+            &base,
+        );
+        sheet.write_rich_styled(
+            2,
+            0,
+            [
+                rxls::TextRun::new(
+                    "A",
+                    rxls::Font::new()
+                        .with_name("Wide Sans")
+                        .with_size(24)
+                        .with_script(rxls::FormatScript::Superscript),
+                ),
+                rxls::TextRun::new(
+                    "B",
+                    rxls::Font::new()
+                        .with_name("Wide Sans")
+                        .with_size(11)
+                        .with_script(rxls::FormatScript::Subscript),
+                ),
+                rxls::TextRun::new("C", rxls::Font::new().with_name("Wide Sans").with_size(11)),
+            ],
+            &base,
+        );
+        sheet.write_styled(3, 0, "回転文字", &base.clone().text_rotation(30));
+        outlined_test_document(&workbook, pack)
     }
 
     fn final_line_nominal_descent_document() -> PrintDocument {
@@ -3629,6 +3827,14 @@ mod tests {
         nodes.iter().find_map(|node| match node {
             SceneNode::ClipGroup(group) => first_glyph_run(&group.nodes),
             SceneNode::GlyphRun(node) => Some(node),
+            _ => None,
+        })
+    }
+
+    fn glyph_run_with_text<'a>(nodes: &'a [SceneNode], expected: &str) -> Option<&'a GlyphRunNode> {
+        nodes.iter().find_map(|node| match node {
+            SceneNode::ClipGroup(group) => glyph_run_with_text(&group.nodes, expected),
+            SceneNode::GlyphRun(node) if node.text == expected => Some(node),
             _ => None,
         })
     }
@@ -4265,6 +4471,146 @@ mod tests {
     }
 
     #[test]
+    fn layout_same_line_metrics_preserve_cjk_rich_scripts_bidi_and_rotation() {
+        let document = same_line_metric_control_document();
+        let nodes = &document.pages[0].scene.nodes;
+        for expected in ["漢字仮名", "ABאב", "ABC", "回転文字"] {
+            let node = glyph_run_with_text(nodes, expected)
+                .unwrap_or_else(|| panic!("missing layout GlyphRun for {expected:?}"));
+            assert!(node.metadata_is_valid());
+            assert_eq!(node.cluster_metrics.len(), node.clusters.len());
+            let spans = glyph_semantic_spans(node, node.clusters.len(), node.clip_bounds).unwrap();
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| &node.text[span.source.clone()])
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{expected:?}"
+            );
+        }
+
+        let scripts = glyph_run_with_text(nodes, "ABC").unwrap();
+        assert!(
+            scripts
+                .cluster_metrics
+                .windows(2)
+                .any(|pair| pair[0].baseline_y != pair[1].baseline_y),
+            "the control must exercise script-displaced baselines"
+        );
+        let superscript = scripts
+            .clusters
+            .iter()
+            .position(|cluster| cluster.source_start == 0)
+            .unwrap();
+        let subscript = scripts
+            .clusters
+            .iter()
+            .position(|cluster| cluster.source_start == 1)
+            .unwrap();
+        let superscript_metrics = scripts.cluster_metrics[superscript];
+        let subscript_metrics = scripts.cluster_metrics[subscript];
+        let baseline_delta =
+            subscript_metrics.baseline_y.raw() - superscript_metrics.baseline_y.raw();
+        let smaller_height = (superscript_metrics.ascent.raw() - superscript_metrics.descent.raw())
+            .min(subscript_metrics.ascent.raw() - subscript_metrics.descent.raw());
+        let larger_height = (superscript_metrics.ascent.raw() - superscript_metrics.descent.raw())
+            .max(subscript_metrics.ascent.raw() - subscript_metrics.descent.raw());
+        assert!(
+            baseline_delta + FIXED_UNITS_PER_PIXEL >= smaller_height,
+            "the control must reject the smaller-height threshold"
+        );
+        assert!(
+            baseline_delta + FIXED_UNITS_PER_PIXEL < larger_height,
+            "the conservative larger-height threshold must retain the script run"
+        );
+        assert!(
+            !nominal_clusters_start_new_visual_line(scripts, superscript, subscript),
+            "same-line script displacement must not create a visual line"
+        );
+
+        let mixed_bidi_scripts = glyph_run_with_text(nodes, "ABאב").unwrap();
+        let latin = mixed_bidi_scripts
+            .clusters
+            .iter()
+            .position(|cluster| cluster.source_start == 1)
+            .unwrap();
+        let rtl = mixed_bidi_scripts
+            .clusters
+            .iter()
+            .position(|cluster| cluster.source_start == 2)
+            .unwrap();
+        let latin_metrics = mixed_bidi_scripts.cluster_metrics[latin];
+        let rtl_metrics = mixed_bidi_scripts.cluster_metrics[rtl];
+        let mixed_delta = rtl_metrics.baseline_y.raw() - latin_metrics.baseline_y.raw();
+        let mixed_smaller = (latin_metrics.ascent.raw() - latin_metrics.descent.raw())
+            .min(rtl_metrics.ascent.raw() - rtl_metrics.descent.raw());
+        let mixed_larger = (latin_metrics.ascent.raw() - latin_metrics.descent.raw())
+            .max(rtl_metrics.ascent.raw() - rtl_metrics.descent.raw());
+        assert!(mixed_delta + FIXED_UNITS_PER_PIXEL >= mixed_smaller);
+        assert!(mixed_delta + FIXED_UNITS_PER_PIXEL < mixed_larger);
+        assert!(!nominal_clusters_start_new_visual_line(
+            mixed_bidi_scripts,
+            latin,
+            rtl
+        ));
+        let rotated = glyph_run_with_text(nodes, "回転文字").unwrap();
+        assert_eq!(rotated.rotation_degrees, 30);
+    }
+
+    #[test]
+    fn aligned_wraps_use_directional_source_cursor_continuity() {
+        for (text, alignment, expected_lengths) in [
+            (RIGHT_ALIGNED_CJK, rxls::HAlign::Right, (3, 2)),
+            (SOFT_WRAPPED_CJK, rxls::HAlign::Center, (3, 1)),
+        ] {
+            let document = wrapped_cjk_outline_document(text, 4.0, Some(alignment), false);
+            let node = first_glyph_run(&document.pages[0].scene.nodes).unwrap();
+            let spans = glyph_semantic_spans(node, node.clusters.len(), node.clip_bounds).unwrap();
+            let [penultimate, last] = &spans[spans.len() - 2..] else {
+                panic!("expected at least two wrapped lines");
+            };
+            assert_eq!(
+                node.text[penultimate.source.clone()].chars().count(),
+                expected_lengths.0
+            );
+            assert_eq!(
+                node.text[last.source.clone()].chars().count(),
+                expected_lengths.1
+            );
+            let left_index = *penultimate
+                .glyphs
+                .iter()
+                .max_by_key(|index| node.clusters[**index].source_end)
+                .unwrap();
+            let right_index = *last
+                .glyphs
+                .iter()
+                .min_by_key(|index| node.clusters[**index].source_start)
+                .unwrap();
+            let left = node.cluster_metrics[left_index];
+            let right = node.cluster_metrics[right_index];
+            assert!(left.advance_x > Fixed::ZERO);
+            assert!(right.advance_x > Fixed::ZERO);
+            let left_end = left.origin_x.raw() + left.advance_x.raw();
+            let right_end = right.origin_x.raw() + right.advance_x.raw();
+            assert!(
+                (left.origin_x.raw() - right_end).abs() <= 1,
+                "the old symmetric check must be ambiguous for {alignment:?}"
+            );
+            assert!(
+                (left_end - right.origin_x.raw()).abs() > 1,
+                "positive source cursors must reset for {alignment:?}"
+            );
+            assert!(nominal_clusters_start_new_visual_line(
+                node,
+                left_index,
+                right_index
+            ));
+        }
+    }
+
+    #[test]
     fn outlined_text_uses_real_bounded_type3_programs_and_cluster_maps() {
         let mut workbook = rxls::Workbook::new();
         workbook.add_sheet("Subset").write(0, 0, "한A");
@@ -4436,6 +4782,167 @@ mod tests {
         if let Some(text) = poppler_text(&pdf) {
             assert!(text.contains("TOP"), "{text:?}");
             assert!(text.contains("BOTTOM"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn type3_poppler_soft_wrapped_cjk_preserves_order_and_line_boxes() {
+        let document = soft_wrapped_cjk_outline_document();
+        let node = first_glyph_run(&document.pages[0].scene.nodes).unwrap();
+        assert_eq!(node.text, SOFT_WRAPPED_CJK);
+        assert_eq!(node.cluster_metrics.len(), node.clusters.len());
+        let spans = glyph_semantic_spans(node, node.clusters.len(), node.clip_bounds).unwrap();
+        let span_text = spans
+            .iter()
+            .map(|span| &node.text[span.source.clone()])
+            .collect::<Vec<_>>();
+        let layout_baselines = node
+            .cluster_metrics
+            .iter()
+            .map(|metrics| metrics.baseline_y.raw())
+            .collect::<BTreeSet<_>>();
+        assert!(layout_baselines.len() >= 2, "{layout_baselines:?}");
+        assert_eq!(span_text.len(), layout_baselines.len(), "{span_text:?}");
+        assert_eq!(spans.first().unwrap().source.start, 0);
+        assert_eq!(spans.last().unwrap().source.end, node.text.len());
+        assert!(spans
+            .windows(2)
+            .all(|pair| pair[0].source.end == pair[1].source.start));
+        for span in &spans {
+            let baselines = span
+                .glyphs
+                .iter()
+                .map(|index| node.cluster_metrics[*index].baseline_y.raw())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(baselines.len(), 1, "{span:?}");
+        }
+
+        let mut no_metrics = node.clone();
+        no_metrics.cluster_metrics.clear();
+        let legacy = glyph_semantic_spans(
+            &no_metrics,
+            no_metrics.clusters.len(),
+            no_metrics.clip_bounds,
+        )
+        .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].source, 0..no_metrics.text.len());
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        for line in &span_text {
+            assert!(
+                source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(line))),
+                "{line:?}"
+            );
+        }
+        assert!(!source.contains(&format!(
+            "/ActualText <FEFF{}>",
+            utf16be_hex(SOFT_WRAPPED_CJK)
+        )));
+
+        if let Some(text) = poppler_text(&pdf) {
+            assert_eq!(
+                text.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>(),
+                SOFT_WRAPPED_CJK
+            );
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), span_text);
+            let boxes = span_text
+                .iter()
+                .map(|line| {
+                    let actual = poppler_word_bbox(&xml, line);
+                    assert_poppler_bbox_close(actual, nominal_source_bbox_points(node, line));
+                    actual
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                boxes
+                    .windows(2)
+                    .all(|pair| pair[0][3] <= pair[1][1] + 0.002),
+                "{boxes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_xlsx_calc_wraps_have_exact_touch_spans_and_poppler_boxes() {
+        for (text, alignment) in [
+            (SOFT_WRAPPED_CJK, None),
+            (RIGHT_ALIGNED_CJK, Some(rxls::HAlign::Right)),
+            (SOFT_WRAPPED_CJK, Some(rxls::HAlign::Center)),
+        ] {
+            let document = wrapped_cjk_outline_document(text, 4.0, alignment, true);
+            let node = first_glyph_run(&document.pages[0].scene.nodes).unwrap();
+            assert_eq!(node.text, text);
+            let spans = glyph_semantic_spans(node, node.clusters.len(), node.clip_bounds).unwrap();
+            assert!(spans.len() >= 2, "{alignment:?}");
+            let span_text = spans
+                .iter()
+                .map(|span| &node.text[span.source.clone()])
+                .collect::<Vec<_>>();
+            assert!(spans
+                .windows(2)
+                .all(|pair| pair[0].source.end == pair[1].source.start));
+            for pair in spans.windows(2) {
+                let left_index = *pair[0]
+                    .glyphs
+                    .iter()
+                    .max_by_key(|index| node.clusters[**index].source_end)
+                    .unwrap();
+                let right_index = *pair[1]
+                    .glyphs
+                    .iter()
+                    .min_by_key(|index| node.clusters[**index].source_start)
+                    .unwrap();
+                let left = node.cluster_metrics[left_index];
+                let right = node.cluster_metrics[right_index];
+                let left_height = left.ascent.raw() - left.descent.raw();
+                let right_height = right.ascent.raw() - right.descent.raw();
+                assert_eq!(left_height, right_height, "{alignment:?}");
+                assert_eq!(
+                    right.baseline_y.raw() - left.baseline_y.raw(),
+                    left_height,
+                    "{alignment:?}"
+                );
+                assert!(nominal_clusters_start_new_visual_line(
+                    node,
+                    left_index,
+                    right_index
+                ));
+            }
+
+            let pdf = render_print_document_pdf(&document).unwrap();
+            if let Some(extracted) = poppler_text(&pdf) {
+                assert_eq!(
+                    extracted
+                        .chars()
+                        .filter(|character| !character.is_whitespace())
+                        .collect::<String>(),
+                    text
+                );
+            }
+            if let Some(xml) = poppler_bbox_layout(&pdf) {
+                assert_eq!(poppler_words(&xml), span_text);
+                let boxes = span_text
+                    .iter()
+                    .map(|line| {
+                        let actual = poppler_word_bbox(&xml, line);
+                        assert_poppler_bbox_close(actual, nominal_source_bbox_points(node, line));
+                        actual
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    boxes
+                        .windows(2)
+                        .all(|pair| pair[0][3] <= pair[1][1] + 0.002),
+                    "{alignment:?} {boxes:?}"
+                );
+            }
         }
     }
 
