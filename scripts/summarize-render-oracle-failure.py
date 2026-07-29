@@ -17,7 +17,7 @@ from typing import Any, Iterable
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v1"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v2"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
@@ -51,6 +51,7 @@ REVIEWED_CLASSIFICATIONS = frozenset(
         "libreoffice_command_output_limit",
         "libreoffice_failed",
         "libreoffice_file_output_limit",
+        "libreoffice_font_pack_mismatch",
         "libreoffice_not_found",
         "libreoffice_oracle_empty",
         "libreoffice_oracle_rejected",
@@ -61,6 +62,7 @@ REVIEWED_CLASSIFICATIONS = frozenset(
         "renderer_failed",
         "renderer_file_output_limit",
         "renderer_not_found",
+        "renderer_pdf_type3_path_text_missing",
         "renderer_timeout",
         "semantic_content_one_sided",
         "unreadable_input",
@@ -68,9 +70,123 @@ REVIEWED_CLASSIFICATIONS = frozenset(
         "within_threshold",
     }
 )
-OUTPUT_CLASSIFICATIONS = REVIEWED_CLASSIFICATIONS | {
-    UNREVIEWED_CLASSIFICATION
-}
+# Unknown detailed classifications may still carry path- or content-derived
+# fragments even when they satisfy CODE_RE. These ordered prefixes therefore
+# select only a fixed, privacy-reviewed stage label; no part of the input value
+# is copied into the output. Values outside these finite families remain in the
+# single unreviewed bucket.
+COARSE_CLASSIFICATION_PREFIXES = (
+    (
+        "authored_print_stage",
+        ("authored_print_", "render_manifest_authored_"),
+    ),
+    (
+        "input_stage",
+        ("corpus_", "input_", "manifest_"),
+    ),
+    (
+        "renderer_pdf_attestation_stage",
+        ("renderer_pdf_font_", "renderer_pdf_type3_"),
+    ),
+    (
+        "renderer_page_map_stage",
+        (
+            "renderer_pdf_page_count",
+            "renderer_pdf_page_map",
+            "renderer_print_pdf_",
+        ),
+    ),
+    (
+        "renderer_raster_stage",
+        (
+            "renderer_pdf_page_limit",
+            "renderer_pdf_page_pixel_",
+            "renderer_pdf_raster_",
+            "renderer_pdf_total_pixel_",
+        ),
+    ),
+    (
+        "renderer_semantic_stage",
+        ("renderer_semantic_", "semantic_svg_"),
+    ),
+    (
+        "renderer_bundle_stage",
+        ("live_output_", "render_manifest_"),
+    ),
+    (
+        "renderer_stage",
+        (
+            "renderer_",
+            "svg_",
+        ),
+    ),
+    (
+        "oracle_font_attestation_stage",
+        ("libreoffice_font_",),
+    ),
+    (
+        "oracle_adapter_stage",
+        ("libreoffice_adapter_", "oracle_"),
+    ),
+    (
+        "oracle_pdf_stage",
+        ("libreoffice_pdf_",),
+    ),
+    (
+        "oracle_raster_stage",
+        (
+            "libreoffice_page_",
+            "libreoffice_raster_",
+            "libreoffice_total_pixel_",
+        ),
+    ),
+    (
+        "oracle_stage",
+        ("libreoffice_",),
+    ),
+    (
+        "environment_stage",
+        (
+            "font_pack_",
+            "numpy_",
+            "pillow_",
+            "poppler_",
+            "visual_dependencies_",
+        ),
+    ),
+    (
+        "measurement_geometry_stage",
+        ("pdfinfo_",),
+    ),
+    (
+        "measurement_raster_stage",
+        ("pdf_raster_", "pdftoppm_", "raster_"),
+    ),
+    (
+        "measurement_semantic_stage",
+        ("semantic_bbox_", "semantic_text_", "text_box_"),
+    ),
+    (
+        "measurement_stage",
+        (
+            "artifact_",
+            "comparison_",
+            "metric_",
+            "page_count_",
+            "pdf_",
+            "pdffonts_",
+            "semantic_",
+        ),
+    ),
+)
+COARSE_CLASSIFICATIONS = frozenset(
+    bucket for bucket, _ in COARSE_CLASSIFICATION_PREFIXES
+)
+OUTPUT_CLASSIFICATIONS = (
+    REVIEWED_CLASSIFICATIONS
+    | COARSE_CLASSIFICATIONS
+    | {UNREVIEWED_CLASSIFICATION}
+)
 FEATURES = frozenset(
     {
         "border",
@@ -253,6 +369,9 @@ def _integer(value: object, code: str, maximum: int) -> int:
 def _public_classification(value: str) -> str:
     if value in REVIEWED_CLASSIFICATIONS:
         return value
+    for bucket, prefixes in COARSE_CLASSIFICATION_PREFIXES:
+        if value.startswith(prefixes):
+            return bucket
     return UNREVIEWED_CLASSIFICATION
 
 
@@ -548,7 +667,7 @@ def _validate_output(value: object) -> None:
             LANES[profile][str(report["label"])],
         )
         _count_map(report["by_status"], total, "output_status", STATUSES)
-        _count_map(
+        report_classes = _count_map(
             report["by_classification"],
             total,
             "output_classification",
@@ -566,6 +685,7 @@ def _validate_output(value: object) -> None:
             ):
                 raise SummaryError("output_group")
             grouped_total = 0
+            grouped_classes: Counter[str] = Counter()
             for group in groups.values():
                 if (
                     not isinstance(group, dict)
@@ -577,14 +697,23 @@ def _validate_output(value: object) -> None:
                 )
                 if group_total == 0:
                     raise SummaryError("output_group")
-                _count_map(
+                group_classes = _count_map(
                     group["by_classification"],
                     group_total,
                     "output_group",
                     OUTPUT_CLASSIFICATIONS,
                 )
+                if key == "by_feature" and any(
+                    count > report_classes.get(classification, 0)
+                    for classification, count in group_classes.items()
+                ):
+                    raise SummaryError("output_group")
+                grouped_classes.update(group_classes)
                 grouped_total += group_total
-            if key == "by_format" and grouped_total != total:
+            if key == "by_format" and (
+                grouped_total != total
+                or dict(sorted(grouped_classes.items())) != report_classes
+            ):
                 raise SummaryError("output_group")
 
 

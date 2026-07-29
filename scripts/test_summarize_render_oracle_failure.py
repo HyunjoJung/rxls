@@ -177,6 +177,10 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 ],
                 1,
             )
+            self.assertEqual(
+                summary["schema"],
+                "rxls.render-oracle-failure-summary.v2",
+            )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
                 parity["by_feature"]["korean-text"]["workbooks"], 20
@@ -448,6 +452,85 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             set(),
         )
 
+    def test_unknown_details_reduce_to_allowlisted_coarse_stages(self) -> None:
+        exact_codes = {
+            "renderer_pdf_type3_path_text_missing": (
+                "renderer_pdf_type3_path_text_missing"
+            ),
+            "libreoffice_font_pack_mismatch": "libreoffice_font_pack_mismatch",
+        }
+        coarse_codes = {
+            "renderer_print_pdf_page_map": "renderer_page_map_stage",
+            "renderer_pdf_raster_output_limit": "renderer_raster_stage",
+            "renderer_semantic_bbox_unreadable": "renderer_semantic_stage",
+            "render_manifest_scene_mismatch": "renderer_bundle_stage",
+            "libreoffice_adapter_image_identity": "oracle_adapter_stage",
+            "libreoffice_pdf_invalid": "oracle_pdf_stage",
+            "libreoffice_page_limit": "oracle_raster_stage",
+            "pdfinfo_page_size_invalid": "measurement_geometry_stage",
+            "pdf_raster_missing": "measurement_raster_stage",
+            "semantic_bbox_output_limit": "measurement_semantic_stage",
+            "authored_print_no_visible_pages": "authored_print_stage",
+            "font_pack_required": "environment_stage",
+            "manifest_local_path_unsafe": "input_stage",
+            "private_customer_path_digest": MODULE.UNREVIEWED_CLASSIFICATION,
+            "renderer_private_customer_path_digest": "renderer_stage",
+            "renderer_pdf_type3_path_text_missing_private_customer": (
+                "renderer_pdf_attestation_stage"
+            ),
+            "libreoffice_font_pack_mismatch_private_path": (
+                "oracle_font_attestation_stage"
+            ),
+        }
+        detailed_codes = {**exact_codes, **coarse_codes}
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            rows = _pilot_rows()
+            for index, code in enumerate(detailed_codes, start=1):
+                rows[index]["classification"] = code
+                rows[index]["status"] = "error"
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        parity = summary["reports"][1]
+        expected = Counter(detailed_codes.values())
+        for bucket, count in expected.items():
+            self.assertEqual(parity["by_classification"][bucket], count)
+            self.assertEqual(
+                parity["by_feature"]["latin-text"]["by_classification"][
+                    bucket
+                ],
+                count,
+            )
+        rendered = MODULE._json(summary).decode("ascii")
+        for code in coarse_codes:
+            self.assertNotIn(code, rendered)
+        for code in exact_codes:
+            self.assertIn(code, rendered)
+        for forbidden in (
+            "private_customer",
+            "path_digest",
+            '"commands"',
+            '"path"',
+            '"stderr"',
+            '"stdout"',
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(
+            set(parity["by_classification"])
+            - MODULE.OUTPUT_CLASSIFICATIONS,
+            set(),
+        )
+
     def test_merged_and_sharded_inputs_cannot_be_mixed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             hosted = Path(raw)
@@ -556,7 +639,29 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         injected["reports"][1]["path"] = "/private/workbook.xlsx"
         drifted = copy.deepcopy(summary)
         drifted["reports"][1]["by_status"]["compared"] = 38
-        for document in (injected, drifted):
+        unreviewed_stage = copy.deepcopy(summary)
+        unreviewed_stage["reports"][1]["by_classification"][
+            "private_customer_stage"
+        ] = 1
+        format_conflict = copy.deepcopy(summary)
+        ods_classes = format_conflict["reports"][1]["by_format"]["ods"][
+            "by_classification"
+        ]
+        ods_classes.pop("libreoffice_adapter_profile_path_missing")
+        ods_classes[MODULE.UNREVIEWED_CLASSIFICATION] = 1
+        feature_conflict = copy.deepcopy(summary)
+        latin_classes = feature_conflict["reports"][1]["by_feature"][
+            "latin-text"
+        ]["by_classification"]
+        latin_classes["within_threshold"] -= 1
+        latin_classes[MODULE.UNREVIEWED_CLASSIFICATION] = 1
+        for document in (
+            injected,
+            drifted,
+            unreviewed_stage,
+            format_conflict,
+            feature_conflict,
+        ):
             with self.subTest(document=document):
                 with self.assertRaises(MODULE.SummaryError):
                     MODULE._validate_output(document)
