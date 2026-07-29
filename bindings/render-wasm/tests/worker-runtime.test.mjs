@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 
 import {
   MAX_INPUT_BYTES,
+  MAX_OPEN_DOCUMENTS,
+  MAX_OPEN_RESOURCE_BYTES,
   MAX_PAGES,
   MAX_PENDING_REQUESTS,
   PROTOCOL
@@ -11,6 +13,7 @@ import { RenderWorkerRuntime } from "../js/worker-runtime.mjs";
 
 class FakeSession {
   static calls = [];
+  static inspectionHook = null;
   static sheetSvg = '<?xml version="1.0"?><svg><title>S</title></svg>';
   static pageGate = null;
 
@@ -19,7 +22,13 @@ class FakeSession {
   }
 
   inspectionJson() {
-    return JSON.stringify({ schemaVersion: 1, sheetCount: 1, sheets: [{ index: 0, name: "S" }] });
+    const inspection = JSON.stringify({
+      schemaVersion: 1,
+      sheetCount: 1,
+      sheets: [{ index: 0, name: "S" }]
+    });
+    FakeSession.inspectionHook?.();
+    return inspection;
   }
 
   printManifestJson(sheetIndex, options) {
@@ -99,6 +108,59 @@ function result(messages, requestId) {
   )?.message;
 }
 
+async function assertReopenedDocumentBalancesResources({
+  runtime,
+  messages,
+  cancelledRequestId,
+  reopenedRequestId,
+  documentId,
+  bytes
+}) {
+  assert.equal(result(messages, reopenedRequestId).ok, true);
+  assert.equal(result(messages, reopenedRequestId).result.documentId, documentId);
+  assert.equal(bytes.byteLength * MAX_OPEN_DOCUMENTS, MAX_OPEN_RESOURCE_BYTES);
+
+  runtime.receive({
+    protocol: PROTOCOL,
+    type: "cancel",
+    requestId: cancelledRequestId
+  });
+  const documentIds = [documentId];
+  for (let index = 1; index < MAX_OPEN_DOCUMENTS; index += 1) {
+    const extraDocumentId = `${documentId}-extra-${index}`;
+    const extraRequestId = `${reopenedRequestId}-extra-${index}`;
+    documentIds.push(extraDocumentId);
+    runtime.receive(
+      request(extraRequestId, "open", {
+        documentId: extraDocumentId,
+        bytes
+      })
+    );
+  }
+  await settle(MAX_OPEN_DOCUMENTS + 4);
+  for (let index = 1; index < MAX_OPEN_DOCUMENTS; index += 1) {
+    assert.equal(result(messages, `${reopenedRequestId}-extra-${index}`).ok, true);
+  }
+
+  for (const [index, openDocumentId] of documentIds.entries()) {
+    runtime.receive(
+      request(`${reopenedRequestId}-close-${index}`, "close", {
+        documentId: openDocumentId
+      })
+    );
+  }
+  await settle(MAX_OPEN_DOCUMENTS + 4);
+  for (const index of documentIds.keys()) {
+    const closed = result(messages, `${reopenedRequestId}-close-${index}`);
+    assert.equal(closed.ok, true);
+    assert.equal(closed.result.closed, true);
+  }
+  assert.equal(
+    FakeSession.calls.filter(([kind]) => kind === "free").length,
+    FakeSession.calls.filter(([kind]) => kind === "open").length
+  );
+}
+
 test("worker opens once and virtualizes only the requested tile and page", async () => {
   FakeSession.calls = [];
   const { runtime, messages } = harness();
@@ -162,6 +224,126 @@ test("queued cancellation prevents wasm work and returns a typed result", async 
   assert.equal(cancelled.ok, false);
   assert.equal(cancelled.error.code, "cancelled");
   assert.equal(FakeSession.calls.length, 0);
+});
+
+test("active open cancellation rolls back before a same-document reopen", async (t) => {
+  FakeSession.calls = [];
+  t.after(() => {
+    FakeSession.inspectionHook = null;
+  });
+  const bytes = new Uint8Array(MAX_INPUT_BYTES);
+  const { runtime, messages } = harness();
+  FakeSession.inspectionHook = () => {
+    FakeSession.inspectionHook = null;
+    setTimeout(() => {
+      runtime.receive({ protocol: PROTOCOL, type: "cancel", requestId: "active-open" });
+      runtime.receive(
+        request("active-reopen", "open", {
+          documentId: "active-document",
+          bytes
+        })
+      );
+    }, 0);
+  };
+
+  runtime.receive(
+    request("active-open", "open", {
+      documentId: "active-document",
+      bytes
+    })
+  );
+  await settle();
+
+  const cancelled = result(messages, "active-open");
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.error.code, "cancelled");
+  assert.equal(
+    messages.some(
+      ({ message }) =>
+        message.type === "result" && message.requestId === "active-open" && message.ok
+    ),
+    false
+  );
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 1);
+  await assertReopenedDocumentBalancesResources({
+    runtime,
+    messages,
+    cancelledRequestId: "active-open",
+    reopenedRequestId: "active-reopen",
+    documentId: "active-document",
+    bytes
+  });
+});
+
+test("completed open remains live after its request id is reused and cancelled", async () => {
+  FakeSession.calls = [];
+  const { runtime, messages } = harness();
+
+  runtime.receive(
+    request("reused", "open", {
+      documentId: "persistent-document",
+      bytes: Uint8Array.of(1)
+    })
+  );
+  await settle();
+  assert.equal(result(messages, "reused").ok, true);
+
+  runtime.receive(request("reused", "capabilities"));
+  await settle();
+  assert.equal(
+    messages.filter(
+      ({ message }) => message.type === "result" && message.requestId === "reused" && message.ok
+    ).length,
+    2
+  );
+  runtime.receive({ protocol: PROTOCOL, type: "cancel", requestId: "reused" });
+  runtime.receive(
+    request("close-persistent", "close", {
+      documentId: "persistent-document"
+    })
+  );
+  await settle();
+  assert.equal(result(messages, "close-persistent").ok, true);
+  assert.equal(result(messages, "close-persistent").result.closed, true);
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 1);
+});
+
+test("failed open with a reused request id cannot roll back the original document", async () => {
+  FakeSession.calls = [];
+  const { runtime, messages } = harness();
+  runtime.receive(
+    request("reused-open", "open", {
+      documentId: "original-document",
+      bytes: Uint8Array.of(1)
+    })
+  );
+  await settle();
+  runtime.receive(
+    request("reused-open", "open", {
+      documentId: "original-document",
+      bytes: Uint8Array.of(2)
+    })
+  );
+  await settle();
+  const reusedResults = messages
+    .filter(
+      ({ message }) => message.type === "result" && message.requestId === "reused-open"
+    )
+    .map(({ message }) => message);
+  assert.equal(reusedResults.length, 2);
+  assert.equal(reusedResults[0].ok, true);
+  assert.equal(reusedResults[1].ok, false);
+  assert.equal(reusedResults[1].error.code, "document_exists");
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 0);
+
+  runtime.receive(
+    request("close-original", "close", {
+      documentId: "original-document"
+    })
+  );
+  await settle();
+  assert.equal(result(messages, "close-original").result.closed, true);
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 1);
 });
 
 test("worker rejects input and grid limits before wasm", async () => {

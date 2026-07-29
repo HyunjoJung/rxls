@@ -206,6 +206,7 @@ export class RenderWorkerRuntime {
 
   async #run(message) {
     const { requestId, operation, payload } = message;
+    let openTransaction = null;
     try {
       this.#throwIfCancelled(requestId);
       this.#progress(requestId, 0, 3, "accepted");
@@ -213,12 +214,25 @@ export class RenderWorkerRuntime {
       this.#throwIfCancelled(requestId);
       this.#progress(requestId, 1, 3, operationStage(operation));
       const result = await this.#execute(operation, payload);
+      openTransaction = result?.openTransaction ?? null;
+      if (openTransaction) {
+        // Synchronous WASM work cannot receive its already-posted cancellation
+        // until control returns to the worker event loop. Keep the session
+        // provisional across one bounded message turn.
+        await yieldToWorkerMessages();
+      }
       this.#throwIfCancelled(requestId);
       this.#progress(requestId, 2, 3, "finalizing");
       this.#progress(requestId, 3, 3, "complete");
+      if (openTransaction) {
+        this.#commitOpen(openTransaction);
+      }
       const transfer = result?.transfer ?? [];
       this.#sendResult(requestId, true, result?.value ?? result, null, transfer);
     } catch (error) {
+      if (openTransaction) {
+        this.#rollbackOpen(openTransaction);
+      }
       this.#sendResult(requestId, false, null, normalizeError(error));
     } finally {
       this.#cancelled.delete(requestId);
@@ -301,9 +315,15 @@ export class RenderWorkerRuntime {
           "wasm"
         );
       }
-      this.#documents.set(documentId, { session, resourceBytes });
-      this.#resourceBytes = total;
-      return { documentId, workbook };
+      return {
+        value: { documentId, workbook },
+        openTransaction: {
+          documentId,
+          document: { session, resourceBytes },
+          total,
+          committed: false
+        }
+      };
     } catch (error) {
       session.free?.();
       throw error;
@@ -320,6 +340,24 @@ export class RenderWorkerRuntime {
     this.#documents.delete(documentId);
     this.#resourceBytes -= document.resourceBytes;
     return { documentId, closed: true };
+  }
+
+  #commitOpen(transaction) {
+    this.#documents.set(transaction.documentId, transaction.document);
+    this.#resourceBytes = transaction.total;
+    transaction.committed = true;
+  }
+
+  #rollbackOpen(transaction) {
+    if (!transaction.committed) {
+      transaction.document.session.free?.();
+      return;
+    }
+    if (this.#documents.get(transaction.documentId) === transaction.document) {
+      transaction.document.session.free?.();
+      this.#documents.delete(transaction.documentId);
+      this.#resourceBytes -= transaction.document.resourceBytes;
+    }
   }
 
   async #preparePages(payload) {
