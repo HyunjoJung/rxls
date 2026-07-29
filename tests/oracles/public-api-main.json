@@ -1436,6 +1436,7 @@
         "pub fn center_horizontally(&self) -> Option<bool>",
         "pub fn center_vertically(&self) -> Option<bool>",
         "pub fn fidelity(&self) -> PrintFidelity",
+        "pub fn fit_to_page(&self) -> Option<bool>",
         "pub fn header_footer(&self) -> &HeaderFooterMetadata",
         "pub fn losses(&self) -> &[PrintLoss]",
         "pub fn manual_col_breaks(&self) -> &[u16]",

@@ -460,10 +460,12 @@ pub(super) fn worksheet_xml(
     ));
     // <sheetPr> (first child): tab color + outline summary direction + fit-to-page
     // flag. Merge all three into one element (Excel rejects two <sheetPr>).
-    let fit_to_page = sheet
-        .page_setup
-        .as_ref()
-        .is_some_and(|p| p.fit_to_width.is_some() || p.fit_to_height.is_some());
+    let fit_to_page = sheet.print_metadata.fit_to_page().unwrap_or_else(|| {
+        sheet
+            .page_setup
+            .as_ref()
+            .is_some_and(|p| p.fit_to_width.is_some() || p.fit_to_height.is_some())
+    });
     let outline_pr = !sheet.outline_summary_below || !sheet.outline_summary_right;
     if sheet.tab_color.is_some() || outline_pr || fit_to_page {
         let mut sheet_pr_xml = String::from("<sheetPr>");

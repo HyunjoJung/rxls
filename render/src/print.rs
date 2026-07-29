@@ -556,6 +556,7 @@ struct RunningText<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrintBehavior {
     page_order: PrintPageOrder,
+    fit_to_page: bool,
     gridlines: bool,
     headings: bool,
     center_horizontally: bool,
@@ -591,6 +592,12 @@ fn effective_print_behavior(sheet: &Sheet, setup: &PageSetup) -> PrintBehavior {
         page_order: metadata
             .page_order()
             .unwrap_or(PrintPageOrder::DownThenOver),
+        // ECMA-376 §18.3.1.65/Annex A.2 defines fitToPage (default false)
+        // as the mode switch. Formats without a retained switch keep the
+        // long-standing PageSetup field-presence inference.
+        fit_to_page: metadata
+            .fit_to_page()
+            .unwrap_or_else(|| legacy_fit_to_page_active(setup)),
         gridlines: metadata
             .print_gridlines()
             .unwrap_or_else(|| sheet.print_gridlines()),
@@ -834,6 +841,7 @@ fn prepare_print_area(
 
     let scale_permille = choose_scale(
         setup,
+        behavior.fit_to_page,
         &body_rows,
         &body_columns,
         repeated_height,
@@ -845,12 +853,12 @@ fn prepare_print_area(
         &col_merges,
         warnings,
     )?;
-    let row_breaks: &[u32] = if fit_to_page_active(setup) {
+    let row_breaks: &[u32] = if behavior.fit_to_page {
         &[]
     } else {
         sheet.print_metadata().manual_row_breaks()
     };
-    let col_breaks: &[u16] = if fit_to_page_active(setup) {
+    let col_breaks: &[u16] = if behavior.fit_to_page {
         &[]
     } else {
         sheet.print_metadata().manual_col_breaks()
@@ -1247,7 +1255,7 @@ pub fn prepare_sheet_print_document(
         .first()
         .cloned()
         .ok_or(RenderError::CoordinateOverflow)?;
-    let (manual_row_breaks, manual_col_breaks) = if fit_to_page_active(&setup) {
+    let (manual_row_breaks, manual_col_breaks) = if behavior.fit_to_page {
         (Vec::new(), Vec::new())
     } else {
         (
@@ -2790,6 +2798,7 @@ fn content_geometry(
 #[allow(clippy::too_many_arguments)]
 fn choose_scale(
     setup: &PageSetup,
+    fit_to_page: bool,
     rows: &[MeasuredAxisSlot<u32>],
     columns: &[MeasuredAxisSlot<u16>],
     repeated_height: Fixed,
@@ -2801,9 +2810,7 @@ fn choose_scale(
     col_merges: &[(u16, u16)],
     warnings: &mut PrintWarnings,
 ) -> Result<u16, RenderError> {
-    let fit_width = setup.fit_to_width.filter(|value| *value != 0);
-    let fit_height = setup.fit_to_height.filter(|value| *value != 0);
-    if fit_width.is_none() && fit_height.is_none() {
+    if !fit_to_page {
         let requested = setup.scale.unwrap_or(100);
         let clamped = requested.clamp(MIN_PRINT_SCALE_PERMILLE / 10, MAX_PRINT_SCALE_PERMILLE / 10);
         if requested != clamped {
@@ -2811,6 +2818,16 @@ fn choose_scale(
         }
         return Ok(clamped.saturating_mul(10));
     }
+    // CT_PageSetup defaults omitted fit dimensions to 1. Excel-compatible
+    // explicit zero leaves that dimension unconstrained.
+    let fit_width = match setup.fit_to_width.unwrap_or(1) {
+        0 => None,
+        value => Some(value),
+    };
+    let fit_height = match setup.fit_to_height.unwrap_or(1) {
+        0 => None,
+        value => Some(value),
+    };
     let fits = |scale| -> Result<bool, RenderError> {
         if scale_fixed(
             repeated_height
@@ -2854,9 +2871,8 @@ fn choose_scale(
     Ok(low)
 }
 
-fn fit_to_page_active(setup: &PageSetup) -> bool {
-    setup.fit_to_width.is_some_and(|value| value != 0)
-        || setup.fit_to_height.is_some_and(|value| value != 0)
+fn legacy_fit_to_page_active(setup: &PageSetup) -> bool {
+    setup.fit_to_width.is_some() || setup.fit_to_height.is_some()
 }
 
 fn unscaled_capacity(

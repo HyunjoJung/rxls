@@ -4929,6 +4929,12 @@ fn parse_sheet(
                         parsed.outline_summary_right = Some(value);
                     }
                 }
+                b"pageSetUpPr" => {
+                    // ECMA-376 §18.3.1.65 makes this the mode switch; Annex A.2
+                    // defaults a missing fitToPage attribute to false.
+                    let fit_to_page = print_bool_attr(&e, b"fitToPage", &mut parsed.print_metadata);
+                    parsed.print_metadata.set_fit_to_page(fit_to_page);
+                }
                 b"col" => {
                     let first = attr(&e, b"min")
                         .and_then(|s| s.parse::<u32>().ok())
@@ -5176,6 +5182,11 @@ fn parse_sheet(
                     }
                 }
                 b"pageSetup" => {
+                    // A missing pageSetUpPr/fitToPage is percentage mode, even
+                    // when stale fit counts remain on pageSetup.
+                    if parsed.print_metadata.fit_to_page().is_none() {
+                        parsed.print_metadata.set_fit_to_page(false);
+                    }
                     match attr(&e, b"pageOrder").as_deref() {
                         Some("overThenDown") => parsed
                             .print_metadata
@@ -5187,14 +5198,18 @@ fn parse_sheet(
                             .print_metadata
                             .add_loss(PrintLossKind::UnsupportedProperty),
                     }
+                    let fit_to_width =
+                        print_fit_count_attr(&e, b"fitToWidth", &mut parsed.print_metadata);
+                    let fit_to_height =
+                        print_fit_count_attr(&e, b"fitToHeight", &mut parsed.print_metadata);
                     let ps = page_setup_mut(&mut parsed);
                     ps.landscape = attr(&e, b"orientation")
                         .as_deref()
                         .is_some_and(|orientation| orientation.eq_ignore_ascii_case("landscape"));
                     ps.paper_size = attr_u16(&e, b"paperSize");
                     ps.scale = attr_u16(&e, b"scale");
-                    ps.fit_to_width = attr_u16(&e, b"fitToWidth");
-                    ps.fit_to_height = attr_u16(&e, b"fitToHeight");
+                    ps.fit_to_width = fit_to_width;
+                    ps.fit_to_height = fit_to_height;
                     ps.first_page_number = attr(&e, b"useFirstPageNumber")
                         .as_deref()
                         .is_some_and(attr_true)
@@ -5796,6 +5811,31 @@ fn attr_f64(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<f64> {
 
 fn attr_u16(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<u16> {
     attr(e, key).and_then(|s| s.parse::<u16>().ok())
+}
+
+fn print_fit_count_attr(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    metadata: &mut PrintMetadata,
+) -> Option<u16> {
+    let value = attr(e, key)?;
+    match value.parse::<u32>() {
+        Ok(value) => match u16::try_from(value) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                // OOXML permits the full unsignedInt range, while the stable
+                // public PageSetup model is u16. Saturation preserves a large,
+                // effectively unconstrained target instead of turning it into
+                // an omitted dimension, whose active-fit default is one page.
+                metadata.add_loss(PrintLossKind::LimitExceeded);
+                Some(u16::MAX)
+            }
+        },
+        Err(_) => {
+            metadata.add_loss(PrintLossKind::UnsupportedProperty);
+            None
+        }
+    }
 }
 
 fn apply_sheet_defined_names<'a, I>(
@@ -8231,6 +8271,182 @@ mod tests {
                 "unexpected first_page_number for pageSetup attrs {attrs}"
             );
         }
+    }
+
+    #[test]
+    fn page_setup_pr_is_the_authoritative_fit_mode_switch() {
+        for (sheet_pr, expected) in [
+            ("", false),
+            ("<sheetPr><pageSetUpPr/></sheetPr>", false),
+            (r#"<sheetPr><pageSetUpPr fitToPage="0"/></sheetPr>"#, false),
+            (
+                r#"<sheetPr><pageSetUpPr fitToPage="false"/></sheetPr>"#,
+                false,
+            ),
+            (r#"<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>"#, true),
+            (
+                r#"<sheetPr><pageSetUpPr fitToPage="true"/></sheetPr>"#,
+                true,
+            ),
+        ] {
+            let xml = format!(
+                r#"<worksheet>{sheet_pr}<sheetData/><pageSetup scale="85" fitToWidth="1" fitToHeight="1"/></worksheet>"#
+            );
+            let mut budget = crate::MAX_TEXT_BYTES;
+            let parsed = parse_sheet(
+                &xml,
+                &[],
+                &Styles::default(),
+                &ThemeColors::default(),
+                false,
+                &mut budget,
+            );
+
+            assert_eq!(parsed.print_metadata.fit_to_page(), Some(expected));
+            let setup = parsed.page_setup.expect("pageSetup must be retained");
+            assert_eq!(setup.scale, Some(85));
+            assert_eq!(setup.fit_to_width, Some(1));
+            assert_eq!(setup.fit_to_height, Some(1));
+        }
+    }
+
+    #[test]
+    fn active_fit_retains_defaulted_and_zero_dimensions() {
+        for (attrs, expected_width, expected_height) in [
+            (r#"scale="85""#, None, None),
+            (
+                r#"scale="85" fitToWidth="1" fitToHeight="0""#,
+                Some(1),
+                Some(0),
+            ),
+            (
+                r#"scale="85" fitToWidth="0" fitToHeight="0""#,
+                Some(0),
+                Some(0),
+            ),
+        ] {
+            let xml = format!(
+                r#"<worksheet><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetData/><pageSetup {attrs}/></worksheet>"#
+            );
+            let mut budget = crate::MAX_TEXT_BYTES;
+            let parsed = parse_sheet(
+                &xml,
+                &[],
+                &Styles::default(),
+                &ThemeColors::default(),
+                false,
+                &mut budget,
+            );
+
+            assert_eq!(parsed.print_metadata.fit_to_page(), Some(true));
+            let setup = parsed.page_setup.expect("pageSetup must be retained");
+            assert_eq!(setup.scale, Some(85));
+            assert_eq!(setup.fit_to_width, expected_width);
+            assert_eq!(setup.fit_to_height, expected_height);
+        }
+    }
+
+    #[test]
+    fn fit_count_attributes_saturate_numeric_overflow_and_report_typed_losses() {
+        for attribute in ["fitToWidth", "fitToHeight"] {
+            for (value, expected, expected_loss) in [
+                ("0", Some(0), None),
+                ("65535", Some(u16::MAX), None),
+                ("65536", Some(u16::MAX), Some(PrintLossKind::LimitExceeded)),
+                (
+                    "4294967295",
+                    Some(u16::MAX),
+                    Some(PrintLossKind::LimitExceeded),
+                ),
+                (
+                    "not-a-count",
+                    None,
+                    Some(PrintLossKind::UnsupportedProperty),
+                ),
+            ] {
+                let xml = format!(
+                    r#"<worksheet><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetData/><pageSetup scale="85" {attribute}="{value}"/></worksheet>"#
+                );
+                let mut budget = crate::MAX_TEXT_BYTES;
+                let parsed = parse_sheet(
+                    &xml,
+                    &[],
+                    &Styles::default(),
+                    &ThemeColors::default(),
+                    false,
+                    &mut budget,
+                );
+
+                assert_eq!(
+                    parsed.print_metadata.fit_to_page(),
+                    Some(true),
+                    "{attribute}={value}"
+                );
+                let setup = parsed.page_setup.expect("pageSetup must be retained");
+                let retained = if attribute == "fitToWidth" {
+                    setup.fit_to_width
+                } else {
+                    setup.fit_to_height
+                };
+                assert_eq!(retained, expected, "{attribute}={value}");
+                let other = if attribute == "fitToWidth" {
+                    setup.fit_to_height
+                } else {
+                    setup.fit_to_width
+                };
+                assert_eq!(other, None, "{attribute}={value}");
+                match expected_loss {
+                    Some(kind) => {
+                        assert_eq!(
+                            parsed.print_metadata.fidelity(),
+                            crate::PrintFidelity::Partial,
+                            "{attribute}={value}"
+                        );
+                        assert_eq!(
+                            parsed
+                                .print_metadata
+                                .losses()
+                                .iter()
+                                .find(|loss| loss.kind == kind)
+                                .map(|loss| loss.occurrences),
+                            Some(1),
+                            "{attribute}={value}"
+                        );
+                    }
+                    None => assert!(
+                        parsed.print_metadata.losses().is_empty(),
+                        "{attribute}={value}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_fit_mode_fails_closed_with_typed_loss() {
+        let xml = r#"<worksheet><sheetPr><pageSetUpPr fitToPage="maybe"/></sheetPr>
+            <sheetData/><pageSetup scale="85" fitToWidth="1" fitToHeight="1"/>
+        </worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(parsed.print_metadata.fit_to_page(), Some(false));
+        assert_eq!(
+            parsed.print_metadata.fidelity(),
+            crate::PrintFidelity::Partial
+        );
+        assert!(parsed
+            .print_metadata
+            .losses()
+            .iter()
+            .any(|loss| loss.kind == PrintLossKind::UnsupportedProperty));
     }
 
     #[test]

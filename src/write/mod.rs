@@ -430,6 +430,115 @@ mod tests {
     }
 
     #[test]
+    fn worksheet_writer_prefers_retained_fit_mode_over_stale_page_setup_fields() {
+        let mut fixed = Sheet::new("fixed");
+        fixed.set_page_setup(crate::PageSetup {
+            scale: Some(85),
+            fit_to_width: Some(1),
+            fit_to_height: Some(0),
+            ..Default::default()
+        });
+        fixed.print_metadata.set_fit_to_page(false);
+        let mut styles = super::StyleTable::new();
+        let mut budget = usize::MAX;
+        let (fixed_xml, links) = worksheet_xml_with_budget(&fixed, &mut styles, &mut budget);
+        assert!(links.is_empty());
+        assert!(!fixed_xml.contains("<pageSetUpPr"));
+        assert!(fixed_xml.contains(
+            r#"<pageSetup orientation="portrait" scale="85" fitToWidth="1" fitToHeight="0"/>"#
+        ));
+
+        let mut fit = Sheet::new("fit");
+        fit.set_page_setup(crate::PageSetup::new().with_scale(85));
+        fit.print_metadata.set_fit_to_page(true);
+        let mut styles = super::StyleTable::new();
+        let mut budget = usize::MAX;
+        let (fit_xml, links) = worksheet_xml_with_budget(&fit, &mut styles, &mut budget);
+        assert!(links.is_empty());
+        assert!(fit_xml.contains(r#"<pageSetUpPr fitToPage="1"/>"#));
+        assert!(fit_xml.contains(r#"<pageSetup orientation="portrait" scale="85"/>"#));
+        assert!(!fit_xml.contains("fitToWidth="));
+        assert!(!fit_xml.contains("fitToHeight="));
+
+        let mut unconstrained = Sheet::new("unconstrained");
+        unconstrained.set_page_setup(crate::PageSetup {
+            scale: Some(85),
+            fit_to_width: Some(0),
+            fit_to_height: Some(0),
+            ..Default::default()
+        });
+        let mut styles = super::StyleTable::new();
+        let mut budget = usize::MAX;
+        let (unconstrained_xml, links) =
+            worksheet_xml_with_budget(&unconstrained, &mut styles, &mut budget);
+        assert!(links.is_empty());
+        assert!(unconstrained_xml.contains(r#"<pageSetUpPr fitToPage="1"/>"#));
+        assert!(unconstrained_xml.contains(r#"fitToWidth="0" fitToHeight="0""#));
+    }
+
+    #[test]
+    fn xlsx_fit_mode_roundtrip_preserves_conflicting_page_setup_semantics() {
+        for (sheet_pr, expected_fit) in [
+            ("", false),
+            (r#"<sheetPr><pageSetUpPr fitToPage="0"/></sheetPr>"#, false),
+            (r#"<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>"#, true),
+        ] {
+            let worksheet = format!(
+                r#"<worksheet>{sheet_pr}<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row></sheetData><pageSetup scale="85" fitToWidth="1" fitToHeight="0"/></worksheet>"#
+            );
+            let input = super::zip_parts(vec![
+                (
+                    "xl/workbook.xml".into(),
+                    br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#
+                        .to_vec(),
+                ),
+                (
+                    "xl/_rels/workbook.xml.rels".into(),
+                    br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#.to_vec(),
+                ),
+                (
+                    "xl/worksheets/sheet1.xml".into(),
+                    worksheet.into_bytes(),
+                ),
+            ]);
+
+            let workbook = Workbook::open(&input).expect("synthetic XLSX must parse");
+            assert_eq!(
+                workbook.sheets[0].print_metadata().fit_to_page(),
+                Some(expected_fit)
+            );
+            let setup = workbook.sheets[0]
+                .page_setup()
+                .expect("page setup must be retained");
+            assert_eq!(setup.scale, Some(85));
+            assert_eq!(setup.fit_to_width, Some(1));
+            assert_eq!(setup.fit_to_height, Some(0));
+
+            let output = workbook.to_xlsx();
+            let output_xml = part(&output, "xl/worksheets/sheet1.xml");
+            assert_eq!(
+                output_xml.contains(r#"<pageSetUpPr fitToPage="1"/>"#),
+                expected_fit
+            );
+            assert!(output_xml.contains(
+                r#"<pageSetup orientation="portrait" scale="85" fitToWidth="1" fitToHeight="0"/>"#
+            ));
+
+            let reopened = Workbook::open(&output).expect("round-tripped XLSX must parse");
+            assert_eq!(
+                reopened.sheets[0].print_metadata().fit_to_page(),
+                Some(expected_fit)
+            );
+            let reopened_setup = reopened.sheets[0]
+                .page_setup()
+                .expect("round-tripped page setup must be retained");
+            assert_eq!(reopened_setup.scale, Some(85));
+            assert_eq!(reopened_setup.fit_to_width, Some(1));
+            assert_eq!(reopened_setup.fit_to_height, Some(0));
+        }
+    }
+
+    #[test]
     fn shared_strings_count_total_references_not_unique_entries() {
         let mut wb = Workbook::new();
         let sheet = wb.add_sheet("sst");

@@ -7369,6 +7369,7 @@ pub struct PrintMetadata {
     manual_row_breaks: Vec<u32>,
     manual_col_breaks: Vec<u16>,
     page_order: Option<PrintPageOrder>,
+    fit_to_page: Option<bool>,
     print_gridlines: Option<bool>,
     print_headings: Option<bool>,
     center_horizontally: Option<bool>,
@@ -7401,6 +7402,12 @@ impl PrintMetadata {
     /// Authored page traversal order, when the source exposes it.
     pub fn page_order(&self) -> Option<PrintPageOrder> {
         self.page_order
+    }
+
+    /// Explicit source selection of fit-to-pages (`true`) versus percentage
+    /// scaling (`false`). `None` means the source format did not retain a mode.
+    pub fn fit_to_page(&self) -> Option<bool> {
+        self.fit_to_page
     }
 
     /// Explicit source setting for printing worksheet gridlines.
@@ -7516,6 +7523,11 @@ impl PrintMetadata {
     pub(crate) fn set_page_order(&mut self, order: PrintPageOrder) {
         self.mark_source();
         self.page_order = Some(order);
+    }
+
+    pub(crate) fn set_fit_to_page(&mut self, value: bool) {
+        self.mark_source();
+        self.fit_to_page = Some(value);
     }
 
     pub(crate) fn set_print_gridlines(&mut self, value: bool) {
@@ -10327,6 +10339,8 @@ impl Sheet {
         let print_gridlines = self.print_metadata.print_gridlines;
         let print_headings = self.print_metadata.print_headings;
         self.print_metadata = PrintMetadata::authored();
+        self.print_metadata
+            .set_fit_to_page(ps.fit_to_width.is_some() || ps.fit_to_height.is_some());
         if let Some(value) = print_gridlines {
             self.print_metadata.set_print_gridlines(value);
         }
@@ -11584,8 +11598,13 @@ mod tests {
         assert_eq!(metadata.print_areas(), &[(2, 1, 8, 4)]);
         assert_eq!(metadata.print_gridlines(), Some(true));
         assert_eq!(metadata.print_headings(), Some(true));
+        assert_eq!(metadata.fit_to_page(), Some(false));
         assert_eq!(metadata.center_horizontally(), Some(true));
         assert_eq!(metadata.header_footer().odd_header(), Some("&CTitle"));
         assert_eq!(metadata.header_footer().odd_footer(), Some("&P/&N"));
+
+        let mut fitted = Sheet::new("Fit");
+        fitted.set_page_setup(PageSetup::new().with_scale(85).with_fit_to_pages(0, 0));
+        assert_eq!(fitted.print_metadata().fit_to_page(), Some(true));
     }
 }

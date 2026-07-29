@@ -1296,6 +1296,9 @@ impl Workbook {
                             if si < sheets.len() {
                                 apply_wsbool_outline(data, &mut sheets[si]);
                             }
+                            if si < sheet_page_setups.len() {
+                                sheet_page_setups[si].set_wsbool(data);
+                            }
                         }
                     }
                 }
@@ -1703,6 +1706,8 @@ fn civil_from_unix_days(z: i64) -> (i64, u32, u32) {
 struct XlsPageSetup {
     setup: PageSetup,
     print_metadata: PrintMetadata,
+    raw_fit_to_width: Option<u16>,
+    raw_fit_to_height: Option<u16>,
     touched: bool,
     left_margin: Option<f64>,
     right_margin: Option<f64>,
@@ -1816,8 +1821,9 @@ impl XlsPageSetup {
                 self.setup.landscape = flags & 0x0002 == 0;
             }
         }
-        self.setup.fit_to_width = nonzero_u16le(data, 6);
-        self.setup.fit_to_height = nonzero_u16le(data, 8);
+        self.raw_fit_to_width = u16le(data, 6);
+        self.raw_fit_to_height = u16le(data, 8);
+        self.resolve_fit_dimensions();
         if flags & 0x0080 != 0 {
             if let Some(page_start) = i16le(data, 4).filter(|page| *page > 0) {
                 self.setup.first_page_number = Some(page_start as u16);
@@ -1826,6 +1832,26 @@ impl XlsPageSetup {
         self.header_margin = read_margin_at(data, 16);
         self.footer_margin = read_margin_at(data, 24);
         self.touched = true;
+    }
+
+    fn set_wsbool(&mut self, data: &[u8]) {
+        let Some(flags) = u16le(data, 0) else {
+            return;
+        };
+        // [MS-XLS] WsBool.fFitToPage is the authoritative mode bit. Retain it
+        // separately from SETUP's possibly stale scale and fit values.
+        self.print_metadata.set_fit_to_page(flags & 0x0100 != 0);
+        self.resolve_fit_dimensions();
+    }
+
+    fn resolve_fit_dimensions(&mut self) {
+        let retain_zero = self.print_metadata.fit_to_page() == Some(true);
+        self.setup.fit_to_width = self
+            .raw_fit_to_width
+            .filter(|value| retain_zero || *value != 0);
+        self.setup.fit_to_height = self
+            .raw_fit_to_height
+            .filter(|value| retain_zero || *value != 0);
     }
 
     fn set_page_breaks(&mut self, data: &[u8], rows: bool, ctx: Ctx) {
@@ -4320,6 +4346,97 @@ mod tests {
         assert_eq!(metadata.header_footer().first_footer(), Some("&RFirstF"));
         assert_eq!(metadata.header_footer().different_odd_even(), Some(true));
         assert_eq!(metadata.header_footer().different_first(), Some(true));
+    }
+
+    #[test]
+    fn xls_wsbool_controls_fit_mode_and_preserves_active_zero_dimension() {
+        fn workbook(
+            wsbool_flags: u16,
+            fit_width: u16,
+            fit_height: u16,
+            wsbool_before_setup: bool,
+        ) -> Workbook {
+            let mut global_bof = vec![0x00, 0x06, 0x05, 0x00];
+            global_bof.extend_from_slice(&[0u8; 12]);
+            let mut stream = rec(BOF, &global_bof);
+            let mut bound_sheet = vec![0, 0, 0, 0, 0, 0, 2, 0x00];
+            bound_sheet.extend_from_slice(b"S1");
+            stream.extend_from_slice(&rec(BOUNDSHEET, &bound_sheet));
+            stream.extend_from_slice(&rec(EOF, &[]));
+
+            let mut sheet_bof = vec![0x00, 0x06, 0x10, 0x00];
+            sheet_bof.extend_from_slice(&[0u8; 12]);
+            stream.extend_from_slice(&rec(BOF, &sheet_bof));
+
+            let mut setup = Vec::new();
+            setup.extend_from_slice(&9u16.to_le_bytes());
+            setup.extend_from_slice(&80u16.to_le_bytes());
+            setup.extend_from_slice(&1i16.to_le_bytes());
+            setup.extend_from_slice(&fit_width.to_le_bytes());
+            setup.extend_from_slice(&fit_height.to_le_bytes());
+            setup.extend_from_slice(&0u16.to_le_bytes());
+            setup.extend_from_slice(&300u16.to_le_bytes());
+            setup.extend_from_slice(&300u16.to_le_bytes());
+            setup.extend_from_slice(&0.2f64.to_le_bytes());
+            setup.extend_from_slice(&0.25f64.to_le_bytes());
+            setup.extend_from_slice(&1u16.to_le_bytes());
+
+            if wsbool_before_setup {
+                stream.extend_from_slice(&rec(WSBOOL, &wsbool_flags.to_le_bytes()));
+            }
+            stream.extend_from_slice(&rec(SETUP, &setup));
+            if !wsbool_before_setup {
+                stream.extend_from_slice(&rec(WSBOOL, &wsbool_flags.to_le_bytes()));
+            }
+            stream.extend_from_slice(&rec(EOF, &[]));
+
+            Workbook::open(&wrap_xls(&stream, "/Workbook")).unwrap()
+        }
+
+        let fixed = workbook(0x0000, 1, 2, true);
+        let fixed_setup = fixed.sheets[0].page_setup().expect("fixed setup");
+        assert_eq!(fixed.sheets[0].print_metadata().fit_to_page(), Some(false));
+        assert_eq!(fixed_setup.scale, Some(80));
+        assert_eq!(fixed_setup.fit_to_width, Some(1));
+        assert_eq!(fixed_setup.fit_to_height, Some(2));
+
+        let fit = workbook(0x0100, 1, 0, false);
+        let fit_setup = fit.sheets[0].page_setup().expect("fit setup");
+        assert_eq!(fit.sheets[0].print_metadata().fit_to_page(), Some(true));
+        assert_eq!(fit_setup.scale, Some(80));
+        assert_eq!(fit_setup.fit_to_width, Some(1));
+        assert_eq!(fit_setup.fit_to_height, Some(0));
+
+        #[cfg(feature = "xlsx")]
+        for (label, source, expected_mode, expected_width, expected_height) in [
+            (
+                "fixed scale with stale fit counts",
+                &fixed,
+                false,
+                Some(1),
+                Some(2),
+            ),
+            (
+                "active one by unconstrained fit",
+                &fit,
+                true,
+                Some(1),
+                Some(0),
+            ),
+        ] {
+            let output = source.to_xlsx();
+            let reopened = Workbook::open(&output).expect(label);
+            let sheet = &reopened.sheets[0];
+            assert_eq!(
+                sheet.print_metadata().fit_to_page(),
+                Some(expected_mode),
+                "{label}"
+            );
+            let setup = sheet.page_setup().expect(label);
+            assert_eq!(setup.scale, Some(80), "{label}");
+            assert_eq!(setup.fit_to_width, expected_width, "{label}");
+            assert_eq!(setup.fit_to_height, expected_height, "{label}");
+        }
     }
 
     #[test]

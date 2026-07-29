@@ -1586,6 +1586,7 @@ struct SheetReadMetadata {
     autofilter: AutoFilter,
     data_validations: Vec<DataValidation>,
     page_setup: Option<PageSetup>,
+    page_setup_fit_counts: Option<(u32, u32)>,
     print_metadata: PrintMetadata,
     tab_color: Option<Color>,
     table_rel_ids: Vec<String>,
@@ -1975,6 +1976,11 @@ fn apply_ws_prop_metadata(p: &[u8], metadata: &mut SheetReadMetadata) {
     if let Some(flags) = u16le(p, 0) {
         metadata.outline_summary_below = Some(flags & 0x0040 != 0);
         metadata.outline_summary_right = Some(flags & 0x0080 != 0);
+        // [MS-XLSB] BrtWsProp.fFitToPage is the authoritative selector between
+        // percentage scaling and fit-to-pages; BrtPageSetup retains both sets
+        // of values regardless of the selected mode.
+        metadata.print_metadata.set_fit_to_page(flags & 0x0100 != 0);
+        apply_page_setup_fit_counts(metadata);
     }
 }
 
@@ -2784,7 +2790,9 @@ fn parse_print_options(p: &[u8], metadata: &mut SheetReadMetadata) {
 }
 
 fn parse_page_setup(p: &[u8], metadata: &mut SheetReadMetadata) {
-    let (Some(page_start), Some(flags)) = (i32le(p, 20), u16le(p, 32)) else {
+    let (Some(page_start), Some(fit_width), Some(fit_height), Some(flags)) =
+        (i32le(p, 20), u32le(p, 24), u32le(p, 28), u16le(p, 32))
+    else {
         metadata
             .print_metadata
             .add_loss(PrintLossKind::UnsupportedProperty);
@@ -2799,17 +2807,36 @@ fn parse_page_setup(p: &[u8], metadata: &mut SheetReadMetadata) {
             PrintPageOrder::DownThenOver
         });
 
+    metadata.page_setup_fit_counts = Some((fit_width, fit_height));
+    {
+        let ps = page_setup_mut(metadata);
+        ps.paper_size = nonzero_u32_as_u16(p, 0);
+        ps.scale = nonzero_u32_as_u16(p, 4);
+        if flags & 0x0040 == 0 {
+            ps.landscape = flags & 0x0002 != 0;
+        }
+        if flags & 0x0080 != 0 && page_start > 0 {
+            ps.first_page_number = u16::try_from(page_start).ok();
+        }
+    }
+    apply_page_setup_fit_counts(metadata);
+}
+
+fn apply_page_setup_fit_counts(metadata: &mut SheetReadMetadata) {
+    let Some((fit_width, fit_height)) = metadata.page_setup_fit_counts else {
+        return;
+    };
+    let preserve_zero = metadata.print_metadata.fit_to_page() == Some(true);
     let ps = page_setup_mut(metadata);
-    ps.paper_size = nonzero_u32_as_u16(p, 0);
-    ps.scale = nonzero_u32_as_u16(p, 4);
-    ps.fit_to_width = nonzero_u32_as_u16(p, 24);
-    ps.fit_to_height = nonzero_u32_as_u16(p, 28);
-    if flags & 0x0040 == 0 {
-        ps.landscape = flags & 0x0002 != 0;
+    ps.fit_to_width = xlsb_fit_count_as_u16(fit_width, preserve_zero);
+    ps.fit_to_height = xlsb_fit_count_as_u16(fit_height, preserve_zero);
+}
+
+fn xlsb_fit_count_as_u16(value: u32, preserve_zero: bool) -> Option<u16> {
+    if value == 0 && !preserve_zero {
+        return None;
     }
-    if flags & 0x0080 != 0 && page_start > 0 {
-        ps.first_page_number = u16::try_from(page_start).ok();
-    }
+    u16::try_from(value).ok()
 }
 
 fn nonzero_u32_as_u16(p: &[u8], offset: usize) -> Option<u16> {
@@ -5151,7 +5178,8 @@ mod tests {
             out
         }
 
-        let mut sheet = rec(BRT_MARGINS, &margins);
+        let mut sheet = rec(BRT_WS_PROP, &0x0100u16.to_le_bytes());
+        sheet.extend_from_slice(&rec(BRT_MARGINS, &margins));
         sheet.extend_from_slice(&rec(BRT_PRINT_OPTIONS, &0b1111u16.to_le_bytes()));
         sheet.extend_from_slice(&rec(BRT_PAGE_SETUP, &page_setup));
         sheet.extend_from_slice(&rec(BRT_BEGIN_HEADER_FOOTER, &header_footer));
@@ -5200,6 +5228,7 @@ mod tests {
         assert_eq!(metadata.manual_row_breaks(), &[5, 20]);
         assert_eq!(metadata.manual_col_breaks(), &[3, 7]);
         assert_eq!(metadata.page_order(), Some(PrintPageOrder::OverThenDown));
+        assert_eq!(metadata.fit_to_page(), Some(true));
         assert_eq!(metadata.print_headings(), Some(true));
         assert_eq!(metadata.print_gridlines(), Some(true));
         assert_eq!(metadata.center_horizontally(), Some(true));
@@ -5212,6 +5241,145 @@ mod tests {
         assert_eq!(metadata.header_footer().first_footer(), Some("&RFirstF"));
         assert_eq!(metadata.header_footer().different_odd_even(), Some(true));
         assert_eq!(metadata.header_footer().different_first(), Some(true));
+    }
+
+    #[test]
+    fn xlsb_fit_to_page_mode_controls_zero_fit_count_retention_in_any_record_order() {
+        fn open_page_setup(
+            ws_flags: Option<u16>,
+            ws_prop_first: bool,
+            fit_width: u32,
+            fit_height: u32,
+        ) -> Workbook {
+            let mut wb_bin = vec![0u8; 8];
+            wb_bin.extend_from_slice(&wstr("rId1"));
+            wb_bin.extend_from_slice(&wstr("Print"));
+            let wb_bin = rec(BRT_BUNDLE_SH, &wb_bin);
+
+            let mut page_setup = Vec::new();
+            page_setup.extend_from_slice(&9u32.to_le_bytes());
+            page_setup.extend_from_slice(&80u32.to_le_bytes());
+            page_setup.extend_from_slice(&600u32.to_le_bytes());
+            page_setup.extend_from_slice(&600u32.to_le_bytes());
+            page_setup.extend_from_slice(&1u32.to_le_bytes());
+            page_setup.extend_from_slice(&1i32.to_le_bytes());
+            page_setup.extend_from_slice(&fit_width.to_le_bytes());
+            page_setup.extend_from_slice(&fit_height.to_le_bytes());
+            page_setup.extend_from_slice(&0u16.to_le_bytes());
+            page_setup.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+            let ws_prop = ws_flags.map(|flags| rec(BRT_WS_PROP, &flags.to_le_bytes()));
+            let mut sheet = Vec::new();
+            if ws_prop_first {
+                if let Some(record) = ws_prop.as_ref() {
+                    sheet.extend_from_slice(record);
+                }
+            }
+            sheet.extend_from_slice(&rec(BRT_PAGE_SETUP, &page_setup));
+            if !ws_prop_first {
+                if let Some(record) = ws_prop.as_ref() {
+                    sheet.extend_from_slice(record);
+                }
+            }
+
+            let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = SimpleFileOptions::default();
+            for (path, body) in [
+                ("xl/workbook.bin", wb_bin.as_slice()),
+                ("xl/_rels/workbook.bin.rels", rels.as_bytes()),
+                ("xl/worksheets/sheet1.bin", sheet.as_slice()),
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            Workbook::open(&writer.finish().unwrap().into_inner()).unwrap()
+        }
+
+        for (
+            label,
+            ws_flags,
+            ws_prop_first,
+            fit_width,
+            fit_height,
+            expected_mode,
+            expected_width,
+            expected_height,
+        ) in [
+            (
+                "fit flag before conflicting scale and fit",
+                Some(0x0100),
+                true,
+                2,
+                1,
+                Some(true),
+                Some(2),
+                Some(1),
+            ),
+            (
+                "scale flag after conflicting scale and fit",
+                Some(0),
+                false,
+                2,
+                1,
+                Some(false),
+                Some(2),
+                Some(1),
+            ),
+            (
+                "fit one by unconstrained after page setup",
+                Some(0x0100),
+                false,
+                1,
+                0,
+                Some(true),
+                Some(1),
+                Some(0),
+            ),
+            (
+                "legacy fallback without worksheet properties",
+                None,
+                true,
+                1,
+                0,
+                None,
+                Some(1),
+                None,
+            ),
+        ] {
+            let workbook = open_page_setup(ws_flags, ws_prop_first, fit_width, fit_height);
+            let sheet = &workbook.sheets[0];
+            let setup = sheet.page_setup().expect(label);
+            assert_eq!(setup.scale, Some(80), "{label}");
+            assert_eq!(setup.fit_to_width, expected_width, "{label}");
+            assert_eq!(setup.fit_to_height, expected_height, "{label}");
+            assert_eq!(
+                sheet.print_metadata().fit_to_page(),
+                expected_mode,
+                "{label}"
+            );
+
+            if let Some(expected_mode) = expected_mode {
+                let output = workbook.to_xlsx();
+                let reopened = Workbook::open(&output).expect(label);
+                let sheet = &reopened.sheets[0];
+                assert_eq!(
+                    sheet.print_metadata().fit_to_page(),
+                    Some(expected_mode),
+                    "{label} after XLSX write/reopen"
+                );
+                let setup = sheet.page_setup().expect(label);
+                assert_eq!(setup.scale, Some(80), "{label} after XLSX write/reopen");
+                assert_eq!(
+                    setup.fit_to_width, expected_width,
+                    "{label} after XLSX write/reopen"
+                );
+                assert_eq!(
+                    setup.fit_to_height, expected_height,
+                    "{label} after XLSX write/reopen"
+                );
+            }
+        }
     }
 
     #[test]
