@@ -407,10 +407,11 @@ jobs:
         timeout-minutes: 15
         shell: bash
         env:
-          RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json
+          RXLS_TEST_FONT_PACK_MANIFEST: ${{ github.workspace }}/local/render-fonts/pack/manifest.json
           RXLS_TEST_FONT_FAMILY: Arimo
         run: |
           set -euo pipefail
+          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]
           test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \

@@ -103,7 +103,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "802e9d82f7e8d7a089a06e93d011535e1cae7d80a4ba5332958fc395cfbd1347",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
-    "74b2d392ed32268384508abc710ba1c1405616478059e749a7e5fafe5a8afa5a",
+    "4e72cf67b74b8d4cfcbbc74746a7a1f51a4fa3fb8572a76c9aa779e00c4da23e",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "8cf408faa253deea839f48f20bd4e23d3e8d58950d2fb6ed97e547ba0cd205a8",
@@ -126,7 +126,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "720b02bbaf0323823d45cd05a476b54341a54d318556003e35ece1e3fa636518"
+    "2ea817c87ee9b630777f20256a4e698c2e9e2b935baa91f4fb27ca187820fb29"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
@@ -2043,10 +2043,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "        timeout-minutes: 15\n"
         "        shell: bash\n"
         "        env:\n"
-        "          RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json\n"
+        "          RXLS_TEST_FONT_PACK_MANIFEST: "
+        "${{ github.workspace }}/local/render-fonts/pack/manifest.json\n"
         "          RXLS_TEST_FONT_FAMILY: Arimo\n"
         "        run: |\n"
         "          set -euo pipefail\n"
+        '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]\n'
         '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
         "          cargo +1.85.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"

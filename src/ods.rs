@@ -9,7 +9,7 @@
 //! `…-rows-repeated` expand runs (clamped), and `…-columns-spanned` /
 //! `…-rows-spanned` give merged ranges. Panic-free / bounds-checked.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 
 use quick_xml::events::{BytesRef, Event};
@@ -286,6 +286,9 @@ struct OdsStyleProps {
     border_top: Option<(BorderStyle, Option<Color>)>,
     border_bottom: Option<(BorderStyle, Option<Color>)>,
     num_fmt: Option<String>,
+    unresolved_number_format: bool,
+    decimal_places: Option<usize>,
+    decimal_places_invalid: bool,
     horizontal: Option<HAlign>,
     vertical: Option<VAlign>,
     wrap: Option<bool>,
@@ -304,6 +307,14 @@ struct OdsStyleProps {
     break_after_page: Option<bool>,
     break_invalid: bool,
     clip: Option<OdsClip>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum OdsNumberFormatState {
+    #[default]
+    General,
+    Resolved,
+    Unresolved,
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +381,10 @@ impl OdsStyleProps {
         }
         if other.break_invalid {
             self.break_invalid = true;
+        }
+        if other.decimal_places.is_some() || other.decimal_places_invalid {
+            self.decimal_places = other.decimal_places;
+            self.decimal_places_invalid = other.decimal_places_invalid;
         }
     }
 
@@ -455,7 +470,9 @@ impl OdsStyleProps {
 #[derive(Clone, Default)]
 struct OdsRawStyle {
     parent: Option<String>,
+    unresolved_parent: bool,
     data_style: Option<String>,
+    unresolved_data_style: bool,
     props: OdsStyleProps,
 }
 
@@ -463,6 +480,7 @@ struct OdsRawStyle {
 struct OdsResolvedStyle {
     props: OdsStyleProps,
     data_style: Option<String>,
+    unresolved_data_style: bool,
 }
 
 #[derive(Default)]
@@ -495,6 +513,7 @@ struct OdsStyleDefinitions {
     raw_styles: HashMap<(String, String), OdsRawStyle>,
     default_styles: HashMap<String, OdsStyleProps>,
     number_formats: HashMap<String, String>,
+    unresolved_number_formats: HashSet<String>,
     losses: Vec<StyleLoss>,
     has_source_styles: bool,
 }
@@ -608,17 +627,28 @@ fn resolve_ods_style(
     if depth >= MAX_ODS_STYLE_DEPTH || visiting.contains(&key) {
         add_ods_style_loss(losses, StyleLossKind::InheritanceCycle, 1);
         return OdsResolvedStyle {
-            props: definitions
-                .default_styles
-                .get(family)
-                .cloned()
-                .unwrap_or_default(),
+            props: OdsStyleProps {
+                unresolved_number_format: true,
+                ..definitions
+                    .default_styles
+                    .get(family)
+                    .cloned()
+                    .unwrap_or_default()
+            },
             data_style: None,
+            unresolved_data_style: true,
         };
     }
     let Some(raw) = definitions.raw_styles.get(&key) else {
         add_ods_style_loss(losses, StyleLossKind::MissingReference, 1);
-        return OdsResolvedStyle::default();
+        return OdsResolvedStyle {
+            props: OdsStyleProps {
+                unresolved_number_format: true,
+                ..OdsStyleProps::default()
+            },
+            data_style: None,
+            unresolved_data_style: true,
+        };
     };
     visiting.push(key.clone());
     let mut resolved = OdsResolvedStyle {
@@ -628,6 +658,7 @@ fn resolve_ods_style(
             .cloned()
             .unwrap_or_default(),
         data_style: None,
+        unresolved_data_style: false,
     };
     if let Some(parent) = raw.parent.as_deref() {
         resolved = resolve_ods_style(
@@ -639,15 +670,34 @@ fn resolve_ods_style(
             losses,
             depth + 1,
         );
+    } else if raw.unresolved_parent {
+        resolved.props.num_fmt = None;
+        resolved.props.unresolved_number_format = true;
+        resolved.data_style = None;
+        resolved.unresolved_data_style = true;
     }
     resolved.props.overlay(&raw.props);
     if raw.data_style.is_some() {
         resolved.data_style.clone_from(&raw.data_style);
+        resolved.unresolved_data_style = false;
+    } else if raw.unresolved_data_style {
+        resolved.data_style = None;
+        resolved.unresolved_data_style = true;
     }
-    if let Some(format_name) = resolved.data_style.as_deref() {
+    if resolved.unresolved_data_style {
+        resolved.props.num_fmt = None;
+        resolved.props.unresolved_number_format = true;
+    } else if let Some(format_name) = resolved.data_style.as_deref() {
+        resolved.props.num_fmt = None;
+        resolved.props.unresolved_number_format = false;
         if let Some(format) = definitions.number_formats.get(format_name) {
             resolved.props.num_fmt = Some(format.clone());
+        } else if definitions.unresolved_number_formats.contains(format_name) {
+            resolved.props.unresolved_number_format = true;
         } else {
+            resolved.data_style = None;
+            resolved.unresolved_data_style = true;
+            resolved.props.unresolved_number_format = true;
             add_ods_style_loss(losses, StyleLossKind::MissingReference, 1);
         }
     }
@@ -819,6 +869,7 @@ struct CellAttrs {
     formula: Option<String>,
     validation_name: Option<String>,
     style_name: Option<String>,
+    style_name_invalid: bool,
     col_rep: u32,
     col_span: u16,
     row_span: u32,
@@ -853,12 +904,21 @@ struct CellMetadata<'a> {
     validation: Option<&'a DataValidation>,
     images: &'a [PendingImage],
     style: Option<&'a CellStyle>,
+    number_format_state: Option<OdsNumberFormatState>,
     row_formats: &'a BTreeMap<u32, CellStyle>,
+    row_number_format_states: &'a BTreeMap<u32, OdsNumberFormatState>,
     col_formats: &'a BTreeMap<u16, CellStyle>,
+    col_number_format_states: &'a BTreeMap<u16, OdsNumberFormatState>,
     default_format: Option<&'a CellStyle>,
+    default_number_format_state: Option<OdsNumberFormatState>,
 }
 
 fn read_cell_attrs(e: &quick_xml::events::BytesStart<'_>) -> CellAttrs {
+    let raw_style_name = attr(e, b"style-name");
+    let style_name = raw_style_name
+        .as_ref()
+        .filter(|name| name.len() <= MAX_ODS_STYLE_NAME)
+        .cloned();
     CellAttrs {
         vtype: attr(e, b"value-type").unwrap_or_default(),
         val: attr(e, b"value")
@@ -867,7 +927,11 @@ fn read_cell_attrs(e: &quick_xml::events::BytesStart<'_>) -> CellAttrs {
             .or_else(|| attr(e, b"time-value")),
         formula: attr(e, b"formula").map(normalize_formula),
         validation_name: attr(e, b"content-validation-name").filter(|name| !name.trim().is_empty()),
-        style_name: attr(e, b"style-name").filter(|name| name.len() <= MAX_ODS_STYLE_NAME),
+        style_name,
+        style_name_invalid: raw_style_name.is_some()
+            && raw_style_name
+                .as_ref()
+                .is_some_and(|name| name.len() > MAX_ODS_STYLE_NAME),
         col_rep: attr(e, b"number-columns-repeated")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1)
@@ -1198,6 +1262,21 @@ fn ods_bool_value(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_ods_bounded_usize(value: &str, max: usize) -> std::result::Result<usize, StyleLossKind> {
+    let value = value.trim().parse::<usize>().map_err(|error| {
+        if matches!(error.kind(), std::num::IntErrorKind::PosOverflow) {
+            StyleLossKind::LimitExceeded
+        } else {
+            StyleLossKind::UnsupportedProperty
+        }
+    })?;
+    if value > max {
+        Err(StyleLossKind::LimitExceeded)
+    } else {
+        Ok(value)
+    }
+}
+
 fn parse_ods_clip_length_points(value: &str) -> Option<f64> {
     if value.eq_ignore_ascii_case("auto") {
         return Some(0.0);
@@ -1329,6 +1408,19 @@ fn apply_ods_style_properties(
             }
         }
         b"table-cell-properties" => {
+            if let Some(value) = attr(e, b"decimal-places") {
+                match parse_ods_bounded_usize(&value, 30) {
+                    Ok(value) => {
+                        props.decimal_places = Some(value);
+                        props.decimal_places_invalid = false;
+                    }
+                    Err(kind) => {
+                        props.decimal_places = None;
+                        props.decimal_places_invalid = true;
+                        add_ods_style_loss(losses, kind, 1);
+                    }
+                }
+            }
             if let Some(background) = attr(e, b"background-color") {
                 if background == "transparent" {
                     props.fill_color = None;
@@ -1501,22 +1593,94 @@ enum OdsNumberStyleKind {
     Text,
 }
 
-fn number_pattern(e: &quick_xml::events::BytesStart<'_>, losses: &mut Vec<StyleLoss>) -> String {
-    let decimals = attr(e, b"decimal-places")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(30);
-    let min_decimals = attr(e, b"min-decimal-places")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(decimals)
-        .min(decimals);
-    let min_integer = attr(e, b"min-integer-digits")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, 30);
-    let grouped = attr(e, b"grouping").as_deref().is_some_and(ods_bool);
-    let mut pattern = if grouped {
+#[derive(Clone, Copy)]
+enum OdsInheritedDecimalPlaces {
+    Absent,
+    Value(usize),
+    Invalid,
+}
+
+#[derive(Clone, Copy)]
+enum OdsUnresolvedNumberFormat {
+    AlreadyReported,
+    Report(StyleLossKind),
+}
+
+fn merge_unresolved_number_format(
+    current: &mut Option<OdsUnresolvedNumberFormat>,
+    next: OdsUnresolvedNumberFormat,
+) {
+    match (*current, next) {
+        (Some(OdsUnresolvedNumberFormat::Report(StyleLossKind::LimitExceeded)), _) => {}
+        (_, OdsUnresolvedNumberFormat::Report(StyleLossKind::LimitExceeded)) => {
+            *current = Some(next);
+        }
+        (None | Some(OdsUnresolvedNumberFormat::AlreadyReported), _) => {
+            *current = Some(next);
+        }
+        (
+            Some(OdsUnresolvedNumberFormat::Report(_)),
+            OdsUnresolvedNumberFormat::AlreadyReported,
+        ) => {}
+        (Some(OdsUnresolvedNumberFormat::Report(_)), OdsUnresolvedNumberFormat::Report(_)) => {}
+    }
+}
+
+fn number_pattern(
+    e: &quick_xml::events::BytesStart<'_>,
+    inherited_decimals: OdsInheritedDecimalPlaces,
+) -> std::result::Result<String, OdsUnresolvedNumberFormat> {
+    // ODF 1.2 §19.343.2 inherits an omitted number:decimal-places
+    // value from style:decimal-places on the default table-cell style.
+    let explicit_decimals = attr(e, b"decimal-places");
+    let decimals = match explicit_decimals.as_deref() {
+        Some(value) => {
+            parse_ods_bounded_usize(value, 30).map_err(OdsUnresolvedNumberFormat::Report)?
+        }
+        None => match inherited_decimals {
+            OdsInheritedDecimalPlaces::Value(value) => value,
+            OdsInheritedDecimalPlaces::Absent => {
+                return Err(OdsUnresolvedNumberFormat::Report(
+                    StyleLossKind::UnsupportedProperty,
+                ));
+            }
+            OdsInheritedDecimalPlaces::Invalid => {
+                return Err(OdsUnresolvedNumberFormat::AlreadyReported);
+            }
+        },
+    };
+    let min_decimals = match attr(e, b"min-decimal-places") {
+        Some(value) => {
+            let value =
+                parse_ods_bounded_usize(&value, 30).map_err(OdsUnresolvedNumberFormat::Report)?;
+            if value > decimals {
+                return Err(OdsUnresolvedNumberFormat::Report(
+                    StyleLossKind::UnsupportedProperty,
+                ));
+            }
+            value
+        }
+        None if explicit_decimals.is_some() => decimals,
+        None => 0,
+    };
+    let min_integer = match attr(e, b"min-integer-digits") {
+        Some(value) => {
+            parse_ods_bounded_usize(&value, 30).map_err(OdsUnresolvedNumberFormat::Report)?
+        }
+        None => 1,
+    };
+    let grouped = match attr(e, b"grouping") {
+        Some(value) => ods_bool_value(value.trim()).ok_or(OdsUnresolvedNumberFormat::Report(
+            StyleLossKind::UnsupportedProperty,
+        ))?,
+        None => false,
+    };
+    let mut pattern = if grouped && min_integer == 0 {
+        "#,###".to_string()
+    } else if grouped {
         "#,##".to_string()
+    } else if min_integer == 0 {
+        "#".to_string()
     } else {
         String::new()
     };
@@ -1527,16 +1691,18 @@ fn number_pattern(e: &quick_xml::events::BytesStart<'_>, losses: &mut Vec<StyleL
         pattern.push_str(&"#".repeat(decimals - min_decimals));
     }
     if attr(e, b"decimal-replacement").is_some() || attr(e, b"display-factor").is_some() {
-        add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+        return Err(OdsUnresolvedNumberFormat::Report(
+            StyleLossKind::UnsupportedProperty,
+        ));
     }
-    pattern
+    Ok(pattern)
 }
 
 fn scientific_pattern(
     e: &quick_xml::events::BytesStart<'_>,
-    losses: &mut Vec<StyleLoss>,
-) -> String {
-    let mut pattern = number_pattern(e, losses);
+    inherited_decimals: OdsInheritedDecimalPlaces,
+) -> std::result::Result<String, OdsUnresolvedNumberFormat> {
+    let mut pattern = number_pattern(e, inherited_decimals)?;
     pattern.push('E');
     match attr(e, b"forced-exponent-sign")
         .as_deref()
@@ -1544,17 +1710,25 @@ fn scientific_pattern(
     {
         Some(Some(true)) => pattern.push('+'),
         Some(Some(false)) | None => {}
-        Some(None) => add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1),
+        Some(None) => {
+            return Err(OdsUnresolvedNumberFormat::Report(
+                StyleLossKind::UnsupportedProperty,
+            ));
+        }
     }
-    let exponent_digits = attr(e, b"min-exponent-digits")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, 30);
+    let exponent_digits = match attr(e, b"min-exponent-digits") {
+        Some(value) => parse_ods_bounded_usize(&value, 30)
+            .map_err(OdsUnresolvedNumberFormat::Report)?
+            .max(1),
+        None => 1,
+    };
     pattern.push_str(&"0".repeat(exponent_digits));
     if attr(e, b"exponent-interval").is_some() {
-        add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+        return Err(OdsUnresolvedNumberFormat::Report(
+            StyleLossKind::UnsupportedProperty,
+        ));
     }
-    pattern
+    Ok(pattern)
 }
 
 fn fraction_pattern(e: &quick_xml::events::BytesStart<'_>, losses: &mut Vec<StyleLoss>) -> String {
@@ -1594,9 +1768,12 @@ fn fraction_pattern(e: &quick_xml::events::BytesStart<'_>, losses: &mut Vec<Styl
     pattern
 }
 
-fn number_component(element: &[u8], e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+fn number_component(
+    element: &[u8],
+    e: &quick_xml::events::BytesStart<'_>,
+) -> std::result::Result<Option<String>, OdsUnresolvedNumberFormat> {
     let long = attr(e, b"style").as_deref() == Some("long");
-    Some(match element {
+    Ok(Some(match element {
         b"day" => if long { "dd" } else { "d" }.to_string(),
         b"month" => {
             if attr(e, b"textual").as_deref().is_some_and(ods_bool) {
@@ -1612,10 +1789,12 @@ fn number_component(element: &[u8], e: &quick_xml::events::BytesStart<'_>) -> Op
         b"hours" => if long { "hh" } else { "h" }.to_string(),
         b"minutes" => if long { "mm" } else { "m" }.to_string(),
         b"seconds" => {
-            let decimals = attr(e, b"decimal-places")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0)
-                .min(9);
+            let decimals = match attr(e, b"decimal-places") {
+                Some(value) => {
+                    parse_ods_bounded_usize(&value, 9).map_err(OdsUnresolvedNumberFormat::Report)?
+                }
+                None => 0,
+            };
             let mut out = if long { "ss" } else { "s" }.to_string();
             if decimals > 0 {
                 out.push('.');
@@ -1625,8 +1804,8 @@ fn number_component(element: &[u8], e: &quick_xml::events::BytesStart<'_>) -> Op
         }
         b"am-pm" => "AM/PM".to_string(),
         b"text-content" => "@".to_string(),
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 fn append_ods_number_literal(
@@ -1653,7 +1832,20 @@ fn append_ods_number_literal(
 
 fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
     let mut reader = Reader::from_str(xml);
-    let mut current: Option<(String, OdsNumberStyleKind, String, bool)> = None;
+    let inherited_decimals = match definitions.default_styles.get("table-cell") {
+        Some(style) if style.decimal_places_invalid => OdsInheritedDecimalPlaces::Invalid,
+        Some(style) if style.decimal_places.is_some() => {
+            OdsInheritedDecimalPlaces::Value(style.decimal_places.unwrap_or_default())
+        }
+        _ => OdsInheritedDecimalPlaces::Absent,
+    };
+    let mut current: Option<(
+        String,
+        OdsNumberStyleKind,
+        String,
+        bool,
+        Option<OdsUnresolvedNumberFormat>,
+    )> = None;
     let mut text_depth = 0usize;
     let mut text = String::new();
     loop {
@@ -1673,21 +1865,28 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                 };
                 if let (Some(kind), Some(name)) = (kind, attr(&e, b"name")) {
                     if name.len() <= MAX_ODS_STYLE_NAME {
-                        current = Some((name, kind, String::new(), false));
+                        current = Some((name, kind, String::new(), false, None));
                     }
-                } else if let Some((_, kind, code, _)) = current.as_mut() {
+                } else if let Some((_, kind, code, _, unresolved_reason)) = current.as_mut() {
                     match element {
-                        b"number" => code.push_str(&number_pattern(&e, &mut definitions.losses)),
-                        b"scientific-number" => {
-                            code.push_str(&scientific_pattern(&e, &mut definitions.losses));
-                        }
+                        b"number" => match number_pattern(&e, inherited_decimals) {
+                            Ok(pattern) => code.push_str(&pattern),
+                            Err(reason) => {
+                                merge_unresolved_number_format(unresolved_reason, reason)
+                            }
+                        },
+                        b"scientific-number" => match scientific_pattern(&e, inherited_decimals) {
+                            Ok(pattern) => code.push_str(&pattern),
+                            Err(reason) => {
+                                merge_unresolved_number_format(unresolved_reason, reason)
+                            }
+                        },
                         b"fraction" => {
                             code.push_str(&fraction_pattern(&e, &mut definitions.losses));
                         }
-                        b"map" => add_ods_style_loss(
-                            &mut definitions.losses,
-                            StyleLossKind::UnsupportedProperty,
-                            1,
+                        b"map" => merge_unresolved_number_format(
+                            unresolved_reason,
+                            OdsUnresolvedNumberFormat::Report(StyleLossKind::UnsupportedProperty),
                         ),
                         b"currency-symbol" | b"text" => {
                             if !e.is_empty() {
@@ -1695,11 +1894,13 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                                 text.clear();
                             }
                         }
-                        _ => {
-                            if let Some(component) = number_component(element, &e) {
-                                code.push_str(&component);
+                        _ => match number_component(element, &e) {
+                            Ok(Some(component)) => code.push_str(&component),
+                            Ok(None) => {}
+                            Err(reason) => {
+                                merge_unresolved_number_format(unresolved_reason, reason)
                             }
-                        }
+                        },
                     }
                     if e.is_empty()
                         && element == b"currency-symbol"
@@ -1717,7 +1918,7 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                 let qname = e.name();
                 let element = local(qname.as_ref());
                 if matches!(element, b"currency-symbol" | b"text") && text_depth > 0 {
-                    if let Some((_, kind, code, active_percent)) = current.as_mut() {
+                    if let Some((_, kind, code, active_percent, _)) = current.as_mut() {
                         append_ods_number_literal(
                             code,
                             &text,
@@ -1741,7 +1942,9 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                     _ => None,
                 };
                 if closes.is_some() {
-                    if let Some((name, kind, mut code, active_percent)) = current.take() {
+                    if let Some((name, kind, mut code, active_percent, unresolved_reason)) =
+                        current.take()
+                    {
                         if kind == OdsNumberStyleKind::Percentage && !active_percent {
                             code.push('%');
                         }
@@ -1751,14 +1954,22 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                         if kind == OdsNumberStyleKind::Text && code.is_empty() {
                             code.push('@');
                         }
-                        if code.len() <= 4_096 {
-                            definitions.number_formats.insert(name, code);
-                        } else {
-                            add_ods_style_loss(
-                                &mut definitions.losses,
+                        let unresolved_reason = if code.len() > 4_096 {
+                            Some(OdsUnresolvedNumberFormat::Report(
                                 StyleLossKind::LimitExceeded,
-                                1,
-                            );
+                            ))
+                        } else {
+                            unresolved_reason
+                        };
+                        if let Some(reason) = unresolved_reason {
+                            definitions.number_formats.remove(&name);
+                            definitions.unresolved_number_formats.insert(name);
+                            if let OdsUnresolvedNumberFormat::Report(reason) = reason {
+                                add_ods_style_loss(&mut definitions.losses, reason, 1);
+                            }
+                        } else {
+                            definitions.unresolved_number_formats.remove(&name);
+                            definitions.number_formats.insert(name, code);
                         }
                     }
                 }
@@ -1788,6 +1999,13 @@ fn start_ods_style(
     }
     definitions.has_source_styles = true;
     if default {
+        if attr(e, b"data-style-name").is_some() {
+            add_ods_style_loss(
+                &mut definitions.losses,
+                StyleLossKind::UnsupportedProperty,
+                1,
+            );
+        }
         definitions
             .default_styles
             .entry(family.clone())
@@ -1799,9 +2017,41 @@ fn start_ods_style(
         add_ods_style_loss(&mut definitions.losses, StyleLossKind::LimitExceeded, 1);
         return None;
     }
+    let raw_parent = attr(e, b"parent-style-name");
+    let parent = raw_parent
+        .as_ref()
+        .filter(|parent| parent.len() <= MAX_ODS_STYLE_NAME)
+        .cloned();
+    let unresolved_parent = raw_parent.is_some() && parent.is_none();
+    if unresolved_parent {
+        add_ods_style_loss(&mut definitions.losses, StyleLossKind::LimitExceeded, 1);
+    }
+    let raw_data_style = attr(e, b"data-style-name");
+    let (data_style, unresolved_data_style) = if family == "table-cell" {
+        let data_style = raw_data_style
+            .as_ref()
+            .filter(|style| style.len() <= MAX_ODS_STYLE_NAME)
+            .cloned();
+        let unresolved = raw_data_style.is_some() && data_style.is_none();
+        if unresolved {
+            add_ods_style_loss(&mut definitions.losses, StyleLossKind::LimitExceeded, 1);
+        }
+        (data_style, unresolved)
+    } else {
+        if raw_data_style.is_some() {
+            add_ods_style_loss(
+                &mut definitions.losses,
+                StyleLossKind::UnsupportedProperty,
+                1,
+            );
+        }
+        (None, false)
+    };
     let raw = OdsRawStyle {
-        parent: attr(e, b"parent-style-name").filter(|parent| parent.len() <= MAX_ODS_STYLE_NAME),
-        data_style: attr(e, b"data-style-name").filter(|style| style.len() <= MAX_ODS_STYLE_NAME),
+        parent,
+        unresolved_parent,
+        data_style,
+        unresolved_data_style,
         props: OdsStyleProps::default(),
     };
     definitions
@@ -1888,7 +2138,6 @@ fn append_ods_header_control(metadata: &mut PrintMetadata, kind: HeaderFooterKin
 }
 
 fn read_ods_style_definitions(xml: &str, definitions: &mut OdsStyleDefinitions) {
-    read_ods_number_formats(xml, definitions);
     let mut reader = Reader::from_str(xml);
     let mut current_style: Option<(String, Option<String>)> = None;
     let mut page_layout = None;
@@ -2161,6 +2410,9 @@ fn read_ods_style_definitions(xml: &str, definitions: &mut OdsStyleDefinitions) 
             _ => {}
         }
     }
+    // Number components with omitted precision inherit style:decimal-places
+    // from the default table-cell style parsed above.
+    read_ods_number_formats(xml, definitions);
 }
 
 fn table_style_options(
@@ -3093,8 +3345,36 @@ fn ods_frame(
 }
 
 fn ods_named_cell_style(styles: &OdsResolvedStyles, name: Option<&str>) -> Option<CellStyle> {
-    name.and_then(|name| styles.cell.get(name))
-        .map(OdsStyleProps::to_cell_style)
+    name.map(|name| {
+        styles
+            .cell
+            .get(name)
+            .map(OdsStyleProps::to_cell_style)
+            .unwrap_or_default()
+    })
+}
+
+fn ods_number_format_state(props: &OdsStyleProps) -> OdsNumberFormatState {
+    if props.unresolved_number_format {
+        OdsNumberFormatState::Unresolved
+    } else if props.num_fmt.is_some() {
+        OdsNumberFormatState::Resolved
+    } else {
+        OdsNumberFormatState::General
+    }
+}
+
+fn ods_named_cell_number_format_state(
+    styles: &OdsResolvedStyles,
+    name: Option<&str>,
+) -> Option<OdsNumberFormatState> {
+    name.map(|name| {
+        styles
+            .cell
+            .get(name)
+            .map(ods_number_format_state)
+            .unwrap_or(OdsNumberFormatState::Unresolved)
+    })
 }
 
 fn record_missing_ods_style(
@@ -3106,6 +3386,10 @@ fn record_missing_ods_style(
     let Some(name) = name.filter(|name| !name.is_empty()) else {
         return;
     };
+    if name.len() > MAX_ODS_STYLE_NAME {
+        add_ods_style_loss(losses, StyleLossKind::LimitExceeded, 1);
+        return;
+    }
     let found = match family {
         "table" => styles.table_styles.contains_key(name),
         "table-cell" => styles.cell.contains_key(name),
@@ -3121,6 +3405,18 @@ fn record_missing_ods_style(
     }
 }
 
+fn record_ods_cell_style_reference(
+    styles: &OdsResolvedStyles,
+    cell: &CellAttrs,
+    losses: &mut Vec<StyleLoss>,
+) {
+    if cell.style_name_invalid {
+        add_ods_style_loss(losses, StyleLossKind::LimitExceeded, 1);
+    } else {
+        record_missing_ods_style(styles, "table-cell", cell.style_name.as_deref(), losses);
+    }
+}
+
 fn ods_default_cell_style(styles: &OdsResolvedStyles) -> Option<CellStyle> {
     styles
         .default_cell
@@ -3133,7 +3429,16 @@ fn ods_table_default_cell_style(
     styles: &OdsResolvedStyles,
     name: Option<&str>,
 ) -> Option<CellStyle> {
-    ods_named_cell_style(styles, name).or_else(|| ods_default_cell_style(styles))
+    match name {
+        Some(name) => Some(
+            styles
+                .cell
+                .get(name)
+                .map(OdsStyleProps::to_cell_style)
+                .unwrap_or_default(),
+        ),
+        None => ods_default_cell_style(styles),
+    }
 }
 
 fn merge_layout_cell_style(
@@ -3156,6 +3461,7 @@ fn apply_ods_column_style(
     first: u32,
     repeat: u32,
     col_formats: &mut BTreeMap<u16, CellStyle>,
+    col_number_format_states: &mut BTreeMap<u16, OdsNumberFormatState>,
     col_widths: &mut BTreeMap<u16, f32>,
     physical_col_widths: &mut BTreeMap<u16, f32>,
     imported_column_axis_measures: &mut BTreeMap<u16, ImportedAxisMeasure>,
@@ -3170,8 +3476,19 @@ fn apply_ods_column_style(
         .as_deref()
         .and_then(|name| styles.column.get(name))
         .or(styles.default_column.as_ref());
-    let default_cell = ods_table_default_cell_style(styles, default_cell_name.as_deref());
+    let default_cell_props = default_cell_name
+        .as_deref()
+        .and_then(|name| styles.cell.get(name));
+    let default_cell_state = default_cell_name.as_deref().map(|name| {
+        styles
+            .cell
+            .get(name)
+            .map(ods_number_format_state)
+            .unwrap_or(OdsNumberFormatState::Unresolved)
+    });
+    let default_cell = default_cell_props.map(OdsStyleProps::to_cell_style);
     let cell_style = merge_layout_cell_style(default_cell, layout);
+    let number_format_state = default_cell_state;
     let directly_hidden = matches!(
         attr(e, b"visibility").as_deref(),
         Some("collapse" | "filter")
@@ -3180,6 +3497,7 @@ fn apply_ods_column_style(
     for raw_col in first..end {
         if col_formats
             .len()
+            .max(col_number_format_states.len())
             .max(col_widths.len())
             .max(imported_column_axis_measures.len())
             .max(hidden_cols.len())
@@ -3191,6 +3509,16 @@ fn apply_ods_column_style(
         let col = raw_col.min(u32::from(u16::MAX)) as u16;
         if let Some(style) = cell_style.as_ref() {
             col_formats.insert(col, style.clone());
+        } else if number_format_state.is_some() {
+            // Preserve an explicitly selected General/Unresolved whole style
+            // so lower-precedence defaults cannot leak through the public
+            // resolved-style cascade.
+            col_formats.insert(col, CellStyle::default());
+        }
+        if let Some(state) = number_format_state {
+            col_number_format_states.insert(col, state);
+        } else {
+            col_number_format_states.remove(&col);
         }
         if let Some(width) = layout.and_then(|style| style.col_width_chars) {
             col_widths.insert(col, width);
@@ -3214,6 +3542,7 @@ fn apply_ods_row_style(
     first: u32,
     repeat: u32,
     row_formats: &mut BTreeMap<u32, CellStyle>,
+    row_number_format_states: &mut BTreeMap<u32, OdsNumberFormatState>,
     row_heights: &mut BTreeMap<u32, f32>,
     imported_row_axis_measures: &mut BTreeMap<u32, ImportedAxisMeasure>,
     hidden_rows: &mut std::collections::BTreeSet<u32>,
@@ -3227,8 +3556,19 @@ fn apply_ods_row_style(
         .as_deref()
         .and_then(|name| styles.row.get(name))
         .or(styles.default_row.as_ref());
-    let default_cell = ods_table_default_cell_style(styles, default_cell_name.as_deref());
+    let default_cell_props = default_cell_name
+        .as_deref()
+        .and_then(|name| styles.cell.get(name));
+    let default_cell_state = default_cell_name.as_deref().map(|name| {
+        styles
+            .cell
+            .get(name)
+            .map(ods_number_format_state)
+            .unwrap_or(OdsNumberFormatState::Unresolved)
+    });
+    let default_cell = default_cell_props.map(OdsStyleProps::to_cell_style);
     let cell_style = merge_layout_cell_style(default_cell, layout);
+    let number_format_state = default_cell_state;
     let directly_hidden = matches!(
         attr(e, b"visibility").as_deref(),
         Some("collapse" | "filter")
@@ -3237,6 +3577,7 @@ fn apply_ods_row_style(
     for row in first..end {
         if row_formats
             .len()
+            .max(row_number_format_states.len())
             .max(row_heights.len())
             .max(imported_row_axis_measures.len())
             .max(hidden_rows.len())
@@ -3247,6 +3588,13 @@ fn apply_ods_row_style(
         }
         if let Some(style) = cell_style.as_ref() {
             row_formats.insert(row, style.clone());
+        } else if number_format_state.is_some() {
+            row_formats.insert(row, CellStyle::default());
+        }
+        if let Some(state) = number_format_state {
+            row_number_format_states.insert(row, state);
+        } else {
+            row_number_format_states.remove(&row);
         }
         if let Some(height) = layout.and_then(|style| style.row_height_pt) {
             row_heights.insert(row, height);
@@ -3324,15 +3672,22 @@ fn ods_cell_base_font(
     default_format: Option<&CellStyle>,
     row_formats: &BTreeMap<u32, CellStyle>,
     col_formats: &BTreeMap<u16, CellStyle>,
-    style_name: Option<&str>,
+    cell: &CellAttrs,
     row: u32,
     col: u16,
 ) -> Font {
     // ODF 1.2 §19.615 applies a row/column default only when a cell has no
     // explicit style, and the row default takes precedence over the column
     // default. Select the complete style before reading one component.
-    if let Some(style) = style_name.and_then(|name| styles.cell.get(name)) {
-        return style.to_cell_style().font.unwrap_or_default();
+    if cell.style_name_invalid {
+        return Font::default();
+    }
+    if let Some(name) = cell.style_name.as_deref() {
+        return styles
+            .cell
+            .get(name)
+            .and_then(|style| style.to_cell_style().font)
+            .unwrap_or_default();
     }
     row_formats
         .get(&row)
@@ -3342,21 +3697,56 @@ fn ods_cell_base_font(
         .unwrap_or_default()
 }
 
+enum OdsCellNumberFormat<'a> {
+    General,
+    Resolved(&'a str),
+    Unresolved,
+}
+
+fn ods_render_number_format_state(
+    state: OdsNumberFormatState,
+    style: Option<&CellStyle>,
+) -> OdsCellNumberFormat<'_> {
+    match state {
+        OdsNumberFormatState::General => OdsCellNumberFormat::General,
+        OdsNumberFormatState::Resolved => style
+            .and_then(|style| style.num_fmt.as_deref())
+            .map(OdsCellNumberFormat::Resolved)
+            .unwrap_or(OdsCellNumberFormat::Unresolved),
+        OdsNumberFormatState::Unresolved => OdsCellNumberFormat::Unresolved,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ods_cell_number_format<'a>(
     explicit: Option<&'a CellStyle>,
+    explicit_state: Option<OdsNumberFormatState>,
     row_formats: &'a BTreeMap<u32, CellStyle>,
+    row_states: &BTreeMap<u32, OdsNumberFormatState>,
     col_formats: &'a BTreeMap<u16, CellStyle>,
+    col_states: &BTreeMap<u16, OdsNumberFormatState>,
     default_format: Option<&'a CellStyle>,
+    default_state: Option<OdsNumberFormatState>,
     row: u32,
     col: u16,
-) -> Option<&'a str> {
+) -> OdsCellNumberFormat<'a> {
     // Keep the same whole-style precedence required by ODF 1.2 §19.615; a
-    // component missing from the selected style has General semantics.
-    explicit
-        .or_else(|| row_formats.get(&row))
-        .or_else(|| col_formats.get(&col))
-        .or(default_format)
-        .and_then(|style| style.num_fmt.as_deref())
+    // component missing from the selected style has General semantics. A
+    // present-but-unresolved ODF data style is distinct: retain its producer
+    // display cache instead of inventing explicit decimal precision.
+    if let Some(state) = explicit_state {
+        return ods_render_number_format_state(state, explicit);
+    }
+    if let Some(state) = row_states.get(&row) {
+        return ods_render_number_format_state(*state, row_formats.get(&row));
+    }
+    if let Some(state) = col_states.get(&col) {
+        return ods_render_number_format_state(*state, col_formats.get(&col));
+    }
+    if let Some(state) = default_state {
+        return ods_render_number_format_state(state, default_format);
+    }
+    OdsCellNumberFormat::General
 }
 
 fn ods_text_font(props: Option<&OdsStyleProps>, mut base: Font) -> Font {
@@ -3420,8 +3810,11 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
     let mut read_images: Images = Vec::new();
     let mut drawing_metadata: Vec<DrawingMetadata> = Vec::new();
     let mut default_format: Option<CellStyle> = None;
+    let mut default_number_format_state: Option<OdsNumberFormatState> = None;
     let mut row_formats: BTreeMap<u32, CellStyle> = BTreeMap::new();
+    let mut row_number_format_states: BTreeMap<u32, OdsNumberFormatState> = BTreeMap::new();
     let mut col_formats: BTreeMap<u16, CellStyle> = BTreeMap::new();
+    let mut col_number_format_states: BTreeMap<u16, OdsNumberFormatState> = BTreeMap::new();
     let mut blank_styles: BTreeMap<(u32, u16), CellStyle> = BTreeMap::new();
     let mut row_heights: BTreeMap<u32, f32> = BTreeMap::new();
     let mut col_widths: BTreeMap<u16, f32> = BTreeMap::new();
@@ -3533,6 +3926,16 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                     print_metadata = table_print_metadata(&e, &name, styles);
                     default_format =
                         ods_table_default_cell_style(styles, default_cell_name.as_deref());
+                    default_number_format_state = match default_cell_name.as_deref() {
+                        Some(name) => Some(
+                            styles
+                                .cell
+                                .get(name)
+                                .map(ods_number_format_state)
+                                .unwrap_or(OdsNumberFormatState::Unresolved),
+                        ),
+                        None => styles.default_cell.as_ref().map(ods_number_format_state),
+                    };
                     cells = Vec::new();
                     merges = Vec::new();
                     read_hyperlinks = Vec::new();
@@ -3541,7 +3944,9 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                     read_images = Vec::new();
                     drawing_metadata = Vec::new();
                     row_formats = BTreeMap::new();
+                    row_number_format_states = BTreeMap::new();
                     col_formats = BTreeMap::new();
+                    col_number_format_states = BTreeMap::new();
                     blank_styles = BTreeMap::new();
                     row_heights = BTreeMap::new();
                     col_widths = BTreeMap::new();
@@ -3594,6 +3999,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         table_column,
                         repeat,
                         &mut col_formats,
+                        &mut col_number_format_states,
                         &mut col_widths,
                         &mut physical_col_widths,
                         &mut imported_column_axis_measures,
@@ -3627,6 +4033,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         row,
                         row_rep,
                         &mut row_formats,
+                        &mut row_number_format_states,
                         &mut row_heights,
                         &mut imported_row_axis_measures,
                         &mut hidden_rows,
@@ -3634,22 +4041,18 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                     );
                 }
                 b"table-cell" | b"covered-table-cell" if in_table => {
-                    cur = Some(read_cell_attrs(&e));
-                    record_missing_ods_style(
-                        styles,
-                        "table-cell",
-                        cur.as_ref().and_then(|cell| cell.style_name.as_deref()),
-                        &mut style_losses,
-                    );
+                    let cell = read_cell_attrs(&e);
+                    record_ods_cell_style_reference(styles, &cell, &mut style_losses);
                     cell_base_font = ods_cell_base_font(
                         styles,
                         default_format.as_ref(),
                         &row_formats,
                         &col_formats,
-                        cur.as_ref().and_then(|cell| cell.style_name.as_deref()),
+                        &cell,
                         row,
                         col,
                     );
+                    cur = Some(cell);
                     cell_run_font = cell_base_font.clone();
                     span_font_stack.clear();
                     current_frame = None;
@@ -3848,13 +4251,12 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                 }
                 b"table-cell" | b"covered-table-cell" if in_table => {
                     let a = read_cell_attrs(&e);
-                    record_missing_ods_style(
-                        styles,
-                        "table-cell",
-                        a.style_name.as_deref(),
-                        &mut style_losses,
-                    );
-                    let resolved_style = ods_named_cell_style(styles, a.style_name.as_deref());
+                    record_ods_cell_style_reference(styles, &a, &mut style_losses);
+                    let resolved_style = if a.style_name_invalid {
+                        Some(CellStyle::default())
+                    } else {
+                        ods_named_cell_style(styles, a.style_name.as_deref())
+                    };
                     let validation = a
                         .validation_name
                         .as_deref()
@@ -3883,9 +4285,17 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                             validation,
                             images: &[],
                             style: resolved_style.as_ref(),
+                            number_format_state: if a.style_name_invalid {
+                                Some(OdsNumberFormatState::Unresolved)
+                            } else {
+                                ods_named_cell_number_format_state(styles, a.style_name.as_deref())
+                            },
                             row_formats: &row_formats,
+                            row_number_format_states: &row_number_format_states,
                             col_formats: &col_formats,
+                            col_number_format_states: &col_number_format_states,
                             default_format: default_format.as_ref(),
+                            default_number_format_state,
                         },
                     );
                 }
@@ -3949,6 +4359,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         table_column,
                         repeat,
                         &mut col_formats,
+                        &mut col_number_format_states,
                         &mut col_widths,
                         &mut physical_col_widths,
                         &mut imported_column_axis_measures,
@@ -3975,6 +4386,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         row,
                         rep,
                         &mut row_formats,
+                        &mut row_number_format_states,
                         &mut row_heights,
                         &mut imported_row_axis_measures,
                         &mut hidden_rows,
@@ -4135,7 +4547,11 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                             .validation_name
                             .as_deref()
                             .and_then(|name| validation_rules.get(name));
-                        let resolved_style = ods_named_cell_style(styles, a.style_name.as_deref());
+                        let resolved_style = if a.style_name_invalid {
+                            Some(CellStyle::default())
+                        } else {
+                            ods_named_cell_style(styles, a.style_name.as_deref())
+                        };
                         let mut sink = CellSink {
                             cells: &mut cells,
                             merges: &mut merges,
@@ -4160,9 +4576,20 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                                 validation,
                                 images: &cell_images,
                                 style: resolved_style.as_ref(),
+                                number_format_state: if a.style_name_invalid {
+                                    Some(OdsNumberFormatState::Unresolved)
+                                } else {
+                                    ods_named_cell_number_format_state(
+                                        styles,
+                                        a.style_name.as_deref(),
+                                    )
+                                },
                                 row_formats: &row_formats,
+                                row_number_format_states: &row_number_format_states,
                                 col_formats: &col_formats,
+                                col_number_format_states: &col_number_format_states,
                                 default_format: default_format.as_ref(),
+                                default_number_format_state,
                             },
                         );
                         if cell_saw_span && !cell_runs.is_empty() {
@@ -4457,16 +4884,32 @@ fn finish_cell(
         // so even empty-text valued cells consume budget and cannot amplify.
         for k in 0..rep {
             let out_col = col.saturating_add(k as u16);
-            let display = ods_cell_number_format(
+            let number_format = ods_cell_number_format(
                 metadata.style,
+                metadata.number_format_state,
                 metadata.row_formats,
+                metadata.row_number_format_states,
                 metadata.col_formats,
+                metadata.col_number_format_states,
                 metadata.default_format,
+                metadata.default_number_format_state,
                 row,
                 out_col,
-            )
-            .and_then(|format| render_ods_number_format(&value, format))
-            .unwrap_or_else(|| fallback_display.clone());
+            );
+            let display = match number_format {
+                OdsCellNumberFormat::Resolved(format) => render_ods_number_format(&value, format)
+                    .unwrap_or_else(|| {
+                        if text.is_empty() {
+                            fallback_display.clone()
+                        } else {
+                            text.to_string()
+                        }
+                    }),
+                OdsCellNumberFormat::Unresolved if !text.is_empty() => text.to_string(),
+                OdsCellNumberFormat::General | OdsCellNumberFormat::Unresolved => {
+                    fallback_display.clone()
+                }
+            };
             let cost = display
                 .len()
                 .saturating_add(metadata.hyperlink.map(str::len).unwrap_or(0))
@@ -5109,6 +5552,307 @@ mod tests {
     }
 
     #[test]
+    fn ods_unresolved_decimal_precision_preserves_bounded_producer_display() {
+        let content = r##"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="InheritedDecimals">
+      <number:number number:min-integer-digits="1" number:grouping="true"/>
+      <number:text> kg</number:text>
+    </number:number-style>
+    <number:number-style style:name="ExplicitInteger">
+      <number:number number:decimal-places="0" number:min-integer-digits="1"/>
+    </number:number-style>
+    <number:number-style style:name="MalformedDecimals">
+      <number:number number:decimal-places="many" number:min-integer-digits="1"/>
+    </number:number-style>
+    <number:number-style style:name="InheritedScientific">
+      <number:scientific-number number:min-integer-digits="1"
+          number:min-exponent-digits="2"/>
+    </number:number-style>
+    <number:currency-style style:name="InheritedCurrency">
+      <number:currency-symbol>$</number:currency-symbol>
+      <number:number number:min-integer-digits="1" number:grouping="true"/>
+    </number:currency-style>
+    <number:percentage-style style:name="InheritedPercentage">
+      <number:number number:min-integer-digits="1"/>
+      <number:text>%</number:text>
+    </number:percentage-style>
+    <style:style style:name="ce_inherited" style:family="table-cell"
+        style:data-style-name="InheritedDecimals"/>
+    <style:style style:name="ce_integer" style:family="table-cell"
+        style:data-style-name="ExplicitInteger"/>
+    <style:style style:name="ce_malformed" style:family="table-cell"
+        style:data-style-name="MalformedDecimals"/>
+    <style:style style:name="ce_scientific" style:family="table-cell"
+        style:data-style-name="InheritedScientific"/>
+    <style:style style:name="ce_currency" style:family="table-cell"
+        style:data-style-name="InheritedCurrency"/>
+    <style:style style:name="ce_percentage" style:family="table-cell"
+        style:data-style-name="InheritedPercentage"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Decimal inheritance">
+        <table:table-row>
+          <table:table-cell table:style-name="ce_inherited"
+              office:value-type="float" office:value="1234.5">
+            <text:p>1,234.50 kg</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_integer"
+              office:value-type="float" office:value="1.5">
+            <text:p>1.5</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_malformed"
+              office:value-type="float" office:value="1.5">
+            <text:p>malformed 1.50</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_inherited"
+              office:value-type="float" office:value="1234.5"/>
+          <table:table-cell table:style-name="ce_scientific"
+              office:value-type="float" office:value="12345">
+            <text:p>1.23E+04</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_currency"
+              office:value-type="currency" office:value="1.5" office:currency="USD">
+            <text:p>$1.50 cached</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_currency"
+              office:value-type="currency" office:value="1.5" office:currency="USD"/>
+          <table:table-cell table:style-name="ce_percentage"
+              office:value-type="percentage" office:value="0.125">
+            <text:p>12.50% cached</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_percentage"
+              office:value-type="percentage" office:value="0.125"/>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_inherited">
+          <table:table-cell office:value-type="float" office:value="9876.5">
+            <text:p>9,876.50 kg</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"##;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(sheet.cell(0, 0), Some(&Cell::Number(1234.5)));
+        assert_eq!(sheet.formatted(0, 0), Some("1,234.50 kg"));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt),
+            None
+        );
+        assert_eq!(sheet.cell(0, 1), Some(&Cell::Number(1.5)));
+        assert_eq!(sheet.formatted(0, 1), Some("2"));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 1)
+                .and_then(|style| style.num_fmt)
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(sheet.formatted(0, 2), Some("malformed 1.50"));
+        assert_eq!(sheet.formatted(0, 3), Some("1234.5"));
+        assert_eq!(sheet.formatted(0, 4), Some("1.23E+04"));
+        assert_eq!(sheet.formatted(0, 5), Some("$1.50 cached"));
+        assert_eq!(sheet.formatted(0, 6), Some("1.5"));
+        assert_eq!(sheet.formatted(0, 7), Some("12.50% cached"));
+        assert_eq!(sheet.formatted(0, 8), Some("12.5%"));
+        assert_eq!(sheet.formatted(1, 0), Some("9,876.50 kg"));
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Partial);
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::UnsupportedProperty)
+                .map(|loss| loss.occurrences),
+            Some(5)
+        );
+        assert!(!sheet
+            .style_losses()
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::MissingReference));
+    }
+
+    #[test]
+    fn ods_omitted_decimal_places_inherit_default_cell_precision() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Inherited precision">
+        <table:table-row>
+          <table:table-cell table:style-name="ce_inherited"
+              office:value-type="float" office:value="1234.5">
+            <text:p>stale producer cache</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_inherited"
+              office:value-type="float" office:value="1234.567">
+            <text:p>stale producer cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+        let styles = r#"
+<office:document-styles
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0">
+  <office:styles>
+    <style:default-style style:family="table-cell">
+      <style:table-cell-properties style:decimal-places=" 2 "/>
+    </style:default-style>
+    <number:number-style style:name="InheritedDecimals">
+      <number:number number:min-integer-digits="1" number:grouping=" true "/>
+      <number:text> kg</number:text>
+    </number:number-style>
+    <style:style style:name="ce_inherited" style:family="table-cell"
+        style:data-style-name="InheritedDecimals"/>
+  </office:styles>
+</office:document-styles>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes_with_styles(content, styles)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("1,234.5 kg"));
+        assert_eq!(sheet.formatted(0, 1), Some("1,234.57 kg"));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt)
+                .as_deref(),
+            Some("#,##0.##\\ \\k\\g")
+        );
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Retained);
+        assert!(sheet.style_losses().is_empty());
+    }
+
+    #[test]
+    fn ods_zero_minimum_integer_digits_remains_optional() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="OptionalInteger">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"
+          number:min-integer-digits="0"/>
+    </number:number-style>
+    <number:number-style style:name="GroupedOptionalInteger">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"
+          number:min-integer-digits="0" number:grouping="true"/>
+    </number:number-style>
+    <style:style style:name="c0" style:family="table-cell"
+        style:data-style-name="OptionalInteger"/>
+    <style:style style:name="c1" style:family="table-cell"
+        style:data-style-name="GroupedOptionalInteger"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Optional integer">
+        <table:table-row>
+          <table:table-cell table:style-name="c0"
+              office:value-type="float" office:value="0.5"/>
+          <table:table-cell table:style-name="c1"
+              office:value-type="float" office:value="1234.5"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some(".50"));
+        assert_eq!(sheet.formatted(0, 1), Some("1,234.50"));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt)
+                .as_deref(),
+            Some("#.00")
+        );
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 1)
+                .and_then(|style| style.num_fmt)
+                .as_deref(),
+            Some("#,###.00")
+        );
+    }
+
+    #[test]
+    fn ods_seconds_omission_keeps_its_explicit_zero_default() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Seconds">
+        <table:table-row>
+          <table:table-cell table:style-name="ce_time"
+              office:value-type="time" office:time-value="PT12H34M56S"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+        let styles = r#"
+<office:document-styles
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0">
+  <office:styles>
+    <style:default-style style:family="table-cell">
+      <style:table-cell-properties style:decimal-places="2"/>
+    </style:default-style>
+    <number:time-style style:name="WholeSeconds">
+      <number:hours number:style="long"/>
+      <number:text>:</number:text>
+      <number:minutes number:style="long"/>
+      <number:text>:</number:text>
+      <number:seconds number:style="long"/>
+    </number:time-style>
+    <style:style style:name="ce_time" style:family="table-cell"
+        style:data-style-name="WholeSeconds"/>
+  </office:styles>
+</office:document-styles>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes_with_styles(content, styles)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("12:34:56"));
+        let format = sheet
+            .resolved_cell_style(0, 0)
+            .and_then(|style| style.num_fmt)
+            .expect("resolved time format");
+        assert!(!format.contains('.'));
+        assert_eq!(sheet.style_fidelity(), StyleFidelity::Retained);
+    }
+
+    #[test]
     fn ods_repeated_cells_resolve_each_output_columns_default_number_style() {
         let content = r##"
 <office:document-content
@@ -5208,6 +5952,621 @@ mod tests {
                     .and_then(|style| style.num_fmt),
                 Some(["0.00", "0.0%", "0"][usize::from(col)].to_string())
             );
+        }
+    }
+
+    #[test]
+    fn ods_number_format_precedence_retains_general_and_unresolved_markers() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <number:number-style style:name="UnresolvedDecimals">
+      <number:number number:min-integer-digits="1"/>
+    </number:number-style>
+    <style:style style:name="ce_two" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+    <style:style style:name="ce_unresolved" style:family="table-cell"
+        style:data-style-name="UnresolvedDecimals"/>
+    <style:style style:name="ce_general" style:family="table-cell"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Precedence">
+        <table:table-column table:default-cell-style-name="ce_two"/>
+        <table:table-row table:default-cell-style-name="ce_general">
+          <table:table-cell office:value-type="float" office:value="1.5">
+            <text:p>stale general cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_unresolved">
+          <table:table-cell office:value-type="float" office:value="1.5">
+            <text:p>row cached</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_two">
+          <table:table-cell table:style-name="ce_unresolved"
+              office:value-type="float" office:value="1.5">
+            <text:p>explicit cached</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell office:value-type="float" office:value="1.5"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("1.5"));
+        assert_eq!(sheet.formatted(1, 0), Some("row cached"));
+        assert_eq!(sheet.formatted(2, 0), Some("explicit cached"));
+        assert_eq!(sheet.formatted(3, 0), Some("1.50"));
+        for row in 0..3 {
+            assert_eq!(
+                sheet
+                    .resolved_cell_style(row, 0)
+                    .and_then(|style| style.num_fmt),
+                None
+            );
+        }
+        assert_eq!(
+            sheet
+                .resolved_cell_style(3, 0)
+                .and_then(|style| style.num_fmt)
+                .as_deref(),
+            Some("0.00")
+        );
+    }
+
+    #[test]
+    fn ods_missing_data_style_preserves_cache_without_parent_format_leakage() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <style:style style:name="Base" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+    <style:style style:name="Child" style:family="table-cell"
+        style:parent-style-name="Base" style:data-style-name="MissingFormat"/>
+    <style:style style:name="Grandchild" style:family="table-cell"
+        style:parent-style-name="Child"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Missing format">
+        <table:table-row>
+          <table:table-cell table:style-name="Grandchild"
+              office:value-type="float" office:value="1.5">
+            <text:p>missing-format cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("missing-format cache"));
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt),
+            None
+        );
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::MissingReference)
+                .map(|loss| loss.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ods_missing_parent_style_preserves_cache_without_lower_format_leakage() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <style:style style:name="ce_two" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+    <style:style style:name="Child" style:family="table-cell"
+        style:parent-style-name="MissingParent"/>
+    <style:style style:name="BrokenRow" style:family="table-row"
+        style:parent-style-name="MissingRowParent"/>
+    <style:style style:name="WrongFamilyData" style:family="table-row"
+        style:data-style-name="TwoDecimals"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Missing parent">
+        <table:table-column table:default-cell-style-name="ce_two"/>
+        <table:table-row>
+          <table:table-cell table:style-name="Child"
+              office:value-type="float" office:value="1.5">
+            <text:p>missing-parent cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:style-name="BrokenRow">
+          <table:table-cell office:value-type="float" office:value="1.5"/>
+        </table:table-row>
+        <table:table-row table:style-name="WrongFamilyData">
+          <table:table-cell office:value-type="float" office:value="1.5"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("missing-parent cache"));
+        assert_eq!(sheet.formatted(1, 0), Some("1.50"));
+        assert_eq!(sheet.formatted(2, 0), Some("1.50"));
+        for row in [1, 2] {
+            assert_eq!(
+                sheet
+                    .resolved_cell_style(row, 0)
+                    .and_then(|style| style.num_fmt)
+                    .as_deref(),
+                Some("0.00")
+            );
+        }
+        assert_eq!(
+            sheet
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt),
+            None
+        );
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::MissingReference)
+                .map(|loss| loss.occurrences),
+            Some(2)
+        );
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::UnsupportedProperty)
+                .map(|loss| loss.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ods_missing_cell_style_references_block_lower_format_precedence() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <style:style style:name="ce_two" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Axis missing">
+        <table:table-column table:default-cell-style-name="ce_two"/>
+        <table:table-row table:default-cell-style-name="MissingRowDefault">
+          <table:table-cell office:value-type="float" office:value="1.5">
+            <text:p>missing-row cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_two">
+          <table:table-cell table:style-name="MissingExplicit"
+              office:value-type="float" office:value="1.5">
+            <text:p>missing-explicit cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+      <table:table table:name="Table missing"
+          table:default-cell-style-name="MissingTableDefault">
+        <table:table-row>
+          <table:table-cell office:value-type="float" office:value="1.5">
+            <text:p>missing-table cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let axis = &workbook.sheets[0];
+        assert_eq!(axis.formatted(0, 0), Some("missing-row cache"));
+        assert_eq!(axis.formatted(1, 0), Some("missing-explicit cache"));
+        for row in 0..2 {
+            assert_eq!(
+                axis.resolved_cell_style(row, 0)
+                    .and_then(|style| style.num_fmt),
+                None
+            );
+        }
+        assert_eq!(
+            axis.style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::MissingReference)
+                .map(|loss| loss.occurrences),
+            Some(2)
+        );
+
+        let table = &workbook.sheets[1];
+        assert_eq!(table.formatted(0, 0), Some("missing-table cache"));
+        assert_eq!(
+            table
+                .resolved_cell_style(0, 0)
+                .and_then(|style| style.num_fmt),
+            None
+        );
+        assert_eq!(
+            table
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::MissingReference)
+                .map(|loss| loss.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ods_over_limit_data_styles_preserve_cache_and_clear_stale_formats() {
+        let long_name = "N".repeat(MAX_ODS_STYLE_NAME + 1);
+        let long_literal = "x".repeat(2_050);
+        let content = format!(
+            r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <number:number-style style:name="Duplicate">
+      <number:number number:decimal-places="2"/>
+    </number:number-style>
+    <number:number-style style:name="Duplicate">
+      <number:number number:decimal-places="2" number:grouping="sometimes"/>
+      <number:text>{long_literal}</number:text>
+    </number:number-style>
+    <style:style style:name="LongReference" style:family="table-cell"
+        style:data-style-name="{long_name}"/>
+    <style:style style:name="TwoDecimalCell" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+    <style:style style:name="LongCode" style:family="table-cell"
+        style:data-style-name="Duplicate"/>
+    <style:style style:name="LongParent" style:family="table-cell"
+        style:parent-style-name="{long_name}"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Limits">
+        <table:table-column table:default-cell-style-name="TwoDecimalCell"
+            table:number-columns-repeated="4"/>
+        <table:table-row>
+          <table:table-cell table:style-name="LongReference"
+              office:value-type="float" office:value="1.5">
+            <text:p>long-reference cache</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="LongCode"
+              office:value-type="float" office:value="1.5">
+            <text:p>long-code cache</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="LongParent"
+              office:value-type="float" office:value="1.5">
+            <text:p>long-parent cache</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="{long_name}"
+              office:value-type="float" office:value="1.5">
+            <text:p>long-cell-reference cache</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#
+        );
+
+        let workbook = Workbook::open(&ods_bytes(&content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("long-reference cache"));
+        assert_eq!(sheet.formatted(0, 1), Some("long-code cache"));
+        assert_eq!(sheet.formatted(0, 2), Some("long-parent cache"));
+        assert_eq!(sheet.formatted(0, 3), Some("long-cell-reference cache"));
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::LimitExceeded)
+                .map(|loss| loss.occurrences),
+            Some(4)
+        );
+        assert!(!sheet
+            .style_losses()
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::MissingReference));
+        assert!(!sheet
+            .style_losses()
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::UnsupportedProperty));
+    }
+
+    #[test]
+    fn ods_malformed_number_components_do_not_synthesize_formats() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="BadMinDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="many"/>
+    </number:number-style>
+    <number:number-style style:name="BadMinInteger">
+      <number:number number:decimal-places="2" number:min-integer-digits="-1"/>
+    </number:number-style>
+    <number:number-style style:name="BadGrouping">
+      <number:number number:decimal-places="2" number:grouping="sometimes"/>
+    </number:number-style>
+    <number:number-style style:name="BadGrouping">
+      <number:number number:decimal-places="2" number:grouping="still-not-a-boolean"/>
+    </number:number-style>
+    <number:number-style style:name="BadDecimalOrder">
+      <number:number number:decimal-places="2" number:min-decimal-places="3"/>
+    </number:number-style>
+    <number:number-style style:name="HugeDecimals">
+      <number:number number:decimal-places="999999999999999999999999999999999999"/>
+    </number:number-style>
+    <number:number-style style:name="HugeExponent">
+      <number:scientific-number number:decimal-places="2"
+          number:min-exponent-digits="31"/>
+    </number:number-style>
+    <style:style style:name="c0" style:family="table-cell"
+        style:data-style-name="BadMinDecimals"/>
+    <style:style style:name="c1" style:family="table-cell"
+        style:data-style-name="BadMinInteger"/>
+    <style:style style:name="c2" style:family="table-cell"
+        style:data-style-name="BadGrouping"/>
+    <style:style style:name="c3" style:family="table-cell"
+        style:data-style-name="BadDecimalOrder"/>
+    <style:style style:name="c4" style:family="table-cell"
+        style:data-style-name="HugeDecimals"/>
+    <style:style style:name="c5" style:family="table-cell"
+        style:data-style-name="HugeExponent"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Malformed formats">
+        <table:table-row>
+          <table:table-cell table:style-name="c0" office:value-type="float"
+              office:value="1.5"><text:p>cache 0</text:p></table:table-cell>
+          <table:table-cell table:style-name="c1" office:value-type="float"
+              office:value="1.5"><text:p>cache 1</text:p></table:table-cell>
+          <table:table-cell table:style-name="c2" office:value-type="float"
+              office:value="1.5"><text:p>cache 2</text:p></table:table-cell>
+          <table:table-cell table:style-name="c3" office:value-type="float"
+              office:value="1.5"><text:p>cache 3</text:p></table:table-cell>
+          <table:table-cell table:style-name="c4" office:value-type="float"
+              office:value="1.5"><text:p>cache 4</text:p></table:table-cell>
+          <table:table-cell table:style-name="c5" office:value-type="float"
+              office:value="1.5"><text:p>cache 5</text:p></table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        for col in 0..6 {
+            assert_eq!(
+                sheet.formatted(0, col),
+                Some(format!("cache {col}").as_str())
+            );
+        }
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::UnsupportedProperty)
+                .map(|loss| loss.occurrences),
+            Some(5)
+        );
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::LimitExceeded)
+                .map(|loss| loss.occurrences),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn ods_display_changing_unsupported_formats_preserve_producer_cache() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="DisplayFactor">
+      <number:number number:decimal-places="2" number:display-factor="1000"/>
+    </number:number-style>
+    <number:number-style style:name="DecimalReplacement">
+      <number:number number:decimal-places="2" number:decimal-replacement="-"/>
+    </number:number-style>
+    <number:number-style style:name="ExponentInterval">
+      <number:scientific-number number:decimal-places="2"
+          number:exponent-interval="3"/>
+    </number:number-style>
+    <number:number-style style:name="Mapped">
+      <number:number number:decimal-places="2"/>
+      <style:map style:condition="value()&gt;0" style:apply-style-name="Other"/>
+    </number:number-style>
+    <number:time-style style:name="MalformedSeconds">
+      <number:seconds number:decimal-places="many"/>
+    </number:time-style>
+    <number:time-style style:name="HugeSeconds">
+      <number:seconds number:decimal-places="10"/>
+    </number:time-style>
+    <style:style style:name="c0" style:family="table-cell"
+        style:data-style-name="DisplayFactor"/>
+    <style:style style:name="c1" style:family="table-cell"
+        style:data-style-name="DecimalReplacement"/>
+    <style:style style:name="c2" style:family="table-cell"
+        style:data-style-name="ExponentInterval"/>
+    <style:style style:name="c3" style:family="table-cell"
+        style:data-style-name="Mapped"/>
+    <style:style style:name="c4" style:family="table-cell"
+        style:data-style-name="MalformedSeconds"/>
+    <style:style style:name="c5" style:family="table-cell"
+        style:data-style-name="HugeSeconds"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Unsupported formats">
+        <table:table-row>
+          <table:table-cell table:style-name="c0" office:value-type="float"
+              office:value="1.5"><text:p>cache 0</text:p></table:table-cell>
+          <table:table-cell table:style-name="c1" office:value-type="float"
+              office:value="1.5"><text:p>cache 1</text:p></table:table-cell>
+          <table:table-cell table:style-name="c2" office:value-type="float"
+              office:value="1.5"><text:p>cache 2</text:p></table:table-cell>
+          <table:table-cell table:style-name="c3" office:value-type="float"
+              office:value="1.5"><text:p>cache 3</text:p></table:table-cell>
+          <table:table-cell table:style-name="c4" office:value-type="time"
+              office:time-value="PT1.5S"><text:p>cache 4</text:p></table:table-cell>
+          <table:table-cell table:style-name="c5" office:value-type="time"
+              office:time-value="PT1.5S"><text:p>cache 5</text:p></table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        for col in 0..6 {
+            let expected = format!("cache {col}");
+            assert_eq!(sheet.formatted(0, col), Some(expected.as_str()));
+        }
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::UnsupportedProperty)
+                .map(|loss| loss.occurrences),
+            Some(5)
+        );
+        assert_eq!(
+            sheet
+                .style_losses()
+                .iter()
+                .find(|loss| loss.kind == StyleLossKind::LimitExceeded)
+                .map(|loss| loss.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ods_invalid_default_decimal_precision_is_reported_once() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Invalid default">
+        <table:table-row>
+          <table:table-cell table:style-name="c0" office:value-type="float"
+              office:value="1.5"><text:p>cache 0</text:p></table:table-cell>
+          <table:table-cell table:style-name="c1" office:value-type="float"
+              office:value="2.5"><text:p>cache 1</text:p></table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+        let styles_template = r#"
+<office:document-styles
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0">
+  <office:styles>
+    <style:default-style style:family="table-cell">
+      <style:table-cell-properties style:decimal-places="DEFAULT_PRECISION"/>
+    </style:default-style>
+    <number:number-style style:name="N0"><number:number/></number:number-style>
+    <number:number-style style:name="N1"><number:number/></number:number-style>
+    <style:style style:name="c0" style:family="table-cell" style:data-style-name="N0"/>
+    <style:style style:name="c1" style:family="table-cell" style:data-style-name="N1"/>
+  </office:styles>
+</office:document-styles>
+"#;
+
+        for (precision, expected_kind) in [
+            ("many", StyleLossKind::UnsupportedProperty),
+            ("31", StyleLossKind::LimitExceeded),
+        ] {
+            let styles = styles_template.replace("DEFAULT_PRECISION", precision);
+            let workbook = Workbook::open(&ods_bytes_with_styles(content, &styles)).expect("ods");
+            let sheet = &workbook.sheets[0];
+            assert_eq!(sheet.formatted(0, 0), Some("cache 0"));
+            assert_eq!(sheet.formatted(0, 1), Some("cache 1"));
+            assert_eq!(sheet.style_losses().len(), 1);
+            assert_eq!(sheet.style_losses()[0].kind, expected_kind);
+            assert_eq!(sheet.style_losses()[0].occurrences, 1);
         }
     }
 

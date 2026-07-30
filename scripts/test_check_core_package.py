@@ -161,11 +161,20 @@ class CorePackageGateTests(unittest.TestCase):
 
     def test_rejects_host_oracle_identity_files(self) -> None:
         names = (
+            "check-ooxml-row-oracle.py",
+            "generate-ooxml-row-oracle.py",
+            "render_parity_geometry_gate.py",
             "render-oracle-host-profile.xcu",
             "render-oracle-host-requirements.txt",
             "render-oracle-host-tools-lock.json",
             "render-oracle-host-tools.py",
+            "smoke-render-oracle-runtime.py",
+            "summarize-render-oracle-failure.py",
+            "test_check_ooxml_row_oracle.py",
+            "test_generate_ooxml_row_oracle.py",
+            "test_render_oracle_runtime_smoke.py",
             "test_render_oracle_host_tools.py",
+            "test_summarize_render_oracle_failure.py",
         )
         for name in names:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:

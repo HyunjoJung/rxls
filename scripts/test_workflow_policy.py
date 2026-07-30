@@ -1216,8 +1216,23 @@ steps:
                 1,
             ),
             "manifest_reassigned": original.replace(
-                "RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json",
-                "RXLS_TEST_FONT_PACK_MANIFEST: local/unverified/manifest.json",
+                "RXLS_TEST_FONT_PACK_MANIFEST: "
+                "${{ github.workspace }}/local/render-fonts/pack/manifest.json",
+                "RXLS_TEST_FONT_PACK_MANIFEST: "
+                "${{ github.workspace }}/local/unverified/manifest.json",
+                1,
+            ),
+            "manifest_made_relative": original.replace(
+                "RXLS_TEST_FONT_PACK_MANIFEST: "
+                "${{ github.workspace }}/local/render-fonts/pack/manifest.json",
+                "RXLS_TEST_FONT_PACK_MANIFEST: "
+                "local/render-fonts/pack/manifest.json",
+                1,
+            ),
+            "workspace_guard_removed": original.replace(
+                '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = '
+                '"$GITHUB_WORKSPACE/"* ]]\n',
+                "",
                 1,
             ),
             "family_reassigned": original.replace(

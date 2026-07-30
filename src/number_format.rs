@@ -1145,7 +1145,11 @@ fn adjacent_field(atoms: &[Atom], mut index: isize, step: isize) -> Option<char>
                 return Some(ch.to_ascii_lowercase());
             }
             Atom::Elapsed(ch, _) => return Some(*ch),
-            Atom::Literal(_) | Atom::At => return None,
+            // Escaped or quoted separators remain literals in the output but
+            // do not break the h…m…s context that distinguishes minutes from
+            // months.
+            Atom::Literal(_) => {}
+            Atom::At => return None,
             Atom::Char(_) => {}
         }
         index += step;
@@ -1345,6 +1349,13 @@ mod tests {
             "2024-03-15 12:00:00"
         );
         assert_eq!(number(45366.5, "m/d/yy h:mm AM/PM"), "3/15/24 12:00 PM");
+        assert_eq!(
+            number(
+                (12.0 * 3_600.0 + 34.0 * 60.0 + 56.0) / 86_400.0,
+                r"hh\:mm\:ss"
+            ),
+            "12:34:56"
+        );
         assert_eq!(number(1.5, "[h]:mm:ss"), "36:00:00");
         assert_eq!(number(1.0 / 86400.0 * 1.125, "[s].000"), "1.125");
     }
