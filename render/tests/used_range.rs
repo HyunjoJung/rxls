@@ -162,8 +162,11 @@ fn empty_used_selection_is_one_pixel_but_explicit_ranges_are_unchanged() {
         },
     )
     .unwrap();
-    assert_eq!(explicit_print.pages[0].scene.width, Fixed::from_pixels(64));
-    assert_eq!(explicit_print.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(explicit_print.pages[0].scene.width, Fixed::from_raw(65_562));
+    assert_eq!(
+        explicit_print.pages[0].scene.height,
+        Fixed::from_raw(20_512)
+    );
 }
 
 #[test]
@@ -199,7 +202,7 @@ fn fully_hidden_selected_rows_keep_a_nonempty_canvas_without_painting_content() 
         },
     )
     .unwrap();
-    assert_eq!(print.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(print.pages[0].scene.width, Fixed::from_raw(65_562));
     assert_eq!(print.pages[0].scene.height, Fixed::from_pixels(1));
     assert!(print.pages[0].scene.nodes.is_empty());
 }
@@ -238,7 +241,7 @@ fn fully_hidden_selected_columns_keep_a_nonempty_canvas_and_honor_limits() {
     )
     .unwrap();
     assert_eq!(print.pages[0].scene.width, Fixed::from_pixels(1));
-    assert_eq!(print.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(print.pages[0].scene.height, Fixed::from_raw(20_512));
     assert!(print.pages[0].scene.nodes.is_empty());
 
     let mut hidden_both = Workbook::new();

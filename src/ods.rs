@@ -853,6 +853,9 @@ struct CellMetadata<'a> {
     validation: Option<&'a DataValidation>,
     images: &'a [PendingImage],
     style: Option<&'a CellStyle>,
+    row_formats: &'a BTreeMap<u32, CellStyle>,
+    col_formats: &'a BTreeMap<u16, CellStyle>,
+    default_format: Option<&'a CellStyle>,
 }
 
 fn read_cell_attrs(e: &quick_xml::events::BytesStart<'_>) -> CellAttrs {
@@ -1626,9 +1629,31 @@ fn number_component(element: &[u8], e: &quick_xml::events::BytesStart<'_>) -> Op
     })
 }
 
+fn append_ods_number_literal(
+    code: &mut String,
+    literal: &str,
+    activate_percent: bool,
+    active_percent: &mut bool,
+) {
+    // The shared formatter consumes Excel-style format codes. Escape every ODF
+    // literal character so letters such as `d`, `m`, and `s` cannot be
+    // reinterpreted as date/time fields and punctuation cannot become a
+    // format directive. A percentage style is the exception: its first
+    // explicit percent glyph must remain an active scaling token.
+    for character in literal.chars() {
+        if activate_percent && character == '%' && !*active_percent {
+            code.push('%');
+            *active_percent = true;
+        } else {
+            code.push('\\');
+            code.push(character);
+        }
+    }
+}
+
 fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
     let mut reader = Reader::from_str(xml);
-    let mut current: Option<(String, OdsNumberStyleKind, String)> = None;
+    let mut current: Option<(String, OdsNumberStyleKind, String, bool)> = None;
     let mut text_depth = 0usize;
     let mut text = String::new();
     loop {
@@ -1648,9 +1673,9 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                 };
                 if let (Some(kind), Some(name)) = (kind, attr(&e, b"name")) {
                     if name.len() <= MAX_ODS_STYLE_NAME {
-                        current = Some((name, kind, String::new()));
+                        current = Some((name, kind, String::new(), false));
                     }
-                } else if let Some((_, kind, code)) = current.as_mut() {
+                } else if let Some((_, kind, code, _)) = current.as_mut() {
                     match element {
                         b"number" => code.push_str(&number_pattern(&e, &mut definitions.losses)),
                         b"scientific-number" => {
@@ -1692,8 +1717,13 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                 let qname = e.name();
                 let element = local(qname.as_ref());
                 if matches!(element, b"currency-symbol" | b"text") && text_depth > 0 {
-                    if let Some((_, _, code)) = current.as_mut() {
-                        code.push_str(&text);
+                    if let Some((_, kind, code, active_percent)) = current.as_mut() {
+                        append_ods_number_literal(
+                            code,
+                            &text,
+                            *kind == OdsNumberStyleKind::Percentage,
+                            active_percent,
+                        );
                     }
                     text.clear();
                     text_depth = 0;
@@ -1711,8 +1741,8 @@ fn read_ods_number_formats(xml: &str, definitions: &mut OdsStyleDefinitions) {
                     _ => None,
                 };
                 if closes.is_some() {
-                    if let Some((name, kind, mut code)) = current.take() {
-                        if kind == OdsNumberStyleKind::Percentage && !code.contains('%') {
+                    if let Some((name, kind, mut code, active_percent)) = current.take() {
+                        if kind == OdsNumberStyleKind::Percentage && !active_percent {
                             code.push('%');
                         }
                         if kind == OdsNumberStyleKind::Boolean && code.is_empty() {
@@ -3298,13 +3328,35 @@ fn ods_cell_base_font(
     row: u32,
     col: u16,
 ) -> Font {
-    style_name
-        .and_then(|name| styles.cell.get(name))
-        .and_then(|style| style.to_cell_style().font)
-        .or_else(|| row_formats.get(&row).and_then(|style| style.font.clone()))
-        .or_else(|| col_formats.get(&col).and_then(|style| style.font.clone()))
-        .or_else(|| default_format.and_then(|style| style.font.clone()))
+    // ODF 1.2 §19.615 applies a row/column default only when a cell has no
+    // explicit style, and the row default takes precedence over the column
+    // default. Select the complete style before reading one component.
+    if let Some(style) = style_name.and_then(|name| styles.cell.get(name)) {
+        return style.to_cell_style().font.unwrap_or_default();
+    }
+    row_formats
+        .get(&row)
+        .or_else(|| col_formats.get(&col))
+        .or(default_format)
+        .and_then(|style| style.font.clone())
         .unwrap_or_default()
+}
+
+fn ods_cell_number_format<'a>(
+    explicit: Option<&'a CellStyle>,
+    row_formats: &'a BTreeMap<u32, CellStyle>,
+    col_formats: &'a BTreeMap<u16, CellStyle>,
+    default_format: Option<&'a CellStyle>,
+    row: u32,
+    col: u16,
+) -> Option<&'a str> {
+    // Keep the same whole-style precedence required by ODF 1.2 §19.615; a
+    // component missing from the selected style has General semantics.
+    explicit
+        .or_else(|| row_formats.get(&row))
+        .or_else(|| col_formats.get(&col))
+        .or(default_format)
+        .and_then(|style| style.num_fmt.as_deref())
 }
 
 fn ods_text_font(props: Option<&OdsStyleProps>, mut base: Font) -> Font {
@@ -3773,6 +3825,12 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         print_metadata: table_print_metadata(&e, &name, styles),
                         name,
                         is_worksheet: true,
+                        // Calc initializes every ODS worksheet column to its
+                        // 64-point application width before applying explicit
+                        // table-column styles.
+                        imported_default_column_axis_measure: Some(ImportedAxisMeasure::Twips(
+                            1_280,
+                        )),
                         style_fidelity,
                         default_format: ods_table_default_cell_style(
                             styles,
@@ -3825,6 +3883,9 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                             validation,
                             images: &[],
                             style: resolved_style.as_ref(),
+                            row_formats: &row_formats,
+                            col_formats: &col_formats,
+                            default_format: default_format.as_ref(),
                         },
                     );
                 }
@@ -4099,6 +4160,9 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                                 validation,
                                 images: &cell_images,
                                 style: resolved_style.as_ref(),
+                                row_formats: &row_formats,
+                                col_formats: &col_formats,
+                                default_format: default_format.as_ref(),
                             },
                         );
                         if cell_saw_span && !cell_runs.is_empty() {
@@ -4281,6 +4345,11 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                     sheets.push(Sheet {
                         name: std::mem::take(&mut name),
                         is_worksheet: true,
+                        // Preserve Calc's application default in its native
+                        // integer-twip domain for undeclared ODS columns.
+                        imported_default_column_axis_measure: Some(ImportedAxisMeasure::Twips(
+                            1_280,
+                        )),
                         style_fidelity,
                         cells: std::mem::take(&mut cells),
                         default_format: default_format.take(),
@@ -4375,7 +4444,7 @@ fn finish_cell(
     metadata: CellMetadata<'_>,
 ) {
     let rep = a.col_rep.min(u32::from(u16::MAX));
-    if let Some((value, disp)) = build_cell(a, text) {
+    if let Some((value, fallback_display)) = build_cell(a, text) {
         // A merged cell spans col_span × row_span; record the range.
         if a.col_span > 1 || a.row_span > 1 {
             let r1 = row.saturating_add(a.row_span.saturating_sub(1));
@@ -4387,7 +4456,18 @@ fn finish_cell(
         // column cursor). Each clone costs its text length plus a per-cell charge,
         // so even empty-text valued cells consume budget and cannot amplify.
         for k in 0..rep {
-            let cost = disp
+            let out_col = col.saturating_add(k as u16);
+            let display = ods_cell_number_format(
+                metadata.style,
+                metadata.row_formats,
+                metadata.col_formats,
+                metadata.default_format,
+                row,
+                out_col,
+            )
+            .and_then(|format| render_ods_number_format(&value, format))
+            .unwrap_or_else(|| fallback_display.clone());
+            let cost = display
                 .len()
                 .saturating_add(metadata.hyperlink.map(str::len).unwrap_or(0))
                 .saturating_add(CELL_COST);
@@ -4396,12 +4476,11 @@ fn finish_cell(
                 break;
             }
             *sink.budget -= cost;
-            let out_col = col.saturating_add(k as u16);
             sink.cells.push(CellEntry {
                 row,
                 col: out_col,
                 value: value.clone(),
-                text: disp.clone(),
+                text: display,
                 style: metadata.style.cloned(),
                 xlsx_font_size_pt: None,
                 hyperlink: None,
@@ -4530,12 +4609,19 @@ fn data_validation_cost(validation: &DataValidation) -> usize {
 fn build_cell(a: &CellAttrs, text: &str) -> Option<(Cell, String)> {
     let formula = a.formula.as_ref().filter(|formula| !formula.is_empty());
     let cached = match a.vtype.as_str() {
-        "float" | "currency" => {
+        "float" => {
+            let f: f64 = a.val.as_deref().and_then(|v| v.parse().ok())?;
+            // A float without a data style has General semantics. Calc derives
+            // its display from the typed office:value instead of treating the
+            // serialized text:p cache as a fixed decimal scale.
+            Some((Cell::Number(f), crate::format_number(f)))
+        }
+        "currency" => {
             let f: f64 = a.val.as_deref().and_then(|v| v.parse().ok())?;
             Some((
                 Cell::Number(f),
                 if text.is_empty() {
-                    num_text(f)
+                    crate::format_number(f)
                 } else {
                     text.to_string()
                 },
@@ -4586,20 +4672,32 @@ fn build_cell(a: &CellAttrs, text: &str) -> Option<(Cell, String)> {
         }
     };
 
-    let Some(formula) = formula else {
-        return cached;
+    let (value, display) = if let Some(formula) = formula {
+        let (cached, display) = cached.unwrap_or_else(|| {
+            let cached = Cell::Text(text.to_string());
+            (cached, text.to_string())
+        });
+        (
+            Cell::Formula {
+                formula: formula.clone(),
+                cached: Box::new(cached),
+            },
+            display,
+        )
+    } else {
+        cached?
     };
-    let (cached, display) = cached.unwrap_or_else(|| {
-        let cached = Cell::Text(text.to_string());
-        (cached, text.to_string())
-    });
-    Some((
-        Cell::Formula {
-            formula: formula.clone(),
-            cached: Box::new(cached),
-        },
-        display,
-    ))
+    Some((value, display))
+}
+
+fn render_ods_number_format(value: &Cell, format: &str) -> Option<String> {
+    match value {
+        Cell::Number(number) | Cell::Date(number) => {
+            Some(crate::format::render_format(*number, format, false))
+        }
+        Cell::Formula { cached, .. } => render_ods_number_format(cached, format),
+        Cell::Text(_) | Cell::Bool(_) | Cell::Error(_) => None,
+    }
 }
 
 fn normalize_formula(formula: String) -> String {
@@ -4644,14 +4742,6 @@ fn parse_iso_duration(s: &str) -> Option<f64> {
         }
     }
     Some((h * 3600.0 + m * 60.0 + sec) / 86400.0)
-}
-
-fn num_text(f: f64) -> String {
-    if f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{}", f as i64)
-    } else {
-        format!("{f}")
-    }
 }
 
 /// Convert an ODF `office:date-value` (`YYYY-MM-DD` or `…THH:MM:SS`) to the Excel
@@ -4798,6 +4888,72 @@ mod tests {
     }
 
     #[test]
+    fn ods_rich_span_base_font_uses_whole_cell_style_precedence() {
+        let content = r##"
+<office:document-content
+    xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <style:style style:name="column_font" style:family="table-cell">
+      <style:text-properties fo:font-family="ColumnFont"/>
+    </style:style>
+    <style:style style:name="fill_only" style:family="table-cell">
+      <style:table-cell-properties fo:background-color="#ffeecc"/>
+    </style:style>
+    <style:style style:name="italic" style:family="text">
+      <style:text-properties fo:font-style="italic"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Font precedence">
+        <table:table-column table:default-cell-style-name="column_font"
+            table:number-columns-repeated="2"/>
+        <table:table-row>
+          <table:table-cell office:value-type="string">
+            <text:p><text:span text:style-name="italic">control</text:span></text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="fill_only" office:value-type="string">
+            <text:p><text:span text:style-name="italic">explicit</text:span></text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="fill_only">
+          <table:table-cell office:value-type="string">
+            <text:p><text:span text:style-name="italic">row</text:span></text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"##;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        let control = sheet.rich_text_runs(0, 0).expect("column font control");
+        let explicit = sheet.rich_text_runs(0, 1).expect("explicit cell style");
+        let row = sheet.rich_text_runs(1, 0).expect("row default cell style");
+
+        assert_eq!(control[0].font.name.as_deref(), Some("ColumnFont"));
+        assert_eq!(explicit[0].font.name, None);
+        assert_eq!(row[0].font.name, None);
+        assert!(control[0].font.italic);
+        assert!(explicit[0].font.italic);
+        assert!(row[0].font.italic);
+        assert_eq!(
+            sheet.resolved_cell_style(0, 1).and_then(|style| style.font),
+            None
+        );
+        assert_eq!(
+            sheet.resolved_cell_style(1, 0).and_then(|style| style.font),
+            None
+        );
+    }
+
+    #[test]
     fn ods_table_protection_surfaces_public_metadata() {
         let content = r#"<?xml version="1.0"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Locked" table:protected="true"></table:table><table:table table:name="LockedEmpty" table:protected="true"/><table:table table:name="Plain" table:protected="false"/></office:spreadsheet></office:body></office:document-content>"#;
         let wb = Workbook::open(&ods_bytes(content)).unwrap();
@@ -4845,6 +5001,256 @@ mod tests {
         assert_eq!(sheet.formatted(0, 1), Some("12:00:00"));
         assert_eq!(range.formatted_abs(0, 1), Some("12:00:00"));
         assert_eq!(sheet.formatted(0, 2), Some("quarter"));
+    }
+
+    #[test]
+    fn ods_typed_general_and_explicit_number_styles_drive_display_text() {
+        let content = r##"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="FourDecimals">
+      <number:number number:decimal-places="4" number:min-decimal-places="4"/>
+    </number:number-style>
+    <number:percentage-style style:name="OneDecimalPercent">
+      <number:number number:decimal-places="1" number:min-decimal-places="1"/>
+      <number:text>%</number:text>
+    </number:percentage-style>
+    <number:currency-style style:name="TwoDecimalCurrency">
+      <number:currency-symbol>$</number:currency-symbol>
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:currency-style>
+    <number:date-style style:name="IsoDate">
+      <number:year number:style="long"/>
+      <number:text>-</number:text>
+      <number:month number:style="long"/>
+      <number:text>-</number:text>
+      <number:day number:style="long"/>
+    </number:date-style>
+    <style:style style:name="ce_four" style:family="table-cell"
+        style:data-style-name="FourDecimals"/>
+    <style:style style:name="ce_percent" style:family="table-cell"
+        style:data-style-name="OneDecimalPercent"/>
+    <style:style style:name="ce_currency" style:family="table-cell"
+        style:data-style-name="TwoDecimalCurrency"/>
+    <style:style style:name="ce_date" style:family="table-cell"
+        style:data-style-name="IsoDate"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Typed display">
+        <table:table-row>
+          <table:table-cell office:value-type="float" office:value="0.2900">
+            <text:p>0.2900</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_four"
+              office:value-type="float" office:value="0.2900">
+            <text:p>0.29</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_percent"
+              office:value-type="percentage" office:value="0.29">
+            <text:p>29%</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_currency"
+              office:value-type="currency" office:value="1.25"
+              office:currency="USD">
+            <text:p>USD 1.25</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_date"
+              office:value-type="date" office:date-value="2024-03-15">
+            <text:p>15/03/2024</text:p>
+          </table:table-cell>
+          <table:table-cell table:style-name="ce_four"
+              table:formula="of:=SUM([.A1])"
+              office:value-type="float" office:value="0.2900">
+            <text:p>0.29</text:p>
+          </table:table-cell>
+          <table:table-cell table:formula="of:=SUM([.A1])"
+              office:value-type="float" office:value="0.2900">
+            <text:p>0.2900</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_four">
+          <table:table-cell office:value-type="float" office:value="0.2900">
+            <text:p>0.29</text:p>
+          </table:table-cell>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"##;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(sheet.formatted(0, 0), Some("0.29"));
+        assert_eq!(sheet.formatted(0, 1), Some("0.2900"));
+        assert_eq!(sheet.formatted(0, 2), Some("29.0%"));
+        assert_eq!(sheet.formatted(0, 3), Some("$1.25"));
+        assert_eq!(sheet.formatted(0, 4), Some("2024-03-15"));
+        assert_eq!(sheet.formatted(0, 5), Some("0.2900"));
+        assert_eq!(sheet.formatted(0, 6), Some("0.29"));
+        assert_eq!(sheet.formatted(1, 0), Some("0.2900"));
+
+        for col in [5, 6] {
+            match sheet.cell(0, col).expect("formula cell") {
+                Cell::Formula { formula, cached } => {
+                    assert_eq!(formula, "SUM([.A1])");
+                    assert_eq!(cached.as_ref(), &Cell::Number(0.29));
+                }
+                other => panic!("expected formula cell, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ods_repeated_cells_resolve_each_output_columns_default_number_style() {
+        let content = r##"
+<office:document-content
+    xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:number-style style:name="TwoDecimals">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:number-style>
+    <number:percentage-style style:name="OneDecimalPercent">
+      <number:number number:decimal-places="1" number:min-decimal-places="1"/>
+    </number:percentage-style>
+    <number:number-style style:name="Integer">
+      <number:number number:decimal-places="0"/>
+    </number:number-style>
+    <number:number-style style:name="FourDecimals">
+      <number:number number:decimal-places="4" number:min-decimal-places="4"/>
+    </number:number-style>
+    <style:style style:name="ce_two" style:family="table-cell"
+        style:data-style-name="TwoDecimals"/>
+    <style:style style:name="ce_percent" style:family="table-cell"
+        style:data-style-name="OneDecimalPercent"/>
+    <style:style style:name="ce_integer" style:family="table-cell"
+        style:data-style-name="Integer"/>
+    <style:style style:name="ce_four" style:family="table-cell"
+        style:data-style-name="FourDecimals"/>
+    <style:style style:name="ce_fill" style:family="table-cell">
+      <style:table-cell-properties fo:background-color="#ffeecc"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Repeated formats">
+        <table:table-column table:default-cell-style-name="ce_two"/>
+        <table:table-column table:default-cell-style-name="ce_percent"/>
+        <table:table-column table:default-cell-style-name="ce_integer"/>
+        <table:table-row>
+          <table:table-cell table:number-columns-repeated="3"
+              office:value-type="float" office:value="0.125"/>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:number-columns-repeated="3"
+              office:value-type="float" office:value="0.125">
+            <text:p>stale serialized display</text:p>
+          </table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="ce_four"
+              table:number-columns-repeated="3"
+              office:value-type="float" office:value="0.125"/>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="ce_fill"
+              table:number-columns-repeated="3"
+              office:value-type="float" office:value="0.125"/>
+        </table:table-row>
+        <table:table-row table:default-cell-style-name="ce_fill">
+          <table:table-cell table:number-columns-repeated="3"
+              office:value-type="float" office:value="0.125"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"##;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+
+        for row in [0, 1] {
+            assert_eq!(sheet.formatted(row, 0), Some("0.13"));
+            assert_eq!(sheet.formatted(row, 1), Some("12.5%"));
+            assert_eq!(sheet.formatted(row, 2), Some("0"));
+            for col in 0..3 {
+                assert_eq!(sheet.cell(row, col), Some(&Cell::Number(0.125)));
+            }
+        }
+        for col in 0..3 {
+            assert_eq!(sheet.formatted(2, col), Some("0.1250"));
+            assert_eq!(sheet.formatted(3, col), Some("0.125"));
+            assert_eq!(sheet.formatted(4, col), Some("0.125"));
+            for row in [3, 4] {
+                assert_eq!(
+                    sheet
+                        .resolved_cell_style(row, col)
+                        .and_then(|style| style.num_fmt),
+                    None
+                );
+            }
+            assert_eq!(
+                sheet
+                    .resolved_cell_style(0, col)
+                    .and_then(|style| style.num_fmt),
+                Some(["0.00", "0.0%", "0"][usize::from(col)].to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn ods_number_style_text_and_currency_symbols_remain_literals() {
+        let content = r#"
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+    xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:automatic-styles>
+    <number:currency-style style:name="Usd">
+      <number:currency-symbol>USD </number:currency-symbol>
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+    </number:currency-style>
+    <number:number-style style:name="Mass">
+      <number:number number:decimal-places="2" number:min-decimal-places="2"/>
+      <number:text> m/d;s\y"h</number:text>
+    </number:number-style>
+    <style:style style:name="usd" style:family="table-cell" style:data-style-name="Usd"/>
+    <style:style style:name="mass" style:family="table-cell" style:data-style-name="Mass"/>
+  </office:automatic-styles>
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="Literals">
+        <table:table-row>
+          <table:table-cell table:style-name="usd"
+              office:value-type="currency" office:value="1.25" office:currency="USD"/>
+          <table:table-cell table:style-name="mass"
+              office:value-type="float" office:value="1.25"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"#;
+
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(sheet.formatted(0, 0), Some("USD 1.25"));
+        assert_eq!(sheet.formatted(0, 1), Some(r#"1.25 m/d;s\y"h"#));
     }
 
     #[test]
@@ -5598,7 +6004,7 @@ mod tests {
 
         let inherited = sheet.resolved_cell_style(0, 0).expect("row style");
         assert!(inherited.font.as_ref().is_some_and(|font| font.bold));
-        assert_eq!(inherited.num_fmt.as_deref(), Some("₩#,##0.00"));
+        assert_eq!(inherited.num_fmt.as_deref(), Some(r"\₩#,##0.00"));
         assert_eq!(inherited.fill, Some(Color::rgb(0xff, 0xee, 0xcc)));
 
         let explicit = sheet.cell_style(0, 1).expect("child style");
@@ -5607,7 +6013,7 @@ mod tests {
         assert!(font.bold);
         assert!(font.italic);
         assert_eq!(font.color, Some(Color::rgb(0x22, 0x44, 0xaa)));
-        assert_eq!(explicit.num_fmt.as_deref(), Some("₩#,##0.00"));
+        assert_eq!(explicit.num_fmt.as_deref(), Some(r"\₩#,##0.00"));
         assert_eq!(
             explicit.border.as_ref().map(|border| border.left),
             Some(BorderStyle::Thin)

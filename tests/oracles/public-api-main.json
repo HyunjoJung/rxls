@@ -383,6 +383,37 @@
       ]
     },
     {
+      "declaration": "#[non_exhaustive]pub enum ChartFrameFill { Automatic, NoFill, Solid(Color), }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartFrameFill",
+      "trait_implementations": [
+        "impl Clone for ChartFrameFill",
+        "impl Copy for ChartFrameFill",
+        "impl Debug for ChartFrameFill",
+        "impl Default for ChartFrameFill",
+        "impl Eq for ChartFrameFill",
+        "impl Hash for ChartFrameFill",
+        "impl PartialEq for ChartFrameFill",
+        "impl StructuralPartialEq for ChartFrameFill"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartFrameStyleLossKind { UnsupportedPaint, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::ChartFrameStyleLossKind",
+      "trait_implementations": [
+        "impl Clone for ChartFrameStyleLossKind",
+        "impl Copy for ChartFrameStyleLossKind",
+        "impl Debug for ChartFrameStyleLossKind",
+        "impl Eq for ChartFrameStyleLossKind",
+        "impl Hash for ChartFrameStyleLossKind",
+        "impl PartialEq for ChartFrameStyleLossKind",
+        "impl StructuralPartialEq for ChartFrameStyleLossKind"
+      ]
+    },
+    {
       "declaration": "pub enum ChartKind { Bar, Line, Pie, Scatter, Area, Doughnut, Radar, Bubble, }",
       "inherent_items": [],
       "kind": "enum",
@@ -427,7 +458,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub struct ChartSeriesStyle { pub marker: ChartMarkerSymbol, pub marker_size: Option<u8>, pub line_visible: bool, pub line_color: Option<Color>, pub losses: Vec<ChartSeriesStyleLossKind>, }",
+      "declaration": "#[non_exhaustive]pub struct ChartSeriesStyle { pub marker: ChartMarkerSymbol, pub marker_size: Option<u8>, pub line_visible: bool, pub line_color: Option<Color>, pub line_width_emu: Option<u32>, pub losses: Vec<ChartSeriesStyleLossKind>, }",
       "inherent_items": [],
       "kind": "struct",
       "path": "rxls::ChartSeriesStyle",
@@ -441,7 +472,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub enum ChartSeriesStyleLossKind { UnsupportedMarkerSymbol, InvalidMarkerSize, UnsupportedLinePaint, }",
+      "declaration": "#[non_exhaustive]pub enum ChartSeriesStyleLossKind { UnsupportedMarkerSymbol, InvalidMarkerSize, UnsupportedLinePaint, InvalidLineWidth, }",
       "inherent_items": [],
       "kind": "enum",
       "path": "rxls::ChartSeriesStyleLossKind",
@@ -772,7 +803,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub struct DrawingMetadata { pub kind: DrawingObjectKind, pub object_index: usize, pub from_cell: Option<(u32, u16)>, pub to_cell: Option<(u32, u16)>, pub from_offset_emu: Option<(i64, i64)>, pub to_offset_emu: Option<(i64, i64)>, pub absolute_size_emu: Option<(u64, u64)>, pub crop: Option<DrawingCrop>, pub rotation_mdeg: Option<i32>, pub z_order: Option<i32>, pub alt_text: Option<String>, pub name: Option<String>, pub behavior: DrawingAnchorBehavior, pub chart_palette: Vec<Color>, pub chart_series_caches: Vec<ChartSeriesCache>, pub chart_series_styles: Vec<ChartSeriesStyle>, pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>, pub chart_bar_direction: ChartBarDirection, }",
+      "declaration": "#[non_exhaustive]pub struct DrawingMetadata { pub kind: DrawingObjectKind, pub object_index: usize, pub from_cell: Option<(u32, u16)>, pub to_cell: Option<(u32, u16)>, pub from_offset_emu: Option<(i64, i64)>, pub to_offset_emu: Option<(i64, i64)>, pub absolute_size_emu: Option<(u64, u64)>, pub crop: Option<DrawingCrop>, pub rotation_mdeg: Option<i32>, pub z_order: Option<i32>, pub alt_text: Option<String>, pub name: Option<String>, pub behavior: DrawingAnchorBehavior, pub chart_palette: Vec<Color>, pub chart_series_caches: Vec<ChartSeriesCache>, pub chart_series_styles: Vec<ChartSeriesStyle>, pub chart_frame_fill: ChartFrameFill, pub chart_frame_style_losses: Vec<ChartFrameStyleLossKind>, pub chart_category_major_gridlines: Option<bool>, pub chart_value_major_gridlines: Option<bool>, pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>, pub chart_bar_direction: ChartBarDirection, }",
       "inherent_items": [],
       "kind": "struct",
       "path": "rxls::DrawingMetadata",
@@ -2438,13 +2469,13 @@
   "summary": {
     "by_kind": {
       "constant": 3,
-      "enum": 39,
+      "enum": 41,
       "fn": 27,
       "module": 1,
       "struct": 61,
       "trait": 2,
       "type": 6
     },
-    "items": 139
+    "items": 141
   }
 }

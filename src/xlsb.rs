@@ -2015,6 +2015,7 @@ fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
     if row > MAX_XLSB_ROW_INDEX {
         return;
     }
+    // [MS-XLSB] §2.4.770: miyRw is authoritative only when fUnsynced is set.
     if (1..=MAX_XLSB_ROW_HEIGHT_TWIPS).contains(&height_twips) && flags & (1 << 13) != 0 {
         metadata
             .row_heights
@@ -2119,9 +2120,10 @@ fn apply_ws_fmt_info(p: &[u8], metadata: &mut SheetReadMetadata) {
         metadata.default_col_width = Some(default_width_256 as f32 / 256.0);
         metadata.default_col_width_256 = Some(default_width_256);
     }
-    // [MS-XLSB] BrtWsFmtInfo: miyDefRwHeight is authoritative only when
-    // fUnsynced is set. Otherwise the application default remains in force.
-    if flags & 0x0001 != 0 && default_row_height_twips > 0 {
+    // [MS-XLSB] §2.4.873: miyDefRwHeight is authoritative only when
+    // fUnsynced is set. Unlike BrtRowHdr.miyRw, its unsigned two-byte field
+    // has no 8192-twip ceiling and can retain an explicit zero.
+    if flags & 0x0001 != 0 {
         metadata.default_row_height = Some(f32::from(default_row_height_twips) / 20.0);
         metadata.imported_default_row_axis_measure = Some(ImportedAxisMeasure::Twips(u32::from(
             default_row_height_twips,
@@ -2639,7 +2641,12 @@ fn read_sheet_drawings(
                     add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
                     continue;
                 };
-                let has_unsupported_chart_content = !parsed.unsupported_reasons.is_empty();
+                let has_unsupported_chart_content = !parsed.unsupported_reasons.is_empty()
+                    || !parsed.frame_style_losses.is_empty()
+                    || parsed
+                        .series_styles
+                        .iter()
+                        .any(|style| !style.losses.is_empty());
                 let index = charts.len();
                 charts.push(parsed.chart);
                 let mut sidecar = drawing.metadata;
@@ -2647,6 +2654,11 @@ fn read_sheet_drawings(
                 sidecar.object_index = index;
                 sidecar.chart_palette = theme.chart_palette();
                 sidecar.chart_series_caches = parsed.series_caches;
+                sidecar.chart_series_styles = parsed.series_styles;
+                sidecar.chart_frame_fill = parsed.frame_fill;
+                sidecar.chart_frame_style_losses = parsed.frame_style_losses;
+                sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
+                sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;
                 metadata.push(sidecar);
@@ -4173,11 +4185,14 @@ mod tests {
 
     #[test]
     fn xlsb_ws_format_info_distinguishes_column_and_row_default_provenance() {
-        let parse = |default_width_256: u32, base_characters: u16, flags: u16| {
+        let parse = |default_width_256: u32,
+                     base_characters: u16,
+                     default_row_height_twips: u16,
+                     flags: u16| {
             let mut payload = Vec::new();
             payload.extend_from_slice(&default_width_256.to_le_bytes());
             payload.extend_from_slice(&base_characters.to_le_bytes());
-            payload.extend_from_slice(&300u16.to_le_bytes());
+            payload.extend_from_slice(&default_row_height_twips.to_le_bytes());
             payload.extend_from_slice(&flags.to_le_bytes());
             payload.extend_from_slice(&[0, 0]); // row/column outline levels
             let mut budget = crate::MAX_TEXT_BYTES;
@@ -4196,32 +4211,58 @@ mod tests {
             .3
         };
 
-        let explicit = parse(2_158, 42, 0);
-        assert_eq!(explicit.default_col_width, Some(2_158.0 / 256.0));
-        assert_eq!(explicit.default_col_width_256, Some(2_158));
-        assert_eq!(explicit.ooxml_base_col_width, None);
-        assert_eq!(
-            explicit.default_row_height, None,
-            "miyDefRwHeight is ignored while fUnsynced is clear"
-        );
+        let implicit = parse(2_158, 42, 300, 0);
+        assert_eq!(implicit.default_col_width, Some(2_158.0 / 256.0));
+        assert_eq!(implicit.default_col_width_256, Some(2_158));
+        assert_eq!(implicit.ooxml_base_col_width, None);
+        assert_eq!(implicit.default_row_height, None);
+        assert_eq!(implicit.imported_default_row_axis_measure, None);
 
-        let base = parse(u32::MAX, 8, 0);
+        let base = parse(u32::MAX, 8, 300, 0);
         assert_eq!(base.default_col_width, None);
         assert_eq!(base.default_col_width_256, None);
         assert_eq!(base.ooxml_base_col_width, Some(8));
 
-        let invalid_base = parse(u32::MAX, 256, 0);
+        let invalid_base = parse(u32::MAX, 256, 300, 0);
         assert_eq!(invalid_base.default_col_width, None);
         assert_eq!(invalid_base.ooxml_base_col_width, None);
 
-        let custom_row = parse(u32::MAX, 8, 0x0001);
+        let custom_row = parse(u32::MAX, 8, 300, 0x0001);
         assert_eq!(custom_row.default_row_height, Some(15.0));
         assert_eq!(
             custom_row.imported_default_row_axis_measure,
             Some(ImportedAxisMeasure::Twips(300))
         );
 
-        let default_hidden = parse(u32::MAX, 8, 0x0002);
+        let implicit_zero = parse(u32::MAX, 8, 0, 0);
+        assert_eq!(implicit_zero.default_row_height, None);
+        assert_eq!(implicit_zero.imported_default_row_axis_measure, None);
+
+        let manual_zero = parse(u32::MAX, 8, 0, 0x0001);
+        assert_eq!(manual_zero.default_row_height, Some(0.0));
+        assert_eq!(
+            manual_zero.imported_default_row_axis_measure,
+            Some(ImportedAxisMeasure::Twips(0))
+        );
+
+        let hidden_zero = parse(u32::MAX, 8, 0, 0x0002);
+        assert_eq!(hidden_zero.default_row_height, None);
+        assert_eq!(hidden_zero.imported_default_row_axis_measure, None);
+        assert!(hidden_zero.default_rows_hidden);
+
+        for valid_height in [MAX_XLSB_ROW_HEIGHT_TWIPS + 1, u16::MAX] {
+            let valid = parse(u32::MAX, 8, valid_height, 0x0001);
+            assert_eq!(
+                valid.default_row_height,
+                Some(f32::from(valid_height) / 20.0)
+            );
+            assert_eq!(
+                valid.imported_default_row_axis_measure,
+                Some(ImportedAxisMeasure::Twips(u32::from(valid_height)))
+            );
+        }
+
+        let default_hidden = parse(u32::MAX, 8, 300, 0x0002);
         assert!(default_hidden.default_rows_hidden);
 
         let mut ws_format = Vec::new();
@@ -4299,6 +4340,10 @@ mod tests {
             )))
         );
 
+        apply_row_outline(&row_header(6, 300, 0), &mut metadata, &styles);
+        assert!(!metadata.row_heights.contains_key(&6));
+        assert!(!metadata.imported_row_axis_measures.contains_key(&6));
+
         let out_of_range_row = MAX_XLSB_ROW_INDEX + 1;
         apply_row_outline(
             &row_header(out_of_range_row, 300, (1 << 13) | (1 << 12)),
@@ -4321,6 +4366,17 @@ mod tests {
         assert!(!metadata.row_heights.contains_key(&7));
         assert!(!metadata.imported_row_axis_measures.contains_key(&7));
         assert!(metadata.explicit_visible_rows.contains(&7));
+
+        apply_row_outline(&row_header(8, 320, 0), &mut metadata, &styles);
+        apply_row_outline(&row_header(8, 340, 1 << 13), &mut metadata, &styles);
+        let mut truncated = row_header(8, 360, 0);
+        truncated.truncate(11);
+        apply_row_outline(&truncated, &mut metadata, &styles);
+        assert_eq!(metadata.row_heights.get(&8), Some(&17.0));
+        assert_eq!(
+            metadata.imported_row_axis_measures.get(&8),
+            Some(&ImportedAxisMeasure::Twips(340))
+        );
     }
 
     #[test]
@@ -4593,7 +4649,7 @@ mod tests {
             .unwrap();
         writer.start_file("xl/charts/chart1.xml", options).unwrap();
         writer
-            .write_all(br#"<chartSpace><chart><plotArea><barChart><barDir val="bar"/><ser><val><numRef><f>Sheet1!$A$1:$A$2</f></numRef></val></ser></barChart></plotArea></chart></chartSpace>"#)
+            .write_all(br#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><plotArea><barChart><barDir val="bar"/><ser><spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></spPr><val><numRef><f>Sheet1!$A$1:$A$2</f></numRef></val></ser></barChart><catAx><majorGridlines/></catAx><valAx/></plotArea></chart><spPr><a:noFill/></spPr></chartSpace>"#)
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
@@ -4614,6 +4670,15 @@ mod tests {
             sidecar.chart_bar_direction,
             crate::ChartBarDirection::Horizontal
         );
+        assert_eq!(sidecar.chart_series_styles.len(), 1);
+        assert_eq!(sidecar.chart_series_styles[0].line_width_emu, Some(19_050));
+        assert_eq!(
+            sidecar.chart_series_styles[0].line_color,
+            Some(Color::rgb(0x12, 0x34, 0x56))
+        );
+        assert_eq!(sidecar.chart_frame_fill, crate::ChartFrameFill::NoFill);
+        assert_eq!(sidecar.chart_category_major_gridlines, Some(true));
+        assert_eq!(sidecar.chart_value_major_gridlines, Some(false));
         assert_eq!(sidecar.from_cell, Some((2, 1)));
         assert_eq!(sidecar.to_cell, Some((14, 7)));
     }
@@ -5139,12 +5204,15 @@ mod tests {
 
     #[test]
     fn xlsb_outline_records_surface_public_metadata() {
-        fn row_hdr(row: u32, level: u8, collapsed: bool) -> Vec<u8> {
+        fn row_hdr(row: u32, level: u8, collapsed: bool, manual: bool) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend_from_slice(&row.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes()); // ixfe
             out.extend_from_slice(&400u16.to_le_bytes()); // miyRw: 20 pt
-            let mut flags = (u16::from(level) << 8) | (1 << 13); // fUnsynced
+            let mut flags = u16::from(level) << 8;
+            if manual {
+                flags |= 1 << 13; // fUnsynced
+            }
             if collapsed {
                 flags |= 1 << 11;
                 flags |= 1 << 12; // hidden
@@ -5185,8 +5253,8 @@ mod tests {
         ws_format.extend_from_slice(&[0, 0]);
         sheet.extend_from_slice(&rec(BRT_WS_FMT_INFO, &ws_format));
         sheet.extend_from_slice(&rec(BRT_COL_INFO, &col_info(1, 3, 3)));
-        sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(2, 2, true)));
-        sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(3, 2, false)));
+        sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(2, 2, true, true)));
+        sheet.extend_from_slice(&rec(BRT_ROW_HDR, &row_hdr(3, 2, false, false)));
 
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
 
@@ -5210,6 +5278,10 @@ mod tests {
         assert_eq!(sheet.col_outline_levels().get(&1), Some(&3));
         assert_eq!(sheet.col_outline_levels().get(&3), Some(&3));
         assert_eq!(sheet.row_heights().get(&2), Some(&20.0));
+        assert!(!sheet.row_heights().contains_key(&3));
+        assert!(sheet.row_height_is_manual(2));
+        assert_eq!(sheet.default_row_height(), None);
+        assert!(!sheet.default_row_height_is_manual());
         assert!(sheet.hidden_rows().contains(&2));
         assert_eq!(
             sheet

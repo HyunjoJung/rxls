@@ -60,6 +60,36 @@ struct PdfGlyphReference {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PdfSemanticBoundaryAnchor {
+    glyph: PdfGlyphReference,
+    clip_bounds: Rect,
+    rotation_degrees: i16,
+}
+
+impl PdfSemanticBoundaryAnchor {
+    fn new(node: &GlyphRunNode, glyph: PdfGlyphReference) -> Self {
+        Self {
+            glyph,
+            clip_bounds: node.clip_bounds,
+            rotation_degrees: node.rotation_degrees.rem_euclid(360),
+        }
+    }
+
+    fn shares_layout_line_with(self, other: Self) -> bool {
+        // Cell clips retain the layout row origin even when scripts, font
+        // sizes, descenders, bottom clipping, or a vertical merge change their
+        // semantic glyph boxes and clip heights. Exact row-origin and
+        // orientation identity therefore avoids both ink-overlap guesses
+        // across adjacent rows and baseline guesses within one row. Equal
+        // complete clips describe one semantic owner rather than two adjacent
+        // cells, so they must not manufacture a boundary.
+        self.rotation_degrees == other.rotation_degrees
+            && self.clip_bounds.y == other.clip_bounds.y
+            && self.clip_bounds != other.clip_bounds
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PdfGlyphPlacement {
     origin_x: Fixed,
     origin_y: Fixed,
@@ -194,11 +224,11 @@ impl PdfFontRegistry {
     fn register_node(
         &mut self,
         node: &GlyphRunNode,
-        page_bounds: Option<Rect>,
+        semantic_clip: Option<Rect>,
         mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
     ) -> Result<Vec<PdfGlyphReference>, RenderError> {
         let placement_clip = if node.rotation_degrees.rem_euclid(360) == 0 {
-            page_bounds
+            semantic_clip
         } else {
             None
         };
@@ -279,7 +309,7 @@ impl PdfFontRegistry {
                 .map(|placement| placement_including_ink(placement, cluster_bounds[index]))
                 .transpose()?
                 .map(|placement| {
-                    placement_within_unrotated_page_bottom(
+                    placement_within_unrotated_clip_bottom(
                         placement,
                         cluster_bounds[index],
                         placement_clip,
@@ -448,6 +478,62 @@ impl PdfFontRegistry {
             origin_y,
             height,
             reverse_y,
+        })
+    }
+
+    /// Register a real Unicode space whose CharProc has metrics but no paint.
+    ///
+    /// Poppler can merge touching text from adjacent cells even when each cell
+    /// has its own ActualText span. A mapped Type3 space is the only reliable
+    /// semantic boundary; keeping its CharProc paint-free makes this operation
+    /// invisible to every raster backend.
+    fn register_semantic_separator(
+        &mut self,
+        anchor: PdfGlyphReference,
+    ) -> Result<PdfGlyphReference, RenderError> {
+        let actual = self
+            .glyph_count
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(LimitKind::BackendCommands, self.glyph_limit, actual)?;
+
+        let width = Fixed::from_pixels(1);
+        let content = format!("{} 0 d0\n", format_fixed(width)).into_bytes();
+        let unicode_hex = utf16be_hex(" ");
+        let retained = (content.len() as u64)
+            .checked_add(unicode_hex.len() as u64)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_add(retained)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(LimitKind::PdfBytes, self.byte_limit, self.retained_bytes)?;
+
+        if self
+            .subsets
+            .last()
+            .is_none_or(|subset| subset.glyphs.len() == TYPE3_GLYPHS_PER_SUBSET)
+        {
+            self.subsets.push(PdfFontSubset::default());
+        }
+        let subset_index = self.subsets.len() - 1;
+        let subset = &mut self.subsets[subset_index];
+        subset.glyphs.push(PdfGlyphProgram {
+            width,
+            unicode_hex,
+            content,
+        });
+        self.glyph_count = actual;
+
+        Ok(PdfGlyphReference {
+            subset_index,
+            code: u8::try_from(subset.glyphs.len()).map_err(|_| RenderError::Backend {
+                reason: "pdf_type3_subset_overflow",
+            })?,
+            origin_x: anchor.origin_x,
+            origin_y: anchor.origin_y,
+            height: anchor.height,
+            reverse_y: anchor.reverse_y,
         })
     }
 }
@@ -785,17 +871,18 @@ fn build_pdf_page(
     let mut images = Vec::new();
     let mut uses_standard_font = false;
     let mut subset_fonts = BTreeSet::new();
+    let mut semantic_boundary_anchor = None;
     push_scene_nodes(
         &mut content,
         &scene.nodes,
         scene.height,
-        page_bounds,
         font_registry,
         &mut subset_fonts,
         &mut links,
         &mut images,
         &mut uses_standard_font,
         Some(page_bounds),
+        &mut semantic_boundary_anchor,
         trace,
         0,
     )?;
@@ -816,19 +903,20 @@ fn push_scene_nodes(
     content: &mut BoundedContent,
     nodes: &[SceneNode],
     scene_height: Fixed,
-    page_bounds: Rect,
     font_registry: &mut PdfFontRegistry,
     subset_fonts: &mut BTreeSet<usize>,
     links: &mut Vec<PdfLink>,
     images: &mut Vec<PdfImage>,
     uses_standard_font: &mut bool,
     active_clip: Option<Rect>,
+    semantic_boundary_anchor: &mut Option<PdfSemanticBoundaryAnchor>,
     mut trace: Option<&mut BackendGeometryTrace>,
     depth: usize,
 ) -> Result<(), RenderError> {
     for node in nodes {
         match node {
             SceneNode::ClipGroup(group) => {
+                *semantic_boundary_anchor = None;
                 if depth >= MAX_CLIP_GROUP_DEPTH {
                     return Err(RenderError::Backend {
                         reason: "pdf_clip_group_depth",
@@ -847,34 +935,38 @@ fn push_scene_nodes(
                     content,
                     &group.nodes,
                     scene_height,
-                    page_bounds,
                     font_registry,
                     subset_fonts,
                     links,
                     images,
                     uses_standard_font,
                     nested_clip,
+                    semantic_boundary_anchor,
                     trace.as_deref_mut(),
                     depth + 1,
                 )?;
+                *semantic_boundary_anchor = None;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::ClipEnd);
                 }
                 content.push("Q\n")?;
             }
             SceneNode::Rect(node) => {
+                *semantic_boundary_anchor = None;
                 push_rect(content, node)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Rect(node.clone()));
                 }
             }
             SceneNode::Line(node) => {
+                *semantic_boundary_anchor = None;
                 push_line(content, node)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Line(node.clone()));
                 }
             }
             SceneNode::Path(node) => {
+                *semantic_boundary_anchor = None;
                 let mut path_trace = trace.is_some().then(|| BackendPathTraceBuilder::new(node));
                 push_path_node(content, node, path_trace.as_mut())?;
                 if let (Some(trace), Some(path_trace)) = (trace.as_deref_mut(), path_trace) {
@@ -884,6 +976,7 @@ fn push_scene_nodes(
                 }
             }
             SceneNode::Image(node) => {
+                *semantic_boundary_anchor = None;
                 let image_index = images.len();
                 images.push(pdf_image(node)?);
                 push_image(content, node, image_index)?;
@@ -892,6 +985,7 @@ fn push_scene_nodes(
                 }
             }
             SceneNode::Text(node) => {
+                *semantic_boundary_anchor = None;
                 let effective_clip = match active_clip {
                     Some(active_clip) => intersect_clip_rects(active_clip, node.clip_bounds)?,
                     None => None,
@@ -925,8 +1019,8 @@ fn push_scene_nodes(
                     node,
                     font_registry,
                     subset_fonts,
-                    page_bounds,
                     effective_clip,
+                    semantic_boundary_anchor,
                     glyph_trace.as_mut(),
                 )?;
                 if let Some(target) = node.hyperlink.as_deref().filter(|_| visible_glyph) {
@@ -1101,8 +1195,8 @@ fn push_glyph_run(
     node: &GlyphRunNode,
     font_registry: &mut PdfFontRegistry,
     subset_fonts: &mut BTreeSet<usize>,
-    page_bounds: Rect,
     effective_clip: Option<Rect>,
+    semantic_boundary_anchor: &mut Option<PdfSemanticBoundaryAnchor>,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
 ) -> Result<bool, RenderError> {
     if !node.metadata_is_valid() {
@@ -1110,7 +1204,7 @@ fn push_glyph_run(
             reason: "invalid_glyph_metadata",
         });
     }
-    let glyphs = font_registry.register_node(node, Some(page_bounds), trace.as_deref_mut())?;
+    let glyphs = font_registry.register_node(node, effective_clip, trace.as_deref_mut())?;
     content.push("q\n")?;
     push_clip(content, node.clip_bounds)?;
     if let Some(trace) = trace.as_deref_mut() {
@@ -1128,6 +1222,29 @@ fn push_glyph_run(
         }
     };
     let visible_glyph = spans.iter().any(|span| !span.glyphs.is_empty());
+    let first_glyph = spans
+        .iter()
+        .flat_map(|span| span.glyphs.iter())
+        .next()
+        .map(|index| PdfSemanticBoundaryAnchor::new(node, glyphs[*index]));
+    if let (Some(previous), Some(current)) = (*semantic_boundary_anchor, first_glyph) {
+        if previous.shares_layout_line_with(current) {
+            let separator = font_registry.register_semantic_separator(current.glyph)?;
+            subset_fonts.insert(separator.subset_index);
+            push_actual_text_begin(content, " ")?;
+            content.push(&format!(
+                "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                separator.subset_index,
+                TYPE3_TEXT_SCALE,
+                type3_height_scale(separator.height, separator.reverse_y),
+                format_fixed(separator.origin_x),
+                format_fixed(separator.origin_y),
+                separator.code
+            ))?;
+            content.push("EMC\n")?;
+        }
+    }
+    let mut current_boundary_anchor = None;
     if !spans.is_empty() {
         for (span_index, span) in spans.iter().enumerate() {
             let word_start = span.source.start;
@@ -1163,6 +1280,7 @@ fn push_glyph_run(
             }
             for glyph_index in &span.glyphs {
                 let glyph = glyphs[*glyph_index];
+                current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(node, glyph));
                 subset_fonts.insert(glyph.subset_index);
                 content.push(&format!(
                     "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
@@ -1177,6 +1295,7 @@ fn push_glyph_run(
             content.push("EMC\n")?;
         }
     }
+    *semantic_boundary_anchor = current_boundary_anchor;
     for decoration in &node.decorations {
         push_rgb_stroke(content, decoration.color)?;
         content.push(&format!(
@@ -1744,22 +1863,22 @@ fn placement_including_ink(
     })
 }
 
-fn placement_within_unrotated_page_bottom(
+fn placement_within_unrotated_clip_bottom(
     placement: PdfGlyphPlacement,
     ink: Option<PdfGlyphBounds>,
-    page_bounds: Option<Rect>,
+    clip_bounds: Option<Rect>,
 ) -> Result<PdfGlyphPlacement, RenderError> {
-    let (Some(ink), Some(page_bounds)) = (ink, page_bounds) else {
+    let (Some(ink), Some(clip_bounds)) = (ink, clip_bounds) else {
         return Ok(placement);
     };
-    if page_bounds.height <= Fixed::ZERO {
+    if clip_bounds.height <= Fixed::ZERO {
         return Ok(placement);
     }
-    let page_bottom = page_bounds
+    let clip_bottom = clip_bounds
         .y
-        .checked_add(page_bounds.height)
+        .checked_add(clip_bounds.height)
         .ok_or(RenderError::CoordinateOverflow)?;
-    let page_inner_bottom = page_bottom
+    let clip_inner_bottom = clip_bottom
         .checked_sub(Fixed::from_raw(1))
         .ok_or(RenderError::CoordinateOverflow)?;
     let placement_top = placement
@@ -1767,13 +1886,14 @@ fn placement_within_unrotated_page_bottom(
         .checked_sub(placement.height)
         .ok_or(RenderError::CoordinateOverflow)?;
 
-    // Poppler discards marked Type3 text whose text origin lies just beyond a
-    // page boundary, even when the complete glyph outline remains visible.
-    // Trim only a nominal descent overhang: the adjusted placement must still
-    // enclose the complete outline, so rebuilding the CharProc around it
-    // preserves the exact scene-space paint.
-    let bottom = if placement.origin_y >= page_bottom && ink.max_y <= page_inner_bottom {
-        page_inner_bottom
+    // Poppler discards marked Type3 text whose text origin lies just beyond an
+    // effective page/cell clip, even when visible outline ink intersects it.
+    // Clamp semantic metrics to the visible ink intersection. Rebuilding the
+    // CharProc around the new origin preserves the exact scene-space path, and
+    // the existing PDF clip still removes the non-visible ink.
+    let ink_intersects_clip = ink.max_y > clip_bounds.y && ink.min_y < clip_bottom;
+    let bottom = if placement.origin_y >= clip_bottom && ink_intersects_clip {
+        clip_inner_bottom
     } else {
         placement.origin_y
     };
@@ -3018,6 +3138,19 @@ mod tests {
         }
     }
 
+    fn positioned_outline_in_clip(
+        text: &str,
+        left: i64,
+        top: i64,
+        width: i64,
+        height: i64,
+        clip_bounds: Rect,
+    ) -> GlyphRunNode {
+        let mut node = positioned_outline(text, left, top, width, height);
+        node.clip_bounds = clip_bounds;
+        node
+    }
+
     fn positioned_outline_document() -> PrintDocument {
         let mut workbook = rxls::Workbook::new();
         workbook.add_sheet("bbox").write(0, 0, "seed");
@@ -3035,6 +3168,244 @@ mod tests {
             ],
         };
         document
+    }
+
+    fn touching_adjacent_outline_document() -> PrintDocument {
+        document_with_nodes(
+            "type3-touching-adjacent-cells",
+            vec![
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "日本語",
+                    24,
+                    16,
+                    32,
+                    12,
+                    Rect {
+                        x: Fixed::from_pixels(24),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(32),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "中文",
+                    56,
+                    20,
+                    24,
+                    8,
+                    Rect {
+                        x: Fixed::from_pixels(56),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(24),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "00",
+                    24,
+                    52,
+                    16,
+                    10,
+                    Rect {
+                        x: Fixed::from_pixels(24),
+                        y: Fixed::from_pixels(48),
+                        width: Fixed::from_pixels(16),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "Cell",
+                    40,
+                    52,
+                    32,
+                    10,
+                    Rect {
+                        x: Fixed::from_pixels(40),
+                        y: Fixed::from_pixels(48),
+                        width: Fixed::from_pixels(32),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+            ],
+        )
+    }
+
+    fn overlapping_adjacent_row_outline_document() -> PrintDocument {
+        document_with_nodes(
+            "type3-overlapping-adjacent-rows",
+            vec![
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "UPPER",
+                    24,
+                    18,
+                    40,
+                    14,
+                    Rect {
+                        x: Fixed::from_pixels(20),
+                        y: Fixed::from_pixels(10),
+                        width: Fixed::from_pixels(80),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "LOWER",
+                    24,
+                    30,
+                    40,
+                    14,
+                    Rect {
+                        x: Fixed::from_pixels(20),
+                        y: Fixed::from_pixels(30),
+                        width: Fixed::from_pixels(80),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+            ],
+        )
+    }
+
+    fn touching_unequal_row_span_outline_document() -> PrintDocument {
+        document_with_nodes(
+            "type3-touching-unequal-row-span-cells",
+            vec![
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "MERGED",
+                    24,
+                    16,
+                    32,
+                    12,
+                    Rect {
+                        x: Fixed::from_pixels(24),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(32),
+                        height: Fixed::from_pixels(40),
+                    },
+                )),
+                SceneNode::GlyphRun(positioned_outline_in_clip(
+                    "ROW",
+                    56,
+                    16,
+                    24,
+                    12,
+                    Rect {
+                        x: Fixed::from_pixels(56),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(24),
+                        height: Fixed::from_pixels(20),
+                    },
+                )),
+            ],
+        )
+    }
+
+    fn touching_rtl_outline_document() -> PrintDocument {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let style = rxls::CellStyle::new().font_name(&family).size(11);
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("type3-touching-rtl-cells");
+        sheet.set_right_to_left(true);
+        sheet.set_col_width(0, 3.0);
+        sheet.set_col_width(1, 3.0);
+        sheet.write_styled(0, 0, "אב", &style);
+        sheet.write_styled(0, 1, "גד", &style);
+        outlined_test_document(&workbook, pack)
+    }
+
+    fn mixed_font_script_adjacent_outline_document() -> PrintDocument {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("type3-mixed-font-script-cells");
+        sheet.set_col_width(0, 4.0);
+        sheet.set_col_width(1, 4.0);
+        sheet.write_styled(
+            0,
+            0,
+            "漢字",
+            &rxls::CellStyle::new().font_name("Wide Sans").size(18),
+        );
+        sheet.write_styled(
+            0,
+            1,
+            "42",
+            &rxls::CellStyle::new().font_name("RTL Sans").size(9),
+        );
+        outlined_test_document(&workbook, pack)
+    }
+
+    fn rotated_boundary_outline_document() -> PrintDocument {
+        let row = |x| Rect {
+            x: Fixed::from_pixels(x),
+            y: Fixed::from_pixels(36),
+            width: Fixed::from_pixels(40),
+            height: Fixed::from_pixels(48),
+        };
+        let mut first = positioned_outline_in_clip("ROT-A", 28, 50, 12, 20, row(20));
+        first.rotation_degrees = 90;
+        first.pivot_x = Fixed::from_pixels(40);
+        first.pivot_y = Fixed::from_pixels(60);
+        let mut second = positioned_outline_in_clip("ROT-B", 68, 50, 12, 20, row(60));
+        second.rotation_degrees = 90;
+        second.pivot_x = Fixed::from_pixels(80);
+        second.pivot_y = Fixed::from_pixels(60);
+        let plain = positioned_outline_in_clip("PLAIN", 104, 54, 28, 12, row(100));
+        document_with_nodes(
+            "type3-rotated-cell-boundaries",
+            vec![
+                SceneNode::GlyphRun(first),
+                SceneNode::GlyphRun(second),
+                SceneNode::GlyphRun(plain),
+            ],
+        )
+    }
+
+    fn reset_boundary_outline_document() -> PrintDocument {
+        let cell = |text, left| {
+            positioned_outline_in_clip(
+                text,
+                left + 4,
+                18,
+                20,
+                10,
+                Rect {
+                    x: Fixed::from_pixels(left),
+                    y: Fixed::from_pixels(12),
+                    width: Fixed::from_pixels(28),
+                    height: Fixed::from_pixels(20),
+                },
+            )
+        };
+        document_with_nodes(
+            "type3-boundary-resets",
+            vec![
+                SceneNode::GlyphRun(cell("BEFORE", 4)),
+                SceneNode::Rect(RectNode {
+                    rect: Rect {
+                        x: Fixed::from_pixels(34),
+                        y: Fixed::from_pixels(12),
+                        width: Fixed::from_pixels(1),
+                        height: Fixed::from_pixels(20),
+                    },
+                    fill: None,
+                    stroke: None,
+                    stroke_width: Fixed::ZERO,
+                }),
+                SceneNode::GlyphRun(cell("AFTER", 40)),
+                SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::ZERO,
+                        y: Fixed::ZERO,
+                        width: Fixed::from_pixels(200),
+                        height: Fixed::from_pixels(120),
+                    },
+                    nodes: vec![
+                        SceneNode::GlyphRun(cell("INNER-A", 76)),
+                        SceneNode::GlyphRun(cell("INNER-B", 104)),
+                    ],
+                }),
+                SceneNode::GlyphRun(cell("OUTSIDE", 140)),
+            ],
+        )
     }
 
     fn whitespace_outline_document() -> PrintDocument {
@@ -3339,6 +3710,83 @@ mod tests {
                 hyperlink: None,
             })],
         };
+        document
+    }
+
+    fn bottom_straddling_outline_document() -> PrintDocument {
+        let text = "CLIPPED-BOTTOM";
+        let commands = sized_rectangle_commands(12, 45, 72, 11);
+        let mut document = document_with_nodes(
+            "type3-bottom-straddling",
+            vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: text.to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(100),
+                    height: Fixed::from_pixels(51),
+                },
+                clusters: vec![GlyphCluster {
+                    source_start: 0,
+                    source_end: text.len() as u64,
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                }],
+                cluster_metrics: vec![GlyphClusterMetrics {
+                    origin_x: Fixed::from_pixels(12),
+                    advance_x: Fixed::from_pixels(72),
+                    baseline_y: Fixed::from_pixels(50),
+                    ascent: Fixed::from_pixels(8),
+                    descent: Fixed::from_pixels(-6),
+                }],
+                paints: vec![GlyphPaint {
+                    command_start: 0,
+                    command_end: commands.len() as u64,
+                    color: Rgb::BLACK,
+                }],
+                commands,
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+            })],
+        );
+        document.pages[0].scene.width = Fixed::from_pixels(100);
+        document.pages[0].scene.height = Fixed::from_pixels(51);
+        document
+    }
+
+    fn touching_bottom_straddling_outline_document() -> PrintDocument {
+        let row = |x, width| Rect {
+            x: Fixed::from_pixels(x),
+            y: Fixed::from_pixels(40),
+            width: Fixed::from_pixels(width),
+            height: Fixed::from_pixels(11),
+        };
+        let mut first = positioned_outline_in_clip("BOTTOM-A", 4, 45, 44, 11, row(0, 48));
+        first.cluster_metrics = vec![GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(4),
+            advance_x: Fixed::from_pixels(44),
+            baseline_y: Fixed::from_pixels(50),
+            ascent: Fixed::from_pixels(8),
+            descent: Fixed::from_pixels(-6),
+        }];
+        let mut second = positioned_outline_in_clip("BOTTOM-B", 48, 45, 48, 11, row(48, 52));
+        second.cluster_metrics = vec![GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(48),
+            advance_x: Fixed::from_pixels(48),
+            baseline_y: Fixed::from_pixels(50),
+            ascent: Fixed::from_pixels(8),
+            descent: Fixed::from_pixels(-6),
+        }];
+        let mut document = document_with_nodes(
+            "type3-touching-bottom-straddling",
+            vec![SceneNode::GlyphRun(first), SceneNode::GlyphRun(second)],
+        );
+        document.pages[0].scene.width = Fixed::from_pixels(100);
+        document.pages[0].scene.height = Fixed::from_pixels(51);
         document
     }
 
@@ -4739,6 +5187,7 @@ mod tests {
         assert!(source.contains("1 0 0 0.01 24 28 Tm <01> Tj"));
         assert!(source.contains("1 0 0 0.01 136 28 Tm <02> Tj"));
         assert!(source.contains("1 0 0 0.012 84 94 Tm <03> Tj"));
+        assert!(!source.contains("<0020>"));
         if let Some(xml) = poppler_bbox_layout(&pdf) {
             assert_eq!(poppler_word_bbox(&xml, "LEFT"), [18.0, 13.5, 42.0, 21.0]);
             assert_eq!(poppler_word_bbox(&xml, "RIGHT"), [102.0, 13.5, 132.0, 21.0]);
@@ -4760,6 +5209,174 @@ mod tests {
             assert_eq!(poppler_word_bbox(&xml, "ALPHA"), [18.0, 13.5, 42.0, 21.0]);
             assert_eq!(poppler_word_bbox(&xml, "BETA"), [60.0, 13.5, 90.0, 21.0]);
             assert!(!xml.contains(">ALPHA  BETA</word>"));
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_splits_touching_adjacent_cell_words_without_paint() {
+        let document = touching_adjacent_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(
+            source.contains("<03> <0020>"),
+            "the first cell boundary must map a real Type3 glyph to U+0020"
+        );
+        assert_eq!(
+            source.matches("<0020>").count(),
+            2,
+            "only distinct horizontal clips in the same row may add boundaries"
+        );
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["日本語", "中文", "00", "Cell"]);
+        }
+
+        let mut registry = PdfFontRegistry::new(16, 4096);
+        let separator = registry
+            .register_semantic_separator(PdfGlyphReference {
+                subset_index: 0,
+                code: 1,
+                origin_x: Fixed::from_pixels(12),
+                origin_y: Fixed::from_pixels(24),
+                height: Fixed::from_pixels(10),
+                reverse_y: true,
+            })
+            .unwrap();
+        assert_eq!(separator.origin_x, Fixed::from_pixels(12));
+        assert_eq!(registry.subsets[0].glyphs[0].unicode_hex, "0020");
+        assert_eq!(
+            registry.subsets[0].glyphs[0].content, b"1 0 d0\n",
+            "the semantic separator CharProc must contain metrics only"
+        );
+    }
+
+    #[test]
+    fn type3_semantic_separator_rejects_overlapping_ink_from_adjacent_rows() {
+        let document = overlapping_adjacent_row_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(!source.contains("<0020>"));
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("UPPER"), "{text:?}");
+            assert!(text.contains("LOWER"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["UPPER", "LOWER"]);
+            let upper = poppler_word_bbox(&xml, "UPPER");
+            let lower = poppler_word_bbox(&xml, "LOWER");
+            assert!(
+                upper[3] > lower[1],
+                "the control must retain vertically overlapping semantic boxes: {upper:?} {lower:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_handles_adjacent_cells_with_unequal_row_spans() {
+        let document = touching_unequal_row_span_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(
+            source.matches("<0020>").count(),
+            1,
+            "a vertically merged cell and its same-row neighbor remain distinct owners"
+        );
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["MERGED", "ROW"]);
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_preserves_touching_rtl_cell_boundaries() {
+        let document = touching_rtl_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(source.matches("<0020>").count(), 1);
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains(' '), "{text:?}");
+            for character in ['א', 'ב', 'ג', 'ד'] {
+                assert!(text.contains(character), "{text:?}");
+            }
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            let words = poppler_words(&xml);
+            assert_eq!(words.len(), 2, "{words:?}");
+            assert!(words.contains(&"אב"), "{words:?}");
+            assert!(words.contains(&"גד"), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_uses_row_geometry_across_mixed_fonts_and_scripts() {
+        let document = mixed_font_script_adjacent_outline_document();
+        let runs = document.pages[0]
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::GlyphRun(run) => Some(run),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].clip_bounds.y, runs[1].clip_bounds.y);
+        assert_eq!(runs[0].clip_bounds.height, runs[1].clip_bounds.height);
+        assert_ne!(
+            runs[0].cluster_metrics[0].ascent, runs[1].cluster_metrics[0].ascent,
+            "the control must use materially different font metrics"
+        );
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(source.matches("<0020>").count(), 1);
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["漢字", "42"]);
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_uses_rotation_as_part_of_the_layout_line() {
+        let document = rotated_boundary_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(
+            source.matches("<0020>").count(),
+            1,
+            "parallel rotated cells share a boundary, but a differently oriented run does not"
+        );
+        if let Some(text) = poppler_text(&pdf) {
+            for expected in ["ROT-A", "ROT-B", "PLAIN"] {
+                assert!(text.contains(expected), "{text:?}");
+            }
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            let words = poppler_words(&xml);
+            for expected in ["ROT-A", "ROT-B", "PLAIN"] {
+                assert!(words.contains(&expected), "{words:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_resets_at_group_and_non_text_boundaries() {
+        let document = reset_boundary_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(
+            source.matches("<0020>").count(),
+            1,
+            "only the consecutive GlyphRuns inside one clip group share state"
+        );
+        if let Some(text) = poppler_text(&pdf) {
+            for expected in ["BEFORE", "AFTER", "INNER-A", "INNER-B", "OUTSIDE"] {
+                assert!(text.contains(expected), "{text:?}");
+            }
         }
     }
 
@@ -4977,6 +5594,54 @@ mod tests {
             assert_raster_rgb(&raster, 20, 68, [0, 0, 0]);
             assert_raster_rgb(&raster, 20, 77, [0, 0, 0]);
             assert_raster_rgb(&raster, 20, 78, [255, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn type3_poppler_retains_bottom_straddling_visible_ink_on_a_51px_page() {
+        let document = bottom_straddling_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains(
+            "/ActualText <FEFF0043004C00490050005000450044002D0042004F00540054004F004D>"
+        ));
+        assert!(source.contains("50.9990234375 Tm <01> Tj"));
+
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("CLIPPED-BOTTOM"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["CLIPPED-BOTTOM"]);
+            let bbox = poppler_word_bbox(&xml, "CLIPPED-BOTTOM");
+            assert!((bbox[3] - 38.249_267_578_125).abs() <= 0.002, "{bbox:?}");
+        }
+        if let Some(raster) = poppler_raster(&pdf, "bottom-straddling") {
+            assert_eq!((raster.width(), raster.height()), (100, 51));
+            assert_raster_rgb(&raster, 20, 44, [255, 255, 255]);
+            assert_raster_rgb(&raster, 20, 45, [0, 0, 0]);
+            assert_raster_rgb(&raster, 20, 50, [0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn type3_semantic_separator_retains_touching_cells_at_the_bottom_clip() {
+        let document = touching_bottom_straddling_outline_document();
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        assert_eq!(source.matches("<0020>").count(), 1);
+        assert_eq!(source.matches("50.9990234375 Tm").count(), 3);
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains("BOTTOM-A"), "{text:?}");
+            assert!(text.contains("BOTTOM-B"), "{text:?}");
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["BOTTOM-A", "BOTTOM-B"]);
+            for word in ["BOTTOM-A", "BOTTOM-B"] {
+                let bbox = poppler_word_bbox(&xml, word);
+                assert!(bbox[3] <= 38.25, "{word}: {bbox:?}");
+            }
         }
     }
 

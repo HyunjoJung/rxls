@@ -1098,8 +1098,42 @@ steps:
                 "path: target/render-oracle-hosted/parity-report-a.json",
             ),
             "failure_upload_before_sanitizer": original.replace(
-                "steps.render_oracle_failure_summary.outcome == 'success'",
-                "steps.render_oracle_failure_summary.outcome != 'cancelled'",
+                "steps.render_oracle_failure_evidence.outcome == 'success'",
+                "steps.render_oracle_failure_evidence.outcome != 'cancelled'",
+            ),
+            "failure_independent_validation_removed": original.replace(
+                "          validate_failure_summary(\n",
+                "          dict(\n",
+                1,
+            ),
+            "failure_overview_is_blocking": original.replace(
+                "        continue-on-error: true\n",
+                "",
+                1,
+            ),
+            "failure_overview_precedes_upload": original.replace(
+                "- name: Upload sanitized Render Oracle failure summary",
+                "- name: TEMPORARY FAILURE STEP",
+                1,
+            )
+            .replace(
+                "- name: Append bounded Render Oracle failure overview",
+                "- name: Upload sanitized Render Oracle failure summary",
+                1,
+            )
+            .replace(
+                "- name: TEMPORARY FAILURE STEP",
+                "- name: Append bounded Render Oracle failure overview",
+                1,
+            ),
+            "failure_overview_uploads_full_json": original.replace(
+                '          python3 - "$GITHUB_STEP_SUMMARY" <<\'PY\'',
+                (
+                    "          cat target/render-oracle-failure/"
+                    "render-oracle-failure-summary.json "
+                    '>> "$GITHUB_STEP_SUMMARY"\n'
+                    "          python3 - /dev/null <<'PY'"
+                ),
             ),
             "bootstrap_path_substring_allowed": original.replace(
                 'assert "path" not in normalized_key',
@@ -1166,6 +1200,57 @@ steps:
                     self.policy.audit_render_oracle_workflow(
                         Path("render-oracle.yml"), workflow
                     )
+                )
+
+    def test_render_oracle_rejects_weakened_pinned_font_cli_regression(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "step_removed": original.replace(
+                "- name: Run the pinned-font SinglePageSheets CLI geometry regression",
+                "- name: Unreviewed pinned-font regression",
+                1,
+            ),
+            "timeout_widened": original.replace(
+                "        timeout-minutes: 15\n",
+                "        timeout-minutes: 30\n",
+                1,
+            ),
+            "manifest_reassigned": original.replace(
+                "RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json",
+                "RXLS_TEST_FONT_PACK_MANIFEST: local/unverified/manifest.json",
+                1,
+            ),
+            "family_reassigned": original.replace(
+                "          RXLS_TEST_FONT_FAMILY: Arimo\n",
+                "          RXLS_TEST_FONT_FAMILY: Carlito\n",
+                1,
+            ),
+            "test_filter_widened": original.replace(
+                "            --test printing "
+                "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n",
+                "            --test printing cli_single_page \\\n",
+                1,
+            ),
+            "exact_filter_removed": original.replace(
+                "            -- --exact\n"
+                "      - name: Build and inspect the locked oracle image",
+                "            --\n"
+                "      - name: Build and inspect the locked oracle image",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_oracle_workflow(
+                    Path("render-oracle.yml"), workflow
+                )
+                self.assertTrue(
+                    any(
+                        "pinned-font SinglePageSheets CLI regression" in error
+                        for error in errors
+                    ),
+                    errors,
                 )
 
     def test_render_oracle_tracks_shared_gate_dependencies(self) -> None:
@@ -1502,13 +1587,41 @@ steps:
             text,
         )
         self.assertIn(
+            "test_failure_summary_validator_is_bound_private_and_fail_closed",
+            text,
+        )
+        self.assertIn(
+            "### Sanitized Render Oracle failure evidence",
+            text,
+        )
+        self.assertNotIn(
+            "cat target/render-oracle-failure/"
+            "render-oracle-failure-summary.json",
+            text,
+        )
+        self.assertIn(
             "path: target/render-oracle-failure/"
             "render-oracle-failure-summary.json",
             text,
         )
         self.assertIn(
-            "steps.render_oracle_failure_summary.outcome == 'success'",
+            "steps.render_oracle_failure_evidence.outcome == 'success'",
             text,
+        )
+        self.assertIn("validate_failure_summary(", text)
+        self.assertIn("id: render_oracle_failure_upload", text)
+        self.assertIn(
+            "steps.render_oracle_failure_upload.outcome == 'success'",
+            text,
+        )
+        self.assertIn("continue-on-error: true", text)
+        self.assertLess(
+            text.index(
+                "- name: Upload sanitized Render Oracle failure summary"
+            ),
+            text.index(
+                "- name: Append bounded Render Oracle failure overview"
+            ),
         )
         self.assertIn(
             '== ("metric_policy", "paths_or_content_retained")',

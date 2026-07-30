@@ -8,10 +8,12 @@ from collections import Counter
 import copy
 from fractions import Fraction
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -24,16 +26,20 @@ except ModuleNotFoundError:  # Imported as ``scripts.*`` by unit tests.
 
 
 INPUT_SCHEMA = "rxls.libreoffice-render-parity.v1"
-OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v8"
+OUTPUT_SCHEMA = "rxls.render-oracle-failure-summary.v10"
 OUTPUT_NAME = "render-oracle-failure-summary.json"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 768 * 1024 * 1024
-MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_ROOT_ENTRIES = 128
 MAX_JSON_DEPTH = 128
 MAX_JSON_NODES = 2_000_000
 MAX_JSON_INTEGER_DIGITS = 128
 MAX_PAGE_COUNT = 64
+MAX_CASE_DIAGNOSTICS_PER_REPORT = 64
+MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK = 1_000_000
+MAX_POPPLER_ITEMS_PER_PAGE = 250_000
+MAX_RASTER_PIXELS_PER_PAGE = 1_000_000_000
 MAX_POINT_RATIONAL_DIGITS = 32
 MAX_POINT_ABSOLUTE_VALUE = 1_000_000
 MAX_POINT_DELTA_MICROPOINTS = MAX_POINT_ABSOLUTE_VALUE * 1_000_000
@@ -57,6 +63,19 @@ PREIDENTITY_CLASSIFICATION_STATUSES = {
     "unreadable_input": "skipped",
 }
 FORMATS = frozenset({"ods", "xls", "xlsb", "xlsx"})
+CASE_ID_DOMAIN = b"rxls.render-oracle-failure-case.v1\0"
+CASE_ID_KEY_BYTES = 32
+# The key is created once per summary and is never serialized. Identifiers are
+# stable inside one artifact but deliberately cannot be correlated across runs.
+CASE_ID_POLICY = {
+    "algorithm": "hmac-sha256",
+    "correlation": "within_summary_only",
+    "domain": "rxls.render-oracle-failure-case.v1",
+    "input": "domain_separated_workbook_digest",
+    "key": "ephemeral_non_exported",
+    "max_cases_per_report": MAX_CASE_DIAGNOSTICS_PER_REPORT,
+    "selection": "lexicographically_lowest_case_ids",
+}
 UNREVIEWED_CLASSIFICATION = "unreviewed_classification"
 # This is deliberately a finite public vocabulary. It covers the stable terminal
 # outcomes and command/runtime failures emitted by evaluate_case and the locked
@@ -549,6 +568,79 @@ TEXT_GEOMETRY_ALLOWED_BUCKETS = frozenset(
     TEXT_GEOMETRY_OVERFLOW_MILLIPOINTS,
 }
 
+FIDELITY_RATIO_KEYS = {
+    "f1_ppm",
+    "libreoffice_items",
+    "matched_items",
+    "precision_ppm",
+    "recall_ppm",
+    "rxls_items",
+}
+FIDELITY_TEXT_KEYS = FIDELITY_RATIO_KEYS | {
+    "ambiguous_items",
+    "libreoffice_unmatched_items",
+    "rxls_unmatched_items",
+}
+FIDELITY_MASK_KEYS = {
+    "f1_ppm",
+    "libreoffice_matched_pixels",
+    "libreoffice_pixels",
+    "precision_ppm",
+    "recall_ppm",
+    "rxls_matched_pixels",
+    "rxls_pixels",
+}
+FIDELITY_RASTER_KEYS = {
+    "absolute_error_sum",
+    "blurred_luma_absolute_error_sum",
+    "blurred_luma_similarity_ppm",
+    "changed_pixels",
+    "edge",
+    "exact_pages",
+    "foreground",
+    "max_channel_delta",
+    "mean_absolute_error_ppm",
+    "mismatch_ppm",
+    "pages",
+    "pixels",
+    "similarity_ppm",
+    "text_ink",
+}
+FIDELITY_COHORT_KEYS = {
+    "pages",
+    "poppler_lines",
+    "poppler_words",
+    "raster",
+    "semantic_visible_characters",
+    "workbooks",
+}
+FIDELITY_OUTPUT_KEYS = {"all", "by_format"}
+CASE_DIAGNOSTIC_KEYS = {
+    "case_id",
+    "format",
+    "page_box",
+    "poppler_lines",
+    "poppler_words",
+    "raster",
+    "semantic_visible_characters",
+}
+CASE_DIAGNOSTICS_KEYS = {
+    "available_cases",
+    "available_cases_by_format",
+    "cases",
+    "retained_cases",
+    "retained_cases_by_format",
+    "truncated",
+}
+INGESTION_KEYS = {
+    "expected_workbooks",
+    "received_workbooks",
+    "status",
+}
+INGESTION_STATUSES = frozenset(
+    {"complete", "partial", "rejected", "unavailable"}
+)
+
 
 def _text_geometry_bucket(delta_millipoints: int) -> int:
     magnitude = abs(delta_millipoints)
@@ -758,6 +850,538 @@ def _signed_integer(value: object, code: str, maximum: int) -> int:
     ):
         raise SummaryError(code)
     return value
+
+
+def _ratio_ppm(numerator: int, denominator: int, *, empty: int = 0) -> int:
+    if denominator == 0:
+        return empty
+    return (numerator * 1_000_000 + denominator // 2) // denominator
+
+
+def _ratio_evidence(
+    rxls_items: int,
+    libreoffice_items: int,
+    matched_items: int,
+) -> dict[str, int]:
+    if matched_items > min(rxls_items, libreoffice_items):
+        raise SummaryError("fidelity_ratio")
+    both_empty = rxls_items == 0 and libreoffice_items == 0
+    return {
+        "f1_ppm": _ratio_ppm(
+            2 * matched_items,
+            rxls_items + libreoffice_items,
+            empty=1_000_000,
+        ),
+        "libreoffice_items": libreoffice_items,
+        "matched_items": matched_items,
+        "precision_ppm": _ratio_ppm(
+            matched_items,
+            rxls_items,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "recall_ppm": _ratio_ppm(
+            matched_items,
+            libreoffice_items,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "rxls_items": rxls_items,
+    }
+
+
+def _text_evidence(
+    rxls_items: int,
+    libreoffice_items: int,
+    matched_items: int,
+    ambiguous_items: int,
+    rxls_unmatched_items: int,
+    libreoffice_unmatched_items: int,
+) -> dict[str, int]:
+    if (
+        rxls_items
+        != matched_items + ambiguous_items + rxls_unmatched_items
+        or libreoffice_items
+        != matched_items + libreoffice_unmatched_items
+    ):
+        raise SummaryError("fidelity_text")
+    return {
+        **_ratio_evidence(
+            rxls_items,
+            libreoffice_items,
+            matched_items,
+        ),
+        "ambiguous_items": ambiguous_items,
+        "libreoffice_unmatched_items": libreoffice_unmatched_items,
+        "rxls_unmatched_items": rxls_unmatched_items,
+    }
+
+
+def _mask_evidence(
+    rxls_pixels: int,
+    libreoffice_pixels: int,
+    rxls_matched_pixels: int,
+    libreoffice_matched_pixels: int,
+) -> dict[str, int]:
+    if (
+        rxls_matched_pixels > rxls_pixels
+        or libreoffice_matched_pixels > libreoffice_pixels
+    ):
+        raise SummaryError("fidelity_raster")
+    both_empty = rxls_pixels == 0 and libreoffice_pixels == 0
+    denominator = (
+        rxls_matched_pixels * libreoffice_pixels
+        + libreoffice_matched_pixels * rxls_pixels
+    )
+    if both_empty:
+        f1 = 1_000_000
+    elif denominator == 0:
+        f1 = 0
+    else:
+        f1 = _ratio_ppm(
+            2 * rxls_matched_pixels * libreoffice_matched_pixels,
+            denominator,
+        )
+    return {
+        "f1_ppm": f1,
+        "libreoffice_matched_pixels": libreoffice_matched_pixels,
+        "libreoffice_pixels": libreoffice_pixels,
+        "precision_ppm": _ratio_ppm(
+            rxls_matched_pixels,
+            rxls_pixels,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "recall_ppm": _ratio_ppm(
+            libreoffice_matched_pixels,
+            libreoffice_pixels,
+            empty=1_000_000 if both_empty else 0,
+        ),
+        "rxls_matched_pixels": rxls_matched_pixels,
+        "rxls_pixels": rxls_pixels,
+    }
+
+
+def _metric_integer(
+    metrics: dict[str, Any],
+    key: str,
+    maximum: int,
+    code: str,
+) -> int:
+    return _integer(metrics.get(key), code, maximum)
+
+
+def _require_metric_ppm(
+    metrics: dict[str, Any],
+    key: str,
+    expected: int,
+    code: str,
+) -> None:
+    if _metric_integer(metrics, key, 1_000_000, code) != expected:
+        raise SummaryError(code)
+
+
+def _metric_ratio(
+    metrics: dict[str, Any],
+    *,
+    prefix: str,
+    maximum: int,
+    code: str,
+) -> dict[str, int]:
+    evidence = _ratio_evidence(
+        _metric_integer(
+            metrics, f"{prefix}_rxls_items", maximum, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_libreoffice_items", maximum, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_matched_items", maximum, code
+        ),
+    )
+    for name in ("precision_ppm", "recall_ppm", "f1_ppm"):
+        _require_metric_ppm(
+            metrics,
+            f"{prefix}_{name}",
+            evidence[name],
+            code,
+        )
+    return evidence
+
+
+def _metric_text(
+    metrics: dict[str, Any],
+    *,
+    prefix: str,
+    maximum: int,
+    code: str,
+) -> dict[str, int]:
+    rxls_items = _metric_integer(
+        metrics, f"{prefix}_rxls_items", maximum, code
+    )
+    libreoffice_items = _metric_integer(
+        metrics, f"{prefix}_libreoffice_items", maximum, code
+    )
+    evidence = _text_evidence(
+        rxls_items,
+        libreoffice_items,
+        _metric_integer(
+            metrics, f"{prefix}_matched_items", maximum, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_ambiguous_items", maximum, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_rxls_unmatched_items", maximum, code
+        ),
+        _metric_integer(
+            metrics,
+            f"{prefix}_libreoffice_unmatched_items",
+            maximum,
+            code,
+        ),
+    )
+    if (
+        _metric_integer(
+            metrics, f"{prefix}_candidate_items", maximum, code
+        )
+        != rxls_items
+        or _metric_integer(
+            metrics, f"{prefix}_unmatched_items", maximum, code
+        )
+        != evidence["rxls_unmatched_items"]
+    ):
+        raise SummaryError(code)
+    for name in ("precision_ppm", "recall_ppm", "f1_ppm"):
+        _require_metric_ppm(
+            metrics,
+            f"{prefix}_{name}",
+            evidence[name],
+            code,
+        )
+    _require_metric_ppm(
+        metrics,
+        f"{prefix}_match_coverage_ppm",
+        evidence["precision_ppm"],
+        code,
+    )
+    return evidence
+
+
+def _metric_mask(
+    metrics: dict[str, Any],
+    *,
+    prefix: str,
+    pixels: int,
+    code: str,
+) -> dict[str, int]:
+    evidence = _mask_evidence(
+        _metric_integer(
+            metrics, f"{prefix}_rxls_pixels", pixels, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_libreoffice_pixels", pixels, code
+        ),
+        _metric_integer(
+            metrics, f"{prefix}_rxls_matched_1px", pixels, code
+        ),
+        _metric_integer(
+            metrics,
+            f"{prefix}_libreoffice_matched_1px",
+            pixels,
+            code,
+        ),
+    )
+    for name in ("precision_ppm", "recall_ppm", "f1_ppm"):
+        _require_metric_ppm(
+            metrics,
+            f"{prefix}_{name}",
+            evidence[name],
+            code,
+        )
+    return evidence
+
+
+def _row_fidelity(
+    row: dict[str, Any],
+) -> dict[str, object] | None:
+    metrics = row.get("metrics")
+    pages = row.get("pages")
+    if metrics is None and pages is None:
+        return None
+    code = "fidelity_metrics"
+    if not isinstance(metrics, dict) or not isinstance(pages, list):
+        raise SummaryError(code)
+    page_count = _metric_integer(
+        metrics, "pages", MAX_PAGE_COUNT, code
+    )
+    if page_count == 0 or page_count != len(pages):
+        raise SummaryError(code)
+    semantic = _metric_ratio(
+        metrics,
+        prefix="semantic_codepoint",
+        maximum=MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK,
+        code=code,
+    )
+    item_limit = page_count * MAX_POPPLER_ITEMS_PER_PAGE
+    words = _metric_text(
+        metrics,
+        prefix="text_box",
+        maximum=item_limit,
+        code=code,
+    )
+    lines = _metric_text(
+        metrics,
+        prefix="text_line_box",
+        maximum=item_limit,
+        code=code,
+    )
+
+    pixel_limit = page_count * MAX_RASTER_PIXELS_PER_PAGE
+    pixels = _metric_integer(metrics, "pixels", pixel_limit, code)
+    if pixels == 0:
+        raise SummaryError(code)
+    changed_pixels = _metric_integer(
+        metrics, "changed_pixels", pixels, code
+    )
+    absolute_error_sum = _metric_integer(
+        metrics, "absolute_error_sum", pixels * 3 * 255, code
+    )
+    blurred_error_sum = _metric_integer(
+        metrics,
+        "blurred_luma_absolute_error_sum",
+        pixels * 255,
+        code,
+    )
+    mean_absolute_error_ppm = _ratio_ppm(
+        absolute_error_sum, pixels * 3 * 255
+    )
+    similarity_ppm = max(
+        0, 1_000_000 - mean_absolute_error_ppm
+    )
+    mismatch_ppm = _ratio_ppm(changed_pixels, pixels)
+    blurred_similarity_ppm = max(
+        0,
+        1_000_000
+        - _ratio_ppm(blurred_error_sum, pixels * 255),
+    )
+    for key, expected in (
+        ("mean_absolute_error_ppm", mean_absolute_error_ppm),
+        ("similarity_ppm", similarity_ppm),
+        ("mismatch_ppm", mismatch_ppm),
+        ("blurred_luma_similarity_ppm", blurred_similarity_ppm),
+    ):
+        _require_metric_ppm(metrics, key, expected, code)
+    raster = {
+        "absolute_error_sum": absolute_error_sum,
+        "blurred_luma_absolute_error_sum": blurred_error_sum,
+        "blurred_luma_similarity_ppm": blurred_similarity_ppm,
+        "changed_pixels": changed_pixels,
+        "edge": _metric_mask(
+            metrics, prefix="edge", pixels=pixels, code=code
+        ),
+        "exact_pages": _metric_integer(
+            metrics, "exact_pages", page_count, code
+        ),
+        "foreground": _metric_mask(
+            metrics, prefix="foreground", pixels=pixels, code=code
+        ),
+        "max_channel_delta": _metric_integer(
+            metrics, "max_channel_delta", 255, code
+        ),
+        "mean_absolute_error_ppm": mean_absolute_error_ppm,
+        "mismatch_ppm": mismatch_ppm,
+        "pages": page_count,
+        "pixels": pixels,
+        "similarity_ppm": similarity_ppm,
+        "text_ink": _metric_mask(
+            metrics, prefix="text_ink", pixels=pixels, code=code
+        ),
+    }
+    return {
+        "pages": page_count,
+        "poppler_lines": lines,
+        "poppler_words": words,
+        "raster": raster,
+        "semantic_visible_characters": semantic,
+        "workbooks": 1,
+    }
+
+
+def _new_fidelity_accumulator() -> dict[str, object]:
+    return {
+        "pages": 0,
+        "poppler_lines": {
+            key: 0
+            for key in (
+                "ambiguous_items",
+                "libreoffice_items",
+                "libreoffice_unmatched_items",
+                "matched_items",
+                "rxls_items",
+                "rxls_unmatched_items",
+            )
+        },
+        "poppler_words": {
+            key: 0
+            for key in (
+                "ambiguous_items",
+                "libreoffice_items",
+                "libreoffice_unmatched_items",
+                "matched_items",
+                "rxls_items",
+                "rxls_unmatched_items",
+            )
+        },
+        "raster": {
+            "absolute_error_sum": 0,
+            "blurred_luma_absolute_error_sum": 0,
+            "changed_pixels": 0,
+            "exact_pages": 0,
+            "masks": {
+                prefix: {
+                    key: 0
+                    for key in (
+                        "libreoffice_matched_pixels",
+                        "libreoffice_pixels",
+                        "rxls_matched_pixels",
+                        "rxls_pixels",
+                    )
+                }
+                for prefix in ("edge", "foreground", "text_ink")
+            },
+            "max_channel_delta": 0,
+            "pixels": 0,
+        },
+        "semantic_visible_characters": {
+            key: 0
+            for key in (
+                "libreoffice_items",
+                "matched_items",
+                "rxls_items",
+            )
+        },
+        "workbooks": 0,
+    }
+
+
+def _merge_fidelity(
+    accumulator: dict[str, object],
+    evidence: dict[str, object],
+) -> None:
+    accumulator["workbooks"] += int(evidence["workbooks"])
+    accumulator["pages"] += int(evidence["pages"])
+    for name in (
+        "semantic_visible_characters",
+        "poppler_words",
+        "poppler_lines",
+    ):
+        target = accumulator[name]
+        source = evidence[name]
+        for key in target:
+            target[key] += int(source[key])
+    target_raster = accumulator["raster"]
+    source_raster = evidence["raster"]
+    for key in (
+        "absolute_error_sum",
+        "blurred_luma_absolute_error_sum",
+        "changed_pixels",
+        "exact_pages",
+        "pixels",
+    ):
+        target_raster[key] += int(source_raster[key])
+    target_raster["max_channel_delta"] = max(
+        int(target_raster["max_channel_delta"]),
+        int(source_raster["max_channel_delta"]),
+    )
+    for prefix in ("edge", "foreground", "text_ink"):
+        for key in target_raster["masks"][prefix]:
+            target_raster["masks"][prefix][key] += int(
+                source_raster[prefix][key]
+            )
+
+
+def _finish_fidelity(
+    accumulator: dict[str, object],
+) -> dict[str, object]:
+    words = accumulator["poppler_words"]
+    lines = accumulator["poppler_lines"]
+    semantic = accumulator["semantic_visible_characters"]
+    raster = accumulator["raster"]
+    pixels = int(raster["pixels"])
+    absolute_error_sum = int(raster["absolute_error_sum"])
+    blurred_error_sum = int(
+        raster["blurred_luma_absolute_error_sum"]
+    )
+    mean_absolute_error_ppm = _ratio_ppm(
+        absolute_error_sum,
+        pixels * 3 * 255,
+        empty=0,
+    )
+    return {
+        "pages": int(accumulator["pages"]),
+        "poppler_lines": _text_evidence(
+            int(lines["rxls_items"]),
+            int(lines["libreoffice_items"]),
+            int(lines["matched_items"]),
+            int(lines["ambiguous_items"]),
+            int(lines["rxls_unmatched_items"]),
+            int(lines["libreoffice_unmatched_items"]),
+        ),
+        "poppler_words": _text_evidence(
+            int(words["rxls_items"]),
+            int(words["libreoffice_items"]),
+            int(words["matched_items"]),
+            int(words["ambiguous_items"]),
+            int(words["rxls_unmatched_items"]),
+            int(words["libreoffice_unmatched_items"]),
+        ),
+        "raster": {
+            "absolute_error_sum": absolute_error_sum,
+            "blurred_luma_absolute_error_sum": blurred_error_sum,
+            "blurred_luma_similarity_ppm": (
+                max(
+                    0,
+                    1_000_000
+                    - _ratio_ppm(
+                        blurred_error_sum,
+                        pixels * 255,
+                        empty=0,
+                    ),
+                )
+                if pixels
+                else 1_000_000
+            ),
+            "changed_pixels": int(raster["changed_pixels"]),
+            "edge": _mask_evidence(
+                **raster["masks"]["edge"]
+            ),
+            "exact_pages": int(raster["exact_pages"]),
+            "foreground": _mask_evidence(
+                **raster["masks"]["foreground"]
+            ),
+            "max_channel_delta": int(raster["max_channel_delta"]),
+            "mean_absolute_error_ppm": mean_absolute_error_ppm,
+            "mismatch_ppm": _ratio_ppm(
+                int(raster["changed_pixels"]),
+                pixels,
+                empty=0,
+            ),
+            "pages": int(accumulator["pages"]),
+            "pixels": pixels,
+            "similarity_ppm": (
+                max(0, 1_000_000 - mean_absolute_error_ppm)
+                if pixels
+                else 1_000_000
+            ),
+            "text_ink": _mask_evidence(
+                **raster["masks"]["text_ink"]
+            ),
+        },
+        "semantic_visible_characters": _ratio_evidence(
+            int(semantic["rxls_items"]),
+            int(semantic["libreoffice_items"]),
+            int(semantic["matched_items"]),
+        ),
+        "workbooks": int(accumulator["workbooks"]),
+    }
 
 
 def _point_fraction(
@@ -1589,6 +2213,98 @@ def _empty_page_box_geometry() -> dict[str, object]:
     }
 
 
+def _case_id_key(value: bytes | None) -> bytes:
+    key = secrets.token_bytes(CASE_ID_KEY_BYTES) if value is None else value
+    if type(key) is not bytes or len(key) != CASE_ID_KEY_BYTES:
+        raise SummaryError("case_id_key")
+    return key
+
+
+def _opaque_case_id(workbook_digest: str, case_id_key: bytes) -> str:
+    if (
+        HASH_RE.fullmatch(workbook_digest) is None
+        or type(case_id_key) is not bytes
+        or len(case_id_key) != CASE_ID_KEY_BYTES
+    ):
+        raise SummaryError("case_id")
+    return hmac.new(
+        case_id_key,
+        CASE_ID_DOMAIN + bytes.fromhex(workbook_digest),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _case_page_box(
+    pages: Sequence[dict[str, Fraction]],
+) -> dict[str, object]:
+    accumulator = _new_page_box_geometry_accumulator()
+    _merge_page_box_geometry_workbook(accumulator, pages)
+    return _finish_page_box_geometry_cohort(
+        accumulator,
+        include_histogram=True,
+    )
+
+
+def _case_diagnostic(
+    row: dict[str, Any],
+    fidelity: dict[str, object],
+    point_pages: Sequence[dict[str, Fraction]],
+    case_id_key: bytes,
+) -> dict[str, object]:
+    digest = row.get("sha256")
+    format_name = row.get("format")
+    if (
+        not isinstance(digest, str)
+        or not isinstance(format_name, str)
+        or format_name not in FORMATS
+    ):
+        raise SummaryError("case_id")
+    return {
+        "case_id": _opaque_case_id(digest, case_id_key),
+        "format": format_name,
+        "page_box": _case_page_box(point_pages),
+        "poppler_lines": copy.deepcopy(
+            fidelity["poppler_lines"]
+        ),
+        "poppler_words": copy.deepcopy(
+            fidelity["poppler_words"]
+        ),
+        "raster": copy.deepcopy(fidelity["raster"]),
+        "semantic_visible_characters": copy.deepcopy(
+            fidelity["semantic_visible_characters"]
+        ),
+    }
+
+
+def _finish_case_diagnostics(
+    cases: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    ordered = sorted(cases, key=lambda case: str(case["case_id"]))
+    retained = ordered[:MAX_CASE_DIAGNOSTICS_PER_REPORT]
+    available_by_format = Counter(
+        str(case["format"]) for case in ordered
+    )
+    retained_by_format = Counter(
+        str(case["format"]) for case in retained
+    )
+    return {
+        "available_cases": len(ordered),
+        "available_cases_by_format": dict(
+            sorted(available_by_format.items())
+        ),
+        "cases": retained,
+        "retained_cases": len(retained),
+        "retained_cases_by_format": dict(
+            sorted(retained_by_format.items())
+        ),
+        "truncated": len(retained) != len(ordered),
+    }
+
+
+def _empty_case_diagnostics() -> dict[str, object]:
+    return _finish_case_diagnostics(())
+
+
 def _empty_geometry() -> dict[str, object]:
     return {
         "by_delta": {
@@ -1868,6 +2584,13 @@ def _empty(label: str) -> dict[str, object]:
         "by_feature": {},
         "by_format": {},
         "by_status": {},
+        "case_diagnostics": _empty_case_diagnostics(),
+        "fidelity": {
+            "all": _finish_fidelity(
+                _new_fidelity_accumulator()
+            ),
+            "by_format": {},
+        },
         "geometry": _empty_geometry(),
         "label": label,
         "line_geometry": _empty_text_geometry(),
@@ -1879,7 +2602,11 @@ def _empty(label: str) -> dict[str, object]:
 
 
 def _summarize_label(
-    root: Path, profile: str, label: str, remaining: int
+    root: Path,
+    profile: str,
+    label: str,
+    remaining: int,
+    case_id_key: bytes,
 ) -> tuple[dict[str, object], int]:
     paths = _paths(root, profile, label)
     if LANES[profile][label] == 0:
@@ -1955,6 +2682,9 @@ def _summarize_label(
     line_geometry_all = _new_text_geometry_accumulator()
     word_geometry_by_format: dict[str, dict[str, object]] = {}
     line_geometry_by_format: dict[str, dict[str, object]] = {}
+    fidelity_all = _new_fidelity_accumulator()
+    fidelity_by_format: dict[str, dict[str, object]] = {}
+    case_diagnostics: list[dict[str, object]] = []
     text_geometry_pages = 0
     text_geometry_histogram_buckets = 0
     for row in rows:
@@ -1976,11 +2706,15 @@ def _summarize_label(
         if status in METRIC_BEARING_STATUSES:
             row_geometry = _row_point_geometry(row)
             text_geometry = _row_unique_text_geometry(row)
+            row_fidelity = _row_fidelity(row)
         else:
             row_geometry = None
             text_geometry = None
+            row_fidelity = None
         if status in METRIC_BEARING_STATUSES and (
-            row_geometry is None or text_geometry is None
+            row_geometry is None
+            or text_geometry is None
+            or row_fidelity is None
         ):
             raise SummaryError("metric_geometry_missing")
         if text_geometry is not None:
@@ -2060,6 +2794,20 @@ def _summarize_label(
                     line_geometry_all, line_page
                 )
                 _merge_text_geometry_page(line_format, line_page)
+        if row_fidelity is not None and row_geometry is not None:
+            fidelity_format = fidelity_by_format.setdefault(
+                fmt, _new_fidelity_accumulator()
+            )
+            _merge_fidelity(fidelity_all, row_fidelity)
+            _merge_fidelity(fidelity_format, row_fidelity)
+            case_diagnostics.append(
+                _case_diagnostic(
+                    row,
+                    row_fidelity,
+                    row_geometry[0],
+                    case_id_key,
+                )
+            )
 
     def groups(values: dict[str, Counter[str]]) -> dict[str, object]:
         return {
@@ -2075,6 +2823,18 @@ def _summarize_label(
         "by_feature": groups(features),
         "by_format": groups(formats),
         "by_status": dict(sorted(statuses.items())),
+        "case_diagnostics": _finish_case_diagnostics(
+            case_diagnostics
+        ),
+        "fidelity": {
+            "all": _finish_fidelity(fidelity_all),
+            "by_format": {
+                fmt: _finish_fidelity(accumulator)
+                for fmt, accumulator in sorted(
+                    fidelity_by_format.items()
+                )
+            },
+        },
         "geometry": geometry,
         "label": label,
         "line_geometry": {
@@ -2230,6 +2990,73 @@ def _validate_geometry_output(
     }
 
 
+def _integer_cohort_sum_is_feasible(
+    *,
+    count: int,
+    nonzero_count: int,
+    total: int,
+    minimum: int,
+    maximum: int,
+    required: Sequence[int],
+) -> bool:
+    """Return whether exact integer counters can realize a bounded cohort."""
+
+    required_nonzero = sum(value != 0 for value in required)
+    required_zero = len(required) - required_nonzero
+    remaining_count = count - len(required)
+    remaining_nonzero = nonzero_count - required_nonzero
+    remaining_zero = count - nonzero_count - required_zero
+    if (
+        remaining_count < 0
+        or remaining_nonzero < 0
+        or remaining_zero < 0
+        or remaining_nonzero + remaining_zero != remaining_count
+        or any(value < minimum or value > maximum for value in required)
+        or (remaining_zero > 0 and not minimum <= 0 <= maximum)
+    ):
+        return False
+    target = total - sum(required)
+    if remaining_nonzero == 0:
+        return target == 0
+    if minimum > 0:
+        return (
+            remaining_nonzero * minimum
+            <= target
+            <= remaining_nonzero * maximum
+        )
+    if maximum < 0:
+        return (
+            remaining_nonzero * minimum
+            <= target
+            <= remaining_nonzero * maximum
+        )
+    if minimum == 0:
+        return (
+            remaining_nonzero
+            <= target
+            <= remaining_nonzero * maximum
+        )
+    if maximum == 0:
+        return (
+            remaining_nonzero * minimum
+            <= target
+            <= -remaining_nonzero
+        )
+    for positive_count in range(remaining_nonzero + 1):
+        negative_count = remaining_nonzero - positive_count
+        minimum_sum = (
+            positive_count
+            + negative_count * minimum
+        )
+        maximum_sum = (
+            positive_count * maximum
+            - negative_count
+        )
+        if minimum_sum <= target <= maximum_sum:
+            return True
+    return False
+
+
 def _validate_page_box_geometry_cohort(
     value: object,
     *,
@@ -2348,6 +3175,18 @@ def _validate_page_box_geometry_cohort(
                 and not minimum <= 0 <= maximum
             ):
                 raise SummaryError(code)
+            required_extrema = [minimum]
+            if maximum != minimum:
+                required_extrema.append(maximum)
+            if not _integer_cohort_sum_is_feasible(
+                count=pages,
+                nonzero_count=nonzero_pages,
+                total=total_delta,
+                minimum=minimum,
+                maximum=maximum,
+                required=required_extrema,
+            ):
+                raise SummaryError(code)
         if histogram is not None:
             _validate_page_box_histogram_aggregates(
                 histogram,
@@ -2439,7 +3278,7 @@ def _validate_page_box_geometry_output(
     feature_workbooks: dict[str, int],
     allowed_features: frozenset[str],
     point_geometry: dict[str, object],
-) -> None:
+) -> dict[str, object]:
     code = "output_page_box_geometry"
     if (
         not isinstance(value, dict)
@@ -2548,6 +3387,10 @@ def _validate_page_box_geometry_output(
                 )
             ):
                 raise SummaryError(code)
+    return {
+        "all": all_cohort,
+        "by_format": format_cohorts,
+    }
 
 
 def _validate_text_geometry_cohort(
@@ -2754,13 +3597,891 @@ def _validate_text_geometry_output(
     }
 
 
+def _validate_ratio_output(
+    value: object,
+    *,
+    maximum: int,
+    code: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != FIDELITY_RATIO_KEYS:
+        raise SummaryError(code)
+    expected = _ratio_evidence(
+        _integer(value["rxls_items"], code, maximum),
+        _integer(value["libreoffice_items"], code, maximum),
+        _integer(value["matched_items"], code, maximum),
+    )
+    if not type_exact_equal(value, expected):
+        raise SummaryError(code)
+    return expected
+
+
+def _validate_text_output(
+    value: object,
+    *,
+    maximum: int,
+    code: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != FIDELITY_TEXT_KEYS:
+        raise SummaryError(code)
+    expected = _text_evidence(
+        _integer(value["rxls_items"], code, maximum),
+        _integer(value["libreoffice_items"], code, maximum),
+        _integer(value["matched_items"], code, maximum),
+        _integer(value["ambiguous_items"], code, maximum),
+        _integer(value["rxls_unmatched_items"], code, maximum),
+        _integer(
+            value["libreoffice_unmatched_items"], code, maximum
+        ),
+    )
+    if not type_exact_equal(value, expected):
+        raise SummaryError(code)
+    return expected
+
+
+def _validate_mask_output(
+    value: object,
+    *,
+    pixels: int,
+    code: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != FIDELITY_MASK_KEYS:
+        raise SummaryError(code)
+    expected = _mask_evidence(
+        _integer(value["rxls_pixels"], code, pixels),
+        _integer(value["libreoffice_pixels"], code, pixels),
+        _integer(value["rxls_matched_pixels"], code, pixels),
+        _integer(
+            value["libreoffice_matched_pixels"], code, pixels
+        ),
+    )
+    if not type_exact_equal(value, expected):
+        raise SummaryError(code)
+    return expected
+
+
+def _validate_raster_raw_relationships(
+    *,
+    pages: int,
+    pixels: int,
+    changed_pixels: int,
+    absolute_error_sum: int,
+    blurred_error_sum: int,
+    exact_pages: int,
+    max_channel_delta: int,
+    code: str,
+) -> None:
+    """Reject raw raster counters that cannot describe one page cohort."""
+
+    nonexact_pages = pages - exact_pages
+    if (
+        (pages == 0) != (pixels == 0)
+        or pixels < pages
+        or changed_pixels > pixels
+        or exact_pages > pages
+        or changed_pixels < nonexact_pages
+        or changed_pixels
+        > nonexact_pages * MAX_RASTER_PIXELS_PER_PAGE
+        or pixels - changed_pixels < exact_pages
+        or (changed_pixels == 0) != (nonexact_pages == 0)
+        or (changed_pixels == 0)
+        != (absolute_error_sum == 0)
+        or (changed_pixels == 0)
+        != (max_channel_delta == 0)
+        or (
+            changed_pixels == 0
+            and blurred_error_sum != 0
+        )
+        or blurred_error_sum > pixels * max_channel_delta
+        or (
+            changed_pixels > 0
+            and (
+                absolute_error_sum
+                < max(changed_pixels, max_channel_delta)
+                or absolute_error_sum
+                > changed_pixels * 3 * max_channel_delta
+            )
+        )
+    ):
+        raise SummaryError(code)
+
+
+def _validate_raster_masks(
+    *,
+    pages: int,
+    pixels: int,
+    exact_pages: int,
+    masks: Iterable[dict[str, int]],
+    code: str,
+) -> None:
+    """Bound every derived-mask difference to nonexact page capacity."""
+
+    nonexact_pixel_limit = min(
+        pixels - exact_pages,
+        (pages - exact_pages) * MAX_RASTER_PIXELS_PER_PAGE,
+    )
+    for mask in masks:
+        rxls_pixels = int(mask["rxls_pixels"])
+        libreoffice_pixels = int(mask["libreoffice_pixels"])
+        rxls_matched = int(mask["rxls_matched_pixels"])
+        libreoffice_matched = int(
+            mask["libreoffice_matched_pixels"]
+        )
+        if (
+            abs(rxls_pixels - libreoffice_pixels)
+            > nonexact_pixel_limit
+            or rxls_pixels - rxls_matched
+            > nonexact_pixel_limit
+            or libreoffice_pixels - libreoffice_matched
+            > nonexact_pixel_limit
+            or abs(rxls_matched - libreoffice_matched)
+            > nonexact_pixel_limit
+        ):
+            raise SummaryError(code)
+
+
+def _validate_raster_output(
+    value: object,
+    *,
+    pages: int,
+    code: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != FIDELITY_RASTER_KEYS:
+        raise SummaryError(code)
+    if _integer(value["pages"], code, pages) != pages:
+        raise SummaryError(code)
+    pixel_limit = pages * MAX_RASTER_PIXELS_PER_PAGE
+    pixels = _integer(value["pixels"], code, pixel_limit)
+    if (pages == 0) != (pixels == 0):
+        raise SummaryError(code)
+    changed_pixels = _integer(
+        value["changed_pixels"], code, pixels
+    )
+    absolute_error_sum = _integer(
+        value["absolute_error_sum"], code, pixels * 3 * 255
+    )
+    blurred_error_sum = _integer(
+        value["blurred_luma_absolute_error_sum"],
+        code,
+        pixels * 255,
+    )
+    exact_pages = _integer(
+        value["exact_pages"], code, pages
+    )
+    max_channel_delta = _integer(
+        value["max_channel_delta"], code, 255
+    )
+    _validate_raster_raw_relationships(
+        pages=pages,
+        pixels=pixels,
+        changed_pixels=changed_pixels,
+        absolute_error_sum=absolute_error_sum,
+        blurred_error_sum=blurred_error_sum,
+        exact_pages=exact_pages,
+        max_channel_delta=max_channel_delta,
+        code=code,
+    )
+    mean_absolute_error_ppm = _ratio_ppm(
+        absolute_error_sum,
+        pixels * 3 * 255,
+        empty=0,
+    )
+    masks = {
+        "edge": _validate_mask_output(
+            value["edge"], pixels=pixels, code=code
+        ),
+        "foreground": _validate_mask_output(
+            value["foreground"], pixels=pixels, code=code
+        ),
+        "text_ink": _validate_mask_output(
+            value["text_ink"], pixels=pixels, code=code
+        ),
+    }
+    _validate_raster_masks(
+        pages=pages,
+        pixels=pixels,
+        exact_pages=exact_pages,
+        masks=masks.values(),
+        code=code,
+    )
+    expected = {
+        "absolute_error_sum": absolute_error_sum,
+        "blurred_luma_absolute_error_sum": blurred_error_sum,
+        "blurred_luma_similarity_ppm": (
+            max(
+                0,
+                1_000_000
+                - _ratio_ppm(
+                    blurred_error_sum,
+                    pixels * 255,
+                    empty=0,
+                ),
+            )
+            if pixels
+            else 1_000_000
+        ),
+        "changed_pixels": changed_pixels,
+        "edge": masks["edge"],
+        "exact_pages": exact_pages,
+        "foreground": masks["foreground"],
+        "max_channel_delta": max_channel_delta,
+        "mean_absolute_error_ppm": mean_absolute_error_ppm,
+        "mismatch_ppm": _ratio_ppm(
+            changed_pixels, pixels, empty=0
+        ),
+        "pages": pages,
+        "pixels": pixels,
+        "similarity_ppm": (
+            max(0, 1_000_000 - mean_absolute_error_ppm)
+            if pixels
+            else 1_000_000
+        ),
+        "text_ink": masks["text_ink"],
+    }
+    if not type_exact_equal(value, expected):
+        raise SummaryError(code)
+    return expected
+
+
+def _validate_fidelity_cohort(
+    value: object,
+    *,
+    workbook_limit: int,
+    code: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != FIDELITY_COHORT_KEYS:
+        raise SummaryError(code)
+    workbooks = _integer(value["workbooks"], code, workbook_limit)
+    pages = _integer(
+        value["pages"], code, workbooks * MAX_PAGE_COUNT
+    )
+    if (
+        (workbooks == 0) != (pages == 0)
+        or (workbooks > 0 and pages < workbooks)
+    ):
+        raise SummaryError(code)
+    expected = {
+        "pages": pages,
+        "poppler_lines": _validate_text_output(
+            value["poppler_lines"],
+            maximum=pages * MAX_POPPLER_ITEMS_PER_PAGE,
+            code=code,
+        ),
+        "poppler_words": _validate_text_output(
+            value["poppler_words"],
+            maximum=pages * MAX_POPPLER_ITEMS_PER_PAGE,
+            code=code,
+        ),
+        "raster": _validate_raster_output(
+            value["raster"], pages=pages, code=code
+        ),
+        "semantic_visible_characters": _validate_ratio_output(
+            value["semantic_visible_characters"],
+            maximum=workbooks
+            * MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK,
+            code=code,
+        ),
+        "workbooks": workbooks,
+    }
+    if not type_exact_equal(value, expected):
+        raise SummaryError(code)
+    return expected
+
+
+def _validate_fidelity_output(
+    value: object,
+    *,
+    total: int,
+    format_workbooks: dict[str, int],
+    metric_format_cohorts: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    code = "output_fidelity"
+    if not isinstance(value, dict) or set(value) != FIDELITY_OUTPUT_KEYS:
+        raise SummaryError(code)
+    all_cohort = _validate_fidelity_cohort(
+        value["all"], workbook_limit=total, code=code
+    )
+    by_format = value["by_format"]
+    if (
+        not isinstance(by_format, dict)
+        or set(by_format) != set(metric_format_cohorts)
+        or any(
+            not isinstance(name, str) or name not in FORMATS
+            for name in by_format
+        )
+    ):
+        raise SummaryError(code)
+    cohorts = {
+        name: _validate_fidelity_cohort(
+            cohort,
+            workbook_limit=format_workbooks.get(name, 0),
+            code=code,
+        )
+        for name, cohort in by_format.items()
+    }
+    if any(
+        cohort["workbooks"]
+        != metric_format_cohorts[name]["workbooks"]
+        or cohort["pages"]
+        != metric_format_cohorts[name]["pages"]
+        for name, cohort in cohorts.items()
+    ):
+        raise SummaryError(code)
+    accumulator = _new_fidelity_accumulator()
+    for cohort in cohorts.values():
+        _merge_fidelity(accumulator, cohort)
+    if not type_exact_equal(
+        _finish_fidelity(accumulator), all_cohort
+    ):
+        raise SummaryError(code)
+    return {
+        "all": all_cohort,
+        "by_format": cohorts,
+    }
+
+
+def _require_fidelity_subset(
+    retained: dict[str, object],
+    total: dict[str, object],
+    code: str,
+) -> None:
+    retained_workbooks = int(retained["workbooks"])
+    total_workbooks = int(total["workbooks"])
+    retained_pages = int(retained["pages"])
+    total_pages = int(total["pages"])
+    if (
+        retained_workbooks > total_workbooks
+        or retained_pages > total_pages
+    ):
+        raise SummaryError(code)
+    residual_workbooks = total_workbooks - retained_workbooks
+    residual_pages = total_pages - retained_pages
+    if (
+        (residual_workbooks == 0) != (residual_pages == 0)
+        or residual_pages < residual_workbooks
+        or residual_pages
+        > residual_workbooks * MAX_PAGE_COUNT
+    ):
+        raise SummaryError(code)
+
+    def residual_values(
+        name: str, keys: Sequence[str]
+    ) -> dict[str, int]:
+        values = {}
+        for key in keys:
+            retained_value = int(retained[name][key])
+            total_value = int(total[name][key])
+            if retained_value > total_value:
+                raise SummaryError(code)
+            values[key] = total_value - retained_value
+        return values
+
+    semantic = residual_values(
+        "semantic_visible_characters",
+        ("rxls_items", "libreoffice_items", "matched_items"),
+    )
+    if any(
+        value
+        > residual_workbooks
+        * MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK
+        for value in semantic.values()
+    ):
+        raise SummaryError(code)
+    _ratio_evidence(
+        semantic["rxls_items"],
+        semantic["libreoffice_items"],
+        semantic["matched_items"],
+    )
+    for name in ("poppler_words", "poppler_lines"):
+        text = residual_values(
+            name,
+            (
+                "rxls_items",
+                "libreoffice_items",
+                "matched_items",
+                "ambiguous_items",
+                "rxls_unmatched_items",
+                "libreoffice_unmatched_items",
+            ),
+        )
+        if any(
+            value
+            > residual_pages * MAX_POPPLER_ITEMS_PER_PAGE
+            for value in text.values()
+        ):
+            raise SummaryError(code)
+        _text_evidence(
+            text["rxls_items"],
+            text["libreoffice_items"],
+            text["matched_items"],
+            text["ambiguous_items"],
+            text["rxls_unmatched_items"],
+            text["libreoffice_unmatched_items"],
+        )
+
+    retained_raster = retained["raster"]
+    total_raster = total["raster"]
+    additive = {}
+    for key in (
+        "absolute_error_sum",
+        "blurred_luma_absolute_error_sum",
+        "changed_pixels",
+        "exact_pages",
+        "pixels",
+    ):
+        retained_value = int(retained_raster[key])
+        total_value = int(total_raster[key])
+        if retained_value > total_value:
+            raise SummaryError(code)
+        additive[key] = total_value - retained_value
+    residual_pixels = additive["pixels"]
+    retained_maximum = int(retained_raster["max_channel_delta"])
+    total_maximum = int(total_raster["max_channel_delta"])
+    if (
+        (residual_pages == 0) != (residual_pixels == 0)
+        or residual_pixels
+        > residual_pages * MAX_RASTER_PIXELS_PER_PAGE
+        or additive["changed_pixels"] > residual_pixels
+        or additive["exact_pages"] > residual_pages
+        or additive["absolute_error_sum"]
+        > residual_pixels * 3 * 255
+        or additive["blurred_luma_absolute_error_sum"]
+        > residual_pixels * 255
+        or retained_maximum > total_maximum
+    ):
+        raise SummaryError(code)
+    residual_changed = additive["changed_pixels"]
+    residual_error = additive["absolute_error_sum"]
+    if residual_changed == 0:
+        if retained_maximum != total_maximum:
+            raise SummaryError(code)
+        residual_maximum = 0
+    else:
+        minimum_feasible_maximum = max(
+            1,
+            (
+                residual_error
+                + residual_changed * 3
+                - 1
+            )
+            // (residual_changed * 3),
+        )
+        maximum_feasible_maximum = min(
+            total_maximum,
+            residual_error,
+        )
+        residual_maximum = (
+            total_maximum
+            if retained_maximum < total_maximum
+            else minimum_feasible_maximum
+        )
+        if not (
+            minimum_feasible_maximum
+            <= residual_maximum
+            <= maximum_feasible_maximum
+        ):
+            raise SummaryError(code)
+    _validate_raster_raw_relationships(
+        pages=residual_pages,
+        pixels=residual_pixels,
+        changed_pixels=residual_changed,
+        absolute_error_sum=residual_error,
+        blurred_error_sum=additive[
+            "blurred_luma_absolute_error_sum"
+        ],
+        exact_pages=additive["exact_pages"],
+        max_channel_delta=residual_maximum,
+        code=code,
+    )
+    residual_masks = []
+    for name in ("edge", "foreground", "text_ink"):
+        mask = {}
+        for key in (
+            "rxls_pixels",
+            "libreoffice_pixels",
+            "rxls_matched_pixels",
+            "libreoffice_matched_pixels",
+        ):
+            retained_value = int(retained_raster[name][key])
+            total_value = int(total_raster[name][key])
+            if retained_value > total_value:
+                raise SummaryError(code)
+            mask[key] = total_value - retained_value
+        if (
+            mask["rxls_pixels"] > residual_pixels
+            or mask["libreoffice_pixels"] > residual_pixels
+        ):
+            raise SummaryError(code)
+        residual_masks.append(_mask_evidence(**mask))
+    _validate_raster_masks(
+        pages=residual_pages,
+        pixels=residual_pixels,
+        exact_pages=additive["exact_pages"],
+        masks=residual_masks,
+        code=code,
+    )
+
+
+def _new_case_page_box_accumulator() -> dict[str, object]:
+    return {
+        "by_axis": {
+            axis: {
+                "histogram": Counter(
+                    {
+                        bucket: 0
+                        for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER
+                    }
+                ),
+                "max_delta_micropoints": None,
+                "min_delta_micropoints": None,
+                "nonzero_pages": 0,
+                "sum_delta_micropoints": 0,
+            }
+            for axis in PAGE_BOX_GEOMETRY_AXES
+        },
+        "pages": 0,
+        "workbooks": 0,
+    }
+
+
+def _merge_case_page_box(
+    accumulator: dict[str, object],
+    cohort: dict[str, object],
+) -> None:
+    accumulator["workbooks"] += int(cohort["workbooks"])
+    accumulator["pages"] += int(cohort["pages"])
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        target = accumulator["by_axis"][axis]
+        source = cohort["by_axis"][axis]
+        target["histogram"].update(source["histogram"])
+        target["nonzero_pages"] += int(source["nonzero_pages"])
+        target["sum_delta_micropoints"] += int(
+            source["sum_delta_micropoints"]
+        )
+        source_minimum = source["min_delta_micropoints"]
+        source_maximum = source["max_delta_micropoints"]
+        if source_minimum is not None:
+            target["min_delta_micropoints"] = (
+                int(source_minimum)
+                if target["min_delta_micropoints"] is None
+                else min(
+                    int(target["min_delta_micropoints"]),
+                    int(source_minimum),
+                )
+            )
+            target["max_delta_micropoints"] = (
+                int(source_maximum)
+                if target["max_delta_micropoints"] is None
+                else max(
+                    int(target["max_delta_micropoints"]),
+                    int(source_maximum),
+                )
+            )
+
+
+def _require_page_box_subset(
+    retained: dict[str, object],
+    total: dict[str, object],
+    code: str,
+) -> None:
+    retained_workbooks = int(retained["workbooks"])
+    total_workbooks = int(total["workbooks"])
+    retained_pages = int(retained["pages"])
+    total_pages = int(total["pages"])
+    residual_workbooks = total_workbooks - retained_workbooks
+    residual_pages = total_pages - retained_pages
+    if (
+        residual_workbooks < 0
+        or residual_pages < 0
+        or (residual_workbooks == 0) != (residual_pages == 0)
+        or residual_pages < residual_workbooks
+        or residual_pages
+        > residual_workbooks * MAX_PAGE_COUNT
+    ):
+        raise SummaryError(code)
+    for axis in PAGE_BOX_GEOMETRY_AXES:
+        retained_axis = retained["by_axis"][axis]
+        total_axis = total["by_axis"][axis]
+        retained_nonzero = int(retained_axis["nonzero_pages"])
+        total_nonzero = int(total_axis["nonzero_pages"])
+        if retained_nonzero > total_nonzero:
+            raise SummaryError(code)
+        residual_nonzero = total_nonzero - retained_nonzero
+        residual_sum = int(
+            total_axis["sum_delta_micropoints"]
+        ) - int(retained_axis["sum_delta_micropoints"])
+        residual_histogram = Counter()
+        for bucket in PAGE_BOX_GEOMETRY_BUCKET_ORDER:
+            count = (
+                int(total_axis["histogram"][bucket])
+                - int(retained_axis["histogram"][bucket])
+            )
+            if count < 0:
+                raise SummaryError(code)
+            residual_histogram[bucket] = count
+        if (
+            sum(residual_histogram.values()) != residual_pages
+            or residual_pages - residual_histogram["zero"]
+            != residual_nonzero
+        ):
+            raise SummaryError(code)
+        if residual_pages == 0:
+            if (
+                residual_nonzero != 0
+                or residual_sum != 0
+                or retained_axis["min_delta_micropoints"]
+                != total_axis["min_delta_micropoints"]
+                or retained_axis["max_delta_micropoints"]
+                != total_axis["max_delta_micropoints"]
+            ):
+                raise SummaryError(code)
+            continue
+        if not 0 <= residual_nonzero <= residual_pages:
+            raise SummaryError(code)
+        total_minimum = int(total_axis["min_delta_micropoints"])
+        total_maximum = int(total_axis["max_delta_micropoints"])
+        retained_minimum = retained_axis["min_delta_micropoints"]
+        retained_maximum = retained_axis["max_delta_micropoints"]
+        if retained_minimum is not None and (
+            int(retained_minimum) < total_minimum
+            or int(retained_maximum) > total_maximum
+        ):
+            raise SummaryError(code)
+        required: list[int] = []
+        if (
+            retained_minimum is None
+            or int(retained_minimum) > total_minimum
+        ):
+            required.append(total_minimum)
+        if (
+            retained_maximum is None
+            or int(retained_maximum) < total_maximum
+        ) and total_maximum not in required:
+            required.append(total_maximum)
+        remaining = residual_histogram.copy()
+        remaining_sum = residual_sum
+        for required_value in required:
+            bucket = _page_box_geometry_bucket(required_value)
+            if (
+                not total_minimum
+                <= required_value
+                <= total_maximum
+                or remaining[bucket] == 0
+            ):
+                raise SummaryError(code)
+            remaining[bucket] -= 1
+            remaining_sum -= required_value
+        minimum_sum = 0
+        maximum_sum = 0
+        for bucket, count in remaining.items():
+            if count == 0:
+                continue
+            lower, upper = PAGE_BOX_GEOMETRY_BUCKET_INTERVALS[
+                bucket
+            ]
+            lower = max(lower, total_minimum)
+            upper = min(upper, total_maximum)
+            if lower > upper:
+                raise SummaryError(code)
+            minimum_sum += lower * count
+            maximum_sum += upper * count
+        if not minimum_sum <= remaining_sum <= maximum_sum:
+            raise SummaryError(code)
+
+
+def _validate_case_diagnostics(
+    value: object,
+    *,
+    fidelity: dict[str, object],
+    page_box_geometry: dict[str, object],
+) -> None:
+    code = "output_case_diagnostics"
+    if not isinstance(value, dict) or set(value) != CASE_DIAGNOSTICS_KEYS:
+        raise SummaryError(code)
+    available = _integer(
+        value["available_cases"],
+        code,
+        int(fidelity["all"]["workbooks"]),
+    )
+    if available != fidelity["all"]["workbooks"]:
+        raise SummaryError(code)
+    expected_available_by_format = {
+        name: int(cohort["workbooks"])
+        for name, cohort in sorted(fidelity["by_format"].items())
+    }
+    if not type_exact_equal(
+        value["available_cases_by_format"],
+        expected_available_by_format,
+    ):
+        raise SummaryError(code)
+    retained = _integer(
+        value["retained_cases"],
+        code,
+        MAX_CASE_DIAGNOSTICS_PER_REPORT,
+    )
+    expected_retained = min(
+        available, MAX_CASE_DIAGNOSTICS_PER_REPORT
+    )
+    cases = value["cases"]
+    if (
+        retained != expected_retained
+        or not isinstance(cases, list)
+        or len(cases) != retained
+        or value["truncated"] is not (
+            retained != available
+        )
+    ):
+        raise SummaryError(code)
+    previous: str | None = None
+    parsed_cases: list[dict[str, object]] = []
+    for case in cases:
+        if not isinstance(case, dict) or set(case) != CASE_DIAGNOSTIC_KEYS:
+            raise SummaryError(code)
+        case_id = case["case_id"]
+        format_name = case["format"]
+        if (
+            not isinstance(case_id, str)
+            or HASH_RE.fullmatch(case_id) is None
+            or (previous is not None and case_id <= previous)
+            or not isinstance(format_name, str)
+            or format_name not in fidelity["by_format"]
+        ):
+            raise SummaryError(code)
+        previous = case_id
+        page_box = _validate_page_box_geometry_cohort(
+            case["page_box"],
+            workbook_limit=1,
+            include_histogram=True,
+        )
+        if page_box["workbooks"] != 1:
+            raise SummaryError(code)
+        page_count = int(page_box["pages"])
+        semantic = _validate_ratio_output(
+            case["semantic_visible_characters"],
+            maximum=MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK,
+            code=code,
+        )
+        words = _validate_text_output(
+            case["poppler_words"],
+            maximum=page_count * MAX_POPPLER_ITEMS_PER_PAGE,
+            code=code,
+        )
+        lines = _validate_text_output(
+            case["poppler_lines"],
+            maximum=page_count * MAX_POPPLER_ITEMS_PER_PAGE,
+            code=code,
+        )
+        parsed_raster = _validate_raster_output(
+            case["raster"],
+            pages=page_count,
+            code=code,
+        )
+        parsed_cases.append(
+            {
+                "format": format_name,
+                "pages": page_count,
+                "page_box": page_box,
+                "poppler_lines": lines,
+                "poppler_words": words,
+                "raster": parsed_raster,
+                "semantic_visible_characters": semantic,
+                "workbooks": 1,
+            }
+        )
+    retained_case_counts = dict(
+        sorted(
+            Counter(
+                str(case["format"]) for case in parsed_cases
+            ).items()
+        )
+    )
+    if not type_exact_equal(
+        value["retained_cases_by_format"],
+        retained_case_counts,
+    ):
+        raise SummaryError(code)
+
+    retained_fidelity = _new_fidelity_accumulator()
+    retained_fidelity_by_format: dict[str, dict[str, object]] = {}
+    retained_page_box = _new_case_page_box_accumulator()
+    retained_page_box_by_format: dict[str, dict[str, object]] = {}
+    for case in parsed_cases:
+        format_name = str(case["format"])
+        _merge_fidelity(retained_fidelity, case)
+        _merge_fidelity(
+            retained_fidelity_by_format.setdefault(
+                format_name, _new_fidelity_accumulator()
+            ),
+            case,
+        )
+        _merge_case_page_box(retained_page_box, case["page_box"])
+        _merge_case_page_box(
+            retained_page_box_by_format.setdefault(
+                format_name, _new_case_page_box_accumulator()
+            ),
+            case["page_box"],
+        )
+    retained_fidelity_output = _finish_fidelity(retained_fidelity)
+    retained_fidelity_formats = {
+        name: _finish_fidelity(accumulator)
+        for name, accumulator in retained_fidelity_by_format.items()
+    }
+    truncated = bool(value["truncated"])
+    if not truncated:
+        if not type_exact_equal(
+            retained_fidelity_output, fidelity["all"]
+        ):
+            raise SummaryError(code)
+    else:
+        _require_fidelity_subset(
+            retained_fidelity_output, fidelity["all"], code
+        )
+    empty_fidelity = _finish_fidelity(
+        _new_fidelity_accumulator()
+    )
+    for name, total_cohort in fidelity["by_format"].items():
+        cohort = retained_fidelity_formats.get(
+            name, empty_fidelity
+        )
+        if not truncated:
+            if not type_exact_equal(cohort, total_cohort):
+                raise SummaryError(code)
+        else:
+            _require_fidelity_subset(
+                cohort, total_cohort, code
+            )
+
+    total_page_box = page_box_geometry["all"]
+    if not truncated:
+        if not type_exact_equal(retained_page_box, total_page_box):
+            raise SummaryError(code)
+    else:
+        _require_page_box_subset(
+            retained_page_box, total_page_box, code
+        )
+    empty_page_box = _new_case_page_box_accumulator()
+    for name, raw_total_cohort in page_box_geometry[
+        "by_format"
+    ].items():
+        cohort = retained_page_box_by_format.get(
+            name, empty_page_box
+        )
+        total_cohort = raw_total_cohort
+        if not truncated:
+            if not type_exact_equal(cohort, total_cohort):
+                raise SummaryError(code)
+        else:
+            _require_page_box_subset(cohort, total_cohort, code)
+
+
 def _validate_output(value: object) -> None:
     """Ensure no unreviewed key or path-like string reached the final JSON."""
 
     top = {
         "baseline_mode",
+        "case_id_policy",
         "geometry_policy",
         "head_sha",
+        "ingestion",
         "profile",
         "reports",
         "schema",
@@ -2770,6 +4491,8 @@ def _validate_output(value: object) -> None:
         "by_feature",
         "by_format",
         "by_status",
+        "case_diagnostics",
+        "fidelity",
         "geometry",
         "label",
         "line_geometry",
@@ -2783,6 +4506,10 @@ def _validate_output(value: object) -> None:
     reports = value.get("reports")
     if (
         value.get("schema") != OUTPUT_SCHEMA
+        or not type_exact_equal(
+            value.get("case_id_policy"),
+            CASE_ID_POLICY,
+        )
         or not type_exact_equal(
             value.get("geometry_policy"),
             TEXT_GEOMETRY_POLICY,
@@ -2801,6 +4528,26 @@ def _validate_output(value: object) -> None:
         raise SummaryError("output_contract")
 
     profile = str(value["profile"])
+    ingestion = value["ingestion"]
+    expected_workbooks = sum(LANES[profile].values())
+    if (
+        not isinstance(ingestion, dict)
+        or set(ingestion) != INGESTION_KEYS
+        or _integer(
+            ingestion.get("expected_workbooks"),
+            "output_ingestion",
+            expected_workbooks,
+        )
+        != expected_workbooks
+        or not isinstance(ingestion.get("status"), str)
+        or ingestion.get("status") not in INGESTION_STATUSES
+    ):
+        raise SummaryError("output_ingestion")
+    received_workbooks = _integer(
+        ingestion.get("received_workbooks"),
+        "output_ingestion",
+        expected_workbooks,
+    )
     allowed_features = (
         FEATURES | DIAGNOSTIC_FEATURES
         if profile == "ooxml-row-diagnostic"
@@ -2931,7 +4678,13 @@ def _validate_output(value: object) -> None:
             )
         ):
             raise SummaryError("output_text_geometry")
-        _validate_page_box_geometry_output(
+        fidelity = _validate_fidelity_output(
+            report["fidelity"],
+            total=total,
+            format_workbooks=format_workbooks,
+            metric_format_cohorts=word_geometry["by_format"],
+        )
+        page_box_geometry = _validate_page_box_geometry_output(
             report["page_box_geometry"],
             total=total,
             metric_format_cohorts=word_geometry["by_format"],
@@ -2939,11 +4692,41 @@ def _validate_output(value: object) -> None:
             allowed_features=allowed_page_box_features,
             point_geometry=point_geometry,
         )
+        _validate_case_diagnostics(
+            report["case_diagnostics"],
+            fidelity=fidelity,
+            page_box_geometry=page_box_geometry,
+        )
+    actual_received = sum(
+        int(report["workbooks"]) for report in reports
+    )
+    if received_workbooks != actual_received:
+        raise SummaryError("output_ingestion")
+    status = ingestion["status"]
+    if (
+        (status == "complete" and actual_received != expected_workbooks)
+        or (
+            status == "partial"
+            and not 0 < actual_received < expected_workbooks
+        )
+        or (status == "unavailable" and actual_received != 0)
+        or (
+            status == "rejected"
+            and (
+                actual_received != 0
+                or any(report != _empty(str(report["label"])) for report in reports)
+            )
+        )
+    ):
+        raise SummaryError("output_ingestion")
 
 
-def summarize(
-    root: Path, *, profile: str, baseline_mode: str, head_sha: str
-) -> dict[str, object]:
+def _validate_invocation(
+    *,
+    profile: str,
+    baseline_mode: str,
+    head_sha: str,
+) -> None:
     if (
         not isinstance(profile, str)
         or profile not in CASES
@@ -2954,21 +4737,30 @@ def summarize(
         or HEAD_RE.fullmatch(head_sha) is None
     ):
         raise SummaryError("invocation")
-    if root.exists() or root.is_symlink():
-        metadata = root.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or root.is_symlink():
-            raise SummaryError("input_root")
-        _validate_namespace(root)
-    consumed = 0
-    reports = []
-    for label in LABELS:
-        report, size = _summarize_label(root, profile, label, MAX_TOTAL_BYTES - consumed)
-        consumed += size
-        reports.append(report)
+
+
+def _summary_document(
+    *,
+    profile: str,
+    baseline_mode: str,
+    head_sha: str,
+    reports: list[dict[str, object]],
+    ingestion_status: str,
+) -> dict[str, object]:
+    expected_workbooks = sum(LANES[profile].values())
+    received_workbooks = sum(
+        int(report["workbooks"]) for report in reports
+    )
     result = {
         "baseline_mode": baseline_mode,
+        "case_id_policy": copy.deepcopy(CASE_ID_POLICY),
         "geometry_policy": copy.deepcopy(TEXT_GEOMETRY_POLICY),
         "head_sha": head_sha,
+        "ingestion": {
+            "expected_workbooks": expected_workbooks,
+            "received_workbooks": received_workbooks,
+            "status": ingestion_status,
+        },
         "profile": profile,
         "reports": reports,
         "schema": OUTPUT_SCHEMA,
@@ -2977,6 +4769,77 @@ def summarize(
     if len(_json(result)) > MAX_OUTPUT_BYTES:
         raise SummaryError("output_size")
     return result
+
+
+def rejected_summary(
+    *,
+    profile: str,
+    baseline_mode: str,
+    head_sha: str,
+) -> dict[str, object]:
+    _validate_invocation(
+        profile=profile,
+        baseline_mode=baseline_mode,
+        head_sha=head_sha,
+    )
+    return _summary_document(
+        profile=profile,
+        baseline_mode=baseline_mode,
+        head_sha=head_sha,
+        reports=[_empty(label) for label in LABELS],
+        ingestion_status="rejected",
+    )
+
+
+def summarize(
+    root: Path,
+    *,
+    profile: str,
+    baseline_mode: str,
+    head_sha: str,
+    _case_id_key_for_test: bytes | None = None,
+) -> dict[str, object]:
+    _validate_invocation(
+        profile=profile,
+        baseline_mode=baseline_mode,
+        head_sha=head_sha,
+    )
+    if root.exists() or root.is_symlink():
+        metadata = root.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or root.is_symlink():
+            raise SummaryError("input_root")
+        _validate_namespace(root)
+    case_id_key = _case_id_key(_case_id_key_for_test)
+    consumed = 0
+    reports = []
+    for label in LABELS:
+        report, size = _summarize_label(
+            root,
+            profile,
+            label,
+            MAX_TOTAL_BYTES - consumed,
+            case_id_key,
+        )
+        consumed += size
+        reports.append(report)
+    received_workbooks = sum(
+        int(report["workbooks"]) for report in reports
+    )
+    expected_workbooks = sum(LANES[profile].values())
+    status = (
+        "complete"
+        if received_workbooks == expected_workbooks
+        else "partial"
+        if received_workbooks
+        else "unavailable"
+    )
+    return _summary_document(
+        profile=profile,
+        baseline_mode=baseline_mode,
+        head_sha=head_sha,
+        reports=reports,
+        ingestion_status=status,
+    )
 
 
 def write_atomic(path: Path, value: object) -> None:
@@ -3025,20 +4888,50 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        write_atomic(
-            args.output,
-            summarize(
-                args.input_root,
+        result = summarize(
+            args.input_root,
+            profile=args.profile,
+            baseline_mode=args.baseline_mode,
+            head_sha=args.head_sha,
+        )
+    except (SummaryError, OSError) as error:
+        if isinstance(error, SummaryError) and str(error) == "invocation":
+            print(
+                "render-oracle-failure-summary: invocation",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            result = rejected_summary(
                 profile=args.profile,
                 baseline_mode=args.baseline_mode,
                 head_sha=args.head_sha,
-            ),
+            )
+            write_atomic(args.output, result)
+        except (SummaryError, OSError) as fallback_error:
+            code = (
+                str(fallback_error)
+                if isinstance(fallback_error, SummaryError)
+                else "filesystem"
+            )
+            print(
+                f"render-oracle-failure-summary: {code}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "render-oracle-failure-summary: "
+            "unsafe_or_incomplete_reports_rejected",
+            file=sys.stderr,
         )
         return 0
+    try:
+        write_atomic(args.output, result)
     except (SummaryError, OSError) as error:
         code = str(error) if isinstance(error, SummaryError) else "filesystem"
         print(f"render-oracle-failure-summary: {code}", file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == "__main__":

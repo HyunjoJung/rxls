@@ -103,7 +103,7 @@ const MAX_BIFF_FONT_RECORD_BYTES: usize = 78;
 const MAX_BIFF_XF_RECORD_BYTES: usize = 20;
 const MAX_BIFF_DEFAULT_COL_WIDTH_CHARS: u16 = 255;
 const MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS: i16 = 8179;
-const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_POINTS: u64 = 64;
+const BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_TWIPS: u32 = 1_280;
 const MIN_BIFF_ROW_HEIGHT_TWIPS: u16 = 2;
 const MAX_BIFF_ROW_HEIGHT_TWIPS: u16 = 8192;
 const BIFF_ROW_FLAG_UNSYNCED: u32 = 1 << 6;
@@ -215,6 +215,7 @@ struct XlsSheetDefaults {
 struct BiffDefaultRowHeight {
     twips: u32,
     hidden: bool,
+    manual: bool,
 }
 
 impl XlsSheetDefaults {
@@ -250,16 +251,15 @@ impl XlsSheetDefaults {
         sheet.imported_default_column_axis_measure = explicit_width_256
             .map(ImportedAxisMeasure::CharacterWidth256)
             .or_else(|| {
-                sheet
-                    .is_worksheet
-                    .then_some(ImportedAxisMeasure::PointRatio(
-                        BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_POINTS,
-                        1,
-                    ))
+                sheet.is_worksheet.then_some(ImportedAxisMeasure::Twips(
+                    BIFF_APPLICATION_DEFAULT_COLUMN_WIDTH_TWIPS,
+                ))
             });
         sheet.biff_application_default_col_width =
             sheet.is_worksheet && explicit_width_256.is_none();
         sheet.default_row_height = self.row_height.map(|height| height.twips as f32 / 20.0);
+        sheet.automatic_default_row_height_candidate =
+            self.row_height.is_some_and(|height| !height.manual);
         sheet.imported_default_row_axis_measure = self
             .row_height
             .map(|height| ImportedAxisMeasure::Twips(height.twips));
@@ -296,6 +296,7 @@ fn parse_biff_default_row_height(data: &[u8]) -> Option<BiffDefaultRowHeight> {
     let flags = u16le(data, 0)?;
     let twips = i16le(data, 2)?;
     let hidden = flags & 0x0002 != 0;
+    let manual = flags & 0x0001 != 0;
     let minimum = if hidden { 0 } else { 1 };
     (minimum..=MAX_BIFF_DEFAULT_ROW_HEIGHT_TWIPS)
         .contains(&twips)
@@ -303,6 +304,7 @@ fn parse_biff_default_row_height(data: &[u8]) -> Option<BiffDefaultRowHeight> {
             Some(BiffDefaultRowHeight {
                 twips: u32::try_from(twips).ok()?,
                 hidden,
+                manual,
             })
         })
         .flatten()
@@ -6189,6 +6191,29 @@ mod tests {
     }
 
     #[test]
+    fn biff_default_row_height_retains_funsynced_manuality() {
+        for (flags, expected_manual) in [(0_u16, false), (0x0001, true)] {
+            let records = vec![(
+                DEFAULTROWHEIGHT,
+                [flags.to_le_bytes(), 300_u16.to_le_bytes()].concat(),
+            )];
+            let workbook = workbook_with_geometry_records(true, &records);
+            let sheet = &workbook.sheets[0];
+
+            assert_eq!(sheet.default_row_height(), Some(15.0));
+            assert_eq!(
+                sheet.imported_default_row_axis_measure(),
+                Some(ImportedAxisMeasure::Twips(300))
+            );
+            assert_eq!(
+                sheet.default_row_height_is_manual(),
+                expected_manual,
+                "DEFAULTROWHEIGHT flags {flags:#06x}"
+            );
+        }
+    }
+
+    #[test]
     fn biff_duplicate_rows_keep_manual_provenance_and_latest_valid_height() {
         for (records, expected) in [
             (
@@ -6315,7 +6340,7 @@ mod tests {
             assert!(sheet.biff_uses_application_default_column_width());
             assert_eq!(
                 sheet.imported_default_column_axis_measure(),
-                Some(ImportedAxisMeasure::PointRatio(64, 1))
+                Some(ImportedAxisMeasure::Twips(1_280))
             );
 
             sheet.set_default_col_width(12.0);

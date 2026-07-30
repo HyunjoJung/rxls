@@ -5492,6 +5492,8 @@ pub enum ChartSeriesStyleLossKind {
     InvalidMarkerSize,
     /// The source line uses a paint or dash mode outside the retained subset.
     UnsupportedLinePaint,
+    /// The source line width is not an OOXML `ST_LineWidth` value.
+    InvalidLineWidth,
 }
 
 /// Bounded visual metadata retained for one imported chart series.
@@ -5510,6 +5512,12 @@ pub struct ChartSeriesStyle {
     pub line_visible: bool,
     /// Explicit RGB line color, or `None` for the chart palette default.
     pub line_color: Option<Color>,
+    /// Retained source-effective line width in EMUs (`1 pt = 12,700 EMUs`).
+    ///
+    /// OOXML constrains `a:ln/@w` to `0..=20,116,800`; chart imports retain
+    /// LibreOffice's 12,700-EMU chart-line default when `a:ln` omits `w`.
+    /// An explicit zero remains a visible device-hairline request.
+    pub line_width_emu: Option<u32>,
     /// Deduplicated typed fallback boundaries observed while importing.
     pub losses: Vec<ChartSeriesStyleLossKind>,
 }
@@ -5521,9 +5529,35 @@ impl Default for ChartSeriesStyle {
             marker_size: None,
             line_visible: true,
             line_color: None,
+            line_width_emu: None,
             losses: Vec::new(),
         }
     }
+}
+
+/// Fill paint retained from an imported chart-space frame.
+///
+/// [`Self::Automatic`] preserves the renderer's authored-chart compatibility
+/// default. Imported OOXML charts use [`Self::NoFill`] or [`Self::Solid`] when
+/// `c:chartSpace/c:spPr` explicitly supplies a supported fill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartFrameFill {
+    /// No supported explicit chart-space fill was retained.
+    #[default]
+    Automatic,
+    /// The chart-space frame explicitly requests `a:noFill`.
+    NoFill,
+    /// The chart-space frame explicitly requests a solid RGB-resolvable fill.
+    Solid(Color),
+}
+
+/// Typed reason that an imported chart-frame style needs a rendering fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChartFrameStyleLossKind {
+    /// The chart-space frame uses a paint outside the retained subset.
+    UnsupportedPaint,
 }
 
 /// Unsupported source-chart construct retained for explicit placeholder rendering.
@@ -5606,6 +5640,18 @@ pub struct DrawingMetadata {
     pub chart_series_caches: Vec<ChartSeriesCache>,
     /// Bounded per-series marker and line metadata in chart-series order.
     pub chart_series_styles: Vec<ChartSeriesStyle>,
+    /// Chart-space frame fill retained from imported OOXML.
+    pub chart_frame_fill: ChartFrameFill,
+    /// Deduplicated typed fallback boundaries for the chart-space frame.
+    pub chart_frame_style_losses: Vec<ChartFrameStyleLossKind>,
+    /// Whether an imported category axis explicitly contains major gridlines.
+    ///
+    /// `None` preserves authored and legacy-reader renderer defaults.
+    pub chart_category_major_gridlines: Option<bool>,
+    /// Whether an imported value axis explicitly contains major gridlines.
+    ///
+    /// `None` preserves authored and legacy-reader renderer defaults.
+    pub chart_value_major_gridlines: Option<bool>,
     /// Unsupported source constructs that require an explicit chart placeholder.
     pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>,
     /// Column versus horizontal-bar orientation for [`ChartKind::Bar`].
@@ -5652,11 +5698,11 @@ pub enum ImportedAxisMeasure {
     MillimeterHundredths(u32),
     /// A positive physical length as a reduced numerator/denominator in points.
     PointRatio(u64, u64),
-    /// Excel character-width units, where 256 units equal one character.
+    /// BIFF character-width units, where 256 units equal one character.
     CharacterWidth256(u32),
-    /// A positive Excel character width as a reduced numerator/denominator.
+    /// A positive OOXML character width as a reduced numerator/denominator.
     CharacterWidthRatio(u64, u64),
-    /// OOXML base-character width, excluding its device-pixel allowance.
+    /// OOXML base-character width, excluding its five device pixels.
     CharacterBaseWidth256(u32),
     /// XLSB standard-digit units, where 256 units equal one digit.
     DigitWidth256(u32),
@@ -5882,6 +5928,11 @@ pub struct Sheet {
     pub(crate) imported_default_column_axis_measure: Option<ImportedAxisMeasure>,
     /// Per-row heights in points, populated by readers and authoring.
     pub(crate) row_heights: BTreeMap<u32, f32>,
+    /// Imported XLSX rows whose retained height is an automatic cached value.
+    ///
+    /// Other readers retain only authoritative per-row heights. In particular,
+    /// XLSB accepts `BrtRowHdr.miyRw` only when its `fUnsynced` flag is set.
+    pub(crate) automatic_row_height_candidates: BTreeSet<u32>,
     /// Exact imported per-row source geometry used only by renderers.
     pub(crate) imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
     /// Exact imported sheet-wide row geometry used only by renderers.
@@ -5904,6 +5955,8 @@ pub struct Sheet {
     pub(crate) blank_styles: BTreeMap<(u32, u16), CellStyle>,
     /// Default row height in points (authoring); `<sheetFormatPr defaultRowHeight>`.
     pub(crate) default_row_height: Option<f32>,
+    /// Whether a retained source default row height is an automatic baseline.
+    pub(crate) automatic_default_row_height_candidate: bool,
     /// Default column width in character units (authoring).
     pub(crate) default_col_width: Option<f32>,
     /// OOXML-only provenance used to distinguish an absent application default
@@ -6288,6 +6341,7 @@ impl Default for Sheet {
             imported_column_axis_measures: BTreeMap::default(),
             imported_default_column_axis_measure: None,
             row_heights: BTreeMap::default(),
+            automatic_row_height_candidates: BTreeSet::default(),
             imported_row_axis_measures: BTreeMap::default(),
             imported_default_row_axis_measure: None,
             hidden_cols: BTreeSet::default(),
@@ -6298,6 +6352,7 @@ impl Default for Sheet {
             default_format: None,
             blank_styles: BTreeMap::default(),
             default_row_height: None,
+            automatic_default_row_height_candidate: false,
             default_col_width: None,
             ooxml_implicit_col_width: OoxmlImplicitColumnWidth::None,
             ooxml_defaulted_base_col_width: false,
@@ -8476,9 +8531,24 @@ impl Sheet {
         self.imported_default_column_axis_measure
     }
 
-    /// Explicit row heights in points, keyed by 0-based row.
+    /// Retained row heights in points, keyed by 0-based row.
+    ///
+    /// XLSX imports may include cached automatic heights; XLSB retains
+    /// `BrtRowHdr.miyRw` only when `fUnsynced` makes it authoritative. Use
+    /// [`Sheet::row_height_is_manual`] when provenance matters.
     pub fn row_heights(&self) -> &BTreeMap<u32, f32> {
         &self.row_heights
+    }
+
+    /// Whether a retained per-row height is a manual geometry override.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`. XLSX rows
+    /// with valid cached heights but without `customHeight` retain source
+    /// geometry while remaining eligible for automatic height expansion.
+    /// Other retained per-row heights are authoritative.
+    #[doc(hidden)]
+    pub fn row_height_is_manual(&self, row: u32) -> bool {
+        self.row_heights.contains_key(&row) && !self.automatic_row_height_candidates.contains(&row)
     }
 
     /// Return exact imported per-row source geometry for renderers.
@@ -8526,6 +8596,15 @@ impl Sheet {
     /// Default row height in points when no explicit height exists.
     pub fn default_row_height(&self) -> Option<f32> {
         self.default_row_height
+    }
+
+    /// Whether a retained sheet-wide default row height is a manual override.
+    ///
+    /// This is an internal cross-crate contract for `rxls-render`. An absent
+    /// default is never manual.
+    #[doc(hidden)]
+    pub fn default_row_height_is_manual(&self) -> bool {
+        self.default_row_height.is_some() && !self.automatic_default_row_height_candidate
     }
 
     /// Whether an imported OOXML worksheet omitted an authoritative default row
@@ -10571,6 +10650,7 @@ impl Sheet {
     /// Set a row height in points.
     pub fn set_row_height(&mut self, row: u32, points: f32) {
         self.row_heights.insert(row, points);
+        self.automatic_row_height_candidates.remove(&row);
         self.imported_row_axis_measures.remove(&row);
         if !self.hidden_rows.contains(&row) {
             if let Some(exceptions) = self.default_hidden_row_exceptions.as_mut() {
@@ -10623,6 +10703,7 @@ impl Sheet {
     /// Set the default row height (points) for rows without an explicit height.
     pub fn set_default_row_height(&mut self, points: f32) {
         self.default_row_height = Some(points);
+        self.automatic_default_row_height_candidate = false;
         self.ooxml_implicit_row_height = OoxmlImplicitRowHeight::None;
         self.biff_application_default_row_height = false;
         self.imported_default_row_axis_measure = None;
@@ -11232,6 +11313,32 @@ mod tests {
         assert_eq!(parse_decimal_scaled_u32("8.43", 256), None);
         assert_eq!(parse_decimal_scaled_u32("4294967295", 1), Some(u32::MAX));
         assert_eq!(parse_decimal_scaled_u32("4294967296", 1), None);
+    }
+
+    #[test]
+    fn authored_row_height_is_always_a_manual_override() {
+        let mut sheet = Sheet::new("manual heights");
+        sheet.automatic_row_height_candidates.insert(2);
+
+        assert!(!sheet.row_height_is_manual(2));
+        sheet.set_row_height(2, 12.0);
+
+        assert!(sheet.row_height_is_manual(2));
+        assert!(!sheet.automatic_row_height_candidates.contains(&2));
+        assert!(!sheet.row_height_is_manual(3));
+    }
+
+    #[test]
+    fn authored_default_row_height_is_always_a_manual_override() {
+        let mut sheet = Sheet::new("manual default height");
+        sheet.default_row_height = Some(15.0);
+        sheet.automatic_default_row_height_candidate = true;
+
+        assert!(!sheet.default_row_height_is_manual());
+        sheet.set_default_row_height(18.0);
+
+        assert!(sheet.default_row_height_is_manual());
+        assert!(!sheet.automatic_default_row_height_candidate);
     }
 
     #[test]

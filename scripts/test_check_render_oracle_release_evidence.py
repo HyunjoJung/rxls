@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check_render_oracle_release_evidence.py"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "render-package-release.yml"
 CORPUS_GENERATOR = ROOT / "scripts" / "generate-render-corpus.py"
+FAILURE_SUMMARY_TEST_SUPPORT = (
+    ROOT / "scripts" / "test_summarize_render_oracle_failure.py"
+)
 
 
 def _load():
@@ -44,6 +47,17 @@ def _load_corpus_generator():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_failure_summary_test_support():
+    spec = importlib.util.spec_from_file_location(
+        "rxls_release_evidence_failure_summary_test_support",
+        FAILURE_SUMMARY_TEST_SUPPORT,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -93,6 +107,240 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
         payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
         path.write_bytes(payload)
         return payload
+
+    def test_failure_summary_validator_is_bound_private_and_fail_closed(
+        self,
+    ) -> None:
+        summarizer = self.checker._load_failure_summarizer()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            path = root / self.checker.FAILURE_SUMMARY_NAME
+            summary = summarizer.rejected_summary(
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=self.head_sha,
+            )
+            path.write_bytes(summarizer._json(summary))
+
+            validated = self.checker.validate_failure_summary(
+                path,
+                head_sha=self.head_sha,
+                profile="pilot",
+                baseline_mode="verify",
+            )
+            self.assertEqual(
+                validated["schema"],
+                self.checker.FAILURE_SUMMARY_SCHEMA,
+            )
+            self.assertEqual(
+                validated["ingestion"]["status"], "rejected"
+            )
+
+            mutations = []
+            value = copy.deepcopy(summary)
+            value["source_url"] = "https://private.invalid/corpus.xlsx"
+            mutations.append(value)
+            value = copy.deepcopy(summary)
+            value["schema"] = "rxls.render-oracle-failure-summary.v9"
+            mutations.append(value)
+            value = copy.deepcopy(summary)
+            value["reports"][0]["case_diagnostics"]["cases"] = [
+                {
+                    "case_id": "a" * 64,
+                    "cell_contents": "private workbook text",
+                }
+            ]
+            mutations.append(value)
+            for index, value in enumerate(mutations):
+                candidate = (
+                    root
+                    / f"candidate-{index}"
+                    / self.checker.FAILURE_SUMMARY_NAME
+                )
+                candidate.parent.mkdir()
+                candidate.write_bytes(summarizer._json(value))
+                with self.assertRaises(self.checker.EvidenceError):
+                    self.checker.validate_failure_summary(
+                        candidate,
+                        head_sha=self.head_sha,
+                        profile="pilot",
+                        baseline_mode="verify",
+                    )
+
+            noncanonical = (
+                root
+                / "noncanonical"
+                / self.checker.FAILURE_SUMMARY_NAME
+            )
+            noncanonical.parent.mkdir()
+            noncanonical.write_text(
+                json.dumps(summary, sort_keys=False),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "failure_summary_canonical",
+            ):
+                self.checker.validate_failure_summary(
+                    noncanonical,
+                    head_sha=self.head_sha,
+                    profile="pilot",
+                    baseline_mode="verify",
+                )
+
+            oversized = (
+                root
+                / "oversized"
+                / self.checker.FAILURE_SUMMARY_NAME
+            )
+            oversized.parent.mkdir()
+            with oversized.open("wb") as output:
+                output.seek(
+                    self.checker.MAX_FAILURE_SUMMARY_BYTES
+                )
+                output.write(b"\n")
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "failure_summary_size",
+            ):
+                self.checker.validate_failure_summary(
+                    oversized,
+                    head_sha=self.head_sha,
+                    profile="pilot",
+                    baseline_mode="verify",
+                )
+
+    def test_failure_summary_consumer_recomputes_case_bindings(
+        self,
+    ) -> None:
+        support = _load_failure_summary_test_support()
+        summarizer = self.checker._load_failure_summarizer()
+        summary = support._summarize_pilot(support._pilot_rows())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            accepted = root / "accepted" / self.checker.FAILURE_SUMMARY_NAME
+            accepted.parent.mkdir()
+            accepted.write_bytes(summarizer._json(summary))
+            self.checker.validate_failure_summary(
+                accepted,
+                head_sha=self.head_sha,
+                profile="pilot",
+                baseline_mode="verify",
+            )
+
+            mutations = {}
+            value = copy.deepcopy(summary)
+            value["case_id_policy"]["algorithm"] = "sha256"
+            mutations["case-id-policy"] = value
+
+            value = copy.deepcopy(summary)
+            diagnostics = value["reports"][1]["case_diagnostics"]
+            format_name = next(
+                iter(diagnostics["available_cases_by_format"])
+            )
+            diagnostics["available_cases_by_format"][format_name] += 1
+            mutations["available-format-count"] = value
+
+            value = copy.deepcopy(summary)
+            case = value["reports"][1]["case_diagnostics"]["cases"][0]
+            case["format"] = (
+                "ods" if case["format"] != "ods" else "xlsx"
+            )
+            mutations["case-format"] = value
+
+            value = copy.deepcopy(summary)
+            value["reports"][1]["case_diagnostics"]["cases"][0][
+                "raster"
+            ]["similarity_ppm"] = 0
+            mutations["case-raster"] = value
+
+            value = copy.deepcopy(summary)
+            axis = value["reports"][1]["case_diagnostics"]["cases"][
+                0
+            ]["page_box"]["by_axis"]["width"]
+            axis.update(
+                {
+                    "max_delta_micropoints": 1,
+                    "min_delta_micropoints": 1,
+                    "nonzero_pages": 1,
+                    "sum_delta_micropoints": 1,
+                }
+            )
+            mutations["case-page-box"] = value
+
+            for name, candidate_value in mutations.items():
+                with self.subTest(name=name):
+                    candidate = (
+                        root
+                        / name
+                        / self.checker.FAILURE_SUMMARY_NAME
+                    )
+                    candidate.parent.mkdir()
+                    candidate.write_bytes(
+                        summarizer._json(candidate_value)
+                    )
+                    with self.assertRaisesRegex(
+                        self.checker.EvidenceError,
+                        "failure_summary_schema",
+                    ):
+                        self.checker.validate_failure_summary(
+                            candidate,
+                            head_sha=self.head_sha,
+                            profile="pilot",
+                            baseline_mode="verify",
+                        )
+
+    def test_rejected_cli_evidence_remains_valid_for_immediate_upload(
+        self,
+    ) -> None:
+        summarizer = self.checker._load_failure_summarizer()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            hosted = root / "hosted"
+            hosted.mkdir()
+            (hosted / "parity-report-a.json").write_text(
+                '{"schema":"unreviewed"}\n',
+                encoding="utf-8",
+            )
+            output = (
+                root
+                / "failure"
+                / self.checker.FAILURE_SUMMARY_NAME
+            )
+            stderr = io.StringIO()
+            with mock.patch.object(
+                summarizer.sys, "stderr", stderr
+            ):
+                result = summarizer.main(
+                    [
+                        "--input-root",
+                        str(hosted),
+                        "--profile",
+                        "pilot",
+                        "--baseline-mode",
+                        "verify",
+                        "--head-sha",
+                        self.head_sha,
+                        "--output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                stderr.getvalue(),
+                "render-oracle-failure-summary: "
+                "unsafe_or_incomplete_reports_rejected\n",
+            )
+            validated = self.checker.validate_failure_summary(
+                output,
+                head_sha=self.head_sha,
+                profile="pilot",
+                baseline_mode="verify",
+            )
+            self.assertEqual(
+                validated["ingestion"]["status"],
+                "rejected",
+            )
 
     def test_hosted_full_generator_derives_each_authoritative_identity(self) -> None:
         manifest, cases = self.corpus_generator.materialize("full")

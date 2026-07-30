@@ -54,6 +54,7 @@ on:
       - "scripts/check-ooxml-row-oracle.py"
       - "scripts/check-render-fidelity-targets.py"
       - "scripts/check-render-parity-baseline.py"
+      - "scripts/check_render_oracle_release_evidence.py"
       - "scripts/check_workflow_policy.py"
       - "scripts/compare-render-parity-runs.py"
       - "scripts/fetch-render-fonts.py"
@@ -77,6 +78,7 @@ on:
       - "scripts/test_check_authored_print_parity.py"
       - "scripts/test_check_render_fidelity_targets.py"
       - "scripts/test_check_render_parity_baseline.py"
+      - "scripts/test_check_render_oracle_release_evidence.py"
       - "scripts/test_fetch_render_fonts.py"
       - "scripts/test_generate_render_corpus.py"
       - "scripts/test_generate_ooxml_row_oracle.py"
@@ -195,6 +197,7 @@ jobs:
           python3 scripts/test_render_oracle_runtime_smoke.py
           python3 scripts/test_render_oracle_host_tools.py
           python3 scripts/test_summarize_render_oracle_failure.py
+          python3 -m unittest scripts.test_check_render_oracle_release_evidence.RenderOracleReleaseEvidenceTests.test_failure_summary_validator_is_bound_private_and_fail_closed
           python3 scripts/test_fetch_render_fonts.py
           python3 scripts/test_generate_render_corpus.py
           python3 scripts/test_generate_ooxml_row_oracle.py
@@ -398,6 +401,19 @@ jobs:
             -- --exact
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact
+      - name: Run the pinned-font SinglePageSheets CLI geometry regression
+        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
+        timeout-minutes: 15
+        shell: bash
+        env:
+          RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json
+          RXLS_TEST_FONT_FAMILY: Arimo
+        run: |
+          set -euo pipefail
+          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
             -- --exact
       - name: Build and inspect the locked oracle image
         shell: bash
@@ -2278,8 +2294,8 @@ jobs:
           compression-level: 9
           if-no-files-found: error
           retention-days: 30
-      - name: Summarize failed Render Oracle reports
-        id: render_oracle_failure_summary
+      - name: Generate and validate sanitized Render Oracle failure evidence
+        id: render_oracle_failure_evidence
         if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         shell: bash
         env:
@@ -2292,10 +2308,27 @@ jobs:
             --baseline-mode "$RXLS_BASELINE_MODE" \
             --head-sha "$EXPECTED_HEAD_SHA" \
             --output target/render-oracle-failure/render-oracle-failure-summary.json
-          cat target/render-oracle-failure/render-oracle-failure-summary.json \
-            >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$EXPECTED_HEAD_SHA" "$RXLS_ORACLE_CAMPAIGN" "$RXLS_BASELINE_MODE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from scripts.check_render_oracle_release_evidence import (
+              validate_failure_summary,
+          )
+
+          validate_failure_summary(
+              Path(
+                  "target/render-oracle-failure/"
+                  "render-oracle-failure-summary.json"
+              ),
+              head_sha=sys.argv[1],
+              profile=sys.argv[2],
+              baseline_mode=sys.argv[3],
+          )
+          PY
       - name: Upload sanitized Render Oracle failure summary
-        if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_summary.outcome == 'success' }}
+        id: render_oracle_failure_upload
+        if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_evidence.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: render-oracle-failure-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2303,3 +2336,44 @@ jobs:
           compression-level: 9
           if-no-files-found: error
           retention-days: 14
+      - name: Append bounded Render Oracle failure overview
+        if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_evidence.outcome == 'success' && steps.render_oracle_failure_upload.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          summary = json.loads(
+              Path(
+                  "target/render-oracle-failure/"
+                  "render-oracle-failure-summary.json"
+              ).read_text(encoding="utf-8")
+          )
+          lines = [
+              "### Sanitized Render Oracle failure evidence",
+              "",
+              (
+                  f"Ingestion: `{summary['ingestion']['status']}`; "
+                  f"received {summary['ingestion']['received_workbooks']} of "
+                  f"{summary['ingestion']['expected_workbooks']} workbooks."
+              ),
+              "",
+              "| Lane | Cases | Semantic F1 | Words F1 | Lines F1 | Raster similarity |",
+              "|---|---:|---:|---:|---:|---:|",
+          ]
+          for report in summary["reports"]:
+              fidelity = report["fidelity"]["all"]
+              lines.append(
+                  f"| {report['label']} | {report['workbooks']} | "
+                  f"{fidelity['semantic_visible_characters']['f1_ppm']} | "
+                  f"{fidelity['poppler_words']['f1_ppm']} | "
+                  f"{fidelity['poppler_lines']['f1_ppm']} | "
+                  f"{fidelity['raster']['similarity_ppm']} |"
+              )
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              output.write("\n".join(lines) + "\n")
+          PY

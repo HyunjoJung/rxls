@@ -21,6 +21,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "summarize-render-oracle-failure.py"
 HEAD_SHA = "a" * 40
+TEST_CASE_ID_KEY = b"\x5a" * 32
 
 
 def _load():
@@ -267,9 +268,86 @@ def _with_geometry(
     )
     for page_offset, page in enumerate(pages):
         page["oracle_output_page_index"] = page_offset
+    semantic_rxls = len(pages) * 10
+    semantic_libreoffice = len(pages) * 11
+    semantic_matched = len(pages) * 9
+
+    def ratio_fields(
+        prefix: str,
+        rxls_items: int,
+        libreoffice_items: int,
+        matched_items: int,
+    ) -> dict[str, int]:
+        evidence = MODULE._ratio_evidence(
+            rxls_items, libreoffice_items, matched_items
+        )
+        return {
+            f"{prefix}_{key}": value
+            for key, value in evidence.items()
+        }
+
+    def text_fields(prefix: str) -> dict[str, int]:
+        rxls_items = sum(
+            int(page[f"{prefix}_rxls_items"]) for page in pages
+        )
+        libreoffice_items = sum(
+            int(page[f"{prefix}_libreoffice_items"])
+            for page in pages
+        )
+        matched_items = sum(
+            int(page[f"{prefix}_matched_items"]) for page in pages
+        )
+        evidence = MODULE._text_evidence(
+            rxls_items,
+            libreoffice_items,
+            matched_items,
+            0,
+            rxls_items - matched_items,
+            libreoffice_items - matched_items,
+        )
+        result = {
+            f"{prefix}_{key}": value
+            for key, value in evidence.items()
+        }
+        result[f"{prefix}_candidate_items"] = rxls_items
+        result[f"{prefix}_unmatched_items"] = evidence[
+            "rxls_unmatched_items"
+        ]
+        result[f"{prefix}_match_coverage_ppm"] = evidence[
+            "precision_ppm"
+        ]
+        return result
+
+    def mask_fields(prefix: str) -> dict[str, int]:
+        evidence = MODULE._mask_evidence(0, 0, 0, 0)
+        result = {}
+        for key, value in evidence.items():
+            suffix = (
+                key.replace("_matched_pixels", "_matched_1px")
+                if key
+                in {
+                    "rxls_matched_pixels",
+                    "libreoffice_matched_pixels",
+                }
+                else key
+            )
+            result[f"{prefix}_{suffix}"] = value
+        return result
+
+    pixels = len(pages) * 100
     row["pages"] = pages
     row["metrics"] = {
+        "absolute_error_sum": 0,
+        "blurred_luma_absolute_error_sum": 0,
+        "blurred_luma_similarity_ppm": 1_000_000,
+        "changed_pixels": 0,
+        "exact_pages": len(pages),
+        "max_channel_delta": 0,
+        "mean_absolute_error_ppm": 0,
+        "mismatch_ppm": 0,
         "pages": len(pages),
+        "pixels": pixels,
+        "similarity_ppm": 1_000_000,
         "max_pdf_point_geometry_delta_millipoints": _ceil_scaled(
             direct_max, 1000
         ),
@@ -277,6 +355,17 @@ def _with_geometry(
             crosscheck_max, 1_000_000
         ),
         "pdf_point_geometry_mismatches": mismatch_pages,
+        **ratio_fields(
+            "semantic_codepoint",
+            semantic_rxls,
+            semantic_libreoffice,
+            semantic_matched,
+        ),
+        **text_fields("text_box"),
+        **text_fields("text_line_box"),
+        **mask_fields("edge"),
+        **mask_fields("foreground"),
+        **mask_fields("text_ink"),
     }
     return row
 
@@ -379,6 +468,7 @@ def _summarize_pilot(
             profile="pilot",
             baseline_mode="verify",
             head_sha=HEAD_SHA,
+            _case_id_key_for_test=TEST_CASE_ID_KEY,
         )
 
 
@@ -428,6 +518,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 profile="pilot",
                 baseline_mode="verify",
                 head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
             )
             output = root / MODULE.OUTPUT_NAME
             MODULE.write_atomic(output, summary)
@@ -452,7 +543,15 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["schema"],
-                "rxls.render-oracle-failure-summary.v8",
+                "rxls.render-oracle-failure-summary.v10",
+            )
+            self.assertEqual(
+                summary["ingestion"],
+                {
+                    "expected_workbooks": 44,
+                    "received_workbooks": 44,
+                    "status": "complete",
+                },
             )
             self.assertEqual(parity["by_format"]["xlsx"]["workbooks"], 10)
             self.assertEqual(
@@ -488,7 +587,760 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             self.assertNotIn("private_measurement", rendered)
             self.assertNotIn('"commands"', rendered)
             self.assertNotIn('"path"', rendered)
-            self.assertNotIn('"sha256"', rendered)
+            self.assertNotIn('"sha256":', rendered)
+            self.assertNotIn(TEST_CASE_ID_KEY.hex(), rendered)
+            for row in _pilot_rows():
+                self.assertNotIn(str(row.get("sha256")), rendered)
+
+    def test_fidelity_cohorts_and_case_ids_are_numeric_and_opaque(
+        self,
+    ) -> None:
+        rows = _pilot_rows()
+        summary = _summarize_pilot(rows)
+        parity = summary["reports"][1]
+        fidelity = parity["fidelity"]
+
+        self.assertEqual(fidelity["all"]["workbooks"], 39)
+        self.assertEqual(fidelity["all"]["pages"], 39)
+        self.assertEqual(
+            fidelity["all"]["semantic_visible_characters"],
+            {
+                "f1_ppm": 857143,
+                "libreoffice_items": 429,
+                "matched_items": 351,
+                "precision_ppm": 900000,
+                "recall_ppm": 818182,
+                "rxls_items": 390,
+            },
+        )
+        self.assertEqual(
+            fidelity["all"]["poppler_words"]["rxls_items"], 39
+        )
+        self.assertEqual(
+            fidelity["all"]["poppler_words"]["libreoffice_items"], 78
+        )
+        self.assertEqual(
+            fidelity["all"]["poppler_words"]["f1_ppm"], 0
+        )
+        self.assertEqual(
+            fidelity["all"]["poppler_lines"],
+            fidelity["all"]["poppler_words"],
+        )
+        self.assertEqual(
+            fidelity["all"]["raster"]["similarity_ppm"], 1_000_000
+        )
+        self.assertEqual(
+            fidelity["all"]["raster"]["pixels"], 3900
+        )
+        self.assertEqual(
+            fidelity["by_format"]["ods"]["workbooks"], 9
+        )
+        self.assertEqual(
+            fidelity["by_format"]["xls"]["workbooks"], 10
+        )
+
+        diagnostics = parity["case_diagnostics"]
+        self.assertEqual(diagnostics["available_cases"], 39)
+        self.assertEqual(diagnostics["retained_cases"], 39)
+        self.assertFalse(diagnostics["truncated"])
+        self.assertEqual(
+            diagnostics["available_cases_by_format"],
+            {"ods": 9, "xls": 10, "xlsb": 10, "xlsx": 10},
+        )
+        self.assertEqual(
+            diagnostics["retained_cases_by_format"],
+            diagnostics["available_cases_by_format"],
+        )
+        self.assertTrue(
+            all(
+                set(case["raster"]) == MODULE.FIDELITY_RASTER_KEYS
+                for case in diagnostics["cases"]
+            )
+        )
+        case_ids = [
+            case["case_id"] for case in diagnostics["cases"]
+        ]
+        self.assertEqual(case_ids, sorted(case_ids))
+        self.assertEqual(len(case_ids), len(set(case_ids)))
+        raw_digests = {
+            str(row["sha256"])
+            for row in rows
+            if row["status"] in MODULE.METRIC_BEARING_STATUSES
+        }
+        self.assertTrue(raw_digests.isdisjoint(case_ids))
+        self.assertTrue(
+            all(MODULE.HASH_RE.fullmatch(case_id) for case_id in case_ids)
+        )
+        self.assertEqual(
+            case_ids,
+            sorted(
+                MODULE._opaque_case_id(
+                    str(row["sha256"]), TEST_CASE_ID_KEY
+                )
+                for row in rows
+                if row["status"] in MODULE.METRIC_BEARING_STATUSES
+            ),
+        )
+        alternate_ids = {
+            MODULE._opaque_case_id(str(row["sha256"]), b"\xa5" * 32)
+            for row in rows
+            if row["status"] in MODULE.METRIC_BEARING_STATUSES
+        }
+        self.assertTrue(alternate_ids.isdisjoint(case_ids))
+        self.assertEqual(
+            MODULE.CASE_ID_POLICY,
+            {
+                "algorithm": "hmac-sha256",
+                "correlation": "within_summary_only",
+                "domain": "rxls.render-oracle-failure-case.v1",
+                "input": "domain_separated_workbook_digest",
+                "key": "ephemeral_non_exported",
+                "max_cases_per_report": 64,
+                "selection": "lexicographically_lowest_case_ids",
+            },
+        )
+
+    def test_default_case_id_key_is_ephemeral_and_test_key_is_strict(
+        self,
+    ) -> None:
+        rows = _pilot_rows()
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+            keys = (b"\x11" * 32, b"\x22" * 32)
+            with mock.patch.object(
+                MODULE.secrets,
+                "token_bytes",
+                side_effect=keys,
+            ) as token_bytes:
+                first = MODULE.summarize(
+                    hosted,
+                    profile="pilot",
+                    baseline_mode="verify",
+                    head_sha=HEAD_SHA,
+                )
+                second = MODULE.summarize(
+                    hosted,
+                    profile="pilot",
+                    baseline_mode="verify",
+                    head_sha=HEAD_SHA,
+                )
+
+        self.assertEqual(
+            token_bytes.call_args_list,
+            [mock.call(MODULE.CASE_ID_KEY_BYTES)] * 2,
+        )
+        first_ids = {
+            case["case_id"]
+            for case in first["reports"][1]["case_diagnostics"][
+                "cases"
+            ]
+        }
+        second_ids = {
+            case["case_id"]
+            for case in second["reports"][1]["case_diagnostics"][
+                "cases"
+            ]
+        }
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+        expected_first = {
+            MODULE._opaque_case_id(str(row["sha256"]), keys[0])
+            for row in rows
+            if row["status"] in MODULE.METRIC_BEARING_STATUSES
+        }
+        self.assertEqual(first_ids, expected_first)
+        for key in keys:
+            self.assertNotIn(key.hex(), MODULE._json(first).decode())
+            self.assertNotIn(key.hex(), MODULE._json(second).decode())
+        for invalid in (
+            b"",
+            b"\x00" * 31,
+            b"\x00" * 33,
+            bytearray(32),
+            "not-bytes",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    MODULE.SummaryError, "case_id_key"
+                ):
+                    MODULE._case_id_key(invalid)
+
+    def test_fidelity_and_case_output_contract_is_fail_closed(self) -> None:
+        summary = _summarize_pilot(_pilot_rows())
+        malformed = []
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["fidelity"]["all"][
+            "semantic_visible_characters"
+        ]["f1_ppm"] -= 1
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["case_diagnostics"]["cases"][0][
+            "source_url"
+        ] = "https://private.invalid/customer.xlsx"
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["case_diagnostics"]["cases"][0][
+            "poppler_words"
+        ]["token"] = "private cell contents"
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["case_diagnostics"][
+            "retained_cases"
+        ] -= 1
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["case_diagnostics"]["cases"][0][
+            "case_id"
+        ] = "a" * 63
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        value["reports"][1]["case_diagnostics"]["cases"][0][
+            "raster"
+        ]["similarity_ppm"] = 0
+        malformed.append(value)
+
+        value = copy.deepcopy(summary)
+        case = value["reports"][1]["case_diagnostics"]["cases"][0]
+        case["format"] = (
+            "ods" if case["format"] != "ods" else "xlsx"
+        )
+        malformed.append(value)
+
+        for document in malformed:
+            with self.subTest(document=document):
+                with self.assertRaises(MODULE.SummaryError):
+                    MODULE._validate_output(document)
+
+    def test_raster_raw_page_and_exact_mask_counts_are_feasible(
+        self,
+    ) -> None:
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 2
+        accumulator["pages"] = 2
+        accumulator["raster"]["pixels"] = 1
+        accumulator["raster"]["exact_pages"] = 2
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                MODULE._finish_fidelity(accumulator)["raster"],
+                pages=2,
+                code="test_raster",
+            )
+
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 2
+        accumulator["pages"] = 2
+        accumulator["raster"].update(
+            {
+                "absolute_error_sum": 2,
+                "changed_pixels": 2,
+                "exact_pages": 1,
+                "max_channel_delta": 1,
+                "pixels": 2,
+            }
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                MODULE._finish_fidelity(accumulator)["raster"],
+                pages=2,
+                code="test_raster",
+            )
+
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 2
+        accumulator["pages"] = 2
+        accumulator["raster"].update(
+            {
+                "absolute_error_sum": (
+                    MODULE.MAX_RASTER_PIXELS_PER_PAGE + 1
+                ),
+                "changed_pixels": (
+                    MODULE.MAX_RASTER_PIXELS_PER_PAGE + 1
+                ),
+                "exact_pages": 1,
+                "max_channel_delta": 1,
+                "pixels": MODULE.MAX_RASTER_PIXELS_PER_PAGE + 2,
+            }
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                MODULE._finish_fidelity(accumulator)["raster"],
+                pages=2,
+                code="test_raster",
+            )
+
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 1
+        accumulator["pages"] = 1
+        accumulator["raster"]["pixels"] = 100
+        accumulator["raster"]["exact_pages"] = 1
+        raster = MODULE._finish_fidelity(accumulator)["raster"]
+        raster["edge"] = MODULE._mask_evidence(1, 0, 0, 0)
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                raster,
+                pages=1,
+                code="test_raster",
+            )
+
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 2
+        accumulator["pages"] = 2
+        accumulator["raster"].update(
+            {
+                "absolute_error_sum": 1,
+                "changed_pixels": 1,
+                "exact_pages": 1,
+                "max_channel_delta": 1,
+                "pixels": 2,
+            }
+        )
+        raster = MODULE._finish_fidelity(accumulator)["raster"]
+        raster["foreground"] = MODULE._mask_evidence(2, 0, 0, 0)
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                raster,
+                pages=2,
+                code="test_raster",
+            )
+
+        accumulator = MODULE._new_fidelity_accumulator()
+        accumulator["workbooks"] = 1
+        accumulator["pages"] = 1
+        accumulator["raster"].update(
+            {
+                "absolute_error_sum": 1,
+                "blurred_luma_absolute_error_sum": 101,
+                "changed_pixels": 1,
+                "exact_pages": 0,
+                "max_channel_delta": 1,
+                "pixels": 100,
+            }
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_raster"
+        ):
+            MODULE._validate_raster_output(
+                MODULE._finish_fidelity(accumulator)["raster"],
+                pages=1,
+                code="test_raster",
+            )
+
+    def test_truncated_case_diagnostics_are_strict_aggregate_subsets(
+        self,
+    ) -> None:
+        policy = {
+            **MODULE.CASE_ID_POLICY,
+            "max_cases_per_report": 2,
+        }
+        with (
+            mock.patch.object(
+                MODULE, "MAX_CASE_DIAGNOSTICS_PER_REPORT", 2
+            ),
+            mock.patch.object(MODULE, "CASE_ID_POLICY", policy),
+        ):
+            summary = _summarize_pilot(_pilot_rows())
+            diagnostics = summary["reports"][1]["case_diagnostics"]
+            self.assertTrue(diagnostics["truncated"])
+            self.assertEqual(
+                diagnostics["available_cases_by_format"],
+                {"ods": 9, "xls": 10, "xlsb": 10, "xlsx": 10},
+            )
+            self.assertEqual(
+                sum(diagnostics["retained_cases_by_format"].values()),
+                diagnostics["retained_cases"],
+            )
+            malformed = []
+
+            value = copy.deepcopy(summary)
+            semantic = value["reports"][1]["case_diagnostics"][
+                "cases"
+            ][0]["semantic_visible_characters"]
+            semantic.clear()
+            semantic.update(MODULE._ratio_evidence(1_000, 1_000, 0))
+            malformed.append(value)
+
+            value = copy.deepcopy(summary)
+            oversized = MODULE._new_fidelity_accumulator()
+            oversized["workbooks"] = 1
+            oversized["pages"] = 1
+            oversized["raster"]["pixels"] = 10_000
+            oversized["raster"]["exact_pages"] = 1
+            value["reports"][1]["case_diagnostics"]["cases"][0][
+                "raster"
+            ] = MODULE._finish_fidelity(oversized)["raster"]
+            malformed.append(value)
+
+            value = copy.deepcopy(summary)
+            value["reports"][1]["case_diagnostics"]["cases"][0][
+                "raster"
+            ]["max_channel_delta"] = 1
+            malformed.append(value)
+
+            value = copy.deepcopy(summary)
+            case = value["reports"][1]["case_diagnostics"]["cases"][0]
+            case["format"] = (
+                "ods" if case["format"] != "ods" else "xlsx"
+            )
+            malformed.append(value)
+
+            value = copy.deepcopy(summary)
+            retained_by_format = value["reports"][1][
+                "case_diagnostics"
+            ]["retained_cases_by_format"]
+            format_name = next(iter(retained_by_format))
+            retained_by_format[format_name] += 1
+            malformed.append(value)
+
+            value = copy.deepcopy(summary)
+            report = value["reports"][1]
+            case_axis = report["case_diagnostics"]["cases"][0][
+                "page_box"
+            ]["by_axis"]["width"]
+            total_maximum = report["page_box_geometry"]["all"][
+                "by_axis"
+            ]["width"]["max_delta_micropoints"]
+            replacement = int(total_maximum) + 1
+            case_axis.update(
+                {
+                    "max_delta_micropoints": replacement,
+                    "min_delta_micropoints": replacement,
+                    "nonzero_pages": 1,
+                    "sum_delta_micropoints": replacement,
+                }
+            )
+            malformed.append(value)
+
+            for value in malformed:
+                with self.assertRaises(MODULE.SummaryError):
+                    MODULE._validate_output(value)
+
+    def test_truncated_residuals_must_be_mathematically_realizable(
+        self,
+    ) -> None:
+        def exact_fidelity(
+            *,
+            workbooks: int,
+            pages: int,
+            pixels: int,
+        ) -> dict[str, object]:
+            accumulator = MODULE._new_fidelity_accumulator()
+            accumulator["workbooks"] = workbooks
+            accumulator["pages"] = pages
+            accumulator["raster"]["pixels"] = pixels
+            accumulator["raster"]["exact_pages"] = pages
+            return MODULE._finish_fidelity(accumulator)
+
+        retained_capacity = exact_fidelity(
+            workbooks=1,
+            pages=1,
+            pixels=1,
+        )
+        semantic_capacity_accumulator = (
+            MODULE._new_fidelity_accumulator()
+        )
+        semantic_capacity_accumulator["workbooks"] = 2
+        semantic_capacity_accumulator["pages"] = 2
+        semantic_capacity_accumulator["raster"]["pixels"] = 2
+        semantic_capacity_accumulator["raster"]["exact_pages"] = 2
+        semantic_overflow = (
+            MODULE.MAX_SEMANTIC_CODEPOINTS_PER_WORKBOOK + 1
+        )
+        for key in (
+            "rxls_items",
+            "libreoffice_items",
+            "matched_items",
+        ):
+            semantic_capacity_accumulator[
+                "semantic_visible_characters"
+            ][key] = semantic_overflow
+        semantic_capacity = MODULE._finish_fidelity(
+            semantic_capacity_accumulator
+        )
+        MODULE._validate_fidelity_cohort(
+            semantic_capacity,
+            workbook_limit=2,
+            code="test_residual",
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_fidelity_subset(
+                retained_capacity,
+                semantic_capacity,
+                "test_residual",
+            )
+
+        text_capacity_accumulator = (
+            MODULE._new_fidelity_accumulator()
+        )
+        text_capacity_accumulator["workbooks"] = 2
+        text_capacity_accumulator["pages"] = 2
+        text_capacity_accumulator["raster"]["pixels"] = 2
+        text_capacity_accumulator["raster"]["exact_pages"] = 2
+        text_overflow = MODULE.MAX_POPPLER_ITEMS_PER_PAGE + 1
+        for key in (
+            "rxls_items",
+            "libreoffice_items",
+            "matched_items",
+        ):
+            text_capacity_accumulator["poppler_words"][
+                key
+            ] = text_overflow
+        text_capacity = MODULE._finish_fidelity(
+            text_capacity_accumulator
+        )
+        MODULE._validate_fidelity_cohort(
+            text_capacity,
+            workbook_limit=2,
+            code="test_residual",
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_fidelity_subset(
+                retained_capacity,
+                text_capacity,
+                "test_residual",
+            )
+
+        raster_capacity = exact_fidelity(
+            workbooks=2,
+            pages=2,
+            pixels=MODULE.MAX_RASTER_PIXELS_PER_PAGE + 2,
+        )
+        MODULE._validate_fidelity_cohort(
+            raster_capacity,
+            workbook_limit=2,
+            code="test_residual",
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_fidelity_subset(
+                retained_capacity,
+                raster_capacity,
+                "test_residual",
+            )
+
+        retained_accumulator = MODULE._new_fidelity_accumulator()
+        retained_accumulator["workbooks"] = 1
+        retained_accumulator["pages"] = 1
+        retained_accumulator["raster"].update(
+            {
+                "absolute_error_sum": 10,
+                "changed_pixels": 1,
+                "exact_pages": 0,
+                "max_channel_delta": 10,
+                "pixels": 100,
+            }
+        )
+        retained_fidelity = MODULE._finish_fidelity(
+            retained_accumulator
+        )
+        total_accumulator = MODULE._new_fidelity_accumulator()
+        total_accumulator["workbooks"] = 2
+        total_accumulator["pages"] = 2
+        total_accumulator["raster"].update(
+            {
+                "absolute_error_sum": 11,
+                "changed_pixels": 1,
+                "exact_pages": 1,
+                "max_channel_delta": 10,
+                "pixels": 200,
+            }
+        )
+        total_fidelity = MODULE._finish_fidelity(
+            total_accumulator
+        )
+        MODULE._validate_fidelity_cohort(
+            retained_fidelity,
+            workbook_limit=1,
+            code="test_residual",
+        )
+        MODULE._validate_fidelity_cohort(
+            total_fidelity,
+            workbook_limit=2,
+            code="test_residual",
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_fidelity_subset(
+                retained_fidelity,
+                total_fidelity,
+                "test_residual",
+            )
+
+        retained_page_capacity = exact_fidelity(
+            workbooks=64,
+            pages=64,
+            pixels=64,
+        )
+        total_page_capacity = exact_fidelity(
+            workbooks=65,
+            pages=65 * MODULE.MAX_PAGE_COUNT,
+            pixels=65 * MODULE.MAX_PAGE_COUNT,
+        )
+        MODULE._validate_fidelity_cohort(
+            retained_page_capacity,
+            workbook_limit=64,
+            code="test_residual",
+        )
+        MODULE._validate_fidelity_cohort(
+            total_page_capacity,
+            workbook_limit=65,
+            code="test_residual",
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_fidelity_subset(
+                retained_page_capacity,
+                total_page_capacity,
+                "test_residual",
+            )
+
+        def page_box(
+            *,
+            workbooks: int,
+            width_values: list[int],
+        ) -> dict[str, object]:
+            def axis(values: list[int]) -> dict[str, object]:
+                histogram = Counter(
+                    MODULE._page_box_geometry_bucket(value)
+                    for value in values
+                )
+                return {
+                    "histogram": [
+                        histogram[bucket]
+                        for bucket in MODULE.PAGE_BOX_GEOMETRY_BUCKET_ORDER
+                    ],
+                    "max_delta_micropoints": max(values),
+                    "min_delta_micropoints": min(values),
+                    "nonzero_pages": sum(value != 0 for value in values),
+                    "sum_delta_micropoints": sum(values),
+                }
+
+            return {
+                "by_axis": {
+                    "height": axis([0] * len(width_values)),
+                    "width": axis(width_values),
+                },
+                "pages": len(width_values),
+                "workbooks": workbooks,
+            }
+
+        retained_page_box = page_box(
+            workbooks=1,
+            width_values=[-1, -1],
+        )
+        total_page_box = page_box(
+            workbooks=2,
+            width_values=[-1, 1, 1, 1, 0, 0],
+        )
+        retained_page_box = MODULE._validate_page_box_geometry_cohort(
+            retained_page_box,
+            workbook_limit=1,
+            include_histogram=True,
+        )
+        total_page_box = MODULE._validate_page_box_geometry_cohort(
+            total_page_box,
+            workbook_limit=2,
+            include_histogram=True,
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_page_box_subset(
+                retained_page_box,
+                total_page_box,
+                "test_residual",
+            )
+
+        retained_absent_bucket = (
+            MODULE._validate_page_box_geometry_cohort(
+                page_box(
+                    workbooks=1,
+                    width_values=[-3_000_000],
+                ),
+                workbook_limit=1,
+                include_histogram=True,
+            )
+        )
+        total_without_bucket = (
+            MODULE._validate_page_box_geometry_cohort(
+                page_box(
+                    workbooks=2,
+                    width_values=[
+                        -6_000_000,
+                        -6_000_000,
+                        -500_000,
+                        -500_000,
+                    ],
+                ),
+                workbook_limit=2,
+                include_histogram=True,
+            )
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_page_box_subset(
+                retained_absent_bucket,
+                total_without_bucket,
+                "test_residual",
+            )
+
+        retained_page_box_capacity = (
+            MODULE._validate_page_box_geometry_cohort(
+                page_box(
+                    workbooks=64,
+                    width_values=[0] * 64,
+                ),
+                workbook_limit=64,
+                include_histogram=True,
+            )
+        )
+        total_page_box_capacity = (
+            MODULE._validate_page_box_geometry_cohort(
+                page_box(
+                    workbooks=65,
+                    width_values=[
+                        0
+                    ]
+                    * (65 * MODULE.MAX_PAGE_COUNT),
+                ),
+                workbook_limit=65,
+                include_histogram=True,
+            )
+        )
+        with self.assertRaisesRegex(
+            MODULE.SummaryError, "test_residual"
+        ):
+            MODULE._require_page_box_subset(
+                retained_page_box_capacity,
+                total_page_box_capacity,
+                "test_residual",
+            )
 
     def test_geometry_summary_is_aggregate_only_and_boundary_exact(self) -> None:
         rows = _pilot_rows()
@@ -1040,7 +1892,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         malformed.append(("format-coverage", value))
 
         value = copy.deepcopy(summary)
-        value["schema"] = "rxls.render-oracle-failure-summary.v7"
+        value["schema"] = "rxls.render-oracle-failure-summary.v9"
         malformed.append(("old-schema", value))
 
         for label, document in malformed:
@@ -1307,9 +2159,6 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         rows_b.reverse()
         for index, row in enumerate(rows_b):
             row["path"] = f"/private/tenant/secret-{index}.xlsx"
-            row["sha256"] = hashlib.sha256(
-                f"replacement-{index}".encode()
-            ).hexdigest()
             row["commands"] = {
                 "stderr": f"private workbook content {index}"
             }
@@ -1332,12 +2181,14 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 profile="pilot",
                 baseline_mode="verify",
                 head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
             )
             summary_b = MODULE.summarize(
                 second,
                 profile="pilot",
                 baseline_mode="verify",
                 head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
             )
 
         self.assertEqual(summary_a, summary_b)
@@ -1345,8 +2196,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         for forbidden in (
             "/private/tenant",
             "private workbook content",
-            "replacement-",
-            '"sha256"',
+            '"sha256":',
             '"path"',
         ):
             self.assertNotIn(forbidden, rendered)
@@ -1526,6 +2376,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 profile="pilot",
                 baseline_mode="verify",
                 head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
             )
 
             _with_geometry(rows[1], [_geometry_page()])
@@ -1538,6 +2389,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                 profile="pilot",
                 baseline_mode="verify",
                 head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
             )
             self.assertEqual(with_incomparable_geometry, summary)
         self.assertEqual(summary["reports"][1]["by_status"]["error"], 2)
@@ -2020,6 +2872,78 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             value["workbooks"] = total
             return value
 
+        def fidelity_cohort(count: int) -> dict[str, object]:
+            accumulator = MODULE._new_fidelity_accumulator()
+            accumulator["workbooks"] = count
+            accumulator["pages"] = count
+            accumulator["raster"]["pixels"] = count * 100
+            accumulator["raster"]["exact_pages"] = count
+            return MODULE._finish_fidelity(accumulator)
+
+        def fidelity(
+            format_counts: dict[str, int],
+        ) -> dict[str, object]:
+            by_format = {
+                format_name: fidelity_cohort(count)
+                for format_name, count in format_counts.items()
+            }
+            accumulator = MODULE._new_fidelity_accumulator()
+            for cohort in by_format.values():
+                MODULE._merge_fidelity(accumulator, cohort)
+            return {
+                "all": MODULE._finish_fidelity(accumulator),
+                "by_format": by_format,
+            }
+
+        def case_diagnostics(
+            label: str,
+            format_counts: dict[str, int],
+        ) -> dict[str, object]:
+            total = sum(format_counts.values())
+            format_name = next(iter(format_counts))
+            single = fidelity_cohort(1)
+            page_box = MODULE._new_page_box_geometry_accumulator()
+            MODULE._merge_page_box_geometry_workbook(
+                page_box, [zero_page]
+            )
+            cases = []
+            for index in range(
+                min(total, MODULE.MAX_CASE_DIAGNOSTICS_PER_REPORT)
+            ):
+                cases.append(
+                    {
+                        "case_id": hashlib.sha256(
+                            f"{label}-{index}".encode()
+                        ).hexdigest(),
+                        "format": format_name,
+                        "page_box": (
+                            MODULE._finish_page_box_geometry_cohort(
+                                page_box,
+                                include_histogram=True,
+                            )
+                        ),
+                        "poppler_lines": single["poppler_lines"],
+                        "poppler_words": single["poppler_words"],
+                        "raster": copy.deepcopy(single["raster"]),
+                        "semantic_visible_characters": single[
+                            "semantic_visible_characters"
+                        ],
+                    }
+                )
+            cases.sort(key=lambda case: case["case_id"])
+            return {
+                "available_cases": total,
+                "available_cases_by_format": copy.deepcopy(
+                    format_counts
+                ),
+                "cases": cases,
+                "retained_cases": len(cases),
+                "retained_cases_by_format": {
+                    format_name: len(cases)
+                },
+                "truncated": len(cases) != total,
+            }
+
         classifications = sorted(MODULE.OUTPUT_CLASSIFICATIONS)
         self.assertIn("page_count_mismatch", classifications)
         ordinary_classifications = [
@@ -2095,6 +3019,11 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                         "compared": len(ordinary_classifications),
                         "error": mismatch_count,
                     },
+                    "case_diagnostics": case_diagnostics(
+                        label,
+                        format_counts,
+                    ),
+                    "fidelity": fidelity(format_counts),
                     "geometry": point_geometry(total),
                     "line_geometry": geometry(format_counts),
                     "page_box_geometry": page_box_geometry(
@@ -2116,8 +3045,14 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
 
         document = {
             "baseline_mode": "candidate",
+            "case_id_policy": MODULE.CASE_ID_POLICY,
             "geometry_policy": MODULE.TEXT_GEOMETRY_POLICY,
             "head_sha": HEAD_SHA,
+            "ingestion": {
+                "expected_workbooks": 1700,
+                "received_workbooks": 1700,
+                "status": "complete",
+            },
             "profile": "full",
             "reports": [
                 report("authored-print", ("xlsx",)),
@@ -2151,8 +3086,14 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             summary,
             {
                 "baseline_mode": "candidate",
+                "case_id_policy": MODULE.CASE_ID_POLICY,
                 "geometry_policy": MODULE.TEXT_GEOMETRY_POLICY,
                 "head_sha": HEAD_SHA,
+                "ingestion": {
+                    "expected_workbooks": 1700,
+                    "received_workbooks": 0,
+                    "status": "unavailable",
+                },
                 "profile": "full",
                 "reports": [
                     MODULE._empty("authored-print"),
@@ -2765,13 +3706,71 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                             str(output),
                         )
                     )
-                self.assertEqual(result, 1)
+                self.assertEqual(result, 0)
                 self.assertEqual(
                     stderr.getvalue(),
-                    "render-oracle-failure-summary: report_unreadable\n",
+                    "render-oracle-failure-summary: "
+                    "unsafe_or_incomplete_reports_rejected\n",
                 )
-                self.assertFalse(output.exists())
+                self.assertTrue(output.is_file())
+                summary = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    summary["ingestion"],
+                    {
+                        "expected_workbooks": 44,
+                        "received_workbooks": 0,
+                        "status": "rejected",
+                    },
+                )
+                MODULE._validate_output(summary)
                 self.assertNotIn(str(root), stderr.getvalue())
+                self.assertNotIn(
+                    str(root), output.read_text(encoding="utf-8")
+                )
+
+    def test_oversized_report_emits_fixed_rejected_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            hosted = root / "hosted"
+            hosted.mkdir()
+            report = hosted / "parity-report-a.json"
+            with report.open("wb") as output:
+                output.seek(MODULE.MAX_REPORT_BYTES)
+                output.write(b"\n")
+            summary_path = root / MODULE.OUTPUT_NAME
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = MODULE.main(
+                    (
+                        "--input-root",
+                        str(hosted),
+                        "--profile",
+                        "pilot",
+                        "--baseline-mode",
+                        "verify",
+                        "--head-sha",
+                        HEAD_SHA,
+                        "--output",
+                        str(summary_path),
+                    )
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                stderr.getvalue(),
+                "render-oracle-failure-summary: "
+                "unsafe_or_incomplete_reports_rejected\n",
+            )
+            summary = json.loads(
+                summary_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                summary["ingestion"]["status"], "rejected"
+            )
+            self.assertLessEqual(
+                summary_path.stat().st_size, MODULE.MAX_OUTPUT_BYTES
+            )
+            MODULE._validate_output(summary)
 
     def test_classification_format_and_feature_are_bounded(self) -> None:
         mutations = (

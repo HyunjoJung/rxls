@@ -99,19 +99,20 @@ pub use model::{
 };
 pub use model::{
     excel_serial_to_datetime, Alignment, Border, BorderStyle, Cell, CellErrorType, CellProtection,
-    CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint, ChartKind, ChartMarkerSymbol,
-    ChartSeriesCache, ChartSeriesStyle, ChartSeriesStyleLossKind, ChartUnsupportedReason, Color,
-    Comment, CommentAuthor, CondFormat, ConditionalFormatMetadata, Data, DataRef, DataType,
-    DataValidation, Dimensions, DisplayCell, DocProperties, DrawingAnchorBehavior, DrawingCrop,
-    DrawingMetadata, DrawingObjectKind, DvKind, DvOp, ExcelDateTime, Fill, Font, Format,
-    FormatAlign, FormatBorder, FormatPattern, FormatScript, FormulaRange, FormulaRangeRow,
-    FormulaRangeRowCells, FormulaRangeRowUsedCells, FormulaRangeRows, HAlign, HeaderFooterKind,
-    HeaderFooterMetadata, HeaderRow, Image, ImageFmt, ImportedAxisMeasure, LocalDefinedName,
-    OoxmlImplicitRowHeight, PageSetup, Picture, PrintFidelity, PrintLoss, PrintLossKind,
-    PrintMetadata, PrintPageOrder, ProtectionOptions, Range, RangeRow, RangeRowCells,
-    RangeRowUsedCells, RangeRows, Reader, Series, Sheet, SheetMetadata, SheetType, SheetView,
-    SheetVisible, Sparkline, SparklineKind, StyleFidelity, StyleLoss, StyleLossKind, Table,
-    TextRun, VAlign, Workbook, WorkbookMetadata, XlsbDefaultColumnWidth,
+    CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint, ChartFrameFill,
+    ChartFrameStyleLossKind, ChartKind, ChartMarkerSymbol, ChartSeriesCache, ChartSeriesStyle,
+    ChartSeriesStyleLossKind, ChartUnsupportedReason, Color, Comment, CommentAuthor, CondFormat,
+    ConditionalFormatMetadata, Data, DataRef, DataType, DataValidation, Dimensions, DisplayCell,
+    DocProperties, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata, DrawingObjectKind, DvKind,
+    DvOp, ExcelDateTime, Fill, Font, Format, FormatAlign, FormatBorder, FormatPattern,
+    FormatScript, FormulaRange, FormulaRangeRow, FormulaRangeRowCells, FormulaRangeRowUsedCells,
+    FormulaRangeRows, HAlign, HeaderFooterKind, HeaderFooterMetadata, HeaderRow, Image, ImageFmt,
+    ImportedAxisMeasure, LocalDefinedName, OoxmlImplicitRowHeight, PageSetup, Picture,
+    PrintFidelity, PrintLoss, PrintLossKind, PrintMetadata, PrintPageOrder, ProtectionOptions,
+    Range, RangeRow, RangeRowCells, RangeRowUsedCells, RangeRows, Reader, Series, Sheet,
+    SheetMetadata, SheetType, SheetView, SheetVisible, Sparkline, SparklineKind, StyleFidelity,
+    StyleLoss, StyleLossKind, Table, TextRun, VAlign, Workbook, WorkbookMetadata,
+    XlsbDefaultColumnWidth,
 };
 #[cfg(feature = "chrono")]
 pub use model::{excel_serial_to_duration, excel_serial_to_naive_datetime};

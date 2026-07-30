@@ -74,6 +74,39 @@ fn declared_blank_extent_xlsx(hidden_tail: bool) -> Workbook {
     source_dimension_xlsx("A1:D6", &body)
 }
 
+fn cli_terminal_drawing_xlsx() -> Vec<u8> {
+    zip_text_parts(&[
+        (
+            "xl/workbook.xml",
+            r#"<workbook><sheets><sheet name="Terminal drawing" r:id="rId1"/></sheets></workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<worksheet>
+              <dimension ref="A1:F1"/>
+              <cols>
+                <col min="1" max="1" width="18" customWidth="1"/>
+                <col min="2" max="5" width="14" customWidth="1"/>
+              </cols>
+              <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>anchor</t></is></c></row></sheetData>
+              <drawing r:id="rIdDrawing"/>
+            </worksheet>"#,
+        ),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            r#"<Relationships><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/drawings/drawing1.xml",
+            r#"<wsDr><twoCellAnchor editAs="oneCell"><from><col>0</col><colOff>0</colOff><row>0</row><rowOff>0</rowOff></from><to><col>6</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></to><sp><nvSpPr><cNvPr id="1" name="Terminal column"/></nvSpPr></sp></twoCellAnchor></wsDr>"#,
+        ),
+    ])
+}
+
 fn blank_table_style_workbook(fill: &str) -> Workbook {
     let styles = format!(
         r#"<styleSheet><dxfs count="1"><dxf><fill><patternFill patternType="solid"><fgColor rgb="{fill}"/></patternFill></fill></dxf></dxfs><tableStyles count="1"><tableStyle name="CustomBlank" count="1"><tableStyleElement type="wholeTable" dxfId="0"/></tableStyle></tableStyles></styleSheet>"#
@@ -401,6 +434,18 @@ fn scene_text(scene: &Scene) -> Vec<&str> {
         .collect()
 }
 
+fn nested_scene_text_occurrences(nodes: &[SceneNode], expected: &str) -> usize {
+    nodes
+        .iter()
+        .map(|node| match node {
+            SceneNode::ClipGroup(group) => nested_scene_text_occurrences(&group.nodes, expected),
+            SceneNode::Text(node) => usize::from(node.text == expected),
+            SceneNode::GlyphRun(node) => usize::from(node.text == expected),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn retained_scene_nodes(nodes: &[SceneNode]) -> u64 {
     nodes
         .iter()
@@ -624,6 +669,376 @@ fn distant_titles_charge_only_the_disjoint_measurement_union() {
             limit: 3,
             actual: 4,
         })
+    );
+}
+
+#[test]
+fn overlapping_print_titles_render_each_tile_cell_once() {
+    let cases = [
+        (
+            "prefix",
+            (0_u32, 0_u32),
+            (0_u16, 0_u16),
+            false,
+            RenderRange::new(1, 1, 2, 5),
+        ),
+        (
+            "middle",
+            (1_u32, 1_u32),
+            (2_u16, 3_u16),
+            false,
+            RenderRange::new(0, 0, 2, 5),
+        ),
+        (
+            "suffix RTL",
+            (2_u32, 2_u32),
+            (5_u16, 5_u16),
+            true,
+            RenderRange::new(0, 0, 2, 5),
+        ),
+    ];
+
+    for (name, repeat_rows, repeat_cols, right_to_left, expected_body) in cases {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet(name);
+        sheet.set_right_to_left(right_to_left);
+        sheet.set_print_headings();
+        for row in 0..=2 {
+            sheet.set_row_height(row, 24.0);
+            for column in 0..=5 {
+                sheet.set_col_width(column, 8.0);
+                sheet.write(row, column, format!("R{row}C{column}"));
+            }
+        }
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 2, 5))
+                .with_repeat_rows(repeat_rows.0, repeat_rows.1)
+                .with_repeat_cols(repeat_cols.0, repeat_cols.1),
+        );
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                omit_sparse_pages: false,
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(document.pages.len(), 1, "{name}");
+        assert_eq!(document.pages[0].map.body_range, expected_body, "{name}");
+        assert!(
+            document
+                .report
+                .warnings
+                .iter()
+                .all(|warning| warning.code != PrintWarningCode::MidAreaPrintTitlesDuplicated),
+            "{name}: {:?}",
+            document.report.warnings
+        );
+        for row in 0..=2 {
+            for column in 0..=5 {
+                let text = format!("R{row}C{column}");
+                assert_eq!(
+                    nested_scene_text_occurrences(&document.pages[0].scene.nodes, &text),
+                    1,
+                    "{name}: {text}"
+                );
+            }
+        }
+        for label in ["A", "B", "C", "D", "E", "F", "1", "2", "3"] {
+            assert_eq!(
+                nested_scene_text_occurrences(&document.pages[0].scene.nodes, label),
+                1,
+                "{name}: heading {label}"
+            );
+        }
+        let expected_headings = if right_to_left {
+            vec!["F", "E", "D", "C", "B", "A", "1", "2", "3"]
+        } else {
+            vec!["A", "B", "C", "D", "E", "F", "1", "2", "3"]
+        };
+        assert_eq!(
+            scene_text(&document.pages[0].scene),
+            expected_headings,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn overlapping_row_titles_use_union_geometry_during_multi_page_planning() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Title union");
+    for row in 0..=7 {
+        sheet.set_row_height(row, if (2..=3).contains(&row) { 201.0 } else { 180.0 });
+        sheet.write(row, 0, format!("row-{row}"));
+    }
+    sheet.set_col_width(0, 8.0);
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_paper_size(1)
+            .with_margins(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            .with_print_area((0, 0, 7, 0))
+            .with_repeat_rows(2, 3)
+            .with_scale(100),
+    );
+
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(document.report.scale_permille, 1_000);
+    assert_eq!(
+        document.report.content_rect.height,
+        Fixed::from_pixels(1_056)
+    );
+    assert_eq!(
+        document
+            .pages
+            .iter()
+            .map(|page| page.map.body_range)
+            .collect::<Vec<_>>(),
+        [
+            RenderRange::new(0, 0, 3, 0),
+            RenderRange::new(4, 0, 5, 0),
+            RenderRange::new(6, 0, 7, 0),
+        ]
+    );
+    assert!(document
+        .report
+        .warnings
+        .iter()
+        .all(|warning| warning.code != PrintWarningCode::PageContentOverflow));
+
+    let expected_rows = [[0, 1, 2, 3], [2, 3, 4, 5], [2, 3, 6, 7]];
+    for (page, expected) in document.pages.iter().zip(expected_rows) {
+        for row in 0..=7 {
+            assert_eq!(
+                nested_scene_text_occurrences(&page.scene.nodes, &format!("row-{row}")),
+                usize::from(expected.contains(&row)),
+                "page {} row {row}",
+                page.map.output_index
+            );
+        }
+    }
+}
+
+#[test]
+fn middle_titles_begin_with_their_natural_page_and_repeat_after_it() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Natural title page");
+    let row_heights = [450.0, 450.0, 75.0, 75.0, 300.0, 300.0, 300.0, 300.0];
+    for (row, height) in row_heights.into_iter().enumerate() {
+        sheet.set_row_height(row as u32, height);
+        sheet.write(row as u32, 0, format!("row-{row}"));
+    }
+    sheet.set_col_width(0, 8.0);
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_paper_size(1)
+            .with_margins(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            .with_print_area((0, 0, 7, 0))
+            .with_repeat_rows(2, 3)
+            .with_scale(100),
+    );
+
+    let document = build_print_document(
+        &workbook,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        document
+            .pages
+            .iter()
+            .map(|page| page.map.body_range)
+            .collect::<Vec<_>>(),
+        [
+            RenderRange::new(0, 0, 0, 0),
+            RenderRange::new(1, 0, 3, 0),
+            RenderRange::new(4, 0, 5, 0),
+            RenderRange::new(6, 0, 7, 0),
+        ]
+    );
+    for title_row in [2, 3] {
+        let title = format!("row-{title_row}");
+        assert_eq!(
+            nested_scene_text_occurrences(&document.pages[0].scene.nodes, &title),
+            0
+        );
+        for page in &document.pages[1..] {
+            assert_eq!(
+                nested_scene_text_occurrences(&page.scene.nodes, &title),
+                1,
+                "page {}",
+                page.map.output_index
+            );
+        }
+    }
+}
+
+#[test]
+fn title_only_print_area_renders_the_complete_union_once_in_ltr_and_rtl() {
+    for right_to_left in [false, true] {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet(if right_to_left {
+            "Title only RTL"
+        } else {
+            "Title only LTR"
+        });
+        sheet.set_right_to_left(right_to_left);
+        for row in 0..=2 {
+            sheet.set_row_height(row, 24.0);
+            for column in 0..=2 {
+                sheet.set_col_width(column, 8.0);
+                sheet.write(row, column, format!("R{row}C{column}"));
+            }
+        }
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 2, 2))
+                .with_repeat_rows(0, 2)
+                .with_repeat_cols(0, 2),
+        );
+
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                omit_sparse_pages: false,
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(
+            document.pages[0].map.body_range,
+            RenderRange::new(0, 0, 0, 0)
+        );
+        for row in 0..=2 {
+            for column in 0..=2 {
+                assert_eq!(
+                    nested_scene_text_occurrences(
+                        &document.pages[0].scene.nodes,
+                        &format!("R{row}C{column}"),
+                    ),
+                    1,
+                    "RTL={right_to_left}, R{row}C{column}"
+                );
+            }
+        }
+        assert!(document
+            .report
+            .warnings
+            .iter()
+            .all(|warning| warning.code != PrintWarningCode::PageContentOverflow));
+    }
+
+    let mut endpoint = Workbook::new();
+    let sheet = endpoint.add_sheet("Endpoint title only");
+    for row in 1_048_574..=1_048_575 {
+        for column in 16_382..=16_383 {
+            sheet.write(row, column, format!("R{row}C{column}"));
+        }
+    }
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_print_area((1_048_575, 16_383, 1_048_575, 16_383))
+            .with_repeat_rows(1_048_574, 1_048_575)
+            .with_repeat_cols(16_382, 16_383),
+    );
+    let document = build_print_document(
+        &endpoint,
+        0,
+        &PrintOptions {
+            omit_sparse_pages: false,
+            ..PrintOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(document.pages.len(), 1);
+    for row in 1_048_574..=1_048_575 {
+        for column in 16_382..=16_383 {
+            assert_eq!(
+                nested_scene_text_occurrences(
+                    &document.pages[0].scene.nodes,
+                    &format!("R{row}C{column}"),
+                ),
+                1,
+                "grid endpoint R{row}C{column}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sparse_omission_counts_prefix_titles_only_on_their_natural_axis_pages() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("Sparse titles");
+    sheet.write(0, 0, "title-corner");
+    sheet.write(4, 4, "tail-corner");
+    sheet.set_row_height(0, 192.0);
+    sheet.set_col_width(0, 20.0);
+    for index in 1..=4 {
+        sheet.set_row_height(index, 300.0);
+        sheet.set_col_width(index as u16, 45.0);
+    }
+    sheet.set_page_setup(
+        PageSetup::new()
+            .with_paper_size(1)
+            .with_margins(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            .with_print_area((0, 0, 4, 4))
+            .with_repeat_rows(0, 0)
+            .with_repeat_cols(0, 0)
+            .with_scale(100),
+    );
+
+    let document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+    assert_eq!(document.pages.len(), 2, "{:?}", document.report.pages);
+    assert_eq!(
+        document.report.sparse_pages_omitted,
+        document.report.logical_pages - 2
+    );
+    assert_eq!(
+        (
+            document.pages[0].map.horizontal_index,
+            document.pages[0].map.vertical_index,
+        ),
+        (0, 0)
+    );
+    assert!(
+        document.pages[1].map.horizontal_index > 0 && document.pages[1].map.vertical_index > 0,
+        "{:?}",
+        document.report.pages
+    );
+    for page in &document.pages {
+        assert_eq!(
+            nested_scene_text_occurrences(&page.scene.nodes, "title-corner"),
+            1,
+            "page {}",
+            page.map.output_index
+        );
+    }
+    assert_eq!(
+        nested_scene_text_occurrences(&document.pages[0].scene.nodes, "tail-corner"),
+        0
+    );
+    assert_eq!(
+        nested_scene_text_occurrences(&document.pages[1].scene.nodes, "tail-corner"),
+        1
     );
 }
 
@@ -1728,8 +2143,8 @@ fn single_page_ignores_declared_blank_extent() {
         document.report.pages[0].body_range,
         RenderRange::new(0, 0, 0, 0)
     );
-    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
-    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(document.pages[0].scene.width, Fixed::from_raw(65_562));
+    assert_eq!(document.pages[0].scene.height, Fixed::from_raw(20_512));
     assert_eq!(document.report.source.visible_columns, 1);
     assert_eq!(document.report.source.visible_rows, 1);
     assert_eq!(document.report.source.merged_regions, 0);
@@ -1763,8 +2178,8 @@ fn single_page_ignores_declared_blank_extent() {
     )
     .unwrap();
     assert_eq!(explicit.report.source.range, RenderRange::new(1, 1, 2, 2));
-    assert_eq!(explicit.pages[0].scene.width, Fixed::from_pixels(128));
-    assert_eq!(explicit.pages[0].scene.height, Fixed::from_pixels(40));
+    assert_eq!(explicit.pages[0].scene.width, Fixed::from_raw(131_124));
+    assert_eq!(explicit.pages[0].scene.height, Fixed::from_raw(41_025));
 }
 
 #[test]
@@ -1784,8 +2199,8 @@ fn single_page_ignores_declared_blank_axes_regardless_of_hidden_policy() {
     )
     .unwrap();
     assert_eq!(hidden.report.source.range, RenderRange::new(0, 0, 0, 0));
-    assert_eq!(hidden.pages[0].scene.width, Fixed::from_pixels(64));
-    assert_eq!(hidden.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(hidden.pages[0].scene.width, Fixed::from_raw(65_562));
+    assert_eq!(hidden.pages[0].scene.height, Fixed::from_raw(20_512));
     assert_eq!(hidden.report.source.visible_columns, 1);
     assert_eq!(hidden.report.source.visible_rows, 1);
 
@@ -1803,8 +2218,8 @@ fn single_page_ignores_declared_blank_axes_regardless_of_hidden_policy() {
         },
     )
     .unwrap();
-    assert_eq!(included.pages[0].scene.width, Fixed::from_pixels(64));
-    assert_eq!(included.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(included.pages[0].scene.width, Fixed::from_raw(65_562));
+    assert_eq!(included.pages[0].scene.height, Fixed::from_raw(20_512));
     assert_eq!(included.report.source.visible_columns, 1);
     assert_eq!(included.report.source.visible_rows, 1);
 }
@@ -1840,8 +2255,8 @@ fn single_page_ignores_stale_small_declaration_and_uses_actual_content() {
     )
     .unwrap();
     assert_eq!(document.report.source.range, RenderRange::new(5, 3, 5, 3));
-    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
-    assert_eq!(document.pages[0].scene.height, Fixed::from_pixels(20));
+    assert_eq!(document.pages[0].scene.width, Fixed::from_raw(65_562));
+    assert_eq!(document.pages[0].scene.height, Fixed::from_raw(20_512));
 
     workbook.sheets[0].add_chart(Chart::new(ChartKind::Line, (8, 5), (9, 6)));
     let drawing_union = build_print_document(
@@ -1895,7 +2310,7 @@ fn single_page_ignores_oversized_declared_extent_before_materialization() {
     )
     .unwrap();
     assert_eq!(document.report.source.range, RenderRange::new(0, 0, 0, 0));
-    assert_eq!(document.pages[0].scene.width, Fixed::from_pixels(64));
+    assert_eq!(document.pages[0].scene.width, Fixed::from_raw(65_562));
     assert_eq!(document.pages[0].scene.height, Fixed::from_raw(19_351));
 }
 
@@ -1996,7 +2411,15 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
     );
 
     assert_eq!(fitted.pages.len(), 1);
-    assert_eq!(fitted.pages[0].scene, whole_scene.scene);
+    assert_eq!(
+        scene_text(&fitted.pages[0].scene),
+        scene_text(&whole_scene.scene)
+    );
+    assert_eq!(fitted.pages[0].scene.title, whole_scene.scene.title);
+    assert_eq!(
+        fitted.pages[0].scene.background,
+        whole_scene.scene.background
+    );
     assert_ne!(fitted.pages[0].scene, whole_scene_with_gridlines.scene);
     assert_eq!(fitted.report.logical_pages, 1);
     assert_eq!(fitted.report.scale_permille, 1_000);
@@ -2005,12 +2428,18 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
     assert_eq!(fitted.report.pages[0].repeat_rows, None);
     assert_eq!(fitted.report.pages[0].repeat_cols, None);
     assert_eq!(fitted.report.paper.paper_code, 0);
-    assert_eq!(fitted.report.paper.width, whole_scene.scene.width);
-    assert_eq!(fitted.report.paper.height, whole_scene.scene.height);
+    assert_eq!(fitted.report.paper.width, fitted.pages[0].scene.width);
+    assert_eq!(fitted.report.paper.height, fitted.pages[0].scene.height);
     assert_eq!(fitted.report.content_rect.x.raw(), 0);
     assert_eq!(fitted.report.content_rect.y.raw(), 0);
-    assert_eq!(fitted.report.content_rect.width, whole_scene.scene.width);
-    assert_eq!(fitted.report.content_rect.height, whole_scene.scene.height);
+    assert_eq!(
+        fitted.report.content_rect.width,
+        fitted.pages[0].scene.width
+    );
+    assert_eq!(
+        fitted.report.content_rect.height,
+        fitted.pages[0].scene.height
+    );
     assert_ne!(fitted.report.paper, authored.report.paper);
     assert_eq!(
         fitted.report.layout_override,
@@ -2051,7 +2480,15 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
     let mut without_gridlines = grid_requested.render.clone();
     without_gridlines.gridlines = false;
     let expected = build_scene(&workbook, 0, &without_gridlines).unwrap();
-    assert_eq!(suppressed.pages[0].scene, expected.scene);
+    assert_eq!(
+        scene_text(&suppressed.pages[0].scene),
+        scene_text(&expected.scene)
+    );
+    assert_eq!(suppressed.pages[0].scene.title, expected.scene.title);
+    assert_eq!(
+        suppressed.pages[0].scene.background,
+        expected.scene.background
+    );
     assert_ne!(suppressed.pages[0].scene, with_gridlines.scene);
 }
 
@@ -2370,6 +2807,153 @@ fn cli_single_page_override_is_exact_and_recorded() {
     }
     fs::remove_dir_all(first).unwrap();
     fs::remove_dir_all(second).unwrap();
+}
+
+#[test]
+fn cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync() {
+    let root = unique_temp_dir("single-page-terminal-drawing");
+    let input = root.join("terminal-drawing.xlsx");
+    let ordinary_dir = root.join("ordinary");
+    let single_page_dir = root.join("single-page");
+    let verified_font_manifest =
+        std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST").map(PathBuf::from);
+    let verified_font_family =
+        std::env::var("RXLS_TEST_FONT_FAMILY").unwrap_or_else(|_| "Arimo".to_string());
+    if let Some(manifest) = verified_font_manifest.as_ref() {
+        assert!(manifest.is_file(), "missing verified test font pack");
+    }
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&input, cli_terminal_drawing_xlsx()).unwrap();
+
+    let mut ordinary_command = Command::new(env!("CARGO_BIN_EXE_rxls-render"));
+    ordinary_command
+        .arg("bundle")
+        .arg(&input)
+        .arg("--output-dir")
+        .arg(&ordinary_dir);
+    if let Some(manifest) = verified_font_manifest.as_ref() {
+        ordinary_command
+            .arg("--font-pack-manifest")
+            .arg(manifest)
+            .arg("--default-font-family")
+            .arg(&verified_font_family);
+    }
+    let ordinary = ordinary_command.output().unwrap();
+    assert!(
+        ordinary.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    let mut single_page_command = Command::new(env!("CARGO_BIN_EXE_rxls-render"));
+    single_page_command
+        .arg("bundle")
+        .arg(&input)
+        .arg("--output-dir")
+        .arg(&single_page_dir)
+        .arg("--single-page-sheets")
+        .arg("--print-backends")
+        .arg("pdf");
+    if let Some(manifest) = verified_font_manifest.as_ref() {
+        single_page_command
+            .arg("--font-pack-manifest")
+            .arg(manifest)
+            .arg("--default-font-family")
+            .arg(&verified_font_family);
+    }
+    let single_page = single_page_command.output().unwrap();
+    assert!(
+        single_page.status.success(),
+        "{}",
+        String::from_utf8_lossy(&single_page.stderr)
+    );
+
+    let ordinary_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(ordinary_dir.join("render-manifest.json")).unwrap())
+            .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(single_page_dir.join("render-manifest.json")).unwrap())
+            .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(single_page_dir.join("sheet-0000-pages.json")).unwrap())
+            .unwrap();
+    let ordinary_sheet = &ordinary_manifest["sheets"][0];
+    let sheet = &manifest["sheets"][0];
+
+    assert_eq!(ordinary_sheet["report"]["range"]["last_col"], 5);
+    if verified_font_manifest.is_some() {
+        assert_eq!(sheet["report"]["range"]["last_col"], 6);
+        assert_eq!(sheet["canvas"]["width_raw"], 757_947);
+    } else {
+        // The ordinary local gate remains hermetic without acquiring the
+        // ignored font payload. Hosted fidelity gates set the environment and
+        // exercise the exact verified-font A:F versus A:G contract above.
+        assert_eq!(sheet["report"]["range"]["last_col"], 5);
+    }
+    assert_ne!(
+        sheet["canvas"]["width_raw"],
+        ordinary_sheet["canvas"]["width_raw"]
+    );
+    assert_eq!(
+        sheet["scene"]["sha256"],
+        sheet["print"]["page_scenes"][0]["sha256"]
+    );
+    assert_eq!(sheet["report"]["range"], report["source_report"]["range"]);
+    assert_eq!(
+        sheet["report"]["range"],
+        report["source_reports"][0]["range"]
+    );
+    assert_eq!(sheet["report"]["range"], report["pages"][0]["body_range"]);
+    assert_eq!(sheet["canvas"]["width_raw"], report["paper"]["width_raw"]);
+    assert_eq!(sheet["canvas"]["height_raw"], report["paper"]["height_raw"]);
+    assert_eq!(
+        sheet["canvas"]["width_raw"],
+        report["content_rect"]["width_raw"]
+    );
+    assert_eq!(
+        sheet["canvas"]["height_raw"],
+        report["content_rect"]["height_raw"]
+    );
+    assert_eq!(report["content_rect"]["x_raw"], 0);
+    assert_eq!(report["content_rect"]["y_raw"], 0);
+    assert_eq!(report["layout_override"], "single_page_sheets");
+    assert_eq!(report["logical_pages"], 1);
+
+    let pdf = fs::read(single_page_dir.join("sheet-0000.pdf")).unwrap();
+    let pdf_text = String::from_utf8_lossy(&pdf);
+    let page_box = |name: &str| {
+        let marker = format!("/{name} [");
+        let start = pdf_text.find(&marker).unwrap() + marker.len();
+        let end = pdf_text[start..].find(']').unwrap() + start;
+        let values = pdf_text[start..end]
+            .split_ascii_whitespace()
+            .map(|value| value.parse::<f64>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4, "{name}: {values:?}");
+        assert_eq!(values[0], 0.0, "{name}");
+        assert_eq!(values[1], 0.0, "{name}");
+        [values[2], values[3]]
+    };
+    let media_box = page_box("MediaBox");
+    let crop_box = page_box("CropBox");
+    assert_eq!(media_box, crop_box);
+    if verified_font_manifest.is_some() {
+        assert!((media_box[0] - 555.136_962_890_625).abs() <= 0.000_000_01);
+    }
+    for (actual, raw) in [
+        (media_box[0], sheet["canvas"]["width_raw"].as_i64().unwrap()),
+        (
+            media_box[1],
+            sheet["canvas"]["height_raw"].as_i64().unwrap(),
+        ),
+    ] {
+        let expected_points = raw as f64 * 3.0 / 4_096.0;
+        assert!(
+            (actual - expected_points).abs() <= 0.000_000_01,
+            "{actual} != {expected_points} for raw coordinate {raw}"
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

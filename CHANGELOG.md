@@ -38,6 +38,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Advanced the stable diagnose JSON contract to schema v2 for the new
   provenance object; schema v1 remains frozen rather than receiving new keys.
+- Preserved format-native imported row and column geometry through Calc-style
+  cumulative print bounds, while distinguishing XLSX automatic cached rows
+  from manual overrides and honoring XLSB `fUnsynced` row-height authority.
+- Aligned repeated print-title pagination with Calc for middle title bands,
+  protected breaks, sparse pages, title-only boundaries, and single-page
+  sheet bounds.
+- Retained OOXML chart-space fills, major-gridline presence, and series line
+  widths (including visible zero-width hairlines) for consistent SVG, PDF, and
+  PNG replay.
+- Made ODS General and inherited number-style display resolution typed and
+  deterministic, including literal currency/text tokens and repeated cells
+  that cross differently formatted columns.
+- Hardened PDF Type3 semantic extraction at adjacent-cell, clipping, RTL,
+  rotation, and mixed-script boundaries without adding visible paint.
 
 ## [0.1.2] - 2026-07-16
 

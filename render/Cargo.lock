@@ -440,6 +440,7 @@ dependencies = [
 name = "rxls-render"
 version = "0.1.0"
 dependencies = [
+ "cfb",
  "flate2",
  "jpeg-decoder",
  "png",

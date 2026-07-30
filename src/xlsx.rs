@@ -21,13 +21,14 @@ use crate::model::{
 };
 use crate::{
     format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
-    Chart, ChartBarDirection, ChartCachedPoint, ChartKind, ChartMarkerSymbol, ChartSeriesCache,
-    ChartSeriesStyle, ChartSeriesStyleLossKind, ChartUnsupportedReason, Color, Comment, CondFormat,
-    ConditionalFormatMetadata, DataValidation, DocProperties, DrawingAnchorBehavior, DrawingCrop,
-    DrawingMetadata, DrawingObjectKind, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript,
-    HAlign, HeaderFooterKind, Image, ImageFmt, PageSetup, PrintLossKind, PrintMetadata,
-    PrintPageOrder, ProtectionOptions, Series, Sheet, SheetType, Sparkline, SparklineKind,
-    StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign, Workbook,
+    Chart, ChartBarDirection, ChartCachedPoint, ChartFrameFill, ChartFrameStyleLossKind, ChartKind,
+    ChartMarkerSymbol, ChartSeriesCache, ChartSeriesStyle, ChartSeriesStyleLossKind,
+    ChartUnsupportedReason, Color, Comment, CondFormat, ConditionalFormatMetadata, DataValidation,
+    DocProperties, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata, DrawingObjectKind, DvKind,
+    DvOp, Fill, Font, FormatPattern, FormatScript, HAlign, HeaderFooterKind, Image, ImageFmt,
+    PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder, ProtectionOptions, Series, Sheet,
+    SheetType, Sparkline, SparklineKind, StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign,
+    Workbook,
 };
 
 /// Detect the ZIP/OOXML magic (`PK\x03\x04`).
@@ -155,6 +156,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            automatic_row_height_candidates,
             imported_column_axis_measures,
             imported_row_axis_measures,
             col_formats,
@@ -164,6 +166,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_rows_hidden,
             explicit_visible_rows,
             default_row_height,
+            automatic_default_row_height_candidate,
             default_col_width,
             imported_default_row_axis_measure,
             imported_default_column_axis_measure,
@@ -318,6 +321,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             col_outline,
             col_widths,
             row_heights,
+            automatic_row_height_candidates,
             imported_column_axis_measures,
             imported_default_column_axis_measure,
             imported_row_axis_measures,
@@ -329,6 +333,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             hidden_rows,
             default_hidden_row_exceptions,
             default_row_height,
+            automatic_default_row_height_candidate,
             default_col_width,
             ooxml_implicit_col_width,
             ooxml_defaulted_base_col_width: defaulted_base_col_width,
@@ -3983,6 +3988,7 @@ fn read_sheet_drawings(
                     continue;
                 };
                 let has_unsupported_chart_content = !parsed.unsupported_reasons.is_empty()
+                    || !parsed.frame_style_losses.is_empty()
                     || parsed
                         .series_styles
                         .iter()
@@ -3995,6 +4001,10 @@ fn read_sheet_drawings(
                 sidecar.chart_palette = theme.chart_palette();
                 sidecar.chart_series_caches = parsed.series_caches;
                 sidecar.chart_series_styles = parsed.series_styles;
+                sidecar.chart_frame_fill = parsed.frame_fill;
+                sidecar.chart_frame_style_losses = parsed.frame_style_losses;
+                sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
+                sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;
                 metadata.push(sidecar);
@@ -4028,11 +4038,17 @@ struct ParsedChartSeries {
 const MAX_XLSX_CHART_SERIES_PER_SHEET: usize = 4_096;
 const MAX_XLSX_CHART_CACHE_POINTS_PER_SHEET: usize = 1_000_000;
 const MAX_XLSX_CHART_CACHE_VALUE_BYTES: usize = 4_096;
+// ECMA-376 Part 1 §20.1.10.35 (`ST_LineWidth`), in English Metric Units.
+const MAX_OOXML_CHART_LINE_WIDTH_EMU: u32 = 20_116_800;
 
 pub(crate) struct ParsedChart {
     pub(crate) chart: Chart,
     pub(crate) series_caches: Vec<ChartSeriesCache>,
     pub(crate) series_styles: Vec<ChartSeriesStyle>,
+    pub(crate) frame_fill: ChartFrameFill,
+    pub(crate) frame_style_losses: Vec<ChartFrameStyleLossKind>,
+    pub(crate) category_major_gridlines: bool,
+    pub(crate) value_major_gridlines: bool,
     pub(crate) limit_exceeded: bool,
     pub(crate) unsupported_reasons: Vec<ChartUnsupportedReason>,
     pub(crate) bar_direction: ChartBarDirection,
@@ -4146,6 +4162,15 @@ fn add_chart_series_style_loss(style: &mut ChartSeriesStyle, loss: ChartSeriesSt
     }
 }
 
+fn add_chart_frame_style_loss(
+    losses: &mut Vec<ChartFrameStyleLossKind>,
+    loss: ChartFrameStyleLossKind,
+) {
+    if !losses.contains(&loss) {
+        losses.push(loss);
+    }
+}
+
 fn retain_chart_marker_symbol(style: &mut ChartSeriesStyle, value: Option<&str>) {
     style.marker = match value {
         Some("none") => ChartMarkerSymbol::None,
@@ -4165,6 +4190,21 @@ fn retain_chart_marker_size(style: &mut ChartSeriesStyle, value: Option<&str>) {
     match value.and_then(|value| value.parse::<u8>().ok()) {
         Some(size @ 2..=72) => style.marker_size = Some(size),
         _ => add_chart_series_style_loss(style, ChartSeriesStyleLossKind::InvalidMarkerSize),
+    }
+}
+
+fn retain_chart_series_line_width(style: &mut ChartSeriesStyle, value: Option<&str>) {
+    let Some(value) = value else {
+        // LibreOffice's DrawingML chart import initializes an authored `a:ln`
+        // to one point when the optional width is absent.
+        style.line_width_emu = Some(12_700);
+        return;
+    };
+    match value.parse::<u32>() {
+        Ok(width) if width <= MAX_OOXML_CHART_LINE_WIDTH_EMU => {
+            style.line_width_emu = Some(width);
+        }
+        _ => add_chart_series_style_loss(style, ChartSeriesStyleLossKind::InvalidLineWidth),
     }
 }
 
@@ -4277,8 +4317,13 @@ fn parse_chart_with_theme(
     let mut capture_cache_value = false;
     let mut limit_exceeded = false;
     let mut unsupported_reasons = Vec::new();
+    let mut frame_fill = ChartFrameFill::Automatic;
+    let mut frame_style_losses = Vec::new();
+    let mut category_major_gridlines = false;
+    let mut value_major_gridlines = false;
     let mut bar_direction = ChartBarDirection::Column;
     let mut bar_chart_depth = 0usize;
+    let mut chart_depth = 0usize;
     let mut axis_context: Option<ChartAxisContext> = None;
     let mut val_axis_count = 0usize;
     let mut marker_depth = 0usize;
@@ -4288,10 +4333,15 @@ fn parse_chart_with_theme(
     let mut series_shape_depth = 0usize;
     let mut series_line_depth = 0usize;
     let mut series_line_solid_fill_depth = 0usize;
+    let mut frame_shape_depth = 0usize;
+    let mut frame_line_depth = 0usize;
+    let mut frame_solid_fill_depth = 0usize;
+    let mut frame_solid_fill_resolved = false;
 
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
+                b"chart" => chart_depth = chart_depth.saturating_add(1),
                 name if chart_kind_element(name).is_some() => {
                     let observed = chart_kind_element(name).expect("guarded chart kind");
                     observe_chart_kind(&mut kind, observed, &mut unsupported_reasons);
@@ -4357,6 +4407,11 @@ fn parse_chart_with_theme(
                         Some(ChartAxisContext::Value)
                     };
                 }
+                b"majorGridlines" => match axis_context {
+                    Some(ChartAxisContext::Category) => category_major_gridlines = true,
+                    Some(ChartAxisContext::Value) => value_major_gridlines = true,
+                    None => {}
+                },
                 b"title" if current_series.is_none() => {
                     let target = match axis_context {
                         Some(ChartAxisContext::Category) if x_axis_title.is_none() => {
@@ -4393,6 +4448,11 @@ fn parse_chart_with_theme(
                 b"trendline" if current_series.is_some() => trendline_depth = 1,
                 b"errBars" if current_series.is_some() => error_bars_depth = 1,
                 b"spPr"
+                    if chart_depth == 0 && current_series.is_none() && frame_shape_depth == 0 =>
+                {
+                    frame_shape_depth = 1;
+                }
+                b"spPr"
                     if current_series.is_some()
                         && marker_depth == 0
                         && data_point_depth == 0
@@ -4402,7 +4462,64 @@ fn parse_chart_with_theme(
                 {
                     series_shape_depth = 1;
                 }
-                b"ln" if series_shape_depth > 0 => series_line_depth = 1,
+                b"ln" if frame_shape_depth > 0 => frame_line_depth = 1,
+                b"solidFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    frame_solid_fill_depth = 1;
+                    frame_solid_fill_resolved = false;
+                }
+                b"noFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    frame_fill = ChartFrameFill::NoFill;
+                }
+                b"srgbClr" | b"schemeClr" if frame_solid_fill_depth > 0 => {
+                    let qualified_name = e.name();
+                    let name = local(qualified_name.as_ref());
+                    let value = attr(&e, b"val");
+                    if let Some(color) = chart_series_line_color(name, value.as_deref(), theme) {
+                        frame_fill = ChartFrameFill::Solid(color);
+                        frame_solid_fill_resolved = true;
+                    } else {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                }
+                b"sysClr" if frame_solid_fill_depth > 0 => {
+                    let value = attr(&e, b"lastClr");
+                    if let Some(color) = chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                    {
+                        frame_fill = ChartFrameFill::Solid(color);
+                        frame_solid_fill_resolved = true;
+                    } else {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                }
+                b"gradFill" | b"pattFill" | b"blipFill" | b"grpFill"
+                    if frame_shape_depth > 0 && frame_line_depth == 0 =>
+                {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
+                b"tint" | b"shade" | b"lumMod" | b"lumOff" if frame_solid_fill_depth > 0 => {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
+                b"ln" if series_shape_depth > 0 => {
+                    series_line_depth = 1;
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_series_line_width(
+                            &mut series.style,
+                            attr(&e, b"w").as_deref(),
+                        );
+                    }
+                }
                 b"solidFill" if series_line_depth > 0 => {
                     series_line_solid_fill_depth = 1;
                     if let Some(series) = current_series.as_mut() {
@@ -4582,6 +4699,11 @@ fn parse_chart_with_theme(
                         ChartBarDirection::Column
                     };
                 }
+                b"majorGridlines" => match axis_context {
+                    Some(ChartAxisContext::Category) => category_major_gridlines = true,
+                    Some(ChartAxisContext::Value) => value_major_gridlines = true,
+                    None => {}
+                },
                 b"legend" => legend = true,
                 b"dLbls" => data_labels = true,
                 b"symbol" if marker_depth > 0 => {
@@ -4592,6 +4714,64 @@ fn parse_chart_with_theme(
                 b"size" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
                         retain_chart_marker_size(&mut series.style, attr(&e, b"val").as_deref());
+                    }
+                }
+                b"noFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    frame_fill = ChartFrameFill::NoFill;
+                }
+                b"solidFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
+                b"srgbClr" | b"schemeClr" if frame_solid_fill_depth > 0 => {
+                    let qualified_name = e.name();
+                    let name = local(qualified_name.as_ref());
+                    let value = attr(&e, b"val");
+                    if let Some(color) = chart_series_line_color(name, value.as_deref(), theme) {
+                        frame_fill = ChartFrameFill::Solid(color);
+                        frame_solid_fill_resolved = true;
+                    } else {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                }
+                b"sysClr" if frame_solid_fill_depth > 0 => {
+                    let value = attr(&e, b"lastClr");
+                    if let Some(color) = chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                    {
+                        frame_fill = ChartFrameFill::Solid(color);
+                        frame_solid_fill_resolved = true;
+                    } else {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                }
+                b"gradFill" | b"pattFill" | b"blipFill" | b"grpFill"
+                    if frame_shape_depth > 0 && frame_line_depth == 0 =>
+                {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
+                b"tint" | b"shade" | b"lumMod" | b"lumOff" if frame_solid_fill_depth > 0 => {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
+                b"ln" if series_shape_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        retain_chart_series_line_width(
+                            &mut series.style,
+                            attr(&e, b"w").as_deref(),
+                        );
                     }
                 }
                 b"noFill" if series_line_depth > 0 => {
@@ -4705,6 +4885,7 @@ fn parse_chart_with_theme(
                 );
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
+                b"chart" if chart_depth > 0 => chart_depth -= 1,
                 b"barChart" if bar_chart_depth > 0 => {
                     bar_chart_depth -= 1;
                 }
@@ -4712,6 +4893,23 @@ fn parse_chart_with_theme(
                 b"dPt" if data_point_depth > 0 => data_point_depth = 0,
                 b"trendline" if trendline_depth > 0 => trendline_depth = 0,
                 b"errBars" if error_bars_depth > 0 => error_bars_depth = 0,
+                b"solidFill" if frame_solid_fill_depth > 0 => {
+                    if !frame_solid_fill_resolved {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_solid_fill_depth = 0;
+                    frame_solid_fill_resolved = false;
+                }
+                b"ln" if frame_line_depth > 0 => frame_line_depth = 0,
+                b"spPr" if frame_shape_depth > 0 => {
+                    frame_shape_depth = 0;
+                    frame_line_depth = 0;
+                    frame_solid_fill_depth = 0;
+                    frame_solid_fill_resolved = false;
+                }
                 b"solidFill" if series_line_solid_fill_depth > 0 => {
                     series_line_solid_fill_depth = 0;
                 }
@@ -4851,6 +5049,10 @@ fn parse_chart_with_theme(
         },
         series_caches,
         series_styles,
+        frame_fill,
+        frame_style_losses,
+        category_major_gridlines,
+        value_major_gridlines,
         limit_exceeded,
         unsupported_reasons,
         bar_direction,
@@ -5410,6 +5612,7 @@ struct ParsedSheet {
     col_outline: BTreeMap<u16, u8>,
     col_widths: BTreeMap<u16, f32>,
     row_heights: BTreeMap<u32, f32>,
+    automatic_row_height_candidates: BTreeSet<u32>,
     imported_column_axis_measures: BTreeMap<u16, ImportedAxisMeasure>,
     imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
     col_formats: BTreeMap<u16, CellStyle>,
@@ -5419,6 +5622,7 @@ struct ParsedSheet {
     default_rows_hidden: bool,
     explicit_visible_rows: BTreeSet<u32>,
     default_row_height: Option<f32>,
+    automatic_default_row_height_candidate: bool,
     default_col_width: Option<f32>,
     imported_default_row_axis_measure: Option<ImportedAxisMeasure>,
     imported_default_column_axis_measure: Option<ImportedAxisMeasure>,
@@ -5460,14 +5664,10 @@ fn parse_character_axis_measure(value: &str) -> Option<ImportedAxisMeasure> {
     if numerator == 0 {
         return None;
     }
-    Some(
-        scaled_ratio_u32(numerator, denominator, 256)
-            .map(ImportedAxisMeasure::CharacterWidth256)
-            .unwrap_or(ImportedAxisMeasure::CharacterWidthRatio(
-                numerator,
-                denominator,
-            )),
-    )
+    Some(ImportedAxisMeasure::CharacterWidthRatio(
+        numerator,
+        denominator,
+    ))
 }
 
 type SheetRange = (u32, u16, u32, u16);
@@ -5711,14 +5911,19 @@ fn parse_sheet(
                             parsed.collapsed_rows.insert(cur_row);
                         }
                         if let Some(source_height) = attr(&e, b"ht") {
+                            let exact_measure = parse_point_axis_measure(&source_height);
                             if let Ok(height) = source_height.trim().parse::<f32>() {
-                                parsed.row_heights.insert(cur_row, height);
-                                match parse_point_axis_measure(&source_height) {
-                                    Some(measure) => {
+                                if height.is_finite() && height > 0.0 {
+                                    parsed.row_heights.insert(cur_row, height);
+                                    if let Some(measure) = exact_measure {
                                         parsed.imported_row_axis_measures.insert(cur_row, measure);
-                                    }
-                                    None => {
+                                    } else {
                                         parsed.imported_row_axis_measures.remove(&cur_row);
+                                    }
+                                    if attr(&e, b"customHeight").as_deref().is_some_and(attr_true) {
+                                        parsed.automatic_row_height_candidates.remove(&cur_row);
+                                    } else {
+                                        parsed.automatic_row_height_candidates.insert(cur_row);
                                     }
                                 }
                             }
@@ -5742,9 +5947,17 @@ fn parse_sheet(
                     let default_row_height = attr(&e, b"defaultRowHeight");
                     parsed.default_row_height = default_row_height
                         .as_deref()
-                        .and_then(|s| s.trim().parse::<f32>().ok());
-                    parsed.imported_default_row_axis_measure = default_row_height
-                        .as_deref()
+                        .and_then(|source| source.trim().parse::<f32>().ok())
+                        .filter(|height| height.is_finite() && *height > 0.0);
+                    parsed.automatic_default_row_height_candidate =
+                        parsed.default_row_height.is_some()
+                            && !attr(&e, b"customHeight").as_deref().is_some_and(attr_true);
+                    // Preserve the compatibility float independently of exact
+                    // source geometry. Valid xsd:double lexical values can
+                    // exceed the bounded rational provenance representation.
+                    parsed.imported_default_row_axis_measure = parsed
+                        .default_row_height
+                        .and(default_row_height.as_deref())
                         .and_then(parse_point_axis_measure);
                     let default_col_width = attr(&e, b"defaultColWidth");
                     parsed.default_col_width = default_col_width
@@ -7279,6 +7492,29 @@ mod tests {
             .collect()
     }
 
+    fn workbook_with_worksheet_xml(worksheet: &str) -> Workbook {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let parts = [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ];
+        for (name, body) in parts {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        Workbook::open(&zip.finish().unwrap().into_inner()).unwrap()
+    }
+
     #[test]
     fn cell_ref_parsing() {
         assert_eq!(parse_ref("A1"), Some((0, 0)));
@@ -7961,7 +8197,7 @@ mod tests {
     }
 
     #[test]
-    fn worksheet_retains_exact_twip_and_width_256_axis_sources() {
+    fn worksheet_retains_exact_twip_and_ooxml_character_axis_sources() {
         let xml = r#"<worksheet><sheetFormatPr defaultRowHeight="15" defaultColWidth="8"/><cols><col min="1" max="2" width="14"/></cols><sheetData><row r="1" ht="18"/><row r="2" hidden="1" ht="12.75"/></sheetData></worksheet>"#;
         let mut budget = crate::MAX_TEXT_BYTES;
         let parsed = parse_sheet(
@@ -7979,7 +8215,7 @@ mod tests {
         );
         assert_eq!(
             parsed.imported_default_column_axis_measure,
-            Some(ImportedAxisMeasure::CharacterWidth256(8 * 256))
+            Some(ImportedAxisMeasure::CharacterWidthRatio(8, 1))
         );
         assert_eq!(
             parsed
@@ -7988,8 +8224,8 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             [
-                ImportedAxisMeasure::CharacterWidth256(14 * 256),
-                ImportedAxisMeasure::CharacterWidth256(14 * 256),
+                ImportedAxisMeasure::CharacterWidthRatio(14, 1),
+                ImportedAxisMeasure::CharacterWidthRatio(14, 1),
             ]
         );
         assert_eq!(
@@ -8033,6 +8269,140 @@ mod tests {
             parsed.imported_row_axis_measures.get(&0),
             Some(&ImportedAxisMeasure::PointRatio(2_469, 200))
         );
+    }
+
+    #[test]
+    fn worksheet_keeps_valid_row_heights_when_exact_provenance_is_unrepresentable() {
+        let source = "15.1234567890123456789012345";
+        let xml = format!(
+            r#"<worksheet><sheetFormatPr defaultRowHeight="{source}"/><sheetData><row r="1" ht="{source}"/></sheetData></worksheet>"#
+        );
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            &xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+        let expected = source.parse::<f32>().expect("finite height");
+
+        assert_eq!(parsed.default_row_height, Some(expected));
+        assert_eq!(parsed.row_heights.get(&0), Some(&expected));
+        assert_eq!(parsed.imported_default_row_axis_measure, None);
+        assert!(!parsed.imported_row_axis_measures.contains_key(&0));
+        assert!(parsed.automatic_default_row_height_candidate);
+        assert!(parsed.automatic_row_height_candidates.contains(&0));
+    }
+
+    #[test]
+    fn worksheet_row_height_manuality_tracks_custom_height_separately() {
+        let xml = r#"<worksheet><sheetData>
+            <row r="1" ht="18" customHeight="1"/>
+            <row r="2" ht="19" customHeight="true"/>
+            <row r="3" ht="20" customHeight="0"/>
+            <row r="4" ht="21" customHeight="false"/>
+            <row r="5" ht="22"/>
+            <row r="6" ht="23" customHeight="malformed"/>
+            <row r="7" ht="NaN" customHeight="1"/>
+            <row r="8" ht="-1" customHeight="1"/>
+            <row r="9" ht="1e309" customHeight="1"/>
+            <row r="10" ht="0" customHeight="1"/>
+            <row r="1048576" ht="24" customHeight="TRUE"/>
+            <row r="1048577" ht="25" customHeight="1"/>
+        </sheetData></worksheet>"#;
+        let mut budget = crate::MAX_TEXT_BYTES;
+        let parsed = parse_sheet(
+            xml,
+            &[],
+            &Styles::default(),
+            &ThemeColors::default(),
+            false,
+            &mut budget,
+        );
+
+        assert_eq!(
+            parsed.row_heights.keys().copied().collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed
+                .imported_row_axis_measures
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, MAX_XLSX_ROW_INDEX]
+        );
+        assert_eq!(
+            parsed
+                .automatic_row_height_candidates
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn imported_xlsx_exposes_row_height_manuality_to_renderers() {
+        let workbook = workbook_with_worksheet_xml(
+            r#"<worksheet><sheetData>
+                <row r="1" ht="18" customHeight="1"/>
+                <row r="2" ht="19" customHeight="false"/>
+                <row r="3" ht="20"/>
+                <row r="4" customHeight="1"/>
+            </sheetData></worksheet>"#,
+        );
+        let sheet = &workbook.sheets[0];
+
+        assert!(sheet.row_height_is_manual(0));
+        assert!(!sheet.row_height_is_manual(1));
+        assert!(!sheet.row_height_is_manual(2));
+        assert!(!sheet.row_height_is_manual(3));
+        assert!(!sheet.row_height_is_manual(4));
+    }
+
+    #[test]
+    fn imported_xlsx_exposes_default_row_height_manuality_to_renderers() {
+        for (attributes, expected_manual) in [
+            (r#"defaultRowHeight="15" customHeight="1""#, true),
+            (r#"defaultRowHeight="15" customHeight="true""#, true),
+            (r#"defaultRowHeight="15" customHeight="0""#, false),
+            (r#"defaultRowHeight="15" customHeight="false""#, false),
+            (r#"defaultRowHeight="15""#, false),
+            (r#"defaultRowHeight="15" customHeight="malformed""#, false),
+        ] {
+            let workbook = workbook_with_worksheet_xml(&format!(
+                r#"<worksheet><sheetFormatPr {attributes}/><sheetData/></worksheet>"#
+            ));
+            let sheet = &workbook.sheets[0];
+
+            assert_eq!(sheet.default_row_height(), Some(15.0), "{attributes}");
+            assert_eq!(
+                sheet.default_row_height_is_manual(),
+                expected_manual,
+                "{attributes}"
+            );
+        }
+
+        let workbook = workbook_with_worksheet_xml(r#"<worksheet><sheetData/></worksheet>"#);
+        assert!(!workbook.sheets[0].default_row_height_is_manual());
+
+        for invalid_height in ["NaN", "-1", "0", "1e309"] {
+            let workbook = workbook_with_worksheet_xml(&format!(
+                r#"<worksheet><sheetFormatPr defaultRowHeight="{invalid_height}" customHeight="1"/><sheetData/></worksheet>"#
+            ));
+            let sheet = &workbook.sheets[0];
+
+            assert_eq!(sheet.default_row_height(), None, "{invalid_height}");
+            assert_eq!(
+                sheet.imported_default_row_axis_measure(),
+                None,
+                "{invalid_height}"
+            );
+            assert!(!sheet.default_row_height_is_manual(), "{invalid_height}");
+        }
     }
 
     #[test]
@@ -8437,7 +8807,7 @@ mod tests {
                 r#"<chartSpace><chart><plotArea><lineChart><ser>
                     <tx><strRef><f>Data!$C$1</f><strCache><pt idx="0"><v>Cached Series</v></pt></strCache></strRef></tx>
                     <marker><symbol val="circle"/><size val="5"/></marker>
-                    <spPr><a:ln><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></a:ln></spPr>
+                    <spPr><a:ln w="38100"><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></a:ln></spPr>
                     <cat><strRef><f>Data!$A$2:$A$4</f><strCache><pt idx="0"><v>Q1</v></pt><pt idx="1"><v>Q2</v></pt><pt idx="2"><v>Q3</v></pt></strCache></strRef></cat>
                     <val><numRef><f>Data!$B$2:$B$4</f><numCache><pt idx="0"><v>10</v></pt><pt idx="1"><v>20</v></pt><pt idx="2"><v>30</v></pt></numCache></numRef></val>
                 </ser></lineChart></plotArea></chart></chartSpace>"#,
@@ -8482,6 +8852,7 @@ mod tests {
             sidecar.chart_series_styles[0].line_color,
             Some(Color::rgb(160, 176, 192))
         );
+        assert_eq!(sidecar.chart_series_styles[0].line_width_emu, Some(38_100));
         assert!(sidecar.chart_series_styles[0].losses.is_empty());
         let cache = &sidecar.chart_series_caches[0];
         assert_eq!(cache.name[0].value, "Cached Series");
@@ -8530,7 +8901,7 @@ mod tests {
     fn unsupported_chart_series_style_metadata_is_typed_and_bounded() {
         let xml = r#"<chartSpace><chart><plotArea><lineChart><ser>
             <marker><symbol val="picture"/><size val="255"/></marker>
-            <spPr><a:ln><a:gradFill/><a:prstDash val="dash"/></a:ln></spPr>
+            <spPr><a:ln w="20116801"><a:gradFill/><a:prstDash val="dash"/></a:ln></spPr>
             <val><numRef><f>S!$A$1:$A$2</f></numRef></val>
         </ser></lineChart></plotArea></chart></chartSpace>"#;
         let mut cache_points = 16;
@@ -8546,9 +8917,105 @@ mod tests {
             [
                 ChartSeriesStyleLossKind::UnsupportedMarkerSymbol,
                 ChartSeriesStyleLossKind::InvalidMarkerSize,
+                ChartSeriesStyleLossKind::InvalidLineWidth,
                 ChartSeriesStyleLossKind::UnsupportedLinePaint,
             ]
         );
+    }
+
+    #[test]
+    fn chart_space_fill_and_axis_gridline_presence_are_retained() {
+        let xml = r#"<chartSpace><chart><plotArea><lineChart><ser>
+            <spPr><a:ln><a:noFill/></a:ln></spPr>
+            <cat><strRef><f>S!$A$1:$A$2</f></strRef></cat>
+            <val><numRef><f>S!$B$1:$B$2</f></numRef></val>
+        </ser></lineChart>
+        <catAx><majorGridlines/></catAx><valAx/>
+        </plotArea></chart>
+        <spPr>
+            <a:solidFill><a:srgbClr val="123456"/></a:solidFill>
+            <a:ln><a:noFill/></a:ln>
+        </spPr></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+
+        assert_eq!(
+            parsed.frame_fill,
+            ChartFrameFill::Solid(Color::rgb(0x12, 0x34, 0x56))
+        );
+        assert!(parsed.frame_style_losses.is_empty());
+        assert!(parsed.category_major_gridlines);
+        assert!(!parsed.value_major_gridlines);
+        assert!(!parsed.series_styles[0].line_visible);
+        assert_eq!(parsed.series_styles[0].line_width_emu, Some(12_700));
+
+        let no_fill = xml.replace(
+            r#"<a:solidFill><a:srgbClr val="123456"/></a:solidFill>"#,
+            "<a:noFill/>",
+        );
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart(
+            &no_fill,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+        )
+        .unwrap();
+        assert_eq!(parsed.frame_fill, ChartFrameFill::NoFill);
+
+        let unsupported = no_fill.replace("<a:noFill/>", "<a:gradFill/>");
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart(
+            &unsupported,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+        )
+        .unwrap();
+        assert_eq!(parsed.frame_fill, ChartFrameFill::Automatic);
+        assert_eq!(
+            parsed.frame_style_losses,
+            [ChartFrameStyleLossKind::UnsupportedPaint]
+        );
+    }
+
+    #[test]
+    fn chart_series_line_width_enforces_ooxml_bounds() {
+        for (width, expected, invalid) in [
+            (None, Some(12_700), false),
+            (Some("0"), Some(0), false),
+            (Some("20116800"), Some(20_116_800), false),
+            (Some("-1"), None, true),
+            (Some("20116801"), None, true),
+            (Some("wide"), None, true),
+        ] {
+            let width = width.map_or(String::new(), |value| format!(r#" w="{value}""#));
+            let xml = format!(
+                r#"<chartSpace><chart><plotArea><lineChart><ser>
+                    <spPr><a:ln{width}/></spPr>
+                    <val><numRef><f>S!$A$1:$A$2</f></numRef></val>
+                </ser></lineChart></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            let style = &parsed.series_styles[0];
+            assert_eq!(style.line_width_emu, expected, "{width}");
+            assert_eq!(
+                style
+                    .losses
+                    .contains(&ChartSeriesStyleLossKind::InvalidLineWidth),
+                invalid,
+                "{width}"
+            );
+        }
     }
 
     #[test]

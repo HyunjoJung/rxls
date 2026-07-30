@@ -98,11 +98,12 @@ ORACLE_RENDER_STEP_SHA256 = (
     "1266e4280f579884aef9895f70988b7a58ac80f791e5b1dae6d63bfa1b001ede",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
-    "d0a6977111dff7834d45d32af480a2856e8de63f39648cf8d75b13be3e1a3921",
+    "736adb4fbe36521a6ca77d28b07fa4a62106b89cca089c048893a00b712ef2ab",
     "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
     "802e9d82f7e8d7a089a06e93d011535e1cae7d80a4ba5332958fc395cfbd1347",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
+    "74b2d392ed32268384508abc710ba1c1405616478059e749a7e5fafe5a8afa5a",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "8cf408faa253deea839f48f20bd4e23d3e8d58950d2fb6ed97e547ba0cd205a8",
@@ -112,8 +113,9 @@ ORACLE_RENDER_STEP_SHA256 = (
     "792449bf571ae8efb3bed9c16b2c17e4a980d2e1dfd1e5a4ffd2eefa57e74234",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
-    "5bba669617ea9f3159be4ba5d3de77115c3ee6954794c585c245dfb7c8eec81e",
-    "b50f2f8062ab74765147148258b18e8adffbc84ac41a7da12d5e63f4edb5f09c",
+    "0277dad1011ca57308140daf2434fa5dd9e2ef4a9936ed041193347904838eb4",
+    "bdd84b925ad854145d404645230fb7fc341be69b76481a8fc6453b829d284bb6",
+    "5f4113d9afc22d73ccc488156e0f3abcea689b74a2b261c7e8522b338029a4e6",
 )
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "82dcaaf5e601cb509cf5312a5caf66a1f08e651165b53a3758e346938a32b7f4",
@@ -124,7 +126,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "3375dd35aa51121d2e5c6349c05ec046e8ffd3e5028d7f5c7611de22694bf183"
+    "720b02bbaf0323823d45cd05a476b54341a54d318556003e35ece1e3fa636518"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
@@ -2027,6 +2029,55 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "target/render-oracle-hosted/build.stderr",
         errors,
     )
+    pinned_font_cli_regression = _single_yaml_block(
+        path,
+        active,
+        "- name: Run the pinned-font SinglePageSheets CLI geometry regression",
+        6,
+        "pinned-font SinglePageSheets CLI geometry regression step",
+        errors,
+    )
+    expected_pinned_font_cli_regression = (
+        "      - name: Run the pinned-font SinglePageSheets CLI geometry regression\n"
+        "        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}\n"
+        "        timeout-minutes: 15\n"
+        "        shell: bash\n"
+        "        env:\n"
+        "          RXLS_TEST_FONT_PACK_MANIFEST: local/render-fonts/pack/manifest.json\n"
+        "          RXLS_TEST_FONT_FAMILY: Arimo\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --test printing "
+        "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
+        "            -- --exact"
+    )
+    if pinned_font_cli_regression != expected_pinned_font_cli_regression:
+        errors.append(
+            f"{path}: pinned-font SinglePageSheets CLI regression must remain one "
+            "exact, verified-manifest Arimo test bounded to fifteen minutes"
+        )
+    type3_smoke_index = active.find(
+        "- name: Run the project-native Type3 PDF Poppler smoke"
+    )
+    pinned_font_regression_index = active.find(
+        "- name: Run the pinned-font SinglePageSheets CLI geometry regression"
+    )
+    oracle_image_build_index = active.find(
+        "- name: Build and inspect the locked oracle image"
+    )
+    if not (
+        0
+        <= type3_smoke_index
+        < pinned_font_regression_index
+        < oracle_image_build_index
+    ):
+        errors.append(
+            f"{path}: pinned-font CLI regression must run after renderer integration "
+            "test availability and before the oracle image build"
+        )
     host_acquisition = _single_yaml_block(
         path,
         active,
@@ -2575,6 +2626,15 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/test_summarize_render_oracle_failure.py": (
             "must test the failure sanitizer before any campaign can invoke it"
         ),
+        (
+            "python3 -m unittest "
+            "scripts.test_check_render_oracle_release_evidence."
+            "RenderOracleReleaseEvidenceTests."
+            "test_failure_summary_validator_is_bound_private_and_fail_closed"
+        ): (
+            "must test the independent failure-summary consumer contract "
+            "before any campaign can invoke it"
+        ),
         "--input-root target/render-oracle-hosted \\": (
             "failure diagnostics may read only the fixed hosted report root"
         ),
@@ -2589,8 +2649,11 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             "failure diagnostics must bind their artifact to the exact source SHA, "
             "run ID, and attempt"
         ),
-        "steps.render_oracle_failure_summary.outcome == 'success'": (
-            "must upload failure diagnostics only after successful sanitization"
+        "steps.render_oracle_failure_evidence.outcome == 'success'": (
+            "must upload failure diagnostics only after successful validation"
+        ),
+        "validate_failure_summary(": (
+            "must independently validate the exact generated failure artifact"
         ),
     }
     for snippet, message in required.items():
@@ -2773,16 +2836,19 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         if uploaded != allowed_artifacts:
             errors.append(f"{path}: hosted artifacts must use the exact aggregate-only allowlist")
 
-    failure_summary = _single_yaml_block(
+    failure_evidence = _single_yaml_block(
         path,
         active,
-        "- name: Summarize failed Render Oracle reports",
+        (
+            "- name: Generate and validate sanitized Render Oracle "
+            "failure evidence"
+        ),
         6,
-        "Render Oracle failure-summary step",
+        "Render Oracle failure-evidence generation step",
         errors,
     )
-    failure_summary_required = {
-        "id: render_oracle_failure_summary",
+    failure_evidence_required = {
+        "id: render_oracle_failure_evidence",
         "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' }}",
         "shell: bash",
         f"EXPECTED_HEAD_SHA: {ORACLE_SOURCE_SHA_EXPRESSION}",
@@ -2793,13 +2859,24 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '--baseline-mode "$RXLS_BASELINE_MODE" \\',
         '--head-sha "$EXPECTED_HEAD_SHA" \\',
         "--output target/render-oracle-failure/render-oracle-failure-summary.json",
-        "cat target/render-oracle-failure/render-oracle-failure-summary.json \\",
-        '>> "$GITHUB_STEP_SUMMARY"',
+        (
+            'python3 - "$EXPECTED_HEAD_SHA" "$RXLS_ORACLE_CAMPAIGN" '
+            '"$RXLS_BASELINE_MODE" <<\'PY\''
+        ),
+        "from scripts.check_render_oracle_release_evidence import (",
+        "validate_failure_summary,",
+        "validate_failure_summary(",
+        "head_sha=sys.argv[1]",
+        "profile=sys.argv[2]",
+        "baseline_mode=sys.argv[3]",
     }
-    if any(value not in failure_summary for value in failure_summary_required):
+    if any(
+        value not in failure_evidence
+        for value in failure_evidence_required
+    ):
         errors.append(
             f"{path}: failed reports must pass through the exact bounded "
-            "path-neutral summary command"
+            "path-neutral summary and independent validation commands"
         )
 
     failure_upload = _single_yaml_block(
@@ -2811,9 +2888,10 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         errors,
     )
     failure_upload_required = {
+        "id: render_oracle_failure_upload",
         (
             "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && "
-            "steps.render_oracle_failure_summary.outcome == 'success' }}"
+            "steps.render_oracle_failure_evidence.outcome == 'success' }}"
         ),
         f"uses: {ORACLE_UPLOAD_ARTIFACT_ACTION}",
         (
@@ -2842,6 +2920,64 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     ):
         errors.append(
             f"{path}: failure upload cannot include raw reports, corpora, or wildcards"
+        )
+
+    failure_overview = _single_yaml_block(
+        path,
+        active,
+        "- name: Append bounded Render Oracle failure overview",
+        6,
+        "Render Oracle failure overview",
+        errors,
+    )
+    failure_overview_required = {
+        (
+            "if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && "
+            "steps.render_oracle_failure_evidence.outcome == 'success' && "
+            "steps.render_oracle_failure_upload.outcome == 'success' }}"
+        ),
+        "continue-on-error: true",
+        "shell: bash",
+        "set -euo pipefail",
+        'python3 - "$GITHUB_STEP_SUMMARY" <<\'PY\'',
+        '"### Sanitized Render Oracle failure evidence"',
+        'summary["reports"]',
+        "fidelity['semantic_visible_characters']['f1_ppm']",
+        "fidelity['poppler_words']['f1_ppm']",
+        "fidelity['poppler_lines']['f1_ppm']",
+        "fidelity['raster']['similarity_ppm']",
+    }
+    if any(
+        value not in failure_overview
+        for value in failure_overview_required
+    ):
+        errors.append(
+            f"{path}: the failure overview must be bounded, non-blocking, "
+            "and consume only successfully uploaded sanitized evidence"
+        )
+    if (
+        "cat target/render-oracle-failure/"
+        "render-oracle-failure-summary.json" in failure_overview
+    ):
+        errors.append(
+            f"{path}: the bounded job overview cannot append the complete "
+            "failure JSON to GITHUB_STEP_SUMMARY"
+        )
+    evidence_position = active.find(
+        "- name: Generate and validate sanitized Render Oracle failure evidence"
+    )
+    upload_position = active.find(
+        "- name: Upload sanitized Render Oracle failure summary"
+    )
+    overview_position = active.find(
+        "- name: Append bounded Render Oracle failure overview"
+    )
+    if not (
+        0 <= evidence_position < upload_position < overview_position
+    ):
+        errors.append(
+            f"{path}: validated failure evidence must be uploaded before "
+            "any best-effort presentation"
         )
 
     apt_lines = [line for line in active.splitlines() if "apt-get " in line]

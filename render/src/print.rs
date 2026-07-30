@@ -136,8 +136,8 @@ pub enum PrintWarningCode {
     FitTargetUnreachable,
     /// A repeated-title range was reversed, outside the grid, or unusable.
     InvalidPrintTitlesIgnored,
-    /// A repeated-title range occurs in the middle of the print area and is
-    /// therefore repeated without being removed from the body.
+    /// Legacy warning identifier for a repeated-title range in the middle of
+    /// a print area. Current page composition deduplicates these overlaps.
     MidAreaPrintTitlesDuplicated,
     /// A merge larger than the available body box forced one page to overflow.
     MergeExpandedPage,
@@ -504,6 +504,7 @@ struct AxisSegment<I> {
     first: I,
     last: I,
     size: Fixed,
+    body_is_empty: bool,
     manual_break_before: bool,
 }
 
@@ -694,20 +695,16 @@ fn prepare_print_area(
     source_options.selection = RenderSelection::Range(range);
     source_options.gridlines &= behavior.gridlines;
 
-    let mut body_first_row = range.first_row;
-    let mut body_first_col = range.first_col;
+    let mut body_first_row = Some(range.first_row);
+    let mut body_first_col = Some(range.first_col);
     if let Some((first, last)) = repeat_rows {
         if first <= range.first_row && last >= range.first_row {
-            body_first_row = last.saturating_add(1);
-        } else if first <= range.last_row && last >= range.first_row {
-            warnings.add(PrintWarningCode::MidAreaPrintTitlesDuplicated);
+            body_first_row = last.checked_add(1);
         }
     }
     if let Some((first, last)) = repeat_cols {
         if first <= range.first_col && last >= range.first_col {
-            body_first_col = last.saturating_add(1);
-        } else if first <= range.last_col && last >= range.first_col {
-            warnings.add(PrintWarningCode::MidAreaPrintTitlesDuplicated);
+            body_first_col = last.checked_add(1);
         }
     }
 
@@ -809,16 +806,16 @@ fn prepare_print_area(
     source
         .warnings
         .retain(|warning| warning.code != WarningCode::PaginationDeferred);
-    let body_rows = if body_first_row <= range.last_row {
-        measured_axis_range(&measured_rows, body_first_row, range.last_row)
-    } else {
-        Vec::new()
-    };
-    let body_columns = if body_first_col <= range.last_col {
-        measured_axis_range(&measured_columns, body_first_col, range.last_col)
-    } else {
-        Vec::new()
-    };
+    let body_rows = body_first_row
+        .filter(|&first| first <= range.last_row)
+        .map_or_else(Vec::new, |first| {
+            measured_axis_range(&measured_rows, first, range.last_row)
+        });
+    let body_columns = body_first_col
+        .filter(|&first| first <= range.last_col)
+        .map_or_else(Vec::new, |first| {
+            measured_axis_range(&measured_columns, first, range.last_col)
+        });
     let repeated_rows = match repeat_rows {
         Some((first, last)) => measured_axis_range(&measured_rows, first, last),
         None => Vec::new(),
@@ -839,8 +836,16 @@ fn prepare_print_area(
     } else {
         Fixed::ZERO
     };
-    let row_merges = merge_intervals_rows(sheet, body_first_row, range.last_row);
-    let col_merges = merge_intervals_columns(sheet, body_first_col, range.last_col);
+    let row_merges = body_first_row
+        .filter(|&first| first <= range.last_row)
+        .map_or_else(Vec::new, |first| {
+            merge_intervals_rows(sheet, first, range.last_row)
+        });
+    let col_merges = body_first_col
+        .filter(|&first| first <= range.last_col)
+        .map_or_else(Vec::new, |first| {
+            merge_intervals_columns(sheet, first, range.last_col)
+        });
 
     let scale_permille = choose_scale(
         setup,
@@ -849,6 +854,8 @@ fn prepare_print_area(
         &body_columns,
         repeated_height,
         repeated_width,
+        repeat_rows,
+        repeat_cols,
         headings_height,
         headings_width,
         content_rect,
@@ -872,16 +879,40 @@ fn prepare_print_area(
         repeated_height,
         headings_height,
     )?;
+    let untitled_capacity_height = unscaled_capacity(
+        content_rect.height,
+        scale_permille,
+        Fixed::ZERO,
+        headings_height,
+    )?;
     let body_capacity_width = unscaled_capacity(
         content_rect.width,
         scale_permille,
         repeated_width,
         headings_width,
     )?;
-    let (row_segments, row_expansions, row_break_shifts) =
-        partition_axis_with_breaks(&body_rows, body_capacity_height, &row_merges, row_breaks)?;
-    let (column_segments, column_expansions, column_break_shifts) =
-        partition_axis_with_breaks(&body_columns, body_capacity_width, &col_merges, col_breaks)?;
+    let untitled_capacity_width = unscaled_capacity(
+        content_rect.width,
+        scale_permille,
+        Fixed::ZERO,
+        headings_width,
+    )?;
+    let (row_segments, row_expansions, row_break_shifts) = partition_axis_with_breaks(
+        &body_rows,
+        untitled_capacity_height,
+        body_capacity_height,
+        &row_merges,
+        row_breaks,
+        repeat_rows,
+    )?;
+    let (column_segments, column_expansions, column_break_shifts) = partition_axis_with_breaks(
+        &body_columns,
+        untitled_capacity_width,
+        body_capacity_width,
+        &col_merges,
+        col_breaks,
+        repeat_cols,
+    )?;
     warnings.add_count(
         PrintWarningCode::MergeExpandedPage,
         row_expansions.saturating_add(column_expansions),
@@ -890,36 +921,28 @@ fn prepare_print_area(
         PrintWarningCode::ManualBreakShiftedForMerge,
         row_break_shifts.saturating_add(column_break_shifts),
     );
-    warnings.add_count(
-        PrintWarningCode::PageContentOverflow,
-        row_segments
-            .iter()
-            .filter(|segment| segment.size > body_capacity_height)
-            .count() as u64
-            + column_segments
-                .iter()
-                .filter(|segment| segment.size > body_capacity_width)
-                .count() as u64
-            + u64::from(
-                scale_fixed(
-                    repeated_height
-                        .checked_add(headings_height)
-                        .ok_or(RenderError::CoordinateOverflow)?,
-                    scale_permille,
-                )? > content_rect.height,
-            )
-            + u64::from(
-                scale_fixed(
-                    repeated_width
-                        .checked_add(headings_width)
-                        .ok_or(RenderError::CoordinateOverflow)?,
-                    scale_permille,
-                )? > content_rect.width,
-            ),
-    );
-
     let row_segments = ensure_row_segment(row_segments, range);
     let column_segments = ensure_column_segment(column_segments, range);
+    let row_overflows = axis_overflow_count(
+        &row_segments,
+        repeated_height,
+        repeat_rows,
+        headings_height,
+        scale_permille,
+        content_rect.height,
+    )?;
+    let column_overflows = axis_overflow_count(
+        &column_segments,
+        repeated_width,
+        repeat_cols,
+        headings_width,
+        scale_permille,
+        content_rect.width,
+    )?;
+    warnings.add_count(
+        PrintWarningCode::PageContentOverflow,
+        row_overflows.saturating_add(column_overflows),
+    );
     let logical_pages = (row_segments.len() as u64)
         .checked_mul(column_segments.len() as u64)
         .ok_or(RenderError::CoordinateOverflow)?;
@@ -945,8 +968,11 @@ fn prepare_print_area(
                             sheet,
                             slot,
                             range,
+                            repeat_rows,
+                            repeat_cols,
                             &source_options,
-                            SheetGeometryOverride::new(&measured_rows, &measured_columns),
+                            &measured_rows,
+                            &measured_columns,
                         )?
                     {
                         slots.push(slot);
@@ -968,8 +994,11 @@ fn prepare_print_area(
                             sheet,
                             slot,
                             range,
+                            repeat_rows,
+                            repeat_cols,
                             &source_options,
-                            SheetGeometryOverride::new(&measured_rows, &measured_columns),
+                            &measured_rows,
+                            &measured_columns,
                         )?
                     {
                         slots.push(slot);
@@ -1452,9 +1481,16 @@ fn print_source_identity(
     update_debug(&mut digest, &sheet.implicit_ooxml_column_width());
     update_debug(&mut digest, &sheet.ooxml_uses_defaulted_base_column_width());
     update_debug(&mut digest, sheet.row_heights());
+    let row_height_manuality = sheet
+        .row_heights()
+        .keys()
+        .map(|&row| (row, sheet.row_height_is_manual(row)))
+        .collect::<Vec<_>>();
+    update_debug(&mut digest, &row_height_manuality);
     update_debug(&mut digest, sheet.imported_row_axis_measures());
     update_debug(&mut digest, &sheet.imported_default_row_axis_measure());
     update_debug(&mut digest, &sheet.default_row_height());
+    update_debug(&mut digest, &sheet.default_row_height_is_manual());
     update_debug(&mut digest, &sheet.has_implicit_ooxml_row_height());
     update_debug(&mut digest, &sheet.implicit_ooxml_row_height_source());
     update_debug(&mut digest, &sheet.verified_xlsx_normal_font_size_pt());
@@ -1778,8 +1814,6 @@ fn build_sheet_print_page_with_budget(
                 slot,
                 area.repeat_rows,
                 area.repeat_cols,
-                area.repeated_height,
-                area.repeated_width,
                 area.headings_height,
                 area.headings_width,
                 area.scale_permille,
@@ -1888,8 +1922,6 @@ fn build_page_scene(
     slot: PageSlot,
     repeat_rows: Option<(u32, u32)>,
     repeat_cols: Option<(u16, u16)>,
-    repeated_height: Fixed,
-    repeated_width: Fixed,
     headings_height: Fixed,
     headings_width: Fixed,
     scale_permille: u16,
@@ -1899,6 +1931,12 @@ fn build_page_scene(
     limits: &PrintLimits,
     media_budget: &mut DecodedMediaBudget,
 ) -> Result<Scene, RenderError> {
+    let repeat_row_ranges = active_repeat_rows(repeat_rows, slot.rows);
+    let repeat_col_ranges = active_repeat_columns(repeat_cols, slot.columns);
+    let title_rows = measured_axis_ranges(measured_rows, &repeat_row_ranges);
+    let title_columns = measured_axis_ranges(measured_columns, &repeat_col_ranges);
+    let repeated_height = axis_total(&title_rows)?;
+    let repeated_width = axis_total(&title_columns)?;
     let unscaled_width = headings_width
         .checked_add(repeated_width)
         .and_then(|value| value.checked_add(slot.columns.size))
@@ -1938,8 +1976,8 @@ fn build_page_scene(
             measured_rows,
             measured_columns,
             slot,
-            repeat_rows,
-            repeat_cols,
+            &title_rows,
+            &title_columns,
             grid_x,
             grid_y,
             repeated_height,
@@ -2008,62 +2046,89 @@ fn build_page_scene(
             media_budget,
         )?;
     }
-    if let Some((first_row, last_row)) = repeat_rows.filter(|_| slot.columns.size.raw() > 0) {
-        append_block(
-            &mut nodes,
-            sheet,
-            sheet_index,
-            source_options,
-            measured_rows,
-            measured_columns,
-            RenderRange::new(first_row, slot.columns.first, last_row, slot.columns.last),
-            body_x,
-            repeat_y,
-            slot.columns.size,
-            repeated_height,
-            content_rect,
-            scale_permille,
-            limits,
-            media_budget,
-        )?;
+    let mut placed_repeat_rows = Vec::with_capacity(repeat_row_ranges.len());
+    let mut title_y = repeat_y;
+    for &(first_row, last_row) in &repeat_row_ranges {
+        let height = axis_total(&measured_axis_range(measured_rows, first_row, last_row))?;
+        placed_repeat_rows.push(((first_row, last_row), title_y, height));
+        if slot.columns.size.raw() > 0 {
+            append_block(
+                &mut nodes,
+                sheet,
+                sheet_index,
+                source_options,
+                measured_rows,
+                measured_columns,
+                RenderRange::new(first_row, slot.columns.first, last_row, slot.columns.last),
+                body_x,
+                title_y,
+                slot.columns.size,
+                height,
+                content_rect,
+                scale_permille,
+                limits,
+                media_budget,
+            )?;
+        }
+        title_y = title_y
+            .checked_add(scale_fixed(height, scale_permille)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
     }
-    if let Some((first_col, last_col)) = repeat_cols.filter(|_| slot.rows.size.raw() > 0) {
-        append_block(
-            &mut nodes,
-            sheet,
-            sheet_index,
-            source_options,
-            measured_rows,
-            measured_columns,
-            RenderRange::new(slot.rows.first, first_col, slot.rows.last, last_col),
-            repeat_x,
-            body_y,
-            repeated_width,
-            slot.rows.size,
-            content_rect,
-            scale_permille,
-            limits,
-            media_budget,
-        )?;
+
+    let mut placed_repeat_columns = Vec::with_capacity(repeat_col_ranges.len());
+    let mut title_x = repeat_x;
+    let repeat_column_order = if right_to_left {
+        repeat_col_ranges.iter().rev().copied().collect::<Vec<_>>()
+    } else {
+        repeat_col_ranges.clone()
+    };
+    for (first_col, last_col) in repeat_column_order {
+        let width = axis_total(&measured_axis_range(measured_columns, first_col, last_col))?;
+        placed_repeat_columns.push(((first_col, last_col), title_x, width));
+        if slot.rows.size.raw() > 0 {
+            append_block(
+                &mut nodes,
+                sheet,
+                sheet_index,
+                source_options,
+                measured_rows,
+                measured_columns,
+                RenderRange::new(slot.rows.first, first_col, slot.rows.last, last_col),
+                title_x,
+                body_y,
+                width,
+                slot.rows.size,
+                content_rect,
+                scale_permille,
+                limits,
+                media_budget,
+            )?;
+        }
+        title_x = title_x
+            .checked_add(scale_fixed(width, scale_permille)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
     }
-    if let (Some((first_row, last_row)), Some((first_col, last_col))) = (repeat_rows, repeat_cols) {
-        append_block(
-            &mut nodes,
-            sheet,
-            sheet_index,
-            source_options,
-            measured_rows,
-            measured_columns,
-            RenderRange::new(first_row, first_col, last_row, last_col),
-            repeat_x,
-            repeat_y,
-            repeated_width,
-            repeated_height,
-            content_rect,
-            scale_permille,
-            limits,
-            media_budget,
-        )?;
+
+    for &((first_row, last_row), y, height) in &placed_repeat_rows {
+        for &((first_col, last_col), x, width) in &placed_repeat_columns {
+            append_block(
+                &mut nodes,
+                sheet,
+                sheet_index,
+                source_options,
+                measured_rows,
+                measured_columns,
+                RenderRange::new(first_row, first_col, last_row, last_col),
+                x,
+                y,
+                width,
+                height,
+                content_rect,
+                scale_permille,
+                limits,
+                media_budget,
+            )?;
+        }
     }
 
     let running_x = if behavior.header_footer.align_with_margins {
@@ -2277,8 +2342,8 @@ fn append_headings(
     measured_rows: &[MeasuredAxisSlot<u32>],
     measured_columns: &[MeasuredAxisSlot<u16>],
     slot: PageSlot,
-    repeat_rows: Option<(u32, u32)>,
-    repeat_cols: Option<(u16, u16)>,
+    title_rows: &[MeasuredAxisSlot<u32>],
+    title_columns: &[MeasuredAxisSlot<u16>],
     grid_x: Fixed,
     grid_y: Fixed,
     repeated_height: Fixed,
@@ -2322,14 +2387,6 @@ fn append_headings(
         measured_axis_range(measured_columns, slot.columns.first, slot.columns.last)
     } else {
         Vec::new()
-    };
-    let title_rows = match repeat_rows {
-        Some((first, last)) => measured_axis_range(measured_rows, first, last),
-        None => Vec::new(),
-    };
-    let title_columns = match repeat_cols {
-        Some((first, last)) => measured_axis_range(measured_columns, first, last),
-        None => Vec::new(),
     };
     let mut x = if right_to_left {
         grid_x
@@ -2837,6 +2894,8 @@ fn choose_scale(
     columns: &[MeasuredAxisSlot<u16>],
     repeated_height: Fixed,
     repeated_width: Fixed,
+    repeat_rows: Option<(u32, u32)>,
+    repeat_cols: Option<(u16, u16)>,
     headings_height: Fixed,
     headings_width: Fixed,
     content: Rect,
@@ -2863,29 +2922,42 @@ fn choose_scale(
         value => Some(value),
     };
     let fits = |scale| -> Result<bool, RenderError> {
-        if scale_fixed(
-            repeated_height
-                .checked_add(headings_height)
-                .ok_or(RenderError::CoordinateOverflow)?,
-            scale,
-        )? > content.height
-            || scale_fixed(
-                repeated_width
-                    .checked_add(headings_width)
-                    .ok_or(RenderError::CoordinateOverflow)?,
-                scale,
-            )? > content.width
-        {
-            return Ok(false);
-        }
         let row_capacity =
             unscaled_capacity(content.height, scale, repeated_height, headings_height)?;
+        let untitled_row_capacity =
+            unscaled_capacity(content.height, scale, Fixed::ZERO, headings_height)?;
         let col_capacity = unscaled_capacity(content.width, scale, repeated_width, headings_width)?;
-        let (row_pages, _) = partition_axis(rows, row_capacity, row_merges)?;
-        let (col_pages, _) = partition_axis(columns, col_capacity, col_merges)?;
-        Ok(row_pages.iter().all(|page| page.size <= row_capacity)
-            && col_pages.iter().all(|page| page.size <= col_capacity)
-            && fit_height.is_none_or(|target| row_pages.len() <= usize::from(target))
+        let untitled_col_capacity =
+            unscaled_capacity(content.width, scale, Fixed::ZERO, headings_width)?;
+        let (row_pages, _) = partition_axis(
+            rows,
+            untitled_row_capacity,
+            row_capacity,
+            row_merges,
+            repeat_rows,
+        )?;
+        let (col_pages, _) = partition_axis(
+            columns,
+            untitled_col_capacity,
+            col_capacity,
+            col_merges,
+            repeat_cols,
+        )?;
+        Ok(axis_segments_fit(
+            &row_pages,
+            repeated_height,
+            repeat_rows,
+            headings_height,
+            scale,
+            content.height,
+        )? && axis_segments_fit(
+            &col_pages,
+            repeated_width,
+            repeat_cols,
+            headings_width,
+            scale,
+            content.width,
+        )? && fit_height.is_none_or(|target| row_pages.len() <= usize::from(target))
             && fit_width.is_none_or(|target| col_pages.len() <= usize::from(target)))
     };
     if !fits(MIN_PRINT_SCALE_PERMILLE)? {
@@ -2927,10 +2999,85 @@ fn unscaled_capacity(
         .max(Fixed::from_raw(1)))
 }
 
+fn axis_segment_repeats_titles<I>(segment: &AxisSegment<I>, repeat: Option<(I, I)>) -> bool
+where
+    I: Copy + Ord,
+{
+    segment.body_is_empty || repeat.is_some_and(|(_, repeat_last)| segment.first > repeat_last)
+}
+
+fn axis_rendered_size<I>(
+    segment: &AxisSegment<I>,
+    repeated: Fixed,
+    repeat: Option<(I, I)>,
+    headings: Fixed,
+) -> Result<Fixed, RenderError>
+where
+    I: Copy + Ord,
+{
+    segment
+        .size
+        .checked_add(if axis_segment_repeats_titles(segment, repeat) {
+            repeated
+        } else {
+            Fixed::ZERO
+        })
+        .and_then(|value| value.checked_add(headings))
+        .ok_or(RenderError::CoordinateOverflow)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn axis_overflow_count<I>(
+    segments: &[AxisSegment<I>],
+    repeated: Fixed,
+    repeat: Option<(I, I)>,
+    headings: Fixed,
+    scale_permille: u16,
+    page_capacity: Fixed,
+) -> Result<u64, RenderError>
+where
+    I: Copy + Ord,
+{
+    segments.iter().try_fold(0_u64, |count, segment| {
+        let rendered = axis_rendered_size(segment, repeated, repeat, headings)?;
+        Ok(count + u64::from(scale_fixed(rendered, scale_permille)? > page_capacity))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn axis_segments_fit<I>(
+    segments: &[AxisSegment<I>],
+    repeated: Fixed,
+    repeat: Option<(I, I)>,
+    headings: Fixed,
+    scale_permille: u16,
+    page_capacity: Fixed,
+) -> Result<bool, RenderError>
+where
+    I: Copy + Ord,
+{
+    if segments.is_empty() {
+        let title_only = repeated
+            .checked_add(headings)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        return Ok(scale_fixed(title_only, scale_permille)? <= page_capacity);
+    }
+    Ok(axis_overflow_count(
+        segments,
+        repeated,
+        repeat,
+        headings,
+        scale_permille,
+        page_capacity,
+    )? == 0)
+}
+
 fn partition_axis<I>(
     slots: &[MeasuredAxisSlot<I>],
-    capacity: Fixed,
+    untitled_capacity: Fixed,
+    titled_capacity: Fixed,
     merges: &[(I, I)],
+    repeat: Option<(I, I)>,
 ) -> Result<(Vec<AxisSegment<I>>, u64), RenderError>
 where
     I: Copy + Ord,
@@ -2944,6 +3091,14 @@ where
     while position < slots.len() {
         let mut next = position;
         let mut size = Fixed::ZERO;
+        // Calc treats a middle title band as ordinary sheet content until a
+        // page starts beyond it. Only those later pages reserve title space.
+        let capacity = if repeat.is_some_and(|(_, repeat_last)| slots[position].index > repeat_last)
+        {
+            titled_capacity
+        } else {
+            untitled_capacity
+        };
         while next < slots.len() {
             let candidate = size
                 .checked_add(slots[next].size)
@@ -2960,10 +3115,67 @@ where
         }
         if next < slots.len() {
             let boundary = slots[next].index;
-            if let Some(&(merge_first, merge_last)) = merges
+            let repeated_interval =
+                repeat.filter(|(first, last)| *first < boundary && boundary <= *last);
+            let merged_interval = merges
                 .iter()
-                .find(|(first, last)| *first < boundary && boundary <= *last)
-            {
+                .copied()
+                .find(|(first, last)| *first < boundary && boundary <= *last);
+            if let Some((_, repeated_last)) = repeated_interval {
+                // Calc removes an automatic break that lands strictly inside
+                // the title band, resets the running page size at that point,
+                // and applies the reduced titled-page capacity from then on.
+                // The natural page may consequently exceed its physical box.
+                let repeated_end = slots
+                    .iter()
+                    .rposition(|slot| slot.index <= repeated_last)
+                    .map_or(next, |index| index + 1);
+                let resumed_at = next;
+                let mut resumed_size = Fixed::ZERO;
+                while next < slots.len() {
+                    let candidate = resumed_size
+                        .checked_add(slots[next].size)
+                        .ok_or(RenderError::CoordinateOverflow)?;
+                    if next > resumed_at && candidate > titled_capacity {
+                        if next >= repeated_end {
+                            break;
+                        }
+                        // Preserve the complete title band even if more than
+                        // one of its indivisible slots exceeds the body box.
+                        resumed_size = slots[next].size;
+                        next += 1;
+                        continue;
+                    }
+                    resumed_size = candidate;
+                    next += 1;
+                }
+                if next < slots.len() {
+                    let resumed_boundary = slots[next].index;
+                    if let Some((merge_first, merge_last)) =
+                        merges.iter().copied().find(|(first, last)| {
+                            *first < resumed_boundary && resumed_boundary <= *last
+                        })
+                    {
+                        let merge_start = slots
+                            .iter()
+                            .position(|slot| slot.index >= merge_first)
+                            .unwrap_or(position);
+                        if merge_start > position {
+                            next = merge_start;
+                        } else {
+                            let merge_end = slots
+                                .iter()
+                                .rposition(|slot| slot.index <= merge_last)
+                                .map_or(next, |index| index + 1);
+                            if merge_end > next {
+                                next = merge_end;
+                                expansions = expansions.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                size = axis_slice_total(&slots[position..next])?;
+            } else if let Some((merge_first, merge_last)) = merged_interval {
                 let merge_start = slots
                     .iter()
                     .position(|slot| slot.index >= merge_first)
@@ -2987,6 +3199,7 @@ where
             first: slots[position].index,
             last: slots[next - 1].index,
             size,
+            body_is_empty: false,
             manual_break_before: false,
         });
         position = next;
@@ -2996,9 +3209,11 @@ where
 
 fn partition_axis_with_breaks<I>(
     slots: &[MeasuredAxisSlot<I>],
-    capacity: Fixed,
+    untitled_capacity: Fixed,
+    titled_capacity: Fixed,
     merges: &[(I, I)],
     manual_breaks: &[I],
+    repeat: Option<(I, I)>,
 ) -> Result<(Vec<AxisSegment<I>>, u64, u64), RenderError>
 where
     I: Copy + Ord,
@@ -3015,12 +3230,18 @@ where
             continue;
         }
         let boundary = slots[position].index;
+        // Calc removes a manual break that lands strictly inside repeated
+        // rows. Apply the same protected-band rule to both axes.
+        if repeat.is_some_and(|(first, last)| first < boundary && boundary <= last) {
+            continue;
+        }
         let previous = cuts.last().map_or(0, |(position, _)| *position);
         let mut adjusted = position;
-        if let Some(&(merge_first, merge_last)) = merges
+        let protected_interval = merges
             .iter()
-            .find(|(first, last)| *first < boundary && boundary <= *last)
-        {
+            .copied()
+            .find(|(first, last)| *first < boundary && boundary <= *last);
+        if let Some((merge_first, merge_last)) = protected_interval {
             let merge_start = slots.partition_point(|slot| slot.index < merge_first);
             let merge_end = slots.partition_point(|slot| slot.index <= merge_last);
             adjusted = if merge_start > previous {
@@ -3045,8 +3266,13 @@ where
         if start >= end {
             continue;
         }
-        let (mut segments, slice_expansions) =
-            partition_axis(&slots[start..end], capacity, merges)?;
+        let (mut segments, slice_expansions) = partition_axis(
+            &slots[start..end],
+            untitled_capacity,
+            titled_capacity,
+            merges,
+            repeat,
+        )?;
         if let Some(first) = segments.first_mut() {
             first.manual_break_before = manual_break_before;
         }
@@ -3065,6 +3291,7 @@ fn ensure_row_segment(
             first: range.first_row,
             last: range.first_row,
             size: Fixed::ZERO,
+            body_is_empty: true,
             manual_break_before: false,
         }]
     } else {
@@ -3081,6 +3308,7 @@ fn ensure_column_segment(
             first: range.first_col,
             last: range.first_col,
             size: Fixed::ZERO,
+            body_is_empty: true,
             manual_break_before: false,
         }]
     } else {
@@ -3088,26 +3316,52 @@ fn ensure_column_segment(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn page_has_content(
     sheet: &Sheet,
     slot: PageSlot,
     print_range: RenderRange,
+    repeat_rows: Option<(u32, u32)>,
+    repeat_cols: Option<(u16, u16)>,
     options: &RenderOptions,
-    geometry: SheetGeometryOverride<'_>,
+    measured_rows: &[MeasuredAxisSlot<u32>],
+    measured_columns: &[MeasuredAxisSlot<u16>],
 ) -> Result<bool, RenderError> {
-    let first_row = slot.rows.first.max(print_range.first_row);
-    let last_row = slot.rows.last.min(print_range.last_row);
-    let first_col = slot.columns.first.max(print_range.first_col);
-    let last_col = slot.columns.last.min(print_range.last_col);
+    // Calc decides whether a logical page is empty from its natural data
+    // rectangle, before separately painting repeated titles. The first axis
+    // page still owns a prefix title band that the rxls planner removes from
+    // its body segment to avoid duplicate paint, so restore that band only for
+    // the sparse-page decision.
+    let natural_prefix_rows = slot.vertical_index == 0
+        && repeat_rows.is_some_and(|(first, last)| {
+            first <= print_range.first_row && last >= print_range.first_row
+        });
+    let natural_prefix_columns = slot.horizontal_index == 0
+        && repeat_cols.is_some_and(|(first, last)| {
+            first <= print_range.first_col && last >= print_range.first_col
+        });
+    let first_row = if natural_prefix_rows {
+        print_range.first_row
+    } else {
+        slot.rows.first.max(print_range.first_row)
+    };
+    let last_row = if natural_prefix_rows && slot.rows.body_is_empty {
+        print_range.last_row
+    } else {
+        slot.rows.last.min(print_range.last_row)
+    };
+    let first_col = if natural_prefix_columns {
+        print_range.first_col
+    } else {
+        slot.columns.first.max(print_range.first_col)
+    };
+    let last_col = if natural_prefix_columns && slot.columns.body_is_empty {
+        print_range.last_col
+    } else {
+        slot.columns.last.min(print_range.last_col)
+    };
     let contains = |row: u32, col: u16| {
-        row >= slot.rows.first
-            && row <= slot.rows.last
-            && col >= slot.columns.first
-            && col <= slot.columns.last
-            && row >= print_range.first_row
-            && row <= print_range.last_row
-            && col >= print_range.first_col
-            && col <= print_range.last_col
+        row >= first_row && row <= last_row && col >= first_col && col <= last_col
     };
     if first_row <= last_row && first_col <= last_col {
         if sheet
@@ -3155,24 +3409,14 @@ fn page_has_content(
         }
     }
     if sheet.merged_ranges().iter().any(|&(r0, c0, r1, c1)| {
-        r0 <= slot.rows.last
-            && r1 >= slot.rows.first
-            && c0 <= slot.columns.last
-            && c1 >= slot.columns.first
+        r0 <= last_row && r1 >= first_row && c0 <= last_col && c1 >= first_col
     }) {
         return Ok(true);
     }
 
-    if cell_drawings_intersect_prepared_range(
-        sheet,
-        RenderRange::new(
-            slot.rows.first,
-            slot.columns.first,
-            slot.rows.last,
-            slot.columns.last,
-        ),
-        geometry,
-    )? {
+    let range = RenderRange::new(first_row, first_col, last_row, last_col);
+    let geometry = SheetGeometryOverride::new(measured_rows, measured_columns);
+    if cell_drawings_intersect_prepared_range(sheet, range, geometry)? {
         return Ok(true);
     }
     if sheet
@@ -3182,19 +3426,9 @@ fn page_has_content(
     {
         return Ok(true);
     }
-    absolute_drawings_intersect_range(
-        sheet,
-        RenderRange::new(
-            slot.rows.first,
-            slot.columns.first,
-            slot.rows.last,
-            slot.columns.last,
-        ),
-        slot.columns.size,
-        slot.rows.size,
-        options,
-        geometry,
-    )
+    let width = axis_total(&measured_axis_range(measured_columns, first_col, last_col))?;
+    let height = axis_total(&measured_axis_range(measured_rows, first_row, last_row))?;
+    absolute_drawings_intersect_range(sheet, range, width, height, options, geometry)
 }
 
 fn merge_intervals_rows(sheet: &Sheet, first: u32, last: u32) -> Vec<(u32, u32)> {
@@ -3236,6 +3470,46 @@ where
         .copied()
         .filter(|slot| slot.index >= first && slot.index <= last)
         .collect()
+}
+
+fn measured_axis_ranges<I>(
+    slots: &[MeasuredAxisSlot<I>],
+    ranges: &[(I, I)],
+) -> Vec<MeasuredAxisSlot<I>>
+where
+    I: Copy + Ord,
+{
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| {
+            ranges
+                .iter()
+                .any(|&(first, last)| slot.index >= first && slot.index <= last)
+        })
+        .collect()
+}
+
+fn active_repeat_rows(repeat: Option<(u32, u32)>, body: AxisSegment<u32>) -> Vec<(u32, u32)> {
+    let Some(repeat) = repeat else {
+        return Vec::new();
+    };
+    if axis_segment_repeats_titles(&body, Some(repeat)) {
+        vec![repeat]
+    } else {
+        Vec::new()
+    }
+}
+
+fn active_repeat_columns(repeat: Option<(u16, u16)>, body: AxisSegment<u16>) -> Vec<(u16, u16)> {
+    let Some(repeat) = repeat else {
+        return Vec::new();
+    };
+    if axis_segment_repeats_titles(&body, Some(repeat)) {
+        vec![repeat]
+    } else {
+        Vec::new()
+    }
 }
 
 fn merge_measured_axis<I>(sizes: &mut BTreeMap<I, Fixed>, slots: &[MeasuredAxisSlot<I>])
@@ -3928,8 +4202,15 @@ mod tests {
                 size: Fixed::from_pixels(10),
             })
             .collect::<Vec<_>>();
-        let (segments, expansions, shifted) =
-            partition_axis_with_breaks(&slots, Fixed::from_pixels(25), &[(2, 4)], &[3, 7]).unwrap();
+        let (segments, expansions, shifted) = partition_axis_with_breaks(
+            &slots,
+            Fixed::from_pixels(25),
+            Fixed::from_pixels(25),
+            &[(2, 4)],
+            &[3, 7],
+            None,
+        )
+        .unwrap();
 
         assert_eq!(shifted, 1);
         assert_eq!(expansions, 1);
@@ -3939,6 +4220,266 @@ mod tests {
                 .map(|segment| (segment.first, segment.last, segment.manual_break_before))
                 .collect::<Vec<_>>(),
             [(0, 1, false), (2, 4, true), (5, 6, false), (7, 8, true)]
+        );
+    }
+
+    fn measured_slots<I: Copy>(indices: &[I], sizes: &[i64]) -> Vec<MeasuredAxisSlot<I>> {
+        let mut offset = Fixed::ZERO;
+        indices
+            .iter()
+            .copied()
+            .zip(sizes.iter().copied())
+            .map(|(index, size)| {
+                let slot = MeasuredAxisSlot {
+                    index,
+                    offset,
+                    size: Fixed::from_pixels(size),
+                };
+                offset = offset.checked_add(slot.size).unwrap();
+                slot
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_title_bands_are_zero_cost_for_partitioning_and_fit() {
+        let sizes = [240, 240, 268, 268, 240, 240, 240, 240];
+        let rows = measured_slots(&(0_u32..8).collect::<Vec<_>>(), &sizes);
+        let columns = measured_slots(&[0_u16], &[64]);
+        let repeated_height = Fixed::from_pixels(536);
+        let capacity = Fixed::from_pixels(520);
+        let untitled_capacity = Fixed::from_pixels(1_056);
+
+        let (row_pages, expansions) =
+            partition_axis(&rows, untitled_capacity, capacity, &[], Some((2, 3))).unwrap();
+        assert_eq!(expansions, 0);
+        assert_eq!(
+            row_pages
+                .iter()
+                .map(|page| (page.first, page.last))
+                .collect::<Vec<_>>(),
+            [(0, 3), (4, 5), (6, 7)]
+        );
+        assert_eq!(
+            axis_overflow_count(
+                &row_pages,
+                repeated_height,
+                Some((2, 3)),
+                Fixed::ZERO,
+                1_000,
+                Fixed::from_pixels(1_056),
+            )
+            .unwrap(),
+            0
+        );
+
+        let column_indices = (0_u16..8).collect::<Vec<_>>();
+        let mirrored_columns = measured_slots(&column_indices, &sizes);
+        let (column_pages, _) = partition_axis(
+            &mirrored_columns,
+            untitled_capacity,
+            capacity,
+            &[],
+            Some((2, 3)),
+        )
+        .unwrap();
+        assert_eq!(
+            column_pages
+                .iter()
+                .map(|page| (page.first, page.last))
+                .collect::<Vec<_>>(),
+            [(0, 3), (4, 5), (6, 7)]
+        );
+
+        let mut warnings = PrintWarnings::default();
+        let capacity_1039 = unscaled_capacity(
+            Fixed::from_pixels(1_056),
+            1_039,
+            repeated_height,
+            Fixed::ZERO,
+        )
+        .unwrap();
+        let untitled_capacity_1039 =
+            unscaled_capacity(Fixed::from_pixels(1_056), 1_039, Fixed::ZERO, Fixed::ZERO).unwrap();
+        let (pages_1039, _) = partition_axis(
+            &rows,
+            untitled_capacity_1039,
+            capacity_1039,
+            &[],
+            Some((2, 3)),
+        )
+        .unwrap();
+        assert_eq!(pages_1039.len(), 3);
+        assert!(axis_segments_fit(
+            &pages_1039,
+            repeated_height,
+            Some((2, 3)),
+            Fixed::ZERO,
+            1_039,
+            Fixed::from_pixels(1_056),
+        )
+        .unwrap());
+        let capacity_1040 = unscaled_capacity(
+            Fixed::from_pixels(1_056),
+            1_040,
+            repeated_height,
+            Fixed::ZERO,
+        )
+        .unwrap();
+        let untitled_capacity_1040 =
+            unscaled_capacity(Fixed::from_pixels(1_056), 1_040, Fixed::ZERO, Fixed::ZERO).unwrap();
+        let (pages_1040, _) = partition_axis(
+            &rows,
+            untitled_capacity_1040,
+            capacity_1040,
+            &[],
+            Some((2, 3)),
+        )
+        .unwrap();
+        assert!(pages_1040.len() > 3);
+
+        let scale = choose_scale(
+            &PageSetup::new().with_fit_to_pages(1, 3),
+            true,
+            &rows,
+            &columns,
+            repeated_height,
+            Fixed::ZERO,
+            Some((2, 3)),
+            None,
+            Fixed::ZERO,
+            Fixed::ZERO,
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(816),
+                height: Fixed::from_pixels(1_056),
+            },
+            &[],
+            &[],
+            &mut warnings,
+        )
+        .unwrap();
+        // Calc stops fit-to-page enlargement at 100%; 1039 is the mathematical
+        // maximum for this fixture, but the source-compatible result is 1000.
+        assert_eq!(scale, 1_000);
+        assert!(warnings.0.is_empty());
+    }
+
+    #[test]
+    fn automatic_break_inside_middle_title_band_keeps_the_natural_band_together() {
+        let sizes = [15, 15, 5, 5, 5, 5, 5, 5, 5, 5];
+        let row_indices = (0_u32..10).collect::<Vec<_>>();
+        let rows = measured_slots(&row_indices, &sizes);
+        let (row_pages, expansions) = partition_axis(
+            &rows,
+            Fixed::from_pixels(35),
+            Fixed::from_pixels(25),
+            &[],
+            Some((2, 3)),
+        )
+        .unwrap();
+
+        assert_eq!(expansions, 0);
+        assert_eq!(
+            row_pages
+                .iter()
+                .map(|page| (page.first, page.last))
+                .collect::<Vec<_>>(),
+            [(0, 7), (8, 9)]
+        );
+        assert_eq!(
+            axis_overflow_count(
+                &row_pages,
+                Fixed::from_pixels(10),
+                Some((2, 3)),
+                Fixed::ZERO,
+                1_000,
+                Fixed::from_pixels(35),
+            )
+            .unwrap(),
+            1
+        );
+
+        let column_indices = (0_u16..10).collect::<Vec<_>>();
+        let columns = measured_slots(&column_indices, &sizes);
+        let (column_pages, column_expansions) = partition_axis(
+            &columns,
+            Fixed::from_pixels(35),
+            Fixed::from_pixels(25),
+            &[],
+            Some((2, 3)),
+        )
+        .unwrap();
+        assert_eq!(column_expansions, expansions);
+        assert_eq!(
+            column_pages
+                .iter()
+                .map(|page| (u32::from(page.first), u32::from(page.last)))
+                .collect::<Vec<_>>(),
+            row_pages
+                .iter()
+                .map(|page| (page.first, page.last))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn manual_break_inside_repeated_band_is_ignored_symmetrically() {
+        let indices = (0_u32..9).collect::<Vec<_>>();
+        let slots = measured_slots(&indices, &[10; 9]);
+        let (segments, expansions, shifted) = partition_axis_with_breaks(
+            &slots,
+            Fixed::from_pixels(25),
+            Fixed::from_pixels(25),
+            &[],
+            &[3],
+            Some((2, 3)),
+        )
+        .unwrap();
+
+        assert_eq!(shifted, 0);
+        assert_eq!(expansions, 0);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.first, segment.last, segment.manual_break_before))
+                .collect::<Vec<_>>(),
+            [
+                (0, 1, false),
+                (2, 3, false),
+                (4, 5, false),
+                (6, 7, false),
+                (8, 8, false)
+            ]
+        );
+
+        let mirrored_indices = (0_u16..9).collect::<Vec<_>>();
+        let mirrored_slots = measured_slots(&mirrored_indices, &[10; 9]);
+        let (mirrored, mirrored_expansions, mirrored_shifted) = partition_axis_with_breaks(
+            &mirrored_slots,
+            Fixed::from_pixels(25),
+            Fixed::from_pixels(25),
+            &[],
+            &[3],
+            Some((2, 3)),
+        )
+        .unwrap();
+        assert_eq!(mirrored_expansions, expansions);
+        assert_eq!(mirrored_shifted, shifted);
+        assert_eq!(
+            mirrored
+                .iter()
+                .map(|segment| (
+                    u32::from(segment.first),
+                    u32::from(segment.last),
+                    segment.manual_break_before,
+                ))
+                .collect::<Vec<_>>(),
+            segments
+                .iter()
+                .map(|segment| (segment.first, segment.last, segment.manual_break_before))
+                .collect::<Vec<_>>()
         );
     }
 

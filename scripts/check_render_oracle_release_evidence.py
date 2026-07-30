@@ -36,6 +36,11 @@ DEFAULT_ORACLE_LOCK = ROOT / "scripts" / "render-oracle-container" / "lock.json"
 DEFAULT_ORACLE_WRAPPER = ROOT / "scripts" / "run-render-oracle-container.py"
 DEFAULT_REVIEWED_BASELINE = ROOT / "scripts" / "render-parity-baseline-full.json"
 BASELINE_CHECKER = ROOT / "scripts" / "check-render-parity-baseline.py"
+FAILURE_SUMMARIZER = (
+    ROOT / "scripts" / "summarize-render-oracle-failure.py"
+)
+FAILURE_SUMMARY_NAME = "render-oracle-failure-summary.json"
+FAILURE_SUMMARY_SCHEMA = "rxls.render-oracle-failure-summary.v10"
 EXPECTED_FILES = frozenset(
     {
         "authored-print-gate.json",
@@ -55,6 +60,7 @@ EXPECTED_FILES = frozenset(
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 48 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_FAILURE_SUMMARY_BYTES = 2 * 1024 * 1024
 MAX_LOCK_BYTES = 256 * 1024
 MAX_WRAPPER_BYTES = 512 * 1024
 MAX_JSON_DEPTH = 128
@@ -307,6 +313,30 @@ def _load_baseline_checker() -> Any:
     except Exception as error:
         sys.modules.pop(module_name, None)
         raise EvidenceError("baseline_checker_import") from error
+    return module
+
+
+def _load_failure_summarizer() -> Any:
+    module_name = "_rxls_render_oracle_failure_summary"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        module_name, FAILURE_SUMMARIZER
+    )
+    _require(
+        spec is not None and spec.loader is not None,
+        "failure_summary_checker_import",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        sys.modules.pop(module_name, None)
+        raise EvidenceError(
+            "failure_summary_checker_import"
+        ) from error
     return module
 
 
@@ -1494,6 +1524,100 @@ def _regular_file_payload(path: Path, maximum: int, code: str) -> bytes:
         f"{code}_changed",
     )
     return payload
+
+
+def validate_failure_summary(
+    path: Path,
+    *,
+    head_sha: str,
+    profile: str,
+    baseline_mode: str,
+) -> dict[str, Any]:
+    """Validate a diagnostic artifact without treating it as release evidence."""
+
+    _require(
+        path.name == FAILURE_SUMMARY_NAME,
+        "failure_summary_name",
+    )
+    _require(
+        HEAD_SHA_RE.fullmatch(head_sha) is not None,
+        "failure_summary_head_sha",
+    )
+    _require(
+        profile in {"pilot", "full", "ooxml-row-diagnostic"},
+        "failure_summary_profile",
+    )
+    _require(
+        baseline_mode in {"candidate", "verify"}
+        and (profile == "full" or baseline_mode == "verify"),
+        "failure_summary_baseline_mode",
+    )
+    payload = _regular_file_payload(
+        path,
+        MAX_FAILURE_SUMMARY_BYTES,
+        "failure_summary",
+    )
+    value = _strict_json_loads(payload, "failure_summary_json")
+    _require(
+        isinstance(value, dict),
+        "failure_summary_schema",
+    )
+    summarizer = _load_failure_summarizer()
+    try:
+        summarizer._validate_output(value)
+    except Exception as error:
+        raise EvidenceError("failure_summary_schema") from error
+    _require(
+        value.get("schema") == FAILURE_SUMMARY_SCHEMA
+        and value.get("head_sha") == head_sha
+        and value.get("profile") == profile
+        and value.get("baseline_mode") == baseline_mode,
+        "failure_summary_binding",
+    )
+    _require(
+        payload == summarizer._json(value),
+        "failure_summary_canonical",
+    )
+    stack = [value]
+    visited = 0
+    while stack:
+        item = stack.pop()
+        visited += 1
+        _require(
+            visited <= MAX_JSON_NODES,
+            "failure_summary_complexity",
+        )
+        if isinstance(item, dict):
+            for key, child in item.items():
+                _require(
+                    isinstance(key, str),
+                    "failure_summary_unsafe_text",
+                )
+                stack.append(key)
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, str):
+            lowered = item.lower()
+            _require(
+                len(item) <= 16_384
+                and not any(
+                    character < " " or character == "\x7f"
+                    for character in item
+                )
+                and SECRET_TEXT_RE.search(item) is None
+                and not item.startswith("/")
+                and re.match(r"^[A-Za-z]:[\\/]", item) is None
+                and "://" not in lowered
+                and "\\" not in item
+                and PATH_TRAVERSAL_RE.search(item) is None
+                and ARTIFACT_EXTENSION_RE.search(item) is None
+                and "local/render-corpus" not in lowered
+                and "render-corpus-generated" not in lowered
+                and "payload/" not in lowered,
+                "failure_summary_unsafe_text",
+            )
+    return value
 
 
 def _release_contract(
