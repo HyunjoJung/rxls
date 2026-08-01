@@ -4234,6 +4234,18 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         imported_default_column_axis_measure: Some(ImportedAxisMeasure::Twips(
                             1_280,
                         )),
+                        // Calc has no persisted document-wide row height for
+                        // ODS the way BIFF's mandatory DEFAULTROWHEIGHT record
+                        // or an authored OOXML sheetFormatPr does, so a row
+                        // left undeclared by both its own style and any
+                        // table-row default-style resolves to Calc's generic
+                        // no-information application default of 0.5 cm
+                        // (14.173228 pt), the same oracle-pinned value OOXML
+                        // falls back to when its own implicit-height
+                        // computation is unavailable.
+                        imported_default_row_axis_measure: Some(
+                            ImportedAxisMeasure::MillimeterHundredths(500),
+                        ),
                         style_fidelity,
                         default_format: ods_table_default_cell_style(
                             styles,
@@ -4777,6 +4789,14 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         imported_default_column_axis_measure: Some(ImportedAxisMeasure::Twips(
                             1_280,
                         )),
+                        // See the sibling empty-table branch above: Calc has
+                        // no persisted document-wide row height for ODS, so
+                        // undeclared rows resolve to Calc's generic
+                        // no-information application default of 0.5 cm
+                        // (14.173228 pt).
+                        imported_default_row_axis_measure: Some(
+                            ImportedAxisMeasure::MillimeterHundredths(500),
+                        ),
                         style_fidelity,
                         cells: std::mem::take(&mut cells),
                         default_format: default_format.take(),
@@ -7382,6 +7402,42 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(runs[0].font.italic);
         assert_eq!(runs[0].font.color, Some(Color::rgb(0x00, 0x88, 0x00)));
+    }
+
+    #[test]
+    fn ods_undeclared_row_retains_calc_application_default_height() {
+        // A row with no table:style-name, and no default-style declared for
+        // table-row anywhere in styles.xml, persists no height at all: not
+        // per-row, not through a sheet-wide default-style cascade. Calc's own
+        // no-information application default (0.5 cm) must still be exposed
+        // as sheet-wide provenance, mirroring the unconditional 64-point
+        // column default a few lines above, so renderers that reconstruct
+        // Calc's native cumulative row geometry do not silently substitute an
+        // unrelated fallback for this row.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/><table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::MillimeterHundredths(500))
+        );
+        assert!(!sheet.imported_row_axis_measures().contains_key(&0));
+        assert!(!sheet.row_heights().contains_key(&0));
+    }
+
+    #[test]
+    fn ods_empty_table_retains_calc_application_default_row_height() {
+        // A self-closing <table:table/> with no rows at all takes the other
+        // sheet-construction branch in the importer; it needs the same
+        // sheet-wide provenance for renderers that populate rows later
+        // through the public API.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Empty"/></office:spreadsheet></office:body></office:document-content>"#;
+        let workbook = Workbook::open(&ods_bytes(content)).expect("ods");
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::MillimeterHundredths(500))
+        );
     }
 
     #[test]

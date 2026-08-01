@@ -17289,6 +17289,90 @@ mod tests {
         assert_eq!(build.scene.height.raw(), 74_140);
     }
 
+    fn ods_workbook(content: &str, styles: &str) -> Workbook {
+        use std::io::Write;
+
+        use zip::write::SimpleFileOptions;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        zip.start_file("mimetype", options).unwrap();
+        zip.write_all(b"application/vnd.oasis.opendocument.spreadsheet")
+            .unwrap();
+        zip.start_file("content.xml", options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+        zip.start_file("styles.xml", options).unwrap();
+        zip.write_all(styles.as_bytes()).unwrap();
+        Workbook::open(&zip.finish().unwrap().into_inner()).expect("ODS workbook")
+    }
+
+    #[test]
+    fn single_page_ods_undeclared_row_uses_calc_application_default_height() {
+        // A row with no table:style-name, and no default-style declared for
+        // table-row anywhere in styles.xml, has no explicit height anywhere
+        // in the document. `src/ods.rs` used to leave
+        // `imported_default_row_axis_measure` as `None` for every ODS sheet,
+        // so this row's contribution to the SinglePageSheets native
+        // cumulative extent silently fell back to the renderer's generic
+        // 15pt Excel-style default (`RenderOptions::default_row_height`)
+        // requantized through a lossy CSS-pixel round trip, instead of
+        // Calc's real 0.5 cm (14.173228 pt) no-information application
+        // default -- the same oracle-pinned constant OOXML already uses for
+        // its own equivalent "no information" row
+        // (`OOXML_APPLICATION_DEFAULT_ROW_HEIGHT`).
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/><table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::MillimeterHundredths(500)),
+            "ods.rs must expose Calc's native no-information row default, \
+             mirroring the unconditional 64-point column default"
+        );
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let opts = outlined_options(range);
+        let single_page = build_single_page_sheet_scene(sheet, 0, &opts).unwrap();
+        assert_eq!(
+            single_page.scene.height,
+            Fixed::from_raw(19_351),
+            "an undeclared ODS row must resolve the single-page page-box \
+             height through Calc's native 0.5 cm application default"
+        );
+    }
+
+    #[test]
+    fn single_page_ods_undeclared_rows_accumulate_exact_native_extent() {
+        // Five stacked undeclared rows exercise the SourceAxisCursor's
+        // cumulative twips accounting rather than a single-row endpoint, the
+        // shape of drift that showed up as page-box error scaling with sheet
+        // size in the hosted pilot.
+        let mut rows = String::new();
+        for _ in 0..5 {
+            rows.push_str(
+                r#"<table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row>"#,
+            );
+        }
+        let content = format!(
+            r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/>{rows}</table:table></office:spreadsheet></office:body></office:document-content>"#
+        );
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(&content, styles);
+        let sheet = &workbook.sheets[0];
+
+        let range = RenderRange::new(0, 0, 4, 0);
+        let opts = outlined_options(range);
+        let single_page = build_single_page_sheet_scene(sheet, 0, &opts).unwrap();
+        assert_eq!(
+            single_page.scene.height,
+            Fixed::from_raw(96_640),
+            "five undeclared ODS rows must accumulate through the same \
+             twips-native cursor as a single row, not drift by a \
+             per-row CSS-pixel rounding residual"
+        );
+    }
+
     #[test]
     fn outlined_typography_limits_are_typed_and_exact_at_the_boundary() {
         let mut workbook = Workbook::new();
