@@ -264,10 +264,15 @@ fn rotated_absolute_images_expand_used_bounds_and_intersect_by_painted_geometry(
     assert_eq!(image.rect.width, Fixed::from_pixels(100));
     assert_eq!(image.rect.height, Fixed::from_pixels(10));
 
-    // The unrotated destination starts below A1's 20px viewport. Its rotated
-    // paint reaches y=0, so an explicit A1 tile must still retain and clip it.
+    // The unrotated destination starts below A1's viewport -- row 0 has no
+    // explicit height, so this ODS sheet's page-box height comes from
+    // `fallback_row_height`'s ODS no-information default (Calc's native
+    // 0.5 cm, `OOXML_APPLICATION_DEFAULT_ROW_HEIGHT`), not the renderer's
+    // generic 20px `RenderOptions::default_row_height` placeholder. Its
+    // rotated paint reaches y=0, so an explicit A1 tile must still retain
+    // and clip it.
     let explicit = build_scene(&workbook, 0, &explicit_a1_options()).unwrap();
-    assert_eq!(explicit.scene.height, Fixed::from_pixels(20));
+    assert_eq!(explicit.scene.height, Fixed::from_raw(19_351));
     assert!(first_clip_group(&explicit.scene.nodes).is_some());
     assert!(first_image(&explicit.scene.nodes).is_some());
 }
@@ -325,7 +330,11 @@ fn explicit_range_translates_full_absolute_geometry_and_silently_omits_noninters
     };
     let build = build_scene(&workbook, 0, &intersecting).unwrap();
     assert_eq!(build.scene.width, Fixed::from_pixels(64));
-    assert_eq!(build.scene.height, Fixed::from_pixels(20));
+    // Row 0 has no explicit height, so this ODS sheet's page-box height comes
+    // from `fallback_row_height`'s ODS no-information default (Calc's native
+    // 0.5 cm, `OOXML_APPLICATION_DEFAULT_ROW_HEIGHT`), not the renderer's
+    // generic 20px `RenderOptions::default_row_height` placeholder.
+    assert_eq!(build.scene.height, Fixed::from_raw(19_351));
     let group = first_clip_group(&build.scene.nodes).expect("absolute object clip");
     assert_eq!(
         group.clip,
@@ -333,7 +342,7 @@ fn explicit_range_translates_full_absolute_geometry_and_silently_omits_noninters
             x: Fixed::ZERO,
             y: Fixed::ZERO,
             width: Fixed::from_pixels(64),
-            height: Fixed::from_pixels(20),
+            height: Fixed::from_raw(19_351),
         }
     );
     assert_eq!(

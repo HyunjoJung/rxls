@@ -3872,10 +3872,44 @@ fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
                 calc_ooxml_implicit_row_height(sheet, options)
                     .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
             }
-            Some(OoxmlImplicitRowHeight::None) | None => {
-                options.default_row_height.max(Fixed::from_raw(1))
-            }
+            Some(OoxmlImplicitRowHeight::None) | None => imported_no_information_row_height(sheet)
+                .unwrap_or(options.default_row_height)
+                .max(Fixed::from_raw(1)),
         }
+    }
+}
+
+/// An imported sheet's own native "no information" default row height,
+/// consumed only when the sheet carries no points-based default row height
+/// at all (`Sheet::default_row_height` is `None`).
+///
+/// XLS, XLSX, and XLSB importers always populate
+/// `imported_default_row_axis_measure` together with `default_row_height`
+/// from the very same source record or attribute -- BIFF's
+/// `DEFAULTROWHEIGHT`, XLSX's `sheetFormatPr defaultRowHeight`, XLSB's
+/// `BrtWsFmtInfo` -- so this function can only ever return `Some` for an
+/// importer, currently only ODS's, that records a native default-row measure
+/// while leaving `default_row_height` unset. The `default_row_height().is_some()`
+/// guard below is a second, independent proof of that: even if a future
+/// importer bug broke the "populated together" invariant, this function
+/// still could not change BIFF/XLSX/XLSB behavior, because those formats
+/// only ever reach `fallback_row_height`'s final branch (this one) with a
+/// per-row or sheet-wide invalid height while `default_row_height` is
+/// `Some`.
+///
+/// `calc_hmm_to_fixed` is the same hundredths-of-millimetre-to-`Fixed`
+/// conversion the SinglePageSheets path already applies to print geometry
+/// (e.g. `calc_twips_position_to_fixed_raw`), so this keeps the physical
+/// quantity to one exact spelling instead of re-deriving a second,
+/// differently-rounded one: `calc_hmm_to_fixed(500)` equals
+/// `OOXML_APPLICATION_DEFAULT_ROW_HEIGHT` exactly.
+fn imported_no_information_row_height(sheet: &Sheet) -> Option<Fixed> {
+    if sheet.default_row_height().is_some() {
+        return None;
+    }
+    match sheet.imported_default_row_axis_measure()? {
+        ImportedAxisMeasure::MillimeterHundredths(mm100) => calc_hmm_to_fixed(i128::from(mm100)),
+        _ => None,
     }
 }
 
@@ -17370,6 +17404,88 @@ mod tests {
             "five undeclared ODS rows must accumulate through the same \
              twips-native cursor as a single row, not drift by a \
              per-row CSS-pixel rounding residual"
+        );
+    }
+
+    #[test]
+    fn fallback_row_height_prefers_ods_native_default_over_generic_placeholder() {
+        // Companion to `single_page_ods_undeclared_row_uses_calc_application_default_height`
+        // above, but exercising `fallback_row_height` directly -- the shared
+        // helper behind the ordinary (`AxisEndpointPolicy::PerTrackFixed`) row
+        // path, not just the single-page SourceNative cursor. Before this fix
+        // ODS sheets fell through every branch (BIFF, then OOXML implicit) to
+        // `options.default_row_height`, the renderer's generic 15pt
+        // Excel-style placeholder, ignoring the sheet's own populated
+        // `imported_default_row_axis_measure`.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/><table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+        assert_eq!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::MillimeterHundredths(500))
+        );
+        assert_eq!(sheet.default_row_height(), None);
+        assert!(!sheet.biff_uses_application_default_row_height());
+        assert_eq!(sheet.implicit_ooxml_row_height_source(), None);
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let opts = outlined_options(range);
+        assert_eq!(
+            fallback_row_height(sheet, &opts),
+            OOXML_APPLICATION_DEFAULT_ROW_HEIGHT,
+            "an ODS sheet's own native no-information row default must win \
+             over the renderer's generic RenderOptions::default_row_height \
+             placeholder"
+        );
+    }
+
+    #[test]
+    fn ordinary_path_ods_undeclared_row_uses_calc_application_default_height() {
+        // The ordinary (non-single-page) render path -- `build_sheet_scene`,
+        // `AxisEndpointPolicy::PerTrackFixed` -- measures row height through
+        // `fallback_row_height` directly, unlike SourceNative which only uses
+        // it as a last-resort fallback behind the twips cursor. This is the
+        // ordinary-path counterpart to
+        // `single_page_ods_undeclared_row_uses_calc_application_default_height`.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/><table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let opts = outlined_options(range);
+        let ordinary = build_sheet_scene(sheet, 0, &opts).unwrap();
+        assert_eq!(
+            ordinary.scene.height,
+            Fixed::from_raw(19_351),
+            "an undeclared ODS row must resolve the ordinary-path page-box \
+             height through Calc's native 0.5 cm application default, the \
+             same value the single-page path already resolves to"
+        );
+    }
+
+    #[test]
+    fn ordinary_and_single_page_ods_paths_agree_on_undeclared_row_height() {
+        // The bug class this tranche fixes is exactly the two endpoint
+        // policies disagreeing about an ODS sheet's undeclared row height:
+        // SourceNative (single-page) already consumed the sheet's native
+        // default after the prior tranche, while PerTrackFixed (ordinary)
+        // still fell back to the unrelated generic placeholder. For a single
+        // row, both paths must now resolve to the identical page-box height.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet><table:table table:name="Plain"><table:table-column/><table:table-row><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let opts = outlined_options(range);
+        let ordinary = build_sheet_scene(sheet, 0, &opts).unwrap();
+        let single_page = build_single_page_sheet_scene(sheet, 0, &opts).unwrap();
+        assert_eq!(
+            ordinary.scene.height, single_page.scene.height,
+            "the ordinary and single-page paths must not disagree about an \
+             undeclared ODS row's height"
         );
     }
 
