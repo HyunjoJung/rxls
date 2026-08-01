@@ -23,7 +23,7 @@ EXPECTED_FULL_MANIFEST_SHA256 = (
     "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
 )
 EXPECTED_DIAGNOSTIC_MANIFEST_SHA256 = (
-    "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef"
+    "088db320a0d35494fa8e0a8c33ba95e12a824cfe1b7163c2071cf70528c5d0a2"
 )
 EXPECTED_PAYLOAD_SHA256 = {
     "row-missing-noto-11-auto-bold-font": (
@@ -32,11 +32,26 @@ EXPECTED_PAYLOAD_SHA256 = {
     "row-missing-noto-11-auto-bold-font-wrapped": (
         "fad3d67238db8b7c68425435d6ae9681e0913642c5811ccff1d7c1dba2f2fbfb"
     ),
+    "row-missing-noto-11-auto-heading-western-asian": (
+        "70dfc8e7fbfd553f49c9e5012fe4a88cff049b4ad0905ecee60eff6a85778ed6"
+    ),
+    "row-missing-noto-11-auto-heading-western-complex": (
+        "bbd0464c01a92fb3b4f711d0d432cf9b855c9cc687fc65d3e3ddfebb1169af21"
+    ),
     "row-missing-noto-11-auto-large-font": (
         "2c50da9539d0728e438e01b6369539e54977130127b2622afaa52ba8fadbdcbc"
     ),
     "row-missing-noto-11-auto-long-unwrapped": (
         "bffa9c454630fe6e754f53ff7245e8b2e18c4d3ad1ef4146747acbfc987c6141"
+    ),
+    "row-missing-noto-11-auto-numeric-color-conditional": (
+        "ce93551100e206c1176b19e5a0808287b5c6370551c5b0551591f67e9bd58961"
+    ),
+    "row-missing-noto-11-auto-numeric-no-conditional": (
+        "0d348978c79364d35a63e25574b3c4af208f1e8a34deade3523b65c29b8f9b02"
+    ),
+    "row-missing-noto-11-auto-wrapped-color-conditional": (
+        "fcfff374387758af77f66fadd344eb544b522b1f8659496fb2afb78c269d50fe"
     ),
     "row-missing-noto-11-auto-wrapped-explicit": (
         "d7c3d6da0ec43505797c2881a0c3930db8089e10ff43e4875c788da919a17785"
@@ -55,6 +70,9 @@ EXPECTED_PAYLOAD_SHA256 = {
     ),
     "row-missing-noto-11-auto-wrapped-merged": (
         "f2c9ac3ba3a3616843dbfe649faba32a166fe9037b37ec86394a90dac0b5fc8a"
+    ),
+    "row-missing-noto-11-auto-wrapped-no-conditional": (
+        "a259cb85fb569df1cf023548271004dcea58dbd807b0746a587265a4d49f179e"
     ),
     "row-missing-noto-11-auto-wrapped-rtl": (
         "f9e8b3ffc14c6f5c2efc96e50cd22b09353a4815805480e1a01ce0ee42047f2b"
@@ -77,11 +95,23 @@ EXPECTED_PAYLOAD_SHA256 = {
     "row-missing-noto-11-hidden-row": (
         "99c24a9aa4e6fb3fc1dd0bc9d12f9ca09727a1e5b748b0ff0770ad087e8db5eb"
     ),
+    "row-missing-noto-11-hidden-heading-western-asian": (
+        "7beb0f91f32ff79cb0221cab4d93dea22b5b443afa32850f97e2bd15dd47aaa8"
+    ),
+    "row-missing-noto-11-hidden-heading-western-complex": (
+        "d2590903f61860cf648f9c006defd2b5839d247edbbc7698aced999570e0e2e7"
+    ),
     "row-missing-noto-11-image-drawing": (
         "90a68c31e7cd05d218c22e36ce34e1b1c5758db21ecb5cffab0292db81ba16ff"
     ),
     "row-missing-noto-11-right-to-left-layout": (
         "e44f26036a49a55e7c59bb3abcafd52c180b4f40235c36edaf72bd3a40ec5f0c"
+    ),
+    "row-missing-noto-11-manual-heading-western-asian": (
+        "786edcbb4cdaba5659a90ebb164ebcdf42cbff9833b1266cb8c54741e5021384"
+    ),
+    "row-missing-noto-11-manual-heading-western-complex": (
+        "86cc7ab76a7c7dcc0382c245a27f90ecf7973c98a5ee093b5822eddb022f99db"
     ),
     "row-missing-noto-12": (
         "d16b58bed41c94bb14dcc2180709f2cab6870a4a5acb6b63556991af63946454"
@@ -120,34 +150,44 @@ RELEASE = load_script(RELEASE_GENERATOR, "rxls_generate_render_corpus_regression
 class OoxmlRowOracleGeneratorTests(unittest.TestCase):
     def test_exact_matrix_and_feature_counts(self) -> None:
         manifest, cases = MODULE.materialize()
-        self.assertEqual(len(cases), 24)
-        self.assertEqual(manifest["case_count"], 24)
-        self.assertEqual(manifest["format_counts"], {"xlsx": 24})
+        self.assertEqual(len(cases), 34)
+        self.assertEqual(manifest["case_count"], 34)
+        self.assertEqual(manifest["format_counts"], {"xlsx": 34})
         self.assertEqual(
             manifest["feature_counts"],
             {
                 "auto-bold-font": 1,
                 "auto-bold-font-wrapped": 1,
+                "auto-heading-western-asian": 1,
+                "auto-heading-western-complex": 1,
                 "auto-large-font": 1,
                 "auto-long-unwrapped": 1,
+                "auto-numeric-color-conditional": 1,
+                "auto-numeric-no-conditional": 1,
+                "auto-wrapped-color-conditional": 1,
                 "auto-wrapped-explicit": 1,
                 "auto-wrapped-hidden": 1,
                 "auto-wrapped-image": 1,
                 "auto-wrapped-long": 1,
                 "auto-wrapped-long-anchor": 1,
                 "auto-wrapped-merged": 1,
+                "auto-wrapped-no-conditional": 1,
                 "auto-wrapped-rtl": 1,
                 "auto-wrapped-wide": 1,
                 "explicit-row-height": 1,
+                "hidden-heading-western-asian": 1,
+                "hidden-heading-western-complex": 1,
                 "hidden-row": 1,
                 "image-drawing": 1,
+                "manual-heading-western-asian": 1,
+                "manual-heading-western-complex": 1,
                 "normal-font-carlito": 4,
-                "normal-font-noto": 20,
-                "normal-size-11": 20,
+                "normal-font-noto": 30,
+                "normal-size-11": 30,
                 "normal-size-12": 4,
-                "ooxml-implicit-row": 24,
+                "ooxml-implicit-row": 34,
                 "right-to-left-layout": 1,
-                "sheet-format-missing": 20,
+                "sheet-format-missing": 30,
                 "sheet-format-present": 4,
             },
         )
@@ -168,7 +208,11 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
         }
         expected_stress = {
             (False, "Noto Sans CJK KR", 11, toggle)
-            for toggle in MODULE.BASELINE_TOGGLES + MODULE.AUTOHEIGHT_TOGGLES
+            for toggle in (
+                MODULE.BASELINE_TOGGLES
+                + MODULE.AUTOHEIGHT_TOGGLES
+                + MODULE.MULTICELL_TOGGLES
+            )
         }
         self.assertEqual(combinations, expected_core | expected_stress)
         for spec, _ in cases:
@@ -183,7 +227,7 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["profile"], "ooxml-row-diagnostic")
         self.assertEqual(manifest["generator"], "rxls-ooxml-row-diagnostic")
-        self.assertEqual(manifest["generator_version"], "1.1.0")
+        self.assertEqual(manifest["generator_version"], "1.2.0")
         self.assertEqual(manifest["rights_tier"], "S")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(manifest["redistribution"], "allowed")
@@ -262,7 +306,13 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                     styles = ElementTree.fromstring(archive.read("xl/styles.xml"))
                     self.assertEqual(
                         sheet.find("s:dimension", namespace).attrib,
-                        {"ref": "A1:B8"},
+                        {
+                            "ref": (
+                                "A1:D8"
+                                if spec.toggle in MODULE.MULTICELL_TOGGLES
+                                else "A1:B8"
+                            )
+                        },
                     )
                     rows = sheet.findall("s:sheetData/s:row", namespace)
                     self.assertEqual(rows[0].attrib, {"r": "1"})
@@ -341,6 +391,7 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
                     MODULE.WRAPPED_TOGGLES
                     | MODULE.BOLD_FONT_TOGGLES
                     | MODULE.LARGE_FONT_TOGGLES
+                    | MODULE.CONDITIONAL_MATRIX_TOGGLES
                 ):
                     self.assertEqual(
                         parts["xl/styles.xml"], baseline_parts["xl/styles.xml"]
@@ -414,6 +465,119 @@ class OoxmlRowOracleGeneratorTests(unittest.TestCase):
             },
             {"xl/styles.xml"},
         )
+
+    def test_multicell_heading_controls_preserve_exact_cells(self) -> None:
+        namespace = {"s": MODULE.SHEET_NS}
+        by_toggle = {spec.toggle: spec for spec in MODULE.CASES}
+        for script, expected_texts in (
+            ("western-asian", MODULE.WESTERN_ASIAN_HEADING),
+            ("western-complex", MODULE.WESTERN_COMPLEX_HEADING),
+        ):
+            observed_cells = []
+            for mode, expected_row in (
+                ("auto", {"r": "4"}),
+                (
+                    "manual",
+                    {"customHeight": "1", "ht": "30", "r": "4"},
+                ),
+                ("hidden", {"hidden": "1", "r": "4"}),
+            ):
+                toggle = f"{mode}-heading-{script}"
+                with ZipFile(
+                    io.BytesIO(MODULE.build_case(by_toggle[toggle]))
+                ) as archive:
+                    sheet = ElementTree.fromstring(
+                        archive.read("xl/worksheets/sheet1.xml")
+                    )
+                row = sheet.find("s:sheetData/s:row[@r='4']", namespace)
+                self.assertEqual(row.attrib, expected_row)
+                cells = row.findall("s:c", namespace)
+                self.assertEqual(
+                    [cell.attrib for cell in cells],
+                    [
+                        {"r": f"{column}4", "s": "1", "t": "inlineStr"}
+                        for column in "ABCD"
+                    ],
+                )
+                self.assertEqual(
+                    tuple(
+                        cell.find("s:is/s:t", namespace).text
+                        for cell in cells
+                    ),
+                    expected_texts,
+                )
+                observed_cells.append(
+                    tuple(ElementTree.tostring(cell) for cell in cells)
+                )
+            self.assertEqual(observed_cells[0], observed_cells[1])
+            self.assertEqual(observed_cells[0], observed_cells[2])
+
+    def test_color_only_conditional_pairs_are_structurally_equivalent(self) -> None:
+        namespace = {"s": MODULE.SHEET_NS}
+        by_toggle = {spec.toggle: spec for spec in MODULE.CASES}
+
+        def parts(toggle: str) -> dict[str, bytes]:
+            with ZipFile(
+                io.BytesIO(MODULE.build_case(by_toggle[toggle]))
+            ) as archive:
+                return {
+                    name: archive.read(name) for name in archive.namelist()
+                }
+
+        for prefix in ("auto-numeric", "auto-wrapped"):
+            conditional = parts(f"{prefix}-color-conditional")
+            control = parts(f"{prefix}-no-conditional")
+            self.assertEqual(
+                {
+                    name
+                    for name in conditional
+                    if conditional[name] != control[name]
+                },
+                {"xl/worksheets/sheet1.xml"},
+            )
+            conditional_sheet = ElementTree.fromstring(
+                conditional["xl/worksheets/sheet1.xml"]
+            )
+            control_sheet = ElementTree.fromstring(
+                control["xl/worksheets/sheet1.xml"]
+            )
+            rule = conditional_sheet.find(
+                "s:conditionalFormatting/s:cfRule",
+                namespace,
+            )
+            self.assertEqual(
+                rule.attrib,
+                {
+                    "dxfId": "0",
+                    "operator": "greaterThan",
+                    "priority": "1",
+                    "type": "cellIs",
+                },
+            )
+            self.assertEqual(
+                rule.find("s:formula", namespace).text,
+                "0",
+            )
+            self.assertIsNone(
+                control_sheet.find("s:conditionalFormatting", namespace)
+            )
+            styles = ElementTree.fromstring(
+                conditional["xl/styles.xml"]
+            )
+            differential = styles.find("s:dxfs/s:dxf", namespace)
+            self.assertEqual(
+                [child.tag.rsplit("}", 1)[-1] for child in differential],
+                ["font"],
+            )
+            font = differential.find("s:font", namespace)
+            self.assertEqual(
+                [child.tag.rsplit("}", 1)[-1] for child in font],
+                ["color"],
+            )
+            self.assertEqual(
+                font.find("s:color", namespace).attrib,
+                {"rgb": "FF9C0006"},
+            )
 
     def test_package_validation_rejects_explicit_vertical_alignment(self) -> None:
         spec = MODULE.CASES[0]

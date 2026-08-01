@@ -3794,8 +3794,6 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
         "crop_box_width",
         "media_box_height",
         "media_box_width",
-        "xhtml_height",
-        "xhtml_width",
     }
 )
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
@@ -3804,7 +3802,9 @@ PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
 # ``pdfinfo`` reports Page size to at most three decimal places while
 # ``pdftotext -bbox-layout`` reports six.  Keep both exact decimal rationals,
 # then allow only the documented display-precision envelope for this internal
-# cross-check.  Cross-document MediaBox/CropBox/XHTML deltas remain exact zero.
+# cross-check.  Cross-document MediaBox/CropBox deltas remain exact zero;
+# pdftotext XHTML dimensions are diagnostic cross-checks, including between
+# the two PDFs, because they are not authoritative page-box measurements.
 PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
 
 
@@ -3819,6 +3819,8 @@ def _point_delta(value: object, *, code: str) -> Fraction:
 def _aggregate_pdf_point_geometry(
     pages: Sequence[dict[str, object]],
 ) -> dict[str, int]:
+    """Aggregate exact PDF boxes separately from diagnostic XHTML checks."""
+
     mismatches = 0
     max_delta_millipoints = 0
     max_xhtml_crosscheck_delta_micropoints = 0
@@ -3863,10 +3865,7 @@ def _aggregate_pdf_point_geometry(
         crosscheck_deltas = [
             parsed[key] for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
         ]
-        page_mismatch = any(delta != 0 for delta in direct_deltas) or any(
-            delta > PDF_XHTML_CROSSCHECK_MAX_POINTS
-            for delta in crosscheck_deltas
-        )
+        page_mismatch = any(delta != 0 for delta in direct_deltas)
         for delta in direct_deltas:
             millipoints = (
                 delta.numerator * 1000 + delta.denominator - 1

@@ -117,10 +117,10 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
                 "renderer_binary": {"bytes": 123_456, "sha256": "d" * 64},
             },
             "discovery": {
-                "candidate_count": 24,
-                "pre_shard_selected_count": 24,
-                "selected_count": 24,
-                "shard_candidate_count": 24,
+                "candidate_count": 34,
+                "pre_shard_selected_count": 34,
+                "selected_count": 34,
+                "shard_candidate_count": 34,
                 "shard_count": 1,
                 "shard_index": 0,
                 "truncated": False,
@@ -131,9 +131,9 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             "schema": "rxls.libreoffice-render-parity.v1",
             "summary": {
                 "authored_print": None,
-                "by_classification": {"within_threshold": 24},
-                "by_status": {"compared": 24},
-                "files": 24,
+                "by_classification": {"within_threshold": 34},
+                "by_status": {"compared": 34},
+                "files": 34,
                 "input_bytes_considered": self.manifest["total_bytes"],
                 "metric_cohorts": {},
             },
@@ -302,35 +302,35 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         self.assertEqual(
             output["baseline"],
             {
-                "case_count": 12,
+                "case_count": 16,
                 "max_absolute_height_delta_millipoints": 40,
                 "passed": True,
                 "threshold_max_absolute_height_delta_millipoints": 50,
             },
         )
-        self.assertEqual(output["coverage"]["case_count"], 24)
-        self.assertEqual(output["coverage"]["page_count"], 24)
+        self.assertEqual(output["coverage"]["case_count"], 34)
+        self.assertEqual(output["coverage"]["page_count"], 34)
         self.assertEqual(
             output["geometry_policy"],
             self.checker.UNIQUE_GEOMETRY_POLICY,
         )
         self.assertEqual(
             output["coverage"]["sheet_format_counts"],
-            {"missing": 20, "present": 4},
+            {"missing": 30, "present": 4},
         )
         self.assertEqual(
             output["coverage"]["normal_font_counts"],
-            {"carlito": 4, "noto": 20},
+            {"carlito": 4, "noto": 30},
         )
         self.assertEqual(
             output["coverage"]["normal_size_point_counts"],
-            {"11": 20, "12": 4},
+            {"11": 30, "12": 4},
         )
         self.assertEqual(
             output["coverage"]["toggle_counts"],
             self.checker.EXPECTED_TOGGLE_COUNTS,
         )
-        self.assertEqual(len(output["cohorts"]), 24)
+        self.assertEqual(len(output["cohorts"]), 34)
         self.assertTrue(
             all(row["height_delta_millipoints"] == 40 for row in output["cohorts"])
         )
@@ -1033,7 +1033,7 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             lambda value: value["baseline"].update(
                 {"threshold_max_absolute_height_delta_millipoints": 51}
             ),
-            lambda value: value["baseline"].update({"case_count": 12.0}),
+            lambda value: value["baseline"].update({"case_count": 16.0}),
             lambda value: value["baseline"].update(
                 {"max_absolute_height_delta_millipoints": 40.0}
             ),

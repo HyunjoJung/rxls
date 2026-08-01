@@ -231,16 +231,26 @@ DIAGNOSTIC_FEATURES = frozenset(
     {
         "auto-bold-font",
         "auto-bold-font-wrapped",
+        "auto-heading-western-asian",
+        "auto-heading-western-complex",
         "auto-large-font",
         "auto-long-unwrapped",
+        "auto-numeric-color-conditional",
+        "auto-numeric-no-conditional",
+        "auto-wrapped-color-conditional",
         "auto-wrapped-explicit",
         "auto-wrapped-hidden",
         "auto-wrapped-image",
         "auto-wrapped-long",
         "auto-wrapped-long-anchor",
         "auto-wrapped-merged",
+        "auto-wrapped-no-conditional",
         "auto-wrapped-rtl",
         "auto-wrapped-wide",
+        "hidden-heading-western-asian",
+        "hidden-heading-western-complex",
+        "manual-heading-western-asian",
+        "manual-heading-western-complex",
     }
 )
 FEATURES = frozenset(
@@ -291,12 +301,12 @@ SHARDED = {
     "parity-a": "parity-a-shard-{index}.json",
     "parity-b": "parity-b-shard-{index}.json",
 }
-CASES = {"full": 800, "ooxml-row-diagnostic": 24, "pilot": 40}
+CASES = {"full": 800, "ooxml-row-diagnostic": 34, "pilot": 40}
 LANES = {
     "full": {"authored-print": 100, "parity-a": 800, "parity-b": 800},
     "ooxml-row-diagnostic": {
         "authored-print": 0,
-        "parity-a": 24,
+        "parity-a": 34,
         "parity-b": 0,
     },
     "pilot": {"authored-print": 4, "parity-a": 40, "parity-b": 0},
@@ -337,8 +347,6 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
         "crop_box_width",
         "media_box_height",
         "media_box_width",
-        "xhtml_height",
-        "xhtml_width",
     }
 )
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = frozenset(PDF_POINT_DELTA_KEYS) - (
@@ -1541,9 +1549,6 @@ def _page_point_geometry(
         raise SummaryError("geometry_delta")
     mismatch = any(
         parsed[key] != 0 for key in PDF_DIRECT_POINT_DELTA_KEYS
-    ) or any(
-        abs(parsed[key]) > PDF_XHTML_CROSSCHECK_MAX_POINTS
-        for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
     )
     return parsed, mismatch
 
@@ -2968,18 +2973,13 @@ def _validate_geometry_output(
     direct_counts = [
         parsed[key][0] for key in PDF_DIRECT_POINT_DELTA_KEYS
     ]
-    over_limit_crosscheck_counts = [
-        parsed[key][0]
-        for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
-        if parsed[key][1] > 1000
-    ]
     minimum_mismatches = max(
-        [*direct_counts, int(bool(over_limit_crosscheck_counts))],
+        direct_counts,
         default=0,
     )
     maximum_mismatches = min(
         pages,
-        sum(direct_counts) + sum(over_limit_crosscheck_counts),
+        sum(direct_counts),
     )
     if not minimum_mismatches <= mismatch_pages <= maximum_mismatches:
         raise SummaryError(code)

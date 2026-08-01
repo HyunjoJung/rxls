@@ -5975,6 +5975,19 @@ pub struct Sheet {
     /// same source font. Other formats and ambiguous/invalid XLSX style tables
     /// retain `None`.
     pub(crate) xlsx_normal_font_size_pt: Option<u16>,
+    /// Exact integral XLSB Normal-style font size retained only when the
+    /// binary Fonts, CellStyleXFs, CellXFs, and Styles collections are
+    /// structurally complete and their default font sources agree.
+    pub(crate) xlsb_normal_font_size_pt: Option<u16>,
+    /// Exact integral XLSB source font size parallel to each retained cell.
+    ///
+    /// Entries are absent for non-XLSB cells and for incomplete, malformed,
+    /// fractional, out-of-range, or ambiguous binary style provenance.
+    pub(crate) xlsb_cell_font_sizes_pt: Vec<Option<u16>>,
+    /// Exact integral XLSB font sizes for retained row XF layers.
+    pub(crate) xlsb_row_font_sizes_pt: BTreeMap<u32, u16>,
+    /// Exact integral XLSB font sizes for retained column XF layers.
+    pub(crate) xlsb_col_font_sizes_pt: BTreeMap<u16, u16>,
     /// Merged ranges `(r0, c0, r1, c1)` set when **authoring** (via
     /// [`Sheet::merge`]). The writer emits these as `<mergeCells>` and omits
     /// cells under them for OOXML conformance.
@@ -6358,6 +6371,10 @@ impl Default for Sheet {
             ooxml_defaulted_base_col_width: false,
             ooxml_implicit_row_height: OoxmlImplicitRowHeight::None,
             xlsx_normal_font_size_pt: None,
+            xlsb_normal_font_size_pt: None,
+            xlsb_cell_font_sizes_pt: Vec::default(),
+            xlsb_row_font_sizes_pt: BTreeMap::default(),
+            xlsb_col_font_sizes_pt: BTreeMap::default(),
             merges: Vec::default(),
             read_merges: Vec::default(),
             read_hyperlinks: Vec::default(),
@@ -8708,6 +8725,88 @@ impl Sheet {
         (!inherited_font).then_some(points)
     }
 
+    /// Return an evidence-bounded XLSB Normal-style font size for rendering.
+    ///
+    /// The value is retained only for imported XLSB worksheets whose binary
+    /// Fonts, CellStyleXFs, CellXFs, and Styles collections are complete,
+    /// bounded, and identify one built-in Normal style. Its first cell XF and
+    /// Normal style XF must resolve to the same exact integral source font.
+    /// Malformed, fractional, out-of-range, authored, and non-XLSB sources
+    /// return `None`.
+    #[doc(hidden)]
+    pub fn verified_xlsb_normal_font_size_pt(&self) -> Option<u16> {
+        self.xlsb_normal_font_size_pt
+    }
+
+    /// Return an evidence-bounded XLSB font size for one retained cell XF.
+    ///
+    /// The value follows the effective last-write-wins cell and exists only
+    /// when its binary cell XF resolves through complete, bounded source style
+    /// tables to an exact integral font size. Rounded public styles, authored
+    /// cells, inherited mutable font layers, malformed references, and
+    /// non-XLSB sources return `None`.
+    #[doc(hidden)]
+    pub fn verified_xlsb_cell_font_size_pt(&self, row: u32, col: u16) -> Option<u16> {
+        let source_index = self.display_cell_index().source_index(row, col)?;
+        let entry = self.cells.get(source_index)?;
+        let points = self
+            .xlsb_cell_font_sizes_pt
+            .get(source_index)
+            .copied()
+            .flatten()?;
+
+        if self.direct_cell_formats.contains_key(&(row, col)) {
+            return None;
+        }
+
+        // Style index zero is represented by the worksheet default instead of
+        // an explicit retained cell style. Do not transfer its source evidence
+        // through a mutable row, column, or table font layer.
+        if entry.style.is_none() {
+            let inherited_points = if self.row_formats.contains_key(&row) {
+                self.xlsb_row_font_sizes_pt.get(&row).copied()
+            } else if self.col_formats.contains_key(&col) {
+                self.xlsb_col_font_sizes_pt.get(&col).copied()
+            } else {
+                self.xlsb_normal_font_size_pt
+            };
+            if inherited_points != Some(points) {
+                return None;
+            }
+        }
+
+        let table_font = self.tables.iter().any(|table| {
+            self.table_region_formats
+                .get(&table.name)
+                .and_then(|application| application.resolve(table, row, col))
+                .and_then(|style| style.font)
+                .is_some()
+                || {
+                    let (first_row, first_col, _, last_col) = table.range;
+                    row == first_row
+                        && col >= first_col
+                        && col <= last_col
+                        && self
+                            .table_header_formats
+                            .get(&table.name)
+                            .and_then(|style| style.font.as_ref())
+                            .is_some()
+                }
+        });
+        if table_font {
+            return None;
+        }
+
+        let retained_font = entry
+            .style
+            .as_ref()
+            .or_else(|| self.row_formats.get(&row))
+            .or_else(|| self.col_formats.get(&col))
+            .or(self.default_format.as_ref())
+            .and_then(|style| style.font.as_ref());
+        (retained_font.and_then(|font| font.size_pt) == Some(points)).then_some(points)
+    }
+
     /// Explicitly hidden columns, as 0-based indexes.
     pub fn hidden_columns(&self) -> &BTreeSet<u16> {
         &self.hidden_cols
@@ -10444,8 +10543,25 @@ impl Sheet {
     /// Write a format-only blank cell at `(row, col)` with an inline style.
     pub fn write_blank_styled(&mut self, row: u32, col: u16, style: &CellStyle) {
         self.rich.remove(&(row, col));
-        self.cells
-            .retain(|entry| entry.row != row || entry.col != col);
+        self.display_cell_index.take();
+        if self.xlsb_cell_font_sizes_pt.len() == self.cells.len() {
+            let source_font_sizes = std::mem::take(&mut self.xlsb_cell_font_sizes_pt);
+            let mut retained_font_sizes = Vec::with_capacity(source_font_sizes.len());
+            let mut source_index = 0;
+            self.cells.retain(|entry| {
+                let retain = entry.row != row || entry.col != col;
+                if retain {
+                    retained_font_sizes.push(source_font_sizes[source_index]);
+                }
+                source_index += 1;
+                retain
+            });
+            self.xlsb_cell_font_sizes_pt = retained_font_sizes;
+        } else {
+            self.cells
+                .retain(|entry| entry.row != row || entry.col != col);
+            self.xlsb_cell_font_sizes_pt.clear();
+        }
         self.blank_styles.insert((row, col), style.clone());
     }
     /// Write a format-only blank cell at `(row, col)` with a [`Format`].
@@ -10672,11 +10788,13 @@ impl Sheet {
     /// Set the default format for cells in a row.
     pub fn set_row_format(&mut self, row: u32, format: &Format) {
         self.row_formats.insert(row, format.as_cell_style().clone());
+        self.xlsb_row_font_sizes_pt.remove(&row);
         self.refresh_authored_display_texts();
     }
     /// Set the default format for cells in a column.
     pub fn set_col_format(&mut self, col: u16, format: &Format) {
         self.col_formats.insert(col, format.as_cell_style().clone());
+        self.xlsb_col_font_sizes_pt.remove(&col);
         self.refresh_authored_display_texts();
     }
     /// Set the worksheet default format for cells without a more specific format.
@@ -10685,6 +10803,10 @@ impl Sheet {
     pub fn set_default_format(&mut self, format: &Format) {
         self.default_format = Some(format.as_cell_style().clone());
         self.xlsx_normal_font_size_pt = None;
+        self.xlsb_normal_font_size_pt = None;
+        self.xlsb_cell_font_sizes_pt.clear();
+        self.xlsb_row_font_sizes_pt.clear();
+        self.xlsb_col_font_sizes_pt.clear();
         self.refresh_authored_display_texts();
     }
     /// Set the format for the header row cells of the named table.
@@ -10839,6 +10961,7 @@ impl Sheet {
             xlsx_font_size_pt: None,
             hyperlink,
         });
+        self.xlsb_cell_font_sizes_pt.push(None);
     }
 
     fn effective_authored_num_fmt<'a>(

@@ -74,6 +74,8 @@ def point_geometry(
     *,
     rxls_width: str = "600/1",
     libreoffice_width: str = "600/1",
+    rxls_xhtml_width: str | None = None,
+    libreoffice_xhtml_width: str | None = None,
 ) -> dict[str, object]:
     def side(width: str) -> dict[str, object]:
         dimensions = {"height_points": "450/1", "width_points": width}
@@ -83,33 +85,52 @@ def point_geometry(
             "page_size": dict(dimensions),
         }
 
-    delta = MODULE._point(
+    rxls_box = MODULE._point(
         rxls_width, "fixture", positive=True
-    ) - MODULE._point(libreoffice_width, "fixture", positive=True)
-    delta_text = f"{delta.numerator}/{delta.denominator}"
+    )
+    libreoffice_box = MODULE._point(
+        libreoffice_width, "fixture", positive=True
+    )
+    rxls_xhtml = MODULE._point(
+        rxls_xhtml_width or rxls_width, "fixture", positive=True
+    )
+    libreoffice_xhtml = MODULE._point(
+        libreoffice_xhtml_width or libreoffice_width,
+        "fixture",
+        positive=True,
+    )
+
+    def point_text(value: MODULE.Fraction) -> str:
+        return f"{value.numerator}/{value.denominator}"
+
+    box_delta = point_text(rxls_box - libreoffice_box)
     return {
         "deltas_points": {
             "crop_box_height": "0/1",
-            "crop_box_width": delta_text,
+            "crop_box_width": box_delta,
             "libreoffice_xhtml_page_size_height": "0/1",
-            "libreoffice_xhtml_page_size_width": "0/1",
+            "libreoffice_xhtml_page_size_width": point_text(
+                libreoffice_xhtml - libreoffice_box
+            ),
             "media_box_height": "0/1",
-            "media_box_width": delta_text,
+            "media_box_width": box_delta,
             "rxls_xhtml_page_size_height": "0/1",
-            "rxls_xhtml_page_size_width": "0/1",
+            "rxls_xhtml_page_size_width": point_text(
+                rxls_xhtml - rxls_box
+            ),
             "xhtml_height": "0/1",
-            "xhtml_width": delta_text,
+            "xhtml_width": point_text(rxls_xhtml - libreoffice_xhtml),
         },
         "libreoffice": side(libreoffice_width),
         "rxls": side(rxls_width),
         "xhtml": {
             "libreoffice": {
                 "height_points": "450/1",
-                "width_points": libreoffice_width,
+                "width_points": point_text(libreoffice_xhtml),
             },
             "rxls": {
                 "height_points": "450/1",
-                "width_points": rxls_width,
+                "width_points": point_text(rxls_xhtml),
             },
         },
     }
@@ -835,6 +856,9 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
             )
             item["metrics"]["pdf_point_geometry_mismatches"] = 1
             item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 1_500
+            item["metrics"][
+                "max_pdf_xhtml_crosscheck_delta_micropoints"
+            ] = 1_500_000
         result = self.evaluate_small(report)
         self.assertEqual(result["metrics"]["page_box_median_millipoints"], 1_500)
         self.assertIn("page_box_median_error_above_target", result["failures"])
@@ -845,6 +869,9 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
                 libreoffice_width="2379/4"
             )
             item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 5_250
+            item["metrics"][
+                "max_pdf_xhtml_crosscheck_delta_micropoints"
+            ] = 5_250_000
         result = self.evaluate_small(report)
         self.assertEqual(result["metrics"]["page_box_max_millipoints"], 5_250)
         self.assertIn("page_box_max_error_above_target", result["failures"])
@@ -857,6 +884,9 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         )
         item["metrics"]["pdf_point_geometry_mismatches"] = 1
         item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 100
+        item["metrics"][
+            "max_pdf_xhtml_crosscheck_delta_micropoints"
+        ] = 100_000
         result = self.evaluate_small(report)
         self.assertIn("pdf_point_geometry_mismatch", result["failures"])
         self.assertNotIn("raster_page_box_mismatch", result["failures"])
@@ -878,6 +908,42 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         self.assertEqual(
             result["metrics"]["pdf_xhtml_crosscheck_max_micropoints"],
             300,
+        )
+
+    def test_cross_document_xhtml_delta_uses_bounded_crosscheck_gate(self) -> None:
+        report = report_document()
+        for item in report["files"]:
+            item["pages"][0]["pdf_point_geometry"] = point_geometry(
+                rxls_xhtml_width="600000365/1000000"
+            )
+            item["metrics"][
+                "max_pdf_xhtml_crosscheck_delta_micropoints"
+            ] = 365
+        result = self.evaluate_small(report)
+        self.assertNotIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertNotIn(
+            "pdf_xhtml_crosscheck_above_tolerance",
+            result["failures"],
+        )
+        self.assertEqual(
+            result["metrics"]["pdf_point_geometry_mismatches"], 0
+        )
+
+        for item in report["files"]:
+            item["pages"][0]["pdf_point_geometry"] = point_geometry(
+                rxls_xhtml_width="600001001/1000000"
+            )
+            item["metrics"][
+                "max_pdf_xhtml_crosscheck_delta_micropoints"
+            ] = 1_001
+        result = self.evaluate_small(report)
+        self.assertNotIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertIn(
+            "pdf_xhtml_crosscheck_above_tolerance",
+            result["failures"],
+        )
+        self.assertEqual(
+            result["metrics"]["pdf_point_geometry_mismatches"], 0
         )
 
     def test_sheet_page_mapping_requires_contiguous_exact_indices(self) -> None:

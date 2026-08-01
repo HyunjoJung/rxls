@@ -1381,6 +1381,7 @@ fn select_default_face(faces: &[FontEntry]) -> Result<FontId, FontPackError> {
 pub(crate) struct FontResolution {
     pub(crate) id: FontId,
     pub(crate) exact_family: bool,
+    pub(crate) declared_alias: bool,
     pub(crate) exact_style: bool,
 }
 
@@ -1397,6 +1398,7 @@ impl FontPack {
                 return FontResolution {
                     id,
                     exact_family: true,
+                    declared_alias: false,
                     exact_style: face.italic == request.italic && face.weight == request.weight,
                 };
             }
@@ -1416,6 +1418,7 @@ impl FontPack {
             return FontResolution {
                 id,
                 exact_family: false,
+                declared_alias: true,
                 exact_style: face.italic == request.italic && face.weight == request.weight,
             };
         }
@@ -1429,6 +1432,7 @@ impl FontPack {
         FontResolution {
             id,
             exact_family: false,
+            declared_alias: false,
             exact_style: face.italic == request.italic && face.weight == request.weight,
         }
     }
@@ -2470,6 +2474,7 @@ mod tests {
         });
         assert_eq!(aliased.id, FontId(0));
         assert!(!aliased.exact_family);
+        assert!(aliased.declared_alias);
         assert!(!aliased.exact_style);
 
         // The manifest deliberately also contains Wide Sans -> RTL Sans. The
@@ -2481,6 +2486,7 @@ mod tests {
         });
         assert_eq!(exact.id, FontId(0));
         assert!(exact.exact_family);
+        assert!(!exact.declared_alias);
         assert!(!exact.exact_style);
 
         let shaped = pack

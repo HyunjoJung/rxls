@@ -28,9 +28,9 @@ METRIC_CONTRACT_SCHEMA = "rxls.render-parity-metrics.v2"
 CONTAINER_IDENTITY_SCHEMA = "rxls.render-oracle-container-identity.v2"
 PROFILE = "ooxml-row-diagnostic"
 GENERATOR = "rxls-ooxml-row-diagnostic"
-GENERATOR_VERSION = "1.1.0"
-CASE_COUNT = 24
-BASELINE_CASE_COUNT = 12
+GENERATOR_VERSION = "1.2.0"
+CASE_COUNT = 34
+BASELINE_CASE_COUNT = 16
 BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS = 50
 PRINT_MODE_SINGLE_PAGE = "single-page-sheets"
 LIBREOFFICE_ARTIFACT_SHA256 = (
@@ -214,26 +214,40 @@ UNIQUE_GEOMETRY_POLICY = {
 TOGGLE_FEATURES = {
     "auto-bold-font": "auto_bold_font",
     "auto-bold-font-wrapped": "auto_bold_font_wrapped",
+    "auto-heading-western-asian": "auto_heading_western_asian",
+    "auto-heading-western-complex": "auto_heading_western_complex",
     "auto-large-font": "auto_large_font",
     "auto-long-unwrapped": "auto_long_unwrapped",
+    "auto-numeric-color-conditional": "auto_numeric_color_conditional",
+    "auto-numeric-no-conditional": "auto_numeric_no_conditional",
+    "auto-wrapped-color-conditional": "auto_wrapped_color_conditional",
     "auto-wrapped-explicit": "auto_wrapped_explicit",
     "auto-wrapped-hidden": "auto_wrapped_hidden",
     "auto-wrapped-image": "auto_wrapped_image",
     "auto-wrapped-long": "auto_wrapped_long",
     "auto-wrapped-long-anchor": "auto_wrapped_long_anchor",
     "auto-wrapped-merged": "auto_wrapped_merged",
+    "auto-wrapped-no-conditional": "auto_wrapped_no_conditional",
     "auto-wrapped-rtl": "auto_wrapped_rtl",
     "auto-wrapped-wide": "auto_wrapped_wide",
     "explicit-row-height": "explicit_row_height",
+    "hidden-heading-western-asian": "hidden_heading_western_asian",
+    "hidden-heading-western-complex": "hidden_heading_western_complex",
     "hidden-row": "hidden_row",
     "image-drawing": "image_drawing",
+    "manual-heading-western-asian": "manual_heading_western_asian",
+    "manual-heading-western-complex": "manual_heading_western_complex",
     "right-to-left-layout": "right_to_left_layout",
 }
 BASELINE_TOGGLE_VALUES = frozenset(
     {
         "explicit_row_height",
         "hidden_row",
+        "hidden_heading_western_asian",
+        "hidden_heading_western_complex",
         "image_drawing",
+        "manual_heading_western_asian",
+        "manual_heading_western_complex",
         "none",
         "right_to_left_layout",
     }
@@ -1199,9 +1213,9 @@ def _validate_output(value: dict[str, object]) -> None:
         "output_coverage_contract",
     )
     _require(
-        coverage.get("normal_font_counts") == {"carlito": 4, "noto": 20}
-        and coverage.get("normal_size_point_counts") == {"11": 20, "12": 4}
-        and coverage.get("sheet_format_counts") == {"missing": 20, "present": 4}
+        coverage.get("normal_font_counts") == {"carlito": 4, "noto": 30}
+        and coverage.get("normal_size_point_counts") == {"11": 30, "12": 4}
+        and coverage.get("sheet_format_counts") == {"missing": 30, "present": 4}
         and coverage.get("toggle_counts") == EXPECTED_TOGGLE_COUNTS,
         "output_coverage_contract",
     )

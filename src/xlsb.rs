@@ -61,11 +61,14 @@ const BRT_SUP_ADDIN: u32 = 667;
 const BRT_ARR_FMLA: u32 = 0x01AA;
 const BRT_SHR_FMLA: u32 = 0x01AB;
 const BRT_EXTERN_SHEET: u32 = 0x016A;
+const BRT_AC_BEGIN: u32 = 37;
+const BRT_AC_END: u32 = 38;
 const BRT_FMT: u32 = 44;
 const BRT_FONT: u32 = 43;
 const BRT_FILL: u32 = 45;
 const BRT_BORDER: u32 = 46;
 const BRT_XF: u32 = 47;
+const BRT_STYLE: u32 = 48;
 const BRT_COL_INFO: u32 = 60;
 const BRT_DVAL: u32 = 64;
 const BRT_BEGIN_WS_VIEW: u32 = 137;
@@ -101,8 +104,14 @@ const BRT_TABLE_STYLE_CLIENT: u32 = 649;
 const BRT_DVAL_LIST: u32 = 681;
 const BRT_BEGIN_CELL_XFS: u32 = 0x0269;
 const BRT_END_CELL_XFS: u32 = 0x026A;
+const BRT_BEGIN_STYLES: u32 = 0x026B;
+const BRT_END_STYLES: u32 = 0x026C;
 const BRT_BEGIN_CELL_STYLE_XFS: u32 = 0x0272;
 const BRT_END_CELL_STYLE_XFS: u32 = 0x0273;
+const BRT_BEGIN_STYLE_SHEET: u32 = 0x0116;
+const BRT_END_STYLE_SHEET: u32 = 0x0117;
+const BRT_BEGIN_FONTS: u32 = 0x0263;
+const BRT_END_FONTS: u32 = 0x0264;
 const MAX_DVAL_RANGES: usize = 8192;
 const MAX_TABLE_COLUMNS: usize = 16_384;
 const MAX_XLSB_COL_INDEX: u32 = 16_383;
@@ -112,6 +121,15 @@ const XLSB_APPLICATION_DEFAULT_COL_WIDTH_256: u32 = 8 * 256 + 128;
 const MAX_XLSB_SUPPORTING_LINKS: usize = 1 << 20;
 const MAX_XLSB_EXTERNAL_NAMES: usize = 1 << 20;
 const MAX_XLSB_STYLE_RECORDS: usize = 65_536;
+// [MS-XLSB] §2.4.89 caps BrtBeginFonts.cfonts at 0xFFD3.
+const MAX_XLSB_FONT_RECORDS: usize = 0xFFD3;
+// [MS-XLSB] §§2.4.20, 2.4.22, and 2.4.232 require non-empty
+// CellStyleXF, CellXF, and Style collections capped at 0xFF96 records.
+const MAX_VERIFIED_XLSB_STYLE_RECORDS: usize = 0xFF96;
+// Office accepts OOXML font sizes through 409.55 points. The renderer
+// provenance sidecar is intentionally narrower because the public Font model
+// stores whole points: only exact integral values through 409 are eligible.
+const MAX_VERIFIED_XLSB_FONT_SIZE_POINTS: u16 = 409;
 const MAX_XLSB_DRAWINGS: usize = 16_384;
 const MAX_XLSB_DRAWING_TEXT: usize = 4_096;
 const MAX_XLSB_BLANK_STYLES: usize = 1 << 20;
@@ -423,6 +441,12 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             default_col_width: metadata.default_col_width,
             ooxml_implicit_col_width,
             ooxml_implicit_row_height,
+            xlsb_normal_font_size_pt: is_worksheet
+                .then_some(styles.xlsb_normal_font_size_pt)
+                .flatten(),
+            xlsb_cell_font_sizes_pt: metadata.xlsb_cell_font_sizes_pt,
+            xlsb_row_font_sizes_pt: metadata.xlsb_row_font_sizes_pt,
+            xlsb_col_font_sizes_pt: metadata.xlsb_col_font_sizes_pt,
             hidden_rows: metadata.hidden_rows,
             hidden_cols: metadata.hidden_cols,
             default_hidden_row_exceptions,
@@ -708,6 +732,10 @@ struct Styles {
     fills: Vec<Fill>,
     borders: Vec<Border>,
     cell_styles: Vec<CellStyle>,
+    /// Exact integral Normal font size proven from complete XLSB style tables.
+    xlsb_normal_font_size_pt: Option<u16>,
+    /// Exact integral effective font size per retained CellXF.
+    xlsb_cell_xf_font_sizes_pt: Vec<Option<u16>>,
     losses: Vec<StyleLoss>,
     has_source_styles: bool,
 }
@@ -737,6 +765,13 @@ impl Styles {
     fn cell_style(&self, style_idx: usize) -> Option<&CellStyle> {
         self.cell_styles.get(style_idx)
     }
+
+    fn xlsb_cell_font_size_pt(&self, style_idx: usize) -> Option<u16> {
+        self.xlsb_cell_xf_font_sizes_pt
+            .get(style_idx)
+            .copied()
+            .flatten()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -756,6 +791,17 @@ fn bounded_wide_string(b: &[u8], offset: usize, max_chars: usize) -> Option<(Str
     (chars <= max_chars)
         .then(|| wide_string(b, offset))
         .flatten()
+}
+
+fn bounded_nullable_wide_string(
+    b: &[u8],
+    offset: usize,
+    max_chars: usize,
+) -> Option<(Option<String>, usize)> {
+    if u32le(b, offset)? == u32::MAX {
+        return Some((None, 4));
+    }
+    bounded_wide_string(b, offset, max_chars).map(|(value, used)| (Some(value), used))
 }
 
 fn tint_color(color: Color, tint: i16) -> Color {
@@ -1112,6 +1158,427 @@ fn raw_xf_style(
     result
 }
 
+/// Bounds-checked BIFF12 reader used only by the renderer provenance oracle.
+///
+/// The general reader deliberately recovers from a truncated final record.
+/// Font-size provenance instead fails closed, including when a variable-width
+/// record header uses more than the schema's two/four byte limits.
+struct StrictRecReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> StrictRecReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn var(&mut self, max_bytes: usize) -> std::result::Result<u32, ()> {
+        let mut value = 0_u32;
+        for index in 0..max_bytes {
+            let byte = *self.bytes.get(self.pos).ok_or(())?;
+            self.pos += 1;
+            value |= u32::from(byte & 0x7F) << (7 * index);
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(())
+    }
+
+    fn next(&mut self) -> std::result::Result<Option<(u32, &'a [u8])>, ()> {
+        if self.pos == self.bytes.len() {
+            return Ok(None);
+        }
+        let record_type = self.var(2)?;
+        let size = usize::try_from(self.var(4)?).map_err(|_| ())?;
+        let end = self.pos.checked_add(size).ok_or(())?;
+        let payload = self.bytes.get(self.pos..end).ok_or(())?;
+        self.pos = end;
+        Ok(Some((record_type, payload)))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvenanceTable {
+    Fonts,
+    StyleXfs,
+    CellXfs,
+    Styles,
+}
+
+#[derive(Clone)]
+struct ParsedXlsbStyle {
+    xf_index: usize,
+    built_in: bool,
+    builtin_id: u8,
+}
+
+#[derive(Default)]
+struct VerifiedXlsbStyleProvenance {
+    normal_font_size_pt: Option<u16>,
+    cell_xf_font_sizes_pt: Vec<Option<u16>>,
+}
+
+fn exact_integral_xlsb_font_size(payload: &[u8]) -> Option<u16> {
+    let height_twips = u16le(payload, 0)?;
+    let (name, used) = bounded_wide_string(payload, 21, 1_024)?;
+    if name.is_empty() || 21_usize.checked_add(used)? != payload.len() || height_twips % 20 != 0 {
+        return None;
+    }
+    let points = height_twips / 20;
+    (1..=MAX_VERIFIED_XLSB_FONT_SIZE_POINTS)
+        .contains(&points)
+        .then_some(points)
+}
+
+fn exact_xlsb_xf(payload: &[u8]) -> Option<RawXf> {
+    // [MS-XLSB] §2.4.876 BrtXF has a fixed 16-byte payload. Bits above the six
+    // formatting-group flags are reserved and cannot establish provenance.
+    if payload.len() != 16 || u16le(payload, 14)? & !0x003F != 0 {
+        return None;
+    }
+    parse_xlsb_xf(payload, &mut Vec::new())
+}
+
+fn parsed_xlsb_style(payload: &[u8]) -> Option<ParsedXlsbStyle> {
+    // [MS-XLSB] §2.4.809: ixf, StyleFlags, built-in id/level, CellStyleName.
+    let xf_index = usize::try_from(u32le(payload, 0)?).ok()?;
+    let flags = u16le(payload, 4)?;
+    let builtin_id = *payload.get(6)?;
+    let level = *payload.get(7)?;
+    let (_, used) = bounded_nullable_wide_string(payload, 8, 255)?;
+    if 8_usize.checked_add(used)? != payload.len()
+        || flags & !0x0007 != 0
+        || (flags & 0x0004 != 0 && flags & 0x0001 == 0)
+        || (builtin_id != 0 && flags & 0x0001 == 0)
+        || (matches!(builtin_id, 1 | 2) && level > 6)
+    {
+        return None;
+    }
+    Some(ParsedXlsbStyle {
+        xf_index,
+        built_in: flags & 0x0001 != 0,
+        builtin_id,
+    })
+}
+
+fn verified_xlsb_collection_count(payload: &[u8], max: usize) -> Option<usize> {
+    if payload.len() != 4 {
+        return None;
+    }
+    let count = usize::try_from(u32le(payload, 0)?).ok()?;
+    (1..=max).contains(&count).then_some(count)
+}
+
+fn verified_xlsb_ac_begin(payload: &[u8]) -> bool {
+    // [MS-XLSB] §2.4.2: cver:u16 followed by exactly cver four-byte
+    // ACProductVersion structures. The u16 count is the schema bound; checked
+    // arithmetic keeps the framing proof allocation-free.
+    let Some(count) = u16le(payload, 0).map(usize::from) else {
+        return false;
+    };
+    count != 0
+        && count
+            .checked_mul(4)
+            .and_then(|versions| versions.checked_add(2))
+            == Some(payload.len())
+}
+
+fn verified_xlsb_style_provenance(
+    bytes: &[u8],
+    parsed_fonts: &[Font],
+) -> VerifiedXlsbStyleProvenance {
+    let mut reader = StrictRecReader::new(bytes);
+    let mut structurally_valid = true;
+    let mut root_state = 0_u8;
+    let mut active_table = None;
+    let mut in_alternate_content = false;
+
+    let mut saw_fonts = false;
+    let mut expected_fonts = None;
+    let mut exact_font_sizes = Vec::new();
+
+    let mut saw_style_xfs = false;
+    let mut expected_style_xfs = None;
+    let mut style_xfs = Vec::new();
+
+    let mut saw_cell_xfs = false;
+    let mut expected_cell_xfs = None;
+    let mut cell_xfs = Vec::new();
+
+    let mut saw_styles = false;
+    let mut expected_styles = None;
+    let mut parsed_styles = Vec::new();
+
+    loop {
+        let record = match reader.next() {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(()) => {
+                structurally_valid = false;
+                break;
+            }
+        };
+        let (record_type, payload) = record;
+        if in_alternate_content {
+            match record_type {
+                // Alternate-content blocks are not recursive. Keep consuming
+                // after a nested begin so the final result fails closed without
+                // allowing any enclosed record to mutate the core table state.
+                BRT_AC_BEGIN => structurally_valid = false,
+                BRT_AC_END => {
+                    if !payload.is_empty() {
+                        structurally_valid = false;
+                    }
+                    in_alternate_content = false;
+                }
+                // The permissive public style reader is not alternate-content
+                // aware. Reject blocks that carry provenance table records or
+                // delimiters so its indexes cannot diverge from this oracle's
+                // ignored alternate content.
+                BRT_BEGIN_STYLE_SHEET
+                | BRT_END_STYLE_SHEET
+                | BRT_BEGIN_FONTS
+                | BRT_END_FONTS
+                | BRT_BEGIN_CELL_STYLE_XFS
+                | BRT_END_CELL_STYLE_XFS
+                | BRT_BEGIN_CELL_XFS
+                | BRT_END_CELL_XFS
+                | BRT_BEGIN_STYLES
+                | BRT_END_STYLES
+                | BRT_FONT
+                | BRT_XF
+                | BRT_STYLE => structurally_valid = false,
+                _ => {}
+            }
+            continue;
+        }
+        match record_type {
+            BRT_AC_BEGIN => {
+                if verified_xlsb_ac_begin(payload) {
+                    in_alternate_content = true;
+                } else {
+                    structurally_valid = false;
+                }
+            }
+            BRT_AC_END => structurally_valid = false,
+            BRT_BEGIN_STYLE_SHEET => {
+                if root_state != 0 || !payload.is_empty() || active_table.is_some() {
+                    structurally_valid = false;
+                } else {
+                    root_state = 1;
+                }
+            }
+            BRT_END_STYLE_SHEET => {
+                if root_state != 1 || !payload.is_empty() || active_table.is_some() {
+                    structurally_valid = false;
+                } else {
+                    root_state = 2;
+                }
+            }
+            _ if root_state != 1 => structurally_valid = false,
+            BRT_BEGIN_FONTS => {
+                let count = verified_xlsb_collection_count(payload, MAX_XLSB_FONT_RECORDS);
+                if saw_fonts || active_table.is_some() || count.is_none() {
+                    structurally_valid = false;
+                } else {
+                    saw_fonts = true;
+                    expected_fonts = count;
+                    active_table = Some(ProvenanceTable::Fonts);
+                }
+            }
+            BRT_END_FONTS => {
+                if active_table != Some(ProvenanceTable::Fonts) || !payload.is_empty() {
+                    structurally_valid = false;
+                } else {
+                    active_table = None;
+                }
+            }
+            BRT_BEGIN_CELL_STYLE_XFS => {
+                let count =
+                    verified_xlsb_collection_count(payload, MAX_VERIFIED_XLSB_STYLE_RECORDS);
+                if saw_style_xfs || active_table.is_some() || count.is_none() {
+                    structurally_valid = false;
+                } else {
+                    saw_style_xfs = true;
+                    expected_style_xfs = count;
+                    active_table = Some(ProvenanceTable::StyleXfs);
+                }
+            }
+            BRT_END_CELL_STYLE_XFS => {
+                if active_table != Some(ProvenanceTable::StyleXfs) || !payload.is_empty() {
+                    structurally_valid = false;
+                } else {
+                    active_table = None;
+                }
+            }
+            BRT_BEGIN_CELL_XFS => {
+                let count =
+                    verified_xlsb_collection_count(payload, MAX_VERIFIED_XLSB_STYLE_RECORDS);
+                if saw_cell_xfs || active_table.is_some() || count.is_none() {
+                    structurally_valid = false;
+                } else {
+                    saw_cell_xfs = true;
+                    expected_cell_xfs = count;
+                    active_table = Some(ProvenanceTable::CellXfs);
+                }
+            }
+            BRT_END_CELL_XFS => {
+                if active_table != Some(ProvenanceTable::CellXfs) || !payload.is_empty() {
+                    structurally_valid = false;
+                } else {
+                    active_table = None;
+                }
+            }
+            BRT_BEGIN_STYLES => {
+                let count =
+                    verified_xlsb_collection_count(payload, MAX_VERIFIED_XLSB_STYLE_RECORDS);
+                if saw_styles || active_table.is_some() || count.is_none() {
+                    structurally_valid = false;
+                } else {
+                    saw_styles = true;
+                    expected_styles = count;
+                    active_table = Some(ProvenanceTable::Styles);
+                }
+            }
+            BRT_END_STYLES => {
+                if active_table != Some(ProvenanceTable::Styles) || !payload.is_empty() {
+                    structurally_valid = false;
+                } else {
+                    active_table = None;
+                }
+            }
+            BRT_FONT => {
+                if active_table != Some(ProvenanceTable::Fonts)
+                    || exact_font_sizes.len() >= MAX_XLSB_FONT_RECORDS
+                {
+                    structurally_valid = false;
+                } else {
+                    exact_font_sizes.push(exact_integral_xlsb_font_size(payload));
+                }
+            }
+            BRT_XF => match active_table {
+                Some(ProvenanceTable::StyleXfs)
+                    if style_xfs.len() < MAX_VERIFIED_XLSB_STYLE_RECORDS =>
+                {
+                    style_xfs.push(exact_xlsb_xf(payload));
+                }
+                Some(ProvenanceTable::CellXfs)
+                    if cell_xfs.len() < MAX_VERIFIED_XLSB_STYLE_RECORDS =>
+                {
+                    cell_xfs.push(exact_xlsb_xf(payload));
+                }
+                _ => structurally_valid = false,
+            },
+            BRT_STYLE => {
+                if active_table != Some(ProvenanceTable::Styles)
+                    || parsed_styles.len() >= MAX_VERIFIED_XLSB_STYLE_RECORDS
+                {
+                    structurally_valid = false;
+                } else {
+                    parsed_styles.push(parsed_xlsb_style(payload));
+                }
+            }
+            _ if active_table.is_some() => structurally_valid = false,
+            _ => {}
+        }
+    }
+
+    structurally_valid &= root_state == 2
+        && active_table.is_none()
+        && !in_alternate_content
+        && saw_fonts
+        && saw_style_xfs
+        && saw_cell_xfs
+        && saw_styles
+        && expected_fonts == Some(exact_font_sizes.len())
+        && expected_style_xfs == Some(style_xfs.len())
+        && expected_cell_xfs == Some(cell_xfs.len())
+        && expected_styles == Some(parsed_styles.len())
+        && parsed_styles.iter().all(Option::is_some)
+        && parsed_fonts.len() == exact_font_sizes.len();
+    if !structurally_valid {
+        return VerifiedXlsbStyleProvenance::default();
+    }
+
+    let style_xf_font_ids = style_xfs
+        .iter()
+        .map(|candidate| {
+            let xf = candidate.as_ref()?;
+            // A CellStyleXF is a root formatting record. Font group bit one is
+            // inverted for style XFs: zero means the source font is present.
+            (xf.parent.is_none() && xf.changed_groups & (1 << 1) == 0).then_some(xf.font)
+        })
+        .collect::<Vec<_>>();
+    let cell_xf_font_ids = cell_xfs
+        .iter()
+        .map(|candidate| {
+            let xf = candidate.as_ref()?;
+            let parent_index = xf.parent?;
+            let parent_xf = style_xfs.get(parent_index)?.as_ref()?;
+            if parent_xf.parent.is_some() {
+                return None;
+            }
+            if xf.changed_groups & (1 << 1) != 0 {
+                Some(xf.font)
+            } else {
+                style_xf_font_ids.get(parent_index).copied().flatten()
+            }
+        })
+        .collect::<Vec<_>>();
+    let cell_xf_font_sizes_pt = cell_xf_font_ids
+        .iter()
+        .map(|font_id| {
+            let font_id = (*font_id)?;
+            exact_font_sizes.get(font_id).copied().flatten()
+        })
+        .collect::<Vec<_>>();
+
+    let normal_font_size_pt = (saw_styles
+        && expected_styles == Some(parsed_styles.len())
+        && parsed_styles.iter().all(Option::is_some))
+    .then(|| {
+        let styles = parsed_styles
+            .iter()
+            .map(|style| style.as_ref().expect("validated style"))
+            .collect::<Vec<_>>();
+        let mut unique_xfs = HashSet::with_capacity(styles.len());
+        if !styles.iter().all(|style| unique_xfs.insert(style.xf_index)) {
+            return None;
+        }
+        let mut normals = styles
+            .iter()
+            .filter(|style| style.built_in && style.builtin_id == 0);
+        let normal = *normals.next()?;
+        if normals.next().is_some() || normal.xf_index != 0 {
+            return None;
+        }
+
+        // [MS-XLSB] §2.2.6.1.2.2 requires Normal to reference the first
+        // CellStyleXF. The first CellXF must in turn resolve to that same
+        // source font before its point size is usable as a row-height oracle.
+        let first_cell_xf = cell_xfs.first()?.as_ref()?;
+        if first_cell_xf.parent != Some(normal.xf_index) {
+            return None;
+        }
+        let normal_font_id = style_xf_font_ids.get(normal.xf_index).copied().flatten()?;
+        let first_font_id = cell_xf_font_ids.first().copied().flatten()?;
+        if normal_font_id != first_font_id {
+            return None;
+        }
+        let normal_points = exact_font_sizes.get(normal_font_id).copied().flatten()?;
+        let first_points = exact_font_sizes.get(first_font_id).copied().flatten()?;
+        (normal_points == first_points).then_some(normal_points)
+    })
+    .flatten();
+
+    VerifiedXlsbStyleProvenance {
+        normal_font_size_pt,
+        cell_xf_font_sizes_pt,
+    }
+}
+
 fn parse_styles(b: &[u8], theme: &XlsbTheme) -> Styles {
     let mut s = Styles::default();
     let mut r = RecReader::new(b);
@@ -1209,6 +1676,9 @@ fn parse_styles(b: &[u8], theme: &XlsbTheme) -> Styles {
         );
         s.cell_styles.push(style);
     }
+    let provenance = verified_xlsb_style_provenance(b, &s.fonts);
+    s.xlsb_normal_font_size_pt = provenance.normal_font_size_pt;
+    s.xlsb_cell_xf_font_sizes_pt = provenance.cell_xf_font_sizes_pt;
     s
 }
 
@@ -1643,6 +2113,12 @@ struct SheetReadMetadata {
     default_rows_hidden: bool,
     explicit_visible_rows: BTreeSet<u32>,
     rich: BTreeMap<(u32, u16), Vec<crate::TextRun>>,
+    /// Exact source font-size provenance parallel to `Sheet::cells`.
+    xlsb_cell_font_sizes_pt: Vec<Option<u16>>,
+    /// Exact source font-size provenance for retained row XF layers.
+    xlsb_row_font_sizes_pt: BTreeMap<u32, u16>,
+    /// Exact source font-size provenance for retained column XF layers.
+    xlsb_col_font_sizes_pt: BTreeMap<u16, u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -1942,6 +2418,7 @@ fn parse_sheet(
                     styles,
                     date1904,
                     &mut cells,
+                    &mut metadata.xlsb_cell_font_sizes_pt,
                     &mut metadata.rich,
                     budget,
                     sheet_names,
@@ -2042,7 +2519,13 @@ fn apply_row_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
         if let Some(style_index) = u32le(p, 4).and_then(|value| usize::try_from(value).ok()) {
             if let Some(style) = styles.cell_style(style_index) {
                 metadata.row_formats.insert(row, style.clone());
+                if let Some(points) = styles.xlsb_cell_font_size_pt(style_index) {
+                    metadata.xlsb_row_font_sizes_pt.insert(row, points);
+                } else {
+                    metadata.xlsb_row_font_sizes_pt.remove(&row);
+                }
             } else if styles.has_source_styles || style_index != 0 {
+                metadata.xlsb_row_font_sizes_pt.remove(&row);
                 add_style_loss(
                     &mut metadata.style_losses,
                     StyleLossKind::MissingReference,
@@ -2068,6 +2551,7 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
         return;
     }
     let column_style = styles.cell_style(style_index).cloned();
+    let column_font_size = styles.xlsb_cell_font_size_pt(style_index);
     if column_style.is_none() && (styles.has_source_styles || style_index != 0) {
         add_style_loss(
             &mut metadata.style_losses,
@@ -2092,6 +2576,11 @@ fn apply_col_outline(p: &[u8], metadata: &mut SheetReadMetadata, styles: &Styles
         }
         if let Some(style) = column_style.as_ref() {
             metadata.col_formats.insert(col, style.clone());
+            if let Some(points) = column_font_size {
+                metadata.xlsb_col_font_sizes_pt.insert(col, points);
+            } else {
+                metadata.xlsb_col_font_sizes_pt.remove(&col);
+            }
         }
     }
 }
@@ -3350,6 +3839,7 @@ fn decode_cell(
     styles: &Styles,
     date1904: bool,
     cells: &mut Vec<CellEntry>,
+    xlsb_cell_font_sizes_pt: &mut Vec<Option<u16>>,
     rich: &mut BTreeMap<(u32, u16), Vec<crate::TextRun>>,
     budget: &mut usize,
     sheet_names: &[String],
@@ -3369,7 +3859,7 @@ fn decode_cell(
         external_names,
         defined_names,
     };
-    let push = |cells: &mut Vec<CellEntry>, budget: &mut usize, value: Cell, text: String| {
+    let mut push = |cells: &mut Vec<CellEntry>, budget: &mut usize, value: Cell, text: String| {
         if text.len() > *budget {
             *budget = 0;
             return;
@@ -3386,8 +3876,9 @@ fn decode_cell(
             xlsx_font_size_pt: None,
             hyperlink: None,
         });
+        xlsb_cell_font_sizes_pt.push(styles.xlsb_cell_font_size_pt(style_idx));
     };
-    let number = |f: f64, cells: &mut Vec<CellEntry>, budget: &mut usize| {
+    let mut number = |f: f64, cells: &mut Vec<CellEntry>, budget: &mut usize| {
         let kind = styles.kind(style_idx);
         let display = styles.custom_format(style_idx).map_or_else(
             || format::render_indexed(f, styles.format_id(style_idx), date1904),
@@ -3591,6 +4082,62 @@ mod tests {
         let mut v = vec![0u8; 16];
         v[2..4].copy_from_slice(&numfmt.to_le_bytes());
         v
+    }
+
+    fn provenance_font(name: &str, height_twips: u16) -> Vec<u8> {
+        let mut font = vec![0_u8; 21];
+        font[0..2].copy_from_slice(&height_twips.to_le_bytes());
+        font[4..6].copy_from_slice(&400_u16.to_le_bytes());
+        font[20] = 2;
+        font.extend_from_slice(&wstr(name));
+        font
+    }
+
+    fn provenance_xf(parent: u16, font: u16, changed_groups: u16) -> Vec<u8> {
+        let mut xf = vec![0_u8; 16];
+        xf[0..2].copy_from_slice(&parent.to_le_bytes());
+        xf[4..6].copy_from_slice(&font.to_le_bytes());
+        xf[14..16].copy_from_slice(&changed_groups.to_le_bytes());
+        xf
+    }
+
+    fn provenance_style(xf_index: u32, flags: u16, builtin_id: u8, name: Option<&str>) -> Vec<u8> {
+        let mut style = xf_index.to_le_bytes().to_vec();
+        style.extend_from_slice(&flags.to_le_bytes());
+        style.push(builtin_id);
+        style.push(u8::MAX);
+        style.extend_from_slice(&name.map_or_else(null_wstr, wstr));
+        style
+    }
+
+    fn complete_provenance_styles_with_normal_name(
+        second_font_twips: u16,
+        normal_name: Option<&str>,
+    ) -> Vec<u8> {
+        let mut styles = rec(BRT_BEGIN_STYLE_SHEET, &[]);
+        styles.extend_from_slice(&rec(BRT_BEGIN_FONTS, &2_u32.to_le_bytes()));
+        styles.extend_from_slice(&rec(BRT_FONT, &provenance_font("Calibri", 220)));
+        styles.extend_from_slice(&rec(
+            BRT_FONT,
+            &provenance_font("Exact direct", second_font_twips),
+        ));
+        styles.extend_from_slice(&rec(BRT_END_FONTS, &[]));
+        styles.extend_from_slice(&rec(BRT_BEGIN_CELL_STYLE_XFS, &1_u32.to_le_bytes()));
+        styles.extend_from_slice(&rec(BRT_XF, &provenance_xf(u16::MAX, 0, 0)));
+        styles.extend_from_slice(&rec(BRT_END_CELL_STYLE_XFS, &[]));
+        styles.extend_from_slice(&rec(BRT_BEGIN_CELL_XFS, &2_u32.to_le_bytes()));
+        styles.extend_from_slice(&rec(BRT_XF, &provenance_xf(0, 0, 0)));
+        styles.extend_from_slice(&rec(BRT_XF, &provenance_xf(0, 1, 1 << 1)));
+        styles.extend_from_slice(&rec(BRT_END_CELL_XFS, &[]));
+        styles.extend_from_slice(&rec(BRT_BEGIN_STYLES, &1_u32.to_le_bytes()));
+        styles.extend_from_slice(&rec(BRT_STYLE, &provenance_style(0, 1, 0, normal_name)));
+        styles.extend_from_slice(&rec(BRT_END_STYLES, &[]));
+        styles.extend_from_slice(&rec(BRT_END_STYLE_SHEET, &[]));
+        styles
+    }
+
+    fn complete_provenance_styles(second_font_twips: u16) -> Vec<u8> {
+        complete_provenance_styles_with_normal_name(second_font_twips, Some("Normal"))
     }
 
     #[test]
@@ -4125,6 +4672,215 @@ mod tests {
         ] {
             assert_eq!(built_in_xlsb_num_fmt(id), Some(expected), "format {id}");
         }
+    }
+
+    #[test]
+    fn xlsb_font_provenance_requires_exact_complete_binary_sources() {
+        let exact = parse_styles(&complete_provenance_styles(280), &XlsbTheme::default());
+        assert_eq!(exact.xlsb_normal_font_size_pt, Some(11));
+        assert_eq!(exact.xlsb_cell_xf_font_sizes_pt, [Some(11), Some(14)]);
+
+        let nullable_normal = parse_styles(
+            &complete_provenance_styles_with_normal_name(280, None),
+            &XlsbTheme::default(),
+        );
+        assert_eq!(nullable_normal.xlsb_normal_font_size_pt, Some(11));
+        assert_eq!(
+            nullable_normal.xlsb_cell_xf_font_sizes_pt,
+            [Some(11), Some(14)]
+        );
+
+        let fractional = parse_styles(&complete_provenance_styles(270), &XlsbTheme::default());
+        assert_eq!(
+            fractional
+                .cell_styles
+                .get(1)
+                .and_then(|style| style.font.as_ref())
+                .and_then(|font| font.size_pt),
+            Some(14),
+            "the public style rounds 13.5pt and cannot prove the source"
+        );
+        assert_eq!(fractional.xlsb_normal_font_size_pt, Some(11));
+        assert_eq!(fractional.xlsb_cell_xf_font_sizes_pt, [Some(11), None]);
+
+        let mut missing_normal = complete_provenance_styles(280);
+        let normal = rec(BRT_STYLE, &provenance_style(0, 1, 0, Some("Normal")));
+        let offset = missing_normal
+            .windows(normal.len())
+            .position(|window| window == normal)
+            .expect("Normal style");
+        let custom = rec(BRT_STYLE, &provenance_style(0, 0, 0, Some("Custom")));
+        missing_normal[offset..offset + normal.len()].copy_from_slice(&custom);
+        let missing_normal = parse_styles(&missing_normal, &XlsbTheme::default());
+        assert_eq!(missing_normal.xlsb_normal_font_size_pt, None);
+        assert_eq!(
+            missing_normal.xlsb_cell_xf_font_sizes_pt,
+            [Some(11), Some(14)],
+            "cell-XF provenance is independent of the named Normal oracle"
+        );
+
+        let mut different_default_source = complete_provenance_styles(220);
+        let inherited = rec(BRT_XF, &provenance_xf(0, 0, 0));
+        let offset = different_default_source
+            .windows(inherited.len())
+            .position(|window| window == inherited)
+            .expect("first CellXF");
+        let direct = rec(BRT_XF, &provenance_xf(0, 1, 1 << 1));
+        different_default_source[offset..offset + inherited.len()].copy_from_slice(&direct);
+        let different_default_source =
+            parse_styles(&different_default_source, &XlsbTheme::default());
+        assert_eq!(
+            different_default_source.xlsb_normal_font_size_pt, None,
+            "equal point sizes from different source font records do not prove Normal"
+        );
+        assert_eq!(
+            different_default_source.xlsb_cell_xf_font_sizes_pt,
+            [Some(11), Some(11)]
+        );
+
+        for invalid_parent in [u16::MAX, 1] {
+            let mut invalid_cell_parent = complete_provenance_styles(280);
+            let direct = rec(BRT_XF, &provenance_xf(0, 1, 1 << 1));
+            let offset = invalid_cell_parent
+                .windows(direct.len())
+                .position(|window| window == direct)
+                .expect("direct CellXF");
+            let invalid = rec(BRT_XF, &provenance_xf(invalid_parent, 1, 1 << 1));
+            invalid_cell_parent[offset..offset + direct.len()].copy_from_slice(&invalid);
+            let invalid_cell_parent = parse_styles(&invalid_cell_parent, &XlsbTheme::default());
+            assert_eq!(invalid_cell_parent.xlsb_normal_font_size_pt, Some(11));
+            assert_eq!(
+                invalid_cell_parent.xlsb_cell_xf_font_sizes_pt,
+                [Some(11), None]
+            );
+        }
+
+        let mut count_mismatch = complete_provenance_styles(280);
+        let begin_fonts = rec(BRT_BEGIN_FONTS, &2_u32.to_le_bytes());
+        let offset = count_mismatch
+            .windows(begin_fonts.len())
+            .position(|window| window == begin_fonts)
+            .expect("font collection");
+        let replacement = rec(BRT_BEGIN_FONTS, &1_u32.to_le_bytes());
+        count_mismatch[offset..offset + begin_fonts.len()].copy_from_slice(&replacement);
+        let malformed = parse_styles(&count_mismatch, &XlsbTheme::default());
+        assert_eq!(malformed.xlsb_normal_font_size_pt, None);
+        assert!(malformed.xlsb_cell_xf_font_sizes_pt.is_empty());
+
+        let mut truncated = complete_provenance_styles(280);
+        truncated.pop();
+        let truncated = parse_styles(&truncated, &XlsbTheme::default());
+        assert_eq!(truncated.xlsb_normal_font_size_pt, None);
+        assert!(truncated.xlsb_cell_xf_font_sizes_pt.is_empty());
+    }
+
+    #[test]
+    fn xlsb_font_provenance_collection_counts_enforce_bounds() {
+        let count = |value: usize, max: usize| {
+            verified_xlsb_collection_count(&(value as u32).to_le_bytes(), max)
+        };
+
+        assert_eq!(count(1, MAX_XLSB_FONT_RECORDS), Some(1));
+        assert_eq!(
+            count(MAX_XLSB_FONT_RECORDS, MAX_XLSB_FONT_RECORDS),
+            Some(MAX_XLSB_FONT_RECORDS)
+        );
+        assert_eq!(count(0, MAX_XLSB_FONT_RECORDS), None);
+        assert_eq!(
+            count(MAX_XLSB_FONT_RECORDS + 1, MAX_XLSB_FONT_RECORDS),
+            None
+        );
+
+        assert_eq!(count(1, MAX_VERIFIED_XLSB_STYLE_RECORDS), Some(1));
+        assert_eq!(
+            count(
+                MAX_VERIFIED_XLSB_STYLE_RECORDS,
+                MAX_VERIFIED_XLSB_STYLE_RECORDS,
+            ),
+            Some(MAX_VERIFIED_XLSB_STYLE_RECORDS)
+        );
+        assert_eq!(count(0, MAX_VERIFIED_XLSB_STYLE_RECORDS), None);
+        assert_eq!(
+            count(
+                MAX_VERIFIED_XLSB_STYLE_RECORDS + 1,
+                MAX_VERIFIED_XLSB_STYLE_RECORDS,
+            ),
+            None
+        );
+        assert_eq!(
+            verified_xlsb_collection_count(&1_u16.to_le_bytes(), usize::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn xlsb_font_provenance_surfaces_per_cell_and_fails_closed_after_authoring() {
+        let mut workbook_record = vec![0_u8; 8];
+        workbook_record.extend_from_slice(&wstr("rId1"));
+        workbook_record.extend_from_slice(&wstr("Font provenance"));
+        let workbook_bin = rec(BRT_BUNDLE_SH, &workbook_record);
+
+        let mut column = Vec::new();
+        column.extend_from_slice(&0_u32.to_le_bytes());
+        column.extend_from_slice(&1_u32.to_le_bytes());
+        column.extend_from_slice(&(8_u32 * 256).to_le_bytes());
+        column.extend_from_slice(&0_u32.to_le_bytes());
+        column.extend_from_slice(&0_u16.to_le_bytes());
+        let mut sheet_bin = rec(BRT_COL_INFO, &column);
+        sheet_bin.extend_from_slice(&rec(BRT_ROW_HDR, &0_u32.to_le_bytes()));
+        for (col, style, text) in [(0_u32, 0_u32, "normal"), (1, 1, "direct")] {
+            let mut cell = col.to_le_bytes().to_vec();
+            cell.extend_from_slice(&style.to_le_bytes());
+            cell.extend_from_slice(&wstr(text));
+            sheet_bin.extend_from_slice(&rec(BRT_CELL_ST, &cell));
+        }
+        let relationships = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (name, body) in [
+            ("xl/workbook.bin", workbook_bin.as_slice()),
+            ("xl/_rels/workbook.bin.rels", relationships.as_bytes()),
+            ("xl/styles.bin", complete_provenance_styles(280).as_slice()),
+            ("xl/worksheets/sheet1.bin", sheet_bin.as_slice()),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+
+        let mut workbook = Workbook::open(&zip.finish().unwrap().into_inner()).unwrap();
+        let sheet = &mut workbook.sheets[0];
+        assert_eq!(sheet.verified_xlsb_normal_font_size_pt(), Some(11));
+        assert_eq!(sheet.verified_xlsb_cell_font_size_pt(0, 0), Some(11));
+        assert_eq!(sheet.verified_xlsb_cell_font_size_pt(0, 1), Some(14));
+        assert_eq!(sheet.verified_xlsx_normal_font_size_pt(), None);
+        assert_eq!(sheet.verified_xlsx_cell_font_size_pt(0, 0), None);
+
+        sheet.write_blank_styled(0, 0, &crate::CellStyle::new());
+        assert!(sheet.cell(0, 0).is_none());
+        assert_eq!(sheet.xlsb_cell_font_sizes_pt, [Some(14)]);
+        assert_eq!(
+            sheet.verified_xlsb_cell_font_size_pt(0, 1),
+            Some(14),
+            "blank authoring preserves aligned provenance for unrelated cells"
+        );
+
+        sheet.set_col_format(0, &crate::Format::new().set_font_size(20));
+        assert_eq!(
+            sheet.verified_xlsb_cell_font_size_pt(0, 0),
+            None,
+            "an authored column font invalidates its rounded source layer"
+        );
+        sheet.write(0, 0, "authored replacement");
+        assert_eq!(sheet.verified_xlsb_cell_font_size_pt(0, 0), None);
+        assert_eq!(
+            sheet.verified_xlsb_cell_font_size_pt(0, 1),
+            Some(14),
+            "unrelated retained cells keep their source provenance"
+        );
+        sheet.set_default_format(&crate::Format::new().set_font_size(20));
+        assert_eq!(sheet.verified_xlsb_normal_font_size_pt(), None);
+        assert_eq!(sheet.verified_xlsb_cell_font_size_pt(0, 1), None);
     }
 
     #[test]
@@ -5943,6 +6699,7 @@ mod tests {
         p.extend_from_slice(&rgce);
         p.extend_from_slice(&0u32.to_le_bytes()); // cb
         let mut cells = Vec::new();
+        let mut font_sizes = Vec::new();
         let mut rich = BTreeMap::new();
         let mut budget = crate::MAX_TEXT_BYTES;
         decode_cell(
@@ -5955,6 +6712,7 @@ mod tests {
             &Styles::default(),
             false,
             &mut cells,
+            &mut font_sizes,
             &mut rich,
             &mut budget,
             &[],
@@ -6117,6 +6875,7 @@ mod tests {
         p.extend_from_slice(&0u32.to_le_bytes());
 
         let mut cells = Vec::new();
+        let mut font_sizes = Vec::new();
         let mut rich = BTreeMap::new();
         let mut budget = crate::MAX_TEXT_BYTES;
         decode_cell(
@@ -6129,6 +6888,7 @@ mod tests {
             &Styles::default(),
             false,
             &mut cells,
+            &mut font_sizes,
             &mut rich,
             &mut budget,
             &[],
@@ -6168,6 +6928,7 @@ mod tests {
             last_sheet: 1,
         }];
         let mut cells = Vec::new();
+        let mut font_sizes = Vec::new();
         let mut rich = BTreeMap::new();
         let mut budget = crate::MAX_TEXT_BYTES;
         decode_cell(
@@ -6180,6 +6941,7 @@ mod tests {
             &Styles::default(),
             false,
             &mut cells,
+            &mut font_sizes,
             &mut rich,
             &mut budget,
             &sheet_names,

@@ -4232,11 +4232,92 @@ Page    2 CropBox: 0 0 841.125 595.0625
             outside_precision,
             outside_precision,
         )
+        aggregate = MODULE._aggregate_pdf_point_geometry([page])
+        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 0)
         self.assertEqual(
-            MODULE._aggregate_pdf_point_geometry([page])[
-                "pdf_point_geometry_mismatches"
-            ],
-            1,
+            aggregate["max_pdf_xhtml_crosscheck_delta_micropoints"],
+            2_000,
+        )
+
+    def test_cross_document_xhtml_size_is_a_bounded_crosscheck(self) -> None:
+        geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.276"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+        )
+        row = {"point_geometry": MODULE._pdf_geometry_evidence(geometry)}
+        libreoffice_page = MODULE.PdfTextPage(
+            MODULE.Fraction("841.889648"),
+            MODULE.Fraction("595.275879"),
+            (),
+            (),
+        )
+        rxls_page = MODULE.PdfTextPage(
+            MODULE.Fraction("841.890013"),
+            MODULE.Fraction("595.275879"),
+            (),
+            (),
+        )
+        page = MODULE.pdf_point_geometry_metrics(
+            row,
+            row,
+            rxls_page,
+            libreoffice_page,
+        )
+        aggregate = MODULE._aggregate_pdf_point_geometry([page])
+        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 0)
+        self.assertEqual(
+            aggregate["max_pdf_point_geometry_delta_millipoints"], 0
+        )
+        self.assertEqual(
+            aggregate["max_pdf_xhtml_crosscheck_delta_micropoints"],
+            365,
+        )
+
+    def test_sub_millipoint_page_box_delta_remains_exact_mismatch(self) -> None:
+        libreoffice_geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.276"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+        )
+        rxls_geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.276"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+            MODULE.Fraction("841.8901"),
+            MODULE.Fraction("595.28"),
+        )
+        libreoffice_row = {
+            "point_geometry": MODULE._pdf_geometry_evidence(
+                libreoffice_geometry
+            )
+        }
+        rxls_row = {
+            "point_geometry": MODULE._pdf_geometry_evidence(rxls_geometry)
+        }
+        text_page = MODULE.PdfTextPage(
+            MODULE.Fraction("841.889648"),
+            MODULE.Fraction("595.275879"),
+            (),
+            (),
+        )
+        page = MODULE.pdf_point_geometry_metrics(
+            rxls_row,
+            libreoffice_row,
+            text_page,
+            text_page,
+        )
+        aggregate = MODULE._aggregate_pdf_point_geometry([page])
+        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 1)
+        self.assertEqual(
+            aggregate["max_pdf_point_geometry_delta_millipoints"], 1
         )
 
     def test_svg_glyph_path_bounds_include_exact_curve_extrema(self) -> None:
@@ -4978,8 +5059,8 @@ Page    2 CropBox: 0 0 841.125 595.0625
             cases, discovery = MODULE.discover_manifest(
                 manifest,
                 max_manifest_bytes=256 * 1024,
-                max_candidates=24,
-                max_files=24,
+                max_candidates=34,
+                max_files=34,
             )
             filtered, discovery = MODULE.filter_cases(
                 cases,
@@ -4992,14 +5073,14 @@ Page    2 CropBox: 0 0 841.125 595.0625
                 discovery,
                 shard_count=1,
                 shard_index=0,
-                max_files=24,
+                max_files=34,
             )
             binding = MODULE.build_manifest_binding(
                 manifest,
                 selected,
                 max_manifest_bytes=256 * 1024,
             )
-        self.assertEqual(len(selected), 24)
+        self.assertEqual(len(selected), 34)
         self.assertTrue(
             all(
                 case.path.suffix == ".xlsx"
@@ -5010,19 +5091,19 @@ Page    2 CropBox: 0 0 841.125 595.0625
         self.assertEqual(
             discovery,
             {
-                "candidate_count": 24,
-                "pre_shard_selected_count": 24,
-                "selected_count": 24,
-                "shard_candidate_count": 24,
+                "candidate_count": 34,
+                "pre_shard_selected_count": 34,
+                "selected_count": 34,
+                "shard_candidate_count": 34,
                 "shard_count": 1,
                 "shard_index": 0,
                 "truncated": False,
             },
         )
-        self.assertEqual(binding["selected_case_count"], 24)
+        self.assertEqual(binding["selected_case_count"], 34)
         self.assertEqual(
             binding["manifest_sha256"],
-            "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef",
+            "088db320a0d35494fa8e0a8c33ba95e12a824cfe1b7163c2071cf70528c5d0a2",
         )
 
     def test_each_case_workspace_is_removed_before_the_next_case(self) -> None:

@@ -71,6 +71,7 @@ def _geometry_page(
     *,
     crop_height_delta: Fraction = Fraction(),
     crop_width_delta: Fraction = Fraction(),
+    xhtml_cross_document_width_delta: Fraction = Fraction(),
     xhtml_internal_width_delta: Fraction = Fraction(),
 ) -> dict[str, object]:
     width = Fraction(600)
@@ -100,13 +101,19 @@ def _geometry_page(
         crop_height=height + crop_height_delta,
         crop_width=width + crop_width_delta,
     )
-    xhtml_width = width + xhtml_internal_width_delta
+    libreoffice_xhtml_width = width + xhtml_internal_width_delta
+    rxls_xhtml_width = (
+        libreoffice_xhtml_width + xhtml_cross_document_width_delta
+    )
     xhtml = {
-        name: {
+        "libreoffice": {
             "height_points": _point_text(height),
-            "width_points": _point_text(xhtml_width),
-        }
-        for name in ("libreoffice", "rxls")
+            "width_points": _point_text(libreoffice_xhtml_width),
+        },
+        "rxls": {
+            "height_points": _point_text(height),
+            "width_points": _point_text(rxls_xhtml_width),
+        },
     }
     deltas = {
         "crop_box_height": crop_height_delta,
@@ -116,9 +123,12 @@ def _geometry_page(
         "media_box_height": Fraction(),
         "media_box_width": Fraction(),
         "rxls_xhtml_page_size_height": Fraction(),
-        "rxls_xhtml_page_size_width": xhtml_internal_width_delta,
+        "rxls_xhtml_page_size_width": (
+            xhtml_internal_width_delta
+            + xhtml_cross_document_width_delta
+        ),
         "xhtml_height": Fraction(),
-        "xhtml_width": Fraction(),
+        "xhtml_width": xhtml_cross_document_width_delta,
     }
     page = {
         "pdf_point_geometry": {
@@ -244,10 +254,6 @@ def _with_geometry(
     ]
     mismatch_pages = sum(
         any(values[key] != 0 for key in direct)
-        or any(
-            abs(values[key]) > Fraction(1, 1000)
-            for key in crosscheck
-        )
         for values in parsed
     )
     direct_max = max(
@@ -1383,7 +1389,7 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         geometry = summary["reports"][1]["geometry"]
         self.assertEqual(geometry["workbooks"], 3)
         self.assertEqual(geometry["pages"], 3)
-        self.assertEqual(geometry["mismatch_pages"], 2)
+        self.assertEqual(geometry["mismatch_pages"], 1)
         self.assertEqual(
             geometry["max_direct_absolute_delta_micropoints"],
             500_000,
@@ -1429,6 +1435,63 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             "deltas_points",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_cross_document_xhtml_noise_is_separate_from_box_mismatches(
+        self,
+    ) -> None:
+        rows = _pilot_rows()
+        for index, row in enumerate(rows):
+            if index not in {1, 2}:
+                _as_premeasurement_error(row)
+        _with_geometry(
+            rows[1],
+            [
+                _geometry_page(
+                    xhtml_cross_document_width_delta=Fraction(
+                        365, 1_000_000
+                    )
+                )
+            ],
+        )
+        _with_geometry(
+            rows[2],
+            [
+                _geometry_page(
+                    xhtml_cross_document_width_delta=Fraction(
+                        1001, 1_000_000
+                    )
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(rows, profile="pilot", label="parity-a"),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+            )
+
+        geometry = summary["reports"][1]["geometry"]
+        self.assertEqual(geometry["mismatch_pages"], 0)
+        self.assertEqual(
+            geometry["max_direct_absolute_delta_micropoints"], 0
+        )
+        self.assertEqual(
+            geometry["max_internal_xhtml_crosscheck_micropoints"],
+            1_001,
+        )
+        self.assertEqual(
+            geometry["by_delta"]["xhtml_width"],
+            {
+                "max_absolute_micropoints": 1_001,
+                "nonzero_pages": 2,
+            },
+        )
 
     def test_page_box_geometry_is_signed_and_grouped_by_reviewed_cohorts(
         self,
@@ -3135,23 +3198,33 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
         automatic_features = (
             "auto-bold-font",
             "auto-bold-font-wrapped",
+            "auto-heading-western-asian",
+            "auto-heading-western-complex",
             "auto-large-font",
             "auto-long-unwrapped",
+            "auto-numeric-color-conditional",
+            "auto-numeric-no-conditional",
+            "auto-wrapped-color-conditional",
             "auto-wrapped-explicit",
             "auto-wrapped-hidden",
             "auto-wrapped-image",
             "auto-wrapped-long",
             "auto-wrapped-long-anchor",
             "auto-wrapped-merged",
+            "auto-wrapped-no-conditional",
             "auto-wrapped-rtl",
             "auto-wrapped-wide",
+            "hidden-heading-western-asian",
+            "hidden-heading-western-complex",
+            "manual-heading-western-asian",
+            "manual-heading-western-complex",
         )
-        for index in range(24):
+        for index in range(34):
             features = {
-                "normal-font-noto" if index < 20 else "normal-font-carlito",
-                "normal-size-11" if index < 20 else "normal-size-12",
+                "normal-font-noto" if index < 30 else "normal-font-carlito",
+                "normal-size-11" if index < 30 else "normal-size-12",
                 "ooxml-implicit-row",
-                "sheet-format-missing" if index < 20 else "sheet-format-present",
+                "sheet-format-missing" if index < 30 else "sheet-format-present",
             }
             if index == 4:
                 features.add("explicit-row-height")
@@ -3189,10 +3262,10 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
 
         self.assertEqual(summary["schema"], MODULE.OUTPUT_SCHEMA)
         self.assertEqual(summary["profile"], "ooxml-row-diagnostic")
-        self.assertEqual(summary["reports"][1]["workbooks"], 24)
+        self.assertEqual(summary["reports"][1]["workbooks"], 34)
         self.assertEqual(
             summary["reports"][1]["by_classification"],
-            {"measurement_geometry_stage": 1, "within_threshold": 23},
+            {"measurement_geometry_stage": 1, "within_threshold": 33},
         )
         self.assertTrue(
             MODULE.DIAGNOSTIC_FEATURES.issubset(

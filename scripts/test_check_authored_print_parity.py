@@ -70,6 +70,8 @@ def point_geometry(
     *,
     rxls_width: str = "612/1",
     libreoffice_width: str = "612/1",
+    rxls_xhtml_width: str | None = None,
+    libreoffice_xhtml_width: str | None = None,
 ) -> dict[str, object]:
     def side(width: str) -> dict[str, object]:
         dimensions = {"height_points": "792/1", "width_points": width}
@@ -79,32 +81,52 @@ def point_geometry(
             "page_size": dict(dimensions),
         }
 
-    delta = MODULE._point(
+    rxls_box = MODULE._point(
         rxls_width, "fixture", positive=True
-    ) - MODULE._point(libreoffice_width, "fixture", positive=True)
+    )
+    libreoffice_box = MODULE._point(
+        libreoffice_width, "fixture", positive=True
+    )
+    rxls_xhtml = MODULE._point(
+        rxls_xhtml_width or rxls_width, "fixture", positive=True
+    )
+    libreoffice_xhtml = MODULE._point(
+        libreoffice_xhtml_width or libreoffice_width,
+        "fixture",
+        positive=True,
+    )
+
+    def point_text(value: MODULE.Fraction) -> str:
+        return f"{value.numerator}/{value.denominator}"
+
+    box_delta = point_text(rxls_box - libreoffice_box)
     return {
         "deltas_points": {
             "crop_box_height": "0/1",
-            "crop_box_width": f"{delta.numerator}/{delta.denominator}",
+            "crop_box_width": box_delta,
             "libreoffice_xhtml_page_size_height": "0/1",
-            "libreoffice_xhtml_page_size_width": "0/1",
+            "libreoffice_xhtml_page_size_width": point_text(
+                libreoffice_xhtml - libreoffice_box
+            ),
             "media_box_height": "0/1",
-            "media_box_width": f"{delta.numerator}/{delta.denominator}",
+            "media_box_width": box_delta,
             "rxls_xhtml_page_size_height": "0/1",
-            "rxls_xhtml_page_size_width": "0/1",
+            "rxls_xhtml_page_size_width": point_text(
+                rxls_xhtml - rxls_box
+            ),
             "xhtml_height": "0/1",
-            "xhtml_width": f"{delta.numerator}/{delta.denominator}",
+            "xhtml_width": point_text(rxls_xhtml - libreoffice_xhtml),
         },
         "libreoffice": side(libreoffice_width),
         "rxls": side(rxls_width),
         "xhtml": {
             "libreoffice": {
                 "height_points": "792/1",
-                "width_points": libreoffice_width,
+                "width_points": point_text(libreoffice_xhtml),
             },
             "rxls": {
                 "height_points": "792/1",
-                "width_points": rxls_width,
+                "width_points": point_text(rxls_xhtml),
             },
         },
     }
@@ -713,6 +735,9 @@ class AuthoredPrintGateTests(unittest.TestCase):
         report["files"][0]["metrics"][
             "max_pdf_point_geometry_delta_millipoints"
         ] = 6_000
+        report["files"][0]["metrics"][
+            "max_pdf_xhtml_crosscheck_delta_micropoints"
+        ] = 6_000_000
         result = MODULE.evaluate(
             report,
             report_sha256="a" * 64,
@@ -747,6 +772,9 @@ class AuthoredPrintGateTests(unittest.TestCase):
         report["files"][0]["metrics"][
             "max_pdf_point_geometry_delta_millipoints"
         ] = 100
+        report["files"][0]["metrics"][
+            "max_pdf_xhtml_crosscheck_delta_micropoints"
+        ] = 100_000
         result = MODULE.evaluate(
             report,
             report_sha256="a" * 64,
@@ -756,6 +784,88 @@ class AuthoredPrintGateTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("pdf_point_geometry_mismatch", result["failures"])
         self.assertNotIn("raster_page_box_mismatch", result["failures"])
+
+    def test_cross_document_xhtml_delta_is_a_bounded_crosscheck(self) -> None:
+        report = report_document()
+        report["files"][0]["pages"][0]["pdf_point_geometry"] = point_geometry(
+            rxls_xhtml_width="612000365/1000000"
+        )
+        report["files"][0]["metrics"][
+            "max_pdf_xhtml_crosscheck_delta_micropoints"
+        ] = 365
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertTrue(result["passed"])
+        self.assertNotIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertNotIn(
+            "pdf_xhtml_crosscheck_above_tolerance",
+            result["failures"],
+        )
+        self.assertEqual(
+            result["metrics"]["pdf_point_geometry_mismatches"], 0
+        )
+        self.assertEqual(
+            result["metrics"]["pdf_xhtml_crosscheck_max_micropoints"],
+            365,
+        )
+
+        report["files"][0]["pages"][0]["pdf_point_geometry"] = point_geometry(
+            rxls_xhtml_width="612001001/1000000"
+        )
+        report["files"][0]["metrics"][
+            "max_pdf_xhtml_crosscheck_delta_micropoints"
+        ] = 1_001
+        result = MODULE.evaluate(
+            report,
+            report_sha256="a" * 64,
+            report_bytes=1234,
+            expected_workbooks=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertNotIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertIn(
+            "pdf_xhtml_crosscheck_above_tolerance",
+            result["failures"],
+        )
+        self.assertEqual(
+            result["metrics"]["pdf_point_geometry_mismatches"], 0
+        )
+
+    def test_xhtml_crosscheck_schema_and_delta_identity_are_fail_closed(
+        self,
+    ) -> None:
+        for mutation, code in (
+            (
+                lambda point: point["deltas_points"].pop("xhtml_width"),
+                "page_point_geometry",
+            ),
+            (
+                lambda point: point["deltas_points"].update(
+                    {"xhtml_width": "0/1"}
+                ),
+                "page_point_geometry_delta",
+            ),
+        ):
+            with self.subTest(code=code):
+                report = report_document()
+                point = point_geometry(
+                    rxls_xhtml_width="612000365/1000000"
+                )
+                mutation(point)
+                report["files"][0]["pages"][0][
+                    "pdf_point_geometry"
+                ] = point
+                with self.assertRaisesRegex(MODULE.GateError, code):
+                    MODULE.evaluate(
+                        report,
+                        report_sha256="a" * 64,
+                        report_bytes=1234,
+                        expected_workbooks=2,
+                    )
 
     def test_correct_page_count_cannot_hide_bad_visual_or_text_placement(self) -> None:
         report = report_document()

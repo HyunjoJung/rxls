@@ -90,8 +90,6 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
         "crop_box_width",
         "media_box_height",
         "media_box_width",
-        "xhtml_height",
-        "xhtml_width",
     }
 )
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
@@ -416,7 +414,11 @@ def _point_side(value: object, code: str) -> dict[str, tuple[Fraction, Fraction]
     return result
 
 
-def _page_point_geometry(page: dict[str, Any]) -> tuple[int, int, bool]:
+def _page_point_geometry(
+    page: dict[str, Any],
+) -> tuple[int, int, bool, bool]:
+    """Return exact PDF-box and bounded XHTML results independently."""
+
     evidence = page.get("pdf_point_geometry")
     if not isinstance(evidence, dict) or set(evidence) != {
         "deltas_points",
@@ -498,9 +500,8 @@ def _page_point_geometry(page: dict[str, Any]) -> tuple[int, int, bool]:
     return (
         max_millipoints,
         max_crosscheck_micropoints,
-        renderer_expected
-        and max_direct_delta == 0
-        and max_crosscheck_delta <= PDF_XHTML_CROSSCHECK_MAX_POINTS,
+        renderer_expected and max_direct_delta == 0,
+        max_crosscheck_delta <= PDF_XHTML_CROSSCHECK_MAX_POINTS,
     )
 
 
@@ -1422,6 +1423,7 @@ def evaluate(
                 point_error,
                 crosscheck_error,
                 exact_point_geometry,
+                exact_xhtml_crosscheck,
             ) = _page_point_geometry(page)
             page_errors.append(point_error)
             file_point_max = max(file_point_max, point_error)
@@ -1431,6 +1433,8 @@ def evaluate(
             file_point_mismatches += int(not exact_point_geometry)
             if not exact_point_geometry:
                 failures.add("pdf_point_geometry_mismatch")
+            if not exact_xhtml_crosscheck:
+                failures.add("pdf_xhtml_crosscheck_above_tolerance")
         point_geometry_mismatches += file_point_mismatches
         xhtml_crosscheck_max_micropoints = max(
             xhtml_crosscheck_max_micropoints,

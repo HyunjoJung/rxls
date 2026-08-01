@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Generate the deterministic project-owned OOXML row-height oracle matrix.
 
-The 24 XLSX workbooks in this diagnostic corpus are intentionally separate from
-the pilot/full render corpus. Twelve preserve the accepted implicit-row
-baseline; twelve paired automatic-height cases isolate wrapping, font, row,
-merge, RTL, width, and drawing-anchor effects without changing the release
-lattice or its reviewed hashes. Generated files remain local-only below
-``local/render-corpus-generated``.
+The 34 XLSX workbooks in this diagnostic corpus are intentionally separate from
+the pilot/full render corpus. The matrix preserves the accepted implicit-row
+baseline, retains the single-cell automatic-height probes, and adds bounded
+multi-cell heading and color-only conditional-format controls without changing
+the release lattice or its reviewed hashes. Generated files remain local-only
+below ``local/render-corpus-generated``.
 """
 
 from __future__ import annotations
@@ -35,13 +35,13 @@ MANIFEST_NAME = "manifest.json"
 SCHEMA_VERSION = 1
 PROFILE = "ooxml-row-diagnostic"
 GENERATOR = "rxls-ooxml-row-diagnostic"
-GENERATOR_VERSION = "1.1.0"
+GENERATOR_VERSION = "1.2.0"
 LICENSE = "MIT"
 REDISTRIBUTION = "allowed"
 RIGHTS_TIER = "S"
 
 DOS_EPOCH = (1980, 1, 1, 0, 0, 0)
-MAX_CASES = 24
+MAX_CASES = 34
 MAX_CASE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 3 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
@@ -75,6 +75,47 @@ AUTOHEIGHT_TOGGLES = (
     "auto-wrapped-image",
     "auto-wrapped-long-anchor",
 )
+MULTICELL_TOGGLES = (
+    "auto-heading-western-asian",
+    "manual-heading-western-asian",
+    "hidden-heading-western-asian",
+    "auto-heading-western-complex",
+    "manual-heading-western-complex",
+    "hidden-heading-western-complex",
+    "auto-numeric-color-conditional",
+    "auto-numeric-no-conditional",
+    "auto-wrapped-color-conditional",
+    "auto-wrapped-no-conditional",
+)
+HEADING_TOGGLES = frozenset(MULTICELL_TOGGLES[:6])
+HEADING_MANUAL_TOGGLES = frozenset(
+    {
+        "manual-heading-western-asian",
+        "manual-heading-western-complex",
+    }
+)
+HEADING_HIDDEN_TOGGLES = frozenset(
+    {
+        "hidden-heading-western-asian",
+        "hidden-heading-western-complex",
+    }
+)
+HEADING_ASIAN_TOGGLES = frozenset(
+    toggle for toggle in HEADING_TOGGLES if toggle.endswith("western-asian")
+)
+CONDITIONAL_MATRIX_TOGGLES = frozenset(MULTICELL_TOGGLES[6:])
+COLOR_CONDITIONAL_TOGGLES = frozenset(
+    {
+        "auto-numeric-color-conditional",
+        "auto-wrapped-color-conditional",
+    }
+)
+MULTICELL_WRAPPED_TOGGLES = frozenset(
+    {
+        "auto-wrapped-color-conditional",
+        "auto-wrapped-no-conditional",
+    }
+)
 WRAPPED_TOGGLES = frozenset(
     {
         "auto-wrapped-long",
@@ -86,10 +127,15 @@ WRAPPED_TOGGLES = frozenset(
         "auto-wrapped-rtl",
         "auto-wrapped-image",
         "auto-wrapped-long-anchor",
+        *MULTICELL_WRAPPED_TOGGLES,
     }
 )
 BOLD_FONT_TOGGLES = frozenset(
-    {"auto-bold-font", "auto-bold-font-wrapped"}
+    {
+        "auto-bold-font",
+        "auto-bold-font-wrapped",
+        *HEADING_TOGGLES,
+    }
 )
 LARGE_FONT_TOGGLES = frozenset(
     {"auto-large-font"}
@@ -105,6 +151,18 @@ LONG_AUTO_TEXT = (
     "한국어 자동 줄바꿈 English 日本語 中文 0123456789 "
     "한국어 자동 줄바꿈 English 日本語 中文 0123456789 "
     "한국어 자동 줄바꿈 English 日本語 中文 0123456789"
+)
+WESTERN_ASIAN_HEADING = (
+    "Project review",
+    "한국어 검토",
+    "日本語確認",
+    "中文复核",
+)
+WESTERN_COMPLEX_HEADING = (
+    "Project review",
+    "مراجعة عربية",
+    "Status check",
+    "2026",
 )
 
 
@@ -186,7 +244,17 @@ def _matrix() -> tuple[CaseSpec, ...]:
         )
         for toggle in AUTOHEIGHT_TOGGLES
     )
-    specs = core + stress + autoheight
+    multicell = tuple(
+        CaseSpec(
+            case_id=f"row-missing-noto-11-{toggle}",
+            sheet_format_present=False,
+            font_family="Noto Sans CJK KR",
+            font_size=11,
+            toggle=toggle,
+        )
+        for toggle in MULTICELL_TOGGLES
+    )
+    specs = core + stress + autoheight + multicell
     if len(specs) != MAX_CASES or len({spec.case_id for spec in specs}) != MAX_CASES:
         raise OracleCorpusError("diagnostic matrix identity")
     return specs
@@ -308,6 +376,7 @@ def _styles(spec: CaseSpec) -> str:
     styled_font = bold_font or large_font
     secondary_size = 14 if large_font else size
     secondary_weight = "<b/>" if bold_font else ""
+    color_differential = spec.toggle in CONDITIONAL_MATRIX_TOGGLES
     fonts = (
         f'<fonts count="2"><font><sz val="{size}"/><name val="{family}"/>'
         f'<family val="2"/></font><font>{secondary_weight}'
@@ -338,6 +407,11 @@ def _styles(spec: CaseSpec) -> str:
             '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" '
             'borderId="0" xfId="0"/></cellXfs>'
         )
+    differentials_line = (
+        '  <dxfs count="1"><dxf><font><color rgb="FF9C0006"/></font></dxf></dxfs>\n'
+        if color_differential
+        else ""
+    )
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="{SHEET_NS}">
   {fonts}
@@ -346,7 +420,7 @@ def _styles(spec: CaseSpec) -> str:
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
   {cell_xfs}
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
-</styleSheet>
+{differentials_line}</styleSheet>
 """
 
 
@@ -389,10 +463,48 @@ def _worksheet(spec: CaseSpec) -> str:
     )
     columns_line = f"  {columns}\n" if columns else ""
     row_four = ""
+    conditional = ""
     if spec.toggle == "explicit-row-height":
         row_four = '<row r="4" ht="21" customHeight="1"/>'
     elif spec.toggle == "hidden-row":
         row_four = '<row r="4" hidden="1"/>'
+    elif spec.toggle in HEADING_TOGGLES:
+        texts = (
+            WESTERN_ASIAN_HEADING
+            if spec.toggle in HEADING_ASIAN_TOGGLES
+            else WESTERN_COMPLEX_HEADING
+        )
+        row_attributes = ""
+        if spec.toggle in HEADING_MANUAL_TOGGLES:
+            row_attributes = ' ht="30" customHeight="1"'
+        elif spec.toggle in HEADING_HIDDEN_TOGGLES:
+            row_attributes = ' hidden="1"'
+        cells = "".join(
+            f'<c r="{column}4" s="1" t="inlineStr"><is><t>{escape(text)}</t></is></c>'
+            for column, text in zip("ABCD", texts, strict=True)
+        )
+        row_four = f'<row r="4"{row_attributes}>{cells}</row>'
+    elif spec.toggle in CONDITIONAL_MATRIX_TOGGLES:
+        if spec.toggle in MULTICELL_WRAPPED_TOGGLES:
+            row_four = (
+                '<row r="4">'
+                f'<c r="A4" s="1" t="inlineStr"><is><t>{escape(LONG_AUTO_TEXT)}</t></is></c>'
+                '<c r="B4"><v>2</v></c><c r="C4"><v>3</v></c>'
+                '<c r="D4"><v>4</v></c></row>'
+            )
+            conditional_range = "B4:D4"
+        else:
+            row_four = (
+                '<row r="4"><c r="A4"><v>1</v></c><c r="B4"><v>2</v></c>'
+                '<c r="C4"><v>3</v></c><c r="D4"><v>4</v></c></row>'
+            )
+            conditional_range = "A4:D4"
+        if spec.toggle in COLOR_CONDITIONAL_TOGGLES:
+            conditional = (
+                f'<conditionalFormatting sqref="{conditional_range}">'
+                '<cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan">'
+                '<formula>0</formula></cfRule></conditionalFormatting>'
+            )
     elif spec.toggle in AUTOHEIGHT_TOGGLES:
         text = (
             "Bold automatic row"
@@ -423,9 +535,10 @@ def _worksheet(spec: CaseSpec) -> str:
         if spec.toggle in DRAWING_TOGGLES
         else ""
     )
+    dimension = "A1:D8" if spec.toggle in MULTICELL_TOGGLES else "A1:B8"
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="{SHEET_NS}" xmlns:r="{REL_NS}">
-  <dimension ref="A1:B8"/>
+  <dimension ref="{dimension}"/>
   <sheetViews><sheetView workbookViewId="0" showGridLines="1"{right_to_left}/></sheetViews>
   {sheet_format}
 {columns_line}\
@@ -434,7 +547,7 @@ def _worksheet(spec: CaseSpec) -> str:
     {row_four}
     <row r="8"><c r="B8"><v>1</v></c></row>
   </sheetData>
-  {merge_cells}{drawing}
+  {merge_cells}{conditional}{drawing}
 </worksheet>
 """
 
@@ -676,12 +789,150 @@ def _validate_package(spec: CaseSpec, payload: bytes) -> None:
             )
         ):
             raise OracleCorpusError("automatic row style contract")
+    differential_container = styles.find("s:dxfs", namespace)
+    differential_formats = styles.findall("s:dxfs/s:dxf", namespace)
+    if spec.toggle in CONDITIONAL_MATRIX_TOGGLES:
+        differential = (
+            differential_formats[0]
+            if len(differential_formats) == 1
+            else None
+        )
+        font = (
+            differential.find("s:font", namespace)
+            if differential is not None
+            else None
+        )
+        color = (
+            font.find("s:color", namespace)
+            if font is not None
+            else None
+        )
+        if (
+            color is None
+            or color.attrib != {"rgb": "FF9C0006"}
+            or differential_container is None
+            or differential_container.attrib != {"count": "1"}
+            or len(differential) != 1
+            or len(font) != 1
+        ):
+            raise OracleCorpusError("conditional color style contract")
+    elif differential_container is not None or differential_formats:
+        raise OracleCorpusError("unexpected differential format")
     row_four = sheet.find("s:sheetData/s:row[@r='4']", namespace)
     expected_row = {
         "explicit-row-height": {"customHeight": "1", "ht": "21", "r": "4"},
         "hidden-row": {"hidden": "1", "r": "4"},
     }.get(spec.toggle)
-    if spec.toggle in AUTOHEIGHT_TOGGLES:
+    if spec.toggle in HEADING_TOGGLES:
+        expected_row = {"r": "4"}
+        if spec.toggle in HEADING_MANUAL_TOGGLES:
+            expected_row.update({"customHeight": "1", "ht": "30"})
+        elif spec.toggle in HEADING_HIDDEN_TOGGLES:
+            expected_row["hidden"] = "1"
+        expected_texts = (
+            WESTERN_ASIAN_HEADING
+            if spec.toggle in HEADING_ASIAN_TOGGLES
+            else WESTERN_COMPLEX_HEADING
+        )
+        cells = (
+            row_four.findall("s:c", namespace)
+            if row_four is not None
+            else []
+        )
+        observed_texts = tuple(
+            cell.find("s:is/s:t", namespace).text
+            if cell.find("s:is/s:t", namespace) is not None
+            else None
+            for cell in cells
+        )
+        if (
+            row_four is None
+            or row_four.attrib != expected_row
+            or [cell.attrib for cell in cells]
+            != [
+                {"r": f"{column}4", "s": "1", "t": "inlineStr"}
+                for column in "ABCD"
+            ]
+            or observed_texts != expected_texts
+        ):
+            raise OracleCorpusError("multi-cell heading contract")
+    elif spec.toggle in CONDITIONAL_MATRIX_TOGGLES:
+        cells = (
+            row_four.findall("s:c", namespace)
+            if row_four is not None
+            else []
+        )
+        if (
+            row_four is None
+            or row_four.attrib != {"r": "4"}
+            or [cell.attrib.get("r") for cell in cells]
+            != [f"{column}4" for column in "ABCD"]
+        ):
+            raise OracleCorpusError("conditional row contract")
+        if spec.toggle in MULTICELL_WRAPPED_TOGGLES:
+            text = cells[0].find("s:is/s:t", namespace)
+            numeric_values = tuple(
+                cell.find("s:v", namespace).text
+                if cell.find("s:v", namespace) is not None
+                else None
+                for cell in cells[1:]
+            )
+            if (
+                cells[0].attrib
+                != {"r": "A4", "s": "1", "t": "inlineStr"}
+                or text is None
+                or text.text != LONG_AUTO_TEXT
+                or any(set(cell.attrib) != {"r"} for cell in cells[1:])
+                or numeric_values != ("2", "3", "4")
+            ):
+                raise OracleCorpusError("conditional wrapped row contract")
+        else:
+            numeric_values = tuple(
+                cell.find("s:v", namespace).text
+                if cell.find("s:v", namespace) is not None
+                else None
+                for cell in cells
+            )
+            if (
+                any(set(cell.attrib) != {"r"} for cell in cells)
+                or numeric_values != ("1", "2", "3", "4")
+            ):
+                raise OracleCorpusError("conditional numeric row contract")
+        conditional = sheet.find("s:conditionalFormatting", namespace)
+        if spec.toggle in COLOR_CONDITIONAL_TOGGLES:
+            rule = (
+                conditional.find("s:cfRule", namespace)
+                if conditional is not None
+                else None
+            )
+            formula = (
+                rule.find("s:formula", namespace)
+                if rule is not None
+                else None
+            )
+            expected_range = (
+                "B4:D4"
+                if spec.toggle in MULTICELL_WRAPPED_TOGGLES
+                else "A4:D4"
+            )
+            if (
+                conditional is None
+                or conditional.attrib != {"sqref": expected_range}
+                or rule is None
+                or rule.attrib
+                != {
+                    "dxfId": "0",
+                    "operator": "greaterThan",
+                    "priority": "1",
+                    "type": "cellIs",
+                }
+                or formula is None
+                or formula.text != "0"
+            ):
+                raise OracleCorpusError("conditional rule contract")
+        elif conditional is not None:
+            raise OracleCorpusError("unexpected conditional rule")
+    elif spec.toggle in AUTOHEIGHT_TOGGLES:
         expected_row = {"r": "4"}
         if spec.toggle == "auto-wrapped-explicit":
             expected_row.update({"customHeight": "1", "ht": "42"})
@@ -723,6 +974,12 @@ def _validate_package(spec: CaseSpec, payload: bytes) -> None:
             raise OracleCorpusError("unexpected row four")
     elif row_four is None or row_four.attrib != expected_row:
         raise OracleCorpusError("row four feature mismatch")
+    dimension = sheet.find("s:dimension", namespace)
+    expected_dimension = (
+        "A1:D8" if spec.toggle in MULTICELL_TOGGLES else "A1:B8"
+    )
+    if dimension is None or dimension.attrib != {"ref": expected_dimension}:
+        raise OracleCorpusError("dimension feature mismatch")
     view = sheet.find("s:sheetViews/s:sheetView", namespace)
     expected_rtl = spec.toggle in {
         "right-to-left-layout",

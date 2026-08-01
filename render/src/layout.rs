@@ -9,12 +9,12 @@ use rxls::{
     ChartFrameFill, ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell,
     DrawingAnchorBehavior, DrawingMetadata, DrawingObjectKind, DvOp, Font, FormatPattern,
     FormatScript, HAlign, ImportedAxisMeasure, OoxmlImplicitRowHeight, Sheet, Sparkline,
-    SparklineKind, StyleFidelity, VAlign, Workbook, XlsbDefaultColumnWidth,
+    SparklineKind, StyleFidelity, StyleLossKind, VAlign, Workbook, XlsbDefaultColumnWidth,
 };
 
 use crate::error::{LimitKind, RenderError};
 use crate::font::{
-    BaseDirection, FontOutlineCommand, FontPack, FontPackError, FontRequest, ShapeOptions,
+    BaseDirection, FontId, FontOutlineCommand, FontPack, FontPackError, FontRequest, ShapeOptions,
     ShapedText, StyledFontRequest, FONT_OUTLINE_UNITS,
 };
 use crate::media::decode_image;
@@ -639,6 +639,7 @@ struct AxisMeasurement {
     columns: Vec<MeasuredAxisSlot<u16>>,
     maximum_digit_width: Fixed,
     typography: TypographyStats,
+    conditional_evaluations: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,6 +888,7 @@ fn measure_sheet_axes_for_ranges_with_policy(
     }
     let candidates = candidates.into_values().collect::<Vec<_>>();
     let mut measurements = Vec::with_capacity(validated.len());
+    let mut conditional_evaluations = 0_u64;
     for range in validated {
         let mut style_snapshot = RenderStyleSnapshot::new(sheet);
         style_snapshot.capture_range(sheet, range, options)?;
@@ -899,7 +901,9 @@ fn measure_sheet_axes_for_ranges_with_policy(
             Some(&candidates),
             &mut warnings,
             endpoint_policy,
+            conditional_evaluations,
         )?;
+        conditional_evaluations = measured.conditional_evaluations;
         measurements.push((measured.rows, measured.columns));
     }
     Ok(measurements)
@@ -922,6 +926,7 @@ fn measure_sheet_axes_inner(
         automatic_candidates,
         warnings,
         AxisEndpointPolicy::PerTrackFixed,
+        0,
     )
 }
 
@@ -934,6 +939,7 @@ fn measure_sheet_axes_inner_with_policy(
     automatic_candidates: Option<&[DisplayCell<'_>]>,
     warnings: &mut Warnings,
     endpoint_policy: AxisEndpointPolicy,
+    initial_conditional_evaluations: u64,
 ) -> Result<AxisMeasurement, RenderError> {
     let range = range.validate()?;
     let row_count = u64::from(range.last_row) - u64::from(range.first_row) + 1;
@@ -941,6 +947,7 @@ fn measure_sheet_axes_inner_with_policy(
     enforce(LimitKind::Rows, options.limits.max_rows, row_count)?;
     enforce(LimitKind::Columns, options.limits.max_columns, column_count)?;
     let mut typography = TypographyStats::default();
+    let mut conditional_evaluations = initial_conditional_evaluations;
     let maximum_digit_width =
         maximum_digit_width(style_snapshot, options, warnings, &mut typography)?;
     let source_native_columns = endpoint_policy == AxisEndpointPolicy::SourceNative;
@@ -1042,6 +1049,7 @@ fn measure_sheet_axes_inner_with_policy(
         &mut column_widths,
         &mut row_sizes,
         &mut typography,
+        &mut conditional_evaluations,
         automatic_candidates,
     )?;
 
@@ -1087,6 +1095,7 @@ fn measure_sheet_axes_inner_with_policy(
         columns,
         maximum_digit_width,
         typography,
+        conditional_evaluations,
     })
 }
 
@@ -1186,6 +1195,17 @@ struct Region {
 struct ConditionalPaint {
     style: Option<CellStyle>,
     data_bar: Option<DataBarPaint>,
+}
+
+/// One conditional-format rule's resolved outcome for a single cell.
+///
+/// Grouped so [`apply_conditional_paint`] takes the rule result as one value
+/// instead of four positional flags that are easy to transpose at a call site.
+struct ConditionalOutcome {
+    style: Option<CellStyle>,
+    data_bar: Option<DataBarPaint>,
+    stop_if_true: bool,
+    text_measurement_unresolved: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1417,7 +1437,7 @@ fn build_sheet_scene_inner(
         sheet.conditional_formats().len() as u64,
     )?;
     let calc_line_layout_available =
-        verified_implicit_xlsx(sheet, options) && !has_conditional_text_layout_overlay(sheet);
+        verified_implicit_ooxml(sheet, options) && !has_conditional_text_layout_overlay(sheet);
     let unsupported_shapes = sheet
         .drawing_metadata()
         .iter()
@@ -1533,6 +1553,7 @@ fn build_sheet_scene_inner(
         None,
         &mut warnings,
         endpoint_policy,
+        0,
     )?;
     let mut row_slots = measured.rows;
     let mut col_slots = measured.columns;
@@ -1542,6 +1563,7 @@ fn build_sheet_scene_inner(
     }
     let maximum_digit_width = measured.maximum_digit_width;
     let mut typography_stats = measured.typography;
+    let mut conditional_evaluations = measured.conditional_evaluations;
     let hidden_rows_skipped = rows_considered.saturating_sub(row_slots.len() as u64);
     let hidden_columns_skipped = columns_considered.saturating_sub(col_slots.len() as u64);
     let mut y = axis_slots_end(&row_slots)?;
@@ -1853,7 +1875,15 @@ fn build_sheet_scene_inner(
     let mut nodes = Vec::new();
     let row_regions = regions_by_visual_row(&regions)?;
     let show_gridlines = options.gridlines && !sheet.sheet_view().hide_gridlines;
-    resolve_conditional_paints(sheet, &display_cells, &mut regions, options, &mut warnings)?;
+    let _ = resolve_conditional_paints(
+        sheet,
+        &display_cells,
+        &mut regions,
+        options,
+        &mut warnings,
+        &mut conditional_evaluations,
+        false,
+    )?;
     let mut suppresses_gridlines = Vec::with_capacity(regions.len());
     for region in &regions {
         let fill = resolve_fill(region.style.as_ref(), region.source, &mut warnings);
@@ -3288,9 +3318,7 @@ fn imported_default_row_axis_measure(
     options: &RenderOptions,
 ) -> Option<ImportedAxisMeasure> {
     sheet.imported_default_row_axis_measure().or_else(|| {
-        (sheet.implicit_ooxml_row_height_source()
-            == Some(OoxmlImplicitRowHeight::XlsxApplicationDefault))
-        .then(|| {
+        sheet.has_implicit_ooxml_row_height().then(|| {
             verified_ooxml_normal_font_size(sheet, options)
                 .and_then(|(points, _)| calc_ooxml_row_height_twips_from_points(points))
                 .map(ImportedAxisMeasure::Twips)
@@ -3840,12 +3868,9 @@ fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
                 calc_ooxml_implicit_row_height(sheet, options)
                     .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
             }
-            // XLSB has a distinct application-default source. Until a bounded
-            // oracle establishes that physical value, retain the prior
-            // conservative fallback instead of borrowing XLSX font heuristics
-            // or introducing a format-specific correction.
             Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => {
-                OOXML_APPLICATION_DEFAULT_ROW_HEIGHT
+                calc_ooxml_implicit_row_height(sheet, options)
+                    .unwrap_or(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
             }
             Some(OoxmlImplicitRowHeight::None) | None => {
                 options.default_row_height.max(Fixed::from_raw(1))
@@ -3855,11 +3880,17 @@ fn fallback_row_height(sheet: &Sheet, options: &RenderOptions) -> Fixed {
 }
 
 fn verified_ooxml_normal_font_size(sheet: &Sheet, options: &RenderOptions) -> Option<(u16, Fixed)> {
-    // The model retains this source size only for imported XLSX worksheets
-    // whose first cell XF and named/built-in Normal style agree exactly.
-    // Fractional, invalid, ambiguous, authored, XLSB, BIFF, and ODS sources
-    // therefore stay on the existing physical fallback.
-    let source_points = sheet.verified_xlsx_normal_font_size_pt()?;
+    // The model retains these source sizes only for structurally complete XLSX
+    // or XLSB style tables whose first cell XF and Normal style agree exactly.
+    // Fractional, invalid, ambiguous, authored, BIFF, and ODS sources stay on
+    // the existing physical fallback.
+    let source_points = match (
+        sheet.verified_xlsx_normal_font_size_pt(),
+        sheet.verified_xlsb_normal_font_size_pt(),
+    ) {
+        (Some(points), None) | (None, Some(points)) => points,
+        (Some(_), Some(_)) | (None, None) => return None,
+    };
     let pack = options.font_pack.as_ref()?;
     let font = sheet.default_cell_style()?.font.as_ref()?;
     let family = font.name.as_deref()?;
@@ -3869,24 +3900,351 @@ fn verified_ooxml_normal_font_size(sheet: &Sheet, options: &RenderOptions) -> Op
         weight: if font.bold { 700 } else { 400 },
         italic: font.italic,
     });
-    if !resolution.exact_family || !resolution.exact_style {
+    if !(resolution.exact_family || resolution.declared_alias) || !resolution.exact_style {
         return None;
     }
     Some((points, points_to_fixed(f32::from(points))?))
 }
 
-fn verified_implicit_xlsx(sheet: &Sheet, options: &RenderOptions) -> bool {
-    sheet.implicit_ooxml_row_height_source() == Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+fn verified_ooxml_cell_font_size_pt(sheet: &Sheet, row: u32, col: u16) -> Option<u16> {
+    match sheet.implicit_ooxml_row_height_source()? {
+        OoxmlImplicitRowHeight::XlsxApplicationDefault => {
+            sheet.verified_xlsx_cell_font_size_pt(row, col)
+        }
+        OoxmlImplicitRowHeight::XlsbApplicationDefault => {
+            sheet.verified_xlsb_cell_font_size_pt(row, col)
+        }
+        OoxmlImplicitRowHeight::None => None,
+    }
+}
+
+fn verified_calc_cell_font_size_pt(
+    sheet: &Sheet,
+    source: CellCoordinate,
+    style: &CellStyle,
+    options: &RenderOptions,
+) -> Option<u16> {
+    let points = verified_ooxml_cell_font_size_pt(sheet, source.row, source.col)?;
+    let font = style.font.as_ref()?;
+    if font.size_pt != Some(points) || font.script != FormatScript::None {
+        return None;
+    }
+    let resolution = options.font_pack.as_ref()?.resolve(FontRequest {
+        family: font.name.as_deref()?,
+        weight: if font.bold { 700 } else { 400 },
+        italic: font.italic,
+    });
+    ((resolution.exact_family || resolution.declared_alias) && resolution.exact_style)
+        .then_some(points)
+}
+
+fn verified_implicit_ooxml(sheet: &Sheet, options: &RenderOptions) -> bool {
+    sheet.has_implicit_ooxml_row_height()
         && verified_ooxml_normal_font_size(sheet, options).is_some()
 }
 
 fn has_conditional_text_layout_overlay(sheet: &Sheet) -> bool {
     sheet.conditional_format_metadata().iter().any(|metadata| {
-        metadata
+        let has_unsafe_losses = metadata
+            .style_losses
+            .iter()
+            .any(|loss| loss.kind != StyleLossKind::UnresolvedColor);
+        let unresolved_color_without_retained_font = metadata
+            .style_losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::UnresolvedColor)
+            && metadata
+                .differential_style
+                .as_ref()
+                .is_none_or(|style| style.font.is_none());
+        metadata.differential_style.as_ref().map_or(
+            has_unsafe_losses || unresolved_color_without_retained_font,
+            |style| {
+                unresolved_color_without_retained_font
+                    || conditional_style_affects_text_layout(style, has_unsafe_losses)
+            },
+        )
+    })
+}
+
+fn conditional_style_is_geometry_safe_color_only(
+    style: &CellStyle,
+    has_unsafe_losses: bool,
+) -> bool {
+    if has_unsafe_losses
+        || style.align.is_some()
+        || style.num_fmt.is_some()
+        || style.protection.is_some()
+    {
+        return false;
+    }
+    let Some(font) = style.font.as_ref() else {
+        return false;
+    };
+    let mut font_without_color = font.clone();
+    if font_without_color.color.take().is_none() || font_without_color != Font::default() {
+        return false;
+    }
+    true
+}
+
+fn conditional_style_affects_text_layout(style: &CellStyle, has_unsafe_losses: bool) -> bool {
+    has_unsafe_losses
+        || style.align.is_some()
+        || style.num_fmt.is_some()
+        || (style.font.is_some()
+            && !conditional_style_is_geometry_safe_color_only(style, has_unsafe_losses))
+}
+
+fn conditional_metadata_requires_text_measurement(
+    metadata: Option<&rxls::ConditionalFormatMetadata>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let has_unsafe_losses = metadata
+        .style_losses
+        .iter()
+        .any(|loss| loss.kind != StyleLossKind::UnresolvedColor);
+    let unresolved_color_without_retained_font = metadata
+        .style_losses
+        .iter()
+        .any(|loss| loss.kind == StyleLossKind::UnresolvedColor)
+        && metadata
             .differential_style
             .as_ref()
-            .is_some_and(|style| style.font.is_some() || style.align.is_some())
-    })
+            .is_none_or(|style| style.font.is_none());
+    has_unsafe_losses
+        || unresolved_color_without_retained_font
+        || metadata.differential_style.as_ref().is_some_and(|style| {
+            style.font.is_some() || style.align.is_some() || style.num_fmt.is_some()
+        })
+}
+
+fn conditional_metadata_text_measurement_is_unresolved(
+    metadata: Option<&rxls::ConditionalFormatMetadata>,
+) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    metadata
+        .style_losses
+        .iter()
+        .any(|loss| loss.kind != StyleLossKind::UnresolvedColor)
+        || (metadata
+            .style_losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::UnresolvedColor)
+            && metadata
+                .differential_style
+                .as_ref()
+                .is_none_or(|style| style.font.is_none()))
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ColorOnlyConditionalActivation {
+    Known(BTreeSet<CellCoordinate>),
+    Unknown,
+}
+
+#[cfg(test)]
+impl ColorOnlyConditionalActivation {
+    fn requires_individual_metrics(&self, source: CellCoordinate) -> bool {
+        match self {
+            Self::Known(active) => active.contains(&source),
+            Self::Unknown => true,
+        }
+    }
+}
+
+#[cfg(test)]
+fn active_color_only_conditional_cells(
+    sheet: &Sheet,
+    candidates: &[DisplayCell<'_>],
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Result<ColorOnlyConditionalActivation, RenderError> {
+    let mut relevant_rule = None;
+    for (index, metadata) in sheet.conditional_format_metadata().iter().enumerate() {
+        if conditional_metadata_text_measurement_is_unresolved(Some(metadata)) {
+            return Ok(ColorOnlyConditionalActivation::Unknown);
+        }
+        let Some(style) = metadata.differential_style.as_ref() else {
+            continue;
+        };
+        let has_unsafe_losses = metadata
+            .style_losses
+            .iter()
+            .any(|loss| loss.kind != StyleLossKind::UnresolvedColor);
+        if !conditional_style_is_geometry_safe_color_only(style, has_unsafe_losses) {
+            continue;
+        }
+        if relevant_rule.replace(index).is_some() {
+            return Ok(ColorOnlyConditionalActivation::Unknown);
+        }
+    }
+    let Some(rule_index) = relevant_rule else {
+        return Ok(ColorOnlyConditionalActivation::Known(BTreeSet::new()));
+    };
+    let Some(conditional) = sheet.conditional_formats().get(rule_index) else {
+        return Ok(ColorOnlyConditionalActivation::Unknown);
+    };
+    let CfRule::CellIs {
+        op,
+        formula1,
+        formula2,
+        ..
+    } = &conditional.rule
+    else {
+        return Ok(ColorOnlyConditionalActivation::Unknown);
+    };
+    let (first_row, first_col, last_row, last_col) = conditional.sqref;
+    if first_row > last_row || first_col > last_col {
+        return Ok(ColorOnlyConditionalActivation::Unknown);
+    }
+    let Some(first) = parse_conditional_operand(formula1) else {
+        warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+        return Ok(ColorOnlyConditionalActivation::Unknown);
+    };
+    let second = match op {
+        DvOp::Between | DvOp::NotBetween => {
+            let Some(second) = formula2.as_deref().and_then(parse_conditional_operand) else {
+                warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                return Ok(ColorOnlyConditionalActivation::Unknown);
+            };
+            Some(second)
+        }
+        _ => None,
+    };
+    let mut evaluations = 0_u64;
+    let mut active = BTreeSet::new();
+    for &cell in candidates {
+        bump_conditional_evaluations(&mut evaluations, options)?;
+        let source = CellCoordinate {
+            row: cell.row,
+            col: cell.col,
+        };
+        if !coordinate_in_range(source, conditional.sqref) {
+            continue;
+        }
+        let Some(value) = numeric_cell_value(cell.value) else {
+            continue;
+        };
+        let Some(first) = resolve_conditional_operand(&first, sheet, source, conditional.sqref)
+        else {
+            warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+            return Ok(ColorOnlyConditionalActivation::Unknown);
+        };
+        let second = match second.as_ref() {
+            Some(second) => {
+                let Some(value) =
+                    resolve_conditional_operand(second, sheet, source, conditional.sqref)
+                else {
+                    warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    return Ok(ColorOnlyConditionalActivation::Unknown);
+                };
+                Some(value)
+            }
+            None => None,
+        };
+        if compare_conditional(value, *op, first, second) {
+            active.insert(source);
+        }
+    }
+    Ok(ColorOnlyConditionalActivation::Known(active))
+}
+
+#[derive(Debug, Clone)]
+struct ConditionalLayoutCell {
+    effective_style: Option<CellStyle>,
+    active_style: Option<CellStyle>,
+}
+
+fn resolve_conditional_layout_cells(
+    sheet: &Sheet,
+    candidates: &[DisplayCell<'_>],
+    style_snapshot: &RenderStyleSnapshot,
+    options: &RenderOptions,
+    evaluations: &mut u64,
+) -> Result<BTreeMap<CellCoordinate, ConditionalLayoutCell>, RenderError> {
+    if sheet.conditional_formats().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut display_cells = BTreeMap::new();
+    for &cell in candidates {
+        if cell.row > MAX_WORKSHEET_ROW || cell.col > MAX_WORKSHEET_COLUMN {
+            continue;
+        }
+        display_cells.insert(
+            CellCoordinate {
+                row: cell.row,
+                col: cell.col,
+            },
+            cell,
+        );
+    }
+    let mut regions = display_cells
+        .keys()
+        .copied()
+        .map(|source| Region {
+            source,
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_raw(1),
+                height: Fixed::from_raw(1),
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::Native,
+            calc_wrap_space: None,
+            style: style_snapshot
+                .owned_style(source)
+                .or_else(|| sheet.resolved_cell_style(source.row, source.col)),
+            conditional: ConditionalPaint::default(),
+            text: String::new(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+        })
+        .collect::<Vec<_>>();
+    let mut measurement_warnings = Warnings::default();
+    let deferred = resolve_conditional_paints(
+        sheet,
+        &display_cells,
+        &mut regions,
+        options,
+        &mut measurement_warnings,
+        evaluations,
+        true,
+    )?;
+    if deferred {
+        return Err(RenderError::Typography {
+            reason: "conditional_text_layout_unresolved",
+        });
+    }
+    let mut resolved = BTreeMap::new();
+    for region in regions {
+        if region
+            .conditional
+            .style
+            .as_ref()
+            .is_some_and(|style| style.num_fmt.is_some())
+        {
+            return Err(RenderError::Typography {
+                reason: "conditional_number_format_layout_unresolved",
+            });
+        }
+        resolved.insert(
+            region.source,
+            ConditionalLayoutCell {
+                effective_style: region.style,
+                active_style: region.conditional.style,
+            },
+        );
+    }
+    Ok(resolved)
 }
 
 fn cell_has_auto_filter_button(sheet: &Sheet, source: CellCoordinate) -> bool {
@@ -3923,19 +4281,7 @@ fn cell_line_layout_policy(
         {
             return None;
         }
-        let exact_points = sheet.verified_xlsx_cell_font_size_pt(source.row, source.col)?;
-        let font = style.font.as_ref()?;
-        if font.size_pt != Some(exact_points) || font.script != FormatScript::None {
-            return None;
-        }
-        let family = font.name.as_deref()?;
-        let pack = options.font_pack.as_ref()?;
-        let resolution = pack.resolve(FontRequest {
-            family,
-            weight: if font.bold { 700 } else { 400 },
-            italic: font.italic,
-        });
-        (resolution.exact_family && resolution.exact_style).then_some(())
+        verified_calc_cell_font_size_pt(sheet, source, style, options).map(|_| ())
     };
     if verified().is_some() {
         CellLineLayoutPolicy::CalcEditEngine
@@ -3945,9 +4291,7 @@ fn cell_line_layout_policy(
 }
 
 fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Option<Fixed> {
-    if sheet.implicit_ooxml_row_height_source()
-        != Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
-    {
+    if !sheet.has_implicit_ooxml_row_height() {
         return None;
     }
     let (points, _) = verified_ooxml_normal_font_size(sheet, options)?;
@@ -4133,16 +4477,27 @@ fn has_mixed_calc_script_classes(text: &str) -> bool {
 struct CalcScriptClassSummary {
     first: Option<CalcScriptClass>,
     mixed: bool,
+    has_asian: bool,
     has_complex: bool,
 }
 
 impl CalcScriptClassSummary {
     fn record(&mut self, script: CalcScriptClass) {
+        self.has_asian |= script == CalcScriptClass::Asian;
         self.has_complex |= script == CalcScriptClass::Complex;
         if self.first.is_some_and(|first| first != script) {
             self.mixed = true;
         } else if self.first.is_none() {
             self.first = Some(script);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.has_asian |= other.has_asian;
+        self.has_complex |= other.has_complex;
+        self.mixed |= other.mixed;
+        if let Some(script) = other.first {
+            self.record(script);
         }
     }
 }
@@ -4213,11 +4568,48 @@ fn effective_row_height_is_manual(sheet: &Sheet, row: u32) -> bool {
     }
 }
 
+fn automatic_candidate_adjustable_row(
+    sheet: &Sheet,
+    range: RenderRange,
+    row_sizes: &BTreeMap<u32, Fixed>,
+    merge_anchors: &BTreeMap<CellCoordinate, (u32, u16, u32, u16)>,
+    source: CellCoordinate,
+    options: &RenderOptions,
+) -> Option<u32> {
+    if let Some(&(r0, c0, r1, c1)) = merge_anchors.get(&source) {
+        let last_col = c1.min(MAX_WORKSHEET_COLUMN);
+        let span = usize::from(last_col.checked_sub(c0)?) + 1;
+        if !options.include_hidden && sheet.hidden_columns().range(c0..=last_col).count() >= span {
+            return None;
+        }
+        let first_row = r0.max(range.first_row);
+        let last_row = r1.min(range.last_row);
+        if first_row > last_row {
+            return None;
+        }
+        row_sizes
+            .range(first_row..=last_row)
+            .map(|(&row, _)| row)
+            .find(|row| !effective_row_height_is_manual(sheet, *row))
+    } else {
+        (row_sizes.contains_key(&source.row)
+            && !effective_row_height_is_manual(sheet, source.row)
+            && (options.include_hidden || !sheet.hidden_columns().contains(&source.col)))
+        .then_some(source.row)
+    }
+}
+
 #[derive(Debug)]
 struct AutoMergeHeight {
     rows: Vec<u32>,
     adjustable_row: u32,
     required: Fixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcAutomaticMetricSource {
+    RequestedFont,
+    PreparedAsianOrRequested,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4231,6 +4623,7 @@ fn expand_automatic_row_heights(
     column_widths: &mut BTreeMap<u16, Fixed>,
     row_sizes: &mut BTreeMap<u32, Fixed>,
     typography: &mut TypographyStats,
+    conditional_evaluations: &mut u64,
     automatic_candidates: Option<&[DisplayCell<'_>]>,
 ) -> Result<(), RenderError> {
     let Some(pack) = options.font_pack.as_ref() else {
@@ -4238,10 +4631,9 @@ fn expand_automatic_row_heights(
     };
     let verified_normal_font = verified_ooxml_normal_font_size(sheet, options)
         .and_then(|_| sheet.default_cell_style()?.font.as_ref());
-    let verified_implicit_xlsx =
+    let verified_implicit_ooxml =
         sheet.has_implicit_ooxml_row_height() && verified_normal_font.is_some();
-    let calc_line_layout_available =
-        verified_implicit_xlsx && !has_conditional_text_layout_overlay(sheet);
+    let calc_line_layout_available = verified_implicit_ooxml;
 
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
@@ -4299,6 +4691,54 @@ fn expand_automatic_row_heights(
     let candidates = automatic_candidates
         .or(local_candidates.as_deref())
         .unwrap_or(&[]);
+    let mut automatic_candidate_rows = BTreeMap::new();
+    let mut layout_candidates = Vec::new();
+    for &cell in candidates {
+        if cell.formatted.is_empty()
+            || cell.row > MAX_WORKSHEET_ROW
+            || cell.col > MAX_WORKSHEET_COLUMN
+        {
+            continue;
+        }
+        let source = CellCoordinate {
+            row: cell.row,
+            col: cell.col,
+        };
+        let Some(adjustable_row) = automatic_candidate_adjustable_row(
+            sheet,
+            range,
+            row_sizes,
+            &merge_anchors,
+            source,
+            options,
+        ) else {
+            continue;
+        };
+        automatic_candidate_rows.insert(source, adjustable_row);
+        layout_candidates.push(cell);
+    }
+    let conditional_layout_cells = resolve_conditional_layout_cells(
+        sheet,
+        &layout_candidates,
+        style_snapshot,
+        options,
+        conditional_evaluations,
+    )?;
+    let mut row_script_classes = BTreeMap::<u32, CalcScriptClassSummary>::new();
+    if calc_line_layout_available {
+        for &cell in &layout_candidates {
+            let source = CellCoordinate {
+                row: cell.row,
+                col: cell.col,
+            };
+            let adjustable_row = automatic_candidate_rows[&source];
+            let summary = calc_script_class_summary_bounded(cell.formatted, options, typography)?;
+            row_script_classes
+                .entry(adjustable_row)
+                .and_modify(|row| row.merge(summary))
+                .or_insert(summary);
+        }
+    }
     for &cell in candidates {
         if cell.formatted.is_empty()
             || cell.row > MAX_WORKSHEET_ROW
@@ -4373,9 +4813,17 @@ fn expand_automatic_row_heights(
                 )
             };
 
-        let style = style_snapshot
-            .owned_style(source)
+        let conditional_layout = conditional_layout_cells.get(&source);
+        let style = conditional_layout
+            .and_then(|cell| cell.effective_style.clone())
+            .or_else(|| style_snapshot.owned_style(source))
             .or_else(|| sheet.resolved_cell_style(source.row, source.col));
+        let active_conditional_style =
+            conditional_layout.and_then(|cell| cell.active_style.as_ref());
+        let active_color_only = active_conditional_style
+            .is_some_and(|style| conditional_style_is_geometry_safe_color_only(style, false));
+        let active_layout_style = active_conditional_style
+            .is_some_and(|style| conditional_style_affects_text_layout(style, false));
         let alignment = style.as_ref().and_then(|style| style.align.as_ref());
         let font_size = style
             .as_ref()
@@ -4404,9 +4852,10 @@ fn expand_automatic_row_heights(
             .and_then(|style| style.font.as_ref())
             .map_or(FormatScript::None, |font| font.script);
         let ordinary_implicit_plain =
-            verified_implicit_xlsx && plain_single_line && effective_script == FormatScript::None;
-        if !verified_implicit_xlsx
+            verified_implicit_ooxml && plain_single_line && effective_script == FormatScript::None;
+        if !verified_implicit_ooxml
             && plain_single_line
+            && !active_layout_style
             && (default_plain_font
                 || (verified_normal_font.is_none() && font_size <= options.default_font_size))
         {
@@ -4416,33 +4865,55 @@ fn expand_automatic_row_heights(
         let effective_font = style.as_ref().and_then(|style| style.font.as_ref());
         let retained_font = cell.explicit_style.and_then(|style| style.font.as_ref());
         let declared_points = ordinary_implicit_plain
-            .then(|| sheet.verified_xlsx_cell_font_size_pt(cell.row, cell.col))
+            .then(|| verified_ooxml_cell_font_size_pt(sheet, cell.row, cell.col))
             .flatten()
             .filter(|points| {
-                effective_font == retained_font
-                    && effective_font.and_then(|font| font.size_pt) == Some(*points)
+                effective_font.and_then(|font| font.size_pt) == Some(*points)
+                    && match sheet.implicit_ooxml_row_height_source() {
+                        Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+                            effective_font == retained_font
+                        }
+                        Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => true,
+                        Some(OoxmlImplicitRowHeight::None) | None => false,
+                    }
             });
-        let declared_plain_height = if let Some(points) = declared_points {
-            let matches_normal_family_and_size = verified_normal_font
-                .zip(effective_font)
-                .is_some_and(|(normal, effective)| {
-                    normal.name == effective.name
-                        && normal.size_pt == effective.size_pt
-                        && sheet.verified_xlsx_normal_font_size_pt() == Some(points)
-                });
-            let script_classes =
-                calc_script_class_summary_bounded(cell.formatted, options, typography)?;
-            if !script_classes.mixed {
-                calc_ooxml_row_height_from_points(points)
-            } else if matches_normal_family_and_size && !script_classes.has_complex {
-                // The pinned Calc oracle preserves its application-default
-                // row height for verified Normal-family/size Western+Asian
-                // text. Complex-script mixes stay on the shaped path so tall
-                // glyph ink cannot be clipped by a geometry-only shortcut.
-                Some(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT)
-            } else {
-                None
+        let verified_calc_points = ordinary_implicit_plain
+            .then(|| {
+                style.as_ref().and_then(|style| {
+                    verified_calc_cell_font_size_pt(sheet, source, style, options)
+                })
+            })
+            .flatten();
+        let row_script_summary = row_script_classes.get(&adjustable_row);
+        let row_is_mixed = row_script_summary.is_some_and(|summary| summary.mixed);
+        let requires_individual_plain = ordinary_implicit_plain
+            && calc_line_layout_available
+            && !cell_has_auto_filter_button(sheet, source)
+            && (row_is_mixed || active_color_only || active_layout_style);
+        let calc_metric_source = if requires_individual_plain && verified_calc_points.is_some() {
+            match sheet.implicit_ooxml_row_height_source() {
+                Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+                    Some(CalcAutomaticMetricSource::RequestedFont)
+                }
+                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault)
+                    if row_is_mixed
+                        && row_script_summary.is_some_and(|summary| summary.has_asian) =>
+                {
+                    Some(CalcAutomaticMetricSource::PreparedAsianOrRequested)
+                }
+                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) if !row_is_mixed => {
+                    Some(CalcAutomaticMetricSource::RequestedFont)
+                }
+                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => None,
+                Some(OoxmlImplicitRowHeight::None) | None => None,
             }
+        } else {
+            None
+        };
+        let declared_plain_height = if requires_individual_plain {
+            None
+        } else if let Some(points) = declared_points {
+            calc_ooxml_row_height_from_points(points)
         } else {
             None
         };
@@ -4460,18 +4931,23 @@ fn expand_automatic_row_heights(
                     == text)
                     .then_some(sanitized)
             });
-            let line_layout_policy = cell_line_layout_policy(
-                sheet,
-                source,
-                style.as_ref(),
-                rich_text.as_deref(),
-                CalcLineLayoutEvidence {
-                    is_plain_text: matches!(cell.value, Cell::Text(_)),
-                    has_adjustable_row: true,
-                    wrap_space_available: calc_line_layout_available && calc_wrap_space.is_some(),
-                },
-                options,
-            );
+            let line_layout_policy = if calc_metric_source.is_some() && calc_wrap_space.is_some() {
+                CellLineLayoutPolicy::CalcEditEngine
+            } else {
+                cell_line_layout_policy(
+                    sheet,
+                    source,
+                    style.as_ref(),
+                    rich_text.as_deref(),
+                    CalcLineLayoutEvidence {
+                        is_plain_text: matches!(cell.value, Cell::Text(_)),
+                        has_adjustable_row: true,
+                        wrap_space_available: calc_line_layout_available
+                            && calc_wrap_space.is_some(),
+                    },
+                    options,
+                )
+            };
             let region = Region {
                 source,
                 rect: Rect {
@@ -4499,6 +4975,7 @@ fn expand_automatic_row_heights(
                 sheet.sheet_view().right_to_left,
                 options,
                 typography,
+                calc_metric_source,
             )?
         };
         if is_merged {
@@ -4804,10 +5281,12 @@ fn resolve_conditional_paints(
     regions: &mut [Region],
     options: &RenderOptions,
     warnings: &mut Warnings,
-) -> Result<(), RenderError> {
+    evaluations: &mut u64,
+    retain_layout_fields: bool,
+) -> Result<bool, RenderError> {
     let mut paints = BTreeMap::<CellCoordinate, ConditionalPaint>::new();
     let mut stopped = BTreeSet::<CellCoordinate>::new();
-    let mut evaluations = 0_u64;
+    let mut deferred_text_layout = false;
     let metadata = sheet.conditional_format_metadata();
     let mut rule_order = (0..sheet.conditional_formats().len()).collect::<Vec<_>>();
     rule_order.sort_by_key(|&index| {
@@ -4823,6 +5302,10 @@ fn resolve_conditional_paints(
     for rule_index in rule_order {
         let conditional = &sheet.conditional_formats()[rule_index];
         let rule_metadata = metadata.get(rule_index);
+        let text_measurement_relevant =
+            conditional_metadata_requires_text_measurement(rule_metadata);
+        let text_measurement_unresolved =
+            conditional_metadata_text_measurement_is_unresolved(rule_metadata);
         let stop_if_true = rule_metadata.is_some_and(|metadata| metadata.stop_if_true);
         if let Some(metadata) = rule_metadata {
             for loss in &metadata.style_losses {
@@ -4837,19 +5320,30 @@ fn resolve_conditional_paints(
             .and_then(|metadata| metadata.differential_style.as_ref())
             .cloned()
             .map(|mut style| {
-                if style.num_fmt.take().is_some() {
+                if style.num_fmt.is_some() {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    if !retain_layout_fields {
+                        style.num_fmt = None;
+                    }
                 }
-                if style.protection.take().is_some() {
+                if style.protection.is_some() {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    if !retain_layout_fields {
+                        style.protection = None;
+                    }
                 }
                 style
             });
         let has_imported_differential =
             rule_metadata.is_some_and(|metadata| metadata.differential_style.is_some());
         let range = conditional.sqref;
+        let measurement_range_intersects = text_measurement_relevant
+            && regions
+                .iter()
+                .any(|region| coordinate_in_range(region.source, range));
         if range.0 > range.2 || range.1 > range.3 {
             warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+            deferred_text_layout |= measurement_range_intersects;
             continue;
         }
         match &conditional.rule {
@@ -4861,6 +5355,7 @@ fn resolve_conditional_paints(
             } => {
                 let Some(first) = parse_conditional_operand(formula1) else {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 };
                 let second = match op {
@@ -4868,6 +5363,7 @@ fn resolve_conditional_paints(
                         let Some(second) = formula2.as_deref().and_then(parse_conditional_operand)
                         else {
                             warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                            deferred_text_layout |= measurement_range_intersects;
                             continue;
                         };
                         Some(second)
@@ -4880,7 +5376,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -4914,6 +5410,7 @@ fn resolve_conditional_paints(
                 }
                 if deferred {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 }
                 for coordinate in matches {
@@ -4921,19 +5418,23 @@ fn resolve_conditional_paints(
                         &mut paints,
                         &mut stopped,
                         coordinate,
-                        Some(conditional_fill_overlay(
-                            rgb(*fill),
-                            differential_style.as_ref(),
-                            has_imported_differential,
-                        )),
-                        None,
-                        stop_if_true,
+                        ConditionalOutcome {
+                            style: Some(conditional_fill_overlay(
+                                rgb(*fill),
+                                differential_style.as_ref(),
+                                has_imported_differential,
+                            )),
+                            data_bar: None,
+                            stop_if_true,
+                            text_measurement_unresolved,
+                        },
+                        &mut deferred_text_layout,
                     );
                 }
             }
             CfRule::ColorScale2 { min, max } => {
                 let values =
-                    conditional_numeric_values(display_cells, range, &mut evaluations, options)?;
+                    conditional_numeric_values(display_cells, range, evaluations, options)?;
                 let Some((minimum, maximum)) = numeric_bounds(&values) else {
                     continue;
                 };
@@ -4941,7 +5442,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -4956,19 +5457,23 @@ fn resolve_conditional_paints(
                         &mut paints,
                         &mut stopped,
                         region.source,
-                        Some(conditional_fill_overlay(
-                            interpolate_rgb(rgb(*min), rgb(*max), ratio),
-                            differential_style.as_ref(),
-                            has_imported_differential,
-                        )),
-                        None,
-                        stop_if_true,
+                        ConditionalOutcome {
+                            style: Some(conditional_fill_overlay(
+                                interpolate_rgb(rgb(*min), rgb(*max), ratio),
+                                differential_style.as_ref(),
+                                has_imported_differential,
+                            )),
+                            data_bar: None,
+                            stop_if_true,
+                            text_measurement_unresolved,
+                        },
+                        &mut deferred_text_layout,
                     );
                 }
             }
             CfRule::ColorScale3 { min, mid, max } => {
                 let mut values =
-                    conditional_numeric_values(display_cells, range, &mut evaluations, options)?;
+                    conditional_numeric_values(display_cells, range, evaluations, options)?;
                 if values.is_empty() {
                     continue;
                 }
@@ -4980,7 +5485,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5007,19 +5512,23 @@ fn resolve_conditional_paints(
                         &mut paints,
                         &mut stopped,
                         region.source,
-                        Some(conditional_fill_overlay(
-                            color,
-                            differential_style.as_ref(),
-                            has_imported_differential,
-                        )),
-                        None,
-                        stop_if_true,
+                        ConditionalOutcome {
+                            style: Some(conditional_fill_overlay(
+                                color,
+                                differential_style.as_ref(),
+                                has_imported_differential,
+                            )),
+                            data_bar: None,
+                            stop_if_true,
+                            text_measurement_unresolved,
+                        },
+                        &mut deferred_text_layout,
                     );
                 }
             }
             CfRule::DataBar { color } => {
                 let values =
-                    conditional_numeric_values(display_cells, range, &mut evaluations, options)?;
+                    conditional_numeric_values(display_cells, range, evaluations, options)?;
                 let Some((minimum, maximum)) = numeric_bounds(&values) else {
                     continue;
                 };
@@ -5028,7 +5537,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5042,12 +5551,16 @@ fn resolve_conditional_paints(
                         &mut paints,
                         &mut stopped,
                         region.source,
-                        differential_style.clone(),
-                        Some(DataBarPaint {
-                            color: rgb(*color),
-                            width_ppm: normalized_ppm(value, minimum, maximum),
-                        }),
-                        stop_if_true,
+                        ConditionalOutcome {
+                            style: differential_style.clone(),
+                            data_bar: Some(DataBarPaint {
+                                color: rgb(*color),
+                                width_ppm: normalized_ppm(value, minimum, maximum),
+                            }),
+                            stop_if_true,
+                            text_measurement_unresolved,
+                        },
+                        &mut deferred_text_layout,
                     );
                 }
             }
@@ -5058,7 +5571,7 @@ fn resolve_conditional_paints(
                 fill,
             } => {
                 let mut values =
-                    conditional_numeric_values(display_cells, range, &mut evaluations, options)?;
+                    conditional_numeric_values(display_cells, range, evaluations, options)?;
                 if values.is_empty() || *rank == 0 {
                     continue;
                 }
@@ -5084,7 +5597,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5099,20 +5612,24 @@ fn resolve_conditional_paints(
                             &mut paints,
                             &mut stopped,
                             region.source,
-                            Some(conditional_fill_overlay(
-                                rgb(*fill),
-                                differential_style.as_ref(),
-                                has_imported_differential,
-                            )),
-                            None,
-                            stop_if_true,
+                            ConditionalOutcome {
+                                style: Some(conditional_fill_overlay(
+                                    rgb(*fill),
+                                    differential_style.as_ref(),
+                                    has_imported_differential,
+                                )),
+                                data_bar: None,
+                                stop_if_true,
+                                text_measurement_unresolved,
+                            },
+                            &mut deferred_text_layout,
                         );
                     }
                 }
             }
             CfRule::AboveAverage { below, fill } => {
                 let values =
-                    conditional_numeric_values(display_cells, range, &mut evaluations, options)?;
+                    conditional_numeric_values(display_cells, range, evaluations, options)?;
                 if values.is_empty() {
                     continue;
                 }
@@ -5122,6 +5639,7 @@ fn resolve_conditional_paints(
                 });
                 let Some(sum) = sum else {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 };
                 let average = sum / values.len() as f64;
@@ -5129,7 +5647,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5144,22 +5662,27 @@ fn resolve_conditional_paints(
                             &mut paints,
                             &mut stopped,
                             region.source,
-                            Some(conditional_fill_overlay(
-                                rgb(*fill),
-                                differential_style.as_ref(),
-                                has_imported_differential,
-                            )),
-                            None,
-                            stop_if_true,
+                            ConditionalOutcome {
+                                style: Some(conditional_fill_overlay(
+                                    rgb(*fill),
+                                    differential_style.as_ref(),
+                                    has_imported_differential,
+                                )),
+                                data_bar: None,
+                                stop_if_true,
+                                text_measurement_unresolved,
+                            },
+                            &mut deferred_text_layout,
                         );
                     }
                 }
             }
             CfRule::DuplicateValues { unique, fill } => {
                 let Some(keys) =
-                    conditional_value_keys(display_cells, range, &mut evaluations, options)?
+                    conditional_value_keys(display_cells, range, evaluations, options)?
                 else {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 };
                 let mut counts = BTreeMap::<ConditionalValueKey, u64>::new();
@@ -5173,7 +5696,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5186,13 +5709,17 @@ fn resolve_conditional_paints(
                             &mut paints,
                             &mut stopped,
                             region.source,
-                            Some(conditional_fill_overlay(
-                                rgb(*fill),
-                                differential_style.as_ref(),
-                                has_imported_differential,
-                            )),
-                            None,
-                            stop_if_true,
+                            ConditionalOutcome {
+                                style: Some(conditional_fill_overlay(
+                                    rgb(*fill),
+                                    differential_style.as_ref(),
+                                    has_imported_differential,
+                                )),
+                                data_bar: None,
+                                stop_if_true,
+                                text_measurement_unresolved,
+                            },
+                            &mut deferred_text_layout,
                         );
                     }
                 }
@@ -5200,6 +5727,7 @@ fn resolve_conditional_paints(
             CfRule::Expression { formula, fill } => {
                 let Some(expression) = parse_conditional_expression(formula) else {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 };
                 let mut matches = Vec::new();
@@ -5208,7 +5736,7 @@ fn resolve_conditional_paints(
                     if stopped.contains(&region.source) {
                         continue;
                     }
-                    bump_conditional_evaluations(&mut evaluations, options)?;
+                    bump_conditional_evaluations(evaluations, options)?;
                     if !coordinate_in_range(region.source, range) {
                         continue;
                     }
@@ -5230,6 +5758,7 @@ fn resolve_conditional_paints(
                 }
                 if deferred {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
+                    deferred_text_layout |= measurement_range_intersects;
                     continue;
                 }
                 for coordinate in matches {
@@ -5237,13 +5766,17 @@ fn resolve_conditional_paints(
                         &mut paints,
                         &mut stopped,
                         coordinate,
-                        Some(conditional_fill_overlay(
-                            rgb(*fill),
-                            differential_style.as_ref(),
-                            has_imported_differential,
-                        )),
-                        None,
-                        stop_if_true,
+                        ConditionalOutcome {
+                            style: Some(conditional_fill_overlay(
+                                rgb(*fill),
+                                differential_style.as_ref(),
+                                has_imported_differential,
+                            )),
+                            data_bar: None,
+                            stop_if_true,
+                            text_measurement_unresolved,
+                        },
+                        &mut deferred_text_layout,
                     );
                 }
             }
@@ -5261,7 +5794,7 @@ fn resolve_conditional_paints(
         }
         region.conditional = paint;
     }
-    Ok(())
+    Ok(deferred_text_layout)
 }
 
 fn bump_conditional_evaluations(
@@ -6226,13 +6759,19 @@ fn apply_conditional_paint(
     paints: &mut BTreeMap<CellCoordinate, ConditionalPaint>,
     stopped: &mut BTreeSet<CellCoordinate>,
     coordinate: CellCoordinate,
-    style: Option<CellStyle>,
-    data_bar: Option<DataBarPaint>,
-    stop_if_true: bool,
+    outcome: ConditionalOutcome,
+    deferred_text_layout: &mut bool,
 ) {
+    let ConditionalOutcome {
+        style,
+        data_bar,
+        stop_if_true,
+        text_measurement_unresolved,
+    } = outcome;
     if stopped.contains(&coordinate) {
         return;
     }
+    *deferred_text_layout |= text_measurement_unresolved;
     let paint = paints.entry(coordinate).or_default();
     if let Some(lower_priority) = style {
         paint.style = Some(match paint.style.take() {
@@ -10369,9 +10908,22 @@ fn measure_automatic_cell_height(
     sheet_right_to_left: bool,
     options: &RenderOptions,
     stats: &mut TypographyStats,
+    calc_metric_source: Option<CalcAutomaticMetricSource>,
 ) -> Result<Fixed, RenderError> {
     let style = text_style(region, options, sheet_right_to_left);
     let prepared = prepare_styled_text(pack, region, &style, sheet_right_to_left, options, stats)?;
+    if let Some(source) = calc_metric_source {
+        if let Some(height) = calc_verified_automatic_cell_height(
+            pack,
+            &prepared,
+            &region.text,
+            source,
+            options,
+            stats,
+        )? {
+            return Ok(height);
+        }
+    }
     match prepared.line_layout_policy {
         CellLineLayoutPolicy::Native => sum_fixed(
             prepared
@@ -10384,6 +10936,96 @@ fn measure_automatic_cell_height(
         .ok_or(RenderError::CoordinateOverflow),
         CellLineLayoutPolicy::CalcEditEngine => calc_automatic_cell_height(&prepared.lines),
     }
+}
+
+fn calc_verified_automatic_cell_height(
+    pack: &FontPack,
+    prepared: &PreparedText,
+    text: &str,
+    source: CalcAutomaticMetricSource,
+    options: &RenderOptions,
+    stats: &mut TypographyStats,
+) -> Result<Option<Fixed>, RenderError> {
+    let style = prepared.styles.first().ok_or(RenderError::Typography {
+        reason: "missing_text_style",
+    })?;
+    let resolution = pack.resolve(style.request());
+    if !(resolution.exact_family || resolution.declared_alias) || !resolution.exact_style {
+        return Ok(None);
+    }
+    let font_id = match source {
+        CalcAutomaticMetricSource::RequestedFont => resolution.id,
+        CalcAutomaticMetricSource::PreparedAsianOrRequested => {
+            match prepared_asian_face(prepared, text, options, stats)? {
+                PreparedAsianFace::None => resolution.id,
+                PreparedAsianFace::Verified(font_id)
+                    if pack.weight(font_id).map_err(map_font_error)?
+                        == if style.bold { 700 } else { 400 }
+                        && pack.is_italic(font_id).map_err(map_font_error)? == style.italic =>
+                {
+                    font_id
+                }
+                PreparedAsianFace::Verified(_) | PreparedAsianFace::Unverified => return Ok(None),
+            }
+        }
+    };
+    let metrics = single_face_line_metrics(
+        pack,
+        font_id,
+        style,
+        CellLineLayoutPolicy::CalcEditEngine,
+        1,
+        1,
+    )?;
+    let line_height = calc_line_height_mm100(metrics)?;
+    let total = line_height
+        .checked_mul(prepared.lines.len() as u64)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    calc_automatic_height_from_engine_mm100(total).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedAsianFace {
+    None,
+    Verified(FontId),
+    Unverified,
+}
+
+fn prepared_asian_face(
+    prepared: &PreparedText,
+    text: &str,
+    options: &RenderOptions,
+    stats: &mut TypographyStats,
+) -> Result<PreparedAsianFace, RenderError> {
+    let mut selected = None;
+    for line in &prepared.lines {
+        for run in &line.shaped.runs {
+            let Some(start) = line.source.start.checked_add(run.source.start) else {
+                return Ok(PreparedAsianFace::Unverified);
+            };
+            let Some(end) = line.source.start.checked_add(run.source.end) else {
+                return Ok(PreparedAsianFace::Unverified);
+            };
+            if start > end || end > line.advance_end {
+                return Ok(PreparedAsianFace::Unverified);
+            }
+            let Some(source) = text.get(start..end) else {
+                return Ok(PreparedAsianFace::Unverified);
+            };
+            let summary = calc_script_class_summary_bounded(source, options, stats)?;
+            if !summary.has_asian {
+                continue;
+            }
+            if run.style_index != 0 || run.glyphs.iter().any(|glyph| glyph.glyph_id == 0) {
+                return Ok(PreparedAsianFace::Unverified);
+            }
+            if selected.is_some_and(|font_id| font_id != run.font_id) {
+                return Ok(PreparedAsianFace::Unverified);
+            }
+            selected = Some(run.font_id);
+        }
+    }
+    Ok(selected.map_or(PreparedAsianFace::None, PreparedAsianFace::Verified))
 }
 
 fn account_shaping(
@@ -11051,6 +11693,82 @@ struct CombinedLineMetrics {
     calc_portion_height_mm100: u64,
 }
 
+fn single_face_line_metrics(
+    pack: &FontPack,
+    font_id: FontId,
+    style: &ResolvedRunStyle,
+    policy: CellLineLayoutPolicy,
+    scale_numerator: i64,
+    scale_denominator: i64,
+) -> Result<CombinedLineMetrics, RenderError> {
+    let metrics = pack.metrics(font_id).map_err(map_font_error)?;
+    let font_size = styled_font_size(style, scale_numerator, scale_denominator)?;
+    let shift = styled_script_shift(style, scale_numerator, scale_denominator)?;
+    let ascent = scale_font_units(
+        i64::from(metrics.ascent),
+        font_size,
+        metrics.units_per_em,
+        1,
+    )?
+    .checked_sub(shift)
+    .ok_or(RenderError::CoordinateOverflow)?;
+    let descent = scale_font_units(
+        i64::from(metrics.descent),
+        font_size,
+        metrics.units_per_em,
+        1,
+    )?
+    .checked_sub(shift)
+    .ok_or(RenderError::CoordinateOverflow)?;
+    let line_gap = scale_font_units(
+        i64::from(metrics.line_gap.max(0)),
+        font_size,
+        metrics.units_per_em,
+        1,
+    )?;
+    let (calc_ascent_pixels, calc_descent_pixels, calc_portion_height_mm100) =
+        if policy == CellLineLayoutPolicy::CalcEditEngine {
+            let device_em_pixels = round_unsigned_ratio(
+                u64::try_from(font_size.raw()).map_err(|_| RenderError::CoordinateOverflow)?,
+                1,
+                FIXED_UNITS_PER_PIXEL as u64,
+            )
+            .ok_or(RenderError::CoordinateOverflow)?;
+            let calc_ascent_pixels = round_signed_ratio(
+                i128::from(metrics.ascent),
+                i128::from(device_em_pixels),
+                i128::from(metrics.units_per_em),
+            )?;
+            let calc_descent_pixels = round_signed_ratio(
+                i128::from(metrics.descent),
+                i128::from(device_em_pixels),
+                i128::from(metrics.units_per_em),
+            )?;
+            let calc_portion_pixels = calc_ascent_pixels
+                .checked_sub(calc_descent_pixels)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let calc_portion_height_mm100 =
+                round_unsigned_ratio(calc_portion_pixels, MM100_PER_INCH, CALC_DEVICE_DPI)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+            (
+                calc_ascent_pixels,
+                calc_descent_pixels,
+                calc_portion_height_mm100,
+            )
+        } else {
+            (0, 0, 0)
+        };
+    Ok(CombinedLineMetrics {
+        ascent,
+        descent,
+        line_gap,
+        calc_ascent_pixels,
+        calc_descent_pixels,
+        calc_portion_height_mm100,
+    })
+}
+
 fn styled_line_metrics(
     pack: &FontPack,
     shaped: &ShapedText,
@@ -11068,84 +11786,30 @@ fn styled_line_metrics(
         calc_portion_height_mm100: 0,
     };
     let mut initialized = false;
-    let mut include = |font_id: crate::font::FontId,
-                       style: &ResolvedRunStyle|
-     -> Result<(), RenderError> {
-        let metrics = pack.metrics(font_id).map_err(map_font_error)?;
-        let font_size = styled_font_size(style, scale_numerator, scale_denominator)?;
-        let shift = styled_script_shift(style, scale_numerator, scale_denominator)?;
-        let ascent = scale_font_units(
-            i64::from(metrics.ascent),
-            font_size,
-            metrics.units_per_em,
-            1,
-        )?
-        .checked_sub(shift)
-        .ok_or(RenderError::CoordinateOverflow)?;
-        let descent = scale_font_units(
-            i64::from(metrics.descent),
-            font_size,
-            metrics.units_per_em,
-            1,
-        )?
-        .checked_sub(shift)
-        .ok_or(RenderError::CoordinateOverflow)?;
-        let line_gap = scale_font_units(
-            i64::from(metrics.line_gap.max(0)),
-            font_size,
-            metrics.units_per_em,
-            1,
+    let mut include = |font_id: FontId, style: &ResolvedRunStyle| -> Result<(), RenderError> {
+        let metrics = single_face_line_metrics(
+            pack,
+            font_id,
+            style,
+            policy,
+            scale_numerator,
+            scale_denominator,
         )?;
-        let (calc_ascent_pixels, calc_descent_pixels, calc_portion_height_mm100) =
-            if policy == CellLineLayoutPolicy::CalcEditEngine {
-                let device_em_pixels = round_unsigned_ratio(
-                    u64::try_from(font_size.raw()).map_err(|_| RenderError::CoordinateOverflow)?,
-                    1,
-                    FIXED_UNITS_PER_PIXEL as u64,
-                )
-                .ok_or(RenderError::CoordinateOverflow)?;
-                let calc_ascent_pixels = round_signed_ratio(
-                    i128::from(metrics.ascent),
-                    i128::from(device_em_pixels),
-                    i128::from(metrics.units_per_em),
-                )?;
-                let calc_descent_pixels = round_signed_ratio(
-                    i128::from(metrics.descent),
-                    i128::from(device_em_pixels),
-                    i128::from(metrics.units_per_em),
-                )?;
-                let calc_portion_pixels = calc_ascent_pixels
-                    .checked_sub(calc_descent_pixels)
-                    .and_then(|value| u64::try_from(value).ok())
-                    .ok_or(RenderError::CoordinateOverflow)?;
-                let calc_portion_height_mm100 =
-                    round_unsigned_ratio(calc_portion_pixels, MM100_PER_INCH, CALC_DEVICE_DPI)
-                        .ok_or(RenderError::CoordinateOverflow)?;
-                (
-                    calc_ascent_pixels,
-                    calc_descent_pixels,
-                    calc_portion_height_mm100,
-                )
-            } else {
-                (0, 0, 0)
-            };
         if !initialized {
-            combined.ascent = ascent;
-            combined.descent = descent;
-            combined.line_gap = line_gap;
-            combined.calc_ascent_pixels = calc_ascent_pixels;
-            combined.calc_descent_pixels = calc_descent_pixels;
-            combined.calc_portion_height_mm100 = calc_portion_height_mm100;
+            combined = metrics;
             initialized = true;
         } else {
-            combined.ascent = combined.ascent.max(ascent);
-            combined.descent = combined.descent.min(descent);
-            combined.line_gap = combined.line_gap.max(line_gap);
-            combined.calc_ascent_pixels = combined.calc_ascent_pixels.max(calc_ascent_pixels);
-            combined.calc_descent_pixels = combined.calc_descent_pixels.min(calc_descent_pixels);
+            combined.ascent = combined.ascent.max(metrics.ascent);
+            combined.descent = combined.descent.min(metrics.descent);
+            combined.line_gap = combined.line_gap.max(metrics.line_gap);
+            combined.calc_ascent_pixels =
+                combined.calc_ascent_pixels.max(metrics.calc_ascent_pixels);
+            combined.calc_descent_pixels = combined
+                .calc_descent_pixels
+                .min(metrics.calc_descent_pixels);
             combined.calc_portion_height_mm100 = combined
                 .calc_portion_height_mm100
-                .max(calc_portion_height_mm100);
+                .max(metrics.calc_portion_height_mm100);
         }
         Ok(())
     };
@@ -14742,7 +15406,7 @@ mod tests {
         let conditional_style = conditional_sheet
             .resolved_cell_style(0, 0)
             .expect("conditionally overlaid wrapped style");
-        let calc_line_layout_available = verified_implicit_xlsx(conditional_sheet, &options)
+        let calc_line_layout_available = verified_implicit_ooxml(conditional_sheet, &options)
             && !has_conditional_text_layout_overlay(conditional_sheet);
         assert_eq!(
             cell_line_layout_policy(
@@ -15194,13 +15858,13 @@ mod tests {
     }
 
     #[test]
-    fn implicit_xlsx_mixed_western_asian_normal_row_uses_application_default_height() {
+    fn implicit_xlsx_mixed_western_asian_normal_row_uses_primary_calc_metrics() {
         const MIXED_TEXT: &str = "한국어 자동 줄바꿈 English 日本語 中文 0123456789 한국어 자동 줄바꿈 English 日本語 中文 0123456789 한국어 자동 줄바꿈 English 日本語 中文 0123456789";
 
         let pack = synthetic_test_pack();
         let family = pack.default_family().to_string();
         let styles = format!(
-            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><b/><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
         );
         let worksheet = format!(
             r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{MIXED_TEXT}</t></is></c></row></sheetData></worksheet>"#
@@ -15250,28 +15914,28 @@ mod tests {
             Some(CalcScriptClass::Western)
         );
         assert_eq!(
-            measured.rows[0].size, OOXML_APPLICATION_DEFAULT_ROW_HEIGHT,
-            "verified Normal-family/size Western+Asian text uses Calc's application default"
+            measured.rows[0].size,
+            calc_ooxml_row_height_from_points(11).unwrap(),
+            "the synthetic primary font has Calc's declared 11pt row height"
         );
         assert_eq!(
-            measured.typography.shaped_runs, 0,
-            "the calibrated Western+Asian path must not shape an unwrapped Normal-sized row"
+            measured.typography.shaped_runs, 1,
+            "mixed-script rows must still shape their glyphs before applying primary Calc metrics"
         );
-        assert_eq!(
-            measured.typography.text_work,
-            MIXED_TEXT.chars().count() as u64,
-            "script calibration must account for every inspected scalar"
+        assert!(
+            measured.typography.text_work >= MIXED_TEXT.chars().count() as u64,
+            "script calibration and shaping must account for every inspected scalar"
         );
     }
 
     #[test]
-    fn implicit_xlsx_mixed_complex_normal_row_remains_shaped() {
+    fn implicit_xlsx_mixed_complex_normal_row_uses_primary_calc_metrics() {
         const MIXED_TEXT: &str = "العربية 0123456789";
 
         let pack = synthetic_test_pack();
         let family = pack.default_family().to_string();
         let styles = format!(
-            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><b/><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            r#"<styleSheet><fonts count="2"><font><sz val="11"/><name val="{family}"/></font><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
         );
         let worksheet = format!(
             r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{MIXED_TEXT}</t></is></c></row></sheetData></worksheet>"#
@@ -15303,9 +15967,329 @@ mod tests {
             measured.typography.shaped_runs > 0,
             "a Western+Complex mix must stay on the glyph-aware height path"
         );
+        assert_eq!(
+            measured.rows[0].size,
+            calc_ooxml_row_height_from_points(11).unwrap(),
+            "fallback glyph metrics must not inflate Calc's primary-font automatic row height"
+        );
+    }
+
+    #[test]
+    fn color_only_conditional_format_preserves_calc_layout_and_sizes_affected_rows() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="3"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyFont="1"/><xf fontId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill><font><color rgb="FFFF0000"/></font></dxf></dxfs></styleSheet>"#
+        );
+        let conditional_worksheet = r#"<worksheet><cols><col min="2" max="2" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1"><v>123</v></c><c r="B1" s="2" t="inlineStr"><is><t>wrapped text remains on Calc line layout</t></is></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let inactive_worksheet = r#"<worksheet><cols><col min="2" max="2" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1"><v>123</v></c><c r="B1" s="2" t="inlineStr"><is><t>wrapped text remains on Calc line layout</t></is></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>1000</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let control_worksheet = r#"<worksheet><cols><col min="2" max="2" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1"><v>123</v></c><c r="B1" s="2" t="inlineStr"><is><t>wrapped text remains on Calc line layout</t></is></c></row></sheetData></worksheet>"#;
+        let conditional = imported_xlsx(&styles, conditional_worksheet);
+        let inactive = imported_xlsx(&styles, inactive_worksheet);
+        let control = imported_xlsx(&styles, control_worksheet);
+        let sheet = &conditional.sheets[0];
         assert!(
-            measured.rows[0].size > calc_ooxml_row_height_from_points(11).unwrap(),
-            "the shaped row must not collapse to the declared-font shortcut"
+            !has_conditional_text_layout_overlay(sheet),
+            "font color does not change text geometry"
+        );
+        let wrapped_style = sheet.resolved_cell_style(0, 1).expect("wrapped cell style");
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 1)),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let candidates = sheet.display_cells().collect::<Vec<_>>();
+        let active = active_color_only_conditional_cells(
+            sheet,
+            &candidates,
+            &options,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        assert!(active.requires_individual_metrics(CellCoordinate { row: 0, col: 0 }));
+        assert!(!active.requires_individual_metrics(CellCoordinate { row: 0, col: 1 }));
+        let inactive_candidates = inactive.sheets[0].display_cells().collect::<Vec<_>>();
+        assert!(
+            !active_color_only_conditional_cells(
+                &inactive.sheets[0],
+                &inactive_candidates,
+                &options,
+                &mut Warnings::default(),
+            )
+            .unwrap()
+            .requires_individual_metrics(CellCoordinate { row: 0, col: 0 }),
+            "a false color-only rule must not request individual automatic height"
+        );
+        assert_eq!(
+            cell_line_layout_policy(
+                sheet,
+                CellCoordinate { row: 0, col: 1 },
+                Some(&wrapped_style),
+                None,
+                CalcLineLayoutEvidence {
+                    is_plain_text: true,
+                    has_adjustable_row: true,
+                    wrap_space_available: true,
+                },
+                &options,
+            ),
+            CellLineLayoutPolicy::CalcEditEngine,
+            "an unrelated color-only rule must not disable Calc wrapping"
+        );
+
+        let measure = |workbook: &Workbook| {
+            let sheet = &workbook.sheets[0];
+            let mut snapshot = RenderStyleSnapshot::new(sheet);
+            snapshot
+                .capture_range(sheet, RenderRange::new(0, 0, 0, 1), &options)
+                .unwrap();
+            measure_sheet_axes_inner(
+                sheet,
+                RenderRange::new(0, 0, 0, 1),
+                &snapshot,
+                &options,
+                None,
+                &mut Warnings::default(),
+            )
+            .unwrap()
+        };
+        let conditional_measured = measure(&conditional);
+        let inactive_measured = measure(&inactive);
+        let control_measured = measure(&control);
+        assert!(
+            conditional_measured.typography.shaped_runs > control_measured.typography.shaped_runs,
+            "the conditionally affected automatic numeric cell must use individual Calc metrics"
+        );
+        assert_eq!(
+            conditional_measured.rows[0].size, control_measured.rows[0].size,
+            "color-only paint must not inflate the row in the synthetic primary font"
+        );
+        assert_eq!(
+            inactive_measured.typography.shaped_runs, control_measured.typography.shaped_runs,
+            "an inactive color-only rule must preserve the declared-height shortcut"
+        );
+    }
+
+    #[test]
+    fn lossy_conditional_font_cannot_use_the_color_only_exemption() {
+        let styles = r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Test Sans"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><font><b val="0"/><color rgb="FFFF0000"/></font></dxf></dxfs></styleSheet>"#;
+        let reset_only_styles = r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Test Sans"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><font><b val="0"/></font></dxf></dxfs></styleSheet>"#;
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let workbook = imported_xlsx(styles, worksheet);
+        let reset_only_workbook = imported_xlsx(reset_only_styles, worksheet);
+        let sheet = &workbook.sheets[0];
+        let [metadata] = sheet.conditional_format_metadata() else {
+            panic!("one conditional metadata row");
+        };
+        assert!(!metadata.style_losses.is_empty());
+        assert!(
+            has_conditional_text_layout_overlay(sheet),
+            "an ambiguous font reset must conservatively disable Calc text layout"
+        );
+        let reset_only_sheet = &reset_only_workbook.sheets[0];
+        let [reset_only_metadata] = reset_only_sheet.conditional_format_metadata() else {
+            panic!("one reset-only conditional metadata row");
+        };
+        assert!(reset_only_metadata
+            .differential_style
+            .as_ref()
+            .is_some_and(|style| style.font.is_none()));
+        assert!(reset_only_metadata
+            .style_losses
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::UnsupportedProperty));
+        assert!(
+            has_conditional_text_layout_overlay(reset_only_sheet),
+            "an unretained reset-only font must conservatively disable Calc text layout"
+        );
+    }
+
+    #[test]
+    fn conditional_layout_styles_drive_axes_and_unresolved_text_styles_fail_closed() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let style_sheet = |dxf: &str| {
+            format!(
+                r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf>{dxf}</dxf></dxfs></styleSheet>"#
+            )
+        };
+        let conditional_sheet = |formula: &str| {
+            format!(
+                r#"<worksheet><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>{formula}</formula></cfRule></conditionalFormatting></worksheet>"#
+            )
+        };
+        let control = imported_xlsx(
+            &style_sheet("<font><sz val=\"24\"/></font>"),
+            r#"<worksheet><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c></row></sheetData></worksheet>"#,
+        );
+        let active = imported_xlsx(
+            &style_sheet("<font><sz val=\"24\"/></font>"),
+            &conditional_sheet("0"),
+        );
+        let inactive = imported_xlsx(
+            &style_sheet("<font><sz val=\"24\"/></font>"),
+            &conditional_sheet("100"),
+        );
+        let reset = imported_xlsx(
+            &style_sheet("<font><b val=\"0\"/></font>"),
+            &conditional_sheet("0"),
+        );
+        let inactive_reset = imported_xlsx(
+            &style_sheet("<font><b val=\"0\"/></font>"),
+            &conditional_sheet("100"),
+        );
+        let unresolved_color = imported_xlsx(
+            &style_sheet("<font><color theme=\"99\"/></font>"),
+            &conditional_sheet("0"),
+        );
+        let inactive_unresolved_color = imported_xlsx(
+            &style_sheet("<font><color theme=\"99\"/></font>"),
+            &conditional_sheet("100"),
+        );
+        let number_format = imported_xlsx(
+            &style_sheet(r#"<numFmt numFmtId="165" formatCode="yyyy-mm-dd hh:mm:ss"/>"#),
+            &conditional_sheet("0"),
+        );
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let measure = |workbook: &Workbook| {
+            let sheet = &workbook.sheets[0];
+            let mut snapshot = RenderStyleSnapshot::new(sheet);
+            snapshot
+                .capture_range(sheet, RenderRange::new(0, 0, 0, 0), &options)
+                .unwrap();
+            measure_sheet_axes_inner(
+                sheet,
+                RenderRange::new(0, 0, 0, 0),
+                &snapshot,
+                &options,
+                None,
+                &mut Warnings::default(),
+            )
+        };
+        let control = measure(&control).unwrap();
+        let active = measure(&active).unwrap();
+        let inactive = measure(&inactive).unwrap();
+        assert!(
+            active.rows[0].size > control.rows[0].size,
+            "an active 24pt differential font must grow the automatic row"
+        );
+        assert_eq!(
+            inactive.rows[0].size, control.rows[0].size,
+            "an inactive differential font must not alter row geometry"
+        );
+        assert_eq!(
+            measure(&reset).map(|_| ()),
+            Err(RenderError::Typography {
+                reason: "conditional_text_layout_unresolved",
+            })
+        );
+        assert_eq!(
+            measure(&inactive_reset).unwrap().rows[0].size,
+            control.rows[0].size,
+            "a proven-inactive reset-only rule must not block measurement"
+        );
+        assert_eq!(
+            measure(&unresolved_color).map(|_| ()),
+            Err(RenderError::Typography {
+                reason: "conditional_text_layout_unresolved",
+            })
+        );
+        assert_eq!(
+            measure(&inactive_unresolved_color).unwrap().rows[0].size,
+            control.rows[0].size,
+            "a proven-inactive unresolved font color must not block measurement"
+        );
+        assert_eq!(
+            measure(&number_format).map(|_| ()),
+            Err(RenderError::Typography {
+                reason: "conditional_number_format_layout_unresolved",
+            })
+        );
+    }
+
+    #[test]
+    fn conditional_evaluation_budget_is_shared_by_axes_and_paint() {
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><font><color rgb="FFFF0000"/></font></dxf></dxfs></styleSheet>"#
+        );
+        let worksheet = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting></worksheet>"#;
+        let workbook = imported_xlsx(&styles, worksheet);
+        let mut options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        options.limits.max_conditional_evaluations = 1;
+        assert_eq!(
+            render_sheet_svg(&workbook, 0, &options).map(|_| ()),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::ConditionalEvaluations,
+                limit: 1,
+                actual: 2,
+            })
+        );
+        options.limits.max_conditional_evaluations = 2;
+        render_sheet_svg(&workbook, 0, &options).unwrap();
+    }
+
+    #[test]
+    fn prepared_asian_metric_face_ignores_complex_only_fallback_runs() {
+        let pack = synthetic_test_pack();
+        let options = RenderOptions {
+            default_font_family: "Legacy Sans".to_string(),
+            font_pack: Some(pack.clone()),
+            ..RenderOptions::default()
+        };
+        let make_region = |text: &str| Region {
+            source: CellCoordinate { row: 0, col: 0 },
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(400),
+                height: Fixed::from_pixels(20),
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::Native,
+            calc_wrap_space: None,
+            style: Some(CellStyle::new().font_name("Legacy Sans").size(11)),
+            conditional: ConditionalPaint::default(),
+            text: text.to_string(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+        };
+        let mut statistics = TypographyStats::default();
+        let region = make_region("Latin 한국어 العربية");
+        let base = text_style(&region, &options, false);
+        let prepared =
+            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        assert_eq!(
+            prepared_asian_face(&prepared, &region.text, &options, &mut statistics).unwrap(),
+            PreparedAsianFace::Verified(FontId(0)),
+            "the actual Asian run selects Wide Sans while the Arabic run's RTL face is ignored"
+        );
+
+        let mut statistics = TypographyStats::default();
+        let region = make_region("Latin العربية");
+        let base = text_style(&region, &options, false);
+        let prepared =
+            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        assert_eq!(
+            prepared_asian_face(&prepared, &region.text, &options, &mut statistics).unwrap(),
+            PreparedAsianFace::None
         );
     }
 

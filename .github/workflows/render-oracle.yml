@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: Run the 40-workbook pilot, exact-SHA 800-workbook full, or 24-workbook OOXML row diagnostic campaign
+        description: Run the 40-workbook pilot, exact-SHA 800-workbook full, or 34-workbook OOXML row diagnostic campaign
         required: true
         default: pilot
         type: choice
@@ -119,7 +119,7 @@ jobs:
       LC_ALL: C.UTF-8
       MAX_PARALLEL_SHARDS: "2"
       ORACLE_IMAGE: rxls-render-oracle:lo-26.2.3
-      OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "24"
+      OOXML_ROW_DIAGNOSTIC_CASE_COUNT: "34"
       PILOT_CASE_COUNT: "40"
       PILOT_AUTHORED_PRINT_COUNT: "4"
       PYTHONHASHSEED: "0"
@@ -304,34 +304,44 @@ jobs:
           if profile == "ooxml-row-diagnostic":
               assert manifest["format_counts"] == {"xlsx": expected_per_format}
               assert manifest["generator"] == "rxls-ooxml-row-diagnostic"
-              assert manifest["generator_version"] == "1.1.0"
+              assert manifest["generator_version"] == "1.2.0"
               assert manifest["feature_counts"] == {
                   "auto-bold-font": 1,
                   "auto-bold-font-wrapped": 1,
+                  "auto-heading-western-asian": 1,
+                  "auto-heading-western-complex": 1,
                   "auto-large-font": 1,
                   "auto-long-unwrapped": 1,
+                  "auto-numeric-color-conditional": 1,
+                  "auto-numeric-no-conditional": 1,
+                  "auto-wrapped-color-conditional": 1,
                   "auto-wrapped-explicit": 1,
                   "auto-wrapped-hidden": 1,
                   "auto-wrapped-image": 1,
                   "auto-wrapped-long": 1,
                   "auto-wrapped-long-anchor": 1,
                   "auto-wrapped-merged": 1,
+                  "auto-wrapped-no-conditional": 1,
                   "auto-wrapped-rtl": 1,
                   "auto-wrapped-wide": 1,
                   "explicit-row-height": 1,
+                  "hidden-heading-western-asian": 1,
+                  "hidden-heading-western-complex": 1,
                   "hidden-row": 1,
                   "image-drawing": 1,
+                  "manual-heading-western-asian": 1,
+                  "manual-heading-western-complex": 1,
                   "normal-font-carlito": 4,
-                  "normal-font-noto": 20,
-                  "normal-size-11": 20,
+                  "normal-font-noto": 30,
+                  "normal-size-11": 30,
                   "normal-size-12": 4,
-                  "ooxml-implicit-row": 24,
+                  "ooxml-implicit-row": 34,
                   "right-to-left-layout": 1,
-                  "sheet-format-missing": 20,
+                  "sheet-format-missing": 30,
                   "sheet-format-present": 4,
               }
               assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == (
-                  "1769c019790e334deabbac0d3623c5f2da3a69d64e8bd06796fcd23dbfa8d7ef"
+                  "088db320a0d35494fa8e0a8c33ba95e12a824cfe1b7163c2071cf70528c5d0a2"
               )
           else:
               assert manifest["format_counts"] == {
@@ -736,7 +746,7 @@ jobs:
               run_full_authored_print_campaign
               ;;
             ooxml-row-diagnostic)
-              test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "24"
+              test "$OOXML_ROW_DIAGNOSTIC_CASE_COUNT" = "34"
               run_parity \
                 target/render-oracle-hosted/parity-report-a.json \
                 1 \
@@ -1062,8 +1072,6 @@ jobs:
               "crop_box_width",
               "media_box_height",
               "media_box_width",
-              "xhtml_height",
-              "xhtml_width",
           }
           xhtml_crosscheck_delta_keys = (
               point_delta_keys - direct_point_delta_keys
@@ -2218,7 +2226,7 @@ jobs:
           assert aggregate["schema"] == "rxls.ooxml-row-oracle.v4"
           assert aggregate["passed"] is True
           assert aggregate["baseline"] == {
-              "case_count": 12,
+              "case_count": 16,
               "max_absolute_height_delta_millipoints": aggregate["baseline"][
                   "max_absolute_height_delta_millipoints"
               ],
@@ -2229,8 +2237,8 @@ jobs:
               aggregate["baseline"]["max_absolute_height_delta_millipoints"]
               <= 50
           )
-          assert aggregate["coverage"]["case_count"] == 24
-          assert aggregate["coverage"]["page_count"] == 24
+          assert aggregate["coverage"]["case_count"] == 34
+          assert aggregate["coverage"]["page_count"] == 34
           assert aggregate["identities"]["report_sha256"] == hashlib.sha256(
               report_path.read_bytes()
           ).hexdigest()
