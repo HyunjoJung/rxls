@@ -1337,4 +1337,100 @@ mod tests {
         assert!(MAX_DIMENSION_RAW <= native.max_dimension_raw);
         assert_eq!(rxls_render::Fixed::from_pixels(1).raw(), 1_024);
     }
+
+    /// [`check_input`] is the Rust-side ceiling on raw workbook bytes: the
+    /// last line of defense for any caller that reaches the compiled wasm
+    /// module without going through the JavaScript worker's duplicate
+    /// preflight check (for example a native host embedding this crate, or
+    /// a hand-rolled caller of the stateless `render_sheet_svg_wasm`-style
+    /// exports). It must fail closed on its own, not merely as a side effect
+    /// of the JS-layer check.
+    #[test]
+    fn input_byte_ceiling_fails_closed_at_the_rust_boundary_independent_of_the_js_layer() {
+        let oversized = vec![0_u8; MAX_INPUT_BYTES + 1];
+        let error = check_input(&oversized).unwrap_err();
+        assert_eq!(error.code, "limit_exceeded");
+        assert_eq!(error.resource, Some("inputBytes"));
+        assert_eq!(error.limit, Some(MAX_INPUT_BYTES as u64));
+        assert_eq!(error.actual, Some((MAX_INPUT_BYTES + 1) as u64));
+
+        // The boundary itself must stay usable: exactly at the ceiling is fine.
+        assert!(check_input(&vec![0_u8; MAX_INPUT_BYTES]).is_ok());
+    }
+
+    /// Request-time validation (`options_reject_unknown_fields_and_limit_increases`
+    /// above) only proves that an over-hard-max override is rejected before any
+    /// workbook content is inspected. It does not prove that real, in-range
+    /// content which exceeds an accepted stricter limit is caught while
+    /// rendering. This test exercises that second, previously untested path:
+    /// a legally requested `maxRows` override that the workbook's actual used
+    /// range violates must still fail closed with the renderer's own typed
+    /// `LimitExceeded` error, mapped through [`map_render_error`].
+    #[test]
+    fn render_time_limit_breach_on_real_content_maps_to_a_typed_facade_error() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Sheet1");
+        for row in 0..11 {
+            sheet.write(row, 0, format!("row {row}"));
+        }
+        let bytes = workbook.to_xlsx();
+
+        // maxRows: 1 is a legal, stricter-than-default request (it is not
+        // rejected by `effective_options`), but the workbook actually uses
+        // eleven rows, so the renderer itself must reject it while building
+        // the scene rather than silently clipping the extra rows.
+        let error = render_sheet_svg_core(&bytes, 0, r#"{"limits":{"maxRows":1}}"#).unwrap_err();
+        assert_eq!(error.code, "limit_exceeded");
+        assert_eq!(error.resource, Some("rows"));
+        assert_eq!(error.limit, Some(1));
+        assert!(error.actual.unwrap() > 1, "actual was {:?}", error.actual);
+    }
+
+    /// Print pages must be independently constructible from one open,
+    /// reused [`RenderSession`] in any order, with no hidden dependency on
+    /// having built earlier pages first. This is the facade-level half of
+    /// virtualized output: the underlying `render` crate already proves the
+    /// memory distinction (see `render/tests/printing.rs`,
+    /// `prepared_page_map_builds_exactly_the_requested_original_page`), and
+    /// this test proves the wasm facade exposes that same random-access
+    /// contract rather than accidentally reintroducing an ordering
+    /// requirement or a per-page cache.
+    #[test]
+    fn print_pages_are_built_out_of_order_from_one_reused_session() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Print");
+        for row in 0..120 {
+            sheet.write(row, 0, format!("row {row}"));
+        }
+        let bytes = workbook.to_xlsx();
+
+        let session = RenderSession::new_core(&bytes, &[]).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&session.print_manifest_json_core(0, "{}").unwrap()).unwrap();
+        let page_count = manifest["pages"].as_array().unwrap().len();
+        assert!(
+            page_count >= 2,
+            "fixture must paginate into at least two pages, got {page_count}"
+        );
+
+        // Request the last page before the first page on the same session.
+        // A cache or ordering bug would surface here as a wrong page, a
+        // panic, or a dependency on having rendered page 0 first.
+        let last = session
+            .render_print_page_svg_core(0, page_count - 1, "{}")
+            .unwrap();
+        let first = session.render_print_page_svg_core(0, 0, "{}").unwrap();
+        assert!(last.contains("<svg"));
+        assert!(first.contains("<svg"));
+        assert_ne!(
+            first, last,
+            "distinct pages of a multi-page sheet must render distinct content"
+        );
+
+        // The same page requested twice, out of order, is still deterministic.
+        let last_again = session
+            .render_print_page_svg_core(0, page_count - 1, "{}")
+            .unwrap();
+        assert_eq!(last, last_again);
+    }
 }

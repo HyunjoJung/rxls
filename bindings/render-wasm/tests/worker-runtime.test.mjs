@@ -209,6 +209,56 @@ test("worker opens once and virtualizes only the requested tile and page", async
   );
 });
 
+test("progress never reaches completion on a failing request and stays monotonic", async () => {
+  FakeSession.calls = [];
+  const { runtime, messages } = harness();
+  // "documentId" format is checked during the synchronous protocol preflight
+  // (before the request is even queued, so it never reaches #run), but
+  // whether that document is actually open is only known once #execute runs.
+  // Requesting an unopened, well-formed documentId therefore fails from
+  // inside #execute, after the pre-work progress steps have already been
+  // sent -- exactly the "failure mid-flight" case this test targets.
+  runtime.receive(
+    request("page-not-open", "render-page", {
+      documentId: "doc-never-opened",
+      sheetIndex: 0,
+      pageIndex: 0
+    })
+  );
+  await settle();
+  const failure = result(messages, "page-not-open");
+  assert.equal(failure.ok, false);
+  assert.equal(failure.error.code, "document_not_open");
+
+  const progress = messages
+    .filter(
+      ({ message }) => message.type === "progress" && message.requestId === "page-not-open"
+    )
+    .map(({ message }) => [message.completed, message.total, message.stage]);
+
+  // The document-existence check runs inside #execute, before any wasm
+  // call, so only the pre-execution steps are ever observed for this
+  // failure.
+  assert.deepEqual(progress, [
+    [0, 3, "accepted"],
+    [1, 3, "rendering"]
+  ]);
+  // A failed request must never fabricate a jump to completion: no observed
+  // step may report completed === total, and "complete" must never appear.
+  assert.equal(
+    progress.some(([completed, total]) => completed === total),
+    false
+  );
+  assert.equal(
+    progress.some(([, , stage]) => stage === "complete"),
+    false
+  );
+  for (let index = 1; index < progress.length; index += 1) {
+    assert.ok(progress[index][0] > progress[index - 1][0], "progress must strictly increase");
+    assert.equal(progress[index][1], progress[0][1], "total must stay constant");
+  }
+});
+
 test("queued cancellation prevents wasm work and returns a typed result", async () => {
   FakeSession.calls = [];
   const { runtime, messages } = harness();
@@ -471,6 +521,54 @@ test("active asynchronous work observes cancellation before emitting output", as
     messages.some(({ message }) => message.type === "result" && message.requestId === "page-async" && message.ok),
     false
   );
+});
+
+test("worker stays reusable and the document stays open after cancelling an active render", async () => {
+  FakeSession.calls = [];
+  const { runtime, messages } = harness();
+  runtime.receive(
+    request("open-reuse", "open", { documentId: "doc-reuse", bytes: Uint8Array.of(1) })
+  );
+  await settle();
+  let release;
+  FakeSession.pageGate = new Promise((resolve) => (release = resolve));
+  runtime.receive(
+    request("page-cancelled", "render-page", {
+      documentId: "doc-reuse",
+      sheetIndex: 0,
+      pageIndex: 0
+    })
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.receive({ protocol: PROTOCOL, type: "cancel", requestId: "page-cancelled" });
+  release('<svg data-page="0"></svg>');
+  await settle();
+  FakeSession.pageGate = null;
+  assert.equal(result(messages, "page-cancelled").error.code, "cancelled");
+
+  // Only "open" transactions roll back on cancellation; a cancelled render
+  // must not free the document's session out from under later requests.
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 0);
+
+  // A fresh request against the same document, on the same runtime instance,
+  // must still succeed -- proving the earlier cancellation left neither the
+  // document nor the worker's queue wedged.
+  runtime.receive(
+    request("page-after-cancel", "render-page", {
+      documentId: "doc-reuse",
+      sheetIndex: 0,
+      pageIndex: 1
+    })
+  );
+  await settle();
+  const followUp = result(messages, "page-after-cancel");
+  assert.equal(followUp.ok, true);
+  assert.match(followUp.result.svg, /data-page="1"/);
+
+  runtime.receive(request("close-reuse", "close", { documentId: "doc-reuse" }));
+  await settle();
+  assert.equal(result(messages, "close-reuse").result.closed, true);
+  assert.equal(FakeSession.calls.filter(([kind]) => kind === "free").length, 1);
 });
 
 test("worker rejects active or externally-loaded SVG before returning it", async () => {
