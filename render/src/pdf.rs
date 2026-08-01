@@ -1347,6 +1347,17 @@ fn glyph_spans_are_on_distinct_lines(
     }
 }
 
+fn cluster_source_text(node: &GlyphRunNode, cluster_index: usize) -> &str {
+    node.clusters
+        .get(cluster_index)
+        .and_then(|cluster| {
+            let start = usize::try_from(cluster.source_start).ok()?;
+            let end = usize::try_from(cluster.source_end).ok()?;
+            node.text.get(start..end)
+        })
+        .unwrap_or_default()
+}
+
 fn nominal_clusters_start_new_visual_line(
     node: &GlyphRunNode,
     left_index: usize,
@@ -1371,9 +1382,43 @@ fn nominal_clusters_start_new_visual_line(
     let nominal_height = |metrics: &GlyphClusterMetrics| {
         i128::from(metrics.ascent.raw()) - i128::from(metrics.descent.raw())
     };
-    let larger_height = nominal_height(left).max(nominal_height(right));
     let baseline_tolerance = i128::from(FIXED_UNITS_PER_PIXEL);
-    if baseline_delta + baseline_tolerance < larger_height {
+    // `build_glyph_run` (layout.rs) positions each line's baseline at
+    // `line_top + ascent` and steps `line_top` forward by that line's own
+    // reserved height, which is always at least its own nominal
+    // `ascent - descent`. So any genuine line break must satisfy
+    // `baseline_delta >= right.ascent - left.descent`, regardless of how the
+    // two lines' font sizes compare. Requiring the *larger* of the two
+    // nominal heights instead (a symmetric guess) under-splits whenever a
+    // wrapped line's style changes size across the break - e.g. a small run
+    // wrapping onto a line that opens with a much larger run - because the
+    // smaller ending line never reserved enough height on its own to clear
+    // the larger start line's ascent. Same-line script displacement
+    // (superscript/subscript, see the same-line control fixtures below) can
+    // also clear this looser asymmetric bound, though, so it alone is not
+    // sufficient: pair it with the symmetric bound whenever either cluster's
+    // own text is strongly right-to-left. Bidi-reordered runs are laid out
+    // with a visual gap at the embedding boundary that the cursor-continuity
+    // check below cannot distinguish from a real wrap reset (the gap is not
+    // reliably signed the way a pure LTR/RTL run's advance is), so for those
+    // pairs we keep the original conservative requirement and only rely on
+    // the tighter bound for the non-bidi case the symmetric guess handles
+    // correctly already.
+    let straddles_strong_rtl = cluster_source_text(node, left_index)
+        .chars()
+        .chain(cluster_source_text(node, right_index).chars())
+        .any(|character| {
+            matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+            )
+        });
+    let required_bound = if straddles_strong_rtl {
+        nominal_height(left).max(nominal_height(right))
+    } else {
+        i128::from(right.ascent.raw()) - i128::from(left.descent.raw())
+    };
+    if baseline_delta + baseline_tolerance < required_bound {
         return false;
     }
 
@@ -5484,6 +5529,133 @@ mod tests {
                 "{boxes:?}"
             );
         }
+    }
+
+    fn mixed_size_soft_wrapped_no_whitespace_document() -> PrintDocument {
+        // Two whitespace-free CJK runs, glued together with no space between
+        // them, wrapped onto a narrow column so the automatic break falls
+        // exactly at the run boundary: "天地玄" (small, fills line 1) then
+        // "宇宙洪" (much larger, each character alone fills a line). This is
+        // the "wrap can occur mid-run with no space cluster" shape from a
+        // script other than uniformly-sized CJK: the visual line boundary
+        // also coincides with a rich-text size change, which is exactly what
+        // defeated the old symmetric "larger of the two nominal heights"
+        // requirement in `nominal_clusters_start_new_visual_line`.
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("mixed-size-wrap");
+        sheet.set_col_width(0, 4.0);
+        let base = rxls::CellStyle::new().font_name(&family).size(11).wrap();
+        sheet.write_rich_styled(
+            0,
+            0,
+            [
+                rxls::TextRun::new("天地玄", rxls::Font::new().with_name(&family).with_size(11)),
+                rxls::TextRun::new("宇宙洪", rxls::Font::new().with_name(&family).with_size(72)),
+            ],
+            &base,
+        );
+        outlined_test_document(&workbook, pack)
+    }
+
+    #[test]
+    fn soft_wrapped_mixed_size_run_splits_at_every_visual_line_without_whitespace() {
+        const TEXT: &str = "天地玄宇宙洪";
+        let document = mixed_size_soft_wrapped_no_whitespace_document();
+        let node = first_glyph_run(&document.pages[0].scene.nodes).unwrap();
+        assert_eq!(node.text, TEXT);
+        assert_eq!(node.cluster_metrics.len(), node.clusters.len());
+
+        // The layout produces four distinct visual lines ("天地玄", "宇",
+        // "宙", "洪"): the size change from 11pt to 72pt forces each large
+        // character onto its own line in this narrow column.
+        let layout_baselines = node
+            .cluster_metrics
+            .iter()
+            .map(|metrics| metrics.baseline_y.raw())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(layout_baselines.len(), 4, "{layout_baselines:?}");
+
+        let spans = glyph_semantic_spans(node, node.clusters.len(), node.clip_bounds).unwrap();
+        let span_text = spans
+            .iter()
+            .map(|span| &node.text[span.source.clone()])
+            .collect::<Vec<_>>();
+        // Before the fix, the small-to-large transition at the first wrap
+        // boundary was missed (the ending line's own reserved height never
+        // reached the much taller next line's nominal height), collapsing
+        // "天地玄" and "宇" into one span: ["天地玄宇", "宙", "洪"]. Each
+        // visual line must instead surface as its own span.
+        assert_eq!(span_text, ["天地玄", "宇", "宙", "洪"], "{span_text:?}");
+
+        // Spans must partition the source text exactly (logical reading
+        // order preserved, no characters dropped or duplicated) and every
+        // span's glyphs share one baseline (a genuine visual line).
+        assert_eq!(spans.first().unwrap().source.start, 0);
+        assert_eq!(spans.last().unwrap().source.end, node.text.len());
+        assert!(spans
+            .windows(2)
+            .all(|pair| pair[0].source.end == pair[1].source.start));
+        for span in &spans {
+            let baselines = span
+                .glyphs
+                .iter()
+                .map(|index| node.cluster_metrics[*index].baseline_y.raw())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(baselines.len(), 1, "{span:?}");
+        }
+
+        let pdf = render_print_document_pdf(&document).unwrap();
+        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let source = String::from_utf8_lossy(&pdf);
+        for line in &span_text {
+            assert!(
+                source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(line))),
+                "{line:?}"
+            );
+        }
+        // The whole run must never be emitted as one page-sized ActualText
+        // span; ToUnicode/ActualText round-trips the same logical text
+        // regardless, split only along visual line boundaries.
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(TEXT))));
+
+        if let Some(text) = poppler_text(&pdf) {
+            assert_eq!(
+                text.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>(),
+                TEXT
+            );
+        }
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), span_text);
+        }
+    }
+
+    #[test]
+    fn same_line_script_displaced_bidi_run_is_not_split_by_the_looser_wrap_bound() {
+        // Guards the fix above: a same-line superscript/subscript baseline
+        // shift across a Latin/RTL boundary must still be retained as one
+        // ActualText span. Bidi-reordered runs are laid out with a visual
+        // gap at the embedding boundary that is not a reliable line-wrap
+        // signal, so `nominal_clusters_start_new_visual_line` must keep
+        // requiring the stricter symmetric height bound whenever either
+        // cluster's own text is strongly right-to-left.
+        let document = same_line_metric_control_document();
+        let nodes = &document.pages[0].scene.nodes;
+        let mixed_bidi_scripts = glyph_run_with_text(nodes, "ABאב").unwrap();
+        let spans = glyph_semantic_spans(
+            mixed_bidi_scripts,
+            mixed_bidi_scripts.clusters.len(),
+            mixed_bidi_scripts.clip_bounds,
+        )
+        .unwrap();
+        let span_text = spans
+            .iter()
+            .map(|span| &mixed_bidi_scripts.text[span.source.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(span_text, ["ABאב"], "{span_text:?}");
     }
 
     #[test]
