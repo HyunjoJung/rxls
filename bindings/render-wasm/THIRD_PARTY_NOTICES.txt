@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: d9a0c97d9341785715e819e56270f09736877b1d7f2d8e0d0823c5f8f7317baf
+- Cargo lock SHA-256: 99acf680e902292e9a1210be1d1c07b2b17de1e2f46656c57c1bf0d125733569
 - Third-party packages: 81
 - Unique legal texts: 73
 

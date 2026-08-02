@@ -263,7 +263,7 @@ To test the exact packaged crate as both an external Rust dependency and a
 ```sh
 cargo package --locked
 python3 scripts/smoke_crate_distribution.py \
-  --crate target/package/rxls-0.1.2.crate \
+  --crate target/package/rxls-0.1.3.crate \
   --fixture tests/fixtures/xlsx/reader-structural.xlsx
 ```
 

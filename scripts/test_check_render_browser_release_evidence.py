@@ -31,7 +31,7 @@ class BrowserEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.archive = self.root / "rxls-render-worker-0.1.2.tgz"
+        self.archive = self.root / "rxls-render-worker-0.1.3.tgz"
         self.archive.write_bytes(b"deterministic npm archive fixture\n" * 64)
         archive = self.archive.read_bytes()
         integrity = base64.b64encode(hashlib.sha512(archive).digest()).decode("ascii")
@@ -41,7 +41,7 @@ class BrowserEvidenceTests(unittest.TestCase):
                 [
                     {
                         "name": "@rxls/render-worker",
-                        "version": "0.1.2",
+                        "version": "0.1.3",
                         "filename": self.archive.name,
                         "size": len(archive),
                         "unpackedSize": 12,

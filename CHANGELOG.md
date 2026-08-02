@@ -6,7 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.3] - 2026-08-02
+
 ### Added
+- Kept a row that is script-mixed only across internally-uniform cells on
+  Calc's pattern row height, so a western/Asian or western/complex heading row
+  no longer renders 3.34 pt taller than Calc while every other cohort agreed.
+  Text that mixes script classes inside one cell, a cell re-resolved by an
+  active conditional format, and multi-line runs deliberately keep the
+  per-line metric accumulation.
+- Ratcheted the hosted OOXML row diagnostic over all 34 cohorts. Automatic
+  height previously sat outside the tracked baseline, so an automatic-height
+  residual of any size still reported success; an over-threshold residual now
+  fails closed.
+- Split soft-wrapped PDF `ActualText` spans at asymmetric-size visual line
+  breaks, using the bound the layout actually guarantees
+  (`baseline_delta >= right.ascent - left.descent`) instead of the larger of
+  the two adjacent clusters' nominal heights, which under-split whenever a
+  whitespace-free wrap coincided with a rich-text size change. Strongly
+  right-to-left pairs keep the original symmetric bound so bidi-reordered
+  same-line runs are not split.
+- Gave ODS sheets Calc's native 0.5 cm no-information default row height on
+  both the single-page and ordinary row paths, which previously disagreed with
+  each other and drifted 0.85 pt per undeclared row against the oracle.
+- Retained exact integral XLSB font-size provenance, resolved only when the
+  binary Fonts, CellStyleXFs, CellXFs, and Styles collections are structurally
+  complete and their default font sources agree, and drove renderer axis
+  geometry from it.
+- Proved the browser render package's typed input/scene/page/output limits,
+  tiered cancellation, monotonic progress, and per-page virtualization with
+  dedicated tests, including the Rust-boundary input ceiling and a render-time
+  limit breach mapping to a typed facade error.
 
 - Added typed, bounded parse provenance for primary and tolerant CFB container
   paths, surfaced consistently through `Workbook`, diagnose JSON, CLI, and WASM.
@@ -210,7 +242,8 @@ Apache POI, or runtime subprocess dependency.
   comments, metadata, charts, drawings, and editable package parts after the
   `quick-xml` migration.
 
-[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.3
 [0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2
 [0.1.1]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.1
 [0.1.0]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.0

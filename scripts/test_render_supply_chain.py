@@ -208,11 +208,11 @@ class RenderSupplyChainTests(unittest.TestCase):
             deny["advisories"]["ignore"],
             ["RUSTSEC-2026-0192", "RUSTSEC-2026-0206"],
         )
-        self.assertEqual(binding["dependencies"]["rxls"]["version"], "0.1.2")
+        self.assertEqual(binding["dependencies"]["rxls"]["version"], "0.1.3")
         self.assertEqual(
             binding["dependencies"]["rxls-render"]["version"], "0.1.0"
         )
-        self.assertEqual(renderer["dependencies"]["rxls"]["version"], "0.1.2")
+        self.assertEqual(renderer["dependencies"]["rxls"]["version"], "0.1.3")
 
 
 if __name__ == "__main__":

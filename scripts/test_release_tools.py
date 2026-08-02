@@ -245,8 +245,8 @@ class ReleaseToolTests(unittest.TestCase):
         registry_index = workflow.index("name: Smoke published crates.io distribution")
         self.assertLess(local_index, assembly_index)
         self.assertLess(publish_index, registry_index)
-        self.assertIn("--crate target/package/rxls-0.1.2.crate", workflow)
-        self.assertIn("--registry-version 0.1.2", workflow)
+        self.assertIn("--crate target/package/rxls-0.1.3.crate", workflow)
+        self.assertIn("--registry-version 0.1.3", workflow)
         self.assertIn("dist/release-crate-distribution-smoke.json", workflow)
         registry_upload = workflow.index(
             "name: Upload published crates.io distribution evidence"

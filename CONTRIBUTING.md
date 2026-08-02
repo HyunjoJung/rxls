@@ -48,7 +48,7 @@ python3 scripts/libreoffice-render-parity.py --corpus tests/fixtures \
   --dry-run --max-files 8 \
   --report target/libreoffice-render-parity-dry-run.json
 cargo package --locked
-python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate
+python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
 cargo publish --dry-run --locked
 ```
 
