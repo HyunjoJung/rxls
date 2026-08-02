@@ -2226,7 +2226,7 @@ jobs:
           assert aggregate["schema"] == "rxls.ooxml-row-oracle.v4"
           assert aggregate["passed"] is True
           assert aggregate["baseline"] == {
-              "case_count": 16,
+              "case_count": 34,
               "max_absolute_height_delta_millipoints": aggregate["baseline"][
                   "max_absolute_height_delta_millipoints"
               ],
