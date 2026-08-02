@@ -4495,7 +4495,11 @@ fn calc_script_class(character: char) -> Option<CalcScriptClass> {
     }
 }
 
-#[cfg(test)]
+/// Whether `text` mixes Calc script classes inside one cell.
+///
+/// Calc keeps an internally-uniform cell on its pattern font height; only a
+/// cell that itself spans script classes selects a taller face for part of the
+/// run and grows the automatic row.
 fn has_mixed_calc_script_classes(text: &str) -> bool {
     let mut resolved = None;
     for script in text.chars().filter_map(calc_script_class) {
@@ -4944,6 +4948,23 @@ fn expand_automatic_row_heights(
         } else {
             None
         };
+        // Calc sizes an automatic row from the *pattern* font height
+        // (`lcl_GetAttribHeight`: 118% of the pattern font's integer-twip
+        // height plus the standard margin/row adjustments) rather than from the
+        // shaped run's own face metrics. The two only diverge when the cell
+        // genuinely forces Calc off the pattern: text that mixes script classes
+        // inside one cell selects a taller face for part of the run, and an
+        // active conditional format re-resolves the cell's own appearance.
+        // A row that is "mixed" only because *different* cells carry different
+        // scripts does not qualify -- each of those cells is internally uniform,
+        // so Calc keeps every one of them on the pattern height, which is why a
+        // western/Asian or western/complex heading row stays exactly as tall as
+        // the same sheet without it.
+        let calc_pattern_points = verified_calc_points.filter(|_| {
+            !active_color_only
+                && !active_layout_style
+                && !has_mixed_calc_script_classes(cell.formatted)
+        });
         let declared_plain_height = if requires_individual_plain {
             None
         } else if let Some(points) = declared_points {
@@ -5010,6 +5031,7 @@ fn expand_automatic_row_heights(
                 options,
                 typography,
                 calc_metric_source,
+                calc_pattern_points,
             )?
         };
         if is_merged {
@@ -10943,6 +10965,7 @@ fn measure_automatic_cell_height(
     options: &RenderOptions,
     stats: &mut TypographyStats,
     calc_metric_source: Option<CalcAutomaticMetricSource>,
+    calc_pattern_points: Option<u16>,
 ) -> Result<Fixed, RenderError> {
     let style = text_style(region, options, sheet_right_to_left);
     let prepared = prepare_styled_text(pack, region, &style, sheet_right_to_left, options, stats)?;
@@ -10952,6 +10975,7 @@ fn measure_automatic_cell_height(
             &prepared,
             &region.text,
             source,
+            calc_pattern_points,
             options,
             stats,
         )? {
@@ -10977,6 +11001,7 @@ fn calc_verified_automatic_cell_height(
     prepared: &PreparedText,
     text: &str,
     source: CalcAutomaticMetricSource,
+    pattern_points: Option<u16>,
     options: &RenderOptions,
     stats: &mut TypographyStats,
 ) -> Result<Option<Fixed>, RenderError> {
@@ -10986,6 +11011,15 @@ fn calc_verified_automatic_cell_height(
     let resolution = pack.resolve(style.request());
     if !(resolution.exact_family || resolution.declared_alias) || !resolution.exact_style {
         return Ok(None);
+    }
+    // A single line whose cell stays on the pattern font resolves through the
+    // same formula the implicit row height already uses, so an automatic row
+    // and an untouched one agree by construction. Multi-line runs keep the
+    // per-line metric accumulation below, because Calc stacks measured lines.
+    if prepared.lines.len() == 1 {
+        if let Some(height) = pattern_points.and_then(calc_ooxml_row_height_from_points) {
+            return Ok(Some(height));
+        }
     }
     let font_id = match source {
         CalcAutomaticMetricSource::RequestedFont => resolution.id,
@@ -15959,6 +15993,69 @@ mod tests {
         assert!(
             measured.typography.text_work >= MIXED_TEXT.chars().count() as u64,
             "script calibration and shaping must account for every inspected scalar"
+        );
+    }
+
+    #[test]
+    fn heading_row_mixed_only_across_uniform_cells_keeps_the_pattern_row_height() {
+        // Each cell is internally single-script, so Calc keeps every one of
+        // them on the pattern font height and the row stays exactly as tall as
+        // the same sheet without it. Only a cell that itself mixes script
+        // classes (or one re-resolved by a conditional format) leaves the
+        // pattern, so a row that is "mixed" merely because separate cells carry
+        // separate scripts must not grow.
+        //
+        // This is a consistency check, not the regression gate: the synthetic
+        // pack resolves every script to one face, so shaped and pattern metrics
+        // coincide here and the assertion below holds either way. The behaviour
+        // is gated for real by the hosted OOXML row-diagnostic ratchet, whose
+        // `auto_heading_western_asian`/`auto_heading_western_complex` cohorts
+        // measure this against Calc with the pinned multi-face font pack.
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let worksheet = concat!(
+            r#"<worksheet><sheetData><row r="1">"#,
+            r#"<c r="A1" t="inlineStr"><is><t>Project review</t></is></c>"#,
+            r#"<c r="B1" t="inlineStr"><is><t>한국어 검토</t></is></c>"#,
+            r#"<c r="C1" t="inlineStr"><is><t>日本語確認</t></is></c>"#,
+            r#"<c r="D1" t="inlineStr"><is><t>中文复核</t></is></c>"#,
+            r#"</row></sheetData></worksheet>"#
+        )
+        .to_string();
+        let workbook = imported_xlsx(&styles, &worksheet);
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 0, 3);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let mut snapshot = RenderStyleSnapshot::new(sheet);
+        snapshot.capture_range(sheet, range, &options).unwrap();
+        let measured = measure_sheet_axes_inner(
+            sheet,
+            range,
+            &snapshot,
+            &options,
+            None,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+
+        // Every heading cell is internally uniform even though the row is not.
+        assert!(!has_mixed_calc_script_classes("Project review"));
+        assert!(!has_mixed_calc_script_classes("한국어 검토"));
+        assert!(!has_mixed_calc_script_classes("日本語確認"));
+        assert!(!has_mixed_calc_script_classes("中文复核"));
+        assert_eq!(
+            measured.rows[0].size,
+            calc_ooxml_row_height_from_points(11).unwrap(),
+            "a row mixed only across internally-uniform cells keeps Calc's pattern row height"
         );
     }
 

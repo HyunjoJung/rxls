@@ -302,7 +302,7 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         self.assertEqual(
             output["baseline"],
             {
-                "case_count": 16,
+                "case_count": 34,
                 "max_absolute_height_delta_millipoints": 40,
                 "passed": True,
                 "threshold_max_absolute_height_delta_millipoints": 50,
@@ -466,7 +466,13 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
         ):
             self._reduce(report)
 
-    def test_automatic_height_residual_is_diagnostic_not_a_gate(self) -> None:
+    def test_automatic_height_residual_is_gated_for_every_cohort(self) -> None:
+        # Automatic height used to be diagnostic-only: every ``auto_*`` cohort
+        # sat outside the tracked baseline, so a residual of any size still
+        # reported success. That is what let a western/Asian heading row drift
+        # 3.34 pt taller than Calc unnoticed. Automatic height is the behaviour
+        # this diagnostic exists to pin, so the whole matrix is now ratcheted
+        # and an over-threshold automatic residual fails closed.
         report = copy.deepcopy(self.report)
         automatic_index = next(
             index
@@ -481,19 +487,9 @@ class OoxmlRowOracleReducerTests(unittest.TestCase):
             rxls_height
         )
         geometry["deltas_points"]["media_box_height"] = self._point(18_020)
-        output = self._reduce(report)
-        automatic = next(
-            row
-            for row in output["cohorts"]
-            if row["dimensions"]["toggle"].startswith("auto_")
-            and row["height_delta_millipoints"] == 18_020
-        )
-        self.assertEqual(
-            automatic["height_delta_millipoints"],
-            18_020,
-        )
-        self.assertIs(output["passed"], True)
-        self.assertIs(output["baseline"]["passed"], True)
+        with self.assertRaises(Exception) as caught:
+            self._reduce(report)
+        self.assertIn("baseline_height_delta", str(caught.exception))
 
     def test_output_is_deterministic_under_report_file_reordering(self) -> None:
         first = self._reduce()

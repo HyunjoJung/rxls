@@ -30,7 +30,7 @@ PROFILE = "ooxml-row-diagnostic"
 GENERATOR = "rxls-ooxml-row-diagnostic"
 GENERATOR_VERSION = "1.2.0"
 CASE_COUNT = 34
-BASELINE_CASE_COUNT = 16
+BASELINE_CASE_COUNT = CASE_COUNT
 BASELINE_MAX_ABSOLUTE_HEIGHT_DELTA_MILLIPOINTS = 50
 PRINT_MODE_SINGLE_PAGE = "single-page-sheets"
 LIBREOFFICE_ARTIFACT_SHA256 = (
@@ -239,19 +239,13 @@ TOGGLE_FEATURES = {
     "manual-heading-western-complex": "manual_heading_western_complex",
     "right-to-left-layout": "right_to_left_layout",
 }
-BASELINE_TOGGLE_VALUES = frozenset(
-    {
-        "explicit_row_height",
-        "hidden_row",
-        "hidden_heading_western_asian",
-        "hidden_heading_western_complex",
-        "image_drawing",
-        "manual_heading_western_asian",
-        "manual_heading_western_complex",
-        "none",
-        "right_to_left_layout",
-    }
-)
+# Every cohort is ratcheted. The baseline used to cover only the explicit,
+# hidden, manual and untoggled rows, which left every `auto_*` automatic-height
+# cohort unmeasured -- a western/Asian heading row drifted 3.34 pt taller than
+# Calc while the campaign still reported success. Automatic height is precisely
+# the behaviour this diagnostic exists to pin, so the tracked set is now the
+# whole matrix.
+BASELINE_TOGGLE_VALUES = frozenset({"none", *TOGGLE_FEATURES.values()})
 EXPECTED_TOGGLE_COUNTS = {
     "none": 8,
     **{value: 1 for value in TOGGLE_FEATURES.values()},
