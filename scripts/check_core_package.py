@@ -209,8 +209,8 @@ def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
                             metadata = manifest.get("package", {})
                             package_name = metadata.get("name")
                             package_version = metadata.get("version")
-                            if package_name != "rxls" or package_version != "0.1.2":
-                                errors.append("package identity is not rxls 0.1.2")
+                            if package_name != "rxls" or package_version != "0.1.3":
+                                errors.append("package identity is not rxls 0.1.3")
                             if metadata.get("rust-version") != "1.85":
                                 errors.append("packaged core MSRV is not 1.85")
                             dependencies = sorted(manifest.get("dependencies", {}))

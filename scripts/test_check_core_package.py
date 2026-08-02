@@ -35,7 +35,7 @@ DEPENDENCIES = "\n".join(
 MANIFEST = f"""
 [package]
 name = "rxls"
-version = "0.1.2"
+version = "0.1.3"
 rust-version = "1.85"
 {FEATURES}
 {DEPENDENCIES}
@@ -58,12 +58,12 @@ def write_crate(
     files.update(extra or {})
     with tarfile.open(path, "w:gz") as package:
         for relative, payload in files.items():
-            info = tarfile.TarInfo(f"rxls-0.1.2/{relative}")
+            info = tarfile.TarInfo(f"rxls-0.1.3/{relative}")
             info.size = len(payload)
             package.addfile(info, io.BytesIO(payload))
         if duplicate is not None:
             payload = b"duplicate"
-            info = tarfile.TarInfo(f"rxls-0.1.2/{duplicate}")
+            info = tarfile.TarInfo(f"rxls-0.1.3/{duplicate}")
             info.size = len(payload)
             package.addfile(info, io.BytesIO(payload))
 
