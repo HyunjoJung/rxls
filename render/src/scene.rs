@@ -456,11 +456,9 @@ impl GlyphRunNode {
             return false;
         }
 
-        if self
-            .glyphs
-            .iter()
-            .any(|glyph| glyph.size <= Fixed::ZERO || glyph.origin_x.checked_add(glyph.size).is_none())
-        {
+        if self.glyphs.iter().any(|glyph| {
+            glyph.size <= Fixed::ZERO || glyph.origin_x.checked_add(glyph.size).is_none()
+        }) {
             return false;
         }
 

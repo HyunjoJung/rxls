@@ -20,8 +20,8 @@ use crate::font::{
 use crate::media::decode_image;
 use crate::scene::{
     ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode, ImageNode,
-    LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
-    TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
+    LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneFontFace, SceneNode,
+    ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
 };
 use crate::typography::{wrap_text_lines, CellLineLayoutPolicy};
 use unicode_bidi::{bidi_class, BidiClass};
@@ -11256,6 +11256,8 @@ fn build_glyph_run(
     let mut cluster_metrics = Vec::new();
     let mut paints = Vec::new();
     let mut decorations = Vec::new();
+    let mut glyphs = Vec::new();
+    let mut font_faces = Vec::new();
     let mut line_top = top;
     for (line, line_height) in prepared.lines.iter().zip(line_heights) {
         let baseline = line_top
@@ -11284,6 +11286,8 @@ fn build_glyph_run(
             &mut cluster_metrics,
             &mut paints,
             &mut decorations,
+            &mut glyphs,
+            &mut font_faces,
         )?;
         if line.advance_end < line.source.end {
             if region.text.get(line.advance_end..line.source.end) != Some(" ") {
@@ -11324,8 +11328,8 @@ fn build_glyph_run(
     }
     let (pivot_x, pivot_y) = rotation_pivot(region.rect, prepared.horizontal_padding, style)?;
     let node = GlyphRunNode {
-        glyphs: Vec::new(),
-        font_faces: Vec::new(),
+        glyphs,
+        font_faces,
         text: region.text.clone(),
         clip_bounds,
         commands,
@@ -11971,6 +11975,8 @@ fn append_styled_shaped_outlines(
     cluster_metrics: &mut Vec<GlyphClusterMetrics>,
     paints: &mut Vec<GlyphPaint>,
     decorations: &mut Vec<LineNode>,
+    glyphs: &mut Vec<ShapedGlyph>,
+    font_faces: &mut Vec<SceneFontFace>,
 ) -> Result<(), RenderError> {
     let mut visual_cursor = line_x;
     for run in &shaped.runs {
@@ -12027,6 +12033,29 @@ fn append_styled_shaped_outlines(
         let synthetic_italic =
             style.italic && !pack.is_italic(run.font_id).map_err(map_font_error)?;
         let synthetic_bold = style.bold && pack.weight(run.font_id).map_err(map_font_error)? < 600;
+        let synthetic_style = synthetic_italic || synthetic_bold;
+        let face_index = {
+            let identity = pack
+                .selected_face_identity(run.font_id)
+                .map_err(map_font_error)?;
+            let existing = font_faces
+                .iter()
+                .position(|face| face.face_sha256 == identity.face_sha256);
+            match existing {
+                Some(index) => index,
+                None => {
+                    font_faces.push(SceneFontFace {
+                        family: identity.family.to_string(),
+                        weight: identity.weight,
+                        italic: identity.italic,
+                        units_per_em: metrics.units_per_em,
+                        face_sha256: identity.face_sha256.to_string(),
+                    });
+                    font_faces.len() - 1
+                }
+            }
+        };
+        let face_index = u32::try_from(face_index).map_err(|_| RenderError::CoordinateOverflow)?;
         let run_command_start = output.len() as u64;
         let mut logical_cluster_starts = run
             .glyphs
@@ -12080,6 +12109,14 @@ fn append_styled_shaped_outlines(
                 let origin_y = run_baseline
                     .checked_sub(y_offset)
                     .ok_or(RenderError::CoordinateOverflow)?;
+                glyphs.push(ShapedGlyph {
+                    face: face_index,
+                    glyph_id: glyph.glyph_id,
+                    origin_x,
+                    origin_y,
+                    size: font_size,
+                    synthetic: synthetic_style,
+                });
                 let remaining = options
                     .limits
                     .max_path_commands
@@ -14288,6 +14325,8 @@ mod tests {
         let mut cluster_metrics = Vec::new();
         let mut paints = Vec::new();
         let mut decorations = Vec::new();
+        let mut glyphs = Vec::new();
+        let mut font_faces = Vec::new();
         append_styled_shaped_outlines(
             &pack,
             "fi",
@@ -14305,8 +14344,17 @@ mod tests {
             &mut cluster_metrics,
             &mut paints,
             &mut decorations,
+            &mut glyphs,
+            &mut font_faces,
         )
         .unwrap();
+        assert_eq!(font_faces.len(), 1);
+        assert_eq!(font_faces[0].units_per_em, 1_000);
+        assert_eq!(glyphs.len(), 1, "the ligature shapes to a single glyph");
+        assert_eq!(glyphs[0].face, 0);
+        assert_eq!(glyphs[0].origin_y, Fixed::from_pixels(16));
+        assert_eq!(glyphs[0].size, Fixed::from_pixels(16));
+        assert!(!glyphs[0].synthetic);
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].source_start, 0);
         assert_eq!(clusters[0].source_end, 2);
@@ -14332,6 +14380,8 @@ mod tests {
             1,
             &limited,
             &mut TypographyStats::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
