@@ -903,6 +903,8 @@ mod tests {
     ) -> GlyphRunNode {
         let command_end = commands.len() as u64;
         GlyphRunNode {
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
             text: text.to_string(),
             clip_bounds: Rect {
                 x: Fixed::from_raw(clip_left),

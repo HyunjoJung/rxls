@@ -321,6 +321,49 @@ pub struct GlyphPaint {
     pub color: Rgb,
 }
 
+/// Identity of one font face referenced by shaped glyphs.
+///
+/// Scenes stay self-describing: the digest pins which face produced each
+/// glyph without carrying the face bytes. A backend that embeds font programs
+/// resolves these against the same pinned pack that produced the scene.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SceneFontFace {
+    /// Resolved family name.
+    pub family: String,
+    /// Resolved OS/2 weight class.
+    pub weight: u16,
+    /// Resolved italic flag.
+    pub italic: bool,
+    /// Design units per em, needed to interpret glyph ids.
+    pub units_per_em: u16,
+    /// Lowercase hex SHA-256 of the face bytes, matching the pack manifest.
+    pub face_sha256: String,
+}
+
+/// One shaped glyph retained alongside its replayed outline.
+///
+/// The outline commands remain authoritative for painting. These records add
+/// the glyph identity that outlines discard, so a backend can embed a real
+/// font program instead of outlining every glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShapedGlyph {
+    /// Index into [`Scene::font_faces`].
+    pub face: u32,
+    /// Glyph id within that face.
+    pub glyph_id: u16,
+    /// Pen x position for this glyph in scene coordinates.
+    pub origin_x: Fixed,
+    /// Baseline y position for this glyph in scene coordinates.
+    pub origin_y: Fixed,
+    /// Rendered em size.
+    pub size: Fixed,
+    /// Whether synthetic bold or italic was applied to the painted outline.
+    ///
+    /// Synthetic styling cannot be reproduced by embedding the face alone, so
+    /// backends must not embed a run whose glyphs set this.
+    pub synthetic: bool,
+}
+
 /// Deterministically shaped text represented by absolute glyph outlines.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GlyphRunNode {
@@ -352,6 +395,16 @@ pub struct GlyphRunNode {
     pub pivot_y: Fixed,
     /// Allowlisted hyperlink target, if this outlined text is interactive.
     pub hyperlink: Option<String>,
+    /// Optional shaped-glyph identities parallel to the painted outlines.
+    ///
+    /// Layout-produced nodes populate this vector. An empty vector retains
+    /// compatibility with caller-authored scenes, which fall back to outlined
+    /// glyph emission.
+    pub glyphs: Vec<ShapedGlyph>,
+    /// Font faces referenced by [`ShapedGlyph::face`], in first-use order.
+    ///
+    /// Empty whenever `glyphs` is empty.
+    pub font_faces: Vec<SceneFontFace>,
 }
 
 impl GlyphRunNode {
@@ -400,6 +453,14 @@ impl GlyphRunNode {
             previous_command_end = cluster.command_end;
         }
         if previous_command_end != command_len {
+            return false;
+        }
+
+        if self
+            .glyphs
+            .iter()
+            .any(|glyph| glyph.size <= Fixed::ZERO || glyph.origin_x.checked_add(glyph.size).is_none())
+        {
             return false;
         }
 
@@ -772,6 +833,8 @@ mod tests {
     #[test]
     fn glyph_metadata_accepts_visual_bidi_order_and_rejects_unsafe_ranges() {
         let mut node = GlyphRunNode {
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
             text: "Aאב".to_string(),
             clip_bounds: Rect {
                 x: Fixed::ZERO,

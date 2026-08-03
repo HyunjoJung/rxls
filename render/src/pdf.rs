@@ -3154,6 +3154,8 @@ mod tests {
     ) -> GlyphRunNode {
         let commands = sized_rectangle_commands(left, top, width, height);
         GlyphRunNode {
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
             text: text.to_string(),
             clip_bounds: Rect {
                 x: Fixed::ZERO,
@@ -3468,6 +3470,8 @@ mod tests {
             height: Fixed::from_pixels(120),
             background: Rgb::WHITE,
             nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
                 text: text.to_string(),
                 clip_bounds: Rect {
                     x: Fixed::ZERO,
@@ -3528,6 +3532,8 @@ mod tests {
             height: Fixed::from_pixels(120),
             background: Rgb::WHITE,
             nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
                 text: text.to_string(),
                 clip_bounds: Rect {
                     x: Fixed::ZERO,
@@ -3721,6 +3727,8 @@ mod tests {
             height: Fixed::from_pixels(80),
             background: Rgb::WHITE,
             nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
                 text: text.to_string(),
                 clip_bounds: Rect {
                     x: Fixed::ZERO,
@@ -3764,6 +3772,8 @@ mod tests {
         let mut document = document_with_nodes(
             "type3-bottom-straddling",
             vec![SceneNode::GlyphRun(GlyphRunNode {
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
                 text: text.to_string(),
                 clip_bounds: Rect {
                     x: Fixed::ZERO,
@@ -3853,6 +3863,8 @@ mod tests {
             height: Fixed::from_pixels(80),
             background: Rgb::WHITE,
             nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
                 text: text.to_string(),
                 clip_bounds: Rect {
                     x: Fixed::ZERO,
@@ -4238,6 +4250,8 @@ mod tests {
                 }
                 SceneNode::Text(text) => {
                     *node = SceneNode::GlyphRun(GlyphRunNode {
+                        glyphs: Vec::new(),
+                        font_faces: Vec::new(),
                         text: text.text.clone(),
                         clip_bounds: Rect {
                             x: Fixed::ZERO,
@@ -4409,6 +4423,8 @@ mod tests {
                     alt_text: Some("four pixels".to_string()),
                 }),
                 SceneNode::GlyphRun(GlyphRunNode {
+                    glyphs: Vec::new(),
+                    font_faces: Vec::new(),
                     text: "AB".to_string(),
                     clip_bounds: Rect {
                         x: Fixed::from_pixels(64),
@@ -4899,6 +4915,8 @@ mod tests {
         commands.extend(sized_rectangle_commands(70, 10, 12, 10));
         commands.extend(sized_rectangle_commands(10, 10, 24, 10));
         let node = GlyphRunNode {
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
             text: "漢字 אב גד".to_string(),
             clip_bounds: Rect {
                 x: Fixed::ZERO,
@@ -5189,6 +5207,8 @@ mod tests {
             });
         }
         let node = GlyphRunNode {
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
             text,
             clip_bounds: Rect {
                 x: Fixed::ZERO,

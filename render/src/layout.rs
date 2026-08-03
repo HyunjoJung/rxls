@@ -11324,6 +11324,8 @@ fn build_glyph_run(
     }
     let (pivot_x, pivot_y) = rotation_pivot(region.rect, prepared.horizontal_padding, style)?;
     let node = GlyphRunNode {
+        glyphs: Vec::new(),
+        font_faces: Vec::new(),
         text: region.text.clone(),
         clip_bounds,
         commands,

@@ -528,6 +528,8 @@ fn outlined_multiscript_node() -> GlyphRunNode {
     append_rectangle(&mut commands, 92, 20, 8, 10);
     append_rectangle(&mut commands, 104, 20, 8, 10);
     GlyphRunNode {
+        glyphs: Vec::new(),
+        font_faces: Vec::new(),
         text: "Latin 한글 אב".to_string(),
         clip_bounds: Rect {
             x: Fixed::ZERO,
