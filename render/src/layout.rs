@@ -10870,8 +10870,11 @@ fn text_style(region: &Region, options: &RenderOptions, sheet_right_to_left: boo
     };
     let baseline = match alignment.and_then(|alignment| alignment.vertical) {
         Some(VAlign::Top) => TextBaseline::Top,
-        Some(VAlign::Bottom) => TextBaseline::Bottom,
-        Some(VAlign::Middle) | None => TextBaseline::Middle,
+        Some(VAlign::Middle) => TextBaseline::Middle,
+        // ECMA-376 Part 1 section 18.8.1 gives `vertical` a default of
+        // `bottom`, which is what Excel and Calc both render for a cell that
+        // declares no vertical alignment.
+        Some(VAlign::Bottom) | None => TextBaseline::Bottom,
     };
     let size = font
         .and_then(|font| font.size_pt)
@@ -13630,6 +13633,27 @@ mod tests {
             }
         }
         maximum - minimum
+    }
+    #[test]
+    fn a_cell_without_vertical_alignment_sits_on_the_row_bottom() {
+        // ECMA-376 Part 1 section 18.8.1 defaults `vertical` to `bottom`, and
+        // both Excel and Calc render it that way. Centring instead lifts every
+        // unaligned cell off the baseline Calc puts it on.
+        let rect = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(100),
+            height: Fixed::from_pixels(40),
+        };
+        let block = Fixed::from_pixels(12);
+        assert_eq!(
+            vertical_block_top(rect, block, TextBaseline::Bottom).unwrap(),
+            Fixed::from_pixels(28)
+        );
+        assert_ne!(
+            vertical_block_top(rect, block, TextBaseline::Bottom).unwrap(),
+            vertical_block_top(rect, block, TextBaseline::Middle).unwrap()
+        );
     }
 
     #[test]
