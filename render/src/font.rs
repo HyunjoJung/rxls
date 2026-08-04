@@ -2050,6 +2050,7 @@ fn synthetic_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
         (*b"loca", synthetic_loca()),
         (*b"maxp", synthetic_maxp()),
         (*b"name", synthetic_name(family)),
+        (*b"OS/2", synthetic_os2()),
         (*b"post", synthetic_post()),
     ];
     tables.sort_by_key(|(tag, _)| *tag);
@@ -2184,6 +2185,49 @@ fn synthetic_hhea() -> Vec<u8> {
     table.extend_from_slice(&[0; 24]);
     be_u16(&mut table, 3);
     assert_eq!(table.len(), 36);
+    table
+}
+
+/// A version 4 `OS/2` table declaring `fsType` 0, installable embedding.
+///
+/// Without this the synthetic faces state no embedding permission at all, and
+/// the conservative gate in `embed` refuses them, so no in-tree test could ever
+/// reach the font-program path.
+#[cfg(test)]
+fn synthetic_os2() -> Vec<u8> {
+    let mut table = Vec::new();
+    be_u16(&mut table, 4); // version
+    be_i16(&mut table, 600); // xAvgCharWidth
+    be_u16(&mut table, 400); // usWeightClass
+    be_u16(&mut table, 5); // usWidthClass
+    be_u16(&mut table, 0); // fsType: installable embedding
+    for _ in 0..8 {
+        be_i16(&mut table, 0); // sub/superscript metrics
+    }
+    be_i16(&mut table, 50); // yStrikeoutSize
+    be_i16(&mut table, 300); // yStrikeoutPosition
+    be_i16(&mut table, 0); // sFamilyClass
+    table.extend_from_slice(&[0_u8; 10]); // panose
+    for _ in 0..4 {
+        be_u32(&mut table, 0); // ulUnicodeRange1..4
+    }
+    table.extend_from_slice(b"RXLS"); // achVendID
+    be_u16(&mut table, 0x0040); // fsSelection: regular
+    be_u16(&mut table, 0x0020); // usFirstCharIndex
+    be_u16(&mut table, 0xFFFF); // usLastCharIndex
+    be_i16(&mut table, 800); // sTypoAscender
+    be_i16(&mut table, -200); // sTypoDescender
+    be_i16(&mut table, 200); // sTypoLineGap
+    be_u16(&mut table, 800); // usWinAscent
+    be_u16(&mut table, 200); // usWinDescent
+    be_u32(&mut table, 0); // ulCodePageRange1
+    be_u32(&mut table, 0); // ulCodePageRange2
+    be_i16(&mut table, 500); // sxHeight
+    be_i16(&mut table, 700); // sCapHeight
+    be_u16(&mut table, 0); // usDefaultChar
+    be_u16(&mut table, 0x0020); // usBreakChar
+    be_u16(&mut table, 1); // usMaxContext
+    assert_eq!(table.len(), 96);
     table
 }
 

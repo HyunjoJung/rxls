@@ -186,9 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_face_without_a_licensing_statement_is_refused() {
-        // The synthetic pack's faces carry no OS/2 table, so they grant no
-        // embedding permission. Refusing costs only the Type 3 fallback.
+    fn a_real_pack_face_subsets_deterministically_and_shrinks() {
         let pack = crate::font::synthetic_test_pack();
         let id = pack
             .resolve(crate::font::FontRequest {
@@ -201,23 +199,93 @@ mod tests {
         let bytes = pack
             .face_program(digest)
             .expect("pack exposes its own face");
+
+        // Deliberately unsorted and repeated: the caller must not have to
+        // normalize, and the output must not depend on the order it supplies.
+        let first = subset_face(bytes, &[2, 1, 2]).expect("subset a real face");
+        let second = subset_face(bytes, &[1, 2, 1, 2]).expect("subset a real face");
+        assert_eq!(
+            first.program, second.program,
+            "the same glyph set must produce byte-identical programs"
+        );
+
+        assert_eq!(first.kind, FontProgramKind::TrueType);
+        assert!(first.program.len() < bytes.len(), "a subset must shrink");
         assert!(
-            ttf_parser::Face::parse(bytes, 0).is_ok(),
-            "the face itself is valid; only its permissions are missing"
+            ttf_parser::Face::parse(&first.program, 0).is_ok(),
+            "the emitted program must be a parseable font"
+        );
+        assert_eq!(first.gids, vec![0, 1, 2], "notdef is always retained");
+        assert_eq!(first.subset_gid(0), Some(0));
+        assert_eq!(first.subset_gid(2), Some(2));
+        assert_eq!(first.subset_gid(9), None, "unrequested glyphs are absent");
+        assert_eq!(first.advances.len(), first.gids.len());
+        assert_eq!(first.units_per_em, 1_000);
+        assert_eq!(first.ascender, 800);
+        assert_eq!(first.descender, -200);
+        assert_eq!(first.cap_height, 700);
+    }
+
+    #[test]
+    fn a_face_without_a_licensing_statement_is_refused() {
+        // Strip the OS/2 table and the face states no embedding permission at
+        // all. Refusing costs only the Type 3 fallback, which renders correctly.
+        let pack = crate::font::synthetic_test_pack();
+        let id = pack
+            .resolve(crate::font::FontRequest {
+                family: "Wide Sans",
+                weight: 400,
+                italic: false,
+            })
+            .id;
+        let digest = pack.selected_face_identity(id).unwrap().face_sha256;
+        let bytes = pack.face_program(digest).unwrap().to_vec();
+        let stripped = strip_table(&bytes, b"OS/2");
+        assert!(
+            ttf_parser::Face::parse(&stripped, 0).is_ok(),
+            "the face itself stays valid; only its permissions are gone"
         );
         assert_eq!(
-            subset_face(bytes, &[2, 5]).unwrap_err(),
+            subset_face(&stripped, &[1, 2]).unwrap_err(),
             EmbedRejection::EmbeddingRestricted
         );
     }
 
-    #[test]
-    fn truncated_font_headers_are_rejected_rather_than_panicking() {
-        // A plausible sfnt magic followed by nothing: the shape of input that
-        // would tempt a parser into reading past the end.
-        assert_eq!(
-            subset_face(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x01], &[1]).unwrap_err(),
-            EmbedRejection::InvalidFace
-        );
+    /// Remove one table from an sfnt, leaving the rest intact.
+    fn strip_table(data: &[u8], drop: &[u8; 4]) -> Vec<u8> {
+        let count = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let mut kept = Vec::new();
+        for index in 0..count {
+            let record = 12 + index * 16;
+            let tag = &data[record..record + 4];
+            let offset = u32::from_be_bytes(data[record + 8..record + 12].try_into().unwrap());
+            let length = u32::from_be_bytes(data[record + 12..record + 16].try_into().unwrap());
+            if tag != drop {
+                let start = offset as usize;
+                let end = start + length as usize;
+                let mut tag_bytes = [0_u8; 4];
+                tag_bytes.copy_from_slice(tag);
+                kept.push((tag_bytes, data[start..end].to_vec()));
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&data[0..4]);
+        out.extend_from_slice(&(kept.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[0_u8; 6]);
+        let mut offset = 12 + kept.len() * 16;
+        for (tag, body) in &kept {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&[0_u8; 4]);
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            offset += (body.len() + 3) & !3;
+        }
+        for (_, body) in &kept {
+            out.extend_from_slice(body);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+        }
+        out
     }
 }

@@ -13170,8 +13170,8 @@ mod tests {
     use super::*;
     use crate::font::{synthetic_test_pack, FontId, ShapedGlyph, ShapedRun};
     use crate::{
-        build_print_document, render_print_document_pdf, render_print_document_png_pages,
-        render_sheet_svg, PrintOptions,
+        build_print_document, render_print_document_pdf, render_print_document_pdf_with_fonts,
+        render_print_document_png_pages, render_sheet_svg, PrintOptions,
     };
 
     fn outlined_options(range: RenderRange) -> RenderOptions {
@@ -14276,6 +14276,30 @@ mod tests {
         assert!(pdf_source.contains("/Subtype /Type3"));
         assert!(!pdf_source.contains("/Helvetica"));
         assert!(pdf_source.contains("0.784314 0.039216 0.078431 rg"));
+
+        // The same document rendered with the pack in hand embeds real font
+        // programs instead of outlining every glyph.
+        let pack = options
+            .font_pack
+            .as_ref()
+            .expect("test renders with a pack");
+        let embedded = render_print_document_pdf_with_fonts(&document, pack).unwrap();
+        assert_eq!(
+            embedded,
+            render_print_document_pdf_with_fonts(&document, pack).unwrap(),
+            "embedded output must be byte-deterministic"
+        );
+        let embedded_source = String::from_utf8_lossy(&embedded);
+        assert!(embedded_source.contains("/Subtype /Type0"));
+        assert!(embedded_source.contains("/Encoding /Identity-H"));
+        assert!(embedded_source.contains("/Subtype /CIDFontType2"));
+        assert!(embedded_source.contains("/FontFile2"));
+        assert!(
+            embedded.len() < pdf.len(),
+            "embedding must shrink the document: {} vs {}",
+            embedded.len(),
+            pdf.len()
+        );
 
         if std::process::Command::new("pdftotext")
             .arg("-v")
