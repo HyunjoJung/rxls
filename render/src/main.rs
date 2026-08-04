@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rxls::Workbook;
 use rxls_render::{
-    build_print_document, render_print_document_pdf, render_print_page_png, render_scene_svg,
-    render_sheet_svg, Fixed, FontPack, PathCommand, PrintDocument, PrintOptions, Rect,
-    RenderOptions, RenderRange, RenderSelection, Rgb, Scene, SceneNode, TextAnchor, TextBaseline,
-    FIXED_UNITS_PER_PIXEL, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    build_print_document, render_print_document_pdf, render_print_document_pdf_with_fonts,
+    render_print_page_png, render_scene_svg, render_sheet_svg, Fixed, FontPack, PathCommand,
+    PrintDocument, PrintOptions, Rect, RenderOptions, RenderRange, RenderSelection, Rgb, Scene,
+    SceneNode, TextAnchor, TextBaseline, FIXED_UNITS_PER_PIXEL, MAX_WORKSHEET_COLUMN,
+    MAX_WORKSHEET_ROW,
 };
 use sha2::{Digest, Sha256};
 
@@ -569,7 +570,12 @@ fn render_print_bundle(
         }
     }
     let pdf = if backends.contains(&PrintBackend::Pdf) {
-        let bytes = render_print_document_pdf(&document)?;
+        // With the verified pack in hand the backend can embed real font
+        // programs; without one it stays on the outlined path.
+        let bytes = match render_options.font_pack.as_ref() {
+            Some(pack) => render_print_document_pdf_with_fonts(&document, pack)?,
+            None => render_print_document_pdf(&document)?,
+        };
         let file = format!("sheet-{sheet_index:04}.pdf");
         record_bundle_bytes(bundle_bytes, bytes.len() as u64)?;
         fs::write(staging_dir.join(&file), &bytes)?;

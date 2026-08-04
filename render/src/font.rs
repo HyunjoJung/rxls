@@ -340,9 +340,6 @@ impl FontPack {
     /// without the scene carrying it. A digest that is absent means the scene
     /// came from a different pack, which the caller treats as "do not embed"
     /// rather than as an error.
-    ///
-    /// Reachable only from tests until the PDF embedding consumer lands.
-    #[allow(dead_code)]
     pub(crate) fn face_program(&self, face_sha256: &str) -> Option<&[u8]> {
         self.inner
             .faces

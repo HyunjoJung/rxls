@@ -347,8 +347,13 @@ pub struct SceneFontFace {
 /// font program instead of outlining every glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShapedGlyph {
-    /// Index into [`Scene::font_faces`].
+    /// Index into [`GlyphRunNode::font_faces`].
     pub face: u32,
+    /// Index of the source cluster this glyph belongs to.
+    ///
+    /// A cluster can shape to several glyphs, and a glyph can paint no
+    /// outline commands at all, so command ranges cannot recover this mapping.
+    pub cluster: u32,
     /// Glyph id within that face.
     pub glyph_id: u16,
     /// Pen x position for this glyph in scene coordinates.

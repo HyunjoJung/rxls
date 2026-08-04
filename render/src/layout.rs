@@ -12111,6 +12111,10 @@ fn append_styled_shaped_outlines(
                     .ok_or(RenderError::CoordinateOverflow)?;
                 glyphs.push(ShapedGlyph {
                     face: face_index,
+                    // This group's cluster is pushed once the group finishes,
+                    // so the pending length is the index it will occupy.
+                    cluster: u32::try_from(clusters.len())
+                        .map_err(|_| RenderError::CoordinateOverflow)?,
                     glyph_id: glyph.glyph_id,
                     origin_x,
                     origin_y,

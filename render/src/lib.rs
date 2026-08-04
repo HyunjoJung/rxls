@@ -27,7 +27,7 @@ pub use layout::{
     RenderReport, RenderSelection, RenderWarning, RenderedFontFace, SceneBuild, WarningCode,
     MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
-pub use pdf::render_print_document_pdf;
+pub use pdf::{render_print_document_pdf, render_print_document_pdf_with_fonts};
 pub use png::{render_print_document_png_pages, render_print_page_png};
 pub use print::{
     build_print_document, build_print_page, build_sheet_print_document, build_sheet_print_page,

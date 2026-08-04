@@ -1,6 +1,6 @@
 //! Deterministic PDF serialization from print-page scenes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 
@@ -8,7 +8,9 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 
+use crate::embed::{subset_face, EmbeddedFace, FontProgramKind};
 use crate::error::{LimitKind, RenderError};
+use crate::font::FontPack;
 use crate::print::PrintDocument;
 use crate::scene::{
     backend_image_trace, backend_text_trace, format_fixed, BackendGeometryTrace,
@@ -21,6 +23,9 @@ const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
 const PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR: i64 = 4;
 const TYPE3_TEXT_SCALE: u16 = 1_000;
 const TYPE3_GLYPHS_PER_SUBSET: usize = 255;
+
+/// Subset index carried by references whose run paints from an embedded font.
+const EMBEDDED_SUBSET_SENTINEL: usize = usize::MAX;
 const MAX_TYPE3_GLYPH_PROGRAMS: u64 = 1_000_000;
 const MAX_CLIP_GROUP_DEPTH: usize = 64;
 
@@ -33,6 +38,7 @@ struct PdfPage {
     images: Vec<PdfImage>,
     uses_standard_font: bool,
     subset_fonts: BTreeSet<usize>,
+    embedded_fonts: BTreeSet<usize>,
 }
 
 #[derive(Debug)]
@@ -201,24 +207,134 @@ struct PdfFontSubset {
     bounds: Option<PdfGlyphBounds>,
 }
 
+/// One glyph shown from an embedded font program.
+#[derive(Debug, Clone, Copy)]
+struct PdfEmbeddedGlyph {
+    font_index: usize,
+    cid: u16,
+    origin_x: Fixed,
+    origin_y: Fixed,
+    size: Fixed,
+}
+
+/// One face embedded as a Type0 composite font.
 #[derive(Debug)]
-struct PdfFontRegistry {
+struct PdfEmbeddedFace {
+    digest: String,
+    face: EmbeddedFace,
+    /// Subset gid to the text it stands for, for `/ToUnicode`.
+    to_unicode: BTreeMap<u16, String>,
+}
+
+#[derive(Debug)]
+struct PdfFontRegistry<'a> {
     subsets: Vec<PdfFontSubset>,
     glyph_count: u64,
     retained_bytes: u64,
     glyph_limit: u64,
     byte_limit: u64,
+    /// Pack backing embedded font programs; `None` keeps every run on the
+    /// outlined Type 3 path.
+    fonts: Option<&'a FontPack>,
+    embedded: Vec<PdfEmbeddedFace>,
 }
 
-impl PdfFontRegistry {
-    fn new(backend_command_limit: u64, byte_limit: u64) -> Self {
+impl<'a> PdfFontRegistry<'a> {
+    fn new(backend_command_limit: u64, byte_limit: u64, fonts: Option<&'a FontPack>) -> Self {
         Self {
             subsets: Vec::new(),
             glyph_count: 0,
             retained_bytes: 0,
             glyph_limit: backend_command_limit.min(MAX_TYPE3_GLYPH_PROGRAMS),
             byte_limit,
+            fonts,
+            embedded: Vec::new(),
         }
+    }
+
+    /// Subset every embeddable face used anywhere in the document.
+    ///
+    /// This must happen before any page is built. Subsetting lazily per run
+    /// would fix each face's glyph set to whatever the first run happened to
+    /// use, so every later run needing another glyph would fall back and the
+    /// document would end up mostly outlined anyway.
+    fn prepare_embedded_faces(&mut self, document: &PrintDocument) {
+        let Some(fonts) = self.fonts else {
+            return;
+        };
+        let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        for page in &document.pages {
+            collect_embeddable_glyphs(&page.scene.nodes, &mut wanted);
+        }
+        for (digest, gids) in wanted {
+            let Some(bytes) = fonts.face_program(&digest) else {
+                continue;
+            };
+            let requested = gids.into_iter().collect::<Vec<_>>();
+            let Ok(face) = subset_face(bytes, &requested) else {
+                continue;
+            };
+            self.embedded.push(PdfEmbeddedFace {
+                digest,
+                face,
+                to_unicode: BTreeMap::new(),
+            });
+        }
+    }
+
+    /// Plan an embedded-font emission for one run, or decline it.
+    ///
+    /// Declining is always safe: the caller falls back to the outlined Type 3
+    /// path, which renders identically. The result is indexed by source cluster
+    /// so the semantic span machinery keeps working unchanged.
+    fn register_embedded_node(
+        &mut self,
+        node: &GlyphRunNode,
+    ) -> Option<Vec<Vec<PdfEmbeddedGlyph>>> {
+        if self.fonts.is_none() || !node_is_embeddable(node) {
+            return None;
+        }
+
+        // A run is embedded whole or not at all, so one unavailable face keeps
+        // the whole run outlined rather than splitting it across two strategies.
+        let mut font_indices = Vec::with_capacity(node.font_faces.len());
+        for scene_face in &node.font_faces {
+            font_indices.push(
+                self.embedded
+                    .iter()
+                    .position(|candidate| candidate.digest == scene_face.face_sha256)?,
+            );
+        }
+
+        let mut per_cluster: Vec<Vec<PdfEmbeddedGlyph>> = vec![Vec::new(); node.clusters.len()];
+        for glyph in &node.glyphs {
+            let face_index = usize::try_from(glyph.face).ok()?;
+            let font_index = *font_indices.get(face_index)?;
+            let cid = self.embedded[font_index].face.subset_gid(glyph.glyph_id)?;
+            let cluster = usize::try_from(glyph.cluster).ok()?;
+            per_cluster.get_mut(cluster)?.push(PdfEmbeddedGlyph {
+                font_index,
+                cid,
+                origin_x: glyph.origin_x,
+                origin_y: glyph.origin_y,
+                size: glyph.size,
+            });
+        }
+
+        // Record what each code stands for while cluster text is still in hand.
+        for (cluster_index, cluster) in node.clusters.iter().enumerate() {
+            let start = usize::try_from(cluster.source_start).ok()?;
+            let end = usize::try_from(cluster.source_end).ok()?;
+            let text = node.text.get(start..end)?;
+            if let Some(first) = per_cluster.get(cluster_index).and_then(|list| list.first()) {
+                self.embedded[first.font_index]
+                    .to_unicode
+                    .entry(first.cid)
+                    .or_insert_with(|| text.to_string());
+            }
+        }
+
+        Some(per_cluster)
     }
 
     fn register_node(
@@ -226,6 +342,7 @@ impl PdfFontRegistry {
         node: &GlyphRunNode,
         semantic_clip: Option<Rect>,
         mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
+        retain_program: bool,
     ) -> Result<Vec<PdfGlyphReference>, RenderError> {
         let placement_clip = if node.rotation_degrees.rem_euclid(360) == 0 {
             semantic_clip
@@ -242,6 +359,7 @@ impl PdfFontRegistry {
                     0..0,
                     Some(default_glyph_placement(node)?),
                     trace.as_deref_mut(),
+                    retain_program,
                 )?);
             }
             return Ok(references);
@@ -323,11 +441,13 @@ impl PdfFontRegistry {
                 paint_cursor..paint_end,
                 placement,
                 trace.as_deref_mut(),
+                retain_program,
             )?);
         }
         Ok(references)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_glyph(
         &mut self,
         node: &GlyphRunNode,
@@ -336,6 +456,7 @@ impl PdfFontRegistry {
         paint_range: std::ops::Range<usize>,
         placement: Option<PdfGlyphPlacement>,
         trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
+        retain_program: bool,
     ) -> Result<PdfGlyphReference, RenderError> {
         let actual = self
             .glyph_count
@@ -421,6 +542,20 @@ impl PdfFontRegistry {
         } else {
             Fixed::from_pixels(1)
         };
+        if !retain_program {
+            // The run paints from an embedded font program, so retaining an
+            // outlined copy would emit a font object nothing draws and give
+            // back the size this path exists to save. Only the placement is
+            // needed, to keep semantic spans and boundary anchors identical.
+            return Ok(PdfGlyphReference {
+                subset_index: EMBEDDED_SUBSET_SENTINEL,
+                code: 0,
+                origin_x,
+                origin_y,
+                height,
+                reverse_y,
+            });
+        }
         let mut content = BoundedContent::new(self.byte_limit);
         content.push(&format!("{} 0 d0\n", format_fixed(width)))?;
         push_glyph_program_paints(
@@ -545,6 +680,154 @@ struct PdfFontObjectIds {
     glyphs: Vec<u32>,
 }
 
+/// Object ids backing one embedded Type0 composite font.
+#[derive(Debug)]
+struct PdfEmbeddedObjectIds {
+    font: u32,
+    descendant: u32,
+    descriptor: u32,
+    program: u32,
+    to_unicode: u32,
+}
+
+/// Resolve the fill colour a cluster's glyphs are painted with.
+///
+/// Paint spans cover outline command ranges, so a cluster takes the colour of
+/// the span containing the first command it paints. Clusters that paint nothing
+/// fall back to the run's cell-level colour.
+fn cluster_paint_color(node: &GlyphRunNode, cluster_index: usize) -> Rgb {
+    let Some(cluster) = node.clusters.get(cluster_index) else {
+        return node.color;
+    };
+    node.paints
+        .iter()
+        .find(|paint| {
+            paint.command_start <= cluster.command_start
+                && cluster.command_start < paint.command_end
+        })
+        .map_or(node.color, |paint| paint.color)
+}
+
+/// Whether a run can paint from an embedded font program.
+///
+/// Synthetic bold and italic are painted by transforming outlines, which
+/// embedding the face alone cannot reproduce.
+fn node_is_embeddable(node: &GlyphRunNode) -> bool {
+    !node.glyphs.is_empty()
+        && !node.font_faces.is_empty()
+        && !node.glyphs.iter().any(|glyph| glyph.synthetic)
+}
+
+/// Gather every glyph id each face must retain, across a whole scene tree.
+fn collect_embeddable_glyphs(nodes: &[SceneNode], wanted: &mut BTreeMap<String, BTreeSet<u16>>) {
+    for node in nodes {
+        match node {
+            SceneNode::ClipGroup(group) => collect_embeddable_glyphs(&group.nodes, wanted),
+            SceneNode::GlyphRun(run) => {
+                if !node_is_embeddable(run) {
+                    continue;
+                }
+                for glyph in &run.glyphs {
+                    let Some(face) = usize::try_from(glyph.face)
+                        .ok()
+                        .and_then(|index| run.font_faces.get(index))
+                    else {
+                        continue;
+                    };
+                    wanted
+                        .entry(face.face_sha256.clone())
+                        .or_default()
+                        .insert(glyph.glyph_id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build the `/ToUnicode` CMap for an embedded subset.
+fn embedded_to_unicode_cmap(entry: &PdfEmbeddedFace) -> String {
+    let mut mappings = String::new();
+    let mut count = 0_usize;
+    for (cid, text) in &entry.to_unicode {
+        let _ = writeln!(&mut mappings, "<{cid:04X}> <{}>", utf16be_hex(text));
+        count += 1;
+    }
+    format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n{count} beginbfchar\n{mappings}endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+    )
+}
+
+/// Build the `/W` array mapping subset CIDs to advance widths.
+///
+/// Widths are expressed in the PDF glyph space of 1/1000 em, so design units
+/// are rescaled by the face's own units per em rather than assumed to be 1000.
+fn embedded_widths_array(face: &EmbeddedFace) -> String {
+    let upem = i64::from(face.units_per_em.max(1));
+    let mut widths = String::from("[0 [");
+    for (index, advance) in face.advances.iter().enumerate() {
+        if index > 0 {
+            widths.push(' ');
+        }
+        let scaled = i64::from(*advance) * 1000 / upem;
+        let _ = write!(&mut widths, "{scaled}");
+    }
+    widths.push_str("]]");
+    widths
+}
+
+/// Build the Type0 font, descendant CIDFont, and descriptor dictionaries.
+fn embedded_font_dictionaries(
+    index: usize,
+    entry: &PdfEmbeddedFace,
+    ids: &PdfEmbeddedObjectIds,
+) -> (String, String, String) {
+    let face = &entry.face;
+    let upem = i64::from(face.units_per_em.max(1));
+    let scale = |value: i16| i64::from(value) * 1000 / upem;
+    let name = format!("RXLSEM+EmbeddedSubset{index:04}");
+    let (subtype, program_key) = match face.kind {
+        FontProgramKind::Cff => ("CIDFontType0", "FontFile3"),
+        FontProgramKind::TrueType => ("CIDFontType2", "FontFile2"),
+    };
+
+    let font = format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H /DescendantFonts [{} 0 R] /ToUnicode {} 0 R >>",
+        ids.descendant, ids.to_unicode
+    );
+    // Symbolic: the subset's built-in encoding is authoritative, and a
+    // nonsymbolic claim would invite a reader to substitute its own.
+    let mut flags = 4_u32;
+    if face.monospaced {
+        flags |= 1;
+    }
+    if face.italic_angle != 0.0 {
+        flags |= 64;
+    }
+    let descendant = format!(
+        "<< /Type /Font /Subtype /{subtype} /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {} 0 R /DW 0 /W {}{} >>",
+        ids.descriptor,
+        embedded_widths_array(face),
+        match face.kind {
+            FontProgramKind::TrueType => " /CIDToGIDMap /Identity",
+            FontProgramKind::Cff => "",
+        }
+    );
+    let descriptor = format!(
+        "<< /Type /FontDescriptor /FontName /{name} /Flags {flags} /FontBBox [{} {} {} {}] /ItalicAngle {} /Ascent {} /Descent {} /CapHeight {} /StemV 80 /{program_key} {} 0 R >>",
+        scale(face.bbox.0),
+        scale(face.bbox.1),
+        scale(face.bbox.2),
+        scale(face.bbox.3),
+        pdf_decimal_value(f64::from(face.italic_angle)),
+        scale(face.ascender),
+        scale(face.descender),
+        scale(face.cap_height),
+        ids.program,
+    );
+    (font, descendant, descriptor)
+}
+
 /// Serialize all print pages into one byte-deterministic PDF 1.7 document.
 ///
 /// Font-shaped cells remain the exact verified glyph outlines from the shared
@@ -554,7 +837,27 @@ struct PdfFontObjectIds {
 /// retain the PDF standard Helvetica fallback only when the caller deliberately
 /// renders without a verified font pack.
 pub fn render_print_document_pdf(document: &PrintDocument) -> Result<Vec<u8>, RenderError> {
-    render_print_document_pdf_impl(document, None)
+    render_print_document_pdf_impl(document, None, None)
+}
+
+/// Render a print document to PDF, embedding font programs where the pack
+/// permits it.
+///
+/// Outlined Type 3 glyphs are always correct to look at, but they make every
+/// consumer recompute text geometry against an em that is not the font's, so
+/// extracted word and line boxes are wrong. Given the pack that produced the
+/// scene, runs whose faces allow installable embedding are emitted as Type0
+/// composite fonts instead, which both shrinks the file and makes the reported
+/// geometry true.
+///
+/// Any face that withholds embedding, any run carrying synthetic bold or
+/// italic, and any subsetting failure fall back to the outlined path, so this
+/// never renders worse than [`render_print_document_pdf`].
+pub fn render_print_document_pdf_with_fonts(
+    document: &PrintDocument,
+    fonts: &FontPack,
+) -> Result<Vec<u8>, RenderError> {
+    render_print_document_pdf_impl(document, None, Some(fonts))
 }
 
 #[cfg(test)]
@@ -562,13 +865,14 @@ pub(crate) fn render_print_document_pdf_with_trace(
     document: &PrintDocument,
 ) -> Result<(Vec<u8>, Vec<BackendGeometryTrace>), RenderError> {
     let mut traces = Vec::with_capacity(document.pages.len());
-    let pdf = render_print_document_pdf_impl(document, Some(&mut traces))?;
+    let pdf = render_print_document_pdf_impl(document, Some(&mut traces), None)?;
     Ok((pdf, traces))
 }
 
 fn render_print_document_pdf_impl(
     document: &PrintDocument,
     mut traces: Option<&mut Vec<BackendGeometryTrace>>,
+    fonts: Option<&FontPack>,
 ) -> Result<Vec<u8>, RenderError> {
     if document.pages.is_empty() {
         return Err(RenderError::Backend {
@@ -581,7 +885,9 @@ fn render_print_document_pdf_impl(
     let mut font_registry = PdfFontRegistry::new(
         document.limits.max_backend_commands,
         document.limits.max_pdf_bytes,
+        fonts,
     );
+    font_registry.prepare_embedded_faces(document);
     for page in &document.pages {
         let mut page_trace = traces
             .is_some()
@@ -679,6 +985,22 @@ fn render_print_document_pdf_impl(
             glyphs,
         });
     }
+    let mut embedded_object_ids = Vec::with_capacity(font_registry.embedded.len());
+    for _ in &font_registry.embedded {
+        let font = next_image;
+        let descendant = next_image + 1;
+        let descriptor = next_image + 2;
+        let program = next_image + 3;
+        let to_unicode = next_image + 4;
+        next_image += 5;
+        embedded_object_ids.push(PdfEmbeddedObjectIds {
+            font,
+            descendant,
+            descriptor,
+            program,
+            to_unicode,
+        });
+    }
     let info_object = next_image;
     let object_count = info_object;
 
@@ -737,6 +1059,14 @@ fn render_print_document_pdf_impl(
                     reason: "pdf_type3_subset_identity",
                 })?;
             let _ = write!(&mut fonts, " /RG{subset_index} {} 0 R", ids.font);
+        }
+        for &embedded_index in &page.embedded_fonts {
+            let ids = embedded_object_ids
+                .get(embedded_index)
+                .ok_or(RenderError::Backend {
+                    reason: "pdf_embedded_font_identity",
+                })?;
+            let _ = write!(&mut fonts, " /RE{embedded_index} {} 0 R", ids.font);
         }
         let dictionary = format!(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /CropBox [0 0 {} {}] /Resources << /Font << {} >>{} >> /Contents {} 0 R{} >>",
@@ -810,6 +1140,32 @@ fn render_print_document_pdf_impl(
             write_pdf_stream_object(&mut output, &mut offsets, id, &glyph.content)?;
         }
     }
+    for (index, entry) in font_registry.embedded.iter().enumerate() {
+        let ids = &embedded_object_ids[index];
+        let (font, descendant, descriptor) = embedded_font_dictionaries(index, entry, ids);
+        write_object(&mut output, &mut offsets, ids.font, font.as_bytes())?;
+        write_object(
+            &mut output,
+            &mut offsets,
+            ids.descendant,
+            descendant.as_bytes(),
+        )?;
+        write_object(
+            &mut output,
+            &mut offsets,
+            ids.descriptor,
+            descriptor.as_bytes(),
+        )?;
+        write_pdf_font_program_object(
+            &mut output,
+            &mut offsets,
+            ids.program,
+            &entry.face.program,
+            entry.face.kind,
+        )?;
+        let cmap = embedded_to_unicode_cmap(entry);
+        write_pdf_stream_object(&mut output, &mut offsets, ids.to_unicode, cmap.as_bytes())?;
+    }
     write_object(
         &mut output,
         &mut offsets,
@@ -839,7 +1195,7 @@ fn build_pdf_page(
     scene: &Scene,
     max_bytes: u64,
     command_count: &mut u64,
-    font_registry: &mut PdfFontRegistry,
+    font_registry: &mut PdfFontRegistry<'_>,
     trace: Option<&mut BackendGeometryTrace>,
 ) -> Result<PdfPage, RenderError> {
     let page_command_count = scene.nodes.iter().try_fold(0_u64, |sum, node| {
@@ -871,6 +1227,7 @@ fn build_pdf_page(
     let mut images = Vec::new();
     let mut uses_standard_font = false;
     let mut subset_fonts = BTreeSet::new();
+    let mut embedded_fonts = BTreeSet::new();
     let mut semantic_boundary_anchor = None;
     push_scene_nodes(
         &mut content,
@@ -878,6 +1235,7 @@ fn build_pdf_page(
         scene.height,
         font_registry,
         &mut subset_fonts,
+        &mut embedded_fonts,
         &mut links,
         &mut images,
         &mut uses_standard_font,
@@ -895,6 +1253,7 @@ fn build_pdf_page(
         images,
         uses_standard_font,
         subset_fonts,
+        embedded_fonts,
     })
 }
 
@@ -903,8 +1262,9 @@ fn push_scene_nodes(
     content: &mut BoundedContent,
     nodes: &[SceneNode],
     scene_height: Fixed,
-    font_registry: &mut PdfFontRegistry,
+    font_registry: &mut PdfFontRegistry<'_>,
     subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
     links: &mut Vec<PdfLink>,
     images: &mut Vec<PdfImage>,
     uses_standard_font: &mut bool,
@@ -937,6 +1297,7 @@ fn push_scene_nodes(
                     scene_height,
                     font_registry,
                     subset_fonts,
+                    embedded_fonts,
                     links,
                     images,
                     uses_standard_font,
@@ -1019,6 +1380,7 @@ fn push_scene_nodes(
                     node,
                     font_registry,
                     subset_fonts,
+                    embedded_fonts,
                     effective_clip,
                     semantic_boundary_anchor,
                     glyph_trace.as_mut(),
@@ -1190,11 +1552,13 @@ fn zlib_compress(bytes: &[u8]) -> Result<Vec<u8>, RenderError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_glyph_run(
     content: &mut BoundedContent,
     node: &GlyphRunNode,
-    font_registry: &mut PdfFontRegistry,
+    font_registry: &mut PdfFontRegistry<'_>,
     subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
     effective_clip: Option<Rect>,
     semantic_boundary_anchor: &mut Option<PdfSemanticBoundaryAnchor>,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
@@ -1204,7 +1568,15 @@ fn push_glyph_run(
             reason: "invalid_glyph_metadata",
         });
     }
-    let glyphs = font_registry.register_node(node, effective_clip, trace.as_deref_mut())?;
+    // Decide the emission strategy before registering anything, so an embedded
+    // run never also retains an outlined copy of the same glyphs.
+    let embedded = font_registry.register_embedded_node(node);
+    let glyphs = font_registry.register_node(
+        node,
+        effective_clip,
+        trace.as_deref_mut(),
+        embedded.is_none(),
+    )?;
     content.push("q\n")?;
     push_clip(content, node.clip_bounds)?;
     if let Some(trace) = trace.as_deref_mut() {
@@ -1281,16 +1653,42 @@ fn push_glyph_run(
             for glyph_index in &span.glyphs {
                 let glyph = glyphs[*glyph_index];
                 current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(node, glyph));
-                subset_fonts.insert(glyph.subset_index);
-                content.push(&format!(
-                    "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
-                    glyph.subset_index,
-                    TYPE3_TEXT_SCALE,
-                    type3_height_scale(glyph.height, glyph.reverse_y),
-                    format_fixed(glyph.origin_x),
-                    format_fixed(glyph.origin_y),
-                    glyph.code
-                ))?;
+                match embedded.as_ref().and_then(|plan| plan.get(*glyph_index)) {
+                    Some(placed_glyphs) => {
+                        // Type 3 CharProcs carry their own colour, so the
+                        // outlined path never sets one here. Text shown from an
+                        // embedded font instead inherits the current fill,
+                        // which at this point is the page background.
+                        push_rgb_fill(content, cluster_paint_color(node, *glyph_index))?;
+                        for placed in placed_glyphs {
+                            embedded_fonts.insert(placed.font_index);
+                            // The page matrix flips y, so the text matrix flips
+                            // back; the font size then lands in `Tf` where a
+                            // reader expects it, rather than being folded into
+                            // the matrix as the Type 3 path must do.
+                            content.push(&format!(
+                                "BT /RE{} {} Tf 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
+                                placed.font_index,
+                                format_fixed(placed.size),
+                                format_fixed(placed.origin_x),
+                                format_fixed(placed.origin_y),
+                                placed.cid
+                            ))?;
+                        }
+                    }
+                    None => {
+                        subset_fonts.insert(glyph.subset_index);
+                        content.push(&format!(
+                            "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                            glyph.subset_index,
+                            TYPE3_TEXT_SCALE,
+                            type3_height_scale(glyph.height, glyph.reverse_y),
+                            format_fixed(glyph.origin_x),
+                            format_fixed(glyph.origin_y),
+                            glyph.code
+                        ))?;
+                    }
+                }
             }
             content.push("EMC\n")?;
         }
@@ -2973,6 +3371,33 @@ fn write_pdf_stream_object(
     write_object(output, offsets, id, &body)
 }
 
+/// Write an embedded font program stream.
+///
+/// The stream dictionary, not the descriptor, is where a font file declares
+/// what it actually is: `/Subtype` for `/FontFile3`, and `/Length1` for the
+/// uncompressed TrueType file behind `/FontFile2`.
+fn write_pdf_font_program_object(
+    output: &mut BoundedPdf,
+    offsets: &mut [u64],
+    id: u32,
+    program: &[u8],
+    kind: FontProgramKind,
+) -> Result<(), RenderError> {
+    let extra = match kind {
+        // The subsetter returns a complete sfnt, so a CFF-flavoured face
+        // arrives wrapped as OpenType rather than as a bare CFF table.
+        FontProgramKind::Cff => " /Subtype /OpenType".to_string(),
+        FontProgramKind::TrueType => format!(" /Length1 {}", program.len()),
+    };
+    let header = format!("<< /Length {}{extra} >>\nstream\n", program.len());
+    let mut body = Vec::with_capacity(header.len() + program.len() + 11);
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(program);
+    body.push(b'\n');
+    body.extend_from_slice(b"endstream");
+    write_object(output, offsets, id, &body)
+}
+
 fn write_pdf_image_object(
     output: &mut BoundedPdf,
     offsets: &mut [u64],
@@ -3143,6 +3568,79 @@ mod tests {
             },
             PathCommand::Close,
         ]
+    }
+
+    /// Build a one-cluster run carrying shaped-glyph identity.
+    fn embeddable_run(synthetic: bool) -> GlyphRunNode {
+        let mut node = positioned_outline("ab", 10, 10, 20, 12);
+        node.font_faces = vec![crate::scene::SceneFontFace {
+            family: "Wide Sans".to_string(),
+            weight: 400,
+            italic: false,
+            units_per_em: 1_000,
+            face_sha256: "digest".to_string(),
+        }];
+        node.glyphs = vec![crate::scene::ShapedGlyph {
+            face: 0,
+            cluster: 0,
+            glyph_id: 7,
+            origin_x: Fixed::from_pixels(10),
+            origin_y: Fixed::from_pixels(20),
+            size: Fixed::from_pixels(11),
+            synthetic,
+        }];
+        node
+    }
+
+    #[test]
+    fn runs_without_shaped_identity_cannot_be_embedded() {
+        // Caller-authored scenes carry outlines only, so there is no face to
+        // embed and they must stay on the Type 3 path.
+        assert!(!node_is_embeddable(&positioned_outline(
+            "ab", 10, 10, 20, 12
+        )));
+    }
+
+    #[test]
+    fn synthetic_styling_blocks_embedding() {
+        assert!(node_is_embeddable(&embeddable_run(false)));
+        // Synthetic bold and italic are painted by transforming outlines, which
+        // the face alone cannot reproduce.
+        assert!(!node_is_embeddable(&embeddable_run(true)));
+    }
+
+    #[test]
+    fn collected_glyphs_are_grouped_by_face_digest() {
+        let mut wanted = BTreeMap::new();
+        collect_embeddable_glyphs(
+            &[
+                SceneNode::GlyphRun(embeddable_run(false)),
+                SceneNode::GlyphRun(embeddable_run(true)),
+            ],
+            &mut wanted,
+        );
+        // The synthetic run contributes nothing, and the plain one contributes
+        // exactly its glyph.
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(
+            wanted
+                .get("digest")
+                .map(|gids| gids.iter().copied().collect::<Vec<_>>()),
+            Some(vec![7])
+        );
+    }
+
+    #[test]
+    fn clusters_take_the_paint_span_colour_they_fall_in() {
+        // Embedded text inherits the current fill, so the wrong colour here
+        // paints glyphs invisibly against the page.
+        let mut node = embeddable_run(false);
+        node.color = Rgb::new(1, 2, 3);
+        let painted = node.paints[0].color;
+        assert_eq!(cluster_paint_color(&node, 0), painted);
+        // A cluster index past the end falls back to the run colour rather
+        // than panicking.
+        assert_eq!(cluster_paint_color(&node, 99), Rgb::new(1, 2, 3));
     }
 
     fn positioned_outline(
@@ -5156,10 +5654,10 @@ mod tests {
         let glyph_node = first_glyph_run(&document.pages[0].scene.nodes)
             .cloned()
             .unwrap();
-        let mut registry = PdfFontRegistry::new(u64::MAX, u64::MAX);
+        let mut registry = PdfFontRegistry::new(u64::MAX, u64::MAX, None);
         registry.glyph_count = MAX_TYPE3_GLYPH_PROGRAMS;
         assert!(matches!(
-            registry.register_node(&glyph_node, None, None),
+            registry.register_node(&glyph_node, None, None, true),
             Err(RenderError::LimitExceeded {
                 kind: LimitKind::BackendCommands,
                 limit: MAX_TYPE3_GLYPH_PROGRAMS,
@@ -5232,8 +5730,8 @@ mod tests {
             hyperlink: None,
         };
         assert!(node.metadata_is_valid());
-        let mut registry = PdfFontRegistry::new(10_000, 10 << 20);
-        let references = registry.register_node(&node, None, None).unwrap();
+        let mut registry = PdfFontRegistry::new(10_000, 10 << 20, None);
+        let references = registry.register_node(&node, None, None, true).unwrap();
         assert_eq!(registry.subsets.len(), 2);
         assert_eq!(registry.subsets[0].glyphs.len(), 255);
         assert_eq!(registry.subsets[1].glyphs.len(), 1);
@@ -5296,7 +5794,7 @@ mod tests {
             assert_eq!(poppler_words(&xml), ["日本語", "中文", "00", "Cell"]);
         }
 
-        let mut registry = PdfFontRegistry::new(16, 4096);
+        let mut registry = PdfFontRegistry::new(16, 4096, None);
         let separator = registry
             .register_semantic_separator(PdfGlyphReference {
                 subset_index: 0,

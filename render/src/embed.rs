@@ -5,11 +5,6 @@
 //! copy per subset. When a face permits embedding, a subset of the real font
 //! program is both smaller and semantically truthful, so the PDF backend
 //! prefers it and keeps the Type 3 path as the fallback.
-//!
-//! The PDF consumer of this module is not wired yet, so every item here is
-//! currently reachable only from tests. The allow below is scoped to this
-//! module and must come off with the consumer.
-#![allow(dead_code)]
 
 use ttf_parser::{Face, GlyphId, Permissions};
 
