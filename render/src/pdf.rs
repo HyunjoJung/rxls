@@ -8,7 +8,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 
-use crate::embed::{subset_face, EmbeddedFace, FontProgramKind};
+use crate::embed::{glyph_id_for_char, subset_face, EmbeddedFace, FontProgramKind};
 use crate::error::{LimitKind, RenderError};
 use crate::font::FontPack;
 use crate::print::PrintDocument;
@@ -69,14 +69,20 @@ struct PdfGlyphReference {
 #[derive(Debug, Clone, Copy)]
 struct PdfSemanticBoundaryAnchor {
     glyph: PdfGlyphReference,
+    embedded_separator: Option<PdfEmbeddedGlyph>,
     clip_bounds: Rect,
     rotation_degrees: i16,
 }
 
 impl PdfSemanticBoundaryAnchor {
-    fn new(node: &GlyphRunNode, glyph: PdfGlyphReference) -> Self {
+    fn new(
+        node: &GlyphRunNode,
+        glyph: PdfGlyphReference,
+        embedded_separator: Option<PdfEmbeddedGlyph>,
+    ) -> Self {
         Self {
             glyph,
+            embedded_separator,
             clip_bounds: node.clip_bounds,
             rotation_degrees: node.rotation_degrees.rem_euclid(360),
         }
@@ -218,11 +224,19 @@ struct PdfEmbeddedGlyph {
     size: Fixed,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PdfSemanticSeparator {
+    Embedded(PdfEmbeddedGlyph),
+    Outlined(PdfGlyphReference),
+}
+
 /// One face embedded as a Type0 composite font.
 #[derive(Debug)]
 struct PdfEmbeddedFace {
     digest: String,
     face: EmbeddedFace,
+    /// CID of an unambiguous U+0020 glyph available for semantic boundaries.
+    semantic_space_cid: Option<u16>,
     /// Subset gid to the text it stands for, for `/ToUnicode`.
     to_unicode: BTreeMap<u16, String>,
 }
@@ -267,14 +281,32 @@ impl<'a> PdfFontRegistry<'a> {
         for page in &document.pages {
             collect_embeddable_glyphs(&page.scene.nodes, &mut wanted);
         }
-        for (digest, gids) in wanted {
+        let semantic_space_gids = wanted
+            .keys()
+            .filter_map(|digest| {
+                fonts
+                    .face_program(digest)
+                    .and_then(|bytes| glyph_id_for_char(bytes, ' '))
+                    .map(|gid| (digest.clone(), gid))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let ambiguous_semantic_spaces = ambiguous_semantic_spaces(document, &semantic_space_gids);
+        for (digest, mut gids) in wanted {
             let Some(bytes) = fonts.face_program(&digest) else {
                 continue;
             };
+            let semantic_space_gid = semantic_space_gids
+                .get(&digest)
+                .copied()
+                .filter(|_| !ambiguous_semantic_spaces.contains(&digest));
+            if let Some(gid) = semantic_space_gid {
+                gids.insert(gid);
+            }
             let requested = gids.into_iter().collect::<Vec<_>>();
             let Ok(face) = subset_face(bytes, &requested) else {
                 continue;
             };
+            let semantic_space_cid = semantic_space_gid.and_then(|gid| face.subset_gid(gid));
             let retained = (digest.len() as u64)
                 .checked_add(face.program.len() as u64)
                 .and_then(|bytes| bytes.checked_add(face.gids.len() as u64 * 2))
@@ -291,6 +323,7 @@ impl<'a> PdfFontRegistry<'a> {
             self.embedded.push(PdfEmbeddedFace {
                 digest,
                 face,
+                semantic_space_cid,
                 to_unicode: BTreeMap::new(),
             });
         }
@@ -372,6 +405,55 @@ impl<'a> PdfFontRegistry<'a> {
         self.retained_bytes = next_retained;
 
         Some(per_cluster)
+    }
+
+    /// Reserve this face's real U+0020 CID for an invisible semantic boundary.
+    ///
+    /// A shared CID can have only one `/ToUnicode` meaning. A missing space,
+    /// an ambiguous cmap, or an existing non-space mapping therefore declines
+    /// the embedded path without mutation so the caller can use Type 3.
+    fn register_embedded_semantic_separator(
+        &mut self,
+        anchor: PdfEmbeddedGlyph,
+    ) -> Result<Option<PdfEmbeddedGlyph>, RenderError> {
+        let Some(entry) = self.embedded.get(anchor.font_index) else {
+            return Ok(None);
+        };
+        let Some(cid) = entry.semantic_space_cid else {
+            return Ok(None);
+        };
+        match entry.to_unicode.get(&cid) {
+            Some(text) if text == " " => {}
+            Some(_) => return Ok(None),
+            None => {
+                let retained = 2_u64 + 1;
+                let next_retained = self
+                    .retained_bytes
+                    .checked_add(retained)
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                if next_retained > self.byte_limit {
+                    return Ok(None);
+                }
+                self.embedded[anchor.font_index]
+                    .to_unicode
+                    .insert(cid, " ".to_string());
+                self.retained_bytes = next_retained;
+            }
+        }
+        Ok(Some(PdfEmbeddedGlyph { cid, ..anchor }))
+    }
+
+    fn register_semantic_separator(
+        &mut self,
+        anchor: PdfSemanticBoundaryAnchor,
+    ) -> Result<PdfSemanticSeparator, RenderError> {
+        if let Some(embedded) = anchor.embedded_separator {
+            if let Some(separator) = self.register_embedded_semantic_separator(embedded)? {
+                return Ok(PdfSemanticSeparator::Embedded(separator));
+            }
+        }
+        self.register_type3_semantic_separator(anchor.glyph)
+            .map(PdfSemanticSeparator::Outlined)
     }
 
     fn register_node(
@@ -653,13 +735,13 @@ impl<'a> PdfFontRegistry<'a> {
         })
     }
 
-    /// Register a real Unicode space whose CharProc has metrics but no paint.
+    /// Register the paint-free Type 3 fallback for a Unicode space boundary.
     ///
     /// Poppler can merge touching text from adjacent cells even when each cell
-    /// has its own ActualText span. A mapped Type3 space is the only reliable
-    /// semantic boundary; keeping its CharProc paint-free makes this operation
-    /// invisible to every raster backend.
-    fn register_semantic_separator(
+    /// has its own ActualText span. If a real embedded U+0020 is unavailable or
+    /// ambiguous, this mapped metrics-only glyph preserves the boundary without
+    /// changing raster output.
+    fn register_type3_semantic_separator(
         &mut self,
         anchor: PdfGlyphReference,
     ) -> Result<PdfGlyphReference, RenderError> {
@@ -781,6 +863,65 @@ fn collect_embeddable_glyphs(nodes: &[SceneNode], wanted: &mut BTreeMap<String, 
             _ => {}
         }
     }
+}
+
+/// Find faces whose U+0020 glyph id is also used for non-space source text.
+///
+/// Scan the bounded scene tree once for every candidate face together. Doing a
+/// whole-document pass per face would multiply the glyph ceiling by the face
+/// ceiling for an adversarial document.
+fn ambiguous_semantic_spaces(
+    document: &PrintDocument,
+    candidates: &BTreeMap<String, u16>,
+) -> BTreeSet<String> {
+    fn visit(
+        nodes: &[SceneNode],
+        candidates: &BTreeMap<String, u16>,
+        ambiguous: &mut BTreeSet<String>,
+    ) {
+        for node in nodes {
+            match node {
+                SceneNode::ClipGroup(group) => {
+                    visit(&group.nodes, candidates, ambiguous);
+                }
+                SceneNode::GlyphRun(run) if node_is_embeddable(run) => {
+                    for glyph in &run.glyphs {
+                        let Some(face) = usize::try_from(glyph.face)
+                            .ok()
+                            .and_then(|index| run.font_faces.get(index))
+                        else {
+                            continue;
+                        };
+                        let Some(&space_gid) = candidates.get(&face.face_sha256) else {
+                            continue;
+                        };
+                        if glyph.glyph_id != space_gid {
+                            continue;
+                        }
+                        let is_space = usize::try_from(glyph.cluster)
+                            .ok()
+                            .and_then(|index| run.clusters.get(index))
+                            .and_then(|cluster| {
+                                let start = usize::try_from(cluster.source_start).ok()?;
+                                let end = usize::try_from(cluster.source_end).ok()?;
+                                run.text.get(start..end)
+                            })
+                            == Some(" ");
+                        if !is_space {
+                            ambiguous.insert(face.face_sha256.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut ambiguous = BTreeSet::new();
+    for page in &document.pages {
+        visit(&page.scene.nodes, candidates, &mut ambiguous);
+    }
+    ambiguous
 }
 
 /// Build the `/ToUnicode` CMap for an embedded subset.
@@ -1651,21 +1792,46 @@ fn push_glyph_run(
         .iter()
         .flat_map(|span| span.glyphs.iter())
         .next()
-        .map(|index| PdfSemanticBoundaryAnchor::new(node, glyphs[*index]));
+        .map(|index| {
+            let embedded_separator = embedded
+                .as_ref()
+                .and_then(|plan| plan.get(*index))
+                .and_then(|placed| placed.first())
+                .copied();
+            PdfSemanticBoundaryAnchor::new(node, glyphs[*index], embedded_separator)
+        });
     if let (Some(previous), Some(current)) = (*semantic_boundary_anchor, first_glyph) {
         if previous.shares_layout_line_with(current) {
-            let separator = font_registry.register_semantic_separator(current.glyph)?;
-            subset_fonts.insert(separator.subset_index);
+            let separator = font_registry.register_semantic_separator(current)?;
             push_actual_text_begin(content, " ")?;
-            content.push(&format!(
-                "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
-                separator.subset_index,
-                TYPE3_TEXT_SCALE,
-                type3_height_scale(separator.height, separator.reverse_y),
-                format_fixed(separator.origin_x),
-                format_fixed(separator.origin_y),
-                separator.code
-            ))?;
+            match separator {
+                PdfSemanticSeparator::Embedded(separator) => {
+                    embedded_fonts.insert(separator.font_index);
+                    // Rendering mode 3 makes the boundary unpainted even for a
+                    // malformed space outline. Isolate the text state so the
+                    // following visible run returns to normal rendering.
+                    content.push(&format!(
+                        "q\nBT /RE{} {} Tf 3 Tr 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\nQ\n",
+                        separator.font_index,
+                        format_fixed(separator.size),
+                        format_fixed(separator.origin_x),
+                        format_fixed(separator.origin_y),
+                        separator.cid
+                    ))?;
+                }
+                PdfSemanticSeparator::Outlined(separator) => {
+                    subset_fonts.insert(separator.subset_index);
+                    content.push(&format!(
+                        "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                        separator.subset_index,
+                        TYPE3_TEXT_SCALE,
+                        type3_height_scale(separator.height, separator.reverse_y),
+                        format_fixed(separator.origin_x),
+                        format_fixed(separator.origin_y),
+                        separator.code
+                    ))?;
+                }
+            }
             content.push("EMC\n")?;
         }
     }
@@ -1705,7 +1871,16 @@ fn push_glyph_run(
             }
             for glyph_index in &span.glyphs {
                 let glyph = glyphs[*glyph_index];
-                current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(node, glyph));
+                let embedded_separator = embedded
+                    .as_ref()
+                    .and_then(|plan| plan.get(*glyph_index))
+                    .and_then(|placed| placed.first())
+                    .copied();
+                current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
+                    node,
+                    glyph,
+                    embedded_separator,
+                ));
                 match embedded.as_ref().and_then(|plan| plan.get(*glyph_index)) {
                     Some(placed_glyphs) => {
                         // Type 3 CharProcs carry their own colour, so the
@@ -3736,6 +3911,99 @@ mod tests {
     }
 
     #[test]
+    fn a_non_space_source_makes_the_face_space_gid_ambiguous() {
+        let node = embeddable_run(false);
+        let document =
+            document_with_nodes("ambiguous-semantic-space", vec![SceneNode::GlyphRun(node)]);
+        let safe = BTreeMap::from([(TEST_FACE_SHA256.to_string(), 2)]);
+        assert!(ambiguous_semantic_spaces(&document, &safe).is_empty());
+
+        let conflicting = BTreeMap::from([(TEST_FACE_SHA256.to_string(), 7)]);
+        assert_eq!(
+            ambiguous_semantic_spaces(&document, &conflicting),
+            BTreeSet::from([TEST_FACE_SHA256.to_string()]),
+            "the glyph used for the non-space source must not be reused as U+0020"
+        );
+    }
+
+    fn semantic_separator_registry(
+        semantic_space_cid: Option<u16>,
+        mapping: Option<&str>,
+    ) -> PdfFontRegistry<'static> {
+        let mut to_unicode = BTreeMap::new();
+        if let (Some(cid), Some(mapping)) = (semantic_space_cid, mapping) {
+            to_unicode.insert(cid, mapping.to_string());
+        }
+        let mut registry = PdfFontRegistry::new(16, 4096, None);
+        registry.embedded.push(PdfEmbeddedFace {
+            digest: TEST_FACE_SHA256.to_string(),
+            face: EmbeddedFace {
+                program: Vec::new(),
+                kind: FontProgramKind::TrueType,
+                gids: vec![0, 1, 2],
+                advances: vec![500, 600, 250],
+                units_per_em: 1_000,
+                ascender: 800,
+                descender: -200,
+                bbox: (0, -200, 1_000, 800),
+                cap_height: 700,
+                italic_angle: 0.0,
+                monospaced: false,
+            },
+            semantic_space_cid,
+            to_unicode,
+        });
+        registry
+    }
+
+    fn semantic_boundary_anchor() -> PdfSemanticBoundaryAnchor {
+        PdfSemanticBoundaryAnchor {
+            glyph: PdfGlyphReference {
+                subset_index: EMBEDDED_SUBSET_SENTINEL,
+                code: 0,
+                origin_x: Fixed::from_pixels(12),
+                origin_y: Fixed::from_pixels(24),
+                height: Fixed::from_pixels(10),
+                reverse_y: true,
+            },
+            embedded_separator: Some(PdfEmbeddedGlyph {
+                font_index: 0,
+                cid: 1,
+                origin_x: Fixed::from_pixels(12),
+                origin_y: Fixed::from_pixels(24),
+                size: Fixed::from_pixels(11),
+            }),
+            clip_bounds: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(20),
+                height: Fixed::from_pixels(20),
+            },
+            rotation_degrees: 0,
+        }
+    }
+
+    #[test]
+    fn missing_or_conflicting_type0_space_uses_type3_without_mutating_the_map() {
+        for (semantic_space_cid, mapping) in [(None, None), (Some(2), Some("X"))] {
+            let mut registry = semantic_separator_registry(semantic_space_cid, mapping);
+            let before_map = registry.embedded[0].to_unicode.clone();
+            let before_bytes = registry.retained_bytes;
+            let separator = registry
+                .register_semantic_separator(semantic_boundary_anchor())
+                .unwrap();
+            let PdfSemanticSeparator::Outlined(separator) = separator else {
+                panic!("missing or conflicting U+0020 must retain the Type3 fallback");
+            };
+            assert_ne!(separator.subset_index, EMBEDDED_SUBSET_SENTINEL);
+            assert_eq!(registry.embedded[0].to_unicode, before_map);
+            assert!(registry.retained_bytes > before_bytes);
+            assert_eq!(registry.subsets[0].glyphs[0].unicode_hex, "0020");
+            assert_eq!(registry.subsets[0].glyphs[0].content, b"1 0 d0\n");
+        }
+    }
+
+    #[test]
     fn embedded_to_unicode_mappings_are_split_at_the_cmap_block_limit() {
         let mut to_unicode = BTreeMap::new();
         for cid in 0..101_u16 {
@@ -3756,6 +4024,7 @@ mod tests {
                 italic_angle: 0.0,
                 monospaced: false,
             },
+            semantic_space_cid: None,
             to_unicode,
         };
 
@@ -3802,6 +4071,7 @@ mod tests {
                 italic_angle: 0.0,
                 monospaced: false,
             },
+            semantic_space_cid: None,
             to_unicode: BTreeMap::from([(1, text.to_string())]),
         };
         let base = entry(vec![1, 2, 3], "A");
@@ -4152,6 +4422,29 @@ mod tests {
         sheet.write_styled(0, 0, "אב", &style);
         sheet.write_styled(0, 1, "גד", &style);
         outlined_test_document(&workbook, pack)
+    }
+
+    fn embedded_touching_cell_document(
+        left: &str,
+        right: &str,
+        family: &str,
+        right_to_left: bool,
+        synthetic_bold: bool,
+    ) -> (PrintDocument, crate::font::FontPack) {
+        let pack = synthetic_test_pack();
+        let mut style = rxls::CellStyle::new().font_name(family).size(11);
+        if synthetic_bold {
+            style = style.bold();
+        }
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("embedded-touching-cells");
+        sheet.set_right_to_left(right_to_left);
+        sheet.set_col_width(0, 8.0);
+        sheet.set_col_width(1, 8.0);
+        sheet.write_styled(0, 0, left, &style);
+        sheet.write_styled(0, 1, right, &style);
+        let document = outlined_test_document(&workbook, pack.clone());
+        (document, pack)
     }
 
     fn mixed_font_script_adjacent_outline_document() -> PrintDocument {
@@ -6125,7 +6418,7 @@ mod tests {
 
         let mut registry = PdfFontRegistry::new(16, 4096, None);
         let separator = registry
-            .register_semantic_separator(PdfGlyphReference {
+            .register_type3_semantic_separator(PdfGlyphReference {
                 subset_index: 0,
                 code: 1,
                 origin_x: Fixed::from_pixels(12),
@@ -6140,6 +6433,77 @@ mod tests {
             registry.subsets[0].glyphs[0].content, b"1 0 d0\n",
             "the semantic separator CharProc must contain metrics only"
         );
+    }
+
+    fn assert_type0_semantic_separator(left: &str, right: &str, family: &str, right_to_left: bool) {
+        let (document, pack) =
+            embedded_touching_cell_document(left, right, family, right_to_left, false);
+        let pdf = render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+        assert_eq!(
+            pdf,
+            render_print_document_pdf_with_fonts(&document, &pack).unwrap(),
+            "embedded semantic boundaries must be byte deterministic"
+        );
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Subtype /Type0"));
+        assert!(
+            !source.contains("/Subtype /Type3"),
+            "a fully embeddable boundary must not retain a Type3 font"
+        );
+        assert_eq!(
+            source.matches("/ActualText <FEFF0020>").count(),
+            1,
+            "the adjacent cells need one explicit U+0020 boundary"
+        );
+        assert_eq!(
+            source.matches(" 3 Tr ").count(),
+            1,
+            "the Type0 space must use invisible text rendering mode"
+        );
+        assert!(
+            source.contains("<0002> <0020>"),
+            "the embedded space CID must map to U+0020"
+        );
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            let words = poppler_words(&xml);
+            assert_eq!(words.len(), 2, "{words:?}");
+            assert!(words.contains(&left), "{words:?}");
+            assert!(words.contains(&right), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn type0_semantic_separator_is_unpainted_for_touching_latin_cells() {
+        assert_type0_semantic_separator("LEFT", "RIGHT", "Wide Sans", false);
+    }
+
+    #[test]
+    fn type0_semantic_separator_is_unpainted_for_touching_cjk_cells() {
+        assert_type0_semantic_separator("日本語", "中文", "Wide Sans", false);
+    }
+
+    #[test]
+    fn type0_semantic_separator_is_unpainted_for_touching_rtl_cells() {
+        assert_type0_semantic_separator("אב", "גד", "RTL Sans", true);
+    }
+
+    #[test]
+    fn synthetic_runs_keep_the_type3_semantic_separator_fallback() {
+        let (document, pack) =
+            embedded_touching_cell_document("BOLD-A", "BOLD-B", "Wide Sans", false, true);
+        let pdf = render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+        assert_eq!(
+            pdf,
+            render_print_document_pdf_with_fonts(&document, &pack).unwrap()
+        );
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Subtype /Type3"));
+        assert!(!source.contains("/Subtype /Type0"));
+        assert_eq!(source.matches("/ActualText <FEFF0020>").count(), 1);
+        assert_eq!(source.matches(" 3 Tr ").count(), 0);
+        if let Some(xml) = poppler_bbox_layout(&pdf) {
+            assert_eq!(poppler_words(&xml), ["BOLD-A", "BOLD-B"]);
+        }
     }
 
     #[test]

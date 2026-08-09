@@ -78,6 +78,19 @@ fn normalize_gids(requested: &[u16]) -> Vec<u16> {
     gids
 }
 
+/// Resolve one Unicode scalar to its original glyph id in `face_bytes`.
+///
+/// Glyph zero is `.notdef`, not evidence that the face can represent the
+/// scalar. Treating it as absent keeps callers on their safe fallback path for
+/// malformed or deliberately ambiguous cmaps.
+pub(crate) fn glyph_id_for_char(face_bytes: &[u8], character: char) -> Option<u16> {
+    Face::parse(face_bytes, 0)
+        .ok()?
+        .glyph_index(character)
+        .map(|glyph| glyph.0)
+        .filter(|glyph| *glyph != 0)
+}
+
 fn font_program_kind(has_cff: bool, has_glyf: bool) -> Result<FontProgramKind, EmbedRejection> {
     match (has_cff, has_glyf) {
         (true, false) => Ok(FontProgramKind::Cff),
@@ -186,6 +199,26 @@ mod tests {
             subset_face(b"not a font at all", &[3]).unwrap_err(),
             EmbedRejection::InvalidFace
         );
+    }
+
+    #[test]
+    fn unicode_glyph_lookup_rejects_invalid_faces_and_notdef() {
+        assert_eq!(glyph_id_for_char(b"not a font", ' '), None);
+
+        let pack = crate::font::synthetic_test_pack();
+        let id = pack
+            .resolve(crate::font::FontRequest {
+                family: "Wide Sans",
+                weight: 400,
+                italic: false,
+            })
+            .id;
+        let digest = pack.selected_face_identity(id).unwrap().face_sha256;
+        let bytes = pack
+            .face_program(digest)
+            .expect("pack exposes its own face");
+        assert_eq!(glyph_id_for_char(bytes, ' '), Some(2));
+        assert_eq!(glyph_id_for_char(bytes, '\u{10ffff}'), None);
     }
 
     #[test]
