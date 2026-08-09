@@ -42,6 +42,47 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_repository_workflows_pass(self) -> None:
         self.assertEqual(self.policy.audit_repository(ROOT), [])
 
+    def test_ci_and_release_pin_the_registry_semver_gate(self) -> None:
+        for workflow_path in (CI_WORKFLOW, ROOT / ".github" / "workflows" / "release.yml"):
+            original = workflow_path.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow_path.name, state="valid"):
+                self.assertEqual(
+                    self.policy.audit_semver_gate(workflow_path.name, original), []
+                )
+            mutations = {
+                "version": original.replace(
+                    'CARGO_SEMVER_CHECKS_VERSION: "0.48.0"',
+                    'CARGO_SEMVER_CHECKS_VERSION: "latest"',
+                    1,
+                ),
+                "install": original.replace(
+                    'cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked',
+                    "cargo install cargo-semver-checks",
+                    1,
+                ),
+                "baseline": original.replace("--baseline-version 0.1.2", "--baseline-version 0.1.3", 1),
+                "release_type": original.replace("--release-type patch", "--release-type minor", 1),
+                "feature_mode": original.replace("--only-explicit-features", "--all-features", 1),
+            }
+            for name, workflow in mutations.items():
+                with self.subTest(workflow=workflow_path.name, mutation=name):
+                    self.assertTrue(
+                        self.policy.audit_semver_gate(workflow_path.name, workflow)
+                    )
+
+    def test_ci_keeps_cli_ods_feature_surface_warning_clean(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, original), []
+        )
+        for command in self.policy.ADDITIONAL_FEATURE_CLIPPY_COMMANDS:
+            with self.subTest(command=command):
+                removed = original.replace(command, "", 1)
+                self.assertNotEqual(removed, original)
+                self.assertTrue(
+                    self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, removed)
+                )
+
     def test_mutable_action_ref_is_rejected(self) -> None:
         errors = self.policy.audit_action_pins(
             Path(".github/workflows/example.yml"),
@@ -955,8 +996,13 @@ steps:
                 1,
             ),
             "native_pdf_smoke": original.replace(
-                "pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens",
+                "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens",
                 "pdf::tests::unreviewed_smoke",
+                1,
+            ),
+            "native_pdf_smoke_poppler_optional": original.replace(
+                "          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test",
+                "          cargo +1.85.0 test",
                 1,
             ),
             "native_common_raster": original.replace(
@@ -1955,10 +2001,16 @@ steps:
             ),
             [],
         )
+        self.assertEqual(text.count("rxls-render-worker-0.1.3.tgz"), 2)
+        self.assertNotIn("rxls-render-worker-0.1.2.tgz", text)
 
     def test_render_browser_rejects_mutable_or_commented_wasm_build_tools(self) -> None:
         original = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
+            "reviewed_baseline_trigger": original.replace(
+                '      - "scripts/render-parity-baseline-full.json"\n',
+                "",
+            ),
             "runner": original.replace(
                 "    runs-on: ubuntu-24.04",
                 "    runs-on: ubuntu-latest",
@@ -2616,14 +2668,25 @@ steps:
         self.assertIn("cargo test --test cli --locked", workflow)
         self.assertIn("cargo package --locked", workflow)
         self.assertIn(
-            "python3 scripts/check_core_package.py target/package/rxls-0.1.2.crate",
+            "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate",
             workflow,
         )
         self.assertIn(
-            "cargo install --path target/package/rxls-0.1.2 --locked --root target/installed-product",
+            "cargo install --path target/package/rxls-0.1.3 --locked --root target/installed-product",
             workflow,
         )
         self.assertIn('installed="target/installed-product/bin/', workflow)
+
+    def test_ci_package_lanes_use_the_source_release_identity(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            workflow.count(
+                "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate"
+            ),
+            2,
+        )
+        self.assertNotIn("target/package/rxls-0.1.2", workflow)
 
 
 if __name__ == "__main__":

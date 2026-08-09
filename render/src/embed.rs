@@ -78,6 +78,18 @@ fn normalize_gids(requested: &[u16]) -> Vec<u16> {
     gids
 }
 
+fn font_program_kind(has_cff: bool, has_glyf: bool) -> Result<FontProgramKind, EmbedRejection> {
+    match (has_cff, has_glyf) {
+        (true, false) => Ok(FontProgramKind::Cff),
+        (false, true) => Ok(FontProgramKind::TrueType),
+        // A conforming OpenType face carries exactly one outline flavour.
+        // In particular, subsetter prefers `glyf` when both tables exist, so
+        // classifying that malformed result as CFF would give PDF the wrong
+        // descendant and font-file subtype.
+        _ => Err(EmbedRejection::UnsupportedOutlines),
+    }
+}
+
 /// Subset `face_bytes` down to `requested` glyph ids.
 ///
 /// `requested` need not be sorted or deduplicated. Glyph 0 is always included
@@ -103,13 +115,16 @@ pub(crate) fn subset_face(
         return Err(EmbedRejection::SubsettingRestricted);
     }
 
-    let kind = if face.tables().cff.is_some() {
-        FontProgramKind::Cff
-    } else if face.tables().glyf.is_some() {
-        FontProgramKind::TrueType
-    } else {
-        return Err(EmbedRejection::UnsupportedOutlines);
-    };
+    let kind = font_program_kind(face.tables().cff.is_some(), face.tables().glyf.is_some())?;
+
+    // The subsetter's remapper uses a u16 next-id counter and consequently
+    // panics if fed all 65,536 possible u16 values. A shaped glyph must name a
+    // glyph that actually exists in the pinned face anyway, so reject invalid
+    // scene identity before entering the third-party remapper.
+    let glyph_count = face.number_of_glyphs();
+    if requested.iter().any(|gid| *gid >= glyph_count) {
+        return Err(EmbedRejection::SubsetFailed);
+    }
 
     let gids = normalize_gids(requested);
 
@@ -186,6 +201,23 @@ mod tests {
     }
 
     #[test]
+    fn exactly_one_supported_outline_flavour_is_required() {
+        assert_eq!(
+            font_program_kind(false, true),
+            Ok(FontProgramKind::TrueType)
+        );
+        assert_eq!(font_program_kind(true, false), Ok(FontProgramKind::Cff));
+        assert_eq!(
+            font_program_kind(false, false),
+            Err(EmbedRejection::UnsupportedOutlines)
+        );
+        assert_eq!(
+            font_program_kind(true, true),
+            Err(EmbedRejection::UnsupportedOutlines)
+        );
+    }
+
+    #[test]
     fn a_real_pack_face_subsets_deterministically_and_shrinks() {
         let pack = crate::font::synthetic_test_pack();
         let id = pack
@@ -224,6 +256,58 @@ mod tests {
         assert_eq!(first.ascender, 800);
         assert_eq!(first.descender, -200);
         assert_eq!(first.cap_height, 700);
+    }
+
+    #[test]
+    fn generated_cff_face_subsets_deterministically_and_remains_parseable() {
+        let bytes = crate::font::synthetic_cff_test_font();
+
+        // Deliberately repeat the requested glyph and vary caller order. The
+        // CFF remapper must make both calls byte-identical just like the
+        // TrueType path does.
+        let first = subset_face(&bytes, &[1, 1]).expect("subset generated CFF face");
+        let second = subset_face(&bytes, &[1]).expect("repeat CFF subset");
+        assert_eq!(first.program, second.program);
+        assert_eq!(first.kind, FontProgramKind::Cff);
+        assert_eq!(first.gids, vec![0, 1]);
+        assert_eq!(first.subset_gid(0), Some(0));
+        assert_eq!(first.subset_gid(1), Some(1));
+        assert_eq!(first.subset_gid(2), None);
+
+        let subset = ttf_parser::Face::parse(&first.program, 0)
+            .expect("subset is a parseable OpenType face");
+        assert!(subset.tables().cff.is_some());
+        assert!(subset.tables().glyf.is_none());
+        assert_eq!(subset.number_of_glyphs(), 2);
+        assert!(
+            subset.glyph_bounding_box(ttf_parser::GlyphId(1)).is_some(),
+            "the retained Type 2 charstring must still evaluate"
+        );
+        assert_eq!(first.advances, vec![600, 600]);
+        assert_eq!(first.units_per_em, 1_000);
+        assert_eq!(first.ascender, 800);
+        assert_eq!(first.descender, -200);
+        assert_eq!(first.cap_height, 700);
+    }
+
+    #[test]
+    fn out_of_range_glyph_ids_are_rejected_without_overflowing_the_remapper() {
+        let pack = crate::font::synthetic_test_pack();
+        let id = pack
+            .resolve(crate::font::FontRequest {
+                family: "Wide Sans",
+                weight: 400,
+                italic: false,
+            })
+            .id;
+        let digest = pack.selected_face_identity(id).unwrap().face_sha256;
+        let bytes = pack.face_program(digest).unwrap();
+        let every_u16 = (0..=u16::MAX).collect::<Vec<_>>();
+
+        assert_eq!(
+            subset_face(bytes, &every_u16).unwrap_err(),
+            EmbedRejection::SubsetFailed
+        );
     }
 
     #[test]

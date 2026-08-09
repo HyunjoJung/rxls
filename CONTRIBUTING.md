@@ -26,21 +26,38 @@ formula subset, and exports CSV/HTML/Markdown.
 
 ## Before opening a PR
 
-Run the full local gate (all must pass clean):
+Install the pinned registry-compatibility checker with
+`cargo install cargo-semver-checks --version 0.48.0 --locked`, ensure the
+`wasm32-unknown-unknown` Rust target is installed, then run the full local gate
+(all must pass clean):
 
 ```sh
 python3 scripts/public_hygiene_audit.py
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --features cli --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --features cli,xlsb --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --features cli,ods --locked -- -D warnings
 RXLS_REQUIRE_OPENPYXL=1 cargo test --all-targets --all-features --locked
 cargo test --no-default-features --all-targets --locked
 cargo test --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+python3 scripts/check_public_api.py
+cargo semver-checks check-release --manifest-path Cargo.toml \
+  --baseline-version 0.1.2 --release-type patch --all-features
+cargo semver-checks check-release --manifest-path Cargo.toml \
+  --baseline-version 0.1.2 --release-type patch --default-features
+cargo semver-checks check-release --manifest-path Cargo.toml \
+  --baseline-version 0.1.2 --release-type patch --only-explicit-features
 cargo fmt --manifest-path render/Cargo.toml -- --check
 cargo clippy --manifest-path render/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path render/Cargo.toml --all-targets --locked
 cargo fmt --manifest-path bindings/render-wasm/Cargo.toml -- --check
 cargo clippy --manifest-path bindings/render-wasm/Cargo.toml --all-targets --locked -- -D warnings
+cargo clippy --manifest-path bindings/wasm/Cargo.toml --all-targets \
+  --target wasm32-unknown-unknown --locked -- -D warnings
+cargo clippy --manifest-path bindings/render-wasm/Cargo.toml --all-targets \
+  --target wasm32-unknown-unknown --locked -- -D warnings
 cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked
 npm --prefix bindings/render-wasm test
 python3 -m unittest discover -s scripts -p "test_*.py"

@@ -6,14 +6,13 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-> **Release status:** `v0.1.2` is published. The crate, tagged source, 47-file
-> GitHub Release bundle, SBOM, and checksums are bound to commit
-> `33b4db17f2047febf9e6550299c3dde572afd6e5`.
+> **Release status:** This source is version `0.1.3`. Publication is accepted
+> only when the crate, tagged source, GitHub Release bundle, SBOM, checksums,
+> and provenance are bound by the release manifest to one exact revision.
 
-> **Development status:** The repository may contain additive, unreleased work
-> that is not part of the crates.io `v0.1.2` package. The installation commands
-> below describe the published package; build the checked-out source to evaluate
-> its development APIs and behavior.
+> **Development status:** Commits after the `v0.1.3` tag may contain additive,
+> unreleased work. The installation commands below select the versioned package;
+> build the checked-out source to evaluate its exact APIs and behavior.
 
 Native Rust spreadsheet toolkit. It reads **`.xls`** (BIFF8/5/7), **`.xlsx`**,
 **`.xlsb`**, and **`.ods`** into one typed cell model; writes styled **`.xlsx`**;
@@ -23,16 +22,16 @@ panicking when bounded recovery is not possible.
 
 ## Install
 
-Add the `0.1.2` library:
+Add the exact `0.1.3` library:
 
 ```sh
-cargo add rxls@0.1.2
+cargo add rxls@0.1.3
 ```
 
 Install the CLI from the same exact release:
 
 ```sh
-cargo install rxls --version =0.1.2 --locked
+cargo install rxls --version =0.1.3 --locked
 rxls --help
 ```
 
@@ -209,9 +208,9 @@ for initialization and memory guidance.
 
 ## Rendering workspace
 
-The unreleased source workspace also contains a separate `rxls-render` crate and
-`@rxls/render-worker` browser/WASM package. They are not part of the published
-core crate `v0.1.2`: the renderer builds one bounded fixed-point scene and
+The source workspace also contains a separate `rxls-render` crate and the
+`@rxls/render-worker@0.1.3` browser/WASM package. They are not bundled into the
+published core crate: the renderer builds one bounded fixed-point scene and
 replays it to deterministic SVG, PDF, and PNG, while the browser surface keeps
 parsing and virtual sheet/tile/page rendering inside a CSP-safe worker. See the
 [renderer guide](render/README.md) and
@@ -272,7 +271,7 @@ diagnose, and invalid-usage contracts through crates.io with:
 
 ```sh
 python3 scripts/smoke_crate_distribution.py \
-  --registry-version 0.1.2 \
+  --registry-version 0.1.3 \
   --fixture tests/fixtures/xlsx/reader-structural.xlsx
 ```
 
@@ -355,7 +354,7 @@ of scope.)
 
 ## Stability
 
-Version 0.1.2 defines the current public API and documented semantics. Compatible
+Version 0.1.3 defines the current public API and documented semantics. Compatible
 updates may add APIs and `#[non_exhaustive]` variants under the published SemVer
 policy; applications that require an exact dependency graph should pin an exact
 version. One deliberate design choice to be aware of: a single model serves
@@ -425,13 +424,15 @@ serials can be converted to `chrono::Duration` via
 callers want calamine-style typed access without choosing the workbook date
 system yet.
 
-## 0.1.2 release status
+## 0.1.3 release contract
 
-Version 0.1.2 is published on crates.io, docs.rs, and GitHub. Its release gates
-cover reader and formula correctness, package-preserving XLSX/XLSM editing,
+Version 0.1.3 is accepted only after its prepublication and postpublication
+gates across crates.io, docs.rs, GitHub, and npm pass. Those gates cover reader
+and formula correctness, package-preserving XLSX/XLSM editing,
 CLI and JSON contracts, WASM/npm and browser consumers, public-corpus parity,
-security analysis, fuzzing, performance budgets, SBOM/provenance, independent
-LibreOffice checks, and exact-package installation.
+security analysis, fuzzing, performance budgets, SBOM/provenance, exact-package
+installation, and the separately published render worker's pinned LibreOffice
+fidelity, hardening, and real-browser evidence.
 
 ## Contributing
 

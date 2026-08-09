@@ -52,6 +52,21 @@ fn error_details(err: &rxls::Error) -> ErrorDetails {
         Error::EncryptedOpenDocument => ("encrypted_open_document", "container", None),
         Error::NoText => ("no_text", "workbook", None),
         Error::SheetOutOfRange => ("sheet_out_of_range", "sheet_index", None),
+        Error::ExportInvalidDelimiter { format, delimiter } => (
+            "invalid_export_delimiter",
+            "output",
+            Some(format!("{format} delimiter {delimiter:?}")),
+        ),
+        Error::ExportOutputTooLarge { format, limit } => (
+            "output_too_large",
+            "output",
+            Some(format!("{format} output limit is {limit} bytes")),
+        ),
+        Error::ExportWorkLimitExceeded { format, limit } => (
+            "work_limit_exceeded",
+            "output",
+            Some(format!("{format} work limit is {limit} operations")),
+        ),
         #[allow(unreachable_patterns)]
         _ => ("unknown", "workbook", None),
     };
@@ -108,6 +123,12 @@ pub fn max_input_bytes() -> usize {
     MAX_INPUT_BYTES
 }
 
+/// Return the maximum CSV, HTML, or Markdown output size in UTF-8 bytes.
+#[wasm_bindgen(js_name = maxExportOutputBytes)]
+pub fn max_export_output_bytes() -> usize {
+    rxls::wasm::MAX_EXPORT_OUTPUT_BYTES
+}
+
 /// Extract workbook text from spreadsheet bytes.
 #[wasm_bindgen(js_name = extractText)]
 pub fn extract_text(bytes: &[u8]) -> std::result::Result<String, JsValue> {
@@ -127,6 +148,13 @@ pub fn to_csv(bytes: &[u8], sheet_index: usize) -> std::result::Result<String, J
 pub fn to_html(bytes: &[u8], sheet_index: usize) -> std::result::Result<String, JsValue> {
     check_input(bytes)?;
     rxls::wasm::to_html_bytes(bytes, sheet_index).map_err(js_error)
+}
+
+/// Export one worksheet as Markdown from spreadsheet bytes.
+#[wasm_bindgen(js_name = toMarkdown)]
+pub fn to_markdown(bytes: &[u8], sheet_index: usize) -> std::result::Result<String, JsValue> {
+    check_input(bytes)?;
+    rxls::wasm::to_markdown_bytes(bytes, sheet_index).map_err(js_error)
 }
 
 /// Build the machine-readable diagnose JSON report from spreadsheet bytes.
@@ -169,10 +197,33 @@ mod tests {
                 cause: Some("part xl/media.bin uses ZIP compression method 99".into()),
             }
         );
+        assert_eq!(
+            error_details(&rxls::Error::ExportOutputTooLarge {
+                format: "HTML",
+                limit: 16,
+            }),
+            ErrorDetails {
+                kind: "output_too_large",
+                location: "output",
+                cause: Some("HTML output limit is 16 bytes".into()),
+            }
+        );
+        assert_eq!(
+            error_details(&rxls::Error::ExportWorkLimitExceeded {
+                format: "Markdown",
+                limit: 4_000_000,
+            }),
+            ErrorDetails {
+                kind: "work_limit_exceeded",
+                location: "output",
+                cause: Some("Markdown work limit is 4000000 operations".into()),
+            }
+        );
     }
 
     #[test]
     fn input_limit_is_fixed_and_browser_conservative() {
         assert_eq!(max_input_bytes(), 32 * 1024 * 1024);
+        assert_eq!(max_export_output_bytes(), 16 * 1024 * 1024);
     }
 }

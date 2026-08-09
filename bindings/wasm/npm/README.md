@@ -73,6 +73,6 @@ and license. `wasm-size-report.json` is published beside the archive as GitHub
 Release evidence; it is deliberately not embedded in the npm package it
 describes.
 
-For 0.1.2, the validated `.tgz` is distributed as a GitHub Release asset rather
+For 0.1.3, the validated `.tgz` is distributed as a GitHub Release asset rather
 than published to the npm registry. Install the downloaded archive with
-`npm install ./rxls-wasm-0.1.2.tgz`.
+`npm install ./rxls-wasm-0.1.3.tgz`.

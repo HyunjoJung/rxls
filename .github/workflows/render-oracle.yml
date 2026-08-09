@@ -397,7 +397,7 @@ jobs:
               json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           PY
-      - name: Run the project-native Type3 PDF Poppler smoke
+      - name: Run the project-native Type0 PDF Poppler smoke
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         shell: bash
         run: |
@@ -406,8 +406,8 @@ jobs:
           command -v pdfinfo
           command -v pdftoppm
           command -v pdftotext
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
-            --lib pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens \
+          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \
             -- --exact
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
@@ -1045,13 +1045,14 @@ jobs:
 
           native_pdf_keys = {
               "actual_text_documents",
-              "charprocs_documents",
               "documents",
               "embedded_font_objects",
               "font_objects",
               "identity_set_sha256",
               "subset_font_objects",
-              "type3_documents",
+              "type0_cff_font_objects",
+              "type0_font_objects",
+              "type0_truetype_font_objects",
               "type3_font_objects",
               "unicode_font_objects",
           }
@@ -1076,8 +1077,16 @@ jobs:
           xhtml_crosscheck_delta_keys = (
               point_delta_keys - direct_point_delta_keys
           )
+          imported_page_box_quantization_max_points = Fraction(15, 1000)
 
-          def validate_native_pdf_and_page_evidence(report):
+          def validate_native_pdf_and_page_evidence(
+              report, *, imported_page_boxes
+          ):
+              direct_point_delta_limit = (
+                  imported_page_box_quantization_max_points
+                  if imported_page_boxes
+                  else Fraction()
+              )
               for row in report["files"]:
                   pages = row["pages"]
                   scenes = row["scenes"]
@@ -1123,7 +1132,7 @@ jobs:
                       metrics[
                           "max_pdf_point_geometry_delta_millipoints"
                       ]
-                      == 0
+                      <= (15 if imported_page_boxes else 0)
                   )
                   assert (
                       metrics[
@@ -1148,7 +1157,7 @@ jobs:
                           ].items()
                       }
                       assert all(
-                          deltas[key] == 0
+                          abs(deltas[key]) <= direct_point_delta_limit
                           for key in direct_point_delta_keys
                       )
                       assert all(
@@ -1162,13 +1171,20 @@ jobs:
                   font_objects = native["font_objects"]
                   assert documents == len(seen_sheets) > 0
                   assert native["actual_text_documents"] == documents
-                  assert native["charprocs_documents"] == documents
-                  assert native["type3_documents"] == documents
                   assert font_objects > 0
                   assert native["embedded_font_objects"] == font_objects
                   assert native["subset_font_objects"] == font_objects
-                  assert native["type3_font_objects"] == font_objects
                   assert native["unicode_font_objects"] == font_objects
+                  assert (
+                      native["type0_truetype_font_objects"]
+                      + native["type0_cff_font_objects"]
+                      == native["type0_font_objects"]
+                  )
+                  assert (
+                      native["type0_font_objects"]
+                      + native["type3_font_objects"]
+                      == font_objects
+                  )
                   assert re.fullmatch(
                       r"[0-9a-f]{64}", native["identity_set_sha256"]
                   )
@@ -1459,7 +1475,10 @@ jobs:
                       r"[0-9a-f]{64}",
                       attestation["normalized_identities_sha256"],
                   )
-              validate_native_pdf_and_page_evidence(report)
+              validate_native_pdf_and_page_evidence(
+                  report,
+                  imported_page_boxes=True,
+              )
 
               report_sha256 = sha256(report_payload)
               gate_path = root / f"fidelity-{'ab'[index]}.json"
@@ -1471,6 +1490,17 @@ jobs:
               assert gate["coverage"]["report_workbooks"] == expected_cases
               assert gate["coverage"]["native_pdf_documents"] > 0
               assert gate["coverage"]["native_pdf_font_objects"] > 0
+              assert gate["coverage"]["native_pdf_type0_font_objects"] > 0
+              assert (
+                  gate["coverage"]["native_pdf_type0_truetype_font_objects"]
+                  + gate["coverage"]["native_pdf_type0_cff_font_objects"]
+                  == gate["coverage"]["native_pdf_type0_font_objects"]
+              )
+              assert (
+                  gate["coverage"]["native_pdf_type0_font_objects"]
+                  + gate["coverage"]["native_pdf_type3_font_objects"]
+                  == gate["coverage"]["native_pdf_font_objects"]
+              )
               assert gate["metrics"]["pdf_point_geometry_mismatches"] == 0
               assert (
                   gate["metrics"][
@@ -1478,7 +1508,12 @@ jobs:
                   ]
                   <= 1_000
               )
-              assert gate["thresholds"]["pdf_point_geometry_exact"] is True
+              assert (
+                  gate["thresholds"][
+                      "pdf_imported_page_box_quantization_max_micropoints"
+                  ]
+                  == 15_000
+              )
               assert (
                   gate["thresholds"][
                       "pdf_xhtml_crosscheck_max_micropoints"
@@ -1554,7 +1589,10 @@ jobs:
               "print-settings" in row.get("features", [])
               for row in authored_report["files"]
           )
-          validate_native_pdf_and_page_evidence(authored_report)
+          validate_native_pdf_and_page_evidence(
+              authored_report,
+              imported_page_boxes=False,
+          )
           authored_manifest_rows = [
               row
               for row in corpus["files"]
@@ -1598,6 +1636,17 @@ jobs:
           ] == {"fit": 1, "scale": 4}
           assert authored_gate["coverage"]["native_pdf_documents"] > 0
           assert authored_gate["coverage"]["native_pdf_font_objects"] > 0
+          assert authored_gate["coverage"]["native_pdf_type0_font_objects"] > 0
+          assert (
+              authored_gate["coverage"]["native_pdf_type0_truetype_font_objects"]
+              + authored_gate["coverage"]["native_pdf_type0_cff_font_objects"]
+              == authored_gate["coverage"]["native_pdf_type0_font_objects"]
+          )
+          assert (
+              authored_gate["coverage"]["native_pdf_type0_font_objects"]
+              + authored_gate["coverage"]["native_pdf_type3_font_objects"]
+              == authored_gate["coverage"]["native_pdf_font_objects"]
+          )
           assert authored_gate["metrics"]["pdf_point_geometry_mismatches"] == 0
           assert (
               authored_gate["metrics"][

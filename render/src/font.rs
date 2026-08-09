@@ -1946,6 +1946,67 @@ pub(crate) fn synthetic_test_pack() -> FontPack {
     pack
 }
 
+/// Build a separate, generated-only CFF/OpenType pack for embedding tests.
+///
+/// Keeping this face out of [`synthetic_test_pack`] preserves the established
+/// TrueType pack identity and every snapshot derived from it. All font bytes
+/// are assembled below, so the fixture has no third-party binary or naming
+/// rights attached to it.
+#[cfg(test)]
+pub(crate) fn synthetic_cff_test_pack() -> FontPack {
+    let family = "Rxls CFF Test";
+    let font = synthetic_cff_test_font();
+    let license = b"SIL OPEN FONT LICENSE Version 1.1\n";
+    let config = b"<fontconfig/>\n";
+    let fonts = serde_json::json!([{
+        "bytes": font.len(),
+        "family": family,
+        "output": "fonts/RxlsCffTest.otf",
+        "sha256": sha256_hex(&font),
+        "style": "normal",
+        "weight": 400
+    }]);
+    let licenses = serde_json::json!([{
+        "bytes": license.len(),
+        "output": "licenses/OFL.txt",
+        "sha256": sha256_hex(license)
+    }]);
+    let config_digest = sha256_hex(config);
+    let aliases = serde_json::json!([]);
+    let mut identity = Map::new();
+    identity.insert("aliases".to_string(), aliases.clone());
+    identity.insert("fonts".to_string(), fonts.clone());
+    identity.insert(
+        "fonts_conf_sha256".to_string(),
+        Value::String(config_digest.clone()),
+    );
+    identity.insert("licenses".to_string(), licenses.clone());
+    let mut canonical = serde_json::to_string_pretty(&Value::Object(identity)).unwrap();
+    canonical.push('\n');
+    let manifest = serde_json::json!({
+        "schema": FONT_PACK_SCHEMA,
+        "license": "SIL-OFL-1.1",
+        "aliases": aliases,
+        "fonts": fonts,
+        "licenses": licenses,
+        "fonts_conf_sha256": config_digest,
+        "total_bytes": font.len() + license.len() + config.len(),
+        "pack_sha256": sha256_hex(canonical.as_bytes())
+    });
+    let mut manifest_bytes = serde_json::to_string_pretty(&manifest).unwrap();
+    manifest_bytes.push('\n');
+
+    FontPack::load_memory(
+        manifest_bytes.as_bytes(),
+        [
+            FontPackMember::new("fonts/RxlsCffTest.otf", font),
+            FontPackMember::new("licenses/OFL.txt", license),
+            FontPackMember::new("fonts.conf", config),
+        ],
+    )
+    .expect("load generated CFF test pack")
+}
+
 #[cfg(test)]
 fn write_synthetic_test_pack() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2081,6 +2142,168 @@ fn synthetic_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
         }
     }
     font
+}
+
+/// Construct a minimal OpenType/CFF1 face without external fixture bytes.
+///
+/// The face deliberately lives outside the normal synthetic font pack. Its
+/// three glyphs are enough to exercise CFF parsing, Type 2 outline evaluation,
+/// subsetting, shaping, and PDF embedding while leaving the TrueType fixture
+/// byte-for-byte unchanged.
+#[cfg(test)]
+pub(crate) fn synthetic_cff_test_font() -> Vec<u8> {
+    let mut tables = vec![
+        (*b"CFF ", synthetic_cff()),
+        (
+            *b"cmap",
+            synthetic_cmap(&[(0x20, 0x20, 2), (0x41, 0x5a, 1)]),
+        ),
+        (*b"head", synthetic_head()),
+        (*b"hhea", synthetic_hhea()),
+        (*b"hmtx", synthetic_hmtx()),
+        (*b"maxp", synthetic_cff_maxp()),
+        (*b"name", synthetic_name("Rxls CFF Test")),
+        (*b"OS/2", synthetic_os2()),
+        (*b"post", synthetic_post()),
+    ];
+    tables.sort_by_key(|(tag, _)| *tag);
+    let table_count = tables.len() as u16;
+    let directory_bytes = 12 + tables.len() * 16;
+    let mut offset = directory_bytes;
+    let mut records = Vec::with_capacity(tables.len());
+    for (tag, bytes) in &tables {
+        records.push((*tag, offset as u32, bytes.len() as u32));
+        offset += (bytes.len() + 3) & !3;
+    }
+    let mut font = Vec::with_capacity(offset);
+    font.extend_from_slice(b"OTTO");
+    be_u16(&mut font, table_count);
+    be_u16(&mut font, 0);
+    be_u16(&mut font, 0);
+    be_u16(&mut font, 0);
+    for (tag, offset, length) in &records {
+        font.extend_from_slice(tag);
+        be_u32(&mut font, 0);
+        be_u32(&mut font, *offset);
+        be_u32(&mut font, *length);
+    }
+    for (_, bytes) in tables {
+        font.extend_from_slice(&bytes);
+        while font.len() % 4 != 0 {
+            font.push(0);
+        }
+    }
+    font
+}
+
+/// Build a CFF1 table containing `.notdef`, a rectangle, and a space glyph.
+#[cfg(test)]
+fn synthetic_cff() -> Vec<u8> {
+    let name_index = synthetic_cff_index(&[b"RxlsCffTest"]);
+    let string_index = synthetic_cff_index(&[]);
+    let global_subr_index = synthetic_cff_index(&[]);
+    let char_strings = synthetic_cff_index(&[&[14], &synthetic_cff_rectangle_charstring(), &[14]]);
+
+    // The Top DICT consists only of the absolute CharStrings offset and its
+    // operator. The offset is encoded once provisionally, then rebuilt using
+    // its final value so the fixture remains correct if a preceding INDEX is
+    // changed later.
+    let mut top_dict = vec![0, 17];
+    loop {
+        let top_dict_index = synthetic_cff_index(&[&top_dict]);
+        let char_strings_offset = 4
+            + name_index.len()
+            + top_dict_index.len()
+            + string_index.len()
+            + global_subr_index.len();
+        let mut final_dict = synthetic_cff_integer(char_strings_offset as i32);
+        final_dict.push(17);
+        if final_dict == top_dict {
+            break;
+        }
+        top_dict = final_dict;
+    }
+
+    let mut table = vec![1, 0, 4, 4];
+    table.extend_from_slice(&name_index);
+    table.extend_from_slice(&synthetic_cff_index(&[&top_dict]));
+    table.extend_from_slice(&string_index);
+    table.extend_from_slice(&global_subr_index);
+    table.extend_from_slice(&char_strings);
+    table
+}
+
+/// Encode a compact, one-byte-offset CFF INDEX.
+#[cfg(test)]
+fn synthetic_cff_index(items: &[&[u8]]) -> Vec<u8> {
+    let mut index = Vec::new();
+    be_u16(&mut index, items.len() as u16);
+    if items.is_empty() {
+        return index;
+    }
+    index.push(1); // offSize
+    let mut offset = 1_usize;
+    index.push(offset as u8);
+    for item in items {
+        offset += item.len();
+        assert!(offset <= u8::MAX as usize, "synthetic CFF INDEX is bounded");
+        index.push(offset as u8);
+    }
+    for item in items {
+        index.extend_from_slice(item);
+    }
+    index
+}
+
+/// Encode an integer operand using CFF DICT/Type 2 compact representation.
+#[cfg(test)]
+fn synthetic_cff_integer(value: i32) -> Vec<u8> {
+    match value {
+        -107..=107 => vec![(value + 139) as u8],
+        108..=1_131 => {
+            let adjusted = value - 108;
+            vec![((adjusted >> 8) + 247) as u8, (adjusted & 0xff) as u8]
+        }
+        -1_131..=-108 => {
+            let adjusted = -value - 108;
+            vec![((adjusted >> 8) + 251) as u8, (adjusted & 0xff) as u8]
+        }
+        -32_768..=32_767 => {
+            let mut encoded = vec![28];
+            encoded.extend_from_slice(&(value as i16).to_be_bytes());
+            encoded
+        }
+        _ => {
+            let mut encoded = vec![29];
+            encoded.extend_from_slice(&value.to_be_bytes());
+            encoded
+        }
+    }
+}
+
+/// Type 2 program for a 500 by 700 design-unit rectangle.
+#[cfg(test)]
+fn synthetic_cff_rectangle_charstring() -> Vec<u8> {
+    let mut program = Vec::new();
+    for value in [0, 0] {
+        program.extend_from_slice(&synthetic_cff_integer(value));
+    }
+    program.push(21); // rmoveto
+    for value in [500, 0, 0, 700, -500, 0, 0, -700] {
+        program.extend_from_slice(&synthetic_cff_integer(value));
+    }
+    program.push(5); // rlineto
+    program.push(14); // endchar
+    program
+}
+
+/// Version 0.5 `maxp`, the compact form required by CFF OpenType faces.
+#[cfg(test)]
+fn synthetic_cff_maxp() -> Vec<u8> {
+    let mut table = Vec::new();
+    be_u32(&mut table, 0x0000_5000);
+    be_u16(&mut table, 3);
+    table
 }
 
 #[cfg(test)]

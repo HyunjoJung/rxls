@@ -4814,6 +4814,80 @@ mod tests {
     }
 
     #[test]
+    fn xlsb_font_provenance_alternate_content_is_bounded_and_fails_closed() {
+        let ac_begin = rec(BRT_AC_BEGIN, &[1, 0, 0, 0, 0, 0]);
+        let ac_end = rec(BRT_AC_END, &[]);
+        let end_style_sheet = rec(BRT_END_STYLE_SHEET, &[]);
+        let insert_before_end = |mut styles: Vec<u8>, records: &[u8]| {
+            let offset = styles
+                .windows(end_style_sheet.len())
+                .rposition(|window| window == end_style_sheet)
+                .expect("style sheet end");
+            styles.splice(offset..offset, records.iter().copied());
+            styles
+        };
+        let provenance = |styles: &[u8]| {
+            let parsed = parse_styles(styles, &XlsbTheme::default());
+            (
+                parsed.xlsb_normal_font_size_pt,
+                parsed.xlsb_cell_xf_font_sizes_pt,
+            )
+        };
+
+        let mut harmless_block = ac_begin.clone();
+        harmless_block.extend_from_slice(&rec(0x0200, &[1, 2, 3]));
+        harmless_block.extend_from_slice(&ac_end);
+        assert_eq!(
+            provenance(&insert_before_end(
+                complete_provenance_styles(280),
+                &harmless_block,
+            )),
+            (Some(11), vec![Some(11), Some(14)]),
+            "unknown alternate content cannot mutate verified style tables"
+        );
+
+        let mut table_record_block = ac_begin.clone();
+        table_record_block
+            .extend_from_slice(&rec(BRT_FONT, &provenance_font("alternate font", 400)));
+        table_record_block.extend_from_slice(&ac_end);
+        assert_eq!(
+            provenance(&insert_before_end(
+                complete_provenance_styles(280),
+                &table_record_block,
+            )),
+            (None, Vec::new()),
+            "the permissive parser cannot supply provenance through alternate content"
+        );
+
+        let mut nested = ac_begin.clone();
+        nested.extend_from_slice(&ac_begin);
+        nested.extend_from_slice(&ac_end);
+        nested.extend_from_slice(&ac_end);
+        assert_eq!(
+            provenance(&insert_before_end(complete_provenance_styles(280), &nested)),
+            (None, Vec::new()),
+            "alternate-content blocks are not recursive"
+        );
+
+        assert_eq!(
+            provenance(&insert_before_end(
+                complete_provenance_styles(280),
+                &rec(BRT_AC_BEGIN, &[0, 0]),
+            )),
+            (None, Vec::new()),
+            "a zero-version or unterminated alternate-content block is malformed"
+        );
+        assert_eq!(
+            provenance(&insert_before_end(
+                complete_provenance_styles(280),
+                &rec(BRT_AC_END, &[]),
+            )),
+            (None, Vec::new()),
+            "a stray alternate-content terminator is malformed"
+        );
+    }
+
+    #[test]
     fn xlsb_font_provenance_surfaces_per_cell_and_fails_closed_after_authoring() {
         let mut workbook_record = vec![0_u8; 8];
         workbook_record.extend_from_slice(&wstr("rId1"));

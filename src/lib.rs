@@ -80,7 +80,8 @@ mod ziputil;
 pub use error::{Error, Result};
 pub use eval::{FormulaEvaluation, FormulaUnsupportedReason};
 pub use export::{
-    export_csv, CsvExportError, CsvFormulaPolicy, CsvNewline, CsvOptions, DEFAULT_EXPORT_MAX_BYTES,
+    export_csv, export_html, export_markdown, CsvExportError, CsvFormulaPolicy, CsvNewline,
+    CsvOptions, MarkupExportError, MarkupFormat, DEFAULT_EXPORT_MAX_BYTES,
 };
 #[cfg(all(feature = "serde", feature = "chrono"))]
 pub use model::{

@@ -887,7 +887,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub enum Error { NotOle2, LegacyBiff, Cfb(Error), InvalidCfb(&'static str), MissingWorkbook, Biff(&'static str), Zip(&'static str), UnsupportedCompression { part: String, method: u16, }, Xml(&'static str), Encrypted, EncryptedPackage, EncryptedOpenDocument, NoText, SheetOutOfRange, }",
+      "declaration": "#[non_exhaustive]pub enum Error { NotOle2, LegacyBiff, Cfb(Error), InvalidCfb(&'static str), MissingWorkbook, Biff(&'static str), Zip(&'static str), UnsupportedCompression { part: String, method: u16, }, Xml(&'static str), Encrypted, EncryptedPackage, EncryptedOpenDocument, NoText, SheetOutOfRange, ExportInvalidDelimiter { format: &'static str, delimiter: char, }, ExportOutputTooLarge { format: &'static str, limit: usize, }, ExportWorkLimitExceeded { format: &'static str, limit: u64, }, }",
       "inherent_items": [],
       "kind": "enum",
       "path": "rxls::Error",
@@ -1355,6 +1355,35 @@
       "kind": "constant",
       "path": "rxls::MAX_PARSE_RECOVERY_CODES",
       "trait_implementations": []
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum MarkupExportError { OutputTooLarge { format: MarkupFormat, limit: usize, }, WorkLimitExceeded { format: MarkupFormat, limit: u64, }, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::MarkupExportError",
+      "trait_implementations": [
+        "impl Clone for MarkupExportError",
+        "impl Debug for MarkupExportError",
+        "impl Display for MarkupExportError",
+        "impl Eq for MarkupExportError",
+        "impl Error for MarkupExportError",
+        "impl PartialEq for MarkupExportError",
+        "impl StructuralPartialEq for MarkupExportError"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum MarkupFormat { Html, Markdown, }",
+      "inherent_items": [],
+      "kind": "enum",
+      "path": "rxls::MarkupFormat",
+      "trait_implementations": [
+        "impl Clone for MarkupFormat",
+        "impl Copy for MarkupFormat",
+        "impl Debug for MarkupFormat",
+        "impl Eq for MarkupFormat",
+        "impl PartialEq for MarkupFormat",
+        "impl StructuralPartialEq for MarkupFormat"
+      ]
     },
     {
       "declaration": "pub struct PageSetup { pub landscape: bool, pub margins: Option<(f64, f64, f64, f64, f64, f64)>, pub print_area: Option<(u32, u16, u32, u16)>, pub repeat_rows: Option<(u32, u32)>, pub repeat_cols: Option<(u16, u16)>, pub fit_to_width: Option<u16>, pub fit_to_height: Option<u16>, pub header: Option<String>, pub footer: Option<String>, pub paper_size: Option<u16>, pub scale: Option<u16>, pub center_horizontally: bool, pub center_vertically: bool, pub first_page_number: Option<u16>, }",
@@ -2254,7 +2283,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub enum WriteError { DuplicateTableName(String), DuplicateDefinedName(String), InvalidDefinedName(String), UnknownDefinedNameSheet { name: String, sheet: String, }, InvalidTableName(String), TableRangeColumnsMismatch { table: String, }, UnknownTableHeaderFormat { table: String, }, CellOutOfGrid { row: u32, col: u16, }, CellUnderMergedRange { row: u32, col: u16, }, NonFiniteNumber { row: u32, col: u16, }, InvalidHyperlinkTarget { row: u32, col: u16, target: String, }, InvalidXmlText { field: String, value: String, }, CellTextTooLong { row: u32, col: u16, length: usize, }, OutputTooLarge { estimated_bytes: usize, limit: usize, }, MergeOutOfGrid, InvalidSheetLayout(String), InvalidSheetViewZoom { value: u16, }, InvalidChartReference(String), InvalidSparklineReference(String), InvalidConditionalFormatRule(String), InvalidDataValidationRule(String), InvalidSheetName(String), DuplicateSheetName(String), TooManySheets, ActiveSheetOutOfRange { index: usize, sheets: usize, }, InvalidPageSetupScale { value: u16, }, InvalidPageSetupMargins, InvalidDocPropertyTimestamp(String), }",
+      "declaration": "#[non_exhaustive]pub enum WriteError { DuplicateTableName(String), DuplicateDefinedName(String), InvalidDefinedName(String), UnknownDefinedNameSheet { name: String, sheet: String, }, InvalidTableName(String), TableRangeColumnsMismatch { table: String, }, UnknownTableHeaderFormat { table: String, }, CellOutOfGrid { row: u32, col: u16, }, CellUnderMergedRange { row: u32, col: u16, }, NonFiniteNumber { row: u32, col: u16, }, InvalidFormulaCachedValue { row: u32, col: u16, }, InvalidHyperlinkTarget { row: u32, col: u16, target: String, }, InvalidXmlText { field: String, value: String, }, CellTextTooLong { row: u32, col: u16, length: usize, }, OutputTooLarge { estimated_bytes: usize, limit: usize, }, MergeOutOfGrid, InvalidSheetLayout(String), InvalidSheetViewZoom { value: u16, }, InvalidChartReference(String), InvalidSparklineReference(String), InvalidConditionalFormatRule(String), InvalidDataValidationRule(String), InvalidSheetName(String), DuplicateSheetName(String), TooManySheets, ActiveSheetOutOfRange { index: usize, sheets: usize, }, InvalidPageSetupScale { value: u16, }, InvalidPageSetupMargins, InvalidDocPropertyTimestamp(String), }",
       "inherent_items": [],
       "kind": "enum",
       "path": "rxls::WriteError",
@@ -2423,6 +2452,20 @@
       "trait_implementations": []
     },
     {
+      "declaration": "pub fn export_html( sheet: &Sheet, max_output_bytes: usize, ) -> Result<String, MarkupExportError>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::export_html",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn export_markdown( sheet: &Sheet, max_output_bytes: usize, ) -> Result<String, MarkupExportError>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::export_markdown",
+      "trait_implementations": []
+    },
+    {
       "declaration": "pub fn extract_text(bytes: &[u8]) -> Result<String>",
       "inherent_items": [],
       "kind": "fn",
@@ -2434,6 +2477,13 @@
       "inherent_items": [],
       "kind": "module",
       "path": "rxls::wasm",
+      "trait_implementations": []
+    },
+    {
+      "declaration": "pub const MAX_EXPORT_OUTPUT_BYTES: usize = _; // 16_777_216usize",
+      "inherent_items": [],
+      "kind": "constant",
+      "path": "rxls::wasm::MAX_EXPORT_OUTPUT_BYTES",
       "trait_implementations": []
     },
     {
@@ -2463,19 +2513,26 @@
       "kind": "fn",
       "path": "rxls::wasm::to_html_bytes",
       "trait_implementations": []
+    },
+    {
+      "declaration": "pub fn to_markdown_bytes(bytes: &[u8], sheet_index: usize) -> Result<String>",
+      "inherent_items": [],
+      "kind": "fn",
+      "path": "rxls::wasm::to_markdown_bytes",
+      "trait_implementations": []
     }
   ],
   "schema": "rxls.public-api.v1",
   "summary": {
     "by_kind": {
-      "constant": 3,
-      "enum": 41,
-      "fn": 27,
+      "constant": 4,
+      "enum": 43,
+      "fn": 30,
       "module": 1,
       "struct": 61,
       "trait": 2,
       "type": 6
     },
-    "items": 141
+    "items": 147
   }
 }

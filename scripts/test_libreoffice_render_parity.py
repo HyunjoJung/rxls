@@ -3749,6 +3749,209 @@ class LibreOfficeRenderParityTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.HarnessError, "output_contract"):
             MODULE.parse_pdffonts_output(payload, max_bytes=len(payload), max_fonts=0)
 
+    def test_native_pdf_attestation_accepts_exact_type0_and_type3_subsets(
+        self,
+    ) -> None:
+        payload = pdffonts_payload(
+            [
+                (
+                    "RXLSEM+EmbeddedSubset0000",
+                    "CID TrueType",
+                    "Identity-H",
+                    "yes",
+                    "yes",
+                    "yes",
+                    7,
+                    0,
+                ),
+                (
+                    "RXLSEM+EmbeddedSubset0001",
+                    "CID Type 0C (OT)",
+                    "Identity-H",
+                    "yes",
+                    "yes",
+                    "yes",
+                    12,
+                    0,
+                ),
+                (
+                    "RXLSRF+OutlinedSubset0002",
+                    "Type 3",
+                    "Custom",
+                    "yes",
+                    "yes",
+                    "yes",
+                    18,
+                    0,
+                ),
+            ]
+        )
+        records = MODULE.parse_pdffonts_output(payload, max_bytes=len(payload))
+        evidence = MODULE.attest_native_pdf_fonts(records)
+
+        self.assertEqual(evidence["font_objects"], 3)
+        self.assertEqual(evidence["embedded_font_objects"], 3)
+        self.assertEqual(evidence["subset_font_objects"], 3)
+        self.assertEqual(evidence["unicode_font_objects"], 3)
+        self.assertEqual(evidence["type0_font_objects"], 2)
+        self.assertEqual(evidence["type0_truetype_font_objects"], 1)
+        self.assertEqual(evidence["type0_cff_font_objects"], 1)
+        self.assertEqual(evidence["type3_font_objects"], 1)
+        self.assertNotIn("EmbeddedSubset", json.dumps(evidence, sort_keys=True))
+
+        MODULE.attest_native_pdf_syntax(
+            b" ".join(
+                (
+                    b"%PDF-1.7 /ActualText <FEFF0061>",
+                    b"/Subtype /Type0 /Subtype /CIDFontType2 /FontFile2 7 0 R",
+                    b"/Subtype /CIDFontType0 /FontFile3 12 0 R",
+                    b"/Subtype /Type3 /CharProcs << >>",
+                )
+            ),
+            evidence,
+        )
+
+    def test_native_pdf_attestation_rejects_wrong_identity_type_and_flags(
+        self,
+    ) -> None:
+        base = MODULE.PdfFontRecord(
+            "embeddedsubset0000",
+            "CID TrueType",
+            True,
+            True,
+            True,
+        )
+        cases = {
+            "renderer_pdf_font_identity": MODULE.PdfFontRecord(
+                "foreignsubset0000", "CID TrueType", True, True, True
+            ),
+            "renderer_pdf_font_type": MODULE.PdfFontRecord(
+                "embeddedsubset0000", "Type 3", True, True, True
+            ),
+            "renderer_pdf_font_attestation": MODULE.PdfFontRecord(
+                base.normalized_identity,
+                base.font_type,
+                False,
+                base.subset,
+                base.unicode_map,
+            ),
+        }
+        for error, record in cases.items():
+            with self.subTest(error=error), self.assertRaisesRegex(
+                MODULE.HarnessError, error
+            ):
+                MODULE.attest_native_pdf_fonts((record,))
+
+    def test_native_pdf_syntax_is_conditional_and_fail_closed(self) -> None:
+        evidence = MODULE.attest_native_pdf_fonts(
+            (
+                MODULE.PdfFontRecord(
+                    "embeddedsubset0000",
+                    "CID TrueType",
+                    True,
+                    True,
+                    True,
+                ),
+            )
+        )
+        valid = (
+            b"%PDF-1.7 /ActualText <FEFF0061> /Subtype /Type0 "
+            b"/Subtype /CIDFontType2 /FontFile2 7 0 R"
+        )
+        MODULE.attest_native_pdf_syntax(valid, evidence)
+        invalid = {
+            "actual_text": valid.replace(b"/ActualText", b"/NotActual"),
+            "missing_type0_program": valid.replace(b"/FontFile2 ", b"/WrongKey "),
+            "unexpected_type3": valid + b" /Subtype /Type3 /CharProcs << >>",
+        }
+        for name, payload in invalid.items():
+            with self.subTest(name=name), self.assertRaises(MODULE.HarnessError):
+                MODULE.attest_native_pdf_syntax(payload, evidence)
+
+    def test_native_pdf_syntax_ignores_markers_inside_validated_streams(
+        self,
+    ) -> None:
+        evidence = MODULE.attest_native_pdf_fonts(
+            (
+                MODULE.PdfFontRecord(
+                    "embeddedsubset0000",
+                    "CID TrueType",
+                    True,
+                    True,
+                    True,
+                ),
+            )
+        )
+        font_program = b"/Subtype /Type3 /CharProcs << >>"
+        payload = (
+            b"%PDF-1.7 /ActualText <FEFF0061> /Subtype /Type0 "
+            b"/Subtype /CIDFontType2 /FontFile2 7 0 R\n"
+            + f"7 0 obj\n<< /Length {len(font_program)} /Length1 "
+            f"{len(font_program)} >>\nstream\n".encode("ascii")
+            + font_program
+            + b"\nendstream\nendobj\n"
+        )
+
+        syntax = MODULE.renderer_pdf_syntax_without_binary_stream_payloads(payload)
+        self.assertNotIn(b"/Subtype /Type3", syntax)
+        MODULE.attest_native_pdf_syntax(payload, evidence)
+
+        font_actual_text = b"/ActualText" + b" " * (
+            len(font_program) - len(b"/ActualText")
+        )
+        actual_text_only_in_font = payload.replace(
+            b"/ActualText <FEFF0061>", b"/NotActualX <FEFF0061>", 1
+        ).replace(font_program, font_actual_text, 1)
+        self.assertEqual(len(actual_text_only_in_font), len(payload))
+        with self.assertRaisesRegex(
+            MODULE.HarnessError, "renderer_pdf_actual_text_missing"
+        ):
+            MODULE.attest_native_pdf_syntax(actual_text_only_in_font, evidence)
+
+    def test_native_pdf_stream_syntax_rejects_malformed_lengths_and_endings(
+        self,
+    ) -> None:
+        data = b"font-data"
+        valid = (
+            f"1 0 obj\n<< /Length {len(data)} >>\nstream\n".encode("ascii")
+            + data
+            + b"\nendstream\nendobj\n"
+        )
+        MODULE.renderer_pdf_syntax_without_binary_stream_payloads(valid)
+        annotation = (
+            b"2 0 obj\n<< /Type /Annot /Contents (stream token) "
+            b"/URI (https://example.invalid/stream) >>\nendobj\n"
+        )
+        self.assertEqual(
+            MODULE.renderer_pdf_syntax_without_binary_stream_payloads(annotation),
+            annotation,
+        )
+        invalid = {
+            "missing_length": valid.replace(
+                f"/Length {len(data)} ".encode("ascii"), b""
+            ),
+            "indirect_length": valid.replace(
+                str(len(data)).encode("ascii"), b"9 0 R", 1
+            ),
+            "short_length": valid.replace(
+                str(len(data)).encode("ascii"),
+                str(len(data) - 1).encode("ascii"),
+                1,
+            ),
+            "long_length": valid.replace(
+                str(len(data)).encode("ascii"),
+                str(len(data) + 2).encode("ascii"),
+                1,
+            ),
+            "missing_endstream": valid.replace(b"endstream", b"not-ending"),
+            "trailing_endstream": valid + b"endstream\n",
+        }
+        for name, payload in invalid.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                MODULE.HarnessError, "renderer_pdf_stream_syntax"
+            ):
+                MODULE.renderer_pdf_syntax_without_binary_stream_payloads(payload)
+
     def test_pdffonts_parser_attests_legal_plus_in_postscript_base_name(
         self,
     ) -> None:
@@ -4277,7 +4480,9 @@ Page    2 CropBox: 0 0 841.125 595.0625
             365,
         )
 
-    def test_sub_millipoint_page_box_delta_remains_exact_mismatch(self) -> None:
+    def test_imported_page_box_quantization_is_bounded_and_authored_is_exact(
+        self,
+    ) -> None:
         libreoffice_geometry = MODULE.PdfPageGeometry(
             MODULE.Fraction("841.89"),
             MODULE.Fraction("595.276"),
@@ -4286,12 +4491,12 @@ Page    2 CropBox: 0 0 841.125 595.0625
             MODULE.Fraction("841.89"),
             MODULE.Fraction("595.28"),
         )
-        rxls_geometry = MODULE.PdfPageGeometry(
+        boundary_geometry = MODULE.PdfPageGeometry(
             MODULE.Fraction("841.89"),
             MODULE.Fraction("595.276"),
             MODULE.Fraction("841.89"),
             MODULE.Fraction("595.28"),
-            MODULE.Fraction("841.8901"),
+            MODULE.Fraction("841.905"),
             MODULE.Fraction("595.28"),
         )
         libreoffice_row = {
@@ -4299,8 +4504,10 @@ Page    2 CropBox: 0 0 841.125 595.0625
                 libreoffice_geometry
             )
         }
-        rxls_row = {
-            "point_geometry": MODULE._pdf_geometry_evidence(rxls_geometry)
+        boundary_row = {
+            "point_geometry": MODULE._pdf_geometry_evidence(
+                boundary_geometry
+            )
         }
         text_page = MODULE.PdfTextPage(
             MODULE.Fraction("841.889648"),
@@ -4309,16 +4516,97 @@ Page    2 CropBox: 0 0 841.125 595.0625
             (),
         )
         page = MODULE.pdf_point_geometry_metrics(
-            rxls_row,
+            boundary_row,
             libreoffice_row,
             text_page,
             text_page,
         )
         aggregate = MODULE._aggregate_pdf_point_geometry([page])
-        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 1)
+        self.assertEqual(aggregate["pdf_point_geometry_mismatches"], 0)
         self.assertEqual(
-            aggregate["max_pdf_point_geometry_delta_millipoints"], 1
+            aggregate["max_pdf_point_geometry_delta_millipoints"], 15
         )
+
+        authored = MODULE._aggregate_pdf_point_geometry(
+            [page], imported_page_boxes=False
+        )
+        self.assertEqual(authored["pdf_point_geometry_mismatches"], 1)
+
+        above_boundary_geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.276"),
+            MODULE.Fraction("841.89"),
+            MODULE.Fraction("595.28"),
+            MODULE.Fraction("841.905001"),
+            MODULE.Fraction("595.28"),
+        )
+        above_boundary_row = {
+            "point_geometry": MODULE._pdf_geometry_evidence(
+                above_boundary_geometry
+            )
+        }
+        above_boundary_page = MODULE.pdf_point_geometry_metrics(
+            above_boundary_row,
+            libreoffice_row,
+            text_page,
+            text_page,
+        )
+        above_boundary = MODULE._aggregate_pdf_point_geometry(
+            [above_boundary_page]
+        )
+        self.assertEqual(
+            above_boundary["pdf_point_geometry_mismatches"], 1
+        )
+        self.assertEqual(
+            above_boundary["max_pdf_point_geometry_delta_millipoints"],
+            16,
+        )
+
+    def test_pdf_point_aggregate_recomputes_and_requires_strict_evidence(
+        self,
+    ) -> None:
+        geometry = MODULE.PdfPageGeometry(
+            MODULE.Fraction("612"),
+            MODULE.Fraction("792"),
+            MODULE.Fraction("612"),
+            MODULE.Fraction("792"),
+            MODULE.Fraction("612"),
+            MODULE.Fraction("792"),
+        )
+        row = {"point_geometry": MODULE._pdf_geometry_evidence(geometry)}
+        text_page = MODULE.PdfTextPage(
+            MODULE.Fraction("612"),
+            MODULE.Fraction("792"),
+            (),
+            (),
+        )
+        page = MODULE.pdf_point_geometry_metrics(
+            row,
+            row,
+            text_page,
+            text_page,
+        )
+        page["pdf_point_geometry"]["deltas_points"][
+            "media_box_width"
+        ] = "1/1000000"
+        with self.assertRaisesRegex(
+            MODULE.HarnessError, "pdf_point_geometry_delta"
+        ):
+            MODULE._aggregate_pdf_point_geometry([page])
+
+        malformed = MODULE.pdf_point_geometry_metrics(
+            row,
+            row,
+            text_page,
+            text_page,
+        )
+        del malformed["pdf_point_geometry"]["deltas_points"][
+            "crop_box_height"
+        ]
+        with self.assertRaisesRegex(
+            MODULE.HarnessError, "pdf_point_geometry"
+        ):
+            MODULE._aggregate_pdf_point_geometry([malformed])
 
     def test_svg_glyph_path_bounds_include_exact_curve_extrema(self) -> None:
         line, _ = MODULE._svg_path_bounds("M0 0 L10 0 L10 10 Z")

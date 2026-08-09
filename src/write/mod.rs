@@ -367,7 +367,8 @@ fn zip_parts(parts: Vec<(String, Vec<u8>)>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Border, BorderStyle, Cell, CellEntry, CellStyle, Color, HAlign, Sheet, VAlign, Workbook,
+        Border, BorderStyle, Cell, CellEntry, CellStyle, Color, Format, HAlign, Sheet, VAlign,
+        Workbook,
     };
     use std::io::Read;
 
@@ -402,6 +403,85 @@ mod tests {
         let first = workbook.to_xlsx();
         let second = workbook.to_xlsx();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn authored_formula_inputs_drop_all_leading_equals_before_storage_and_serialization() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_formula(0, 0, "===SUM(1,2)", 3.0);
+        sheet.write_formula_with_format(0, 1, "==A1", 3.0, &Format::new().bold());
+        sheet.write(
+            0,
+            2,
+            Cell::Formula {
+                formula: "=A1+B1".to_string(),
+                cached: Box::new(Cell::Number(6.0)),
+            },
+        );
+
+        assert_eq!(
+            sheet.cell(0, 0).and_then(Cell::get_formula),
+            Some("SUM(1,2)")
+        );
+        assert_eq!(sheet.cell(0, 1).and_then(Cell::get_formula), Some("A1"));
+        assert_eq!(sheet.cell(0, 2).and_then(Cell::get_formula), Some("A1+B1"));
+
+        let bytes = workbook
+            .to_xlsx_checked()
+            .expect("normalized formulas remain structurally valid");
+        let worksheet = part(&bytes, "xl/worksheets/sheet1.xml");
+        assert!(worksheet.contains("<f>SUM(1,2)</f>"));
+        assert!(worksheet.contains("<f>A1</f>"));
+        assert!(worksheet.contains("<f>A1+B1</f>"));
+        assert!(
+            !worksheet.contains("<f>="),
+            "OOXML formula text must not retain a UI leading equals sign"
+        );
+
+        let reopened = Workbook::open(&bytes).expect("reopen normalized formula workbook");
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0).and_then(Cell::get_formula),
+            Some("SUM(1,2)")
+        );
+        assert_eq!(
+            reopened.sheets[0].cell(0, 1).and_then(Cell::get_formula),
+            Some("A1")
+        );
+        assert_eq!(
+            reopened.sheets[0].cell(0, 2).and_then(Cell::get_formula),
+            Some("A1+B1")
+        );
+    }
+
+    #[test]
+    fn unchecked_writer_preserves_nested_formula_cache_zero_compatibility() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data").write_formula(
+            0,
+            0,
+            "A1",
+            Cell::Formula {
+                formula: "B1".to_string(),
+                cached: Box::new(Cell::Number(9.0)),
+            },
+        );
+
+        let bytes = workbook.to_xlsx();
+        let worksheet = part(&bytes, "xl/worksheets/sheet1.xml");
+        assert!(
+            worksheet.contains("<f>A1</f><v>0</v>"),
+            "the unchecked compatibility writer must keep its scalar-zero fallback"
+        );
+
+        let reopened = Workbook::open(&bytes).expect("reopen unchecked compatibility output");
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Formula {
+                formula: "A1".to_string(),
+                cached: Box::new(Cell::Number(0.0)),
+            })
+        );
     }
 
     fn worksheet_xml_with_budget<'a>(

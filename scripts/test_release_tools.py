@@ -588,6 +588,23 @@ class ReleaseToolTests(unittest.TestCase):
             ["internal_planning_document"],
         )
 
+    def test_hygiene_rejects_public_markdown_checklists(self) -> None:
+        module = _load("public_hygiene_audit_checklists", HYGIENE)
+        task_items = "\n".join(
+            (
+                "- " + "[ ] private planning item",
+                "* " + "[x] completed private planning item",
+                "1. " + "[X] numbered private planning item",
+            )
+        )
+
+        findings = module.scan_text("README.md", task_items)
+
+        self.assertEqual(
+            [finding.kind for finding in findings],
+            ["public_checklist_markup"] * 3,
+        )
+
     def test_hygiene_scans_office_member_text(self) -> None:
         module = _load("public_hygiene_audit", HYGIENE)
         with tempfile.TemporaryDirectory() as tmp:

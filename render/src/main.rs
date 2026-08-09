@@ -762,7 +762,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn scene_sha256_hex(scene: &Scene) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"rxls-render-scene-v2\0");
+    digest.update(b"rxls-render-scene-v3\0");
     update_string(&mut digest, &scene.title);
     update_fixed(&mut digest, scene.width.raw());
     update_fixed(&mut digest, scene.height.raw());
@@ -893,6 +893,24 @@ fn scene_sha256_hex(scene: &Scene) -> String {
                     ] {
                         update_fixed(&mut digest, value.raw());
                     }
+                }
+                digest.update((node.glyphs.len() as u64).to_le_bytes());
+                for glyph in &node.glyphs {
+                    digest.update(glyph.face.to_le_bytes());
+                    digest.update(glyph.cluster.to_le_bytes());
+                    digest.update(glyph.glyph_id.to_le_bytes());
+                    update_fixed(&mut digest, glyph.origin_x.raw());
+                    update_fixed(&mut digest, glyph.origin_y.raw());
+                    update_fixed(&mut digest, glyph.size.raw());
+                    digest.update([u8::from(glyph.synthetic)]);
+                }
+                digest.update((node.font_faces.len() as u64).to_le_bytes());
+                for face in &node.font_faces {
+                    update_string(&mut digest, &face.family);
+                    digest.update(face.weight.to_le_bytes());
+                    digest.update([u8::from(face.italic)]);
+                    digest.update(face.units_per_em.to_le_bytes());
+                    update_string(&mut digest, &face.face_sha256);
                 }
                 digest.update((node.paints.len() as u64).to_le_bytes());
                 for paint in &node.paints {
@@ -1025,6 +1043,8 @@ fn push_json_escaped(out: &mut String, value: &str) {
 mod tests {
     use std::ffi::OsString;
 
+    use rxls_render::{GlyphRunNode, SceneFontFace, ShapedGlyph};
+
     use super::*;
 
     #[test]
@@ -1070,6 +1090,74 @@ mod tests {
         let manifest = bundle_manifest_json(b"source", "source-digest", Some(digest), &[]);
         assert!(manifest.contains(&format!("\"font_pack_sha256\":\"{digest}\"")));
         assert!(!manifest.contains("manifest.json"));
+    }
+
+    #[test]
+    fn scene_identity_binds_every_embedded_font_and_glyph_field() {
+        let base = Scene {
+            title: "identity".to_string(),
+            width: Fixed::from_pixels(100),
+            height: Fixed::from_pixels(40),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(GlyphRunNode {
+                text: "A".to_string(),
+                clip_bounds: Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(100),
+                    height: Fixed::from_pixels(40),
+                },
+                commands: Vec::new(),
+                clusters: Vec::new(),
+                cluster_metrics: Vec::new(),
+                paints: Vec::new(),
+                decorations: Vec::new(),
+                color: Rgb::BLACK,
+                rotation_degrees: 0,
+                pivot_x: Fixed::ZERO,
+                pivot_y: Fixed::ZERO,
+                hyperlink: None,
+                glyphs: vec![ShapedGlyph {
+                    face: 0,
+                    cluster: 0,
+                    glyph_id: 7,
+                    origin_x: Fixed::from_pixels(10),
+                    origin_y: Fixed::from_pixels(20),
+                    size: Fixed::from_pixels(11),
+                    synthetic: false,
+                }],
+                font_faces: vec![SceneFontFace {
+                    family: "Wide Sans".to_string(),
+                    weight: 400,
+                    italic: false,
+                    units_per_em: 1_000,
+                    face_sha256: "0123456789abcdef".repeat(4),
+                }],
+            })],
+        };
+        let identity = scene_sha256_hex(&base);
+        let mutations: &[fn(&mut GlyphRunNode)] = &[
+            |node| node.glyphs[0].face = 1,
+            |node| node.glyphs[0].cluster = 1,
+            |node| node.glyphs[0].glyph_id = 8,
+            |node| node.glyphs[0].origin_x = Fixed::from_pixels(11),
+            |node| node.glyphs[0].origin_y = Fixed::from_pixels(21),
+            |node| node.glyphs[0].size = Fixed::from_pixels(12),
+            |node| node.glyphs[0].synthetic = true,
+            |node| node.font_faces[0].family.push_str(" Alternate"),
+            |node| node.font_faces[0].weight = 500,
+            |node| node.font_faces[0].italic = true,
+            |node| node.font_faces[0].units_per_em = 2_048,
+            |node| node.font_faces[0].face_sha256.replace_range(0..1, "f"),
+        ];
+        for mutate in mutations {
+            let mut changed = base.clone();
+            let SceneNode::GlyphRun(node) = &mut changed.nodes[0] else {
+                unreachable!();
+            };
+            mutate(node);
+            assert_ne!(scene_sha256_hex(&changed), identity);
+        }
     }
 
     #[test]

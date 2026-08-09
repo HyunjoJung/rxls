@@ -799,6 +799,10 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     "libreoffice_pdf_font_objects": 800,
                     "native_pdf_documents": 800,
                     "native_pdf_font_objects": 800,
+                    "native_pdf_type0_cff_font_objects": 0,
+                    "native_pdf_type0_font_objects": 800,
+                    "native_pdf_type0_truetype_font_objects": 800,
+                    "native_pdf_type3_font_objects": 0,
                     "pages": 800,
                     "report_workbooks": 800,
                     "status_counts": {"compared": 800},
@@ -881,6 +885,10 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "libreoffice_pdf_font_objects": 100,
                 "native_pdf_documents": 100,
                 "native_pdf_font_objects": 100,
+                "native_pdf_type0_cff_font_objects": 0,
+                "native_pdf_type0_font_objects": 100,
+                "native_pdf_type0_truetype_font_objects": 100,
+                "native_pdf_type3_font_objects": 0,
                 "page_count_histogram": {"1": 50, "4": 50},
                 "pages": 250,
                 "semantic_codepoint_libreoffice_items": 1000,
@@ -2310,6 +2318,31 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     oracle_wrapper=wrapper,
                 )
 
+    def test_native_pdf_coverage_path_counts_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact, _, _, _ = self._fixture(Path(temporary))
+            fidelity = json.loads(
+                (artifact / "fidelity-a.json").read_text(encoding="utf-8")
+            )
+            fidelity["coverage"]["native_pdf_type0_truetype_font_objects"] = 799
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "fidelity_native_pdf_coverage",
+            ):
+                self.checker._validate_fidelity_gate(fidelity)
+
+            authored = json.loads(
+                (artifact / "authored-print-gate.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            authored["coverage"]["native_pdf_type3_font_objects"] = 1
+            with self.assertRaisesRegex(
+                self.checker.EvidenceError,
+                "authored_native_pdf_coverage",
+            ):
+                self.checker._validate_authored_gate(authored)
+
     def test_repeatability_baseline_contract_and_observed_drift_are_bound(
         self,
     ) -> None:
@@ -2988,7 +3021,11 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "fidelity_threshold_bool_int_alias": (
                 "fidelity-a.json",
                 lambda value: value["thresholds"].update(
-                    {"pdf_point_geometry_exact": 1}
+                    {
+                        "pdf_imported_page_box_quantization_max_micropoints": (
+                            True
+                        )
+                    }
                 ),
                 "fidelity_thresholds",
             ),

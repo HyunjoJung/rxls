@@ -192,7 +192,7 @@ EXPECTED_FIDELITY_THRESHOLDS = {
     "page_box_max_millipoints": 5_000,
     "page_box_median_max_millipoints": 1_000,
     "page_box_p95_max_millipoints": 2_500,
-    "pdf_point_geometry_exact": True,
+    "pdf_imported_page_box_quantization_max_micropoints": 15_000,
     "pdf_xhtml_crosscheck_max_micropoints": 1_000,
     "semantic_codepoint_precision_min_ppm": 999_000,
     "semantic_codepoint_recall_min_ppm": 999_000,
@@ -2251,6 +2251,10 @@ def _validate_fidelity_gate(value: dict[str, Any]) -> dict[str, object]:
             "libreoffice_pdf_font_objects",
             "native_pdf_documents",
             "native_pdf_font_objects",
+            "native_pdf_type0_cff_font_objects",
+            "native_pdf_type0_font_objects",
+            "native_pdf_type0_truetype_font_objects",
+            "native_pdf_type3_font_objects",
             "pages",
             "report_workbooks",
             "status_counts",
@@ -2268,12 +2272,42 @@ def _validate_fidelity_gate(value: dict[str, Any]) -> dict[str, object]:
         "fidelity_coverage",
     )
     _bounded_int(coverage["pages"], "fidelity_pages", minimum=1, maximum=1_000_000)
-    for key in (
-        "libreoffice_pdf_font_objects",
-        "native_pdf_documents",
-        "native_pdf_font_objects",
-    ):
+    for key in ("libreoffice_pdf_font_objects", "native_pdf_documents"):
         _bounded_int(coverage[key], f"fidelity_coverage:{key}", minimum=1)
+    native_pdf_font_objects = _bounded_int(
+        coverage["native_pdf_font_objects"],
+        "fidelity_coverage:native_pdf_font_objects",
+        minimum=1,
+    )
+    native_pdf_type0_font_objects = _bounded_int(
+        coverage["native_pdf_type0_font_objects"],
+        "fidelity_coverage:native_pdf_type0_font_objects",
+        minimum=1,
+        maximum=native_pdf_font_objects,
+    )
+    native_pdf_type0_truetype_font_objects = _bounded_int(
+        coverage["native_pdf_type0_truetype_font_objects"],
+        "fidelity_coverage:native_pdf_type0_truetype_font_objects",
+        maximum=native_pdf_type0_font_objects,
+    )
+    native_pdf_type0_cff_font_objects = _bounded_int(
+        coverage["native_pdf_type0_cff_font_objects"],
+        "fidelity_coverage:native_pdf_type0_cff_font_objects",
+        maximum=native_pdf_type0_font_objects,
+    )
+    native_pdf_type3_font_objects = _bounded_int(
+        coverage["native_pdf_type3_font_objects"],
+        "fidelity_coverage:native_pdf_type3_font_objects",
+        maximum=native_pdf_font_objects,
+    )
+    _require(
+        native_pdf_type0_truetype_font_objects
+        + native_pdf_type0_cff_font_objects
+        == native_pdf_type0_font_objects
+        and native_pdf_type0_font_objects + native_pdf_type3_font_objects
+        == native_pdf_font_objects,
+        "fidelity_native_pdf_coverage",
+    )
     for prefix, minimum in (("core_text_box", 100), ("core_text_line_box", 1)):
         candidates = _bounded_int(
             coverage[f"{prefix}_candidates"],
@@ -2555,6 +2589,10 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
             "libreoffice_pdf_font_objects",
             "native_pdf_documents",
             "native_pdf_font_objects",
+            "native_pdf_type0_cff_font_objects",
+            "native_pdf_type0_font_objects",
+            "native_pdf_type0_truetype_font_objects",
+            "native_pdf_type3_font_objects",
             "page_count_histogram",
             "pages",
             "semantic_codepoint_libreoffice_items",
@@ -2581,11 +2619,44 @@ def _validate_authored_gate(value: dict[str, Any]) -> dict[str, object]:
         "edge_rxls_pixels",
         "libreoffice_pdf_font_objects",
         "native_pdf_documents",
-        "native_pdf_font_objects",
         "semantic_codepoint_libreoffice_items",
         "semantic_codepoint_rxls_items",
     ):
         _bounded_int(coverage[key], f"authored_coverage:{key}", minimum=1)
+    native_pdf_font_objects = _bounded_int(
+        coverage["native_pdf_font_objects"],
+        "authored_coverage:native_pdf_font_objects",
+        minimum=1,
+    )
+    native_pdf_type0_font_objects = _bounded_int(
+        coverage["native_pdf_type0_font_objects"],
+        "authored_coverage:native_pdf_type0_font_objects",
+        minimum=1,
+        maximum=native_pdf_font_objects,
+    )
+    native_pdf_type0_truetype_font_objects = _bounded_int(
+        coverage["native_pdf_type0_truetype_font_objects"],
+        "authored_coverage:native_pdf_type0_truetype_font_objects",
+        maximum=native_pdf_type0_font_objects,
+    )
+    native_pdf_type0_cff_font_objects = _bounded_int(
+        coverage["native_pdf_type0_cff_font_objects"],
+        "authored_coverage:native_pdf_type0_cff_font_objects",
+        maximum=native_pdf_type0_font_objects,
+    )
+    native_pdf_type3_font_objects = _bounded_int(
+        coverage["native_pdf_type3_font_objects"],
+        "authored_coverage:native_pdf_type3_font_objects",
+        maximum=native_pdf_font_objects,
+    )
+    _require(
+        native_pdf_type0_truetype_font_objects
+        + native_pdf_type0_cff_font_objects
+        == native_pdf_type0_font_objects
+        and native_pdf_type0_font_objects + native_pdf_type3_font_objects
+        == native_pdf_font_objects,
+        "authored_native_pdf_coverage",
+    )
     metrics = value.get("metrics")
     _require(
         isinstance(metrics, dict)

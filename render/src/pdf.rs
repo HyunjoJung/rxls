@@ -23,6 +23,7 @@ const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
 const PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR: i64 = 4;
 const TYPE3_TEXT_SCALE: u16 = 1_000;
 const TYPE3_GLYPHS_PER_SUBSET: usize = 255;
+const CMAP_ENTRIES_PER_BLOCK: usize = 100;
 
 /// Subset index carried by references whose run paints from an embedded font.
 const EMBEDDED_SUBSET_SENTINEL: usize = usize::MAX;
@@ -274,6 +275,19 @@ impl<'a> PdfFontRegistry<'a> {
             let Ok(face) = subset_face(bytes, &requested) else {
                 continue;
             };
+            let retained = (digest.len() as u64)
+                .checked_add(face.program.len() as u64)
+                .and_then(|bytes| bytes.checked_add(face.gids.len() as u64 * 2))
+                .and_then(|bytes| bytes.checked_add(face.advances.len() as u64 * 2));
+            let Some(next_retained) = retained
+                .and_then(|retained| self.retained_bytes.checked_add(retained))
+                .filter(|retained| *retained <= self.byte_limit)
+            else {
+                // The outlined path remains available and may be materially
+                // smaller than retaining this whole subset program.
+                continue;
+            };
+            self.retained_bytes = next_retained;
             self.embedded.push(PdfEmbeddedFace {
                 digest,
                 face,
@@ -322,17 +336,40 @@ impl<'a> PdfFontRegistry<'a> {
         }
 
         // Record what each code stands for while cluster text is still in hand.
+        // Stage the additions first so a run can fall back to Type 3 without
+        // leaving partial maps behind when the retained-byte budget is full.
+        let mut pending_mappings = BTreeMap::<(usize, u16), String>::new();
         for (cluster_index, cluster) in node.clusters.iter().enumerate() {
             let start = usize::try_from(cluster.source_start).ok()?;
             let end = usize::try_from(cluster.source_end).ok()?;
             let text = node.text.get(start..end)?;
             if let Some(first) = per_cluster.get(cluster_index).and_then(|list| list.first()) {
-                self.embedded[first.font_index]
-                    .to_unicode
-                    .entry(first.cid)
+                pending_mappings
+                    .entry((first.font_index, first.cid))
                     .or_insert_with(|| text.to_string());
             }
         }
+        let added_mapping_bytes =
+            pending_mappings
+                .iter()
+                .try_fold(0_u64, |total, ((font_index, cid), text)| {
+                    if self.embedded[*font_index].to_unicode.contains_key(cid) {
+                        Some(total)
+                    } else {
+                        total.checked_add(2)?.checked_add(text.len() as u64)
+                    }
+                })?;
+        let next_retained = self.retained_bytes.checked_add(added_mapping_bytes)?;
+        if next_retained > self.byte_limit {
+            return None;
+        }
+        for ((font_index, cid), text) in pending_mappings {
+            self.embedded[font_index]
+                .to_unicode
+                .entry(cid)
+                .or_insert(text);
+        }
+        self.retained_bytes = next_retained;
 
         Some(per_cluster)
     }
@@ -713,7 +750,8 @@ fn cluster_paint_color(node: &GlyphRunNode, cluster_index: usize) -> Rgb {
 /// Synthetic bold and italic are painted by transforming outlines, which
 /// embedding the face alone cannot reproduce.
 fn node_is_embeddable(node: &GlyphRunNode) -> bool {
-    !node.glyphs.is_empty()
+    node.metadata_is_valid()
+        && !node.glyphs.is_empty()
         && !node.font_faces.is_empty()
         && !node.glyphs.iter().any(|glyph| glyph.synthetic)
 }
@@ -747,15 +785,19 @@ fn collect_embeddable_glyphs(nodes: &[SceneNode], wanted: &mut BTreeMap<String, 
 
 /// Build the `/ToUnicode` CMap for an embedded subset.
 fn embedded_to_unicode_cmap(entry: &PdfEmbeddedFace) -> String {
-    let mut mappings = String::new();
-    let mut count = 0_usize;
-    for (cid, text) in &entry.to_unicode {
-        let _ = writeln!(&mut mappings, "<{cid:04X}> <{}>", utf16be_hex(text));
-        count += 1;
+    let mut output = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    let mappings = entry.to_unicode.iter().collect::<Vec<_>>();
+    for chunk in mappings.chunks(CMAP_ENTRIES_PER_BLOCK) {
+        let _ = writeln!(&mut output, "{} beginbfchar", chunk.len());
+        for (cid, text) in chunk {
+            let _ = writeln!(&mut output, "<{cid:04X}> <{}>", utf16be_hex(text));
+        }
+        output.push_str("endbfchar\n");
     }
-    format!(
-        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n{count} beginbfchar\n{mappings}endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
-    )
+    output.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend");
+    output
 }
 
 /// Build the `/W` array mapping subset CIDs to advance widths.
@@ -769,7 +811,7 @@ fn embedded_widths_array(face: &EmbeddedFace) -> String {
         if index > 0 {
             widths.push(' ');
         }
-        let scaled = i64::from(*advance) * 1000 / upem;
+        let scaled = (i64::from(*advance) * 1000 + upem / 2) / upem;
         let _ = write!(&mut widths, "{scaled}");
     }
     widths.push_str("]]");
@@ -882,6 +924,17 @@ fn render_print_document_pdf_impl(
     let mut pages = Vec::with_capacity(document.pages.len());
     let mut command_count = 0_u64;
     let mut content_bytes = 0_u64;
+    let preflight_command_count = document.pages.iter().try_fold(0_u64, |total, page| {
+        page.scene.nodes.iter().try_fold(total, |sum, node| {
+            sum.checked_add(node_command_count(node, 0)?)
+                .ok_or(RenderError::CoordinateOverflow)
+        })
+    })?;
+    enforce(
+        LimitKind::BackendCommands,
+        document.limits.max_backend_commands,
+        preflight_command_count,
+    )?;
     let mut font_registry = PdfFontRegistry::new(
         document.limits.max_backend_commands,
         document.limits.max_pdf_bytes,
@@ -1004,7 +1057,7 @@ fn render_print_document_pdf_impl(
     let info_object = next_image;
     let object_count = info_object;
 
-    let document_id = document_id(&pages, &font_registry.subsets);
+    let document_id = document_id(&pages, &font_registry.subsets, &font_registry.embedded);
     let mut output = BoundedPdf::new(document.limits.max_pdf_bytes);
     output.push(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")?;
     let mut offsets = vec![0_u64; object_count as usize + 1];
@@ -3211,10 +3264,16 @@ fn node_command_count(node: &SceneNode, depth: usize) -> Result<u64, RenderError
         SceneNode::Line(_) => Ok(2),
         SceneNode::Path(node) => Ok(node.commands.len() as u64),
         SceneNode::Image(_) => Ok(1),
-        SceneNode::GlyphRun(node) => (node.commands.len() as u64)
-            .checked_add(node.clusters.len().max(1) as u64)
-            .and_then(|count| count.checked_add(node.decorations.len() as u64 * 2))
-            .ok_or(RenderError::CoordinateOverflow),
+        SceneNode::GlyphRun(node) => {
+            let text_emissions = node.clusters.len().max(node.glyphs.len()).max(1) as u64;
+            let decoration_commands = (node.decorations.len() as u64)
+                .checked_mul(2)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            (node.commands.len() as u64)
+                .checked_add(text_emissions)
+                .and_then(|count| count.checked_add(decoration_commands))
+                .ok_or(RenderError::CoordinateOverflow)
+        }
     }
 }
 
@@ -3275,10 +3334,10 @@ fn type3_to_unicode_cmap(subset_index: usize, subset: &PdfFontSubset) -> String 
     let mut output = format!(
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /RXLSRF-OutlinedSubset{subset_index:04} def\n/CMapType 2 def\n1 begincodespacerange\n<01> <FF>\nendcodespacerange\n"
     );
-    for (chunk_index, chunk) in subset.glyphs.chunks(100).enumerate() {
+    for (chunk_index, chunk) in subset.glyphs.chunks(CMAP_ENTRIES_PER_BLOCK).enumerate() {
         let _ = writeln!(&mut output, "{} beginbfchar", chunk.len());
         for (offset, glyph) in chunk.iter().enumerate() {
-            let code = chunk_index * 100 + offset + 1;
+            let code = chunk_index * CMAP_ENTRIES_PER_BLOCK + offset + 1;
             let _ = writeln!(&mut output, "<{code:02X}> <{}>", glyph.unicode_hex);
         }
         output.push_str("endbfchar\n");
@@ -3287,9 +3346,13 @@ fn type3_to_unicode_cmap(subset_index: usize, subset: &PdfFontSubset) -> String 
     output
 }
 
-fn document_id(pages: &[PdfPage], subsets: &[PdfFontSubset]) -> String {
+fn document_id(
+    pages: &[PdfPage],
+    subsets: &[PdfFontSubset],
+    embedded: &[PdfEmbeddedFace],
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"rxls-render-pdf-v3\0");
+    digest.update(b"rxls-render-pdf-v4\0");
     for page in pages {
         digest.update((page.width_points.len() as u64).to_le_bytes());
         digest.update(page.width_points.as_bytes());
@@ -3327,6 +3390,45 @@ fn document_id(pages: &[PdfPage], subsets: &[PdfFontSubset]) -> String {
             digest.update(glyph.unicode_hex.as_bytes());
             digest.update((glyph.content.len() as u64).to_le_bytes());
             digest.update(&glyph.content);
+        }
+    }
+    digest.update((embedded.len() as u64).to_le_bytes());
+    for entry in embedded {
+        digest.update((entry.digest.len() as u64).to_le_bytes());
+        digest.update(entry.digest.as_bytes());
+        digest.update([match entry.face.kind {
+            FontProgramKind::TrueType => 0,
+            FontProgramKind::Cff => 1,
+        }]);
+        digest.update((entry.face.program.len() as u64).to_le_bytes());
+        digest.update(&entry.face.program);
+        digest.update((entry.face.gids.len() as u64).to_le_bytes());
+        for gid in &entry.face.gids {
+            digest.update(gid.to_le_bytes());
+        }
+        digest.update((entry.face.advances.len() as u64).to_le_bytes());
+        for advance in &entry.face.advances {
+            digest.update(advance.to_le_bytes());
+        }
+        digest.update(entry.face.units_per_em.to_le_bytes());
+        digest.update(entry.face.ascender.to_le_bytes());
+        digest.update(entry.face.descender.to_le_bytes());
+        for value in [
+            entry.face.bbox.0,
+            entry.face.bbox.1,
+            entry.face.bbox.2,
+            entry.face.bbox.3,
+        ] {
+            digest.update(value.to_le_bytes());
+        }
+        digest.update(entry.face.cap_height.to_le_bytes());
+        digest.update(entry.face.italic_angle.to_bits().to_le_bytes());
+        digest.update([u8::from(entry.face.monospaced)]);
+        digest.update((entry.to_unicode.len() as u64).to_le_bytes());
+        for (cid, text) in &entry.to_unicode {
+            digest.update(cid.to_le_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text.as_bytes());
         }
     }
     hex_bytes(&digest.finalize()[..16])
@@ -3515,7 +3617,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::font::synthetic_test_pack;
+    use crate::font::{synthetic_cff_test_pack, synthetic_test_pack};
     use crate::layout::RenderOptions;
     use crate::png::render_print_page_png_with_trace;
     use crate::print::{build_print_document, PrintOptions};
@@ -3525,6 +3627,9 @@ mod tests {
     };
     use crate::svg::render_scene_svg_with_trace;
     use zip::write::SimpleFileOptions;
+
+    const TEST_FACE_SHA256: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn rectangle_commands(left: i64, top: i64) -> Vec<PathCommand> {
         vec![
@@ -3578,7 +3683,7 @@ mod tests {
             weight: 400,
             italic: false,
             units_per_em: 1_000,
-            face_sha256: "digest".to_string(),
+            face_sha256: TEST_FACE_SHA256.to_string(),
         }];
         node.glyphs = vec![crate::scene::ShapedGlyph {
             face: 0,
@@ -3624,10 +3729,202 @@ mod tests {
         assert_eq!(wanted.len(), 1);
         assert_eq!(
             wanted
-                .get("digest")
+                .get(TEST_FACE_SHA256)
                 .map(|gids| gids.iter().copied().collect::<Vec<_>>()),
             Some(vec![7])
         );
+    }
+
+    #[test]
+    fn embedded_to_unicode_mappings_are_split_at_the_cmap_block_limit() {
+        let mut to_unicode = BTreeMap::new();
+        for cid in 0..101_u16 {
+            to_unicode.insert(cid, "A".to_string());
+        }
+        let entry = PdfEmbeddedFace {
+            digest: "digest".to_string(),
+            face: EmbeddedFace {
+                program: Vec::new(),
+                kind: FontProgramKind::TrueType,
+                gids: Vec::new(),
+                advances: Vec::new(),
+                units_per_em: 1_000,
+                ascender: 800,
+                descender: -200,
+                bbox: (0, -200, 1_000, 800),
+                cap_height: 700,
+                italic_angle: 0.0,
+                monospaced: false,
+            },
+            to_unicode,
+        };
+
+        let cmap = embedded_to_unicode_cmap(&entry);
+        assert!(cmap.contains("100 beginbfchar"));
+        assert!(cmap.contains("1 beginbfchar"));
+        assert!(!cmap.contains("101 beginbfchar"));
+        assert_eq!(cmap.matches("endbfchar").count(), 2);
+    }
+
+    #[test]
+    fn embedded_widths_use_nearest_design_unit_in_pdf_glyph_space() {
+        let face = EmbeddedFace {
+            program: Vec::new(),
+            kind: FontProgramKind::TrueType,
+            gids: vec![0, 1],
+            advances: vec![0, 684],
+            units_per_em: 2_048,
+            ascender: 1_600,
+            descender: -400,
+            bbox: (0, -400, 2_048, 1_600),
+            cap_height: 1_400,
+            italic_angle: 0.0,
+            monospaced: false,
+        };
+
+        assert_eq!(embedded_widths_array(&face), "[0 [0 334]]");
+    }
+
+    #[test]
+    fn pdf_document_identity_binds_embedded_programs_and_unicode_maps() {
+        let entry = |program: Vec<u8>, text: &str| PdfEmbeddedFace {
+            digest: TEST_FACE_SHA256.to_string(),
+            face: EmbeddedFace {
+                program,
+                kind: FontProgramKind::TrueType,
+                gids: vec![0, 7],
+                advances: vec![500, 600],
+                units_per_em: 1_000,
+                ascender: 800,
+                descender: -200,
+                bbox: (0, -200, 1_000, 800),
+                cap_height: 700,
+                italic_angle: 0.0,
+                monospaced: false,
+            },
+            to_unicode: BTreeMap::from([(1, text.to_string())]),
+        };
+        let base = entry(vec![1, 2, 3], "A");
+        let base_id = document_id(&[], &[], std::slice::from_ref(&base));
+        let changed_program = entry(vec![1, 2, 4], "A");
+        let changed_mapping = entry(vec![1, 2, 3], "B");
+
+        assert_ne!(
+            document_id(&[], &[], std::slice::from_ref(&changed_program)),
+            base_id
+        );
+        assert_ne!(
+            document_id(&[], &[], std::slice::from_ref(&changed_mapping)),
+            base_id
+        );
+    }
+
+    #[test]
+    fn embedded_glyph_emissions_are_counted_individually() {
+        let mut node = embeddable_run(false);
+        let one_glyph = node_command_count(&SceneNode::GlyphRun(node.clone()), 0).unwrap();
+        let mut second = node.glyphs[0];
+        second.origin_x = Fixed::from_pixels(16);
+        node.glyphs.push(second);
+        assert!(node.metadata_is_valid());
+
+        assert_eq!(
+            node_command_count(&SceneNode::GlyphRun(node), 0).unwrap(),
+            one_glyph + 1
+        );
+    }
+
+    #[test]
+    fn embedded_faces_and_unicode_maps_respect_the_retained_byte_budget() {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        workbook.add_sheet("embedding-budget").write(0, 0, "A");
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                single_page_sheets: true,
+                render: RenderOptions {
+                    gridlines: false,
+                    default_font_family: pack.default_family().to_string(),
+                    font_pack: Some(pack.clone()),
+                    ..RenderOptions::default()
+                },
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+        let node = first_glyph_run(&document.pages[0].scene.nodes).unwrap();
+
+        let mut measured = PdfFontRegistry::new(u64::MAX, u64::MAX, Some(&pack));
+        measured.prepare_embedded_faces(&document);
+        assert_eq!(measured.embedded.len(), 1);
+        let program_budget = measured.retained_bytes;
+        assert!(program_budget > 0);
+
+        let mut too_small = PdfFontRegistry::new(u64::MAX, program_budget - 1, Some(&pack));
+        too_small.prepare_embedded_faces(&document);
+        assert!(too_small.embedded.is_empty());
+        assert_eq!(too_small.retained_bytes, 0);
+
+        measured.byte_limit = program_budget;
+        assert!(measured.register_embedded_node(node).is_none());
+        assert!(measured.embedded[0].to_unicode.is_empty());
+        assert_eq!(measured.retained_bytes, program_budget);
+
+        let mapping_budget = program_budget + 2 + node.text.len() as u64;
+        let mut exact = PdfFontRegistry::new(u64::MAX, mapping_budget, Some(&pack));
+        exact.prepare_embedded_faces(&document);
+        assert!(exact.register_embedded_node(node).is_some());
+        assert_eq!(exact.retained_bytes, mapping_budget);
+    }
+
+    #[test]
+    fn generated_cff_face_uses_the_complete_type0_embedding_path() {
+        let pack = synthetic_cff_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("cff-embedding");
+        sheet.set_col_width(0, 20.0);
+        sheet.write(0, 0, "A");
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                single_page_sheets: true,
+                render: RenderOptions {
+                    gridlines: false,
+                    default_font_family: pack.default_family().to_string(),
+                    font_pack: Some(pack.clone()),
+                    ..RenderOptions::default()
+                },
+                ..PrintOptions::default()
+            },
+        )
+        .expect("layout generated CFF fixture");
+
+        let pdf = render_print_document_pdf_with_fonts(&document, &pack)
+            .expect("embed generated CFF fixture");
+        assert_eq!(
+            pdf,
+            render_print_document_pdf_with_fonts(&document, &pack).unwrap(),
+            "CFF PDF output must be byte deterministic"
+        );
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Subtype /Type0"));
+        assert!(source.contains("/Subtype /CIDFontType0"));
+        assert!(source.contains("/FontFile3"));
+        assert!(source.contains("/Subtype /OpenType"));
+        assert!(pdf.windows(4).any(|window| window == b"OTTO"));
+        assert!(!source.contains("/Subtype /CIDFontType2"));
+        assert!(!source.contains("/FontFile2"));
+        assert!(!source.contains("/CIDToGIDMap /Identity"));
+        assert!(!source.contains("/Subtype /Type3"));
+
+        // When Poppler is available, make it reopen the serialized file and
+        // consume the embedded CFF program instead of only inspecting bytes.
+        if let Some(text) = poppler_text(&pdf) {
+            assert_eq!(text.trim(), "A");
+        }
     }
 
     #[test]
@@ -4581,6 +4878,38 @@ mod tests {
             pages.pop();
         }
         Some(pages)
+    }
+
+    fn poppler_fonts(pdf: &[u8]) -> Option<String> {
+        let available = std::process::Command::new("pdffonts")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if std::env::var_os("RXLS_REQUIRE_POPPLER").is_some() {
+            assert!(available, "RXLS_REQUIRE_POPPLER requires pdffonts");
+        }
+        if !available {
+            return None;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = poppler_temp_directory("fonts", nonce);
+        std::fs::create_dir(&directory).unwrap();
+        let pdf_path = directory.join("fixture.pdf");
+        std::fs::write(&pdf_path, pdf).unwrap();
+        let output = std::process::Command::new("pdffonts")
+            .arg(&pdf_path)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8(output.stdout).unwrap())
     }
 
     fn poppler_raster(pdf: &[u8], kind: &str) -> Option<tiny_skia::Pixmap> {
@@ -6849,7 +7178,7 @@ mod tests {
     }
 
     #[test]
-    fn project_font_pack_pdf_exposes_exact_poppler_word_tokens() {
+    fn project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens() {
         let pack = synthetic_test_pack();
         let mut workbook = rxls::Workbook::new();
         let sheet = workbook.add_sheet("words");
@@ -6860,13 +7189,32 @@ mod tests {
             render: RenderOptions {
                 gridlines: false,
                 default_font_family: pack.default_family().to_string(),
-                font_pack: Some(pack),
+                font_pack: Some(pack.clone()),
                 ..RenderOptions::default()
             },
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &options).unwrap();
-        let pdf = render_print_document_pdf(&document).unwrap();
+        let pdf = render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+        if let Some(fonts) = poppler_fonts(&pdf) {
+            let rows = fonts.lines().skip(2).collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "{fonts}");
+            let fields = rows[0].split_ascii_whitespace().collect::<Vec<_>>();
+            assert!(fields.len() >= 7, "{fonts}");
+            assert_eq!(
+                &fields[..7],
+                [
+                    "RXLSEM+EmbeddedSubset0000",
+                    "CID",
+                    "TrueType",
+                    "Identity-H",
+                    "yes",
+                    "yes",
+                    "yes",
+                ],
+                "{fonts}"
+            );
+        }
         if let Some(xml) = poppler_bbox_layout(&pdf) {
             assert_eq!(poppler_words(&xml), ["alpha", "beta", "gamma"]);
             let alpha = poppler_word_bbox(&xml, "alpha");

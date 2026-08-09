@@ -423,6 +423,7 @@ impl GlyphRunNode {
             || self.paints.len() > self.commands.len()
             || (!self.cluster_metrics.is_empty()
                 && self.cluster_metrics.len() != self.clusters.len())
+            || self.glyphs.is_empty() != self.font_faces.is_empty()
         {
             return false;
         }
@@ -461,8 +462,28 @@ impl GlyphRunNode {
             return false;
         }
 
+        if self.font_faces.iter().any(|face| {
+            face.units_per_em == 0
+                || face.face_sha256.len() != 64
+                || !face
+                    .face_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return false;
+        }
         if self.glyphs.iter().any(|glyph| {
-            glyph.size <= Fixed::ZERO || glyph.origin_x.checked_add(glyph.size).is_none()
+            usize::try_from(glyph.face)
+                .ok()
+                .is_none_or(|index| index >= self.font_faces.len())
+                || usize::try_from(glyph.cluster)
+                    .ok()
+                    .is_none_or(|index| index >= self.clusters.len())
+                || glyph.size <= Fixed::ZERO
+                || glyph.origin_x.checked_add(glyph.size).is_none()
+                || glyph.origin_x.checked_sub(glyph.size).is_none()
+                || glyph.origin_y.checked_add(glyph.size).is_none()
+                || glyph.origin_y.checked_sub(glyph.size).is_none()
         }) {
             return false;
         }
@@ -910,6 +931,46 @@ mod tests {
         assert!(
             !node.metadata_is_valid(),
             "nominal metric extents must not overflow"
+        );
+
+        node.cluster_metrics[0].origin_x = Fixed::ZERO;
+        node.font_faces.push(SceneFontFace {
+            family: "Test Sans".to_string(),
+            weight: 400,
+            italic: false,
+            units_per_em: 1_000,
+            face_sha256: "0123456789abcdef".repeat(4),
+        });
+        node.glyphs.push(ShapedGlyph {
+            face: 0,
+            cluster: 1,
+            glyph_id: 1,
+            origin_x: Fixed::from_pixels(1),
+            origin_y: Fixed::from_pixels(8),
+            size: Fixed::from_pixels(7),
+            synthetic: false,
+        });
+        assert!(node.metadata_is_valid());
+
+        node.glyphs[0].face = 1;
+        assert!(!node.metadata_is_valid(), "font indexes must be in range");
+        node.glyphs[0].face = 0;
+        node.glyphs[0].cluster = 3;
+        assert!(
+            !node.metadata_is_valid(),
+            "cluster indexes must be in range"
+        );
+        node.glyphs[0].cluster = 1;
+        node.font_faces[0].face_sha256.make_ascii_uppercase();
+        assert!(
+            !node.metadata_is_valid(),
+            "face identities must be canonical lowercase SHA-256"
+        );
+        node.font_faces[0].face_sha256 = "0123456789abcdef".repeat(4);
+        node.glyphs.clear();
+        assert!(
+            !node.metadata_is_valid(),
+            "font identities cannot remain without shaped glyphs"
         );
     }
 }

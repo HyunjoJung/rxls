@@ -22,9 +22,11 @@ const fs = require("node:fs");
 const api = require("rxls-wasm");
 const bytes = fs.readFileSync(process.env.RXLS_WASM_FIXTURE);
 assert.equal(api.maxInputBytes(), 32 * 1024 * 1024);
+assert.equal(api.maxExportOutputBytes(), 16 * 1024 * 1024);
 assert.ok(api.extractText(bytes).length > 0);
 assert.equal(typeof api.toCsv(bytes, 0), "string");
 assert.match(api.toHtml(bytes, 0), /^<table>/);
+assert.equal(typeof api.toMarkdown(bytes, 0), "string");
 assert.equal(JSON.parse(api.reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "consumer.cjs"), common);
@@ -32,12 +34,14 @@ assert.equal(JSON.parse(api.reportJson(bytes)).schema_version, 2);
   const esm = `
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { extractText, maxInputBytes, reportJson, toCsv, toHtml } from "rxls-wasm";
+import { extractText, maxExportOutputBytes, maxInputBytes, reportJson, toCsv, toHtml, toMarkdown } from "rxls-wasm";
 const bytes = fs.readFileSync(process.env.RXLS_WASM_FIXTURE);
 assert.equal(maxInputBytes(), 32 * 1024 * 1024);
+assert.equal(maxExportOutputBytes(), 16 * 1024 * 1024);
 assert.ok(extractText(bytes).length > 0);
 assert.equal(typeof toCsv(bytes, 0), "string");
 assert.match(toHtml(bytes, 0), /^<table>/);
+assert.equal(typeof toMarkdown(bytes, 0), "string");
 assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "consumer.mjs"), esm);
@@ -45,15 +49,17 @@ assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
   const browser = `
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import init, { extractText, maxInputBytes, reportJson, toCsv, toHtml } from "rxls-wasm";
+import init, { extractText, maxExportOutputBytes, maxInputBytes, reportJson, toCsv, toHtml, toMarkdown } from "rxls-wasm";
 const moduleUrl = import.meta.resolve("rxls-wasm");
 const wasmBytes = fs.readFileSync(new URL("./rxls_wasm_bg.wasm", moduleUrl));
 await init({ module_or_path: wasmBytes });
 const bytes = fs.readFileSync(process.env.RXLS_WASM_FIXTURE);
 assert.equal(maxInputBytes(), 32 * 1024 * 1024);
+assert.equal(maxExportOutputBytes(), 16 * 1024 * 1024);
 assert.ok(extractText(bytes).length > 0);
 assert.equal(typeof toCsv(bytes, 0), "string");
 assert.match(toHtml(bytes, 0), /^<table>/);
+assert.equal(typeof toMarkdown(bytes, 0), "string");
 assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
 `;
   fs.writeFileSync(path.join(consumerDir, "browser-consumer.mjs"), browser);
@@ -61,10 +67,12 @@ assert.equal(JSON.parse(reportJson(bytes)).schema_version, 2);
   const nodeTypescript = `
 import {
   extractText,
+  maxExportOutputBytes,
   maxInputBytes,
   reportJson,
   toCsv,
   toHtml,
+  toMarkdown,
   type RxlsErrorObject,
 } from "rxls-wasm";
 
@@ -76,8 +84,10 @@ const bytes = Uint8Array.from(JSON.parse(process.env.RXLS_WASM_BYTES ?? "[]") as
 const text: string = extractText(bytes);
 const csv: string = toCsv(bytes, 0);
 const html: string = toHtml(bytes, 0);
+const markdown: string = toMarkdown(bytes, 0);
 const report = JSON.parse(reportJson(bytes)) as { schema_version: number };
 const limit: number = maxInputBytes();
+const outputLimit: number = maxExportOutputBytes();
 const typedError = (error: unknown): RxlsErrorObject | null =>
   error instanceof Error && error.name === "RxlsError"
     ? error as RxlsErrorObject
@@ -85,8 +95,10 @@ const typedError = (error: unknown): RxlsErrorObject | null =>
 ensure(text.length > 0, "text export is empty");
 ensure(typeof csv === "string", "CSV export is not text");
 ensure(/^<table>/.test(html), "HTML export is not a table");
+ensure(typeof markdown === "string", "Markdown export is not text");
 ensure(report.schema_version === 2, "report schema mismatch");
 ensure(limit === 32 * 1024 * 1024, "input limit mismatch");
+ensure(outputLimit === 16 * 1024 * 1024, "output limit mismatch");
 void typedError;
 `;
   fs.writeFileSync(path.join(consumerDir, "node-consumer.mts"), nodeTypescript);
@@ -94,10 +106,12 @@ void typedError;
   const browserTypescript = `
 import init, {
   extractText,
+  maxExportOutputBytes,
   maxInputBytes,
   reportJson,
   toCsv,
   toHtml,
+  toMarkdown,
   type InitOutput,
   type RxlsErrorObject,
 } from "rxls-wasm";
@@ -106,10 +120,12 @@ async function initialize(bytes: Uint8Array): Promise<InitOutput> {
   const initialized = await init();
   void [
     extractText(bytes),
+    maxExportOutputBytes(),
     maxInputBytes(),
     reportJson(bytes),
     toCsv(bytes, 0),
     toHtml(bytes, 0),
+    toMarkdown(bytes, 0),
   ];
   return initialized;
 }

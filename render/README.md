@@ -36,7 +36,10 @@ than silent omissions.
 For reproducible typography, pass an explicitly acquired and verified OFL font
 pack. The renderer verifies every declared file size and SHA-256, performs
 Unicode bidirectional shaping and fallback only from the owned pack bytes, and
-emits glyph outlines instead of relying on fonts installed on the host. The
+retains the exact shaped glyph outlines instead of relying on fonts installed
+on the host. PDF output may additionally subset and embed the verified font
+program when its OS/2 permissions explicitly allow installable embedding and
+subsetting. The
 checked-in lock pins regular, bold, italic, and bold-italic Carlito, Arimo,
 Tinos, Cousine, and Caladea faces from their primary Google Fonts upstream
 repositories. Manifest aliases substitute Calibri, Arial/Helvetica, Times New
@@ -67,12 +70,15 @@ indentation, shrink-to-fit, horizontal and vertical alignment, rotation,
 clipping, and legal empty-cell overflow remain cell-level policies. Each
 outlined node records bounded UTF-8 source-cluster to path-command ranges and
 contiguous paint spans, including ligatures, combining sequences, fallback
-faces, CJK, and bidirectional visual order. SVG, PDF, and PNG replay those same
-scene commands and colors. PDF additionally uses Unicode `ActualText` plus a
-deterministic embedded Type3 subset whose bounded source-cluster glyph programs,
-non-zero widths, color spans, and `ToUnicode` maps come directly from those
-retained outlines, without consulting host fonts. The bundle manifest records
-the exact path-independent font-pack SHA-256.
+faces, CJK, and bidirectional visual order. SVG and PNG replay those exact scene
+commands and colors. PDF preserves the same shaping and paint while additionally
+using Unicode `ActualText` and deterministic font subsets. Verified faces that
+permit installable embedding and subsetting are emitted as Type0 composite fonts
+whose glyph identities, widths, and `ToUnicode` maps come from the retained
+shaping result. Restricted, synthetic, or unsupported faces fall back to
+embedded Type3 source-cluster glyph programs derived from the retained outlines.
+Neither path consults host fonts. The bundle manifest records the exact
+path-independent font-pack SHA-256.
 Sandboxed and WASM callers can supply the same manifest and owned virtual files
 through `FontPack::load_memory`; it applies identical bounds and hashes, rejects
 missing/extra/unsafe members, and exposes verified per-face SHA-256 identities
@@ -110,19 +116,23 @@ cargo run --manifest-path render/Cargo.toml -- \
 For LibreOffice `SinglePageSheets` differential runs, add
 `--single-page-sheets`. This opt-in override emits the selected visible sheet
 scene at 100% on one content-sized page. Like LibreOffice, it ignores authored
-paper, orientation, margins, scale, print headings, repeated titles, and
-headers/footers. The `single_page_sheets` override is recorded in both the page
-report and bundle manifest. Default authored pagination is unchanged.
+paper, orientation, margins, scale, print gridlines/headings, repeated titles,
+and headers/footers. The `single_page_sheets` override is recorded in both the
+page report and bundle manifest. Default authored pagination is unchanged and
+continues to honor source print-gridline settings plus the caller's gridline
+flag.
 
 Print layout honors the retained print area, paper/orientation, margins,
 percentage or fit-to-page scaling, repeated title rows and columns, horizontal
 and vertical centering, print gridlines/headings, and headers/footers. Page maps
 and typed approximations are written to `sheet-0000-pages.json`. PDF files have
 fixed metadata and IDs, path-safe link annotations, and Unicode `ActualText`;
-verified font glyphs are embedded as deterministic Type3 source-cluster subsets
-and remain the exact outlines and colors used by SVG and PNG. PNG output requires
-a verified font pack whenever a scene contains text, and each page is preflighted
-and rasterized independently at the requested DPI.
+verified faces with explicit installable-embedding and subsetting permission use
+deterministic Type0 composite subsets, while all other glyphs use deterministic
+Type3 source-cluster subsets. Both paths retain the shaping and source-cluster
+mapping used by the exact outlines and colors replayed by SVG and PNG. PNG output
+requires a verified font pack whenever a scene contains text, and each page is
+preflighted and rasterized independently at the requested DPI.
 
 The nested crate enables the `rxls` XLSX, XLSB, and ODS readers without the core
 CLI, so the renderer accepts every spreadsheet format supported by `rxls` while

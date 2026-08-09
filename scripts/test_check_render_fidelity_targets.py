@@ -74,22 +74,37 @@ def point_geometry(
     *,
     rxls_width: str = "600/1",
     libreoffice_width: str = "600/1",
+    rxls_box_width: str | None = None,
+    libreoffice_box_width: str | None = None,
     rxls_xhtml_width: str | None = None,
     libreoffice_xhtml_width: str | None = None,
 ) -> dict[str, object]:
-    def side(width: str) -> dict[str, object]:
-        dimensions = {"height_points": "450/1", "width_points": width}
+    def side(width: str, box_width: str) -> dict[str, object]:
+        page_dimensions = {
+            "height_points": "450/1",
+            "width_points": width,
+        }
+        box_dimensions = {
+            "height_points": "450/1",
+            "width_points": box_width,
+        }
         return {
-            "crop_box": dict(dimensions),
-            "media_box": dict(dimensions),
-            "page_size": dict(dimensions),
+            "crop_box": dict(box_dimensions),
+            "media_box": dict(box_dimensions),
+            "page_size": dict(page_dimensions),
         }
 
+    rxls_page = MODULE._point(rxls_width, "fixture", positive=True)
+    libreoffice_page = MODULE._point(
+        libreoffice_width, "fixture", positive=True
+    )
     rxls_box = MODULE._point(
-        rxls_width, "fixture", positive=True
+        rxls_box_width or rxls_width, "fixture", positive=True
     )
     libreoffice_box = MODULE._point(
-        libreoffice_width, "fixture", positive=True
+        libreoffice_box_width or libreoffice_width,
+        "fixture",
+        positive=True,
     )
     rxls_xhtml = MODULE._point(
         rxls_xhtml_width or rxls_width, "fixture", positive=True
@@ -110,19 +125,22 @@ def point_geometry(
             "crop_box_width": box_delta,
             "libreoffice_xhtml_page_size_height": "0/1",
             "libreoffice_xhtml_page_size_width": point_text(
-                libreoffice_xhtml - libreoffice_box
+                libreoffice_xhtml - libreoffice_page
             ),
             "media_box_height": "0/1",
             "media_box_width": box_delta,
             "rxls_xhtml_page_size_height": "0/1",
             "rxls_xhtml_page_size_width": point_text(
-                rxls_xhtml - rxls_box
+                rxls_xhtml - rxls_page
             ),
             "xhtml_height": "0/1",
             "xhtml_width": point_text(rxls_xhtml - libreoffice_xhtml),
         },
-        "libreoffice": side(libreoffice_width),
-        "rxls": side(rxls_width),
+        "libreoffice": side(
+            libreoffice_width,
+            libreoffice_box_width or libreoffice_width,
+        ),
+        "rxls": side(rxls_width, rxls_box_width or rxls_width),
         "xhtml": {
             "libreoffice": {
                 "height_points": "450/1",
@@ -233,14 +251,15 @@ def file_row(format_name: str, index: int) -> dict[str, object]:
         },
         "native_pdf_attestation": {
             "actual_text_documents": 1,
-            "charprocs_documents": 1,
             "documents": 1,
             "embedded_font_objects": 1,
             "font_objects": 1,
             "identity_set_sha256": "6" * 64,
             "subset_font_objects": 1,
-            "type3_documents": 1,
-            "type3_font_objects": 1,
+            "type0_cff_font_objects": 0,
+            "type0_font_objects": 1,
+            "type0_truetype_font_objects": 1,
+            "type3_font_objects": 0,
             "unicode_font_objects": 1,
         },
     }
@@ -665,6 +684,19 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.GateError, "font_attestation"):
             self.evaluate_small(report)
 
+    def test_native_pdf_attestation_schema_and_path_counts_are_exact(self) -> None:
+        report = report_document()
+        report["files"][0]["native_pdf_attestation"][
+            "type0_truetype_font_objects"
+        ] = 0
+        with self.assertRaisesRegex(MODULE.GateError, "native_pdf_attestation"):
+            self.evaluate_small(report)
+
+        report = report_document()
+        report["files"][0]["native_pdf_attestation"]["unreviewed"] = 0
+        with self.assertRaisesRegex(MODULE.GateError, "native_pdf_attestation"):
+            self.evaluate_small(report)
+
     def test_cli_output_is_path_and_content_neutral(self) -> None:
         report = report_document(40)
         with tempfile.TemporaryDirectory() as raw:
@@ -876,20 +908,51 @@ class CheckRenderFidelityTargetsTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["page_box_max_millipoints"], 5_250)
         self.assertIn("page_box_max_error_above_target", result["failures"])
 
-    def test_sub_raster_pdf_point_delta_fails_exact_geometry_gate(self) -> None:
+    def test_imported_page_box_quantization_bound_is_inclusive(self) -> None:
         report = report_document()
         item = report["files"][0]
         item["pages"][0]["pdf_point_geometry"] = point_geometry(
-            libreoffice_width="5999/10"
+            libreoffice_box_width="119997/200"
         )
-        item["metrics"]["pdf_point_geometry_mismatches"] = 1
-        item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 100
+        item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 15
         item["metrics"][
             "max_pdf_xhtml_crosscheck_delta_micropoints"
-        ] = 100_000
+        ] = 0
+        result = self.evaluate_small(report)
+        self.assertNotIn("pdf_point_geometry_mismatch", result["failures"])
+        self.assertNotIn("raster_page_box_mismatch", result["failures"])
+        self.assertEqual(
+            result["thresholds"][
+                "pdf_imported_page_box_quantization_max_micropoints"
+            ],
+            15_000,
+        )
+
+        item["pages"][0]["pdf_point_geometry"] = point_geometry(
+            libreoffice_box_width="599984999/1000000"
+        )
+        item["metrics"]["pdf_point_geometry_mismatches"] = 1
+        item["metrics"]["max_pdf_point_geometry_delta_millipoints"] = 16
         result = self.evaluate_small(report)
         self.assertIn("pdf_point_geometry_mismatch", result["failures"])
         self.assertNotIn("raster_page_box_mismatch", result["failures"])
+
+    def test_page_point_geometry_rejects_inconsistent_and_malformed_deltas(
+        self,
+    ) -> None:
+        report = report_document()
+        point = report["files"][0]["pages"][0]["pdf_point_geometry"]
+        point["deltas_points"]["media_box_width"] = "1/1000000"
+        with self.assertRaisesRegex(
+            MODULE.GateError, "page_point_geometry_delta"
+        ):
+            self.evaluate_small(report)
+
+        report = report_document()
+        point = report["files"][0]["pages"][0]["pdf_point_geometry"]
+        del point["deltas_points"]["crop_box_height"]
+        with self.assertRaisesRegex(MODULE.GateError, "page_point_geometry"):
+            self.evaluate_small(report)
 
     def test_poppler_xhtml_precision_crosscheck_is_bounded_not_zeroed(self) -> None:
         report = report_document()

@@ -71,7 +71,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
@@ -206,6 +206,12 @@ PDF_FONT_TYPES = frozenset(
         "CID TrueType",
         "CID TrueType (OT)",
     }
+)
+NATIVE_PDF_TYPE0_TRUETYPE_TYPES = frozenset(
+    {"CID TrueType", "CID TrueType (OT)"}
+)
+NATIVE_PDF_TYPE0_CFF_TYPES = frozenset(
+    {"CID Type 0C", "CID Type 0C (OT)"}
 )
 FOREGROUND_CHANNEL_THRESHOLD = 248
 EDGE_LUMA_DELTA = 32
@@ -3799,12 +3805,24 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
     PDF_POINT_DELTA_KEYS - PDF_DIRECT_POINT_DELTA_KEYS
 )
+# Calc records imported page boxes as integer hundredths of a millimetre.
+# Half of one mm100 is 9/635 points (about 14,174 micropoints), and half of one
+# rxls 1/1024-CSS-pixel fixed unit is 3/8192 points (about 366 micropoints).
+# Retain and recompute the exact PDF rationals, but use a conservative
+# 15,000-micropoint envelope when classifying imported MediaBox/CropBox deltas.
+# Authored print does not use this envelope and remains exact.
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS = 15_000
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS = Fraction(
+    PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS,
+    1_000_000,
+)
+
 # ``pdfinfo`` reports Page size to at most three decimal places while
 # ``pdftotext -bbox-layout`` reports six.  Keep both exact decimal rationals,
 # then allow only the documented display-precision envelope for this internal
-# cross-check.  Cross-document MediaBox/CropBox deltas remain exact zero;
-# pdftotext XHTML dimensions are diagnostic cross-checks, including between
-# the two PDFs, because they are not authoritative page-box measurements.
+# cross-check.  pdftotext XHTML dimensions are diagnostic cross-checks,
+# including between the two PDFs, because they are not authoritative page-box
+# measurements.
 PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
 
 
@@ -3818,8 +3836,14 @@ def _point_delta(value: object, *, code: str) -> Fraction:
 
 def _aggregate_pdf_point_geometry(
     pages: Sequence[dict[str, object]],
+    *,
+    imported_page_boxes: bool = True,
 ) -> dict[str, int]:
-    """Aggregate exact PDF boxes separately from diagnostic XHTML checks."""
+    """Aggregate exact PDF boxes separately from diagnostic XHTML checks.
+
+    Imported boxes use Calc's bounded mm100 quantization policy.  Authored
+    boxes remain exact when ``imported_page_boxes`` is false.
+    """
 
     mismatches = 0
     max_delta_millipoints = 0
@@ -3833,8 +3857,10 @@ def _aggregate_pdf_point_geometry(
             "xhtml",
         }:
             raise HarnessError("pdf_point_geometry")
-        _point_geometry_dimensions(evidence["rxls"], code="pdf_point_geometry")
-        _point_geometry_dimensions(
+        rxls = _point_geometry_dimensions(
+            evidence["rxls"], code="pdf_point_geometry"
+        )
+        libreoffice = _point_geometry_dimensions(
             evidence["libreoffice"], code="pdf_point_geometry"
         )
         xhtml = evidence["xhtml"]
@@ -3843,6 +3869,7 @@ def _aggregate_pdf_point_geometry(
             "rxls",
         }:
             raise HarnessError("pdf_point_geometry")
+        xhtml_values: dict[str, tuple[Fraction, Fraction]] = {}
         for side in ("rxls", "libreoffice"):
             row = xhtml[side]
             if not isinstance(row, dict) or set(row) != {
@@ -3850,22 +3877,53 @@ def _aggregate_pdf_point_geometry(
                 "width_points",
             }:
                 raise HarnessError("pdf_point_geometry")
-            _point_dimension(row["width_points"], code="pdf_point_geometry")
-            _point_dimension(row["height_points"], code="pdf_point_geometry")
+            xhtml_values[side] = (
+                _point_dimension(
+                    row["width_points"], code="pdf_point_geometry"
+                ),
+                _point_dimension(
+                    row["height_points"], code="pdf_point_geometry"
+                ),
+            )
         deltas = evidence["deltas_points"]
         if not isinstance(deltas, dict) or set(deltas) != PDF_POINT_DELTA_KEYS:
             raise HarnessError("pdf_point_geometry")
         parsed = {
-            key: abs(_point_delta(value, code="pdf_point_geometry"))
+            key: _point_delta(value, code="pdf_point_geometry")
             for key, value in deltas.items()
         }
+        expected: dict[str, Fraction] = {}
+        for box in ("media_box", "crop_box"):
+            for offset, axis in enumerate(("width", "height")):
+                expected[f"{box}_{axis}"] = (
+                    rxls[box][offset] - libreoffice[box][offset]
+                )
+        for side in ("rxls", "libreoffice"):
+            geometry = rxls if side == "rxls" else libreoffice
+            for offset, axis in enumerate(("width", "height")):
+                expected[f"{side}_xhtml_page_size_{axis}"] = (
+                    xhtml_values[side][offset]
+                    - geometry["page_size"][offset]
+                )
+        for offset, axis in enumerate(("width", "height")):
+            expected[f"xhtml_{axis}"] = (
+                xhtml_values["rxls"][offset]
+                - xhtml_values["libreoffice"][offset]
+            )
+        if parsed != expected:
+            raise HarnessError("pdf_point_geometry_delta")
         direct_deltas = [
-            parsed[key] for key in PDF_DIRECT_POINT_DELTA_KEYS
+            abs(parsed[key]) for key in PDF_DIRECT_POINT_DELTA_KEYS
         ]
         crosscheck_deltas = [
-            parsed[key] for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
+            abs(parsed[key]) for key in PDF_XHTML_CROSSCHECK_DELTA_KEYS
         ]
-        page_mismatch = any(delta != 0 for delta in direct_deltas)
+        direct_limit = (
+            PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS
+            if imported_page_boxes
+            else Fraction()
+        )
+        page_mismatch = any(delta > direct_limit for delta in direct_deltas)
         for delta in direct_deltas:
             millipoints = (
                 delta.numerator * 1000 + delta.denominator - 1
@@ -4628,25 +4686,39 @@ def attest_pdf_fonts(
 def attest_native_pdf_fonts(
     records: Sequence[PdfFontRecord],
 ) -> dict[str, object]:
-    """Attest project-owned path-text Type 3 subsets without exposing names."""
+    """Attest the exact project-owned Type0 and Type3 subset identities."""
     if not records:
         raise HarnessError("renderer_pdf_font_missing")
     identities = sorted(record.normalized_identity for record in records)
-    if any(
-        re.fullmatch(r"outlinedsubset[0-9]{4}", identity) is None
-        for identity in identities
-    ):
-        raise HarnessError("renderer_pdf_font_identity")
-    type3 = sum(record.font_type == "Type 3" for record in records)
+    type0_truetype = 0
+    type0_cff = 0
+    type3 = 0
+    for record in records:
+        identity = record.normalized_identity
+        if re.fullmatch(r"embeddedsubset[0-9]{4}", identity) is not None:
+            if record.font_type in NATIVE_PDF_TYPE0_TRUETYPE_TYPES:
+                type0_truetype += 1
+            elif record.font_type in NATIVE_PDF_TYPE0_CFF_TYPES:
+                type0_cff += 1
+            else:
+                raise HarnessError("renderer_pdf_font_type")
+        elif re.fullmatch(r"outlinedsubset[0-9]{4}", identity) is not None:
+            if record.font_type != "Type 3":
+                raise HarnessError("renderer_pdf_font_type")
+            type3 += 1
+        else:
+            raise HarnessError("renderer_pdf_font_identity")
     embedded = sum(record.embedded for record in records)
     subset = sum(record.subset for record in records)
     unicode_maps = sum(record.unicode_map for record in records)
     if (
-        type3 != len(records)
-        or embedded != len(records)
+        embedded != len(records)
         or subset != len(records)
         or unicode_maps != len(records)
     ):
+        raise HarnessError("renderer_pdf_font_attestation")
+    type0 = type0_truetype + type0_cff
+    if type0 + type3 != len(records):
         raise HarnessError("renderer_pdf_font_attestation")
     identity_payload = ("\n".join(identities) + "\n").encode("ascii")
     return {
@@ -4656,10 +4728,121 @@ def attest_native_pdf_fonts(
             identity_payload
         ).hexdigest(),
         "subset_font_objects": subset,
+        "type0_cff_font_objects": type0_cff,
+        "type0_font_objects": type0,
+        "type0_truetype_font_objects": type0_truetype,
         "type3_font_objects": type3,
         "unicode_font_objects": unicode_maps,
         "unique_font_identities": len(set(identities)),
     }
+
+
+_PDF_STREAM_TOKEN_RE = re.compile(rb"^stream$", re.MULTILINE)
+_PDF_ENDSTREAM_TOKEN_RE = re.compile(rb"^endstream$", re.MULTILINE)
+_PDF_LENGTH_KEY_RE = re.compile(rb"/Length(?=[\x00\t\n\x0c\r /<>\[\]()])")
+_PDF_DIRECT_LENGTH_RE = re.compile(
+    rb"/Length[\x00\t\n\x0c\r ]+([0-9]+)"
+    rb"(?=[\x00\t\n\x0c\r ]*(?:/|>>))"
+)
+
+
+def renderer_pdf_syntax_without_binary_stream_payloads(payload: bytes) -> bytes:
+    """Return renderer PDF syntax after validating and removing binary streams."""
+    syntax = bytearray()
+    cursor = 0
+    while True:
+        stream_match = _PDF_STREAM_TOKEN_RE.search(payload, cursor)
+        segment_end = len(payload) if stream_match is None else stream_match.start()
+        segment = payload[cursor:segment_end]
+        if _PDF_ENDSTREAM_TOKEN_RE.search(segment) is not None:
+            raise HarnessError("renderer_pdf_stream_syntax")
+        syntax.extend(segment)
+        if stream_match is None:
+            break
+
+        stream_start = stream_match.start()
+        stream_end = stream_match.end()
+        if (
+            stream_start == 0
+            or payload[stream_start - 1 : stream_start] != b"\n"
+            or payload[stream_end : stream_end + 1] != b"\n"
+        ):
+            raise HarnessError("renderer_pdf_stream_syntax")
+        dictionary_start = payload.rfind(b"<<", cursor, stream_start)
+        if dictionary_start < cursor:
+            raise HarnessError("renderer_pdf_stream_syntax")
+        dictionary = payload[dictionary_start:stream_start]
+        if not dictionary.rstrip().endswith(b">>"):
+            raise HarnessError("renderer_pdf_stream_syntax")
+        length_keys = _PDF_LENGTH_KEY_RE.findall(dictionary)
+        direct_lengths = _PDF_DIRECT_LENGTH_RE.findall(dictionary)
+        if len(length_keys) != 1 or len(direct_lengths) != 1:
+            raise HarnessError("renderer_pdf_stream_syntax")
+        length_digits = direct_lengths[0]
+        if len(length_digits) > 20:
+            raise HarnessError("renderer_pdf_stream_syntax")
+        stream_length = int(length_digits)
+        data_start = stream_end + 1
+        data_end = data_start + stream_length
+        if data_end > len(payload):
+            raise HarnessError("renderer_pdf_stream_syntax")
+        if payload.startswith(b"endstream", data_end):
+            endstream_start = data_end
+        elif payload.startswith(b"\nendstream", data_end):
+            endstream_start = data_end + 1
+        else:
+            raise HarnessError("renderer_pdf_stream_syntax")
+        endstream_end = endstream_start + len(b"endstream")
+        if payload[endstream_end : endstream_end + 1] not in (b"", b"\n"):
+            raise HarnessError("renderer_pdf_stream_syntax")
+
+        syntax.extend(payload[stream_start:data_start])
+        if not any(
+            marker in dictionary
+            for marker in (
+                b"/Length1 ",
+                b"/Subtype /OpenType",
+                b"/Filter /FlateDecode",
+            )
+        ):
+            syntax.extend(payload[data_start:data_end])
+        syntax.extend(b"endstream")
+        cursor = endstream_end
+    return bytes(syntax)
+
+
+def attest_native_pdf_syntax(
+    payload: bytes,
+    font_attestation: Mapping[str, object],
+) -> None:
+    """Bind the Poppler object inventory to the renderer's exact PDF paths."""
+    syntax_payload = renderer_pdf_syntax_without_binary_stream_payloads(payload)
+    if b"/ActualText" not in syntax_payload:
+        raise HarnessError("renderer_pdf_actual_text_missing")
+    expected_markers = (
+        (
+            int(font_attestation["type0_font_objects"]) > 0,
+            (b"/Subtype /Type0 ",),
+        ),
+        (
+            int(font_attestation["type0_truetype_font_objects"]) > 0,
+            (b"/Subtype /CIDFontType2 ", b"/FontFile2 "),
+        ),
+        (
+            int(font_attestation["type0_cff_font_objects"]) > 0,
+            (b"/Subtype /CIDFontType0 ", b"/FontFile3 "),
+        ),
+        (
+            int(font_attestation["type3_font_objects"]) > 0,
+            (b"/Subtype /Type3 ", b"/CharProcs "),
+        ),
+    )
+    if any(
+        (marker in syntax_payload) != expected
+        for expected, markers in expected_markers
+        for marker in markers
+    ):
+        raise HarnessError("renderer_pdf_font_syntax")
 
 
 def parse_pdftotext_pages(
@@ -6835,6 +7018,8 @@ def _aggregate_mask_metrics(
 
 def aggregate_page_metrics(
     pages: Sequence[dict[str, object]],
+    *,
+    imported_page_boxes: bool = True,
 ) -> dict[str, object]:
     pixels = sum(int(page["pixels"]) for page in pages)
     changed = sum(int(page["changed_pixels"]) for page in pages)
@@ -6906,7 +7091,10 @@ def aggregate_page_metrics(
     if any(point_geometry_presence) and not all(point_geometry_presence):
         raise HarnessError("pdf_point_geometry_incomplete")
     evidence.update(
-        _aggregate_pdf_point_geometry(pages)
+        _aggregate_pdf_point_geometry(
+            pages,
+            imported_page_boxes=imported_page_boxes,
+        )
         if all(point_geometry_presence)
         else {
             "pdf_point_geometry_mismatches": 0,
@@ -7709,11 +7897,7 @@ def evaluate_case(
     rxls_bbox_facts: list[dict[str, object]] = []
     native_font_facts: list[dict[str, object]] = []
     native_attestations: list[dict[str, object]] = []
-    native_pdf_syntax = {
-        "actual_text_documents": 0,
-        "charprocs_documents": 0,
-        "type3_documents": 0,
-    }
+    native_pdf_actual_text_documents = 0
     pdf_groups: dict[Path, list[tuple[int, int]]] = {}
     for output_index, page in enumerate(comparison_pages):
         if (
@@ -7778,19 +7962,13 @@ def evaluate_case(
                     native_font_result.stdout,
                     max_bytes=config.caps.max_command_output_bytes,
                 )
-                native_attestations.append(attest_native_pdf_fonts(records))
+                native_attestation = attest_native_pdf_fonts(records)
                 pdf_payload = rxls_pdf.read_bytes()
                 if len(pdf_payload) > config.caps.max_artifact_bytes:
                     raise HarnessError("renderer_pdf_output_limit")
-                native_pdf_syntax["actual_text_documents"] += int(
-                    b"/ActualText" in pdf_payload
-                )
-                native_pdf_syntax["charprocs_documents"] += int(
-                    b"/CharProcs" in pdf_payload
-                )
-                native_pdf_syntax["type3_documents"] += int(
-                    b"/Subtype /Type3" in pdf_payload
-                )
+                attest_native_pdf_syntax(pdf_payload, native_attestation)
+                native_attestations.append(native_attestation)
+                native_pdf_actual_text_documents += 1
             except (OSError, HarnessError) as error:
                 classification = (
                     str(error)
@@ -7971,22 +8149,18 @@ def evaluate_case(
     native_pdf_attestation: dict[str, object] | None = None
     if config.require_font_pack:
         documents = len(pdf_groups)
-        if (
-            len(native_attestations) != documents
-            or any(value != documents for value in native_pdf_syntax.values())
-        ):
+        if len(native_attestations) != documents:
             return _classified(
                 base,
                 "error",
-                "renderer_pdf_type3_path_text_missing",
+                "renderer_pdf_font_attestation_missing",
                 renderer=bundle.renderer,
                 scenes=scene_evidence,
                 commands=commands,
                 native_pdf_font_commands=native_font_facts,
             )
         native_pdf_attestation = {
-            "actual_text_documents": native_pdf_syntax["actual_text_documents"],
-            "charprocs_documents": native_pdf_syntax["charprocs_documents"],
+            "actual_text_documents": native_pdf_actual_text_documents,
             "documents": documents,
             "embedded_font_objects": sum(
                 int(row["embedded_font_objects"]) for row in native_attestations
@@ -8008,7 +8182,18 @@ def evaluate_case(
             "subset_font_objects": sum(
                 int(row["subset_font_objects"]) for row in native_attestations
             ),
-            "type3_documents": native_pdf_syntax["type3_documents"],
+            "type0_cff_font_objects": sum(
+                int(row["type0_cff_font_objects"])
+                for row in native_attestations
+            ),
+            "type0_font_objects": sum(
+                int(row["type0_font_objects"])
+                for row in native_attestations
+            ),
+            "type0_truetype_font_objects": sum(
+                int(row["type0_truetype_font_objects"])
+                for row in native_attestations
+            ),
             "type3_font_objects": sum(
                 int(row["type3_font_objects"]) for row in native_attestations
             ),
@@ -8257,7 +8442,12 @@ def evaluate_case(
                     **point_geometry,
                 }
             )
-        aggregate = aggregate_page_metrics(page_results)
+        aggregate = aggregate_page_metrics(
+            page_results,
+            imported_page_boxes=(
+                config.print_mode == PRINT_MODE_SINGLE_PAGE
+            ),
+        )
     except (OSError, HarnessError) as error:
         classification = str(error) if isinstance(error, HarnessError) else "artifact_unreadable"
         return _classified(base, "error", classification, commands=commands)

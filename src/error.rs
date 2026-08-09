@@ -75,6 +75,33 @@ pub enum Error {
     /// The requested worksheet index does not exist or is not a grid worksheet.
     #[error("sheet index out of range")]
     SheetOutOfRange,
+
+    /// An export delimiter conflicts with CSV quoting or record framing.
+    #[error("invalid {format} export delimiter {delimiter:?}")]
+    ExportInvalidDelimiter {
+        /// Export format whose configuration was rejected.
+        format: &'static str,
+        /// Rejected delimiter.
+        delimiter: char,
+    },
+
+    /// A portable export would exceed its configured UTF-8 output limit.
+    #[error("{format} output exceeds the configured {limit}-byte limit")]
+    ExportOutputTooLarge {
+        /// Requested export format.
+        format: &'static str,
+        /// Configured output byte limit.
+        limit: usize,
+    },
+
+    /// A portable merged-range export would exceed its bounded work limit.
+    #[error("{format} export exceeds the {limit}-operation work limit")]
+    ExportWorkLimitExceeded {
+        /// Requested export format.
+        format: &'static str,
+        /// Maximum coordinate/merge lookup operations.
+        limit: u64,
+    },
 }
 
 /// Convenience alias.

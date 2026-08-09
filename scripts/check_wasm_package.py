@@ -34,10 +34,12 @@ EXPECTED_FILES = frozenset(REQUIRED_FILES)
 REQUIRED_TYPES = (
     "RxlsErrorObject",
     "extractText",
+    "maxExportOutputBytes",
     "maxInputBytes",
     "reportJson",
     "toCsv",
     "toHtml",
+    "toMarkdown",
 )
 
 

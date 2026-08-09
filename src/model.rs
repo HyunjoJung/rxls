@@ -8008,6 +8008,11 @@ impl Sheet {
     ///
     /// Values use the same formatted display text as [`Sheet::to_text`]. Empty
     /// rows are skipped; empty cells between non-empty cells in a row are kept.
+    /// This compatibility method is capped at
+    /// [`crate::DEFAULT_EXPORT_MAX_BYTES`]. If the cap is exceeded, it returns
+    /// a diagnostic record beginning `# rxls-export-error:` instead of partial
+    /// or truncated source data. Use [`crate::export_csv`] to select a limit and
+    /// receive a typed error.
     pub fn to_csv(&self) -> String {
         self.to_csv_with_delimiter(',')
     }
@@ -8023,97 +8028,30 @@ impl Sheet {
     /// genuinely ambiguous to any reader. Since this method's return type
     /// cannot signal failure, a `delimiter` of `'"'` is silently normalized
     /// to the default `','` rather than emitting that ambiguous output.
+    ///
+    /// This compatibility method is capped at
+    /// [`crate::DEFAULT_EXPORT_MAX_BYTES`]. If the cap is exceeded, it returns
+    /// a diagnostic record beginning `# rxls-export-error:` instead of partial
+    /// or truncated source data. Use [`crate::export_csv`] to select a limit and
+    /// receive a typed error.
     pub fn to_csv_with_delimiter(&self, delimiter: char) -> String {
         let delimiter = if delimiter == '"' { ',' } else { delimiter };
-        let mut by_row: BTreeMap<u32, BTreeMap<u16, &str>> = BTreeMap::new();
-        for cell in &self.cells {
-            by_row
-                .entry(cell.row)
-                .or_default()
-                .insert(cell.col, cell.text.as_str());
-        }
-
-        let mut out = String::new();
-        for (_row, cols) in by_row {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-
-            // ponytail: CSV has no row identity; keep sparse row export bounded.
-            // Add a checked rectangular exporter if coordinate-faithful blanks matter.
-            let mut first = true;
-            let mut next_col: Option<u32> = None;
-            for (col, text) in cols {
-                let col = u32::from(col);
-                if let Some(mut expected) = next_col {
-                    while expected < col {
-                        if !first {
-                            out.push(delimiter);
-                        }
-                        first = false;
-                        expected += 1;
-                    }
-                }
-                if !first {
-                    out.push(delimiter);
-                }
-                push_csv_field(&mut out, text, delimiter);
-                first = false;
-                next_col = col.checked_add(1);
-            }
-        }
-        out
+        crate::export::legacy_csv(self, delimiter, crate::DEFAULT_EXPORT_MAX_BYTES)
     }
 
     /// Export the worksheet as an HTML table fragment.
     ///
     /// The fragment contains one `<table>` and no document wrapper. Values use
     /// the same formatted display text as [`Sheet::to_text`].
+    ///
+    /// This compatibility method uses sparse `colspan` cells and is capped at
+    /// [`crate::DEFAULT_EXPORT_MAX_BYTES`] plus a bounded merged-range work
+    /// budget. On either limit it returns a visible table carrying a
+    /// `data-rxls-export-error` attribute; it never returns partial or silently
+    /// truncated source data. Use [`crate::export_html`] for typed errors and a
+    /// caller-selected byte limit.
     pub fn to_html(&self) -> String {
-        let mut by_row: BTreeMap<u32, BTreeMap<u16, &str>> = BTreeMap::new();
-        for cell in &self.cells {
-            by_row
-                .entry(cell.row)
-                .or_default()
-                .insert(cell.col, cell.text.as_str());
-        }
-        let merges = self.merged_ranges();
-
-        let mut out = String::from("<table>");
-        for (row, cols) in by_row {
-            out.push_str("<tr>");
-            // Dense 0..=max_col iteration (matching to_markdown), not just the
-            // sparsely-written coordinates: a coordinate with no CellEntry in
-            // the middle of the row still needs an empty <td></td> so later
-            // columns don't shift left and visually land in the wrong cell.
-            // This also means a merge anchor with no CellEntry of its own
-            // (but a covered cell elsewhere in the same row that does) is now
-            // visited as an empty-text cell, so the merge's <td rowspan=..
-            // colspan=..> is still emitted instead of silently vanishing.
-            let max_col = cols.keys().next_back().copied().unwrap_or(0);
-            for col in 0..=max_col {
-                let merge = html_merge_for_cell(merges, row, col);
-                if merge.is_some_and(|merge| merge.skip) {
-                    continue;
-                }
-                let text = cols.get(&col).copied().unwrap_or_default();
-                out.push_str("<td");
-                if let Some(merge) = merge {
-                    if merge.rowspan > 1 {
-                        out.push_str(&format!(r#" rowspan="{}""#, merge.rowspan));
-                    }
-                    if merge.colspan > 1 {
-                        out.push_str(&format!(r#" colspan="{}""#, merge.colspan));
-                    }
-                }
-                out.push('>');
-                push_html_escaped(&mut out, text);
-                out.push_str("</td>");
-            }
-            out.push_str("</tr>");
-        }
-        out.push_str("</table>");
-        out
+        crate::export::legacy_html(self, crate::DEFAULT_EXPORT_MAX_BYTES)
     }
 
     /// Export the worksheet as GitHub-flavored Markdown.
@@ -8121,53 +8059,15 @@ impl Sheet {
     /// Merged cells cannot be expressed losslessly in GFM, so sheets with merges
     /// fall back to the HTML fragment. Very wide sheets also fall back to HTML to
     /// keep the Markdown table bounded.
+    ///
+    /// This compatibility method is capped at
+    /// [`crate::DEFAULT_EXPORT_MAX_BYTES`] plus a bounded merged-range work
+    /// budget. On either limit it returns a visible block beginning with an
+    /// `rxls export error` marker; it never returns partial or silently
+    /// truncated source data. Use [`crate::export_markdown`] for typed errors
+    /// and a caller-selected byte limit.
     pub fn to_markdown(&self) -> String {
-        const MAX_MD_COLS: usize = 256;
-        if !self.merged_ranges().is_empty() {
-            return self.to_html();
-        }
-
-        let mut by_row: BTreeMap<u32, BTreeMap<u16, &str>> = BTreeMap::new();
-        for cell in &self.cells {
-            by_row
-                .entry(cell.row)
-                .or_default()
-                .insert(cell.col, cell.text.as_str());
-        }
-        let max_col = by_row
-            .values()
-            .filter_map(|cols| cols.keys().next_back().copied())
-            .max();
-        let Some(max_col) = max_col else {
-            return String::new();
-        };
-        let width = usize::from(max_col) + 1;
-        if width > MAX_MD_COLS {
-            return self.to_html();
-        }
-
-        let mut rows = Vec::new();
-        for (_row, cols) in by_row {
-            let mut row = Vec::with_capacity(width);
-            for col in 0..=max_col {
-                row.push(markdown_cell(cols.get(&col).copied().unwrap_or_default()));
-            }
-            rows.push(row);
-        }
-        if rows.is_empty() {
-            return String::new();
-        }
-
-        let mut out = String::new();
-        push_markdown_row(&mut out, &rows[0]);
-        out.push('\n');
-        let separators = vec!["---".to_string(); width];
-        push_markdown_row(&mut out, &separators);
-        for row in rows.iter().skip(1) {
-            out.push('\n');
-            push_markdown_row(&mut out, row);
-        }
-        out
+        crate::export::legacy_markdown(self, crate::DEFAULT_EXPORT_MAX_BYTES)
     }
 
     /// Grouped worksheet-level metadata borrowed from this sheet.
@@ -9358,81 +9258,6 @@ fn image_extension(format: ImageFmt) -> &'static str {
     }
 }
 
-fn push_csv_field(out: &mut String, field: &str, delimiter: char) {
-    let quote = field.contains(delimiter)
-        || field.contains('"')
-        || field.contains('\n')
-        || field.contains('\r');
-    if !quote {
-        out.push_str(field);
-        return;
-    }
-
-    out.push('"');
-    for ch in field.chars() {
-        if ch == '"' {
-            out.push('"');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-}
-
-#[derive(Clone, Copy)]
-struct HtmlMerge {
-    rowspan: u32,
-    colspan: u32,
-    skip: bool,
-}
-
-fn html_merge_for_cell(ranges: &[(u32, u16, u32, u16)], row: u32, col: u16) -> Option<HtmlMerge> {
-    for &(r0, c0, r1, c1) in ranges {
-        let (top, bottom) = (r0.min(r1), r0.max(r1));
-        let (left, right) = (c0.min(c1), c0.max(c1));
-        if top <= row && row <= bottom && left <= col && col <= right {
-            return Some(HtmlMerge {
-                rowspan: bottom.saturating_sub(top).saturating_add(1),
-                colspan: u32::from(right.saturating_sub(left).saturating_add(1)),
-                skip: row != top || col != left,
-            });
-        }
-    }
-    None
-}
-
-fn push_html_escaped(out: &mut String, text: &str) {
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(ch),
-        }
-    }
-}
-
-fn markdown_cell(text: &str) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        match ch {
-            '|' => out.push_str(r"\|"),
-            '\n' | '\r' => out.push_str("<br>"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn push_markdown_row(out: &mut String, cells: &[String]) {
-    out.push('|');
-    for cell in cells {
-        out.push(' ');
-        out.push_str(cell);
-        out.push_str(" |");
-    }
-}
-
 impl Workbook {
     /// Flatten every worksheet to text, each prefixed with `# <name>`.
     pub fn text(&self) -> String {
@@ -10033,8 +9858,8 @@ impl Workbook {
     /// infallible writer would otherwise silently sanitize (out-of-grid or reversed
     /// cells/merges/ranges, authored cell/formula XML text, duplicate/invalid
     /// sheet or table names, a table range whose width disagrees with its column
-    /// count, table-header format target mismatches, active-sheet index mistakes,
-    /// too many sheets). On success the bytes are exactly what
+    /// count, table-header format target mismatches, nested formula cached values,
+    /// active-sheet index mistakes, too many sheets). On success the bytes are exactly what
     /// [`to_xlsx`](Self::to_xlsx) produces, unmodified.
     ///
     /// This is a best-effort structural pre-flight, not an exhaustive Excel
@@ -10941,10 +10766,20 @@ impl Sheet {
         &mut self,
         row: u32,
         col: u16,
-        value: Cell,
+        mut value: Cell,
         style: Option<CellStyle>,
         hyperlink: Option<String>,
     ) {
+        // OOXML stores formula source without Excel's UI-only leading `=`.
+        // Keep the public Cell invariant consistent across `write_formula`,
+        // `write_formula_with_format`, and callers that pass Cell::Formula to
+        // a generic write method. Match Spreadsheet::set_cell_formula by
+        // accepting and removing every repeated leading marker.
+        if let Cell::Formula { formula, .. } = &mut value {
+            if formula.starts_with('=') {
+                *formula = formula.trim_start_matches('=').to_string();
+            }
+        }
         // A plain write supersedes any rich-string runs previously set here;
         // `write_rich` re-inserts after calling this, so its own runs survive.
         self.rich.remove(&(row, col));

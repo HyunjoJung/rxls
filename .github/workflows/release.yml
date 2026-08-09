@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_SEMVER_CHECKS_VERSION: "0.48.0"
   RUSTFLAGS: "-D warnings"
   RELEASE_RUST_VERSION: "1.96.1"
   FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
@@ -54,6 +55,7 @@ jobs:
         run: |
           version=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
           cargo install wasm-bindgen-cli --version "$version" --locked
+          cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked
           npm install --prefix target/playwright --no-save --ignore-scripts playwright@1.54.1
           npm exec --prefix target/playwright -- playwright install --with-deps chromium
       - name: Install public reference readers
@@ -98,6 +100,9 @@ jobs:
           cargo test --doc --all-features --locked
           cargo doc --no-deps --all-features --locked
           python3 scripts/check_public_api.py
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --all-features
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --default-features
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --only-explicit-features
           bash scripts/build-wasm-package.sh
           cargo run --bin rxls --all-features --locked -- diagnose tests/fixtures/xlsx/reader-structural.xlsx > target/wasm-native-report.json
           node bindings/wasm/tests/node-smoke.cjs target/wasm-package target/wasm-native-report.json \

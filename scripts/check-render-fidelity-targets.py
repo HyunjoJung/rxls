@@ -125,6 +125,15 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = (
     PDF_POINT_DELTA_KEYS - PDF_DIRECT_POINT_DELTA_KEYS
 )
+# Calc persists imported page boxes as integer mm100 values.  Half an mm100
+# is 9/635 points (about 14,174 micropoints), and half of one rxls
+# 1/1024-CSS-pixel fixed unit is 3/8192 points (about 366 micropoints).  The
+# 15,000-micropoint ceiling is therefore a conservative, explicit bound.
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS = 15_000
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS = Fraction(
+    PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS,
+    1_000_000,
+)
 PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
 PDF_XHTML_CROSSCHECK_MAX_MICROPOINTS = 1_000
 UNIQUE_TEXT_GEOMETRY_POLICY = {
@@ -433,7 +442,7 @@ def _point_side(value: object, code: str) -> dict[str, tuple[Fraction, Fraction]
 def _page_point_geometry(
     page: dict[str, Any],
 ) -> tuple[int, int, bool, bool]:
-    """Return exact box and bounded XHTML crosscheck results independently."""
+    """Return exact evidence with imported-box and XHTML bounds separated."""
 
     evidence = _exact_object(
         page.get("pdf_point_geometry"),
@@ -510,7 +519,10 @@ def _page_point_geometry(
     return (
         millipoints,
         crosscheck_micropoints,
-        max_direct_delta == 0,
+        (
+            max_direct_delta
+            <= PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS
+        ),
         max_crosscheck_delta <= PDF_XHTML_CROSSCHECK_MAX_POINTS,
     )
 
@@ -1174,18 +1186,19 @@ def _font_attestation(value: object) -> int:
     return objects
 
 
-def _native_pdf_attestation(value: object) -> tuple[int, int]:
+def _native_pdf_attestation(value: object) -> dict[str, int]:
     row = _exact_object(
         value,
         {
             "actual_text_documents",
-            "charprocs_documents",
             "documents",
             "embedded_font_objects",
             "font_objects",
             "identity_set_sha256",
             "subset_font_objects",
-            "type3_documents",
+            "type0_cff_font_objects",
+            "type0_font_objects",
+            "type0_truetype_font_objects",
             "type3_font_objects",
             "unicode_font_objects",
         },
@@ -1203,27 +1216,52 @@ def _native_pdf_attestation(value: object) -> tuple[int, int]:
         minimum=1,
         maximum=1_000_000,
     )
-    for key in (
-        "actual_text_documents",
-        "charprocs_documents",
-        "type3_documents",
-    ):
-        if _integer(
-            row[key], "native_pdf_attestation", maximum=documents
-        ) != documents:
-            raise GateError("native_pdf_attestation")
+    if _integer(
+        row["actual_text_documents"],
+        "native_pdf_attestation",
+        maximum=documents,
+    ) != documents:
+        raise GateError("native_pdf_attestation")
     for key in (
         "embedded_font_objects",
         "subset_font_objects",
-        "type3_font_objects",
         "unicode_font_objects",
     ):
         if _integer(
             row[key], "native_pdf_attestation", maximum=objects
         ) != objects:
             raise GateError("native_pdf_attestation")
+    type0 = _integer(
+        row["type0_font_objects"],
+        "native_pdf_attestation",
+        maximum=objects,
+    )
+    type0_truetype = _integer(
+        row["type0_truetype_font_objects"],
+        "native_pdf_attestation",
+        maximum=type0,
+    )
+    type0_cff = _integer(
+        row["type0_cff_font_objects"],
+        "native_pdf_attestation",
+        maximum=type0,
+    )
+    type3 = _integer(
+        row["type3_font_objects"],
+        "native_pdf_attestation",
+        maximum=objects,
+    )
+    if type0_truetype + type0_cff != type0 or type0 + type3 != objects:
+        raise GateError("native_pdf_attestation")
     _sha256(row["identity_set_sha256"], "native_pdf_attestation")
-    return documents, objects
+    return {
+        "documents": documents,
+        "font_objects": objects,
+        "type0_cff_font_objects": type0_cff,
+        "type0_font_objects": type0,
+        "type0_truetype_font_objects": type0_truetype,
+        "type3_font_objects": type3,
+    }
 
 
 def _configuration(
@@ -1469,6 +1507,10 @@ def evaluate(
     font_objects = 0
     native_pdf_documents = 0
     native_pdf_font_objects = 0
+    native_pdf_type0_cff_font_objects = 0
+    native_pdf_type0_font_objects = 0
+    native_pdf_type0_truetype_font_objects = 0
+    native_pdf_type3_font_objects = 0
     point_geometry_mismatches = 0
     xhtml_crosscheck_max_micropoints = 0
     failures: set[str] = set()
@@ -1496,11 +1538,19 @@ def evaluate(
             failures.add("broad_coverage_incomplete")
             continue
         font_objects += _font_attestation(item.get("font_attestation"))
-        native_documents, native_objects = _native_pdf_attestation(
+        native = _native_pdf_attestation(
             item.get("native_pdf_attestation")
         )
-        native_pdf_documents += native_documents
-        native_pdf_font_objects += native_objects
+        native_pdf_documents += native["documents"]
+        native_pdf_font_objects += native["font_objects"]
+        native_pdf_type0_cff_font_objects += native[
+            "type0_cff_font_objects"
+        ]
+        native_pdf_type0_font_objects += native["type0_font_objects"]
+        native_pdf_type0_truetype_font_objects += native[
+            "type0_truetype_font_objects"
+        ]
+        native_pdf_type3_font_objects += native["type3_font_objects"]
         if oracle_mode == "container":
             if container_identity is None:
                 raise GateError("configuration_container_identity")
@@ -1571,18 +1621,20 @@ def evaluate(
             (
                 point_error,
                 crosscheck_error,
-                exact_point_geometry,
-                exact_xhtml_crosscheck,
+                imported_point_geometry_within_quantization,
+                xhtml_crosscheck_within_tolerance,
             ) = _page_point_geometry(page)
             page_errors_millipoints.append(point_error)
             file_point_max = max(file_point_max, point_error)
             file_crosscheck_max = max(
                 file_crosscheck_max, crosscheck_error
             )
-            file_point_mismatches += int(not exact_point_geometry)
-            if not exact_point_geometry:
+            file_point_mismatches += int(
+                not imported_point_geometry_within_quantization
+            )
+            if not imported_point_geometry_within_quantization:
                 failures.add("pdf_point_geometry_mismatch")
-            if not exact_xhtml_crosscheck:
+            if not xhtml_crosscheck_within_tolerance:
                 failures.add("pdf_xhtml_crosscheck_above_tolerance")
         point_geometry_mismatches += file_point_mismatches
         xhtml_crosscheck_max_micropoints = max(
@@ -1669,6 +1721,8 @@ def evaluate(
     for required in ORACLE_FORMATS:
         if format_counts[required] == 0:
             failures.add(f"broad_format_missing:{required}")
+    if native_pdf_type0_font_objects == 0:
+        failures.add("native_pdf_type0_coverage_missing")
     if not broad_rows:
         raise GateError("empty_broad_cohort")
     if not core_rows:
@@ -1861,7 +1915,9 @@ def evaluate(
         "page_box_max_millipoints": PAGE_BOX_MAX_MILLIPOINTS,
         "page_box_median_max_millipoints": PAGE_BOX_MEDIAN_MAX_MILLIPOINTS,
         "page_box_p95_max_millipoints": PAGE_BOX_P95_MAX_MILLIPOINTS,
-        "pdf_point_geometry_exact": True,
+        "pdf_imported_page_box_quantization_max_micropoints": (
+            PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS
+        ),
         "pdf_xhtml_crosscheck_max_micropoints": (
             PDF_XHTML_CROSSCHECK_MAX_MICROPOINTS
         ),
@@ -1899,6 +1955,14 @@ def evaluate(
             "libreoffice_pdf_font_objects": font_objects,
             "native_pdf_documents": native_pdf_documents,
             "native_pdf_font_objects": native_pdf_font_objects,
+            "native_pdf_type0_cff_font_objects": (
+                native_pdf_type0_cff_font_objects
+            ),
+            "native_pdf_type0_font_objects": native_pdf_type0_font_objects,
+            "native_pdf_type0_truetype_font_objects": (
+                native_pdf_type0_truetype_font_objects
+            ),
+            "native_pdf_type3_font_objects": native_pdf_type3_font_objects,
             "pages": total_pages,
             "report_workbooks": len(files),
             "status_counts": dict(sorted(status_counts.items())),

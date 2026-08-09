@@ -64,6 +64,13 @@ DOC_CONTRACTS = (
     ),
     ("rxls::extract_text", "fn.extract_text.html", None, ("Errors",)),
     ("rxls::export_csv", "fn.export_csv.html", None, ("Errors", "Examples")),
+    ("rxls::export_html", "fn.export_html.html", None, ("Errors", "Examples")),
+    (
+        "rxls::export_markdown",
+        "fn.export_markdown.html",
+        None,
+        ("Errors", "Examples"),
+    ),
     ("rxls::Workbook::evaluate_cell", "struct.Workbook.html", "method.evaluate_cell", ("Examples",)),
     (
         "rxls::WorkbookReport::from_workbook",
@@ -74,6 +81,12 @@ DOC_CONTRACTS = (
     ("rxls::wasm::extract_text_bytes", "wasm/fn.extract_text_bytes.html", None, ("Errors",)),
     ("rxls::wasm::to_csv_bytes", "wasm/fn.to_csv_bytes.html", None, ("Errors",)),
     ("rxls::wasm::to_html_bytes", "wasm/fn.to_html_bytes.html", None, ("Errors",)),
+    (
+        "rxls::wasm::to_markdown_bytes",
+        "wasm/fn.to_markdown_bytes.html",
+        None,
+        ("Errors",),
+    ),
     ("rxls::wasm::report_json_bytes", "wasm/fn.report_json_bytes.html", None, ("Errors",)),
 )
 

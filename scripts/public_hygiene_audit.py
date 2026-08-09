@@ -79,6 +79,12 @@ INTERNAL_TRACE_PATTERNS = (
         ),
     ),
 )
+PUBLIC_DOCUMENT_PATTERNS = (
+    (
+        "public_checklist_markup",
+        re.compile(r"^[ \t]{0,3}(?:[-+*]|[0-9]+[.)])[ \t]+\[[ xX]\](?:[ \t]+|$)"),
+    ),
+)
 INTERNAL_PLANNING_PREFIXES = ("ROADMAP-", "MIGRATION-")
 
 
@@ -114,7 +120,12 @@ def git_files(repo: Path = REPO) -> list[Path]:
 
 def scan_text(path: str, text: str) -> list[Finding]:
     findings: list[Finding] = []
-    patterns = SECRET_PATTERNS + LOCAL_PATH_PATTERNS + INTERNAL_TRACE_PATTERNS
+    patterns = (
+        SECRET_PATTERNS
+        + LOCAL_PATH_PATTERNS
+        + INTERNAL_TRACE_PATTERNS
+        + PUBLIC_DOCUMENT_PATTERNS
+    )
     for line_number, line in enumerate(text.splitlines(), start=1):
         for kind, pattern in patterns:
             if pattern.search(line):

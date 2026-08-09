@@ -189,6 +189,9 @@ class RenderSupplyChainTests(unittest.TestCase):
         checked_bytes = checked.read_bytes()
         self.assertNotIn(b"\r", checked_bytes)
         self.assertEqual(checked_bytes, rendered.encode("utf-8"))
+        self.assertIn("PACKAGE: subsetter 0.2.6", rendered)
+        self.assertIn("subsetter 0.2.6/NOTICE", rendered)
+        self.assertIn("PACKAGE: rustc-hash 2.1.3", rendered)
         self.assertGreater(summary["packages"], 0)
         self.assertGreater(summary["legal_texts"], 0)
 
@@ -213,6 +216,35 @@ class RenderSupplyChainTests(unittest.TestCase):
             binding["dependencies"]["rxls-render"]["version"], "0.1.0"
         )
         self.assertEqual(renderer["dependencies"]["rxls"]["version"], "0.1.3")
+
+    def test_tracked_renderer_locks_match_the_current_local_dependency_closure(self) -> None:
+        lock_paths = (
+            ROOT / "render" / "Cargo.lock",
+            ROOT / "render" / "perf" / "Cargo.lock",
+            ROOT / "render" / "fuzz" / "Cargo.lock",
+            ROOT / "bindings" / "render-wasm" / "Cargo.lock",
+        )
+        for path in lock_paths:
+            with self.subTest(path=path.relative_to(ROOT)):
+                document = tomllib.loads(path.read_text(encoding="utf-8"))
+                packages = document.get("package")
+                self.assertIsInstance(packages, list)
+
+                def package(name: str) -> dict:
+                    matches = [
+                        row
+                        for row in packages
+                        if isinstance(row, dict) and row.get("name") == name
+                    ]
+                    self.assertEqual(len(matches), 1, f"{path}: {name}")
+                    return matches[0]
+
+                self.assertEqual(package("rxls").get("version"), "0.1.3")
+                renderer = package("rxls-render")
+                self.assertEqual(renderer.get("version"), "0.1.0")
+                self.assertIn("subsetter", renderer.get("dependencies", []))
+                self.assertEqual(package("subsetter").get("version"), "0.2.6")
+                self.assertEqual(package("rustc-hash").get("version"), "2.1.3")
 
 
 if __name__ == "__main__":

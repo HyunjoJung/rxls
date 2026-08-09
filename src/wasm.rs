@@ -4,7 +4,15 @@
 //! standalone `bindings/wasm` crate exposes them to JavaScript with
 //! `wasm-bindgen` without changing this crate's native artifact types.
 
-use crate::{Error, Result, Workbook, WorkbookReport};
+use crate::{CsvExportError, Error, MarkupExportError, Result, Workbook, WorkbookReport};
+
+/// Maximum UTF-8 output returned by one browser-oriented CSV, HTML, or
+/// Markdown adapter call (16 MiB).
+///
+/// This is intentionally lower than [`crate::DEFAULT_EXPORT_MAX_BYTES`]
+/// because WebAssembly must retain the Rust string while `wasm-bindgen` copies
+/// it into a JavaScript string.
+pub const MAX_EXPORT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Extract workbook text from spreadsheet bytes.
 ///
@@ -19,24 +27,86 @@ pub fn extract_text_bytes(bytes: &[u8]) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns a typed parse error for invalid input or [`Error::SheetOutOfRange`]
-/// when `sheet_index` does not identify a grid worksheet.
+/// Returns a typed parse error for invalid input, [`Error::SheetOutOfRange`]
+/// when `sheet_index` does not identify a grid worksheet, or
+/// [`Error::ExportOutputTooLarge`] when the result would exceed
+/// [`MAX_EXPORT_OUTPUT_BYTES`].
 pub fn to_csv_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
-    Workbook::open(bytes)?
-        .to_csv(sheet_index)
-        .ok_or(Error::SheetOutOfRange)
+    to_csv_bytes_with_limit(bytes, sheet_index, MAX_EXPORT_OUTPUT_BYTES)
 }
 
 /// Export one worksheet as an HTML table fragment from spreadsheet bytes.
 ///
 /// # Errors
 ///
-/// Returns a typed parse error for invalid input or [`Error::SheetOutOfRange`]
-/// when `sheet_index` does not identify a grid worksheet.
+/// Returns a typed parse error for invalid input, [`Error::SheetOutOfRange`]
+/// when `sheet_index` does not identify a grid worksheet, or a typed output or
+/// merged-range work-limit error.
 pub fn to_html_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
-    Workbook::open(bytes)?
-        .to_html(sheet_index)
+    to_html_bytes_with_limit(bytes, sheet_index, MAX_EXPORT_OUTPUT_BYTES)
+}
+
+/// Export one worksheet as Markdown from spreadsheet bytes.
+///
+/// # Errors
+///
+/// Returns a typed parse error for invalid input, [`Error::SheetOutOfRange`]
+/// when `sheet_index` does not identify a grid worksheet, or a typed output or
+/// merged-range work-limit error.
+pub fn to_markdown_bytes(bytes: &[u8], sheet_index: usize) -> Result<String> {
+    to_markdown_bytes_with_limit(bytes, sheet_index, MAX_EXPORT_OUTPUT_BYTES)
+}
+
+fn to_csv_bytes_with_limit(bytes: &[u8], sheet_index: usize, limit: usize) -> Result<String> {
+    let workbook = Workbook::open(bytes)?;
+    let sheet = worksheet(&workbook, sheet_index)?;
+    crate::export::export_csv_legacy(sheet, ',', limit).map_err(map_csv_export_error)
+}
+
+fn to_html_bytes_with_limit(bytes: &[u8], sheet_index: usize, limit: usize) -> Result<String> {
+    let workbook = Workbook::open(bytes)?;
+    let sheet = worksheet(&workbook, sheet_index)?;
+    crate::export_html(sheet, limit).map_err(map_markup_export_error)
+}
+
+fn to_markdown_bytes_with_limit(bytes: &[u8], sheet_index: usize, limit: usize) -> Result<String> {
+    let workbook = Workbook::open(bytes)?;
+    let sheet = worksheet(&workbook, sheet_index)?;
+    crate::export_markdown(sheet, limit).map_err(map_markup_export_error)
+}
+
+fn worksheet(workbook: &Workbook, sheet_index: usize) -> Result<&crate::Sheet> {
+    workbook
+        .sheets
+        .get(sheet_index)
+        .filter(|sheet| sheet.is_worksheet)
         .ok_or(Error::SheetOutOfRange)
+}
+
+fn map_csv_export_error(error: CsvExportError) -> Error {
+    match error {
+        CsvExportError::InvalidDelimiter(delimiter) => Error::ExportInvalidDelimiter {
+            format: "CSV",
+            delimiter,
+        },
+        CsvExportError::OutputTooLarge { limit } => Error::ExportOutputTooLarge {
+            format: "CSV",
+            limit,
+        },
+    }
+}
+
+fn map_markup_export_error(error: MarkupExportError) -> Error {
+    match error {
+        MarkupExportError::OutputTooLarge { format, limit } => Error::ExportOutputTooLarge {
+            format: format.as_str(),
+            limit,
+        },
+        MarkupExportError::WorkLimitExceeded { format, limit } => Error::ExportWorkLimitExceeded {
+            format: format.as_str(),
+            limit,
+        },
+    }
 }
 
 /// Build the machine-readable diagnose JSON report from spreadsheet bytes.
@@ -107,6 +177,9 @@ mod tests {
         assert!(extract_text_bytes(&bytes).unwrap().contains("item"));
         assert_eq!(to_csv_bytes(&bytes, 0).unwrap(), "item,2\n4");
         assert!(to_html_bytes(&bytes, 0).unwrap().contains("<table>"));
+        assert!(to_markdown_bytes(&bytes, 0)
+            .unwrap()
+            .starts_with("| item |"));
         let report = report_json_bytes(&bytes).unwrap();
         assert!(report.contains(r#""format":"xlsx""#));
         assert!(report.contains(r#""formulas":1"#));
@@ -154,6 +227,14 @@ mod tests {
     }
 
     #[test]
+    fn to_markdown_bytes_happy_path_exact_value() {
+        assert_eq!(
+            to_markdown_bytes(&tiny_fixture_bytes(), 0).unwrap(),
+            "| hi |\n| --- |"
+        );
+    }
+
+    #[test]
     fn report_json_bytes_happy_path_exact_value() {
         assert_eq!(
             report_json_bytes(&tiny_fixture_bytes()).unwrap(),
@@ -197,6 +278,14 @@ mod tests {
     }
 
     #[test]
+    fn to_markdown_bytes_rejects_garbage_bytes() {
+        assert!(matches!(
+            to_markdown_bytes(b"not a spreadsheet", 0),
+            Err(Error::NotOle2)
+        ));
+    }
+
+    #[test]
     fn report_json_bytes_rejects_garbage_bytes() {
         assert!(matches!(
             report_json_bytes(b"not a spreadsheet"),
@@ -228,5 +317,33 @@ mod tests {
         let bytes = fixture_bytes();
         assert!(to_csv_bytes(&bytes, 0).is_ok());
         assert!(to_html_bytes(&bytes, 0).is_ok());
+        assert!(to_markdown_bytes(&bytes, 0).is_ok());
+    }
+
+    #[test]
+    fn browser_exports_map_checked_output_limits_to_typed_errors() {
+        let bytes = tiny_fixture_bytes();
+        assert!(matches!(
+            to_csv_bytes_with_limit(&bytes, 0, 1),
+            Err(Error::ExportOutputTooLarge {
+                format: "CSV",
+                limit: 1
+            })
+        ));
+        assert!(matches!(
+            to_html_bytes_with_limit(&bytes, 0, 1),
+            Err(Error::ExportOutputTooLarge {
+                format: "HTML",
+                limit: 1
+            })
+        ));
+        assert!(matches!(
+            to_markdown_bytes_with_limit(&bytes, 0, 1),
+            Err(Error::ExportOutputTooLarge {
+                format: "Markdown",
+                limit: 1
+            })
+        ));
+        assert_eq!(MAX_EXPORT_OUTPUT_BYTES, 16 * 1024 * 1024);
     }
 }

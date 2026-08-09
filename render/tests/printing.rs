@@ -2383,6 +2383,7 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
     sheet.hide_row(18);
     sheet.hide_column(8);
     sheet.set_print_headings();
+    sheet.set_print_gridlines();
     sheet.set_page_setup(
         PageSetup::new()
             .with_print_area((0, 0, 19, 15))

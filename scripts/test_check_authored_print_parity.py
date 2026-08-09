@@ -289,14 +289,15 @@ def report_document() -> dict[str, object]:
                 },
                 "native_pdf_attestation": {
                     "actual_text_documents": 1,
-                    "charprocs_documents": 1,
                     "documents": 1,
                     "embedded_font_objects": 1,
                     "font_objects": 1,
                     "identity_set_sha256": "f" * 64,
                     "subset_font_objects": 1,
-                    "type3_documents": 1,
-                    "type3_font_objects": 1,
+                    "type0_cff_font_objects": 0,
+                    "type0_font_objects": 1,
+                    "type0_truetype_font_objects": 1,
+                    "type3_font_objects": 0,
                     "unicode_font_objects": 1,
                 },
                 "oracle_adapter": copy.deepcopy(adapter),
@@ -382,6 +383,22 @@ def report_document() -> dict[str, object]:
 
 
 class AuthoredPrintGateTests(unittest.TestCase):
+    def test_native_pdf_attestation_schema_and_path_counts_are_exact(self) -> None:
+        row = report_document()["files"][0]
+        native = MODULE._native_pdf_attestation(row)
+        self.assertEqual(native["type0_font_objects"], 1)
+        self.assertEqual(native["type3_font_objects"], 0)
+
+        row = copy.deepcopy(row)
+        row["native_pdf_attestation"]["type0_truetype_font_objects"] = 0
+        with self.assertRaisesRegex(MODULE.GateError, "native_pdf_attestation"):
+            MODULE._native_pdf_attestation(row)
+
+        row = report_document()["files"][0]
+        row["native_pdf_attestation"]["unreviewed"] = 0
+        with self.assertRaisesRegex(MODULE.GateError, "native_pdf_attestation"):
+            MODULE._native_pdf_attestation(row)
+
     def test_requires_complete_unsharded_discovery(self) -> None:
         mutations = (
             (

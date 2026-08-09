@@ -1,11 +1,78 @@
 //! Deterministic, bounded spreadsheet export helpers.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::Sheet;
 
 /// Default maximum size of one in-memory export result (256 MiB).
 pub const DEFAULT_EXPORT_MAX_BYTES: usize = 256 << 20;
+
+// Merged HTML currently preserves the established coordinate-by-coordinate
+// semantics. Cap the worst-case `coordinate × merge-range` lookup count before
+// traversal so a hostile collection of overlapping ranges cannot amplify a
+// small output into unbounded CPU work.
+const MAX_DENSE_MARKUP_WORK: u64 = 4_000_000;
+
+/// Markup format selected by a checked HTML or Markdown export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkupFormat {
+    /// HTML table-fragment output.
+    Html,
+    /// GitHub-flavored Markdown output (with HTML fallback for merges or very
+    /// wide sheets).
+    Markdown,
+}
+
+impl MarkupFormat {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Html => "HTML",
+            Self::Markdown => "Markdown",
+        }
+    }
+}
+
+/// Failure returned by [`export_html`] or [`export_markdown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkupExportError {
+    /// The configured output byte or dense-grid work limit would be exceeded.
+    OutputTooLarge {
+        /// Requested output format.
+        format: MarkupFormat,
+        /// Configured UTF-8 output byte limit.
+        limit: usize,
+    },
+    /// Rendering merged ranges would exceed the bounded coordinate-lookup
+    /// budget.
+    WorkLimitExceeded {
+        /// Requested output format.
+        format: MarkupFormat,
+        /// Maximum coordinate/merge lookup operations.
+        limit: u64,
+    },
+}
+
+impl fmt::Display for MarkupExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputTooLarge { format, limit } => write!(
+                f,
+                "{} output exceeds the configured {limit}-byte limit",
+                format.as_str()
+            ),
+            Self::WorkLimitExceeded { format, limit } => write!(
+                f,
+                "{} export exceeds the {limit}-operation merged-range work limit",
+                format.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarkupExportError {}
 
 /// Record separator used by [`export_csv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,47 +193,538 @@ pub fn export_csv(sheet: &Sheet, options: CsvOptions) -> Result<String, CsvExpor
     if matches!(options.delimiter, '"' | '\r' | '\n') {
         return Err(CsvExportError::InvalidDelimiter(options.delimiter));
     }
+    export_csv_inner(sheet, options, true)
+}
 
-    let mut out = String::new();
+pub(crate) fn export_csv_legacy(
+    sheet: &Sheet,
+    delimiter: char,
+    max_output_bytes: usize,
+) -> Result<String, CsvExportError> {
+    export_csv_inner(
+        sheet,
+        CsvOptions {
+            delimiter,
+            max_output_bytes,
+            ..CsvOptions::default()
+        },
+        false,
+    )
+}
+
+fn export_csv_inner(
+    sheet: &Sheet,
+    options: CsvOptions,
+    retain_leading_empty_fields: bool,
+) -> Result<String, CsvExportError> {
+    let required = csv_encoded_len(sheet, options, retain_leading_empty_fields)?;
+    let mut out = String::with_capacity(required);
     if options.bom {
-        push_checked(&mut out, "\u{FEFF}", options.max_output_bytes)?;
+        out.push('\u{FEFF}');
     }
 
     let mut first_row = true;
-    for (row, cols) in sheet.rows() {
-        if !first_row {
-            push_checked(&mut out, options.newline.as_str(), options.max_output_bytes)?;
+    let mut current_row = None;
+    let mut emitted_delimiters = 0u32;
+    for cell in sheet.display_cells() {
+        if current_row != Some(cell.row) {
+            if !first_row {
+                out.push_str(options.newline.as_str());
+            }
+            first_row = false;
+            current_row = Some(cell.row);
+            emitted_delimiters = if retain_leading_empty_fields {
+                0
+            } else {
+                u32::from(cell.col)
+            };
         }
-        first_row = false;
+        let col = u32::from(cell.col);
+        while emitted_delimiters < col {
+            out.push(options.delimiter);
+            emitted_delimiters += 1;
+        }
+        push_csv_field_unchecked(&mut out, cell.formatted, options);
+    }
+    debug_assert_eq!(out.len(), required);
+    Ok(out)
+}
 
-        let mut first_col = true;
-        let mut next_col = 0u32;
-        for (col, _cell) in cols {
-            let col = u32::from(col);
-            while next_col < col {
-                if !first_col {
-                    push_char_checked(&mut out, options.delimiter, options.max_output_bytes)?;
-                }
-                first_col = false;
-                next_col += 1;
+fn csv_encoded_len(
+    sheet: &Sheet,
+    options: CsvOptions,
+    retain_leading_empty_fields: bool,
+) -> Result<usize, CsvExportError> {
+    let limit = options.max_output_bytes;
+    let mut required = if options.bom {
+        '\u{FEFF}'.len_utf8()
+    } else {
+        0
+    };
+    ensure_csv_total(required, limit)?;
+
+    let delimiter_len = options.delimiter.len_utf8();
+    let mut current_row = None;
+    let mut min_col = 0u16;
+    let mut max_col = 0u16;
+    for cell in sheet.display_cells() {
+        if current_row != Some(cell.row) {
+            if current_row.is_some() {
+                add_csv_required(
+                    &mut required,
+                    usize::from(max_col.saturating_sub(if retain_leading_empty_fields {
+                        0
+                    } else {
+                        min_col
+                    }))
+                    .saturating_mul(delimiter_len),
+                    limit,
+                )?;
+                add_csv_required(&mut required, options.newline.as_str().len(), limit)?;
             }
-            if !first_col {
-                push_char_checked(&mut out, options.delimiter, options.max_output_bytes)?;
-            }
-            let text = sheet.formatted(row, col as u16).unwrap_or_default();
-            push_csv_field(&mut out, text, options)?;
-            first_col = false;
-            next_col = col.saturating_add(1);
+            current_row = Some(cell.row);
+            min_col = cell.col;
+            max_col = cell.col;
+        } else {
+            max_col = cell.col;
+        }
+        add_csv_required(
+            &mut required,
+            csv_field_encoded_len(cell.formatted, options),
+            limit,
+        )?;
+    }
+    if current_row.is_some() {
+        add_csv_required(
+            &mut required,
+            usize::from(max_col.saturating_sub(if retain_leading_empty_fields {
+                0
+            } else {
+                min_col
+            }))
+            .saturating_mul(delimiter_len),
+            limit,
+        )?;
+    }
+    Ok(required)
+}
+
+fn add_csv_required(
+    required: &mut usize,
+    added: usize,
+    limit: usize,
+) -> Result<(), CsvExportError> {
+    *required = required.saturating_add(added);
+    ensure_csv_total(*required, limit)
+}
+
+fn ensure_csv_total(required: usize, limit: usize) -> Result<(), CsvExportError> {
+    if required > limit {
+        Err(CsvExportError::OutputTooLarge { limit })
+    } else {
+        Ok(())
+    }
+}
+
+/// Export one worksheet as a bounded HTML table fragment.
+///
+/// Empty horizontal gaps are represented by equivalent `colspan` cells, so a
+/// sparse value at column XFD does not require allocating 16,383 individual
+/// empty tags. The result contains one `<table>` and no document wrapper.
+///
+/// # Errors
+///
+/// Returns [`MarkupExportError::OutputTooLarge`] without returning partial
+/// output if `max_output_bytes` would be exceeded, or
+/// [`MarkupExportError::WorkLimitExceeded`] when merged ranges exceed the
+/// conservative coordinate-lookup budget.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), rxls::MarkupExportError> {
+/// let mut workbook = rxls::Workbook::new();
+/// workbook.add_sheet("Data").write(0, 0, "<ready>");
+/// let html = rxls::export_html(&workbook.sheets[0], 1_024)?;
+/// assert!(html.contains("&lt;ready&gt;"));
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_html(sheet: &Sheet, max_output_bytes: usize) -> Result<String, MarkupExportError> {
+    export_html_as(sheet, max_output_bytes, MarkupFormat::Html)
+}
+
+/// Export one worksheet as bounded GitHub-flavored Markdown.
+///
+/// Merged or wider-than-256-column sheets use the same bounded HTML fragment
+/// fallback as [`Sheet::to_markdown`].
+///
+/// # Errors
+///
+/// Returns [`MarkupExportError::OutputTooLarge`] without returning partial
+/// output if `max_output_bytes` would be exceeded, or
+/// [`MarkupExportError::WorkLimitExceeded`] when an HTML fallback for merged
+/// ranges exceeds the conservative coordinate-lookup budget.
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> Result<(), rxls::MarkupExportError> {
+/// let mut workbook = rxls::Workbook::new();
+/// workbook.add_sheet("Data").write(0, 0, "heading");
+/// let markdown = rxls::export_markdown(&workbook.sheets[0], 1_024)?;
+/// assert_eq!(markdown, "| heading |\n| --- |");
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_markdown(
+    sheet: &Sheet,
+    max_output_bytes: usize,
+) -> Result<String, MarkupExportError> {
+    const MAX_MD_COLS: usize = 256;
+    let rows = export_rows(sheet);
+    if !sheet.merged_ranges().is_empty() {
+        return export_html_rows_as(
+            &rows,
+            sheet.merged_ranges(),
+            max_output_bytes,
+            MarkupFormat::Markdown,
+        );
+    }
+    let max_col = rows
+        .iter()
+        .filter_map(|(_, cols)| cols.keys().next_back().copied())
+        .max();
+    let Some(max_col) = max_col else {
+        return Ok(String::new());
+    };
+    let width = usize::from(max_col) + 1;
+    if width > MAX_MD_COLS {
+        return export_html_rows_as(&rows, &[], max_output_bytes, MarkupFormat::Markdown);
+    }
+
+    let mut out = String::new();
+    for (index, (_, cols)) in rows.iter().enumerate() {
+        if index > 0 {
+            push_markup(&mut out, "\n", max_output_bytes, MarkupFormat::Markdown)?;
+        }
+        push_markdown_row_checked(
+            &mut out,
+            cols,
+            max_col,
+            max_output_bytes,
+            MarkupFormat::Markdown,
+        )?;
+        if index == 0 {
+            push_markup(&mut out, "\n", max_output_bytes, MarkupFormat::Markdown)?;
+            push_markdown_separator(&mut out, width, max_output_bytes, MarkupFormat::Markdown)?;
         }
     }
     Ok(out)
 }
 
-fn push_csv_field(
+pub(crate) fn legacy_csv(sheet: &Sheet, delimiter: char, limit: usize) -> String {
+    export_csv_legacy(sheet, delimiter, limit).unwrap_or_else(|_| csv_limit_fallback(limit))
+}
+
+pub(crate) fn legacy_html(sheet: &Sheet, limit: usize) -> String {
+    match export_html(sheet, limit) {
+        Ok(output) => output,
+        Err(MarkupExportError::OutputTooLarge { .. }) => html_limit_fallback(limit),
+        Err(MarkupExportError::WorkLimitExceeded { limit, .. }) => html_work_fallback(limit),
+    }
+}
+
+pub(crate) fn legacy_markdown(sheet: &Sheet, limit: usize) -> String {
+    match export_markdown(sheet, limit) {
+        Ok(output) => output,
+        Err(MarkupExportError::OutputTooLarge { .. }) => markdown_limit_fallback(limit),
+        Err(MarkupExportError::WorkLimitExceeded { limit, .. }) => markdown_work_fallback(limit),
+    }
+}
+
+fn csv_limit_fallback(limit: usize) -> String {
+    format!("# rxls-export-error: output-too-large; format=CSV; limit={limit} bytes")
+}
+
+fn html_limit_fallback(limit: usize) -> String {
+    format!(
+        "<table data-rxls-export-error=\"output-too-large\"><tr><td><strong>rxls export error:</strong> HTML output exceeds the {limit}-byte limit; no source data was exported.</td></tr></table>"
+    )
+}
+
+fn html_work_fallback(limit: u64) -> String {
+    format!(
+        "<table data-rxls-export-error=\"work-limit-exceeded\"><tr><td><strong>rxls export error:</strong> HTML merged-range work exceeds the {limit}-operation limit; no source data was exported.</td></tr></table>"
+    )
+}
+
+fn markdown_limit_fallback(limit: usize) -> String {
+    format!(
+        "<!-- rxls-export-error: output-too-large -->\n> **rxls export error:** Markdown output exceeds the {limit}-byte limit; no source data was exported."
+    )
+}
+
+fn markdown_work_fallback(limit: u64) -> String {
+    format!(
+        "<!-- rxls-export-error: work-limit-exceeded -->\n> **rxls export error:** Markdown merged-range work exceeds the {limit}-operation limit; no source data was exported."
+    )
+}
+
+fn export_rows(sheet: &Sheet) -> Vec<(u32, BTreeMap<u16, &str>)> {
+    sheet
+        .rows()
+        .map(|(row, cells)| {
+            let cols = cells
+                .into_iter()
+                .map(|(col, _)| (col, sheet.formatted(row, col).unwrap_or_default()))
+                .collect();
+            (row, cols)
+        })
+        .collect()
+}
+
+fn export_html_as(
+    sheet: &Sheet,
+    max_output_bytes: usize,
+    format: MarkupFormat,
+) -> Result<String, MarkupExportError> {
+    let rows = export_rows(sheet);
+    export_html_rows_as(&rows, sheet.merged_ranges(), max_output_bytes, format)
+}
+
+fn export_html_rows_as(
+    rows: &[(u32, BTreeMap<u16, &str>)],
+    merges: &[(u32, u16, u32, u16)],
+    max_output_bytes: usize,
+    format: MarkupFormat,
+) -> Result<String, MarkupExportError> {
+    // Merged cells require coordinate-aware traversal. Bound the full
+    // coordinate × merge-range lookup count before entering the loop;
+    // no-merge sheets use the sparse colspan path below.
+    if !merges.is_empty() {
+        let dense_cells = rows.iter().fold(0u64, |total, (_, cols)| {
+            total.saturating_add(cols.keys().next_back().map_or(0, |col| u64::from(*col) + 1))
+        });
+        let lookup_work = dense_cells.saturating_mul(merges.len() as u64);
+        if lookup_work > MAX_DENSE_MARKUP_WORK {
+            return Err(MarkupExportError::WorkLimitExceeded {
+                format,
+                limit: MAX_DENSE_MARKUP_WORK,
+            });
+        }
+    }
+
+    let mut out = String::new();
+    push_markup(&mut out, "<table>", max_output_bytes, format)?;
+    for (row, cols) in rows {
+        push_markup(&mut out, "<tr>", max_output_bytes, format)?;
+        if merges.is_empty() {
+            push_sparse_html_row(&mut out, cols, max_output_bytes, format)?;
+        } else {
+            let max_col = cols.keys().next_back().copied().unwrap_or(0);
+            for col in 0..=u32::from(max_col) {
+                let col = col as u16;
+                let merge = html_merge_for_cell(merges, *row, col);
+                if merge.is_some_and(|merge| merge.skip) {
+                    continue;
+                }
+                push_markup(&mut out, "<td", max_output_bytes, format)?;
+                if let Some(merge) = merge {
+                    if merge.rowspan > 1 {
+                        push_markup(
+                            &mut out,
+                            &format!(r#" rowspan="{}""#, merge.rowspan),
+                            max_output_bytes,
+                            format,
+                        )?;
+                    }
+                    if merge.colspan > 1 {
+                        push_markup(
+                            &mut out,
+                            &format!(r#" colspan="{}""#, merge.colspan),
+                            max_output_bytes,
+                            format,
+                        )?;
+                    }
+                }
+                push_markup(&mut out, ">", max_output_bytes, format)?;
+                push_html_escaped_checked(
+                    &mut out,
+                    cols.get(&col).copied().unwrap_or_default(),
+                    max_output_bytes,
+                    format,
+                )?;
+                push_markup(&mut out, "</td>", max_output_bytes, format)?;
+            }
+        }
+        push_markup(&mut out, "</tr>", max_output_bytes, format)?;
+    }
+    push_markup(&mut out, "</table>", max_output_bytes, format)?;
+    Ok(out)
+}
+
+fn push_sparse_html_row(
     out: &mut String,
-    field: &str,
-    options: CsvOptions,
-) -> Result<(), CsvExportError> {
+    cols: &BTreeMap<u16, &str>,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    let mut next_col = 0u32;
+    for (&col, &text) in cols {
+        let col = u32::from(col);
+        if col > next_col {
+            push_empty_html_gap(out, col - next_col, limit, format)?;
+        }
+        push_markup(out, "<td>", limit, format)?;
+        push_html_escaped_checked(out, text, limit, format)?;
+        push_markup(out, "</td>", limit, format)?;
+        next_col = col + 1;
+    }
+    Ok(())
+}
+
+fn push_empty_html_gap(
+    out: &mut String,
+    count: u32,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    if count == 1 {
+        push_markup(out, "<td></td>", limit, format)
+    } else {
+        push_markup(
+            out,
+            &format!(r#"<td colspan="{count}"></td>"#),
+            limit,
+            format,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HtmlMerge {
+    rowspan: u32,
+    colspan: u32,
+    skip: bool,
+}
+
+fn html_merge_for_cell(ranges: &[(u32, u16, u32, u16)], row: u32, col: u16) -> Option<HtmlMerge> {
+    for &(r0, c0, r1, c1) in ranges {
+        let (top, bottom) = (r0.min(r1), r0.max(r1));
+        let (left, right) = (c0.min(c1), c0.max(c1));
+        if top <= row && row <= bottom && left <= col && col <= right {
+            return Some(HtmlMerge {
+                rowspan: bottom.saturating_sub(top).saturating_add(1),
+                colspan: u32::from(right.saturating_sub(left).saturating_add(1)),
+                skip: row != top || col != left,
+            });
+        }
+    }
+    None
+}
+
+fn push_html_escaped_checked(
+    out: &mut String,
+    text: &str,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    for ch in text.chars() {
+        let escaped = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            _ => {
+                ensure_markup_capacity(out, ch.len_utf8(), limit, format)?;
+                out.push(ch);
+                continue;
+            }
+        };
+        push_markup(out, escaped, limit, format)?;
+    }
+    Ok(())
+}
+
+fn push_markdown_row_checked(
+    out: &mut String,
+    cols: &BTreeMap<u16, &str>,
+    max_col: u16,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    push_markup(out, "|", limit, format)?;
+    for col in 0..=max_col {
+        push_markup(out, " ", limit, format)?;
+        push_markdown_cell_checked(
+            out,
+            cols.get(&col).copied().unwrap_or_default(),
+            limit,
+            format,
+        )?;
+        push_markup(out, " |", limit, format)?;
+    }
+    Ok(())
+}
+
+fn push_markdown_separator(
+    out: &mut String,
+    width: usize,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    push_markup(out, "|", limit, format)?;
+    for _ in 0..width {
+        push_markup(out, " --- |", limit, format)?;
+    }
+    Ok(())
+}
+
+fn push_markdown_cell_checked(
+    out: &mut String,
+    text: &str,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    for ch in text.chars() {
+        match ch {
+            '|' => push_markup(out, r"\|", limit, format)?,
+            '\n' | '\r' => push_markup(out, "<br>", limit, format)?,
+            _ => {
+                ensure_markup_capacity(out, ch.len_utf8(), limit, format)?;
+                out.push(ch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_markup(
+    out: &mut String,
+    value: &str,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    ensure_markup_capacity(out, value.len(), limit, format)?;
+    out.push_str(value);
+    Ok(())
+}
+
+fn ensure_markup_capacity(
+    out: &str,
+    added: usize,
+    limit: usize,
+    format: MarkupFormat,
+) -> Result<(), MarkupExportError> {
+    if out.len().saturating_add(added) > limit {
+        Err(MarkupExportError::OutputTooLarge { format, limit })
+    } else {
+        Ok(())
+    }
+}
+
+fn csv_field_encoded_len(field: &str, options: CsvOptions) -> usize {
     let escape_formula = options.formula_policy == CsvFormulaPolicy::Escape
         && field
             .chars()
@@ -179,12 +737,24 @@ fn push_csv_field(
         || field.contains('\r');
 
     let escaped_quotes = field.bytes().filter(|byte| *byte == b'"').count();
-    let required = field
+    field
         .len()
         .saturating_add(escaped_quotes)
         .saturating_add(usize::from(escape_formula))
-        .saturating_add(if quote { 2 } else { 0 });
-    ensure_capacity(out, required, options.max_output_bytes)?;
+        .saturating_add(if quote { 2 } else { 0 })
+}
+
+fn push_csv_field_unchecked(out: &mut String, field: &str, options: CsvOptions) {
+    let escape_formula = options.formula_policy == CsvFormulaPolicy::Escape
+        && field
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '=' | '+' | '-' | '@' | '\t' | '\r' | '\n'));
+    let quote = escape_formula
+        || field.contains(options.delimiter)
+        || field.contains('"')
+        || field.contains('\n')
+        || field.contains('\r');
 
     if quote {
         out.push('"');
@@ -200,27 +770,6 @@ fn push_csv_field(
     }
     if quote {
         out.push('"');
-    }
-    Ok(())
-}
-
-fn push_checked(out: &mut String, value: &str, limit: usize) -> Result<(), CsvExportError> {
-    ensure_capacity(out, value.len(), limit)?;
-    out.push_str(value);
-    Ok(())
-}
-
-fn push_char_checked(out: &mut String, value: char, limit: usize) -> Result<(), CsvExportError> {
-    ensure_capacity(out, value.len_utf8(), limit)?;
-    out.push(value);
-    Ok(())
-}
-
-fn ensure_capacity(out: &str, added: usize, limit: usize) -> Result<(), CsvExportError> {
-    if out.len().saturating_add(added) > limit {
-        Err(CsvExportError::OutputTooLarge { limit })
-    } else {
-        Ok(())
     }
 }
 
@@ -295,5 +844,179 @@ mod tests {
             export_csv(sheet, options).unwrap(),
             export_csv(sheet, options).unwrap()
         );
+    }
+
+    #[test]
+    fn csv_preflights_xfd_gap_amplification_before_emission() {
+        const XFD: u16 = 16_383;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for row in 0..20_000 {
+            sheet.write(row, XFD, "x");
+        }
+
+        assert_eq!(
+            export_csv(
+                sheet,
+                CsvOptions {
+                    max_output_bytes: 1 << 20,
+                    ..CsvOptions::default()
+                },
+            ),
+            Err(CsvExportError::OutputTooLarge { limit: 1 << 20 })
+        );
+    }
+
+    #[test]
+    fn csv_limit_boundary_uses_encoded_utf8_size() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "a§b");
+        sheet.write(0, 2, "=x");
+        let options = CsvOptions {
+            delimiter: '§',
+            bom: true,
+            formula_policy: CsvFormulaPolicy::Escape,
+            max_output_bytes: usize::MAX,
+            ..CsvOptions::default()
+        };
+        let expected = export_csv(sheet, options).unwrap();
+        let exact = CsvOptions {
+            max_output_bytes: expected.len(),
+            ..options
+        };
+        assert_eq!(export_csv(sheet, exact).unwrap(), expected);
+        assert_eq!(
+            export_csv(
+                sheet,
+                CsvOptions {
+                    max_output_bytes: expected.len() - 1,
+                    ..options
+                },
+            ),
+            Err(CsvExportError::OutputTooLarge {
+                limit: expected.len() - 1
+            })
+        );
+    }
+
+    #[test]
+    fn html_represents_an_xfd_gap_with_one_bounded_colspan() {
+        const XFD: u16 = 16_383;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, XFD, "edge");
+
+        assert_eq!(
+            export_html(sheet, 1_024).unwrap(),
+            "<table><tr><td colspan=\"16383\"></td><td>edge</td></tr></table>"
+        );
+    }
+
+    #[test]
+    fn html_many_xfd_rows_remain_compact() {
+        const XFD: u16 = 16_383;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for row in 0..20_000 {
+            sheet.write(row, XFD, "x");
+        }
+
+        let html = export_html(sheet, 2 << 20).unwrap();
+        assert!(html.len() < 2 << 20);
+        assert_eq!(html.matches(r#"colspan="16383""#).count(), 20_000);
+        assert_eq!(html.matches("<td>").count(), 20_000);
+    }
+
+    #[test]
+    fn html_escaped_text_accepts_the_exact_limit_and_rejects_one_less() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "&<>\"한".repeat(1_024));
+
+        let expected = export_html(sheet, usize::MAX).unwrap();
+        assert_eq!(export_html(sheet, expected.len()).unwrap(), expected);
+        assert_eq!(
+            export_html(sheet, expected.len() - 1),
+            Err(MarkupExportError::OutputTooLarge {
+                format: MarkupFormat::Html,
+                limit: expected.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn markdown_escaped_text_accepts_the_exact_limit_and_rejects_one_less() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "a|b\nc".repeat(1_024));
+
+        let expected = export_markdown(sheet, usize::MAX).unwrap();
+        assert_eq!(export_markdown(sheet, expected.len()).unwrap(), expected);
+        assert_eq!(
+            export_markdown(sheet, expected.len() - 1),
+            Err(MarkupExportError::OutputTooLarge {
+                format: MarkupFormat::Markdown,
+                limit: expected.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn wide_markdown_fallback_stays_sparse_and_reports_markdown_errors() {
+        const XFD: u16 = 16_383;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, XFD, "edge");
+
+        let expected = "<table><tr><td colspan=\"16383\"></td><td>edge</td></tr></table>";
+        assert_eq!(export_markdown(sheet, expected.len()).unwrap(), expected);
+        assert_eq!(
+            export_markdown(sheet, expected.len() - 1),
+            Err(MarkupExportError::OutputTooLarge {
+                format: MarkupFormat::Markdown,
+                limit: expected.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn merged_html_rejects_dense_lookup_work_with_a_distinct_error() {
+        const XFD: u16 = 16_383;
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.merge(0, 0, 0, 1);
+        for row in 0..245 {
+            sheet.write(row, XFD, "x");
+        }
+
+        assert_eq!(
+            export_html(sheet, usize::MAX),
+            Err(MarkupExportError::WorkLimitExceeded {
+                format: MarkupFormat::Html,
+                limit: MAX_DENSE_MARKUP_WORK,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_fallbacks_are_explicit_diagnostics_and_never_partial_data() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "secret-source-value");
+
+        let csv = legacy_csv(sheet, ',', 1);
+        assert!(csv.starts_with("# rxls-export-error: output-too-large;"));
+        assert!(!csv.contains("secret-source-value"));
+
+        let html = legacy_html(sheet, 1);
+        assert!(html.contains(r#"data-rxls-export-error="output-too-large""#));
+        assert!(html.contains("rxls export error:"));
+        assert!(!html.contains("secret-source-value"));
+
+        let markdown = legacy_markdown(sheet, 1);
+        assert!(markdown.contains("rxls-export-error: output-too-large"));
+        assert!(markdown.contains("**rxls export error:**"));
+        assert!(!markdown.contains("secret-source-value"));
     }
 }

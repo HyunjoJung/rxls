@@ -83,6 +83,16 @@ const XLSB_BASE_COLUMN_SCREEN_PIXELS: u16 = 5;
 const AUTO_ROW_VERTICAL_PADDING_PIXELS: i64 = 2;
 /// Calc's default left and right EditEngine cell margins are each 20 twips.
 const CALC_CELL_HORIZONTAL_MARGIN_TWIPS: u64 = 20;
+/// Calc's `sc/source/ui/view/output2.cxx` offsets top-aligned text by
+/// `ATTR_MARGIN`'s top value and bottom-aligned text by its bottom value. The
+/// default cell item supplies 20 twips on each side: exactly one point. Keep
+/// that source quantity distinct from the device-pixel truncation used only by
+/// optimal-row measurement.
+const CALC_CELL_VERTICAL_MARGIN_TWIPS: i128 = 20;
+const CALC_CELL_VERTICAL_MARGIN: Fixed = Fixed::from_raw(
+    ((CALC_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128 + TWIPS_PER_CSS_PIXEL / 2)
+        / TWIPS_PER_CSS_PIXEL) as i64,
+);
 /// Calc removes one additional device pixel for the cell grid line before
 /// converting the wrapping paper size to Map100thMM.
 const CALC_CELL_GRID_PIXELS: u64 = 1;
@@ -1141,6 +1151,7 @@ pub(crate) fn build_auxiliary_text_node(
         font_pack,
         &region,
         bounds,
+        bounds,
         &style,
         false,
         &auxiliary_options,
@@ -1436,8 +1447,7 @@ fn build_sheet_scene_inner(
         options.limits.max_conditional_rules,
         sheet.conditional_formats().len() as u64,
     )?;
-    let calc_line_layout_available =
-        verified_implicit_ooxml(sheet, options) && !has_conditional_text_layout_overlay(sheet);
+    let calc_line_layout_available = calc_line_layout_available(sheet, options);
     let unsupported_shapes = sheet
         .drawing_metadata()
         .iter()
@@ -1919,10 +1929,12 @@ fn build_sheet_scene_inner(
         }
         let style = text_style(region, options, sheet_right_to_left);
         let clip_bounds = text_clip_bounds(region_index, &regions, &row_regions, &style)?;
+        let layout_bounds = calc_cell_text_layout_bounds(region.rect, style.baseline)?;
         let node = match options.font_pack.as_ref() {
             Some(font_pack) => SceneNode::GlyphRun(build_glyph_run(
                 font_pack,
                 region,
+                layout_bounds,
                 clip_bounds,
                 &style,
                 sheet_right_to_left,
@@ -1932,7 +1944,7 @@ fn build_sheet_scene_inner(
             )?),
             None => SceneNode::Text(TextNode {
                 text: region.text.clone(),
-                bounds: region.rect,
+                bounds: layout_bounds,
                 clip_bounds,
                 horizontal_padding: options.horizontal_padding,
                 style,
@@ -4001,6 +4013,10 @@ fn has_conditional_text_layout_overlay(sheet: &Sheet) -> bool {
     })
 }
 
+fn calc_line_layout_available(sheet: &Sheet, options: &RenderOptions) -> bool {
+    verified_implicit_ooxml(sheet, options) && !has_conditional_text_layout_overlay(sheet)
+}
+
 fn conditional_style_is_geometry_safe_color_only(
     style: &CellStyle,
     has_unsafe_losses: bool,
@@ -4671,7 +4687,12 @@ fn expand_automatic_row_heights(
         .and_then(|_| sheet.default_cell_style()?.font.as_ref());
     let verified_implicit_ooxml =
         sheet.has_implicit_ooxml_row_height() && verified_normal_font.is_some();
-    let calc_line_layout_available = verified_implicit_ooxml;
+    // Painting conservatively disables Calc's wrapper whenever retained
+    // conditional metadata can change text geometry. Automatic-row
+    // measurement must make the same decision even when the affected rule is
+    // outside the rendered subset; otherwise the row is measured with Calc's
+    // paper and painted with the native wrapper.
+    let calc_line_layout_available = calc_line_layout_available(sheet, options);
 
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
@@ -5489,8 +5510,7 @@ fn resolve_conditional_paints(
                 }
             }
             CfRule::ColorScale2 { min, max } => {
-                let values =
-                    conditional_numeric_values(display_cells, range, evaluations, options)?;
+                let values = conditional_numeric_values(sheet, range, evaluations, options)?;
                 let Some((minimum, maximum)) = numeric_bounds(&values) else {
                     continue;
                 };
@@ -5528,8 +5548,7 @@ fn resolve_conditional_paints(
                 }
             }
             CfRule::ColorScale3 { min, mid, max } => {
-                let mut values =
-                    conditional_numeric_values(display_cells, range, evaluations, options)?;
+                let mut values = conditional_numeric_values(sheet, range, evaluations, options)?;
                 if values.is_empty() {
                     continue;
                 }
@@ -5583,8 +5602,7 @@ fn resolve_conditional_paints(
                 }
             }
             CfRule::DataBar { color } => {
-                let values =
-                    conditional_numeric_values(display_cells, range, evaluations, options)?;
+                let values = conditional_numeric_values(sheet, range, evaluations, options)?;
                 let Some((minimum, maximum)) = numeric_bounds(&values) else {
                     continue;
                 };
@@ -5626,8 +5644,7 @@ fn resolve_conditional_paints(
                 percent,
                 fill,
             } => {
-                let mut values =
-                    conditional_numeric_values(display_cells, range, evaluations, options)?;
+                let mut values = conditional_numeric_values(sheet, range, evaluations, options)?;
                 if values.is_empty() || *rank == 0 {
                     continue;
                 }
@@ -5684,8 +5701,7 @@ fn resolve_conditional_paints(
                 }
             }
             CfRule::AboveAverage { below, fill } => {
-                let values =
-                    conditional_numeric_values(display_cells, range, evaluations, options)?;
+                let values = conditional_numeric_values(sheet, range, evaluations, options)?;
                 if values.is_empty() {
                     continue;
                 }
@@ -5734,9 +5750,7 @@ fn resolve_conditional_paints(
                 }
             }
             CfRule::DuplicateValues { unique, fill } => {
-                let Some(keys) =
-                    conditional_value_keys(display_cells, range, evaluations, options)?
-                else {
+                let Some(keys) = conditional_value_keys(sheet, range, evaluations, options)? else {
                     warnings.add(WarningCode::ConditionalFormattingDeferred, None);
                     deferred_text_layout |= measurement_range_intersects;
                     continue;
@@ -5868,18 +5882,19 @@ fn bump_conditional_evaluations(
 }
 
 fn conditional_numeric_values(
-    display_cells: &BTreeMap<CellCoordinate, DisplayCell<'_>>,
+    sheet: &Sheet,
     range: (u32, u16, u32, u16),
     evaluations: &mut u64,
     options: &RenderOptions,
 ) -> Result<Vec<f64>, RenderError> {
     let mut values = Vec::new();
-    for (coordinate, cell) in display_cells {
+    // Aggregate conditional rules are defined over their authored sqref, not
+    // the clipped scene. The sparse sheet iterator visits only retained cells,
+    // while each visit still consumes the shared conditional-evaluation budget.
+    for cell in SparseDisplayCellIndex::new(sheet).range(range) {
         bump_conditional_evaluations(evaluations, options)?;
-        if coordinate_in_range(*coordinate, range) {
-            if let Some(value) = numeric_cell_value(cell.value) {
-                values.push(value);
-            }
+        if let Some(value) = numeric_cell_value(cell.value) {
+            values.push(value);
         }
     }
     Ok(values)
@@ -6711,7 +6726,7 @@ fn conditional_value_key(cell: &Cell) -> Option<ConditionalValueKey> {
 }
 
 fn conditional_value_keys(
-    display_cells: &BTreeMap<CellCoordinate, DisplayCell<'_>>,
+    sheet: &Sheet,
     range: (u32, u16, u32, u16),
     evaluations: &mut u64,
     options: &RenderOptions,
@@ -6734,14 +6749,14 @@ fn conditional_value_keys(
     )?;
     *evaluations = actual;
 
+    // Duplicate/unique classification likewise uses the complete authored
+    // range. This rule intentionally remains exact-only: unsupported or blank
+    // members still defer the whole result instead of guessing.
     let mut keys = BTreeMap::new();
     for row in range.0..=range.2 {
         for col in range.1..=range.3 {
             let coordinate = CellCoordinate { row, col };
-            let Some(key) = display_cells
-                .get(&coordinate)
-                .and_then(|cell| conditional_value_key(cell.value))
-            else {
+            let Some(key) = sheet.cell(row, col).and_then(conditional_value_key) else {
                 return Ok(None);
             };
             keys.insert(coordinate, key);
@@ -11194,6 +11209,7 @@ fn calc_automatic_height_from_engine_mm100(total_mm100: u64) -> Result<Fixed, Re
 fn build_glyph_run(
     pack: &FontPack,
     region: &Region,
+    layout_bounds: Rect,
     clip_bounds: Rect,
     style: &TextStyle,
     sheet_right_to_left: bool,
@@ -11252,7 +11268,7 @@ fn build_glyph_run(
         .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
         .collect::<Result<Vec<_>, _>>()?;
     let block_height = sum_fixed(line_heights.iter().copied())?;
-    let top = vertical_block_top(region.rect, block_height, style.baseline)?;
+    let top = vertical_block_top(layout_bounds, block_height, style.baseline)?;
 
     let mut commands = Vec::new();
     let mut clusters = Vec::new();
@@ -11267,7 +11283,7 @@ fn build_glyph_run(
             .checked_add(line.metrics.ascent)
             .ok_or(RenderError::CoordinateOverflow)?;
         let line_x = horizontal_line_start(
-            region.rect,
+            layout_bounds,
             prepared.horizontal_padding,
             line.width,
             style.anchor,
@@ -11329,7 +11345,7 @@ fn build_glyph_run(
             .checked_add(line_height)
             .ok_or(RenderError::CoordinateOverflow)?;
     }
-    let (pivot_x, pivot_y) = rotation_pivot(region.rect, prepared.horizontal_padding, style)?;
+    let (pivot_x, pivot_y) = rotation_pivot(layout_bounds, prepared.horizontal_padding, style)?;
     let node = GlyphRunNode {
         glyphs,
         font_faces,
@@ -11928,6 +11944,27 @@ fn vertical_block_top(
     }
 }
 
+fn calc_cell_text_layout_bounds(rect: Rect, baseline: TextBaseline) -> Result<Rect, RenderError> {
+    // Calc applies the corresponding ATTR_MARGIN edge as a positional offset;
+    // it does not resize the cell clip. Translating the backend-neutral layout
+    // bounds preserves the original clip and keeps the exact one-point inset
+    // even when a deliberately short row cannot contain the margin. Equal top
+    // and bottom defaults cancel for middle alignment, so its bounds stay byte-
+    // for-byte unchanged.
+    let y = match baseline {
+        TextBaseline::Top => rect
+            .y
+            .checked_add(CALC_CELL_VERTICAL_MARGIN)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        TextBaseline::Middle => rect.y,
+        TextBaseline::Bottom => rect
+            .y
+            .checked_sub(CALC_CELL_VERTICAL_MARGIN)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    };
+    Ok(Rect { y, ..rect })
+}
+
 fn horizontal_line_start(
     rect: Rect,
     padding: Fixed,
@@ -12080,6 +12117,7 @@ fn append_styled_shaped_outlines(
         }
         let mut glyph_index = 0_usize;
         while glyph_index < run.glyphs.len() {
+            let shaped_glyph_start = glyphs.len();
             let cluster_start = usize::try_from(run.glyphs[glyph_index].cluster).map_err(|_| {
                 RenderError::Typography {
                     reason: "invalid_glyph_cluster",
@@ -12114,10 +12152,9 @@ fn append_styled_shaped_outlines(
                     .ok_or(RenderError::CoordinateOverflow)?;
                 glyphs.push(ShapedGlyph {
                     face: face_index,
-                    // This group's cluster is pushed once the group finishes,
-                    // so the pending length is the index it will occupy.
-                    cluster: u32::try_from(clusters.len())
-                        .map_err(|_| RenderError::CoordinateOverflow)?,
+                    // Filled with the actual merged-or-new cluster index once
+                    // the group's command range and source range are known.
+                    cluster: u32::MAX,
                     glyph_id: glyph.glyph_id,
                     origin_x,
                     origin_y,
@@ -12219,7 +12256,7 @@ fn append_styled_shaped_outlines(
                 });
             }
             let command_end = output.len() as u64;
-            if let Some(previous) = clusters.last_mut() {
+            let cluster_index = if let Some(previous) = clusters.last_mut() {
                 if previous.source_start == source_start as u64
                     && previous.source_end == source_end as u64
                     && previous.command_end == command_start
@@ -12230,7 +12267,9 @@ fn append_styled_shaped_outlines(
                             reason: "invalid_glyph_metadata",
                         })?;
                     merge_cluster_metrics(previous_metrics, metrics)?;
+                    clusters.len() - 1
                 } else {
+                    let index = clusters.len();
                     clusters.push(GlyphCluster {
                         source_start: source_start as u64,
                         source_end: source_end as u64,
@@ -12238,6 +12277,7 @@ fn append_styled_shaped_outlines(
                         command_end,
                     });
                     cluster_metrics.push(metrics);
+                    index
                 }
             } else {
                 clusters.push(GlyphCluster {
@@ -12247,6 +12287,12 @@ fn append_styled_shaped_outlines(
                     command_end,
                 });
                 cluster_metrics.push(metrics);
+                0
+            };
+            let cluster_index =
+                u32::try_from(cluster_index).map_err(|_| RenderError::CoordinateOverflow)?;
+            for glyph in &mut glyphs[shaped_glyph_start..] {
+                glyph.cluster = cluster_index;
             }
             glyph_index = group_end;
         }
@@ -13638,7 +13684,8 @@ mod tests {
     fn a_cell_without_vertical_alignment_sits_on_the_row_bottom() {
         // ECMA-376 Part 1 section 18.8.1 defaults `vertical` to `bottom`, and
         // both Excel and Calc render it that way. Centring instead lifts every
-        // unaligned cell off the baseline Calc puts it on.
+        // unaligned cell off the baseline Calc puts it on. Calc then applies
+        // the default 20-twip bottom ATTR_MARGIN before positioning the block.
         let rect = Rect {
             x: Fixed::ZERO,
             y: Fixed::ZERO,
@@ -13647,12 +13694,170 @@ mod tests {
         };
         let block = Fixed::from_pixels(12);
         assert_eq!(
-            vertical_block_top(rect, block, TextBaseline::Bottom).unwrap(),
-            Fixed::from_pixels(28)
+            CALC_CELL_VERTICAL_MARGIN,
+            points_to_fixed(1.0).expect("one point")
         );
-        assert_ne!(
-            vertical_block_top(rect, block, TextBaseline::Bottom).unwrap(),
-            vertical_block_top(rect, block, TextBaseline::Middle).unwrap()
+        let bottom = calc_cell_text_layout_bounds(rect, TextBaseline::Bottom).unwrap();
+        let top = calc_cell_text_layout_bounds(rect, TextBaseline::Top).unwrap();
+        let middle = calc_cell_text_layout_bounds(rect, TextBaseline::Middle).unwrap();
+        assert_eq!(
+            vertical_block_top(bottom, block, TextBaseline::Bottom).unwrap(),
+            Fixed::from_pixels(28)
+                .checked_sub(CALC_CELL_VERTICAL_MARGIN)
+                .unwrap()
+        );
+        assert_eq!(
+            vertical_block_top(top, block, TextBaseline::Top).unwrap(),
+            CALC_CELL_VERTICAL_MARGIN
+        );
+        assert_eq!(
+            vertical_block_top(middle, block, TextBaseline::Middle).unwrap(),
+            Fixed::from_pixels(14)
+        );
+        assert_eq!(
+            middle, rect,
+            "equal top and bottom margins cancel at center"
+        );
+    }
+
+    #[test]
+    fn calc_vertical_cell_margin_is_shared_by_scene_text_and_outlined_glyphs() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("vertical-margins");
+        for row in 0..4 {
+            sheet.set_row_height(row, 30.0);
+        }
+        sheet.write(0, 0, "default");
+        sheet.write_styled(1, 0, "bottom", &CellStyle::new().valign(VAlign::Bottom));
+        sheet.write_styled(2, 0, "top", &CellStyle::new().valign(VAlign::Top));
+        sheet.write_styled(3, 0, "middle", &CellStyle::new().valign(VAlign::Middle));
+        let range = RenderRange::new(0, 0, 3, 0);
+        let approximate = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(range),
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let text_node = |text: &str| {
+            approximate
+                .scene
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    SceneNode::Text(node) if node.text == text => Some(node),
+                    _ => None,
+                })
+                .expect("cell text node")
+        };
+        let default = text_node("default");
+        let bottom = text_node("bottom");
+        let top = text_node("top");
+        let middle = text_node("middle");
+        assert_eq!(default.style.baseline, TextBaseline::Bottom);
+        assert_eq!(bottom.style.baseline, TextBaseline::Bottom);
+        assert_eq!(top.style.baseline, TextBaseline::Top);
+        assert_eq!(middle.style.baseline, TextBaseline::Middle);
+        for node in [default, bottom] {
+            assert_eq!(node.bounds.height, node.clip_bounds.height);
+            assert_eq!(
+                node.bounds.y.checked_add(CALC_CELL_VERTICAL_MARGIN),
+                Some(node.clip_bounds.y),
+                "default and explicit bottom alignment share the exact bottom inset"
+            );
+        }
+        assert_eq!(top.bounds.height, top.clip_bounds.height);
+        assert_eq!(
+            top.bounds.y,
+            top.clip_bounds
+                .y
+                .checked_add(CALC_CELL_VERTICAL_MARGIN)
+                .unwrap()
+        );
+        assert_eq!(middle.bounds, middle.clip_bounds);
+
+        let pack = synthetic_test_pack();
+        let outlined = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(range),
+                gridlines: false,
+                default_font_family: pack.default_family().to_string(),
+                font_pack: Some(pack),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let default = glyph_run(&outlined.scene, "default");
+        let bottom = glyph_run(&outlined.scene, "bottom");
+        let top = glyph_run(&outlined.scene, "top");
+        let relative_baseline =
+            |run: &GlyphRunNode| run.cluster_metrics[0].baseline_y.raw() - run.clip_bounds.y.raw();
+        assert_eq!(relative_baseline(default), relative_baseline(bottom));
+        assert_eq!(
+            top.cluster_metrics[0].baseline_y.raw() - top.cluster_metrics[0].ascent.raw(),
+            top.clip_bounds.y.raw() + CALC_CELL_VERTICAL_MARGIN.raw(),
+            "outlined top text starts exactly one point inside the original clip"
+        );
+    }
+
+    #[test]
+    fn calc_vertical_cell_margin_keeps_too_short_row_clips_bounded() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("short-margin");
+        sheet.set_row_height(0, 0.5);
+        sheet.write_styled(0, 0, "top", &CellStyle::new().valign(VAlign::Top));
+        sheet.write_styled(0, 1, "bottom", &CellStyle::new().valign(VAlign::Bottom));
+        sheet.write_styled(0, 2, "middle", &CellStyle::new().valign(VAlign::Middle));
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 2)),
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let text_node = |text: &str| {
+            build
+                .scene
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    SceneNode::Text(node) if node.text == text => Some(node),
+                    _ => None,
+                })
+                .expect("short-row text node")
+        };
+        let top = text_node("top");
+        let bottom = text_node("bottom");
+        let middle = text_node("middle");
+        assert!(top.clip_bounds.height < CALC_CELL_VERTICAL_MARGIN);
+        assert_eq!(top.bounds.height, top.clip_bounds.height);
+        assert_eq!(bottom.bounds.height, bottom.clip_bounds.height);
+        assert_eq!(middle.bounds, middle.clip_bounds);
+        assert!(
+            top.bounds.y
+                > top
+                    .clip_bounds
+                    .y
+                    .checked_add(top.clip_bounds.height)
+                    .unwrap(),
+            "the exact top inset may fall beyond a sub-point row, while clipping stays on the row"
+        );
+        assert!(
+            bottom
+                .bounds
+                .y
+                .checked_add(bottom.bounds.height)
+                .unwrap()
+                < bottom.clip_bounds.y,
+            "the exact bottom inset may fall above a sub-point row, while clipping stays on the row"
         );
     }
 
@@ -14103,6 +14308,7 @@ mod tests {
             &pack,
             &region,
             region.rect,
+            region.rect,
             &base,
             false,
             &options,
@@ -14448,6 +14654,91 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn merged_source_clusters_retain_the_actual_shaped_glyph_cluster_index() {
+        let pack = synthetic_test_pack();
+        let styles = vec![ResolvedRunStyle {
+            family: "Wide Sans".to_string(),
+            size: Fixed::from_pixels(16),
+            color: Rgb::BLACK,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            script: FormatScript::None,
+        }];
+        let glyph = ShapedGlyph {
+            glyph_id: 1,
+            cluster: 0,
+            x_advance: 600,
+            y_advance: 0,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        // Layout normally produces disjoint run sources, but the cluster
+        // builder deliberately supports adjacent command ranges for one
+        // source cluster. Exercise that supported merge directly so retained
+        // shaped-glyph identity cannot point at the next/nonexistent cluster.
+        let shaped = ShapedText {
+            runs: vec![
+                ShapedRun {
+                    font_id: FontId(0),
+                    direction: BaseDirection::LeftToRight,
+                    source: 0..1,
+                    style_index: 0,
+                    glyphs: vec![glyph],
+                },
+                ShapedRun {
+                    font_id: FontId(0),
+                    direction: BaseDirection::LeftToRight,
+                    source: 0..1,
+                    style_index: 0,
+                    glyphs: vec![glyph],
+                },
+            ],
+            glyph_count: 2,
+            missing_glyphs: 0,
+            requested_family_matched: true,
+            selected_faces: Vec::new(),
+            base_direction: BaseDirection::LeftToRight,
+        };
+        let mut stats = TypographyStats::default();
+        let mut commands = Vec::new();
+        let mut clusters = Vec::new();
+        let mut cluster_metrics = Vec::new();
+        let mut paints = Vec::new();
+        let mut decorations = Vec::new();
+        let mut glyphs = Vec::new();
+        let mut font_faces = Vec::new();
+        append_styled_shaped_outlines(
+            &pack,
+            "A",
+            0,
+            &shaped,
+            Fixed::ZERO,
+            Fixed::from_pixels(16),
+            &styles,
+            1,
+            1,
+            &RenderOptions::default(),
+            &mut stats,
+            &mut commands,
+            &mut clusters,
+            &mut cluster_metrics,
+            &mut paints,
+            &mut decorations,
+            &mut glyphs,
+            &mut font_faces,
+        )
+        .unwrap();
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(cluster_metrics.len(), 1);
+        assert_eq!(glyphs.len(), 2);
+        assert!(glyphs.iter().all(|glyph| glyph.cluster == 0));
+        assert_eq!(clusters[0].command_end, commands.len() as u64);
     }
 
     #[test]
@@ -15596,6 +15887,130 @@ mod tests {
             CellLineLayoutPolicy::Native
         );
         build_scene(&conditional, 0, &options).unwrap();
+    }
+
+    #[test]
+    fn geometry_conditional_outside_selection_keeps_measurement_and_painting_on_native_wrap() {
+        const TEXT: &str = "aa aa aa aa aa aa";
+
+        let pack = synthetic_test_pack();
+        let family = pack.default_family().to_string();
+        let styles = format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><font><sz val="24"/></font></dxf></dxfs></styleSheet>"#
+        );
+        let workbook = imported_xlsx(
+            &styles,
+            &format!(
+                r#"<worksheet><cols><col min="1" max="1" width="4" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>{TEXT}</t></is></c><c r="B1"><v>1</v></c></row></sheetData><conditionalFormatting sqref="B1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting></worksheet>"#
+            ),
+        );
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = RenderOptions {
+            selection: RenderSelection::Range(range),
+            gridlines: false,
+            default_font_family: family,
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        assert!(has_conditional_text_layout_overlay(sheet));
+        assert!(!calc_line_layout_available(sheet, &options));
+
+        let (rows, columns) = measure_sheet_axes(sheet, range, &options).unwrap();
+        let style = sheet.resolved_cell_style(0, 0).expect("wrapped style");
+        let mut digit_warnings = Warnings::default();
+        let mut digit_statistics = TypographyStats::default();
+        let maximum_digit_width = maximum_digit_width(
+            &RenderStyleSnapshot::new(sheet),
+            &options,
+            &mut digit_warnings,
+            &mut digit_statistics,
+        )
+        .unwrap();
+        let calc_wrap_space = calc_ooxml_wrap_space(sheet, [0], maximum_digit_width)
+            .unwrap()
+            .expect("verified Calc wrap space");
+        let native_region = Region {
+            source: CellCoordinate { row: 0, col: 0 },
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: columns[0].size,
+                height: rows[0].size,
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::Native,
+            calc_wrap_space: None,
+            style: Some(style),
+            conditional: ConditionalPaint::default(),
+            text: TEXT.to_string(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+        };
+        let mut native_statistics = TypographyStats::default();
+        let native_height = measure_automatic_cell_height(
+            options.font_pack.as_ref().unwrap(),
+            &native_region,
+            false,
+            &options,
+            &mut native_statistics,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut calc_region = native_region.clone();
+        calc_region.line_layout_policy = CellLineLayoutPolicy::CalcEditEngine;
+        calc_region.calc_wrap_space = Some(calc_wrap_space);
+        let mut calc_statistics = TypographyStats::default();
+        let calc_height = measure_automatic_cell_height(
+            options.font_pack.as_ref().unwrap(),
+            &calc_region,
+            false,
+            &options,
+            &mut calc_statistics,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(
+            native_height, calc_height,
+            "the fixture must distinguish the native and Calc measurement paths"
+        );
+        assert_eq!(
+            rows[0].size, native_height,
+            "automatic-row measurement must use the same conservative native wrapper as painting"
+        );
+
+        let native_style = text_style(&native_region, &options, false);
+        let mut prepared_statistics = TypographyStats::default();
+        let prepared = prepare_styled_text(
+            options.font_pack.as_ref().unwrap(),
+            &native_region,
+            &native_style,
+            false,
+            &options,
+            &mut prepared_statistics,
+        )
+        .unwrap();
+        let scene = build_scene(&workbook, 0, &options).unwrap();
+        let baselines = glyph_run(&scene.scene, TEXT)
+            .cluster_metrics
+            .iter()
+            .map(|metric| metric.baseline_y.raw())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(baselines.len(), prepared.lines.len());
+        for (window, line) in baselines.windows(2).zip(&prepared.lines) {
+            assert_eq!(
+                window[1] - window[0],
+                line_height_from_metrics(line.metrics, CellLineLayoutPolicy::Native)
+                    .unwrap()
+                    .raw()
+            );
+        }
     }
 
     #[test]
@@ -17889,6 +18304,110 @@ mod tests {
                 .count(),
             4,
             "the strict numeric comparison expression uses relative A1 references"
+        );
+    }
+
+    #[test]
+    fn conditional_rule_statistics_include_cells_outside_the_render_selection() {
+        let render_middle = |workbook: &Workbook| {
+            build_scene(
+                workbook,
+                0,
+                &RenderOptions {
+                    selection: RenderSelection::Range(RenderRange::new(1, 0, 1, 0)),
+                    gridlines: false,
+                    ..RenderOptions::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let mut scale = Workbook::new();
+        let sheet = scale.add_sheet("scale");
+        for (row, value) in [0.0, 50.0, 100.0].into_iter().enumerate() {
+            sheet.write_number(row as u32, 0, value);
+        }
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 2, 0),
+            CfRule::color_scale2(Color::rgb(255, 0, 0), Color::rgb(0, 255, 0)),
+        ));
+        let scale = render_middle(&scale);
+        assert!(
+            scale.scene.nodes.iter().any(|node| {
+                matches!(
+                    node,
+                    SceneNode::Rect(RectNode {
+                        fill: Some(Rgb {
+                            red: 128,
+                            green: 128,
+                            blue: 0
+                        }),
+                        ..
+                    })
+                )
+            }),
+            "the selected midpoint must be scaled against the off-selection minimum and maximum"
+        );
+
+        let mut ranked = Workbook::new();
+        let sheet = ranked.add_sheet("ranked");
+        for (row, value) in [100.0, 50.0, 100.0].into_iter().enumerate() {
+            sheet.write_number(row as u32, 0, value);
+        }
+        let top_fill = Rgb::new(255, 192, 0);
+        let below_average_fill = Rgb::new(0, 176, 80);
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 2, 0),
+            CfRule::top_bottom(1, false, false, Color::rgb(255, 192, 0)),
+        ));
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 2, 0),
+            CfRule::above_average(true, Color::rgb(0, 176, 80)),
+        ));
+        let ranked = render_middle(&ranked);
+        let fills = ranked
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Rect(node) => node.fill,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !fills.contains(&top_fill),
+            "the selected 50 is not a top-one value when off-selection 100s are included"
+        );
+        assert!(
+            fills.contains(&below_average_fill),
+            "the selected 50 is below the full rule-range average"
+        );
+
+        let mut duplicate = Workbook::new();
+        let sheet = duplicate.add_sheet("duplicate");
+        for (row, value) in ["Alpha", "alpha", "Beta"].into_iter().enumerate() {
+            sheet.write(row as u32, 0, value);
+        }
+        let duplicate_fill = Rgb::new(68, 114, 196);
+        sheet.add_conditional_format(CondFormat::new(
+            (0, 0, 2, 0),
+            CfRule::duplicate_values(false, Color::rgb(68, 114, 196)),
+        ));
+        let duplicate = render_middle(&duplicate);
+        assert!(
+            duplicate.scene.nodes.iter().any(|node| matches!(
+                node,
+                SceneNode::Rect(node) if node.fill == Some(duplicate_fill)
+            )),
+            "duplicate classification must include the matching off-selection value"
+        );
+        assert!(
+            !duplicate
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == WarningCode::ConditionalFormattingDeferred),
+            "a fully supported rule range must not become deferred only because it is clipped"
         );
     }
 

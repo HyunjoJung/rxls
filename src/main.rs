@@ -3701,7 +3701,7 @@ fn inspect_package_bytes(
     })
 }
 
-#[cfg(any(feature = "xlsx", feature = "ods"))]
+#[cfg(feature = "xlsx")]
 fn count_parts_with_prefix(parts: &[PackagePart], prefix: &str) -> usize {
     parts
         .iter()
@@ -3709,7 +3709,7 @@ fn count_parts_with_prefix(parts: &[PackagePart], prefix: &str) -> usize {
         .count()
 }
 
-#[cfg(any(feature = "xlsx", feature = "ods"))]
+#[cfg(feature = "xlsx")]
 fn has_part(parts: &[PackagePart], name: &str) -> bool {
     parts.iter().any(|part| part.name == name)
 }

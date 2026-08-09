@@ -79,9 +79,7 @@ fn node_command_count(node: &SceneNode) -> u64 {
         SceneNode::Rect(_) | SceneNode::Image(_) | SceneNode::Text(_) => 1,
         SceneNode::Line(_) => 2,
         SceneNode::Path(node) => node.commands.len() as u64,
-        SceneNode::GlyphRun(node) => {
-            node.commands.len() as u64 + node.decorations.len() as u64 * 2
-        }
+        SceneNode::GlyphRun(node) => node.commands.len() as u64 + node.decorations.len() as u64 * 2,
     }
 }
 
@@ -588,6 +586,8 @@ mod tests {
             pivot_x: Fixed::ZERO,
             pivot_y: Fixed::ZERO,
             hyperlink: None,
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
         });
         let nodes = vec![SceneNode::ClipGroup(ClipGroupNode {
             clip,

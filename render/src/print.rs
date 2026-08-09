@@ -78,7 +78,8 @@ pub struct PrintOptions {
     /// or merge. Scale selection still sees the complete print area.
     pub omit_sparse_pages: bool,
     /// Ignore authored print-page settings and emit the selected visible sheet
-    /// scene at 100% on one content-sized page.
+    /// scene at 100% on one content-sized page. This Calc-parity mode also
+    /// suppresses worksheet gridlines regardless of source or caller flags.
     pub single_page_sheets: bool,
     /// Pagination and backend resource ceilings.
     pub limits: PrintLimits,
@@ -1053,10 +1054,11 @@ fn prepare_single_page_sheet_document(
     enforce_print_limit(LimitKind::Pages, options.limits.max_pages, 1)?;
 
     let mut render_options = options.render.clone();
-    let metadata = sheet.print_metadata();
-    render_options.gridlines &= metadata
-        .print_gridlines()
-        .unwrap_or_else(|| sheet.print_gridlines());
+    // LibreOffice Calc 26.2.3's SinglePageSheets PDF path suppresses worksheet
+    // gridlines even when the source printOptions and the renderer caller both
+    // request them. Authored pagination continues to combine those flags in
+    // `prepare_print_area`; this override is deliberately narrower.
+    render_options.gridlines = false;
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
     let build = build_single_page_sheet_scene(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
@@ -3715,6 +3717,18 @@ fn transform_node_inner(
             node.clip_bounds = transform_rect(node.clip_bounds, x, y, scale_permille)?;
             node.pivot_x = transform_coordinate(node.pivot_x, x, scale_permille)?;
             node.pivot_y = transform_coordinate(node.pivot_y, y, scale_permille)?;
+            for metrics in &mut node.cluster_metrics {
+                metrics.origin_x = transform_coordinate(metrics.origin_x, x, scale_permille)?;
+                metrics.advance_x = scale_fixed(metrics.advance_x, scale_permille)?;
+                metrics.baseline_y = transform_coordinate(metrics.baseline_y, y, scale_permille)?;
+                metrics.ascent = scale_fixed(metrics.ascent, scale_permille)?;
+                metrics.descent = scale_fixed(metrics.descent, scale_permille)?;
+            }
+            for glyph in &mut node.glyphs {
+                glyph.origin_x = transform_coordinate(glyph.origin_x, x, scale_permille)?;
+                glyph.origin_y = transform_coordinate(glyph.origin_y, y, scale_permille)?;
+                glyph.size = scale_fixed(glyph.size, scale_permille)?;
+            }
             for command in &mut node.commands {
                 *command = transform_path_command(*command, x, y, scale_permille)?;
             }
@@ -4537,6 +4551,105 @@ mod tests {
     }
 
     #[test]
+    fn print_transform_moves_embedded_glyphs_and_pdf_uses_the_moved_positions() {
+        let pack = crate::font::synthetic_test_pack();
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("embedded").write(0, 0, "AB");
+        let options = RenderOptions {
+            font_pack: Some(pack.clone()),
+            default_font_family: pack.default_family().to_string(),
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+        let build = build_sheet_scene(&workbook.sheets[0], 0, &options).unwrap();
+        let original = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::GlyphRun(node) => Some(node.clone()),
+                _ => None,
+            })
+            .expect("layout-produced glyph run");
+        assert!(!original.glyphs.is_empty());
+        assert!(!original.cluster_metrics.is_empty());
+
+        let offset_x = Fixed::from_pixels(37);
+        let offset_y = Fixed::from_pixels(53);
+        let scale_permille = 625;
+        let transformed = match transform_node(
+            SceneNode::GlyphRun(original.clone()),
+            offset_x,
+            offset_y,
+            scale_permille,
+        )
+        .unwrap()
+        {
+            SceneNode::GlyphRun(node) => node,
+            _ => unreachable!(),
+        };
+
+        for (before, after) in original.glyphs.iter().zip(&transformed.glyphs) {
+            assert_eq!(
+                after.origin_x,
+                transform_coordinate(before.origin_x, offset_x, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.origin_y,
+                transform_coordinate(before.origin_y, offset_y, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.size,
+                scale_fixed(before.size, scale_permille).unwrap()
+            );
+        }
+        for (before, after) in original
+            .cluster_metrics
+            .iter()
+            .zip(&transformed.cluster_metrics)
+        {
+            assert_eq!(
+                after.origin_x,
+                transform_coordinate(before.origin_x, offset_x, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.advance_x,
+                scale_fixed(before.advance_x, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.baseline_y,
+                transform_coordinate(before.baseline_y, offset_y, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.ascent,
+                scale_fixed(before.ascent, scale_permille).unwrap()
+            );
+            assert_eq!(
+                after.descent,
+                scale_fixed(before.descent, scale_permille).unwrap()
+            );
+        }
+
+        let first = transformed.glyphs[0];
+        let expected_text_matrix = format!(
+            "BT /RE0 {} Tf 1 0 0 -1 {} {} Tm",
+            crate::scene::format_fixed(first.size),
+            crate::scene::format_fixed(first.origin_x),
+            crate::scene::format_fixed(first.origin_y),
+        );
+        let mut document = multipage_document();
+        document.pages.truncate(1);
+        document.pages[0].scene.nodes = vec![SceneNode::GlyphRun(transformed)];
+        let pdf = crate::render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains("/Subtype /Type0"));
+        assert!(
+            source.contains(&expected_text_matrix),
+            "embedded text must use the translated and scaled glyph placement"
+        );
+    }
+
+    #[test]
     fn ordered_pages_pdf_and_png_share_one_scene_deterministically() {
         let document = multipage_document();
         assert!(document.pages.len() >= 4);
@@ -4562,7 +4675,7 @@ mod tests {
     }
 
     #[test]
-    fn single_page_sheets_honors_source_print_gridlines_and_caller_disable() {
+    fn single_page_sheets_suppresses_gridlines_while_authored_print_honors_flags() {
         fn has_gridline(nodes: &[SceneNode]) -> bool {
             nodes.iter().any(|node| match node {
                 SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
@@ -4576,8 +4689,9 @@ mod tests {
         sheet.write(0, 0, "A");
         sheet.write(1, 1, "B");
         sheet.set_print_gridlines();
-        let options = PrintOptions {
-            single_page_sheets: true,
+        assert!(sheet.print_gridlines());
+        assert!(sheet.print_metadata().print_gridlines().unwrap_or(false));
+        let authored = PrintOptions {
             render: RenderOptions {
                 font_pack: Some(crate::font::synthetic_test_pack()),
                 default_font_family: "Wide Sans".to_string(),
@@ -4585,12 +4699,20 @@ mod tests {
             },
             ..PrintOptions::default()
         };
-        let document = build_print_document(&workbook, 0, &options).unwrap();
+        let document = build_print_document(&workbook, 0, &authored).unwrap();
         assert!(has_gridline(&document.pages[0].scene.nodes));
 
-        let mut disabled = options;
+        let mut disabled = authored.clone();
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
+        assert!(!has_gridline(&document.pages[0].scene.nodes));
+
+        let single_page = PrintOptions {
+            single_page_sheets: true,
+            ..authored
+        };
+        let document = build_print_document(&workbook, 0, &single_page).unwrap();
+        assert!(single_page.render.gridlines);
         assert!(!has_gridline(&document.pages[0].scene.nodes));
     }
 

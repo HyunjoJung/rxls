@@ -195,6 +195,19 @@ impl Spreadsheet {
             return Err(Error::Zip("cell is outside the Excel grid"));
         }
         validate_edit_cell_value(&value)?;
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| {
+            candidate.set_cell_value_in_place(&sheet_name, row, col, &value)
+        })
+    }
+
+    fn set_cell_value_in_place(
+        &mut self,
+        sheet_name: &str,
+        row: u32,
+        col: u16,
+        value: &Cell,
+    ) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -202,7 +215,7 @@ impl Spreadsheet {
         let path = worksheet_path(package, sheet_name)?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
-        sml_edit_cell(tree, row, col, &value)?;
+        sml_edit_cell(tree, row, col, value)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -247,6 +260,11 @@ impl Spreadsheet {
         for value in &values {
             validate_edit_cell_value(value)?;
         }
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| candidate.append_row_in_place(&sheet_name, &values))
+    }
+
+    fn append_row_in_place(&mut self, sheet_name: &str, values: &[Cell]) -> Result<u32> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -269,8 +287,8 @@ impl Spreadsheet {
         }
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
-        for (col, value) in values.into_iter().enumerate() {
-            sml_edit_cell(tree, row, col as u16, &value)?;
+        for (col, value) in values.iter().enumerate() {
+            sml_edit_cell(tree, row, col as u16, value)?;
         }
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
@@ -303,6 +321,20 @@ impl Spreadsheet {
             return Err(Error::Zip("range is too large for package-preserving edit"));
         }
 
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| {
+            candidate.clear_range_in_place(&sheet_name, row0, col0, row1, col1)
+        })
+    }
+
+    fn clear_range_in_place(
+        &mut self,
+        sheet_name: &str,
+        row0: u32,
+        col0: u16,
+        row1: u32,
+        col1: u16,
+    ) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -374,7 +406,8 @@ impl Spreadsheet {
         Ok(())
     }
 
-    /// Set or replace a workbook-global defined name in `xl/workbook.xml`.
+    /// Set or replace a workbook-global defined name in `xl/workbook.xml`
+    /// atomically.
     ///
     /// Sheet-local and built-in `_xlnm.*` names are left untouched.
     pub fn set_defined_name(
@@ -392,6 +425,12 @@ impl Spreadsheet {
             return Err(Error::Zip("defined name is not editable"));
         }
         validate_xml_value(refers_to, "defined name formula contains invalid XML text")?;
+        let name = name.to_string();
+        let refers_to = refers_to.to_string();
+        self.mutate_atomic(move |candidate| candidate.set_defined_name_in_place(&name, &refers_to))
+    }
+
+    fn set_defined_name_in_place(&mut self, name: &str, refers_to: &str) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -1471,8 +1510,19 @@ impl Spreadsheet {
         Ok(())
     }
 
-    /// Set a worksheet visibility state in `xl/workbook.xml`.
+    /// Set a worksheet visibility state in `xl/workbook.xml` atomically.
     pub fn set_sheet_visibility(&mut self, sheet_name: &str, visible: SheetVisible) -> Result<()> {
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| {
+            candidate.set_sheet_visibility_in_place(&sheet_name, visible)
+        })
+    }
+
+    fn set_sheet_visibility_in_place(
+        &mut self,
+        sheet_name: &str,
+        visible: SheetVisible,
+    ) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -1506,8 +1556,13 @@ impl Spreadsheet {
         Ok(())
     }
 
-    /// Set the active worksheet by name in `xl/workbook.xml`.
+    /// Set the active worksheet by name in `xl/workbook.xml` atomically.
     pub fn set_active_sheet(&mut self, sheet_name: &str) -> Result<()> {
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| candidate.set_active_sheet_in_place(&sheet_name))
+    }
+
+    fn set_active_sheet_in_place(&mut self, sheet_name: &str) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -1525,8 +1580,16 @@ impl Spreadsheet {
         Ok(())
     }
 
-    /// Set worksheet tab color in the target worksheet XML part.
+    /// Set worksheet tab color in the target worksheet XML part atomically.
     pub fn set_sheet_tab_color(&mut self, sheet_name: &str, color: impl Into<Color>) -> Result<()> {
+        let sheet_name = sheet_name.to_string();
+        let color = color.into();
+        self.mutate_atomic(move |candidate| {
+            candidate.set_sheet_tab_color_in_place(&sheet_name, color)
+        })
+    }
+
+    fn set_sheet_tab_color_in_place(&mut self, sheet_name: &str, color: Color) -> Result<()> {
         self.ensure_editable()?;
         let package = self.package.as_mut().ok_or(Error::Zip(
             "spreadsheet is read-only for package-preserving edit",
@@ -1534,7 +1597,7 @@ impl Spreadsheet {
         let path = worksheet_path(package, sheet_name)?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
-        sml_set_tab_color(tree, color.into())?;
+        sml_set_tab_color(tree, color)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -1600,11 +1663,11 @@ fn atomic_write_sibling(path: &Path, bytes: &[u8]) -> Result<()> {
         .and_then(|_| temp_file.sync_all())
         .is_err()
     {
-        drop(temp_file);
+        close_atomic_file(temp_file);
         let _ = fs::remove_file(&temp_path);
         return Err(Error::Zip("failed to write atomic save temporary file"));
     }
-    drop(temp_file);
+    close_atomic_file(temp_file);
 
     if fs::rename(&temp_path, path).is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -1618,6 +1681,17 @@ fn atomic_write_sibling(path: &Path, bytes: &[u8]) -> Result<()> {
             .map_err(|_| Error::Zip("failed to sync atomic save directory"))?;
     }
     Ok(())
+}
+
+fn close_atomic_file(file: File) {
+    // Native platforms must close the sibling before remove/rename (notably
+    // on Windows). The wasm32 std facade has no file descriptor and its File
+    // stub does not implement Drop, but consuming the value keeps this shared
+    // source warning-clean for browser bindings.
+    #[cfg(not(target_arch = "wasm32"))]
+    drop(file);
+    #[cfg(target_arch = "wasm32")]
+    let _ = file;
 }
 
 fn remember_edited_part(parts: &mut Vec<String>, part: String) {
@@ -5265,6 +5339,11 @@ mod tests {
     /// (`Spreadsheet::set_cell_value`) node-budget regression tests below, so
     /// the pinned budget and the fixture can never drift out of sync.
     const MINIMAL_WORKSHEET_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+    const EMPTY_WORKSHEET_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData></sheetData></worksheet>"#;
+    const MINIMAL_WORKBOOK_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    const MINIMAL_CONTENT_TYPES_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+    const UNTYPED_WORKSHEET_CONTENT_TYPES_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+    const UNTYPED_WORKBOOK_CONTENT_TYPES_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
 
     /// Regression test for a `sml_set_cell_value` bug: it unconditionally
     /// removed the cell's existing `<v>`/`<f>`/`<is>` child FIRST, and only
@@ -5321,7 +5400,7 @@ mod tests {
     /// Builds a minimal single-sheet `.xlsx` ZIP whose `xl/worksheets/sheet1.xml`
     /// is exactly [`MINIMAL_WORKSHEET_XML`], for the broader
     /// `Spreadsheet::set_cell_value` end-to-end regression test below.
-    fn minimal_xlsx_with_one_valued_cell() -> Vec<u8> {
+    fn minimal_xlsx_with_worksheet(worksheet_xml: &[u8], content_types_xml: &[u8]) -> Vec<u8> {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
 
@@ -5337,37 +5416,26 @@ mod tests {
 
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let opt = SimpleFileOptions::default();
-        add(
-            &mut zip,
-            opt,
-            "[Content_Types].xml",
-            br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
-        );
+        add(&mut zip, opt, "[Content_Types].xml", content_types_xml);
         add(
             &mut zip,
             opt,
             "_rels/.rels",
             br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
         );
-        add(
-            &mut zip,
-            opt,
-            "xl/workbook.xml",
-            br#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
-        );
+        add(&mut zip, opt, "xl/workbook.xml", MINIMAL_WORKBOOK_XML);
         add(
             &mut zip,
             opt,
             "xl/_rels/workbook.xml.rels",
             br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
         );
-        add(
-            &mut zip,
-            opt,
-            "xl/worksheets/sheet1.xml",
-            MINIMAL_WORKSHEET_XML,
-        );
+        add(&mut zip, opt, "xl/worksheets/sheet1.xml", worksheet_xml);
         zip.finish().unwrap().into_inner()
+    }
+
+    fn minimal_xlsx_with_one_valued_cell() -> Vec<u8> {
+        minimal_xlsx_with_worksheet(MINIMAL_WORKSHEET_XML, MINIMAL_CONTENT_TYPES_XML)
     }
 
     /// Broader end-to-end confirmation through the public API: the same
@@ -5403,6 +5471,126 @@ mod tests {
             Some(&Cell::Number(1.0)),
             "original cell value must survive a failed edit"
         );
+    }
+
+    #[test]
+    fn set_cell_value_rolls_back_created_nodes_when_value_write_fails() {
+        let input = minimal_xlsx_with_worksheet(EMPTY_WORKSHEET_XML, MINIMAL_CONTENT_TYPES_XML);
+        let mut spreadsheet = Spreadsheet::open(&input).expect("open editable empty xlsx");
+        let before = spreadsheet.save().expect("serialize original package");
+        let budget = XmlTree::parse(EMPTY_WORKSHEET_XML)
+            .expect("parse empty worksheet")
+            .node_count()
+            + 2;
+
+        // Leave room for the new row and cell nodes, but not the value node.
+        // The in-place edit therefore fails only after it has created both
+        // containers; the public operation must discard that candidate.
+        set_test_node_budget(budget);
+        let result = spreadsheet.set_cell_value("Data", 0, 0, Cell::Number(999.0));
+        reset_test_node_budget();
+
+        assert!(
+            result.is_err(),
+            "the value write must exceed the node budget"
+        );
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+
+    #[test]
+    fn append_row_rolls_back_earlier_cells_when_later_cell_fails() {
+        let input = minimal_xlsx_with_one_valued_cell();
+        let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsx");
+        let before = spreadsheet.save().expect("serialize original package");
+        let budget = XmlTree::parse(MINIMAL_WORKSHEET_XML)
+            .expect("parse populated worksheet")
+            .node_count()
+            + 4;
+
+        // The budget admits the appended row, its first complete cell, and
+        // the second cell container. Writing the second value then fails,
+        // exercising rollback after a genuinely partial in-place append.
+        set_test_node_budget(budget);
+        let result = spreadsheet.append_row("Data", [Cell::Number(2.0), Cell::Number(3.0)]);
+        reset_test_node_budget();
+
+        assert!(
+            result.is_err(),
+            "the second value must exceed the node budget"
+        );
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+
+    #[test]
+    fn clear_range_rolls_back_when_candidate_package_validation_fails() {
+        // This source package is readable and metadata parses losslessly, but
+        // the worksheet has no content type. An untouched passthrough save is
+        // permitted; once the worksheet is edited, final package validation
+        // must reject it. The public clear must not retain that failed edit.
+        let input =
+            minimal_xlsx_with_worksheet(MINIMAL_WORKSHEET_XML, UNTYPED_WORKSHEET_CONTENT_TYPES_XML);
+        let mut spreadsheet = Spreadsheet::open(&input).expect("open readable xlsx");
+        let before = spreadsheet.save().expect("serialize untouched package");
+
+        let result = spreadsheet.clear_range("Data", 0, 0, 0, 0);
+
+        assert!(
+            result.is_err(),
+            "edited untyped worksheet must fail validation"
+        );
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+
+    #[test]
+    fn set_active_sheet_rolls_back_book_views_created_before_late_failure() {
+        let input = minimal_xlsx_with_one_valued_cell();
+        let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsx");
+        let before = spreadsheet.save().expect("serialize original package");
+        let budget = XmlTree::parse(MINIMAL_WORKBOOK_XML)
+            .expect("parse minimal workbook")
+            .node_count()
+            + 1;
+
+        // The missing <bookViews> fits, but the nested <workbookView> does
+        // not. The public operation must discard the candidate containing
+        // that first insertion when the second insertion is rejected.
+        set_test_node_budget(budget);
+        let result = spreadsheet.set_active_sheet("Data");
+        reset_test_node_budget();
+
+        assert!(
+            result.is_err(),
+            "the nested workbook view must exceed the node budget"
+        );
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+
+    #[test]
+    fn metadata_mutators_roll_back_final_package_validation_failures() {
+        fn assert_rolls_back(
+            content_types: &[u8],
+            edit: impl FnOnce(&mut Spreadsheet) -> Result<()>,
+        ) {
+            let input = minimal_xlsx_with_worksheet(MINIMAL_WORKSHEET_XML, content_types);
+            let mut spreadsheet = Spreadsheet::open(&input).expect("open readable xlsx");
+            let before = spreadsheet.save().expect("serialize untouched package");
+
+            assert!(
+                edit(&mut spreadsheet).is_err(),
+                "the touched untyped part must fail final validation"
+            );
+            assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+        }
+
+        assert_rolls_back(UNTYPED_WORKBOOK_CONTENT_TYPES_XML, |spreadsheet| {
+            spreadsheet.set_defined_name("Rate", "Data!$A$1")
+        });
+        assert_rolls_back(UNTYPED_WORKBOOK_CONTENT_TYPES_XML, |spreadsheet| {
+            spreadsheet.set_sheet_visibility("Data", SheetVisible::Visible)
+        });
+        assert_rolls_back(UNTYPED_WORKSHEET_CONTENT_TYPES_XML, |spreadsheet| {
+            spreadsheet.set_sheet_tab_color("Data", Color::rgb(0x12, 0x34, 0x56))
+        });
     }
 
     fn assert_rejected_edit_is_unchanged(spreadsheet: &Spreadsheet, before: &[u8]) {

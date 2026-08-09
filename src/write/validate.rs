@@ -88,6 +88,15 @@ pub enum WriteError {
         /// 0-based column index of the authored cell.
         col: u16,
     },
+    /// A formula uses another formula cell as its cached result. OOXML caches
+    /// carry only scalar cell values; the unchecked compatibility writer emits
+    /// numeric zero for this unsupported shape.
+    InvalidFormulaCachedValue {
+        /// 0-based row index of the authored formula cell.
+        row: u32,
+        /// 0-based column index of the authored formula cell.
+        col: u16,
+    },
     /// An authored hyperlink target is empty or contains XML-forbidden control
     /// characters that the unchecked writer would drop before emission. Carries
     /// the 0-based cell coordinate and original target.
@@ -219,6 +228,10 @@ impl fmt::Display for WriteError {
                 f,
                 "non-finite numeric cell at row {row}, col {col} cannot be written to Excel"
             ),
+            WriteError::InvalidFormulaCachedValue { row, col } => write!(
+                f,
+                "formula at row {row}, col {col} cannot use another formula as its cached value"
+            ),
             WriteError::InvalidHyperlinkTarget { row, col, target } => write!(
                 f,
                 "invalid hyperlink target at row {row}, col {col}: {target:?}"
@@ -348,6 +361,15 @@ pub(crate) fn validate(wb: &Workbook) -> Result<(), WriteError> {
         for cell in &sheet.cells {
             if cell.row > MAX_ROW || cell.col > MAX_COL {
                 return Err(WriteError::CellOutOfGrid {
+                    row: cell.row,
+                    col: cell.col,
+                });
+            }
+            if matches!(
+                &cell.value,
+                Cell::Formula { cached, .. } if matches!(cached.as_ref(), Cell::Formula { .. })
+            ) {
+                return Err(WriteError::InvalidFormulaCachedValue {
                     row: cell.row,
                     col: cell.col,
                 });
@@ -955,7 +977,8 @@ fn validate_formula_cached_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(
             validate_xml_text("formula cached text", value)
         }
         Cell::Error(value) => validate_xml_text("formula cached error", value),
-        Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) | Cell::Formula { .. } => Ok(()),
+        Cell::Formula { .. } => Err(WriteError::InvalidFormulaCachedValue { row, col }),
+        Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => Ok(()),
     }
 }
 
@@ -1603,6 +1626,30 @@ mod tests {
             wb.to_xlsx_checked(),
             Err(WriteError::NonFiniteNumber { row: 1, col: 2 })
         ));
+    }
+
+    #[test]
+    fn nested_formula_cached_values_are_rejected_with_their_coordinate() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("S").write_formula(
+            4,
+            5,
+            "A1",
+            Cell::Formula {
+                formula: "B1".to_string(),
+                cached: Box::new(Cell::Number(1.0)),
+            },
+        );
+
+        let error = workbook.to_xlsx_checked().unwrap_err();
+        assert_eq!(
+            error,
+            WriteError::InvalidFormulaCachedValue { row: 4, col: 5 }
+        );
+        assert_eq!(
+            error.to_string(),
+            "formula at row 4, col 5 cannot use another formula as its cached value"
+        );
     }
 
     #[test]

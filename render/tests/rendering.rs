@@ -50,7 +50,7 @@ fn korean_merges_hidden_axes_styles_and_xml_escaping_are_exact() {
     assert_eq!(output.svg, EXPECTED_STYLED_SVG);
     assert_eq!(
         output.report.to_json(),
-        "{\"schema_version\":2,\"sheet_index\":0,\"sheet_name\":\"서울 & <주택>\",\"range\":{\"first_row\":0,\"first_col\":0,\"last_row\":2,\"last_col\":2},\"rows_considered\":3,\"columns_considered\":3,\"cells_considered\":9,\"visible_rows\":2,\"visible_columns\":2,\"rendered_regions\":3,\"hidden_rows_skipped\":1,\"hidden_columns_skipped\":1,\"merged_regions\":1,\"text_bytes\":28,\"glyphs\":16,\"scene_nodes\":7,\"svg_bytes\":1323,\"font_pack_sha256\":null,\"font_faces\":[],\"warnings\":[{\"code\":\"approximate_text_metrics\",\"occurrences\":2,\"first_cell\":{\"row\":0,\"col\":0}}]}"
+        "{\"schema_version\":2,\"sheet_index\":0,\"sheet_name\":\"서울 & <주택>\",\"range\":{\"first_row\":0,\"first_col\":0,\"last_row\":2,\"last_col\":2},\"rows_considered\":3,\"columns_considered\":3,\"cells_considered\":9,\"visible_rows\":2,\"visible_columns\":2,\"rendered_regions\":3,\"hidden_rows_skipped\":1,\"hidden_columns_skipped\":1,\"merged_regions\":1,\"text_bytes\":28,\"glyphs\":16,\"scene_nodes\":7,\"svg_bytes\":1334,\"font_pack_sha256\":null,\"font_faces\":[],\"warnings\":[{\"code\":\"approximate_text_metrics\",\"occurrences\":2,\"first_cell\":{\"row\":0,\"col\":0}}]}"
     );
     assert!(output.svg.contains("서울 &amp; &lt;주택&gt;"));
     assert!(output.svg.contains("입주 &lt;공고&gt; &amp; \"확정\""));
@@ -455,7 +455,7 @@ const EXPECTED_STYLED_SVG: &str = r###"<?xml version="1.0" encoding="UTF-8"?>
 <rect width="100%" height="100%" fill="#FFFFFF"/>
 <rect x="0" y="0" width="128" height="20" fill="#1F4E79"/>
 <text x="64" y="10" font-family="맑은 &quot;고딕&quot; &amp; Sans" font-size="16" fill="#FFFFFF" text-anchor="middle" dominant-baseline="central" font-weight="700" clip-path="url(#clip-0)" xml:space="preserve">입주 &lt;공고&gt; &amp; "확정"</text>
-<text x="125" y="40" font-family="Liberation Sans" font-size="14.6669921875" fill="#000000" text-anchor="end" dominant-baseline="text-after-edge" clip-path="url(#clip-1)" xml:space="preserve">42</text>
+<text x="125" y="38.6669921875" font-family="Liberation Sans" font-size="14.6669921875" fill="#000000" text-anchor="end" dominant-baseline="text-after-edge" clip-path="url(#clip-1)" xml:space="preserve">42</text>
 <line x1="0" y1="0" x2="0" y2="20" stroke="#C00000" stroke-width="1" stroke-linecap="butt"/>
 <line x1="128" y1="0" x2="128" y2="20" stroke="#C00000" stroke-width="1" stroke-linecap="butt"/>
 <line x1="0" y1="0" x2="128" y2="0" stroke="#C00000" stroke-width="1" stroke-linecap="butt"/>

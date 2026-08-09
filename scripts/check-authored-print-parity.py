@@ -1127,17 +1127,18 @@ def _font_attestation(row: dict[str, Any]) -> int:
     return objects
 
 
-def _native_pdf_attestation(row: dict[str, Any]) -> tuple[int, int]:
+def _native_pdf_attestation(row: dict[str, Any]) -> dict[str, int]:
     evidence = row.get("native_pdf_attestation")
     if not isinstance(evidence, dict) or set(evidence) != {
         "actual_text_documents",
-        "charprocs_documents",
         "documents",
         "embedded_font_objects",
         "font_objects",
         "identity_set_sha256",
         "subset_font_objects",
-        "type3_documents",
+        "type0_cff_font_objects",
+        "type0_font_objects",
+        "type0_truetype_font_objects",
         "type3_font_objects",
         "unicode_font_objects",
     }:
@@ -1148,27 +1149,52 @@ def _native_pdf_attestation(row: dict[str, Any]) -> tuple[int, int]:
     objects = _integer(
         evidence["font_objects"], "native_pdf_attestation", minimum=1
     )
-    for key in (
-        "actual_text_documents",
-        "charprocs_documents",
-        "type3_documents",
-    ):
-        if _integer(
-            evidence[key], "native_pdf_attestation", maximum=documents
-        ) != documents:
-            raise GateError("native_pdf_attestation")
+    if _integer(
+        evidence["actual_text_documents"],
+        "native_pdf_attestation",
+        maximum=documents,
+    ) != documents:
+        raise GateError("native_pdf_attestation")
     for key in (
         "embedded_font_objects",
         "subset_font_objects",
-        "type3_font_objects",
         "unicode_font_objects",
     ):
         if _integer(
             evidence[key], "native_pdf_attestation", maximum=objects
         ) != objects:
             raise GateError("native_pdf_attestation")
+    type0 = _integer(
+        evidence["type0_font_objects"],
+        "native_pdf_attestation",
+        maximum=objects,
+    )
+    type0_truetype = _integer(
+        evidence["type0_truetype_font_objects"],
+        "native_pdf_attestation",
+        maximum=type0,
+    )
+    type0_cff = _integer(
+        evidence["type0_cff_font_objects"],
+        "native_pdf_attestation",
+        maximum=type0,
+    )
+    type3 = _integer(
+        evidence["type3_font_objects"],
+        "native_pdf_attestation",
+        maximum=objects,
+    )
+    if type0_truetype + type0_cff != type0 or type0 + type3 != objects:
+        raise GateError("native_pdf_attestation")
     _sha(evidence["identity_set_sha256"], "native_pdf_attestation")
-    return documents, objects
+    return {
+        "documents": documents,
+        "font_objects": objects,
+        "type0_cff_font_objects": type0_cff,
+        "type0_font_objects": type0,
+        "type0_truetype_font_objects": type0_truetype,
+        "type3_font_objects": type3,
+    }
 
 
 def _adapter(row: dict[str, Any], identity: dict[str, Any]) -> None:
@@ -1317,6 +1343,10 @@ def evaluate(
     font_objects = 0
     native_pdf_documents = 0
     native_pdf_font_objects = 0
+    native_pdf_type0_cff_font_objects = 0
+    native_pdf_type0_font_objects = 0
+    native_pdf_type0_truetype_font_objects = 0
+    native_pdf_type3_font_objects = 0
     point_geometry_mismatches = 0
     xhtml_crosscheck_max_micropoints = 0
     total_pages = 0
@@ -1340,9 +1370,17 @@ def evaluate(
         scale_mode = _attestation(row)
         scale_modes[scale_mode] += 1
         font_objects += _font_attestation(row)
-        native_documents, native_objects = _native_pdf_attestation(row)
-        native_pdf_documents += native_documents
-        native_pdf_font_objects += native_objects
+        native = _native_pdf_attestation(row)
+        native_pdf_documents += native["documents"]
+        native_pdf_font_objects += native["font_objects"]
+        native_pdf_type0_cff_font_objects += native[
+            "type0_cff_font_objects"
+        ]
+        native_pdf_type0_font_objects += native["type0_font_objects"]
+        native_pdf_type0_truetype_font_objects += native[
+            "type0_truetype_font_objects"
+        ]
+        native_pdf_type3_font_objects += native["type3_font_objects"]
         _adapter(row, identity)
         pages = row.get("pages")
         scenes = row.get("scenes")
@@ -1468,6 +1506,8 @@ def evaluate(
     }
     if expected_workbooks % 2 != 0 or dict(scale_modes) != expected_scale_modes:
         failures.add("scale_fit_coverage_incomplete")
+    if native_pdf_type0_font_objects == 0:
+        failures.add("native_pdf_type0_coverage_missing")
     page_median = _nearest_rank(page_errors, 1, 2)
     page_p95 = _nearest_rank(page_errors, 95, 100)
     page_max = max(page_errors)
@@ -1577,6 +1617,14 @@ def evaluate(
             "libreoffice_pdf_font_objects": font_objects,
             "native_pdf_documents": native_pdf_documents,
             "native_pdf_font_objects": native_pdf_font_objects,
+            "native_pdf_type0_cff_font_objects": (
+                native_pdf_type0_cff_font_objects
+            ),
+            "native_pdf_type0_font_objects": native_pdf_type0_font_objects,
+            "native_pdf_type0_truetype_font_objects": (
+                native_pdf_type0_truetype_font_objects
+            ),
+            "native_pdf_type3_font_objects": native_pdf_type3_font_objects,
             "page_count_histogram": {
                 str(key): value for key, value in sorted(page_count_histogram.items())
             },

@@ -23,6 +23,23 @@ RELEASE_VERSIONS = {
     "FUZZ_NIGHTLY_VERSION": "nightly-2026-07-10",
     "CARGO_FUZZ_VERSION": "0.13.2",
 }
+SEMVER_CHECKS_VERSION = "0.48.0"
+SEMVER_BASELINE_VERSION = "0.1.2"
+SEMVER_RELEASE_TYPE = "patch"
+SEMVER_FEATURE_MODES = (
+    "--all-features",
+    "--default-features",
+    "--only-explicit-features",
+)
+ADDITIONAL_FEATURE_CLIPPY_COMMANDS = (
+    "cargo clippy --all-targets --no-default-features --features cli --locked -- -D warnings",
+    "cargo clippy --all-targets --no-default-features --features cli,xlsb --locked -- -D warnings",
+    "cargo clippy --all-targets --no-default-features --features cli,ods --locked -- -D warnings",
+    "cargo clippy --manifest-path bindings/wasm/Cargo.toml --all-targets --target "
+    "wasm32-unknown-unknown --locked -- -D warnings",
+    "cargo clippy --manifest-path bindings/render-wasm/Cargo.toml --all-targets --target "
+    "wasm32-unknown-unknown --locked -- -D warnings",
+)
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
 RENDER_ORACLE_DIAGNOSTIC_CASES = "34"
@@ -102,14 +119,14 @@ ORACLE_RENDER_STEP_SHA256 = (
     "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
     "ca9d4b75751b6960f4ee6e43b45ba9b4ab660812f74e69d282a9e73005b901ec",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
-    "4815362fe4a7801a8cbc94dc9b554b947b14a83363c3896c6caac7e1c80d2ae0",
+    "70fb927413f6ba0e98a8b745ae63ea2afa1d36fb5974dbbf3caecebeccdbae1a",
     "4e72cf67b74b8d4cfcbbc74746a7a1f51a4fa3fb8572a76c9aa779e00c4da23e",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "fbc0770bcf8bc9116e347014f5ce675abd0bbf10700de8c898ec4c95f1a72849",
+    "b17813565ec4ff504604982406e080f4576480b917d4e54cac1e190ce4f43336",
     "940f6c80f0324bc5969d03134a1d1e5448c7c8c9f455cb5979a23a81cc9b2ce0",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
@@ -126,7 +143,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "6d637b4d572cc0a55ed68f789a7d90ab196980150ce063b1f541676e514b60df"
+    "64c29c1ced5ab14dcc00f8b00fc38670d4b718ee4eea34341582bd615d292cc6"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
@@ -1925,6 +1942,47 @@ def audit_release_versions(path: Path, text: str) -> list[str]:
     return audit_fuzz_tools(path, text, tuple(RELEASE_VERSIONS))
 
 
+def audit_semver_gate(path: Path, text: str) -> list[str]:
+    """Require the frozen registry baseline on every supported feature surface."""
+
+    active = _without_commented_lines(text)
+    errors: list[str] = []
+    assignment = re.compile(
+        rf'^\s*CARGO_SEMVER_CHECKS_VERSION:\s*["\']?'
+        rf'{re.escape(SEMVER_CHECKS_VERSION)}["\']?\s*$',
+        re.MULTILINE,
+    )
+    if assignment.search(active) is None:
+        errors.append(
+            f"{path}: expected exact CARGO_SEMVER_CHECKS_VERSION={SEMVER_CHECKS_VERSION}"
+        )
+
+    install = re.compile(
+        r"cargo\s+install\s+cargo-semver-checks\s+"
+        r"--version\s+(?:[\"']?\$\{?CARGO_SEMVER_CHECKS_VERSION\}?[\"']?|"
+        + re.escape(SEMVER_CHECKS_VERSION)
+        + r")\s+--locked(?:\s|$)"
+    )
+    if install.search(active) is None:
+        errors.append(
+            f"{path}: cargo-semver-checks install must use exact version "
+            f"{SEMVER_CHECKS_VERSION} with --locked"
+        )
+
+    prefix = (
+        "cargo semver-checks check-release --manifest-path Cargo.toml "
+        f"--baseline-version {SEMVER_BASELINE_VERSION} "
+        f"--release-type {SEMVER_RELEASE_TYPE}"
+    )
+    for mode in SEMVER_FEATURE_MODES:
+        command = f"{prefix} {mode}"
+        if active.count(command) != 1:
+            errors.append(
+                f"{path}: expected exactly one registry SemVer gate for {mode}"
+            )
+    return errors
+
+
 def audit_fuzz_workflow(path: Path, text: str) -> list[str]:
     """Return violations for the standalone hosted fuzz workflow."""
 
@@ -2061,8 +2119,8 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             f"{path}: pinned-font SinglePageSheets CLI regression must remain one "
             "exact, verified-manifest Arimo test bounded to fifteen minutes"
         )
-    type3_smoke_index = active.find(
-        "- name: Run the project-native Type3 PDF Poppler smoke"
+    type0_smoke_index = active.find(
+        "- name: Run the project-native Type0 PDF Poppler smoke"
     )
     pinned_font_regression_index = active.find(
         "- name: Run the pinned-font SinglePageSheets CLI geometry regression"
@@ -2072,7 +2130,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     )
     if not (
         0
-        <= type3_smoke_index
+        <= type0_smoke_index
         < pinned_font_regression_index
         < oracle_image_build_index
     ):
@@ -2390,7 +2448,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '--host-tools-identity-sha256 "$HOST_TOOLS_IDENTITY_SHA256"': (
             "must bind reports to the complete verified host-tools closure"
         ),
-        "- name: Run the project-native Type3 PDF Poppler smoke": (
+        "- name: Run the project-native Type0 PDF Poppler smoke": (
             "must run the project-owned native PDF Poppler smoke before campaigns"
         ),
         "- name: Smoke the locked oracle runtime": (
@@ -2417,8 +2475,11 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '--image "$IMAGE_ID"': (
             "runtime smoke must execute the exact image identity produced above"
         ),
-        "pdf::tests::project_font_pack_pdf_exposes_exact_poppler_word_tokens": (
-            "must attest Type3 path text and exact Poppler word boxes"
+        "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens": (
+            "must attest Type0 embedded text and exact Poppler word boxes"
+        ),
+        "          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test": (
+            "must fail closed when the native PDF Poppler tools are unavailable"
         ),
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text": (
             "must attest project-native PDF page order and extractable text"
@@ -2609,7 +2670,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'gate["evidence"]["host_tools_identity_sha256"]': (
             "must preserve the complete host-tools closure through aggregate gates"
         ),
-        "validate_native_pdf_and_page_evidence(report)": (
+        "validate_native_pdf_and_page_evidence(": (
             "must verify native Type3, page-order, bbox, and point geometry evidence"
         ),
         'gate["metrics"]["pdf_point_geometry_mismatches"] == 0': (
@@ -3342,11 +3403,28 @@ def audit_codeql_workflow(path: Path, text: str) -> list[str]:
     return errors
 
 
+def audit_ci_feature_matrix(path: Path, text: str) -> list[str]:
+    """Keep otherwise-uncovered feature and wasm surfaces warning-clean."""
+
+    normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", _without_commented_lines(text))
+    return [
+        f"{path}: CI must run exactly once with `{command}`"
+        for command in ADDITIONAL_FEATURE_CLIPPY_COMMANDS
+        if normalized.count(command) != 1
+    ]
+
+
 def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
     """Require the browser lane to build wasm-bindgen with its exact Rust pin."""
 
     errors: list[str] = []
     active = _without_commented_lines(text)
+    baseline_trigger = '      - "scripts/render-parity-baseline-full.json"'
+    if active.count(baseline_trigger) != 2:
+        errors.append(
+            f"{path}: push and pull-request browser lanes must track the reviewed "
+            "render baseline so its adoption commit receives exact-SHA evidence"
+        )
     for name, value in {
         "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
         "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
@@ -4158,6 +4236,10 @@ def audit_repository(root: Path) -> list[str]:
             errors.extend(audit_fuzz_workflow(relative, text))
         elif path.name != "release.yml":
             errors.extend(audit_tool_commands(relative, text))
+        if path.name in {"ci.yml", "release.yml"}:
+            errors.extend(audit_semver_gate(relative, text))
+        if path.name == "ci.yml":
+            errors.extend(audit_ci_feature_matrix(relative, text))
         if path.name == "render-oracle.yml":
             errors.extend(audit_render_oracle_workflow(relative, text))
         elif path.name == "render-hardening.yml":

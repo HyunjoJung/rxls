@@ -8,9 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
-## [0.1.3] - 2026-08-02
+## [0.1.3] - 2026-08-09
 
 ### Added
+
+- Added deterministic PDF Type0 composite font embedding for verified
+  TrueType and CFF faces whose OS/2 permissions explicitly allow installable
+  embedding and subsetting. The renderer carries shaped glyph and face
+  identities through the scene, subsets each used font program once per
+  document, and retains the Type3 outline path as a fail-safe fallback for
+  restricted, synthetic, or unsupported faces.
+- Added deterministic synthetic-font coverage for the permitted TrueType and
+  CFF Type0 paths and the conservative Type3 fallback gate.
+- Added checked HTML and Markdown export APIs with typed format, output-size,
+  and work-limit errors. Sparse column gaps are encoded without materializing
+  worksheet-width rows, while CSV and WASM exports preflight their encoded
+  output ceilings before emission.
+- Added pinned render and browser dependency locks, reviewed third-party
+  notices, complete license-text inputs, and immutable package inspection to
+  the render-worker supply-chain evidence.
 - Kept a row that is script-mixed only across internally-uniform cells on
   Calc's pattern row height, so a western/Asian or western/complex heading row
   no longer renders 3.34 pt taller than Calc while every other cohort agreed.
@@ -68,6 +84,33 @@ _Nothing yet._
 
 ### Changed
 
+- Made public package-preserving edits transactional for cell values, appended
+  rows, cleared ranges, defined names, sheet visibility, the active sheet, and
+  sheet tab colors. Each edit validates a cloned package and replaces live
+  state only after the complete result passes validation.
+- Normalized every formula-authoring entry point by removing all leading `=`
+  characters, and made checked writes reject formula-valued cached results
+  with a typed row-and-column error while retaining unchecked compatibility.
+- Bound rendered scene identity and replay metadata to shaped glyph, face, and
+  cluster fields. Pagination transforms now move glyph origins and cluster
+  metrics together, and merged glyph runs retain their actual cluster index.
+- Defaulted cells without an authored vertical alignment to the bottom of their
+  row and matched Calc's 1 pt top and bottom in-cell offsets while preserving
+  middle alignment and clipping behavior.
+- Matched Calc 26.2.3 by suppressing worksheet gridlines only in the
+  `SinglePageSheets` fidelity override; authored print still honors the source
+  print option and caller flag.
+- Distinguished exact authored page geometry from Calc's bounded imported-file
+  quantization with a 15,000-micropoint acceptance envelope, and extended
+  hosted oracle evidence to attest Type0 TrueType, Type0 CFF, and Type3
+  fallback inventories together with font embedding, subsetting, Unicode
+  extraction, and page geometry.
+- Enforced SemVer compatibility across default, no-default, and all-feature API
+  surfaces, and expanded lint, test, and package gates across the CLI feature
+  combinations and both WASM bindings.
+- Made browser-render CI react to changes in the committed full-parity
+  baseline, ensuring a baseline update produces fresh same-revision browser
+  evidence for the hosted release gates.
 - Advanced the stable diagnose JSON contract to schema v2 for the new
   provenance object; schema v1 remains frozen rather than receiving new keys.
 - Preserved format-native imported row and column geometry through Calc-style
@@ -84,6 +127,24 @@ _Nothing yet._
   that cross differently formatted columns.
 - Hardened PDF Type3 semantic extraction at adjacent-cell, clipping, RTL,
   rotation, and mixed-script boundaries without adding visible paint.
+
+### Fixed
+
+- Evaluated numeric and duplicate conditional-format rules across their full
+  authored ranges, including sparse cells beyond the rendered subset.
+- Prevented sparse CSV, HTML, Markdown, and WASM exports from performing
+  unbounded dense-gap work or allocating output beyond their declared limits;
+  legacy string-returning helpers now produce an explicit bounded fallback.
+- Hardened PDF syntax attestation to recognize only line-delimited stream
+  objects with validated direct lengths and terminators. Binary font and image
+  payloads can no longer fabricate, hide, or satisfy textual PDF evidence such
+  as `ActualText`.
+- Rejected invalid glyph identifiers and conflicting TrueType/CFF font
+  programs before Type0 serialization, bounded retained font bytes, generated
+  deterministic PDF identifiers, and corrected composite-font width mapping.
+- Extended public-hygiene auditing to reject Markdown task-list syntax in
+  public release inputs and converted the public contribution prompt to plain
+  verification bullets.
 
 ## [0.1.2] - 2026-07-16
 

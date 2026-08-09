@@ -108,6 +108,8 @@ fuzz_target!(|data: &[u8]| {
                 hyperlink: bool::arbitrary(&mut unstructured)
                     .unwrap_or(false)
                     .then(|| support::bounded_text(&mut unstructured, 128)),
+                glyphs: Vec::new(),
+                font_faces: Vec::new(),
             }),
         ],
     };
