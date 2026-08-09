@@ -120,7 +120,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "ca9d4b75751b6960f4ee6e43b45ba9b4ab660812f74e69d282a9e73005b901ec",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "70fb927413f6ba0e98a8b745ae63ea2afa1d36fb5974dbbf3caecebeccdbae1a",
-    "4e72cf67b74b8d4cfcbbc74746a7a1f51a4fa3fb8572a76c9aa779e00c4da23e",
+    "919c12743484c191a2b1022b682926e0c2fc7d130ee882974be8cdd4168f96a6",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
@@ -143,7 +143,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "64c29c1ced5ab14dcc00f8b00fc38670d4b718ee4eea34341582bd615d292cc6"
+    "36c0b9d3fc6f1fb0f2cc3147f802ba64a1f67aa37a7690a7670a5f1b214395ee"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
@@ -2110,14 +2110,19 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
         "          cargo +1.85.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
+        "            --lib "
+        "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
+        "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
         "            --test printing "
         "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
         "            -- --exact"
     )
     if pinned_font_cli_regression != expected_pinned_font_cli_regression:
         errors.append(
-            f"{path}: pinned-font SinglePageSheets CLI regression must remain one "
-            "exact, verified-manifest Arimo test bounded to fifteen minutes"
+            f"{path}: pinned-font SinglePageSheets CLI regression must retain the "
+            "exact verified-manifest CTL and Arimo tests bounded to fifteen minutes"
         )
     type0_smoke_index = active.find(
         "- name: Run the project-native Type0 PDF Poppler smoke"

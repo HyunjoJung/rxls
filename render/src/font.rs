@@ -1460,6 +1460,13 @@ impl FontPack {
         Ok(self.entry(id)?.weight)
     }
 
+    /// Whether one already-verified face covers every non-ignorable scalar in
+    /// `text`. This exposes coverage to source-specific metric selection
+    /// without permitting layout code to inspect unauthenticated font bytes.
+    pub(crate) fn face_supports_text(&self, id: FontId, text: &str) -> Result<bool, FontPackError> {
+        self.face_supports(id, text)
+    }
+
     pub(crate) fn metrics(&self, id: FontId) -> Result<FontMetrics, FontPackError> {
         let face = self.face(id)?;
         let units_per_em = face.units_per_em();

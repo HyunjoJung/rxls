@@ -424,6 +424,9 @@ jobs:
           [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]
           test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \
+            -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
             -- --exact
       - name: Build and inspect the locked oracle image

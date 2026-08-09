@@ -24,7 +24,7 @@ use crate::scene::{
     ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
 };
 use crate::typography::{wrap_text_lines, CellLineLayoutPolicy};
-use unicode_bidi::{bidi_class, BidiClass};
+use unicode_bidi::{bidi_class, BidiClass, BidiInfo};
 use unicode_script::{Script, UnicodeScript};
 
 /// Largest supported zero-based worksheet row (Excel row 1,048,576).
@@ -76,6 +76,17 @@ const CALC_OPTIMAL_HEIGHT_SAMPLE_TWIPS: u64 = 1_000;
 const CALC_OPTIMAL_HEIGHT_SAMPLE_PIXELS: u64 = 67;
 const CALC_DEVICE_DPI: u64 = 96;
 const MM100_PER_INCH: u64 = 2_540;
+/// Calc's English `CTL_SPREADSHEET` default starts with Tahoma. The verified
+/// render font configuration declares the deterministic substitute; packs
+/// without either an exact Tahoma face or that retained alias fail closed.
+const CALC_CTL_LOGICAL_FAMILY: &str = "Tahoma";
+/// `sc/source/filter/oox/stylesbuffer.cxx::Font::finalizeImport` assigns the
+/// requested family to Calc's complex-script role when its resolved face has
+/// any one of these exact sentinel glyphs. Otherwise that role retains the
+/// document-pool default above.
+const CALC_CTL_FONT_PROBES: [&str; 8] = [
+    "\u{05d1}", "\u{0631}", "\u{0721}", "\u{0911}", "\u{0e01}", "\u{fb21}", "\u{fb51}", "\u{fe71}",
+];
 /// `cchDefColWidth` excludes the four margins and one gridline screen pixel.
 const XLSB_BASE_COLUMN_SCREEN_PIXELS: u16 = 5;
 /// Calc's default 20-twip top and bottom margins each truncate to one device
@@ -4556,6 +4567,11 @@ impl CalcScriptClassSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CalcCellScriptAnalysis {
+    edit_engine_uses_only_complex_role: bool,
+}
+
 fn account_automatic_text_bytes(
     text: &str,
     options: &RenderOptions,
@@ -4588,15 +4604,115 @@ fn calc_script_class_summary_bounded(
             .checked_add(scanned)
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce(LimitKind::TextRuns, options.limits.max_text_runs, actual)?;
-        let Some(script) = calc_script_class(character) else {
-            continue;
-        };
-        summary.record(script);
+        if let Some(script) = calc_script_class(character) {
+            summary.record(script);
+        }
     }
     stats.text_work = base_work
         .checked_add(scanned)
         .ok_or(RenderError::CoordinateOverflow)?;
     Ok(summary)
+}
+
+fn is_explicit_bidi_control(class: BidiClass) -> bool {
+    matches!(
+        class,
+        BidiClass::LRE
+            | BidiClass::RLE
+            | BidiClass::LRO
+            | BidiClass::RLO
+            | BidiClass::PDF
+            | BidiClass::LRI
+            | BidiClass::RLI
+            | BidiClass::FSI
+            | BidiClass::PDI
+    )
+}
+
+/// Whether Calc's `MakeScriptChangeScanner` assigns every scalar in one
+/// ambiguous plain-text cell to the COMPLEX role.
+///
+/// `unicode-bidi` supplies the same UAX #9 logical embedding levels consumed
+/// by LibreOffice's `MakeDirectionChangeScanner`. Within an RTL level, or an
+/// embedded LTR level that has no strong LTR scalar, EditEngine promotes every
+/// non-Asian script class (including ASCII punctuation and digits) to COMPLEX.
+/// Explicit embeddings, overrides, and isolates fail closed because faithfully
+/// replaying their directional-status stack is outside this source-specific
+/// automatic-row contract.
+fn calc_edit_engine_uses_only_complex_role(
+    text: &str,
+    summary: CalcScriptClassSummary,
+    options: &RenderOptions,
+) -> Result<bool, RenderError> {
+    if !summary.mixed || !summary.has_complex || text.is_empty() {
+        return Ok(false);
+    }
+    enforce(
+        LimitKind::TextBytes,
+        options.limits.max_text_bytes,
+        text.len() as u64,
+    )?;
+    if text.chars().map(bidi_class).any(is_explicit_bidi_control) {
+        return Ok(false);
+    }
+
+    let bidi = BidiInfo::new(text, None);
+    let Some(paragraph) = bidi.paragraphs.first() else {
+        return Ok(false);
+    };
+    if bidi.paragraphs.len() != 1 || paragraph.range != (0..text.len()) {
+        return Ok(false);
+    }
+
+    let mut previous = text
+        .chars()
+        .find_map(calc_script_class)
+        .unwrap_or(CalcScriptClass::Western);
+    let mut run_start = 0_usize;
+    while run_start < text.len() {
+        let Some(level) = bidi.levels.get(run_start).copied() else {
+            return Ok(false);
+        };
+        let mut run_end = text.len();
+        for (relative, _) in text[run_start..].char_indices().skip(1) {
+            let index = run_start
+                .checked_add(relative)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            if bidi.levels.get(index).copied() != Some(level) {
+                run_end = index;
+                break;
+            }
+        }
+        if run_end <= run_start || !text.is_char_boundary(run_end) {
+            return Ok(false);
+        }
+        let run = &text[run_start..run_end];
+        let embedded_ltr_has_strong = level.is_ltr()
+            && level.number() > 1
+            && run
+                .chars()
+                .map(bidi_class)
+                .any(|class| class == BidiClass::L);
+        for character in run.chars() {
+            let mut script = calc_script_class(character);
+            if (level.is_rtl() || (level.number() > 0 && !embedded_ltr_has_strong))
+                && script != Some(CalcScriptClass::Asian)
+            {
+                script = Some(CalcScriptClass::Complex);
+            } else if script.is_none() {
+                script = Some(previous);
+            }
+            let Some(script) = script else {
+                return Ok(false);
+            };
+            if script != CalcScriptClass::Complex {
+                return Ok(false);
+            }
+            previous = script;
+        }
+        run_start = run_end;
+    }
+    Ok(true)
 }
 
 fn same_row_height_font(left: &Font, right: &Font) -> bool {
@@ -4664,6 +4780,41 @@ struct AutoMergeHeight {
 enum CalcAutomaticMetricSource {
     RequestedFont,
     PreparedAsianOrRequested,
+    CalcComplexRole,
+}
+
+fn calc_automatic_metric_source(
+    source: Option<OoxmlImplicitRowHeight>,
+    requires_individual_plain: bool,
+    has_verified_points: bool,
+    row_script_summary: Option<&CalcScriptClassSummary>,
+    cell_script_analysis: Option<&CalcCellScriptAnalysis>,
+) -> Option<CalcAutomaticMetricSource> {
+    if !requires_individual_plain || !has_verified_points {
+        return None;
+    }
+    // This precedes the XLSX/XLSB split because both importers hand the same
+    // mixed RTL text to EditEngine and both use the imported CTL role for the
+    // resulting COMPLEX metric portion.
+    if cell_script_analysis.is_some_and(|analysis| analysis.edit_engine_uses_only_complex_role) {
+        return Some(CalcAutomaticMetricSource::CalcComplexRole);
+    }
+    let row_is_mixed = row_script_summary.is_some_and(|summary| summary.mixed);
+    match source {
+        Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+            Some(CalcAutomaticMetricSource::RequestedFont)
+        }
+        Some(OoxmlImplicitRowHeight::XlsbApplicationDefault)
+            if row_is_mixed && row_script_summary.is_some_and(|summary| summary.has_asian) =>
+        {
+            Some(CalcAutomaticMetricSource::PreparedAsianOrRequested)
+        }
+        Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) if !row_is_mixed => {
+            Some(CalcAutomaticMetricSource::RequestedFont)
+        }
+        Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => None,
+        Some(OoxmlImplicitRowHeight::None) | None => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4784,6 +4935,7 @@ fn expand_automatic_row_heights(
         conditional_evaluations,
     )?;
     let mut row_script_classes = BTreeMap::<u32, CalcScriptClassSummary>::new();
+    let mut cell_script_classes = BTreeMap::<CellCoordinate, CalcCellScriptAnalysis>::new();
     if calc_line_layout_available {
         for &cell in &layout_candidates {
             let source = CellCoordinate {
@@ -4792,6 +4944,14 @@ fn expand_automatic_row_heights(
             };
             let adjustable_row = automatic_candidate_rows[&source];
             let summary = calc_script_class_summary_bounded(cell.formatted, options, typography)?;
+            let edit_engine_uses_only_complex_role =
+                calc_edit_engine_uses_only_complex_role(cell.formatted, summary, options)?;
+            cell_script_classes.insert(
+                source,
+                CalcCellScriptAnalysis {
+                    edit_engine_uses_only_complex_role,
+                },
+            );
             row_script_classes
                 .entry(adjustable_row)
                 .and_modify(|row| row.merge(summary))
@@ -4944,31 +5104,19 @@ fn expand_automatic_row_heights(
             })
             .flatten();
         let row_script_summary = row_script_classes.get(&adjustable_row);
+        let cell_script_analysis = cell_script_classes.get(&source);
         let row_is_mixed = row_script_summary.is_some_and(|summary| summary.mixed);
         let requires_individual_plain = ordinary_implicit_plain
             && calc_line_layout_available
             && !cell_has_auto_filter_button(sheet, source)
             && (row_is_mixed || active_color_only || active_layout_style);
-        let calc_metric_source = if requires_individual_plain && verified_calc_points.is_some() {
-            match sheet.implicit_ooxml_row_height_source() {
-                Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
-                    Some(CalcAutomaticMetricSource::RequestedFont)
-                }
-                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault)
-                    if row_is_mixed
-                        && row_script_summary.is_some_and(|summary| summary.has_asian) =>
-                {
-                    Some(CalcAutomaticMetricSource::PreparedAsianOrRequested)
-                }
-                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) if !row_is_mixed => {
-                    Some(CalcAutomaticMetricSource::RequestedFont)
-                }
-                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => None,
-                Some(OoxmlImplicitRowHeight::None) | None => None,
-            }
-        } else {
-            None
-        };
+        let calc_metric_source = calc_automatic_metric_source(
+            sheet.implicit_ooxml_row_height_source(),
+            requires_individual_plain,
+            verified_calc_points.is_some(),
+            row_script_summary,
+            cell_script_analysis,
+        );
         // Calc sizes an automatic row from the *pattern* font height
         // (`lcl_GetAttribHeight`: 118% of the pattern font's integer-twip
         // height plus the standard margin/row adjustments) rather than from the
@@ -11054,6 +11202,12 @@ fn calc_verified_automatic_cell_height(
                 PreparedAsianFace::Verified(_) | PreparedAsianFace::Unverified => return Ok(None),
             }
         }
+        CalcAutomaticMetricSource::CalcComplexRole => {
+            let Some(font_id) = calc_verified_complex_role_face(pack, style, resolution.id)? else {
+                return Ok(None);
+            };
+            font_id
+        }
     };
     let metrics = single_face_line_metrics(
         pack,
@@ -11068,6 +11222,46 @@ fn calc_verified_automatic_cell_height(
         .checked_mul(prepared.lines.len() as u64)
         .ok_or(RenderError::CoordinateOverflow)?;
     calc_automatic_height_from_engine_mm100(total).map(Some)
+}
+
+fn calc_face_has_complex_role_coverage(
+    pack: &FontPack,
+    font_id: FontId,
+) -> Result<bool, RenderError> {
+    for probe in CALC_CTL_FONT_PROBES {
+        if pack
+            .face_supports_text(font_id, probe)
+            .map_err(map_font_error)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn calc_verified_complex_role_face(
+    pack: &FontPack,
+    style: &ResolvedRunStyle,
+    requested_font_id: FontId,
+) -> Result<Option<FontId>, RenderError> {
+    // OOXML import keeps a requested family in the CTL slot whenever the
+    // resolved face passes Calc's complex-script classification. The logical
+    // document default is consulted only when that slot was left untouched.
+    if calc_face_has_complex_role_coverage(pack, requested_font_id)? {
+        return Ok(Some(requested_font_id));
+    }
+    let resolution = pack.resolve(FontRequest {
+        family: CALC_CTL_LOGICAL_FAMILY,
+        weight: if style.bold { 700 } else { 400 },
+        italic: style.italic,
+    });
+    if !(resolution.exact_family || resolution.declared_alias) || !resolution.exact_style {
+        return Ok(None);
+    }
+    if !calc_face_has_complex_role_coverage(pack, resolution.id)? {
+        return Ok(None);
+    }
+    Ok(Some(resolution.id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14040,6 +14234,118 @@ mod tests {
                 "{lines} lines"
             );
         }
+
+        let ctl_metrics = CombinedLineMetrics {
+            ascent: Fixed::from_pixels(16),
+            descent: Fixed::from_pixels(-4),
+            line_gap: Fixed::ZERO,
+            calc_ascent_pixels: 16,
+            calc_descent_pixels: -4,
+            calc_portion_height_mm100: 529,
+        };
+        assert_eq!(calc_line_height_mm100(ctl_metrics).unwrap(), 529);
+        assert_eq!(
+            calc_automatic_height_from_engine_mm100(529).unwrap(),
+            Fixed::from_raw(22_391),
+            "Calc's 20px CTL line plus two padding pixels is 328 twips"
+        );
+    }
+
+    #[test]
+    fn pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = FontPack::load_manifest(manifest).expect("load pinned render font pack");
+        for bold in [false, true] {
+            for (requested, selected, ascent, descent, mm100, row_raw) in [
+                ("Noto Sans CJK KR", "Noto Sans Hebrew", 16, -4, 529, 22_391),
+                ("Noto Sans Arabic", "Noto Sans Arabic", 21, -11, 847, 34_611),
+                ("Arial", "Arimo", 14, -3, 450, 19_319),
+            ] {
+                let style = ResolvedRunStyle {
+                    family: requested.to_string(),
+                    size: points_to_fixed(11.0).unwrap(),
+                    color: Rgb::BLACK,
+                    bold,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    script: FormatScript::None,
+                };
+                let requested_resolution = pack.resolve(style.request());
+                assert!(requested_resolution.exact_family || requested_resolution.declared_alias);
+                assert!(requested_resolution.exact_style);
+                let font_id =
+                    calc_verified_complex_role_face(&pack, &style, requested_resolution.id)
+                        .unwrap()
+                        .expect("verified pack must retain Calc's CTL metric role");
+                let identity = pack.selected_face_identity(font_id).unwrap();
+                assert_eq!(identity.family, selected, "{requested}");
+                assert_eq!(identity.weight, if bold { 700 } else { 400 });
+                assert_eq!(identity.source_pack_sha256, pack.pack_sha256());
+                let metrics = single_face_line_metrics(
+                    &pack,
+                    font_id,
+                    &style,
+                    CellLineLayoutPolicy::CalcEditEngine,
+                    1,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(metrics.calc_ascent_pixels, ascent, "{requested}");
+                assert_eq!(metrics.calc_descent_pixels, descent, "{requested}");
+                assert_eq!(
+                    calc_line_height_mm100(metrics).unwrap(),
+                    mm100,
+                    "{requested}"
+                );
+                assert_eq!(
+                    calc_automatic_height_from_engine_mm100(mm100).unwrap(),
+                    Fixed::from_raw(row_raw),
+                    "{requested}"
+                );
+            }
+        }
+
+        for (family, expected_raw) in [
+            ("Noto Sans CJK KR", 22_391),
+            ("Noto Sans Arabic", 34_611),
+            ("Arial", 19_319),
+        ] {
+            let styles = format!(
+                r#"<styleSheet><fonts count="2"><font><b/><sz val="11"/><name val="{family}"/></font><font><b/><sz val="11"/><name val="{family}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf fontId="0" xfId="0"/><xf fontId="1" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+            );
+            let workbook = imported_xlsx(
+                &styles,
+                r#"<worksheet><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>مرحبا بالعالم 0009</t></is></c></row></sheetData></worksheet>"#,
+            );
+            let sheet = &workbook.sheets[0];
+            let range = RenderRange::new(0, 0, 0, 0);
+            let options = RenderOptions {
+                selection: RenderSelection::Range(range),
+                gridlines: false,
+                default_font_family: family.to_string(),
+                font_pack: Some(pack.clone()),
+                ..RenderOptions::default()
+            };
+            let mut snapshot = RenderStyleSnapshot::new(sheet);
+            snapshot.capture_range(sheet, range, &options).unwrap();
+            let measured = measure_sheet_axes_inner(
+                sheet,
+                range,
+                &snapshot,
+                &options,
+                None,
+                &mut Warnings::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                measured.rows[0].size,
+                Fixed::from_raw(expected_raw),
+                "verified XLSX Arabic-plus-digits row for {family}"
+            );
+        }
     }
 
     #[test]
@@ -16579,7 +16885,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_xlsx_mixed_complex_normal_row_uses_primary_calc_metrics() {
+    fn implicit_xlsx_unattested_complex_base_falls_back_without_inflation() {
         const MIXED_TEXT: &str = "العربية 0123456789";
 
         let pack = synthetic_test_pack();
@@ -16620,7 +16926,7 @@ mod tests {
         assert_eq!(
             measured.rows[0].size,
             calc_ooxml_row_height_from_points(11).unwrap(),
-            "fallback glyph metrics must not inflate Calc's primary-font automatic row height"
+            "an unattested synthetic pack must keep the conservative measured fallback"
         );
     }
 
@@ -16951,6 +17257,7 @@ mod tests {
         let summary = calc_script_class_summary_bounded("한1ع", &options, &mut typography).unwrap();
         assert!(summary.mixed);
         assert!(summary.has_complex);
+        assert!(!calc_edit_engine_uses_only_complex_role("한1ع", summary, &options).unwrap());
         assert_eq!(typography.text_work, 3);
 
         options.limits.max_text_runs = 2;
@@ -16961,6 +17268,110 @@ mod tests {
                 kind: LimitKind::TextRuns,
                 limit: 2,
                 actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn calc_complex_role_metric_source_replays_bounded_logical_bidi_runs() {
+        let options = RenderOptions::default();
+        let analyze = |text: &str| {
+            let summary =
+                calc_script_class_summary_bounded(text, &options, &mut TypographyStats::default())
+                    .unwrap();
+            let edit_engine_uses_only_complex_role =
+                calc_edit_engine_uses_only_complex_role(text, summary, &options).unwrap();
+            (
+                summary,
+                CalcCellScriptAnalysis {
+                    edit_engine_uses_only_complex_role,
+                },
+            )
+        };
+        for text in [
+            "مرحبا بالعالم 0009",
+            "0009 مرحبا بالعالم",
+            "مرحبا!",
+            "مرحبا-0009",
+            "עברית (123)",
+        ] {
+            let (summary, analysis) = analyze(text);
+            assert!(analysis.edit_engine_uses_only_complex_role, "{text}");
+            for source in [
+                OoxmlImplicitRowHeight::XlsxApplicationDefault,
+                OoxmlImplicitRowHeight::XlsbApplicationDefault,
+            ] {
+                assert_eq!(
+                    calc_automatic_metric_source(
+                        Some(source),
+                        true,
+                        true,
+                        Some(&summary),
+                        Some(&analysis),
+                    ),
+                    Some(CalcAutomaticMetricSource::CalcComplexRole),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+
+        for text in [
+            "مرحبا بالعالم",
+            "0009",
+            "Latin مرحبا 0009",
+            "مرحبا 0009 한국어",
+            "हिन्दी 0009",
+            "مرحبا abc 0009",
+            "مرحبا \u{2066}0009\u{2069}",
+            "مرحبا \u{2067}0009\u{2069}",
+            "مرحبا \u{2068}0009\u{2069}",
+            "مرحبا \u{202a}0009\u{202c}",
+            "مرحبا \u{202b}0009\u{202c}",
+            "مرحبا \u{202d}0009\u{202c}",
+            "مرحبا \u{202e}0009\u{202c}",
+        ] {
+            let (_, analysis) = analyze(text);
+            assert!(
+                !analysis.edit_engine_uses_only_complex_role,
+                "unsupported mixed form must fail closed: {text}"
+            );
+        }
+        let (qualified, qualified_analysis) = analyze("مرحبا 0009");
+        assert_eq!(
+            calc_automatic_metric_source(
+                Some(OoxmlImplicitRowHeight::XlsxApplicationDefault),
+                false,
+                true,
+                Some(&qualified),
+                Some(&qualified_analysis),
+            ),
+            None,
+            "the source-specific metric never bypasses normal eligibility"
+        );
+        assert_eq!(
+            calc_automatic_metric_source(
+                Some(OoxmlImplicitRowHeight::XlsbApplicationDefault),
+                true,
+                false,
+                Some(&qualified),
+                Some(&qualified_analysis),
+            ),
+            None,
+            "an unattested workbook font never selects the pinned CTL metric"
+        );
+
+        let text = "مرحبا!";
+        let mut limited = RenderOptions::default();
+        limited.limits.max_text_bytes = text.len() as u64 - 1;
+        let summary =
+            calc_script_class_summary_bounded(text, &limited, &mut TypographyStats::default())
+                .unwrap();
+        assert_eq!(
+            calc_edit_engine_uses_only_complex_role(text, summary, &limited),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::TextBytes,
+                limit: text.len() as u64 - 1,
+                actual: text.len() as u64,
             })
         );
     }

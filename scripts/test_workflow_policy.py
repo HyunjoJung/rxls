@@ -1286,6 +1286,12 @@ steps:
                 "          RXLS_TEST_FONT_FAMILY: Carlito\n",
                 1,
             ),
+            "ctl_test_filter_widened": original.replace(
+                "            --lib "
+                "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n",
+                "            --lib layout::tests::pinned_calc_ctl_base_face \\\n",
+                1,
+            ),
             "test_filter_widened": original.replace(
                 "            --test printing "
                 "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n",

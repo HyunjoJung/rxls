@@ -37,6 +37,10 @@
       "substitute": "Tinos"
     },
     {
+      "family": "Tahoma",
+      "substitute": "Noto Sans Hebrew"
+    },
+    {
       "family": "Times New Roman",
       "substitute": "Tinos"
     }

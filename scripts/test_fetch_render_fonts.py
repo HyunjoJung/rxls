@@ -127,6 +127,7 @@ class RenderFontLockTests(unittest.TestCase):
                 {"family": "Liberation Mono", "substitute": "Cousine"},
                 {"family": "Liberation Sans", "substitute": "Arimo"},
                 {"family": "Liberation Serif", "substitute": "Tinos"},
+                {"family": "Tahoma", "substitute": "Noto Sans Hebrew"},
                 {"family": "Times New Roman", "substitute": "Tinos"},
             ],
         )
