@@ -352,6 +352,11 @@ PDF_DIRECT_POINT_DELTA_KEYS = frozenset(
 PDF_XHTML_CROSSCHECK_DELTA_KEYS = frozenset(PDF_POINT_DELTA_KEYS) - (
     PDF_DIRECT_POINT_DELTA_KEYS
 )
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS = 15_000
+PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS = Fraction(
+    PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS,
+    1_000_000,
+)
 PDF_XHTML_CROSSCHECK_MAX_POINTS = Fraction(1, 1000)
 GEOMETRY_KEYS = {
     "by_delta",
@@ -1480,6 +1485,8 @@ def _ceil_millipoints(value: Fraction) -> int:
 
 def _page_point_geometry(
     page: object,
+    *,
+    imported_page_boxes: bool,
 ) -> tuple[dict[str, Fraction], bool]:
     code = "geometry_page"
     if not isinstance(page, dict):
@@ -1547,14 +1554,22 @@ def _page_point_geometry(
     }
     if parsed != expected:
         raise SummaryError("geometry_delta")
+    direct_limit = (
+        PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS
+        if imported_page_boxes
+        else Fraction()
+    )
     mismatch = any(
-        parsed[key] != 0 for key in PDF_DIRECT_POINT_DELTA_KEYS
+        abs(parsed[key]) > direct_limit
+        for key in PDF_DIRECT_POINT_DELTA_KEYS
     )
     return parsed, mismatch
 
 
 def _row_point_geometry(
     row: dict[str, Any],
+    *,
+    imported_page_boxes: bool,
 ) -> tuple[list[dict[str, Fraction]], int] | None:
     has_pages = "pages" in row
     has_metrics = "metrics" in row
@@ -1583,7 +1598,10 @@ def _row_point_geometry(
             != page_offset
         ):
             raise SummaryError("geometry_page_index")
-        parsed, mismatch = _page_point_geometry(page)
+        parsed, mismatch = _page_point_geometry(
+            page,
+            imported_page_boxes=imported_page_boxes,
+        )
         parsed_pages.append(parsed)
         mismatch_pages += int(mismatch)
     direct_max = max(
@@ -2709,7 +2727,10 @@ def _summarize_label(
         # Retained command diagnostics on terminal rows are incomparable and
         # are deliberately stripped from every public metric aggregate.
         if status in METRIC_BEARING_STATUSES:
-            row_geometry = _row_point_geometry(row)
+            row_geometry = _row_point_geometry(
+                row,
+                imported_page_boxes=(label != "authored-print"),
+            )
             text_geometry = _row_unique_text_geometry(row)
             row_fidelity = _row_fidelity(row)
         else:
@@ -2918,7 +2939,10 @@ def _validate_namespace(root: Path) -> None:
 
 
 def _validate_geometry_output(
-    value: object, total: int
+    value: object,
+    total: int,
+    *,
+    imported_page_boxes: bool,
 ) -> dict[str, object]:
     code = "output_geometry"
     if not isinstance(value, dict) or set(value) != GEOMETRY_KEYS:
@@ -2970,16 +2994,28 @@ def _validate_geometry_output(
         default=0,
     ):
         raise SummaryError(code)
-    direct_counts = [
-        parsed[key][0] for key in PDF_DIRECT_POINT_DELTA_KEYS
+    direct_limit = (
+        PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_MICROPOINTS
+        if imported_page_boxes
+        else 0
+    )
+    over_limit_counts = [
+        parsed[key][0]
+        for key in PDF_DIRECT_POINT_DELTA_KEYS
+        if parsed[key][1] > direct_limit
     ]
-    minimum_mismatches = max(
-        direct_counts,
-        default=0,
+    minimum_mismatches = (
+        0
+        if not over_limit_counts
+        else (
+            1
+            if imported_page_boxes
+            else max(over_limit_counts)
+        )
     )
     maximum_mismatches = min(
         pages,
-        sum(direct_counts),
+        sum(over_limit_counts),
     )
     if not minimum_mismatches <= mismatch_pages <= maximum_mismatches:
         raise SummaryError(code)
@@ -4572,7 +4608,9 @@ def _validate_output(value: object) -> None:
             OUTPUT_CLASSIFICATIONS,
         )
         point_geometry = _validate_geometry_output(
-            report["geometry"], total
+            report["geometry"],
+            total,
+            imported_page_boxes=(report["label"] != "authored-print"),
         )
         page_count_mismatches = report["page_count_mismatches"]
         if (

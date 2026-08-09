@@ -240,6 +240,8 @@ def _ceil_scaled(value: Fraction, scale: int) -> int:
 def _with_geometry(
     row: dict[str, object],
     pages: list[dict[str, object]],
+    *,
+    imported_page_boxes: bool = True,
 ) -> dict[str, object]:
     direct = MODULE.PDF_DIRECT_POINT_DELTA_KEYS
     crosscheck = MODULE.PDF_XHTML_CROSSCHECK_DELTA_KEYS
@@ -252,8 +254,13 @@ def _with_geometry(
         }
         for page in pages
     ]
+    direct_limit = (
+        MODULE.PDF_IMPORTED_PAGE_BOX_QUANTIZATION_MAX_POINTS
+        if imported_page_boxes
+        else Fraction()
+    )
     mismatch_pages = sum(
-        any(values[key] != 0 for key in direct)
+        any(abs(values[key]) > direct_limit for key in direct)
         for values in parsed
     )
     direct_max = max(
@@ -1435,6 +1442,78 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
             "deltas_points",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_imported_page_box_quantization_boundary_matches_harness(
+        self,
+    ) -> None:
+        cases = (
+            (Fraction(15, 1000), 0),
+            (Fraction(-15, 1000), 0),
+            (Fraction(15_001, 1_000_000), 1),
+            (Fraction(-15_001, 1_000_000), 1),
+        )
+        for delta, expected_mismatches in cases:
+            with self.subTest(delta=delta):
+                rows = _pilot_rows()
+                _with_geometry(
+                    rows[1],
+                    [_geometry_page(crop_width_delta=delta)],
+                )
+                summary = _summarize_pilot(rows)
+                self.assertEqual(
+                    summary["reports"][1]["geometry"][
+                        "mismatch_pages"
+                    ],
+                    expected_mismatches,
+                )
+
+    def test_authored_print_page_boxes_remain_exact(self) -> None:
+        authored_rows = [
+            _row(
+                1000 + index,
+                features=(
+                    "latin-text",
+                    "number-cell",
+                    "print-settings",
+                ),
+            )
+            for index in range(4)
+        ]
+        _with_geometry(
+            authored_rows[0],
+            [_geometry_page(crop_width_delta=Fraction(1, 1000))],
+            imported_page_boxes=False,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            _write(
+                hosted / "parity-report-a.json",
+                _report(
+                    _pilot_rows(),
+                    profile="pilot",
+                    label="parity-a",
+                ),
+            )
+            _write(
+                hosted / "authored-print-report.json",
+                _report(
+                    authored_rows,
+                    profile="pilot",
+                    label="authored-print",
+                ),
+            )
+            summary = MODULE.summarize(
+                hosted,
+                profile="pilot",
+                baseline_mode="verify",
+                head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
+            )
+
+        self.assertEqual(
+            summary["reports"][0]["geometry"]["mismatch_pages"],
+            1,
+        )
 
     def test_cross_document_xhtml_noise_is_separate_from_box_mismatches(
         self,
@@ -3389,6 +3468,54 @@ class RenderOracleFailureSummaryTests(unittest.TestCase):
                     "workbooks": 3,
                 },
             },
+        )
+
+    def test_full_shards_accept_imported_page_box_quantization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            hosted = Path(raw)
+            for shard_index in range(4):
+                rows = []
+                for offset in range(200):
+                    index = shard_index * 200 + offset
+                    row = _row(index)
+                    _with_geometry(
+                        row,
+                        [
+                            _geometry_page(
+                                crop_width_delta=Fraction(15, 1000)
+                            )
+                        ],
+                    )
+                    rows.append(row)
+                _write(
+                    hosted / f"parity-a-shard-{shard_index}.json",
+                    _report(
+                        rows,
+                        profile="full",
+                        label="parity-a",
+                        shard_index=shard_index,
+                    ),
+                )
+
+            summary = MODULE.summarize(
+                hosted,
+                profile="full",
+                baseline_mode="candidate",
+                head_sha=HEAD_SHA,
+                _case_id_key_for_test=TEST_CASE_ID_KEY,
+            )
+
+        parity = summary["reports"][1]
+        self.assertEqual(parity["workbooks"], 800)
+        self.assertEqual(parity["geometry"]["pages"], 800)
+        self.assertEqual(parity["geometry"]["mismatch_pages"], 0)
+        self.assertEqual(
+            parity["geometry"][
+                "max_direct_absolute_delta_micropoints"
+            ],
+            15_000,
         )
 
     def test_reported_counts_must_match_rows(self) -> None:
