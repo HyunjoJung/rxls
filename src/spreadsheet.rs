@@ -542,7 +542,7 @@ impl Spreadsheet {
         let relationship_target = Package::rel_target(&workbook_path, &worksheet_path);
         let before = package.touched_parts();
         let rid =
-            package.add_relationship(&workbook_path, REL_WORKSHEET, &relationship_target, false);
+            package.add_relationship(&workbook_path, REL_WORKSHEET, &relationship_target, false)?;
         package.set_part(&worksheet_path, empty_worksheet_xml(), Some(CT_WORKSHEET));
 
         let tree = package.part_tree_mut(&workbook_path)?;
@@ -592,7 +592,7 @@ impl Spreadsheet {
                     "workbook sheet relationships are missing or ambiguous",
                 ));
             }
-            if matches[0].rel_type.rsplit('/').next() == Some("worksheet") {
+            if crate::xlsx::relationship_type_matches(&matches[0].rel_type, "worksheet") {
                 worksheet_count += 1;
             }
         }
@@ -607,10 +607,13 @@ impl Spreadsheet {
             return Err(Error::Zip("worksheet relationship is missing or ambiguous"));
         }
         let relationship = relationship_matches[0];
-        if relationship.external || relationship.rel_type.rsplit('/').next() != Some("worksheet") {
+        if relationship.external
+            || !crate::xlsx::relationship_type_matches(&relationship.rel_type, "worksheet")
+        {
             return Err(Error::MissingWorkbook);
         }
-        let worksheet_path = Package::resolve_rel_target(&workbook_path, &relationship.target);
+        let worksheet_path = Package::try_resolve_rel_target(&workbook_path, &relationship.target)
+            .ok_or(Error::MissingWorkbook)?;
         if !package.has_part(&worksheet_path) {
             return Err(Error::MissingWorkbook);
         }
@@ -1001,7 +1004,7 @@ impl Spreadsheet {
         ))?;
         let worksheet_path = worksheet_path(package, sheet_name)?;
         let comment_relation = unique_related_part(package, &worksheet_path, "comments")?;
-        let vml_relation = unique_related_part(package, &worksheet_path, "vmldrawing")?;
+        let vml_relation = unique_related_part(package, &worksheet_path, "vmlDrawing")?;
         let existing = if let Some(relation) = &comment_relation {
             if !package.has_part(&relation.path) {
                 return Err(Error::Zip("comment relationship target is missing"));
@@ -1044,7 +1047,7 @@ impl Spreadsheet {
                     Some(CT_COMMENTS),
                 );
                 let target = Package::rel_target(&worksheet_path, &path);
-                package.add_relationship(&worksheet_path, REL_COMMENTS, &target, false);
+                package.add_relationship(&worksheet_path, REL_COMMENTS, &target, false)?;
             }
         }
 
@@ -1078,8 +1081,12 @@ impl Spreadsheet {
                         Some(CT_VML),
                     );
                     let target = Package::rel_target(&worksheet_path, &path);
-                    let id =
-                        package.add_relationship(&worksheet_path, REL_VML_DRAWING, &target, false);
+                    let id = package.add_relationship(
+                        &worksheet_path,
+                        REL_VML_DRAWING,
+                        &target,
+                        false,
+                    )?;
                     RelatedPart { id, path }
                 }
             };
@@ -1110,7 +1117,7 @@ impl Spreadsheet {
         let worksheet_path = worksheet_path(package, sheet_name)?;
         let comment_relation = unique_related_part(package, &worksheet_path, "comments")?
             .ok_or(Error::Zip("comment does not exist"))?;
-        let vml_relation = unique_related_part(package, &worksheet_path, "vmldrawing")?
+        let vml_relation = unique_related_part(package, &worksheet_path, "vmlDrawing")?
             .ok_or(Error::Zip("legacy comment VML relationship is missing"))?;
         if !package.has_part(&comment_relation.path) || !package.has_part(&vml_relation.path) {
             return Err(Error::Zip("legacy comment package part is missing"));
@@ -1258,7 +1265,7 @@ impl Spreadsheet {
 
         let new_rid = match edit {
             HyperlinkEdit::External(target) => {
-                Some(package.add_relationship(&worksheet_path, REL_HYPERLINK, target, true))
+                Some(package.add_relationship(&worksheet_path, REL_HYPERLINK, target, true)?)
             }
             HyperlinkEdit::Internal(_) => None,
         };
@@ -1725,8 +1732,8 @@ fn invalidate_calc_chain(package: &mut Package) -> Result<Vec<String>> {
         .iter()
         .filter(|relationship| {
             !relationship.external
-                && Package::resolve_rel_target(&workbook_path, &relationship.target)
-                    == CALC_CHAIN_PART
+                && Package::try_resolve_rel_target(&workbook_path, &relationship.target)
+                    .is_some_and(|target| target == CALC_CHAIN_PART)
         })
         .map(|relationship| relationship.id.clone())
         .collect();
@@ -2737,11 +2744,7 @@ fn unique_related_part(
         .iter()
         .filter(|relationship| {
             !relationship.external
-                && relationship
-                    .rel_type
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case(relationship_kind))
+                && crate::xlsx::relationship_type_matches(&relationship.rel_type, relationship_kind)
         })
         .collect();
     if matches.len() > 1 {
@@ -2749,10 +2752,17 @@ fn unique_related_part(
             "multiple relationships of the requested type are unsupported",
         ));
     }
-    Ok(matches.first().map(|relationship| RelatedPart {
-        id: relationship.id.clone(),
-        path: Package::resolve_rel_target(source, &relationship.target),
-    }))
+    matches
+        .first()
+        .map(|relationship| {
+            Ok(RelatedPart {
+                id: relationship.id.clone(),
+                path: Package::try_resolve_rel_target(source, &relationship.target).ok_or(
+                    Error::Zip("relationship target is not a valid internal part URI"),
+                )?,
+            })
+        })
+        .transpose()
 }
 
 fn next_numbered_part_name(package: &Package, prefix: &str, extension: &str) -> Result<String> {
@@ -3257,7 +3267,9 @@ fn validate_hyperlink_relationship(
         ));
     }
     let relationship = matches[0];
-    if !relationship.external || relationship.rel_type.rsplit('/').next() != Some("hyperlink") {
+    if !relationship.external
+        || !crate::xlsx::relationship_type_matches(&relationship.rel_type, "hyperlink")
+    {
         return Err(Error::Zip(
             "cell r:id is not an external hyperlink relationship",
         ));
@@ -3686,11 +3698,12 @@ fn worksheet_table_parts(package: &Package, worksheet_path: &str) -> Result<Vec<
             .collect();
         if matches.len() != 1
             || matches[0].external
-            || matches[0].rel_type.rsplit('/').next() != Some("table")
+            || !crate::xlsx::relationship_type_matches(&matches[0].rel_type, "table")
         {
             return Err(Error::Zip("table relationship is missing or ambiguous"));
         }
-        let path = Package::resolve_rel_target(worksheet_path, &matches[0].target);
+        let path = Package::try_resolve_rel_target(worksheet_path, &matches[0].target)
+            .ok_or(Error::Zip("table relationship target URI is invalid"))?;
         if !package.has_part(&path) {
             return Err(Error::Zip("table relationship target is missing"));
         }
@@ -3881,7 +3894,9 @@ fn formula_bearing_parts(package: &Package, workbook_path: &str) -> Vec<String> 
             if rel.external || !formula_relationship_type(&rel.rel_type) {
                 continue;
             }
-            let target = Package::resolve_rel_target(&source, &rel.target);
+            let Some(target) = Package::try_resolve_rel_target(&source, &rel.target) else {
+                continue;
+            };
             if !package.has_part(&target) {
                 continue;
             }
@@ -3894,21 +3909,24 @@ fn formula_bearing_parts(package: &Package, workbook_path: &str) -> Vec<String> 
 }
 
 fn formula_relationship_type(rel_type: &str) -> bool {
-    let kind = rel_type.rsplit('/').next().unwrap_or(rel_type);
-    matches!(
-        kind.to_ascii_lowercase().as_str(),
-        "worksheet"
-            | "chartsheet"
-            | "dialogsheet"
-            | "macrosheet"
-            | "xlmacrosheet"
-            | "xlintlmacrosheet"
-            | "drawing"
-            | "chart"
-            | "table"
-            | "pivottable"
-            | "pivotcachedefinition"
-    )
+    [
+        "worksheet",
+        "chartsheet",
+        "dialogsheet",
+        "macrosheet",
+        "drawing",
+        "chart",
+        "table",
+        "pivotTable",
+        "pivotCacheDefinition",
+    ]
+    .into_iter()
+    .any(|kind| crate::xlsx::relationship_type_matches(rel_type, kind))
+        || matches!(
+            rel_type,
+            "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet"
+                | "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet"
+        )
 }
 
 fn canonical_part_key(name: &str) -> String {
@@ -3957,6 +3975,63 @@ fn unsafe_sheet_dependency_kind(kind: &str) -> bool {
     )
 }
 
+fn standard_relationship_kind(rel_type: &str) -> Option<&'static str> {
+    let microsoft_kind = match rel_type {
+        "http://schemas.microsoft.com/office/2006/relationships/ctrlProp" => Some("ctrlprop"),
+        "http://schemas.microsoft.com/office/2007/relationships/slicer" => Some("slicer"),
+        "http://schemas.microsoft.com/office/2007/relationships/slicerCache" => Some("slicercache"),
+        "http://schemas.microsoft.com/office/2011/relationships/chartStyle" => Some("chartstyle"),
+        "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" => {
+            Some("chartcolorstyle")
+        }
+        "http://schemas.microsoft.com/office/2011/relationships/timeline" => Some("timeline"),
+        "http://schemas.microsoft.com/office/2011/relationships/timelineCache" => {
+            Some("timelinecache")
+        }
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" => {
+            Some("threadedcomment")
+        }
+        _ => None,
+    };
+    if microsoft_kind.is_some() {
+        return microsoft_kind;
+    }
+    [
+        ("drawing", "drawing"),
+        ("comments", "comments"),
+        ("vmlDrawing", "vmldrawing"),
+        ("table", "table"),
+        ("printerSettings", "printersettings"),
+        ("chart", "chart"),
+        ("image", "image"),
+        ("diagramData", "diagramdata"),
+        ("diagramLayout", "diagramlayout"),
+        ("diagramColors", "diagramcolors"),
+        ("diagramQuickStyle", "diagramquickstyle"),
+        ("chartStyle", "chartstyle"),
+        ("chartColorStyle", "chartcolorstyle"),
+        ("pivotTable", "pivottable"),
+        ("pivotCacheDefinition", "pivotcachedefinition"),
+        ("queryTable", "querytable"),
+        ("oleObject", "oleobject"),
+        ("control", "control"),
+        ("ctrlProp", "ctrlprop"),
+        ("threadedComment", "threadedcomment"),
+        ("threadedComments", "threadedcomments"),
+        ("slicer", "slicer"),
+        ("slicerCache", "slicercache"),
+        ("timeline", "timeline"),
+        ("timelineCache", "timelinecache"),
+        ("connections", "connections"),
+        ("externalLink", "externallink"),
+        ("hyperlink", "hyperlink"),
+    ]
+    .into_iter()
+    .find_map(|(uri_kind, classification)| {
+        crate::xlsx::relationship_type_matches(rel_type, uri_kind).then_some(classification)
+    })
+}
+
 /// Find standard package parts exclusively owned by a worksheet. Unknown
 /// relationship types are deliberately left alone: dropping a known
 /// worksheet must not guess that an extension/custom target is disposable.
@@ -3990,27 +4065,27 @@ fn plan_sheet_owned_parts(package: &Package, worksheet_path: &str) -> Result<Vec
             if relationship.external {
                 continue;
             }
-            let target = Package::resolve_rel_target(relationship_source, &relationship.target);
+            let Some(kind) = standard_relationship_kind(&relationship.rel_type) else {
+                continue;
+            };
+            let target = Package::try_resolve_rel_target(relationship_source, &relationship.target)
+                .ok_or(Error::Zip(
+                    "sheet dependency relationship target URI is invalid",
+                ))?;
             if !package.has_part(&target) {
                 return Err(Error::Zip(
                     "sheet dependency relationship target is missing",
                 ));
             }
-            let kind = relationship
-                .rel_type
-                .rsplit('/')
-                .next()
-                .unwrap_or(&relationship.rel_type)
-                .to_ascii_lowercase();
-            if unsafe_sheet_dependency_kind(&kind) {
+            if unsafe_sheet_dependency_kind(kind) {
                 return Err(Error::Zip(
                     "worksheet has a structural dependency that cannot be repaired safely",
                 ));
             }
             let owned = if source_key == worksheet_key {
-                sheet_owned_relationship_kind(&kind)
+                sheet_owned_relationship_kind(kind)
             } else {
-                nested_owned_relationship_kind(&kind)
+                nested_owned_relationship_kind(kind)
             };
             if !owned {
                 continue;
@@ -4039,8 +4114,11 @@ fn plan_sheet_owned_parts(package: &Package, worksheet_path: &str) -> Result<Vec
                     if relationship.external {
                         return false;
                     }
-                    let relationship_target =
-                        Package::resolve_rel_target(source, &relationship.target);
+                    let Some(relationship_target) =
+                        Package::try_resolve_rel_target(source, &relationship.target)
+                    else {
+                        return false;
+                    };
                     canonical_part_key(&relationship_target) == target_key.as_str()
                         && canonical_part_key(source) != worksheet_key
                         && !removable.contains(&canonical_part_key(source))
@@ -4892,17 +4970,20 @@ fn worksheet_path(package: &Package, sheet_name: &str) -> Result<String> {
     let workbook_bytes = part_xml_bytes(package, &workbook_path)?;
     let workbook_xml = std::str::from_utf8(&workbook_bytes).map_err(|_| Error::MissingWorkbook)?;
     let rid = workbook_sheet_rid(workbook_xml, sheet_name).ok_or(Error::MissingWorkbook)?;
-    let rels_path = rels_path_for(&workbook_path);
-    // Same promotion hazard as `workbook_bytes` above: the workbook `.rels`
-    // part is promoted to a live `XmlTree` the moment an earlier edit's
-    // `invalidate_calc_chain` removes a calc-chain `Relationship` from it --
-    // at which point a bare `Package::part_bytes` (raw-only) would
-    // incorrectly report it missing even though it's still fully present.
-    let rels_bytes = part_xml_bytes(package, &rels_path)?;
-    let rels_xml = std::str::from_utf8(&rels_bytes).map_err(|_| Error::MissingWorkbook)?;
-    let rels = crate::xlsx::parse_rels(rels_xml);
-    let target = rels.get(&rid).ok_or(Error::MissingWorkbook)?;
-    Ok(normalize_part_target(&workbook_path, target))
+    let relationships: Vec<_> = package
+        .relationships_of(&workbook_path)
+        .iter()
+        .filter(|relationship| relationship.id == rid)
+        .collect();
+    if relationships.len() != 1
+        || relationships[0].external
+        || !crate::xlsx::relationship_type_matches(&relationships[0].rel_type, "worksheet")
+    {
+        return Err(Error::MissingWorkbook);
+    }
+    Package::try_resolve_rel_target(&workbook_path, &relationships[0].target)
+        .filter(|path| package.has_part(path))
+        .ok_or(Error::MissingWorkbook)
 }
 
 /// `path`'s XML bytes regardless of whether the part is still `Raw` or has
@@ -4922,22 +5003,20 @@ fn part_xml_bytes(package: &Package, path: &str) -> Result<Vec<u8>> {
 }
 
 fn workbook_path(package: &Package) -> String {
-    let Some(root_rels) = package
-        .part_bytes("_rels/.rels")
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-    else {
-        return "xl/workbook.xml".to_string();
-    };
-    let rels = crate::xlsx::parse_rels(root_rels);
-    let types = crate::xlsx::parse_rel_types(root_rels);
-    types
-        .into_iter()
-        .find_map(|(id, ty)| {
-            (ty.rsplit('/').next() == Some("officeDocument"))
-                .then(|| rels.get(&id).map(|target| canonical_part_name(target)))
-                .flatten()
+    let relationships: Vec<_> = package
+        .relationships_of("")
+        .iter()
+        .filter(|relationship| {
+            !relationship.external
+                && crate::xlsx::relationship_type_matches(&relationship.rel_type, "officeDocument")
         })
-        .unwrap_or_else(|| "xl/workbook.xml".to_string())
+        .collect();
+    if relationships.len() == 1 {
+        if let Some(path) = Package::try_resolve_rel_target("", &relationships[0].target) {
+            return path;
+        }
+    }
+    "xl/workbook.xml".to_string()
 }
 
 fn workbook_sheet_rid(xml: &str, sheet_name: &str) -> Option<String> {
@@ -5272,34 +5351,6 @@ fn newly_touched(before: &[String], package: &Package) -> Vec<String> {
         .into_iter()
         .filter(|n| !before.contains(n))
         .collect()
-}
-
-fn rels_path_for(path: &str) -> String {
-    match path.rfind('/') {
-        Some(i) => format!("{}/_rels/{}.rels", &path[..i], &path[i + 1..]),
-        None => format!("_rels/{path}.rels"),
-    }
-}
-
-fn normalize_part_target(base: &str, target: &str) -> String {
-    let target = target.replace('\\', "/");
-    if let Some(abs) = target.strip_prefix('/') {
-        return abs.to_string();
-    }
-    let mut parts: Vec<&str> = base
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.split('/').collect())
-        .unwrap_or_default();
-    for segment in target.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(segment),
-        }
-    }
-    parts.join("/")
 }
 
 fn canonical_part_name(name: &str) -> String {
@@ -5846,6 +5897,146 @@ mod tests {
         out
     }
 
+    fn replace_zip_member(bytes: &[u8], name: &str, replacement: &[u8]) -> Vec<u8> {
+        use std::io::{Read, Write};
+        use zip::write::SimpleFileOptions;
+
+        let mut input = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open input zip");
+        let mut output = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for index in 0..input.len() {
+            let mut part = input.by_index(index).expect("read input zip member");
+            let part_name = part.name().to_string();
+            output
+                .start_file(&part_name, SimpleFileOptions::default())
+                .expect("start replacement zip member");
+            if part_name == name {
+                output
+                    .write_all(replacement)
+                    .expect("write replacement zip member");
+            } else {
+                let mut contents = Vec::new();
+                part.read_to_end(&mut contents)
+                    .expect("read original zip member");
+                output
+                    .write_all(&contents)
+                    .expect("copy original zip member");
+            }
+        }
+        output
+            .finish()
+            .expect("finish replacement zip")
+            .into_inner()
+    }
+
+    #[test]
+    fn edits_xlsx_with_above_root_office_document_target() {
+        let input = replace_zip_member(
+            &minimal_xlsx_with_one_valued_cell(),
+            "_rels/.rels",
+            br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="../../xl/workbook.xml"/></Relationships>"#,
+        );
+
+        let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsx");
+        spreadsheet
+            .set_cell_value("Data", 0, 0, Cell::Number(2.0))
+            .expect("edit through normalized workbook target");
+        let saved = spreadsheet.save().expect("save edited package");
+        let reopened = Workbook::open(&saved).expect("reopen saved package");
+        assert_eq!(
+            reopened.sheet_by_name("Data").and_then(|s| s.cell(0, 0)),
+            Some(&Cell::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn workbook_edit_selection_is_exact_ordered_and_backslash_compatible() {
+        let base = minimal_xlsx_with_one_valued_cell();
+        let custom = replace_zip_member(
+            &base,
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="custom" Type="https://attacker.invalid/officeDocument" Target="evil/workbook.xml"/><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        );
+        let mut spreadsheet = Spreadsheet::open(&custom).expect("open exact root relationship");
+        spreadsheet
+            .set_cell_value("Data", 0, 0, Cell::Number(2.0))
+            .expect("custom suffix relationship must not affect dispatch");
+
+        let backslash = replace_zip_member(
+            &base,
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl\workbook.xml"/></Relationships>"#,
+        );
+        let mut spreadsheet = Spreadsheet::open(&backslash).expect("open backslash root target");
+        spreadsheet
+            .set_cell_value("Data", 0, 0, Cell::Number(3.0))
+            .expect("edit through backslash root target");
+        let reopened = Workbook::open(&spreadsheet.save().unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .sheet_by_name("Data")
+                .and_then(|sheet| sheet.cell(0, 0)),
+            Some(&Cell::Number(3.0))
+        );
+    }
+
+    #[test]
+    fn cell_mutation_requires_the_exact_worksheet_relationship_type() {
+        for relationship_type in [
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet",
+            "https://attacker.invalid/relationships/worksheet",
+        ] {
+            let relationships = format!(
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{relationship_type}" Target="worksheets/sheet1.xml"/></Relationships>"#
+            );
+            let input = replace_zip_member(
+                &minimal_xlsx_with_one_valued_cell(),
+                "xl/_rels/workbook.xml.rels",
+                relationships.as_bytes(),
+            );
+            let mut spreadsheet = Spreadsheet::open(&input).expect("open non-worksheet fixture");
+            assert!(spreadsheet
+                .set_cell_value("Data", 0, 0, Cell::Number(9.0))
+                .is_err());
+            assert!(spreadsheet.edited_parts().is_empty());
+        }
+    }
+
+    #[test]
+    fn unrelated_hyperlink_edit_preserves_an_internal_fragment_relationship() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "fragment");
+        sheet.write(0, 1, "external");
+        let mut seed = Spreadsheet::open(&workbook.to_xlsx()).unwrap();
+        seed.set_external_hyperlink("Data", 0, 0, "https://example.invalid")
+            .unwrap();
+        let with_relationship = seed.save().unwrap();
+        let rels = String::from_utf8(zip_member(
+            &with_relationship,
+            "xl/worksheets/_rels/sheet1.xml.rels",
+        ))
+        .unwrap()
+        .replace("https://example.invalid", "#Sheet2!A1")
+        .replace(r#" TargetMode="External""#, "");
+        let fragment_fixture = replace_zip_member(
+            &with_relationship,
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            rels.as_bytes(),
+        );
+
+        let mut spreadsheet = Spreadsheet::open(&fragment_fixture).unwrap();
+        spreadsheet
+            .set_external_hyperlink("Data", 0, 1, "https://example.com/new")
+            .unwrap();
+        let saved = spreadsheet
+            .save()
+            .expect("fragment target resolves to source part");
+        let saved_rels =
+            String::from_utf8(zip_member(&saved, "xl/worksheets/_rels/sheet1.xml.rels")).unwrap();
+        assert!(saved_rels.contains(r##"Target="#Sheet2!A1""##));
+        assert!(saved_rels.contains("https://example.com/new"));
+    }
+
     fn zip_has_member(bytes: &[u8], name: &str) -> bool {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open zip");
         let exists = zip.by_name(name).is_ok();
@@ -5890,12 +6081,14 @@ mod tests {
             b"unknown worksheet extension payload".to_vec(),
             Some("application/octet-stream"),
         );
-        package.add_relationship(
-            "xl/worksheets/sheet1.xml",
-            "http://example.com/relationships/customWorksheetExtension",
-            "../custom/keep.bin",
-            false,
-        );
+        package
+            .add_relationship(
+                "xl/worksheets/sheet1.xml",
+                "http://example.com/relationships/customWorksheetExtension",
+                "../custom/keep.bin",
+                false,
+            )
+            .unwrap();
         seed.save().expect("save delete dependency fixture")
     }
 
@@ -6075,25 +6268,23 @@ mod tests {
         let mut workbook = Workbook::new();
         workbook.add_sheet("First");
         workbook.add_sheet("Second");
-        let mut seed = Spreadsheet::open(&workbook.to_xlsx()).expect("open relationship fixture");
-        let package = seed.package.as_mut().expect("editable package");
-        let tree = package
-            .part_tree_mut("xl/_rels/workbook.xml.rels")
-            .expect("promote workbook relationships");
-        let root = tree.root_element().expect("relationships root");
-        let index = tree.children_of(root).len();
-        tree.insert_fragment_at(
-            root,
-            index,
-            br#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>"#,
-        )
-        .expect("insert duplicate relationship id");
-        let ambiguous = seed.save().expect("save ambiguous relationship fixture");
-        let mut spreadsheet = Spreadsheet::open(&ambiguous).expect("reopen ambiguous fixture");
-        let before = spreadsheet.save().expect("serialize ambiguous fixture");
-        assert!(spreadsheet.delete_sheet("First").is_err());
-        assert!(spreadsheet.edited_parts().is_empty());
-        assert_eq!(spreadsheet.save().expect("save rejected deletion"), before);
+        let seed = workbook.to_xlsx();
+        let relationships = String::from_utf8(zip_member(&seed, "xl/_rels/workbook.xml.rels"))
+            .expect("workbook relationships UTF-8");
+        let relationships = relationships.replacen(
+            "</Relationships>",
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            1,
+        );
+        let ambiguous = replace_zip_member(
+            &seed,
+            "xl/_rels/workbook.xml.rels",
+            relationships.as_bytes(),
+        );
+        assert!(
+            Spreadsheet::open(&ambiguous).is_err(),
+            "a duplicate relationship ID must fail closed before mutation"
+        );
 
         let mut workbook = Workbook::new();
         workbook.add_sheet("First");
@@ -6105,12 +6296,14 @@ mod tests {
             b"<pivotTableDefinition/>".to_vec(),
             Some("application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"),
         );
-        package.add_relationship(
-            "xl/worksheets/sheet1.xml",
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
-            "../pivotTables/pivotTable1.xml",
-            false,
-        );
+        package
+            .add_relationship(
+                "xl/worksheets/sheet1.xml",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+                "../pivotTables/pivotTable1.xml",
+                false,
+            )
+            .unwrap();
         let unsafe_graph = seed.save().expect("save pivot dependency fixture");
         let mut spreadsheet = Spreadsheet::open(&unsafe_graph).expect("reopen pivot fixture");
         let before = spreadsheet.save().expect("serialize pivot fixture");

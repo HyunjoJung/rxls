@@ -7,15 +7,17 @@ use rxls::{PageSetup, PrintLossKind, PrintPageOrder, Sheet, Workbook};
 use sha2::{Digest, Sha256};
 
 use crate::error::{LimitKind, RenderError};
+#[cfg(test)]
+use crate::layout::build_sheet_scene;
 use crate::layout::{
-    absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene,
-    build_sheet_scene_with_geometry, build_single_page_sheet_scene,
+    absolute_drawings_intersect_range, build_auxiliary_text_node, build_sheet_scene_for_print,
+    build_sheet_scene_with_geometry_for_print, build_single_page_sheet_scene_for_print,
     cell_drawings_intersect_prepared_range, cell_style_has_visible_blank_paint,
     external_render_dependency_cells, measure_sheet_axes_for_ranges,
     prepared_drawing_geometry_extent, render_single_page_used_scene_range, render_used_print_range,
     CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions, RenderRange, RenderReport,
     RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex, WarningCode,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW, PRINT_GRIDLINE_WIDTH,
 };
 use crate::scene::{
     ClipGroupNode, Fixed, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode, TextAnchor,
@@ -78,8 +80,8 @@ pub struct PrintOptions {
     /// or merge. Scale selection still sees the complete print area.
     pub omit_sparse_pages: bool,
     /// Ignore authored print-page settings and emit the selected visible sheet
-    /// scene at 100% on one content-sized page. This Calc-parity mode also
-    /// suppresses worksheet gridlines regardless of source or caller flags.
+    /// scene at 100% on one content-sized page. Source and caller print-gridline
+    /// intent is still honored.
     pub single_page_sheets: bool,
     /// Pagination and backend resource ceilings.
     pub limits: PrintLimits,
@@ -465,11 +467,11 @@ impl DecodedMediaBudget {
             .checked_sub(self.retained)
             .ok_or(RenderError::CoordinateOverflow)?;
         let build = match (geometry, single_page_used_bounds) {
-            (None, true) => build_single_page_sheet_scene(sheet, sheet_index, &options),
+            (None, true) => build_single_page_sheet_scene_for_print(sheet, sheet_index, &options),
             (Some(geometry), _) => {
-                build_sheet_scene_with_geometry(sheet, sheet_index, &options, geometry)
+                build_sheet_scene_with_geometry_for_print(sheet, sheet_index, &options, geometry)
             }
-            (None, false) => build_sheet_scene(sheet, sheet_index, &options),
+            (None, false) => build_sheet_scene_for_print(sheet, sheet_index, &options),
         };
         let build = match build {
             Ok(build) => build,
@@ -797,7 +799,7 @@ fn prepare_print_area(
     }
     let measured_rows = measured_axis_slots(row_sizes)?;
     let measured_columns = measured_axis_slots(column_sizes)?;
-    let mut source = build_sheet_scene_with_geometry(
+    let mut source = build_sheet_scene_with_geometry_for_print(
         sheet,
         sheet_index,
         &source_options,
@@ -1054,13 +1056,13 @@ fn prepare_single_page_sheet_document(
     enforce_print_limit(LimitKind::Pages, options.limits.max_pages, 1)?;
 
     let mut render_options = options.render.clone();
-    // LibreOffice Calc 26.2.3's SinglePageSheets PDF path suppresses worksheet
-    // gridlines even when the source printOptions and the renderer caller both
-    // request them. Authored pagination continues to combine those flags in
-    // `prepare_print_area`; this override is deliberately narrower.
-    render_options.gridlines = false;
+    let setup = sheet.page_setup().cloned().unwrap_or_default();
+    let behavior = effective_print_behavior(sheet, &setup);
+    // SinglePageSheets replaces page geometry, not print paint. Match the
+    // authored-page path by requiring both caller and source gridline intent.
+    render_options.gridlines &= behavior.gridlines;
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
-    let build = build_single_page_sheet_scene(sheet, sheet_index, &render_options)?;
+    let build = build_single_page_sheet_scene_for_print(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
     let mut source = build.report;
     source
@@ -3692,7 +3694,9 @@ fn transform_node_inner(
             node.x2 = transform_coordinate(node.x2, x, scale_permille)?;
             node.y1 = transform_coordinate(node.y1, y, scale_permille)?;
             node.y2 = transform_coordinate(node.y2, y, scale_permille)?;
-            node.width = scale_fixed(node.width, scale_permille)?;
+            if node.width != PRINT_GRIDLINE_WIDTH {
+                node.width = scale_fixed(node.width, scale_permille)?;
+            }
             SceneNode::Line(node)
         }
         SceneNode::Path(mut node) => {
@@ -4675,11 +4679,13 @@ mod tests {
     }
 
     #[test]
-    fn single_page_sheets_suppresses_gridlines_while_authored_print_honors_flags() {
-        fn has_gridline(nodes: &[SceneNode]) -> bool {
+    fn single_page_sheets_and_authored_print_combine_source_and_caller_gridlines() {
+        fn has_print_gridline(nodes: &[SceneNode]) -> bool {
             nodes.iter().any(|node| match node {
-                SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
-                SceneNode::ClipGroup(group) => has_gridline(&group.nodes),
+                SceneNode::Line(line) => {
+                    line.color == Rgb::BLACK && line.width == PRINT_GRIDLINE_WIDTH
+                }
+                SceneNode::ClipGroup(group) => has_print_gridline(&group.nodes),
                 _ => false,
             })
         }
@@ -4700,12 +4706,12 @@ mod tests {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &authored).unwrap();
-        assert!(has_gridline(&document.pages[0].scene.nodes));
+        assert!(has_print_gridline(&document.pages[0].scene.nodes));
 
         let mut disabled = authored.clone();
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
-        assert!(!has_gridline(&document.pages[0].scene.nodes));
+        assert!(!has_print_gridline(&document.pages[0].scene.nodes));
 
         let single_page = PrintOptions {
             single_page_sheets: true,
@@ -4713,7 +4719,59 @@ mod tests {
         };
         let document = build_print_document(&workbook, 0, &single_page).unwrap();
         assert!(single_page.render.gridlines);
-        assert!(!has_gridline(&document.pages[0].scene.nodes));
+        assert!(has_print_gridline(&document.pages[0].scene.nodes));
+
+        let mut single_page_disabled = single_page.clone();
+        single_page_disabled.render.gridlines = false;
+        let document = build_print_document(&workbook, 0, &single_page_disabled).unwrap();
+        assert!(!has_print_gridline(&document.pages[0].scene.nodes));
+
+        let mut source_disabled = Workbook::new();
+        let sheet = source_disabled.add_sheet("source-disabled");
+        sheet.write(0, 0, "A");
+        sheet.write(1, 1, "B");
+        let document = build_print_document(&source_disabled, 0, &single_page).unwrap();
+        assert!(!has_print_gridline(&document.pages[0].scene.nodes));
+    }
+
+    #[test]
+    fn print_gridline_hairline_width_is_physical_across_print_scales() {
+        let line = crate::scene::LineNode {
+            x1: Fixed::from_pixels(1),
+            y1: Fixed::from_pixels(2),
+            x2: Fixed::from_pixels(3),
+            y2: Fixed::from_pixels(4),
+            color: Rgb::BLACK,
+            width: PRINT_GRIDLINE_WIDTH,
+        };
+        for scale_permille in [500, 850, 1_000, 1_250] {
+            let transformed = match transform_node(
+                SceneNode::Line(line.clone()),
+                Fixed::from_pixels(7),
+                Fixed::from_pixels(11),
+                scale_permille,
+            )
+            .unwrap()
+            {
+                SceneNode::Line(line) => line,
+                _ => unreachable!(),
+            };
+            assert_eq!(transformed.width, PRINT_GRIDLINE_WIDTH);
+            assert_eq!(
+                transformed.x2,
+                transform_coordinate(line.x2, Fixed::from_pixels(7), scale_permille).unwrap()
+            );
+        }
+
+        let mut ordinary = line;
+        ordinary.width = Fixed::from_pixels(1);
+        let transformed =
+            match transform_node(SceneNode::Line(ordinary), Fixed::ZERO, Fixed::ZERO, 500).unwrap()
+            {
+                SceneNode::Line(line) => line,
+                _ => unreachable!(),
+            };
+        assert_eq!(transformed.width, Fixed::from_raw(512));
     }
 
     #[test]

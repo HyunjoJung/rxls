@@ -250,9 +250,24 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let shared = part(&mut zip, "xl/sharedStrings.bin")
         .map(|b| parse_shared_strings(&b))
         .unwrap_or_default();
-    let theme = crate::xlsx::part_str(&mut zip, "xl/theme/theme1.xml")
-        .map(|xml| parse_xlsb_theme(&xml))
-        .unwrap_or_default();
+    let workbook_rels_xml =
+        crate::xlsx::part_str(&mut zip, "xl/_rels/workbook.bin.rels").unwrap_or_default();
+    let workbook_relationships = crate::xlsx::parse_ooxml_relationships(&workbook_rels_xml);
+    let theme = match crate::xlsx::unique_internal_relationship_target(&workbook_rels_xml, "theme")
+    {
+        crate::xlsx::RelationshipTarget::Missing => {
+            crate::xlsx::part_str(&mut zip, "xl/theme/theme1.xml")
+                .map(|xml| parse_xlsb_theme(&xml))
+                .unwrap_or_default()
+        }
+        crate::xlsx::RelationshipTarget::Internal(target) => {
+            let path = normalize_part_target("xl/workbook.bin", &target);
+            crate::xlsx::part_str(&mut zip, &path)
+                .map(|xml| parse_xlsb_theme(&xml))
+                .unwrap_or_else(XlsbTheme::invalid)
+        }
+        crate::xlsx::RelationshipTarget::Invalid => XlsbTheme::invalid(),
+    };
     let styles = part(&mut zip, "xl/styles.bin")
         .map(|b| parse_styles(&b, &theme))
         .unwrap_or_default();
@@ -260,12 +275,12 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         crate::xlsx::part_str(&mut zip, "docProps/core.xml").as_deref(),
         crate::xlsx::part_str(&mut zip, "docProps/app.xml").as_deref(),
     );
-    let workbook_rels_xml =
-        crate::xlsx::part_str(&mut zip, "xl/_rels/workbook.bin.rels").unwrap_or_default();
-    let rels = crate::xlsx::parse_rels(&workbook_rels_xml);
-    let rel_types = crate::xlsx::parse_rel_types(&workbook_rels_xml);
     let workbook_bin = part(&mut zip, "xl/workbook.bin").ok_or(Error::MissingWorkbook)?;
-    let external_names = load_external_defined_names(&mut zip, &workbook_bin, &rels);
+    let external_names = load_external_defined_names(
+        &mut zip,
+        &workbook_bin,
+        workbook_relationships.as_deref().unwrap_or(&[]),
+    );
     let (
         names,
         date1904,
@@ -280,25 +295,49 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let formula_sheet_names: Vec<String> = names.iter().map(|(name, _, _)| name.clone()).collect();
 
     let mut budget = crate::MAX_TEXT_BYTES;
+    let mut chart_budget = crate::xlsx::ChartImportBudget::default();
     let mut sheets = Vec::with_capacity(names.len().min(1 << 16));
     let mut selected_sheet_fallback = None;
     for (sheet_index, (name, rid, hs_state)) in names.into_iter().enumerate() {
-        let sheet_type = xlsb_sheet_type(&rid, hs_state, rel_types.get(&rid).map(String::as_str));
+        let relationship = workbook_relationships.as_deref().and_then(|relationships| {
+            relationships
+                .iter()
+                .find(|relationship| relationship.id == rid)
+        });
+        let path = relationship
+            .filter(|relationship| !relationship.external)
+            .and_then(|relationship| {
+                crate::xlsx::resolve_internal_relationship_part(
+                    "xl/workbook.bin",
+                    &relationship.target,
+                )
+            })
+            .unwrap_or_default();
+        let sheet_type = relationship
+            .filter(|relationship| {
+                !relationship.external
+                    && crate::xlsx::resolve_internal_relationship_part(
+                        "xl/workbook.bin",
+                        &relationship.target,
+                    )
+                    .is_some()
+            })
+            .map_or(SheetType::Vba, |relationship| {
+                xlsb_sheet_type(&rid, hs_state, relationship.rel_type.as_deref())
+            });
         let is_worksheet = sheet_type == SheetType::WorkSheet;
-        let target = rels.get(&rid).cloned().unwrap_or_default();
-        let path = normalize_target(&target);
         let sheet_rels_xml = if is_worksheet {
             crate::xlsx::part_str(&mut zip, &sheet_rels_path(&path)).unwrap_or_default()
         } else {
             String::new()
         };
         let sheet_rels = if is_worksheet && !sheet_rels_xml.is_empty() {
-            crate::xlsx::parse_rels(&sheet_rels_xml)
+            crate::xlsx::parse_ooxml_relationships(&sheet_rels_xml).unwrap_or_default()
         } else {
-            HashMap::new()
+            Vec::new()
         };
         let comments = if is_worksheet {
-            parse_sheet_comments(&mut zip, &path, &sheet_rels, &sheet_rels_xml)
+            parse_sheet_comments(&mut zip, &path, &sheet_rels_xml)
         } else {
             Vec::new()
         };
@@ -331,18 +370,12 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             selected_sheet_fallback = Some(sheet_index);
         }
         let tables = if is_worksheet {
-            parse_sheet_tables(
-                &mut zip,
-                &path,
-                &sheet_rels,
-                &sheet_rels_xml,
-                &metadata.table_rel_ids,
-            )
+            parse_sheet_tables(&mut zip, &path, &sheet_rels_xml, &metadata.table_rel_ids)
         } else {
             Vec::new()
         };
         let (images, charts, drawing_metadata, drawing_losses) = if is_worksheet {
-            read_sheet_drawings(&mut zip, &path, &sheet_rels_xml, &theme)
+            read_sheet_drawings(&mut zip, &path, &sheet_rels_xml, &theme, &mut chart_budget)
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
@@ -479,23 +512,28 @@ fn xlsb_sheet_type(rid: &str, hs_state: u32, rel_type: Option<&str>) -> SheetTyp
     if rid.is_empty() && hs_state == 2 {
         return SheetType::Vba;
     }
-    let kind = rel_type
-        .and_then(|ty| ty.rsplit('/').next())
-        .unwrap_or("worksheet");
-    match kind.to_ascii_lowercase().as_str() {
-        "chartsheet" => SheetType::ChartSheet,
-        "dialogsheet" => SheetType::DialogSheet,
-        "macrosheet" | "xlmacrosheet" | "xlintlmacrosheet" => SheetType::MacroSheet,
-        _ => SheetType::WorkSheet,
-    }
-}
-
-fn normalize_target(target: &str) -> String {
-    let t = target.trim_start_matches('/');
-    if t.starts_with("xl/") {
-        t.to_string()
-    } else {
-        format!("xl/{t}")
+    match rel_type {
+        None => SheetType::WorkSheet,
+        Some(rel_type) if crate::xlsx::relationship_type_matches(rel_type, "worksheet") => {
+            SheetType::WorkSheet
+        }
+        Some(rel_type) if crate::xlsx::relationship_type_matches(rel_type, "chartsheet") => {
+            SheetType::ChartSheet
+        }
+        Some(rel_type) if crate::xlsx::relationship_type_matches(rel_type, "dialogsheet") => {
+            SheetType::DialogSheet
+        }
+        Some(rel_type)
+            if crate::xlsx::relationship_type_matches(rel_type, "macrosheet")
+                || matches!(
+                    rel_type,
+                    "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet"
+                        | "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet"
+                ) =>
+        {
+            SheetType::MacroSheet
+        }
+        Some(_) => SheetType::Vba,
     }
 }
 
@@ -507,23 +545,7 @@ fn sheet_rels_path(path: &str) -> String {
 }
 
 fn normalize_part_target(base: &str, target: &str) -> String {
-    if let Some(abs) = target.strip_prefix('/') {
-        return abs.to_string();
-    }
-    let mut dir: Vec<&str> = match base.rfind('/') {
-        Some(i) => base[..i].split('/').collect(),
-        None => Vec::new(),
-    };
-    for seg in target.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                dir.pop();
-            }
-            other => dir.push(other),
-        }
-    }
-    dir.join("/")
+    crate::xlsx::resolve_internal_relationship_part(base, target).unwrap_or_default()
 }
 
 /// Load one external-name table per workbook supporting-link record.
@@ -535,15 +557,28 @@ fn normalize_part_target(base: &str, target: &str) -> String {
 fn load_external_defined_names(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     workbook: &[u8],
-    rels: &HashMap<String, String>,
+    relationships: &[crate::xlsx::OoxmlRelationship],
 ) -> Vec<Vec<String>> {
     parse_supporting_link_rel_ids(workbook)
         .into_iter()
         .map(|rel_id| {
-            let Some(target) = rel_id.as_ref().and_then(|id| rels.get(id)) else {
+            let Some(relationship) = rel_id.as_ref().and_then(|id| {
+                relationships.iter().find(|relationship| {
+                    relationship.id == *id
+                        && !relationship.external
+                        && relationship.rel_type.as_deref().is_some_and(|rel_type| {
+                            crate::xlsx::relationship_type_matches(rel_type, "externalLink")
+                        })
+                })
+            }) else {
                 return Vec::new();
             };
-            let path = normalize_part_target("xl/workbook.bin", target);
+            let Some(path) = crate::xlsx::resolve_internal_relationship_part(
+                "xl/workbook.bin",
+                &relationship.target,
+            ) else {
+                return Vec::new();
+            };
             part(zip, &path)
                 .map(|bytes| parse_external_defined_names(&bytes))
                 .unwrap_or_default()
@@ -600,12 +635,33 @@ fn parse_external_defined_names(b: &[u8]) -> Vec<String> {
     names
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone)]
 struct XlsbTheme {
     colors: [Option<Color>; 12],
+    major_latin_font_family: Option<String>,
+    minor_latin_font_family: Option<String>,
+    source_valid: bool,
+}
+
+impl Default for XlsbTheme {
+    fn default() -> Self {
+        Self {
+            colors: [None; 12],
+            major_latin_font_family: None,
+            minor_latin_font_family: None,
+            source_valid: true,
+        }
+    }
 }
 
 impl XlsbTheme {
+    fn invalid() -> Self {
+        Self {
+            source_valid: false,
+            ..Self::default()
+        }
+    }
+
     fn chart_palette(&self) -> Vec<Color> {
         const OFFICE_ACCENTS: [Color; 6] = [
             Color::rgb(68, 114, 196),
@@ -618,6 +674,12 @@ impl XlsbTheme {
         (0..OFFICE_ACCENTS.len())
             .map(|index| self.colors[index + 4].unwrap_or(OFFICE_ACCENTS[index]))
             .collect()
+    }
+
+    fn chart_default_latin_font_family(&self) -> &str {
+        self.minor_latin_font_family
+            .as_deref()
+            .unwrap_or(crate::xlsx::CALC_IMPORTED_CHART_LATIN_FONT_FAMILY)
     }
 }
 
@@ -645,72 +707,14 @@ fn xml_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String>
     })
 }
 
-fn parse_hex_color(value: &str) -> Option<Color> {
-    let value = value.trim().trim_start_matches('#');
-    let value = match value.len() {
-        8 => &value[2..],
-        6 => value,
-        _ => return None,
-    };
-    let red = u8::from_str_radix(value.get(0..2)?, 16).ok()?;
-    let green = u8::from_str_radix(value.get(2..4)?, 16).ok()?;
-    let blue = u8::from_str_radix(value.get(4..6)?, 16).ok()?;
-    Some(Color::rgb(red, green, blue))
-}
-
-fn theme_slot(name: &[u8]) -> Option<usize> {
-    match name {
-        b"dk1" => Some(0),
-        b"lt1" => Some(1),
-        b"dk2" => Some(2),
-        b"lt2" => Some(3),
-        b"accent1" => Some(4),
-        b"accent2" => Some(5),
-        b"accent3" => Some(6),
-        b"accent4" => Some(7),
-        b"accent5" => Some(8),
-        b"accent6" => Some(9),
-        b"hlink" => Some(10),
-        b"folHlink" => Some(11),
-        _ => None,
-    }
-}
-
 fn parse_xlsb_theme(xml: &str) -> XlsbTheme {
-    let mut reader = Reader::from_str(xml);
-    let mut theme = XlsbTheme::default();
-    let mut slot = None;
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let name = e.name();
-                let local = xml_local(name.as_ref());
-                if let Some(next) = theme_slot(local) {
-                    slot = Some(next);
-                } else if local == b"srgbClr" {
-                    if let (Some(index), Some(color)) = (
-                        slot,
-                        xml_attr(&e, b"val").as_deref().and_then(parse_hex_color),
-                    ) {
-                        theme.colors[index] = Some(color);
-                    }
-                } else if local == b"sysClr" {
-                    if let (Some(index), Some(color)) = (
-                        slot,
-                        xml_attr(&e, b"lastClr")
-                            .as_deref()
-                            .and_then(parse_hex_color),
-                    ) {
-                        theme.colors[index] = Some(color);
-                    }
-                }
-            }
-            Ok(Event::End(e)) if theme_slot(xml_local(e.name().as_ref())).is_some() => slot = None,
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
+    let theme = crate::xlsx::parse_theme(xml);
+    XlsbTheme {
+        colors: theme.xlsb_ordered_colors(),
+        major_latin_font_family: theme.source_major_latin_font_family().map(str::to_string),
+        minor_latin_font_family: theme.source_minor_latin_font_family().map(str::to_string),
+        source_valid: theme.source_valid(),
     }
-    theme
 }
 
 fn add_style_loss(losses: &mut Vec<StyleLoss>, kind: StyleLossKind, occurrences: u32) {
@@ -1581,6 +1585,9 @@ fn verified_xlsb_style_provenance(
 
 fn parse_styles(b: &[u8], theme: &XlsbTheme) -> Styles {
     let mut s = Styles::default();
+    if !theme.source_valid {
+        add_style_loss(&mut s.losses, StyleLossKind::UnsupportedProperty, 1);
+    }
     let mut r = RecReader::new(b);
     let mut in_cell_xfs = false;
     let mut in_style_xfs = false;
@@ -2130,21 +2137,19 @@ enum XlsbPageBreakAxis {
 fn parse_sheet_comments(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     sheet_path: &str,
-    sheet_rels: &HashMap<String, String>,
     sheet_rels_xml: &str,
 ) -> Vec<Comment> {
     if sheet_rels_xml.is_empty() {
         return Vec::new();
     }
-    let rel_types = crate::xlsx::parse_rel_types(sheet_rels_xml);
-    let Some(target) = rel_types
-        .iter()
-        .find(|(_, ty)| ty.rsplit('/').next() == Some("comments"))
-        .and_then(|(id, _)| sheet_rels.get(id))
-    else {
-        return Vec::new();
+    let target = match crate::xlsx::unique_internal_relationship_target(sheet_rels_xml, "comments")
+    {
+        crate::xlsx::RelationshipTarget::Internal(target) => target,
+        crate::xlsx::RelationshipTarget::Missing | crate::xlsx::RelationshipTarget::Invalid => {
+            return Vec::new()
+        }
     };
-    let path = normalize_part_target(sheet_path, target);
+    let path = normalize_part_target(sheet_path, &target);
     part(zip, &path)
         .map(|b| parse_comments(&b))
         .unwrap_or_default()
@@ -2228,7 +2233,7 @@ fn parse_sheet(
     shared: &[SharedString],
     styles: &Styles,
     date1904: bool,
-    sheet_rels: &HashMap<String, String>,
+    sheet_rels: &[crate::xlsx::OoxmlRelationship],
     budget: &mut usize,
     sheet_names: &[String],
     extern_sheets: &[crate::ptg::ExternSheet],
@@ -2660,14 +2665,8 @@ enum DrawingMarkerField {
     ColOffset,
 }
 
-fn drawing_relationship_target(xml: &str) -> Option<String> {
-    let rels = crate::xlsx::parse_rels(xml);
-    let types = crate::xlsx::parse_rel_types(xml);
-    types.into_iter().find_map(|(id, ty)| {
-        (ty.rsplit('/').next() == Some("drawing"))
-            .then(|| rels.get(&id).cloned())
-            .flatten()
-    })
+fn drawing_relationship_target(xml: &str) -> crate::xlsx::RelationshipTarget {
+    crate::xlsx::unique_internal_relationship_target(xml, "drawing")
 }
 
 fn drawing_text(e: &quick_xml::events::BytesText<'_>) -> String {
@@ -3026,6 +3025,14 @@ fn part_bytes_limited(
     (u64::try_from(out.len()).ok()? <= max).then_some(out)
 }
 
+fn part_declared_size(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    name: &str,
+) -> Option<u64> {
+    let index = part_index(zip, name)?;
+    zip.by_index(index).ok().map(|file| file.size())
+}
+
 type DrawingReadResult = (Vec<Image>, Vec<Chart>, Vec<DrawingMetadata>, Vec<StyleLoss>);
 
 fn retain_xlsb_unrepresented_drawing(
@@ -3042,11 +3049,26 @@ fn read_sheet_drawings(
     sheet_path: &str,
     sheet_rels_xml: &str,
     theme: &XlsbTheme,
+    chart_budget: &mut crate::xlsx::ChartImportBudget,
 ) -> DrawingReadResult {
     const MAX_IMAGE_PART: u64 = 64 << 20;
     const MAX_IMAGE_TOTAL: usize = 256 << 20;
-    let Some(target) = drawing_relationship_target(sheet_rels_xml) else {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let target = match drawing_relationship_target(sheet_rels_xml) {
+        crate::xlsx::RelationshipTarget::Internal(target) => target,
+        crate::xlsx::RelationshipTarget::Missing => {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        crate::xlsx::RelationshipTarget::Invalid => {
+            return (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![StyleLoss {
+                    kind: StyleLossKind::DrawingMetadataPartial,
+                    occurrences: 1,
+                }],
+            );
+        }
     };
     let drawing_path = normalize_part_target(sheet_path, &target);
     let Some(drawing_xml) = crate::xlsx::part_str(zip, &drawing_path) else {
@@ -3062,23 +3084,58 @@ fn read_sheet_drawings(
     };
     let refs = parse_xlsb_drawing_refs(&drawing_xml);
     let rels_xml = crate::xlsx::part_str(zip, &sheet_rels_path(&drawing_path)).unwrap_or_default();
-    let rels = crate::xlsx::parse_rels(&rels_xml);
+    let rels = crate::xlsx::parse_ooxml_relationships(&rels_xml);
     let mut images = Vec::new();
     let mut charts = Vec::new();
     let mut metadata = Vec::new();
     let mut losses = Vec::new();
     let mut image_bytes = 0usize;
-    let mut chart_cache_points_remaining = 1_000_000;
-    let mut chart_series_remaining = 4_096;
+    let chart_theme = crate::xlsx::chart_theme(
+        [
+            theme.colors[1],
+            theme.colors[0],
+            theme.colors[3],
+            theme.colors[2],
+            theme.colors[4],
+            theme.colors[5],
+            theme.colors[6],
+            theme.colors[7],
+            theme.colors[8],
+            theme.colors[9],
+            theme.colors[10],
+            theme.colors[11],
+        ],
+        theme.major_latin_font_family.as_deref(),
+        theme.minor_latin_font_family.as_deref(),
+        theme.source_valid,
+    );
     for drawing in refs {
         match drawing.kind {
             XlsbDrawingKind::Image => {
-                let Some(target) = drawing.rid.as_ref().and_then(|rid| rels.get(rid)) else {
-                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
-                    add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
-                    continue;
+                let target = match drawing.rid.as_deref().map_or(
+                    crate::xlsx::RelationshipTarget::Missing,
+                    |rid| {
+                        rels.as_deref().map_or(
+                            crate::xlsx::RelationshipTarget::Invalid,
+                            |relationships| {
+                                crate::xlsx::internal_relationship_target_by_id(
+                                    relationships,
+                                    rid,
+                                    "image",
+                                )
+                            },
+                        )
+                    },
+                ) {
+                    crate::xlsx::RelationshipTarget::Internal(target) => target,
+                    crate::xlsx::RelationshipTarget::Missing
+                    | crate::xlsx::RelationshipTarget::Invalid => {
+                        retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                        add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        continue;
+                    }
                 };
-                let path = normalize_part_target(&drawing_path, target);
+                let path = normalize_part_target(&drawing_path, &target);
                 let Some(format) = xlsb_image_format(&path) else {
                     retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
                     add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
@@ -3108,23 +3165,92 @@ fn read_sheet_drawings(
                 metadata.push(sidecar);
             }
             XlsbDrawingKind::Chart => {
-                let Some(target) = drawing.rid.as_ref().and_then(|rid| rels.get(rid)) else {
+                let target = match drawing.rid.as_deref().map_or(
+                    crate::xlsx::RelationshipTarget::Missing,
+                    |rid| {
+                        rels.as_deref().map_or(
+                            crate::xlsx::RelationshipTarget::Invalid,
+                            |relationships| {
+                                crate::xlsx::internal_relationship_target_by_id(
+                                    relationships,
+                                    rid,
+                                    "chart",
+                                )
+                            },
+                        )
+                    },
+                ) {
+                    crate::xlsx::RelationshipTarget::Internal(target) => target,
+                    crate::xlsx::RelationshipTarget::Missing
+                    | crate::xlsx::RelationshipTarget::Invalid => {
+                        retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                        add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                        continue;
+                    }
+                };
+                if !chart_budget.reserve_chart() {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let path = normalize_part_target(&drawing_path, &target);
+                let Some(declared_size) = part_declared_size(zip, &path) else {
                     retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
                     add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
                     continue;
                 };
-                let path = normalize_part_target(&drawing_path, target);
-                let Some(chart_xml) = crate::xlsx::part_str(zip, &path) else {
+                let Some(declared_work) = usize::try_from(declared_size)
+                    .ok()
+                    .and_then(|size| size.checked_mul(crate::xlsx::XLSX_CHART_XML_SCAN_PASSES))
+                else {
                     retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
-                    add_style_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
                     continue;
                 };
-                let Some(parsed) = crate::xlsx::parse_chart(
+                if declared_size > crate::xlsx::MAX_XLSX_CHART_XML_BYTES
+                    || !chart_budget.reserve_xml_work(declared_work)
+                {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let Some(chart_bytes) =
+                    part_bytes_limited(zip, &path, crate::xlsx::MAX_XLSX_CHART_XML_BYTES)
+                else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                };
+                let Some(chart_work) = chart_bytes
+                    .len()
+                    .checked_mul(crate::xlsx::XLSX_CHART_XML_SCAN_PASSES)
+                else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                };
+                if !chart_budget.reconcile_xml_work(declared_work, chart_work) {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let Ok(chart_xml) = String::from_utf8(chart_bytes) else {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                if !crate::xml_reference_work_within_budget(&chart_xml) {
+                    retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_style_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let Some(parsed) = crate::xlsx::parse_chart_with_theme(
                     &chart_xml,
                     drawing.from,
                     drawing.to.unwrap_or(drawing.from),
-                    &mut chart_cache_points_remaining,
-                    &mut chart_series_remaining,
+                    &mut chart_budget.cache_points_remaining,
+                    &mut chart_budget.series_remaining,
+                    &chart_theme,
                 ) else {
                     retain_xlsb_unrepresented_drawing(drawing.metadata, &mut metadata);
                     add_style_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
@@ -3142,12 +3268,17 @@ fn read_sheet_drawings(
                 sidecar.kind = DrawingObjectKind::Chart;
                 sidecar.object_index = index;
                 sidecar.chart_palette = theme.chart_palette();
+                sidecar.chart_default_latin_font_family =
+                    Some(theme.chart_default_latin_font_family().to_string());
+                sidecar.chart_text_styles = parsed.text_styles;
                 sidecar.chart_series_caches = parsed.series_caches;
                 sidecar.chart_series_styles = parsed.series_styles;
                 sidecar.chart_frame_fill = parsed.frame_fill;
                 sidecar.chart_frame_style_losses = parsed.frame_style_losses;
                 sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
                 sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
+                sidecar.chart_category_axis_visible = parsed.category_axis_visible;
+                sidecar.chart_value_axis_visible = parsed.value_axis_visible;
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;
                 metadata.push(sidecar);
@@ -3173,7 +3304,6 @@ fn read_sheet_drawings(
 fn parse_sheet_tables(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     sheet_path: &str,
-    sheet_rels: &HashMap<String, String>,
     sheet_rels_xml: &str,
     table_rel_ids: &[String],
 ) -> Vec<Table> {
@@ -3181,31 +3311,51 @@ fn parse_sheet_tables(
         return Vec::new();
     }
 
-    let rel_types = crate::xlsx::parse_rel_types(sheet_rels_xml);
-    let mut rel_ids: Vec<String> = table_rel_ids
+    let Some(relationships) = crate::xlsx::parse_ooxml_relationships(sheet_rels_xml) else {
+        return Vec::new();
+    };
+    let table_relationships: Vec<_> = relationships
         .iter()
-        .filter(|id| {
-            rel_types
-                .get(*id)
-                .is_some_and(|ty| ty.rsplit('/').next() == Some("table"))
+        .filter(|relationship| {
+            relationship
+                .rel_type
+                .as_deref()
+                .is_some_and(|rel_type| crate::xlsx::relationship_type_matches(rel_type, "table"))
         })
-        .cloned()
+        .collect();
+    if table_relationships
+        .iter()
+        .any(|relationship| relationship.external)
+    {
+        return Vec::new();
+    }
+    let mut rel_ids: Vec<&str> = table_rel_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| {
+            table_relationships
+                .iter()
+                .any(|relationship| relationship.id == *id)
+        })
         .collect();
     if rel_ids.is_empty() {
         rel_ids.extend(
-            rel_types
+            table_relationships
                 .iter()
-                .filter(|(_, ty)| ty.rsplit('/').next() == Some("table"))
-                .map(|(id, _)| id.clone()),
+                .map(|relationship| relationship.id.as_str()),
         );
     }
-
     let mut seen = HashSet::new();
     rel_ids
         .into_iter()
-        .filter(|id| seen.insert(id.clone()))
-        .filter_map(|id| sheet_rels.get(&id).cloned())
-        .map(|target| normalize_part_target(sheet_path, &target))
+        .filter(|id| seen.insert(*id))
+        .filter_map(|id| {
+            table_relationships
+                .iter()
+                .find(|relationship| relationship.id == id)
+                .map(|relationship| relationship.target.as_str())
+        })
+        .map(|target| normalize_part_target(sheet_path, target))
         .filter_map(|path| part(zip, &path))
         .filter_map(|bytes| parse_table(&bytes))
         .collect()
@@ -3655,7 +3805,7 @@ fn parse_unchecked_rfx(p: &[u8]) -> AutoFilter {
     ))
 }
 
-fn parse_hlink(p: &[u8], sheet_rels: &HashMap<String, String>) -> Hyperlinks {
+fn parse_hlink(p: &[u8], sheet_rels: &[crate::xlsx::OoxmlRelationship]) -> Hyperlinks {
     const MAX_HYPERLINK_CELLS: usize = 1 << 16;
     let (Some(rf), Some(rl), Some(cf), Some(cl)) =
         (u32le(p, 0), u32le(p, 4), u32le(p, 8), u32le(p, 12))
@@ -3670,9 +3820,15 @@ fn parse_hlink(p: &[u8], sheet_rels: &HashMap<String, String>) -> Hyperlinks {
         return Vec::new();
     };
 
-    let target = match (sheet_rels.get(&rel_id), location.is_empty()) {
-        (Some(url), true) => url.clone(),
-        (Some(url), false) => format!("{url}#{location}"),
+    let relationship = sheet_rels.iter().find(|relationship| {
+        relationship.id == rel_id
+            && relationship.rel_type.as_deref().is_some_and(|rel_type| {
+                crate::xlsx::relationship_type_matches(rel_type, "hyperlink")
+            })
+    });
+    let target = match (relationship, location.is_empty()) {
+        (Some(relationship), true) => relationship.target.clone(),
+        (Some(relationship), false) => format!("{}#{location}", relationship.target),
         (None, false) if rel_id.is_empty() => format!("#{location}"),
         _ => return Vec::new(),
     };
@@ -4039,6 +4195,12 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
+    fn complete_theme_xml(major_latin: &str, minor_latin: &str) -> String {
+        format!(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme><a:majorFont><a:latin typeface="{major_latin}"/></a:majorFont><a:minorFont><a:latin typeface="{minor_latin}"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
+        )
+    }
+
     /// `XLWideString`: `cch:u32` + UTF-16LE chars.
     fn wstr(s: &str) -> Vec<u8> {
         let units: Vec<u16> = s.encode_utf16().collect();
@@ -4308,7 +4470,10 @@ mod tests {
         real.extend_from_slice(&42.0f64.to_le_bytes());
         sh.extend_from_slice(&rec(BRT_CELL_REAL, &real));
 
-        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
+        // The workbook base is `/xl/workbook.bin`; RFC 3986 removes both
+        // parent segments, clamps at `/`, and then resolves the sheet below
+        // `/xl/worksheets`.
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="../../xl/worksheets/sheet1.bin"/></Relationships>"#;
 
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let opt = SimpleFileOptions::default();
@@ -4359,6 +4524,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["품", "목"]
         );
+    }
+
+    #[test]
+    fn external_xlsb_worksheet_relationship_does_not_load_a_local_part() {
+        let mut bundle = vec![0u8; 8];
+        bundle.extend_from_slice(&wstr("rId1"));
+        bundle.extend_from_slice(&wstr("External"));
+        let workbook = rec(BRT_BUNDLE_SH, &bundle);
+
+        let mut sheet = rec(BRT_ROW_HDR, &[0, 0, 0, 0]);
+        let mut number = vec![0u8; 8];
+        number.extend_from_slice(&42.0f64.to_le_bytes());
+        sheet.extend_from_slice(&rec(BRT_CELL_REAL, &number));
+        let relationships = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.bin" TargetMode="External"/></Relationships>"#;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for (path, body) in [
+            ("xl/workbook.bin", workbook.as_slice()),
+            ("xl/_rels/workbook.bin.rels", relationships.as_bytes()),
+            ("xl/worksheets/sheet1.bin", sheet.as_slice()),
+        ] {
+            writer.start_file(path, options).unwrap();
+            writer.write_all(body).unwrap();
+        }
+
+        let workbook = Workbook::open(&writer.finish().unwrap().into_inner()).unwrap();
+        assert_eq!(workbook.sheets[0].sheet_type(), SheetType::Vba);
+        assert!(workbook.sheets[0].cells.is_empty());
     }
 
     #[test]
@@ -4995,7 +5189,7 @@ mod tests {
             &[],
             &styles,
             false,
-            &HashMap::new(),
+            &[],
             &mut budget,
             &[],
             &[],
@@ -5031,7 +5225,7 @@ mod tests {
                 &[],
                 &Styles::default(),
                 false,
-                &HashMap::new(),
+                &[],
                 &mut budget,
                 &[],
                 &[],
@@ -5118,7 +5312,7 @@ mod tests {
             &[],
             &Styles::default(),
             false,
-            &HashMap::new(),
+            &[],
             &mut budget,
             &[],
             &[],
@@ -5459,6 +5653,100 @@ mod tests {
     }
 
     #[test]
+    fn xlsb_drawing_relationship_selection_rejects_ambiguity_and_external_targets() {
+        let duplicate = r#"<Relationships><Relationship Id="first" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="a.xml"/><Relationship Id="second" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="b.xml"/></Relationships>"#;
+        assert_eq!(
+            drawing_relationship_target(duplicate),
+            crate::xlsx::RelationshipTarget::Invalid
+        );
+
+        let duplicate_id = r#"<Relationships><Relationship Id="same" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="a.xml"/><Relationship Id="same" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="b.xml"/></Relationships>"#;
+        assert_eq!(
+            drawing_relationship_target(duplicate_id),
+            crate::xlsx::RelationshipTarget::Invalid
+        );
+
+        let external = r#"<Relationships><Relationship Id="draw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="https://example.invalid/drawing.xml" TargetMode="External"/></Relationships>"#;
+        assert_eq!(
+            drawing_relationship_target(external),
+            crate::xlsx::RelationshipTarget::Invalid
+        );
+
+        let suffix_attacker = r#"<Relationships><Relationship Id="draw" Type="https://example.invalid/relationships/drawing" Target="evil.xml"/></Relationships>"#;
+        assert_eq!(
+            drawing_relationship_target(suffix_attacker),
+            crate::xlsx::RelationshipTarget::Missing
+        );
+    }
+
+    #[test]
+    fn xlsb_chart_import_count_budget_is_shared_across_sheets() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        const CHART_XML: &str = r#"<chartSpace xmlns="http://schemas.openxmlformats.org/drawingml/2006/chart"><chart><plotArea><lineChart><grouping val="standard"/><varyColors val="0"/><axId val="1"/><axId val="2"/></lineChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for index in 1..=2 {
+            writer
+                .start_file(format!("xl/drawings/drawing{index}.xml"), options)
+                .unwrap();
+            writer
+                .write_all(
+                    format!(r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:row>8</xdr:row></xdr:to><xdr:graphicFrame><c:chart r:id="rIdChart{index}"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>"#).as_bytes(),
+                )
+                .unwrap();
+            writer
+                .start_file(
+                    format!("xl/drawings/_rels/drawing{index}.xml.rels"),
+                    options,
+                )
+                .unwrap();
+            writer
+                .write_all(
+                    format!(r#"<Relationships><Relationship Id="rIdChart{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{index}.xml"/></Relationships>"#).as_bytes(),
+                )
+                .unwrap();
+            writer
+                .start_file(format!("xl/charts/chart{index}.xml"), options)
+                .unwrap();
+            writer.write_all(CHART_XML.as_bytes()).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let sheet_rels = |index| {
+            format!(
+                r#"<Relationships><Relationship Id="rIdDraw{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{index}.xml"/></Relationships>"#
+            )
+        };
+        let mut chart_budget = crate::xlsx::ChartImportBudget {
+            charts_remaining: 1,
+            ..crate::xlsx::ChartImportBudget::default()
+        };
+
+        let first = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.bin",
+            &sheet_rels(1),
+            &XlsbTheme::default(),
+            &mut chart_budget,
+        );
+        let second = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet2.bin",
+            &sheet_rels(2),
+            &XlsbTheme::default(),
+            &mut chart_budget,
+        );
+        assert_eq!(first.1.len(), 1);
+        assert!(second.1.is_empty());
+        assert!(second
+            .3
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::LimitExceeded));
+    }
+
+    #[test]
     fn xlsb_chart_sidecar_retains_horizontal_bar_direction() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -5475,20 +5763,22 @@ mod tests {
             .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
             .unwrap();
         writer
-            .write_all(br#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#)
+            .write_all(br#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#)
             .unwrap();
         writer.start_file("xl/charts/chart1.xml", options).unwrap();
         writer
-            .write_all(br#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><plotArea><barChart><barDir val="bar"/><ser><spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></spPr><val><numRef><f>Sheet1!$A$1:$A$2</f></numRef></val></ser></barChart><catAx><majorGridlines/></catAx><valAx/></plotArea></chart><spPr><a:noFill/></spPr></chartSpace>"#)
+            .write_all(br#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><plotArea><barChart><barDir val="bar"/><ser><idx val="0"/><order val="0"/><spPr><a:ln w="19050"><a:solidFill><a:srgbClr val="123456"/></a:solidFill></a:ln></spPr><val><numRef><f>Sheet1!$A$1:$A$2</f></numRef></val></ser><axId val="1"/><axId val="2"/></barChart><catAx><axId val="1"/><majorGridlines/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart><spPr><a:noFill/></spPr></chartSpace>"#)
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
         let sheet_rels = r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let mut chart_budget = crate::xlsx::ChartImportBudget::default();
         let (_, charts, metadata, losses) = read_sheet_drawings(
             &mut zip,
             "xl/worksheets/sheet1.bin",
             sheet_rels,
             &XlsbTheme::default(),
+            &mut chart_budget,
         );
         assert_eq!(charts.len(), 1);
         assert!(losses.is_empty(), "unexpected losses: {losses:?}");
@@ -5496,6 +5786,10 @@ mod tests {
             .iter()
             .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
             .expect("chart sidecar");
+        assert_eq!(
+            sidecar.chart_default_latin_font_family.as_deref(),
+            Some(crate::xlsx::CALC_IMPORTED_CHART_LATIN_FONT_FAMILY)
+        );
         assert_eq!(
             sidecar.chart_bar_direction,
             crate::ChartBarDirection::Horizontal
@@ -5511,6 +5805,71 @@ mod tests {
         assert_eq!(sidecar.chart_value_major_gridlines, Some(false));
         assert_eq!(sidecar.from_cell, Some((2, 1)));
         assert_eq!(sidecar.to_cell, Some((14, 7)));
+    }
+
+    #[test]
+    fn xlsb_chart_sidecar_uses_explicit_minor_theme_latin_font() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer
+            .start_file("xl/drawings/drawing1.xml", options)
+            .unwrap();
+        writer
+            .write_all(br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>1</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:to><xdr:col>7</xdr:col><xdr:row>14</xdr:row></xdr:to><xdr:graphicFrame><c:chart r:id="rIdChart"/></xdr:graphicFrame></xdr:twoCellAnchor></xdr:wsDr>"#)
+            .unwrap();
+        writer
+            .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
+            .unwrap();
+        writer
+            .write_all(br#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#)
+            .unwrap();
+        writer.start_file("xl/charts/chart1.xml", options).unwrap();
+        writer
+            .write_all(
+                br#"<chartSpace><chart><plotArea><lineChart><axId val="1"/><axId val="2"/></lineChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#,
+            )
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let sheet_rels = r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let theme = parse_xlsb_theme(&complete_theme_xml("Ignored Major", "Source Sans 3"));
+
+        let mut chart_budget = crate::xlsx::ChartImportBudget::default();
+        let (_, charts, metadata, losses) = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.bin",
+            sheet_rels,
+            &theme,
+            &mut chart_budget,
+        );
+
+        assert_eq!(charts.len(), 1);
+        assert!(losses.is_empty(), "unexpected losses: {losses:?}");
+        let sidecar = metadata
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("chart sidecar");
+        assert_eq!(
+            sidecar.chart_default_latin_font_family.as_deref(),
+            Some("Source Sans 3")
+        );
+    }
+
+    #[test]
+    fn xlsb_minor_theme_latin_font_family_rejects_empty_and_oversized_values() {
+        for invalid in [String::new(), " ".to_string(), "x".repeat(256)] {
+            let xml = complete_theme_xml("Major", &invalid);
+            let theme = parse_xlsb_theme(&xml);
+            assert!(!theme.source_valid);
+            assert!(theme.minor_latin_font_family.is_none());
+            assert_eq!(
+                theme.chart_default_latin_font_family(),
+                crate::xlsx::CALC_IMPORTED_CHART_LATIN_FONT_FAMILY
+            );
+        }
     }
 
     #[test]
@@ -5537,11 +5896,13 @@ mod tests {
         let bytes = writer.finish().unwrap().into_inner();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
         let sheet_rels = r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let mut chart_budget = crate::xlsx::ChartImportBudget::default();
         let (images, charts, metadata, losses) = read_sheet_drawings(
             &mut zip,
             "xl/worksheets/sheet1.bin",
             sheet_rels,
             &XlsbTheme::default(),
+            &mut chart_budget,
         );
         assert!(images.is_empty());
         assert!(charts.is_empty());
@@ -6865,7 +7226,7 @@ mod tests {
             &[],
             &Styles::default(),
             false,
-            &HashMap::new(),
+            &[],
             &mut budget,
             &[],
             &[],
@@ -6916,7 +7277,7 @@ mod tests {
             &[],
             &Styles::default(),
             false,
-            &HashMap::new(),
+            &[],
             &mut budget,
             &[],
             &[],
@@ -7070,7 +7431,7 @@ mod tests {
             &[],
             &Styles::default(),
             false,
-            &HashMap::new(),
+            &[],
             &mut budget,
             &[],
             &[],

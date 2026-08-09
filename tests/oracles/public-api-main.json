@@ -487,7 +487,36 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub enum ChartUnsupportedReason { Combo, ThreeDimensional, Pivot, ExternalData, UnsupportedKind, }",
+      "declaration": "#[non_exhaustive]pub struct ChartTextStyle { pub latin_font_family: String, pub size_hundredths_of_point: u32, pub color: Color, pub bold: bool, pub italic: bool, pub underline: bool, pub strikethrough: bool, pub kerning_minimum_hundredths_of_point: Option<u32>, pub rotation_degrees: Option<i16>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ChartTextStyle",
+      "trait_implementations": [
+        "impl Clone for ChartTextStyle",
+        "impl Debug for ChartTextStyle",
+        "impl Eq for ChartTextStyle",
+        "impl Hash for ChartTextStyle",
+        "impl PartialEq for ChartTextStyle",
+        "impl StructuralPartialEq for ChartTextStyle"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub struct ChartTextStyles { pub chart_title: Option<ChartTextStyle>, pub category_axis_title: Option<ChartTextStyle>, pub value_axis_title: Option<ChartTextStyle>, pub legend: Option<ChartTextStyle>, pub category_axis_labels: Option<ChartTextStyle>, pub value_axis_labels: Option<ChartTextStyle>, pub data_labels: Option<ChartTextStyle>, }",
+      "inherent_items": [],
+      "kind": "struct",
+      "path": "rxls::ChartTextStyles",
+      "trait_implementations": [
+        "impl Clone for ChartTextStyles",
+        "impl Debug for ChartTextStyles",
+        "impl Default for ChartTextStyles",
+        "impl Eq for ChartTextStyles",
+        "impl Hash for ChartTextStyles",
+        "impl PartialEq for ChartTextStyles",
+        "impl StructuralPartialEq for ChartTextStyles"
+      ]
+    },
+    {
+      "declaration": "#[non_exhaustive]pub enum ChartUnsupportedReason { Combo, ThreeDimensional, Pivot, ExternalData, UnsupportedKind, MixedTextStyle, UnsupportedTextStyle, UnsupportedDataLabels, InvalidAxisVisibility, UnsupportedAxisTopology, UnsupportedAxisPresentation, UnsupportedPlotSemantics, UnsupportedLegend, UnsupportedChartStyle, UnsupportedMarkup, }",
       "inherent_items": [],
       "kind": "enum",
       "path": "rxls::ChartUnsupportedReason",
@@ -803,7 +832,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub struct DrawingMetadata { pub kind: DrawingObjectKind, pub object_index: usize, pub from_cell: Option<(u32, u16)>, pub to_cell: Option<(u32, u16)>, pub from_offset_emu: Option<(i64, i64)>, pub to_offset_emu: Option<(i64, i64)>, pub absolute_size_emu: Option<(u64, u64)>, pub crop: Option<DrawingCrop>, pub rotation_mdeg: Option<i32>, pub z_order: Option<i32>, pub alt_text: Option<String>, pub name: Option<String>, pub behavior: DrawingAnchorBehavior, pub chart_palette: Vec<Color>, pub chart_series_caches: Vec<ChartSeriesCache>, pub chart_series_styles: Vec<ChartSeriesStyle>, pub chart_frame_fill: ChartFrameFill, pub chart_frame_style_losses: Vec<ChartFrameStyleLossKind>, pub chart_category_major_gridlines: Option<bool>, pub chart_value_major_gridlines: Option<bool>, pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>, pub chart_bar_direction: ChartBarDirection, }",
+      "declaration": "#[non_exhaustive]pub struct DrawingMetadata { pub kind: DrawingObjectKind, pub object_index: usize, pub from_cell: Option<(u32, u16)>, pub to_cell: Option<(u32, u16)>, pub from_offset_emu: Option<(i64, i64)>, pub to_offset_emu: Option<(i64, i64)>, pub absolute_size_emu: Option<(u64, u64)>, pub crop: Option<DrawingCrop>, pub rotation_mdeg: Option<i32>, pub z_order: Option<i32>, pub alt_text: Option<String>, pub name: Option<String>, pub behavior: DrawingAnchorBehavior, pub chart_palette: Vec<Color>, pub chart_default_latin_font_family: Option<String>, pub chart_text_styles: ChartTextStyles, pub chart_category_axis_visible: Option<bool>, pub chart_value_axis_visible: Option<bool>, pub chart_series_caches: Vec<ChartSeriesCache>, pub chart_series_styles: Vec<ChartSeriesStyle>, pub chart_frame_fill: ChartFrameFill, pub chart_frame_style_losses: Vec<ChartFrameStyleLossKind>, pub chart_category_major_gridlines: Option<bool>, pub chart_value_major_gridlines: Option<bool>, pub chart_unsupported_reasons: Vec<ChartUnsupportedReason>, pub chart_bar_direction: ChartBarDirection, }",
       "inherent_items": [],
       "kind": "struct",
       "path": "rxls::DrawingMetadata",
@@ -2529,10 +2558,10 @@
       "enum": 43,
       "fn": 30,
       "module": 1,
-      "struct": 61,
+      "struct": 63,
       "trait": 2,
       "type": 6
     },
-    "items": 147
+    "items": 149
   }
 }

@@ -119,7 +119,7 @@ fn partial_area_image_workbook(
         ("xl/drawings/drawing1.xml", drawing.as_bytes()),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            br#"<Relationships><Relationship Id="rIdImage" Target="../media/image1.png"/></Relationships>"#,
+            br#"<Relationships><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#,
         ),
         ("xl/media/image1.png", &image),
     ]))
@@ -171,7 +171,7 @@ fn offset_cropped_image_workbook(right_to_left: bool) -> Workbook {
         ("xl/drawings/drawing1.xml", drawing.as_bytes()),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            br#"<Relationships><Relationship Id="rIdImage" Target="../media/image1.png"/></Relationships>"#,
+            br#"<Relationships><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#,
         ),
         ("xl/media/image1.png", &image),
     ]))
@@ -247,7 +247,7 @@ fn rotated_image_workbook(right_to_left: bool) -> Workbook {
         ("xl/drawings/drawing1.xml", drawing.as_bytes()),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            br#"<Relationships><Relationship Id="rIdImage" Target="../media/image1.png"/></Relationships>"#,
+            br#"<Relationships><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#,
         ),
         ("xl/media/image1.png", &image),
     ]))

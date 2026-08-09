@@ -135,7 +135,11 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertLess(checksum_index, wasm_install_index)
         self.assertNotIn('--pattern "rxls-$version.crate"', workflow)
         self.assertIn('--verify-bundle "$smoke/assets"', workflow)
-        self.assertIn("--expected-files 47", workflow)
+        self.assertIn("--expected-files 52", workflow)
+        self.assertIn(
+            '--receipt "$smoke/assets/release-cargo-publish-dry-run.json"',
+            workflow,
+        )
         self.assertIn("npm install --ignore-scripts --no-audit --no-fund", workflow)
         self.assertIn('require("rxls-wasm")', workflow)
         self.assertIn("assert.equal(maxInputBytes(), 32 * 1024 * 1024)", workflow)
@@ -254,10 +258,10 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertGreater(registry_upload, registry_index)
         self.assertIn("target/release-crates-io-distribution-smoke.json", workflow)
 
-    def test_hosted_release_bundle_contract_is_exactly_47_files(self) -> None:
+    def test_hosted_candidate_release_bundle_contract_is_exactly_48_files(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertEqual(workflow.count("--expected-files 47"), 3)
+        self.assertEqual(workflow.count("--expected-files 48"), 2)
         generation = workflow.index("name: Generate release evidence")
         manifest_start = workflow.index(
             "python3 scripts/release_manifest.py", generation
@@ -313,10 +317,11 @@ class ReleaseToolTests(unittest.TestCase):
             "fuzz-seed-replay.json",
             "release-toolchain-versions.json",
             "release-crate-distribution-smoke.json",
+            "release-cargo-publish-dry-run.json",
             "public-hygiene.json",
             "rxls-release-manifest.json",
         }
-        self.assertEqual(len(expected), 47)
+        self.assertEqual(len(expected), 48)
         self.assertEqual(actual, expected)
         for name in (
             "release-libreoffice-version.txt",

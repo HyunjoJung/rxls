@@ -6,7 +6,10 @@
 //! program is both smaller and semantically truthful, so the PDF backend
 //! prefers it and keeps the Type 3 path as the fallback.
 
-use ttf_parser::{Face, GlyphId, Permissions};
+use ttf_parser::{Face, GlyphId, Permissions, Tag};
+
+const OS2_WINDOWS_ASCENT_OFFSET: usize = 74;
+const OS2_WINDOWS_DESCENT_OFFSET: usize = 76;
 
 /// Which font-program flavour a subset carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +33,10 @@ pub(crate) struct EmbeddedFace {
     pub(crate) advances: Vec<u16>,
     /// Design units per em.
     pub(crate) units_per_em: u16,
-    /// Typographic ascender in design units.
-    pub(crate) ascender: i16,
-    /// Typographic descender in design units, non-positive.
-    pub(crate) descender: i16,
+    /// PDF descriptor ascent in design units.
+    pub(crate) pdf_ascent: i32,
+    /// PDF descriptor descent in design units, non-positive.
+    pub(crate) pdf_descent: i32,
     /// Global bounding box in design units as `(x_min, y_min, x_max, y_max)`.
     pub(crate) bbox: (i16, i16, i16, i16),
     /// Capital height in design units.
@@ -103,6 +106,67 @@ fn font_program_kind(has_cff: bool, has_glyf: bool) -> Result<FontProgramKind, E
     }
 }
 
+fn read_be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let bytes: [u8; 2] = data.get(offset..end)?.try_into().ok()?;
+    Some(u16::from_be_bytes(bytes))
+}
+
+/// Select the vertical metrics written to a PDF font descriptor.
+///
+/// LibreOffice uses the unsigned OS/2 Windows clipping metrics for SFNT font
+/// descriptors. Reading the raw fields avoids interpreting values above
+/// `i16::MAX` as negative, while their `u16` representation gives an explicit
+/// upper bound before the PDF backend widens and rescales them. A malformed
+/// table is not authoritative. A zero Windows component is filled independently
+/// from the parser's horizontal metrics, then the global font box, and finally
+/// a one-em ascent as bounded fallbacks, while a nonzero sibling is preserved.
+fn pdf_descriptor_vertical_metrics(face: &Face<'_>) -> (i32, i32) {
+    let horizontal = (i32::from(face.ascender()), i32::from(face.descender()));
+    let bounds = face.global_bounding_box();
+    let bounding_box = (i32::from(bounds.y_max), i32::from(bounds.y_min));
+    let fallback_ascent = if horizontal.0 > 0 {
+        horizontal.0
+    } else if bounding_box.0 > 0 {
+        bounding_box.0
+    } else {
+        i32::from(face.units_per_em().max(1))
+    };
+    let fallback_descent = if horizontal.1 <= 0 {
+        horizontal.1
+    } else if bounding_box.1 <= 0 {
+        bounding_box.1
+    } else {
+        0
+    };
+    let fallback = (fallback_ascent, fallback_descent);
+
+    if face.tables().os2.is_none() {
+        return fallback;
+    }
+    let Some(os2) = face.raw_face().table(Tag::from_bytes(b"OS/2")) else {
+        return fallback;
+    };
+    let Some(ascent) = read_be_u16(os2, OS2_WINDOWS_ASCENT_OFFSET) else {
+        return fallback;
+    };
+    let Some(descent) = read_be_u16(os2, OS2_WINDOWS_DESCENT_OFFSET) else {
+        return fallback;
+    };
+    let ascent = if ascent == 0 {
+        fallback.0
+    } else {
+        i32::from(ascent)
+    };
+    let descent = if descent == 0 {
+        fallback.1
+    } else {
+        -i32::from(descent)
+    };
+
+    (ascent, descent)
+}
+
 /// Subset `face_bytes` down to `requested` glyph ids.
 ///
 /// `requested` need not be sorted or deduplicated. Glyph 0 is always included
@@ -154,6 +218,7 @@ pub(crate) fn subset_face(
         .map(|gid| face.glyph_hor_advance(GlyphId(*gid)).unwrap_or(0))
         .collect();
     let bounds = face.global_bounding_box();
+    let (pdf_ascent, pdf_descent) = pdf_descriptor_vertical_metrics(&face);
 
     Ok(EmbeddedFace {
         program,
@@ -161,8 +226,8 @@ pub(crate) fn subset_face(
         gids,
         advances,
         units_per_em: face.units_per_em(),
-        ascender: face.ascender(),
-        descender: face.descender(),
+        pdf_ascent,
+        pdf_descent,
         bbox: (bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max),
         cap_height: face.capital_height().unwrap_or_else(|| face.ascender()),
         italic_angle: face.italic_angle(),
@@ -286,8 +351,8 @@ mod tests {
         assert_eq!(first.subset_gid(9), None, "unrequested glyphs are absent");
         assert_eq!(first.advances.len(), first.gids.len());
         assert_eq!(first.units_per_em, 1_000);
-        assert_eq!(first.ascender, 800);
-        assert_eq!(first.descender, -200);
+        assert_eq!(first.pdf_ascent, 900);
+        assert_eq!(first.pdf_descent, -300);
         assert_eq!(first.cap_height, 700);
     }
 
@@ -318,8 +383,8 @@ mod tests {
         );
         assert_eq!(first.advances, vec![600, 600]);
         assert_eq!(first.units_per_em, 1_000);
-        assert_eq!(first.ascender, 800);
-        assert_eq!(first.descender, -200);
+        assert_eq!(first.pdf_ascent, 900);
+        assert_eq!(first.pdf_descent, -300);
         assert_eq!(first.cap_height, 700);
     }
 
@@ -366,6 +431,150 @@ mod tests {
             subset_face(&stripped, &[1, 2]).unwrap_err(),
             EmbedRejection::EmbeddingRestricted
         );
+    }
+
+    #[test]
+    fn pdf_descriptor_metrics_use_unsigned_windows_values_without_wrapping() {
+        let bytes = synthetic_true_type_bytes();
+        let face = Face::parse(&bytes, 0).unwrap();
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (900, -300));
+
+        let mut maximum = bytes;
+        write_table_u16(&mut maximum, b"OS/2", OS2_WINDOWS_ASCENT_OFFSET, u16::MAX);
+        write_table_u16(&mut maximum, b"OS/2", OS2_WINDOWS_DESCENT_OFFSET, u16::MAX);
+        let face = Face::parse(&maximum, 0).unwrap();
+        assert_eq!(
+            pdf_descriptor_vertical_metrics(&face),
+            (65_535, -65_535),
+            "OS/2 Windows fields are unsigned and bounded to u16"
+        );
+    }
+
+    #[test]
+    fn pdf_descriptor_metrics_fall_back_for_absent_malformed_or_zero_windows_pairs() {
+        let bytes = synthetic_true_type_bytes();
+
+        let stripped = strip_table(&bytes, b"OS/2");
+        let face = Face::parse(&stripped, 0).unwrap();
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (800, -200));
+
+        let mut bounding_box_fallback = stripped.clone();
+        write_table_u16(&mut bounding_box_fallback, b"hhea", 4, 0);
+        write_table_u16(&mut bounding_box_fallback, b"hhea", 6, 0);
+        let face = Face::parse(&bounding_box_fallback, 0).unwrap();
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (700, 0));
+
+        let mut invalid_ascent = stripped.clone();
+        write_table_u16(&mut invalid_ascent, b"hhea", 4, 0);
+        let face = Face::parse(&invalid_ascent, 0).unwrap();
+        assert_eq!(
+            pdf_descriptor_vertical_metrics(&face),
+            (700, -200),
+            "an invalid hhea ascent must not discard its valid descent sibling"
+        );
+
+        let mut invalid_descent = stripped.clone();
+        write_table_u16(&mut invalid_descent, b"hhea", 6, 100);
+        let face = Face::parse(&invalid_descent, 0).unwrap();
+        assert_eq!(
+            pdf_descriptor_vertical_metrics(&face),
+            (800, 0),
+            "an invalid hhea descent must not discard its valid ascent sibling"
+        );
+
+        let mut em_fallback = bounding_box_fallback;
+        write_table_u16(&mut em_fallback, b"head", 42, 0);
+        let face = Face::parse(&em_fallback, 0).unwrap();
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (1_000, 0));
+
+        let mut malformed = bytes.clone();
+        write_table_u16(&mut malformed, b"OS/2", 0, u16::MAX);
+        let face = Face::parse(&malformed, 0).unwrap();
+        assert!(face.tables().os2.is_none());
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (800, -200));
+
+        let mut zero_ascent = bytes.clone();
+        write_table_u16(&mut zero_ascent, b"OS/2", OS2_WINDOWS_ASCENT_OFFSET, 0);
+        let face = Face::parse(&zero_ascent, 0).unwrap();
+        assert_eq!(
+            pdf_descriptor_vertical_metrics(&face),
+            (800, -300),
+            "only a zero Windows ascent falls back to hhea"
+        );
+
+        let mut zero_descent = bytes.clone();
+        write_table_u16(&mut zero_descent, b"OS/2", OS2_WINDOWS_DESCENT_OFFSET, 0);
+        let face = Face::parse(&zero_descent, 0).unwrap();
+        assert_eq!(
+            pdf_descriptor_vertical_metrics(&face),
+            (900, -200),
+            "only a zero Windows descent falls back to hhea"
+        );
+
+        let mut both_zero = bytes;
+        write_table_u16(&mut both_zero, b"OS/2", OS2_WINDOWS_ASCENT_OFFSET, 0);
+        write_table_u16(&mut both_zero, b"OS/2", OS2_WINDOWS_DESCENT_OFFSET, 0);
+        let face = Face::parse(&both_zero, 0).unwrap();
+        assert_eq!(pdf_descriptor_vertical_metrics(&face), (800, -200));
+    }
+
+    #[test]
+    fn pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = crate::font::FontPack::load_manifest(manifest).unwrap();
+        for (family, kind, upem, ascent, descent) in [
+            ("Arimo", FontProgramKind::TrueType, 2_048, 2_136, -797),
+            ("Noto Sans CJK KR", FontProgramKind::Cff, 1_000, 1_160, -288),
+        ] {
+            let id = pack
+                .resolve(crate::font::FontRequest {
+                    family,
+                    weight: 400,
+                    italic: false,
+                })
+                .id;
+            let identity = pack.selected_face_identity(id).unwrap();
+            assert_eq!(identity.family, family);
+            let bytes = pack.face_program(identity.face_sha256).unwrap();
+            let glyph = glyph_id_for_char(bytes, 'Q').unwrap();
+            let embedded = subset_face(bytes, &[glyph]).unwrap();
+            assert_eq!(embedded.kind, kind, "{family}");
+            assert_eq!(embedded.units_per_em, upem, "{family}");
+            assert_eq!(embedded.pdf_ascent, ascent, "{family}");
+            assert_eq!(embedded.pdf_descent, descent, "{family}");
+        }
+    }
+
+    fn synthetic_true_type_bytes() -> Vec<u8> {
+        let pack = crate::font::synthetic_test_pack();
+        let id = pack
+            .resolve(crate::font::FontRequest {
+                family: "Wide Sans",
+                weight: 400,
+                italic: false,
+            })
+            .id;
+        let digest = pack.selected_face_identity(id).unwrap().face_sha256;
+        pack.face_program(digest).unwrap().to_vec()
+    }
+
+    fn table_offset(data: &[u8], tag: &[u8; 4]) -> usize {
+        let count = u16::from_be_bytes([data[4], data[5]]) as usize;
+        for index in 0..count {
+            let record = 12 + index * 16;
+            if &data[record..record + 4] == tag {
+                return u32::from_be_bytes(data[record + 8..record + 12].try_into().unwrap())
+                    as usize;
+            }
+        }
+        panic!("missing table {tag:?}");
+    }
+
+    fn write_table_u16(data: &mut [u8], tag: &[u8; 4], field_offset: usize, value: u16) {
+        let offset = table_offset(data, tag) + field_offset;
+        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Remove one table from an sfnt, leaving the rest intact.

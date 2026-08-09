@@ -2371,6 +2371,21 @@ fn prepared_single_page_ignores_output_inert_source_dimension_changes() {
 
 #[test]
 fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() {
+    fn has_view_gridline(nodes: &[SceneNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
+            SceneNode::ClipGroup(group) => has_view_gridline(&group.nodes),
+            _ => false,
+        })
+    }
+    fn has_print_gridline(nodes: &[SceneNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::BLACK && line.width == Fixed::from_raw(137),
+            SceneNode::ClipGroup(group) => has_print_gridline(&group.nodes),
+            _ => false,
+        })
+    }
+
     let mut workbook = Workbook::new();
     let sheet = workbook.add_sheet("Single page");
     for row in 0..20 {
@@ -2403,10 +2418,7 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         single_page_sheets: true,
         ..PrintOptions::default()
     };
-    let whole_scene_with_gridlines = build_scene(&workbook, 0, &options.render).unwrap();
-    let mut override_render = options.render.clone();
-    override_render.gridlines = false;
-    let whole_scene = build_scene(&workbook, 0, &override_render).unwrap();
+    let whole_scene = build_scene(&workbook, 0, &options.render).unwrap();
     let fitted = build_print_document(&workbook, 0, &options).unwrap();
     assert_eq!(
         fitted,
@@ -2423,7 +2435,8 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         fitted.pages[0].scene.background,
         whole_scene.scene.background
     );
-    assert_ne!(fitted.pages[0].scene, whole_scene_with_gridlines.scene);
+    assert!(has_print_gridline(&fitted.pages[0].scene.nodes));
+    assert!(has_view_gridline(&whole_scene.scene.nodes));
     assert_eq!(fitted.report.logical_pages, 1);
     assert_eq!(fitted.report.scale_permille, 1_000);
     assert_eq!(fitted.report.pages[0].scale_permille, 1_000);
@@ -2478,21 +2491,95 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         },
         ..PrintOptions::default()
     };
-    let suppressed = build_print_document(&workbook, 0, &grid_requested).unwrap();
+    let retained = build_print_document(&workbook, 0, &grid_requested).unwrap();
     let with_gridlines = build_scene(&workbook, 0, &grid_requested.render).unwrap();
-    let mut without_gridlines = grid_requested.render.clone();
-    without_gridlines.gridlines = false;
-    let expected = build_scene(&workbook, 0, &without_gridlines).unwrap();
     assert_eq!(
-        scene_text(&suppressed.pages[0].scene),
-        scene_text(&expected.scene)
+        scene_text(&retained.pages[0].scene),
+        scene_text(&with_gridlines.scene)
     );
-    assert_eq!(suppressed.pages[0].scene.title, expected.scene.title);
+    assert_eq!(retained.pages[0].scene.title, with_gridlines.scene.title);
     assert_eq!(
-        suppressed.pages[0].scene.background,
-        expected.scene.background
+        retained.pages[0].scene.background,
+        with_gridlines.scene.background
     );
-    assert_ne!(suppressed.pages[0].scene, with_gridlines.scene);
+    assert!(has_print_gridline(&retained.pages[0].scene.nodes));
+    assert!(has_view_gridline(&with_gridlines.scene.nodes));
+}
+
+#[test]
+fn single_page_gridline_intent_is_preserved_for_xls_xlsx_xlsb_and_ods_sources() {
+    fn has_view_gridline(nodes: &[SceneNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
+            SceneNode::ClipGroup(group) => has_view_gridline(&group.nodes),
+            _ => false,
+        })
+    }
+    fn has_print_gridline(nodes: &[SceneNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::BLACK && line.width == Fixed::from_raw(137),
+            SceneNode::ClipGroup(group) => has_print_gridline(&group.nodes),
+            _ => false,
+        })
+    }
+
+    let mut sources = [
+        (
+            "xls",
+            include_bytes!("../../tests/fixtures/xls/reader-basic.xls").as_slice(),
+        ),
+        (
+            "xlsb",
+            include_bytes!("../../tests/fixtures/xlsb/reader-basic.xlsb").as_slice(),
+        ),
+        (
+            "ods",
+            include_bytes!("../../tests/fixtures/ods/repeated-hidden.ods").as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, bytes)| (label, Workbook::open(bytes).unwrap()))
+    .collect::<Vec<_>>();
+    sources.push((
+        "xlsx",
+        source_dimension_xlsx(
+            "A1:B2",
+            r#"<sheetViews><sheetView showGridLines="0"/></sheetViews><sheetData>
+              <row r="1"><c r="A1" t="inlineStr"><is><t>A</t></is></c></row>
+              <row r="2"><c r="B2" t="inlineStr"><is><t>B</t></is></c></row>
+            </sheetData><printOptions gridLines="1"/>"#,
+        ),
+    ));
+
+    for (label, mut workbook) in sources {
+        if label != "xlsx" {
+            workbook.sheets[0].set_print_gridlines();
+        }
+        if matches!(label, "ods" | "xlsx") {
+            let ordinary = build_scene(&workbook, 0, &RenderOptions::default()).unwrap();
+            assert!(
+                !has_view_gridline(&ordinary.scene.nodes),
+                "ordinary rendering must continue to honor the source sheet-view gridline flag"
+            );
+        }
+        let enabled = PrintOptions {
+            single_page_sheets: true,
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &enabled).unwrap();
+        assert!(
+            has_print_gridline(&document.pages[0].scene.nodes),
+            "{label} source gridlines must survive SinglePageSheets"
+        );
+
+        let mut disabled = enabled;
+        disabled.render.gridlines = false;
+        let document = build_print_document(&workbook, 0, &disabled).unwrap();
+        assert!(
+            !has_print_gridline(&document.pages[0].scene.nodes),
+            "{label} caller opt-out must still suppress gridlines"
+        );
+    }
 }
 
 #[test]

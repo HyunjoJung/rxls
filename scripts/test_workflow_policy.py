@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "scripts" / "check_workflow_policy.py"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 CODEQL_WORKFLOW = ROOT / ".github" / "workflows" / "codeql.yml"
 FUZZ_WORKFLOW = ROOT / ".github" / "workflows" / "fuzz.yml"
 RENDER_ORACLE_WORKFLOW = ROOT / ".github" / "workflows" / "render-oracle.yml"
@@ -43,7 +44,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(self.policy.audit_repository(ROOT), [])
 
     def test_ci_and_release_pin_the_registry_semver_gate(self) -> None:
-        for workflow_path in (CI_WORKFLOW, ROOT / ".github" / "workflows" / "release.yml"):
+        for workflow_path in (
+            CI_WORKFLOW,
+            ROOT / ".github" / "workflows" / "release.yml",
+        ):
             original = workflow_path.read_text(encoding="utf-8")
             with self.subTest(workflow=workflow_path.name, state="valid"):
                 self.assertEqual(
@@ -60,9 +64,15 @@ class WorkflowPolicyTests(unittest.TestCase):
                     "cargo install cargo-semver-checks",
                     1,
                 ),
-                "baseline": original.replace("--baseline-version 0.1.2", "--baseline-version 0.1.3", 1),
-                "release_type": original.replace("--release-type patch", "--release-type minor", 1),
-                "feature_mode": original.replace("--only-explicit-features", "--all-features", 1),
+                "baseline": original.replace(
+                    "--baseline-version 0.1.2", "--baseline-version 0.1.3", 1
+                ),
+                "release_type": original.replace(
+                    "--release-type patch", "--release-type minor", 1
+                ),
+                "feature_mode": original.replace(
+                    "--only-explicit-features", "--all-features", 1
+                ),
             }
             for name, workflow in mutations.items():
                 with self.subTest(workflow=workflow_path.name, mutation=name):
@@ -154,33 +164,27 @@ jobs:
             ),
             valid.replace(
                 "      - name: Verify exact source revision\n",
-                "      - run: true\n"
-                "      - name: Verify exact source revision\n",
+                "      - run: true\n      - name: Verify exact source revision\n",
             ),
             valid.replace(
                 "        shell: bash\n",
-                "        continue-on-error: true\n"
-                "        shell: bash\n",
+                "        continue-on-error: true\n        shell: bash\n",
                 1,
             ),
             valid.replace(
                 "        shell: bash\n",
-                "        if: ${{ false }}\n"
-                "        shell: bash\n",
+                "        if: ${{ false }}\n        shell: bash\n",
                 1,
             ),
             valid.replace(
                 "        with:\n",
-                "        if: ${{ false }}\n"
-                "        with:\n",
+                "        if: ${{ false }}\n        with:\n",
                 1,
             ),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation):
-                self.assertTrue(
-                    self.policy.audit_pr_head_checkouts(path, mutation)
-                )
+                self.assertTrue(self.policy.audit_pr_head_checkouts(path, mutation))
 
     def test_pull_request_checkout_accepts_only_exact_hardened_verifier(self) -> None:
         expression = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -213,9 +217,7 @@ jobs:
         ):
             with self.subTest(command=command):
                 weakened = hardened.replace(command, "", 1)
-                self.assertTrue(
-                    self.policy.audit_pr_head_checkouts(path, weakened)
-                )
+                self.assertTrue(self.policy.audit_pr_head_checkouts(path, weakened))
 
     def test_flow_map_pull_request_cannot_bypass_exact_head_guards(self) -> None:
         expression = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -267,16 +269,16 @@ jobs:
         valid = (
             "on: pull_request\n"
             "jobs:\n"
-            "  linux:\n"
-            + guarded_steps
-            + "  macos:\n"
-            + guarded_steps
+            "  linux:\n" + guarded_steps + "  macos:\n" + guarded_steps
         )
         path = Path(".github/workflows/example.yml")
         self.assertEqual(self.policy.audit_pr_head_checkouts(path, valid), [])
 
         mutations = (
-            valid.replace("  macos:\n" + guarded_steps, "  macos:\n    steps:\n      - run: true\n"),
+            valid.replace(
+                "  macos:\n" + guarded_steps,
+                "  macos:\n    steps:\n      - run: true\n",
+            ),
             valid.replace(
                 "  macos:\n" + guarded_steps,
                 "  macos:\n    uses: owner/repository/.github/workflows/test.yml@main\n",
@@ -350,6 +352,224 @@ steps:
             self.policy.audit_release_versions(Path("release.yml"), text), []
         )
 
+    def test_core_release_binds_dry_run_and_public_provenance(self) -> None:
+        original = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(
+            self.policy.audit_core_release_evidence(Path("release.yml"), original),
+            [],
+        )
+        runner = (
+            "          python3 scripts/check_cargo_publish_dry_run.py run \\\n"
+            "            --manifest Cargo.toml \\\n"
+            '            --git-sha "$GITHUB_SHA" \\\n'
+            "            --output target/package/"
+            "release-cargo-publish-dry-run.json\n"
+        )
+        dist_verifier = (
+            "          python3 scripts/check_cargo_publish_dry_run.py verify \\\n"
+            "            --manifest Cargo.toml \\\n"
+            '            --git-sha "$GITHUB_SHA" \\\n'
+            "            --receipt dist/release-cargo-publish-dry-run.json\n"
+        )
+        mutations = {
+            "bare_dry_run": original.replace(
+                runner,
+                "          cargo publish --dry-run --locked --registry crates-io\n",
+                1,
+            ),
+            "heredoc_receipt": original.replace(
+                runner,
+                "          python3 - <<'PY'\n"
+                "          from pathlib import Path\n"
+                "          Path('target/package/release-cargo-publish-dry-run.json')"
+                ".write_text('{}')\n"
+                "          PY\n",
+                1,
+            ),
+            "runner_output_detached": original.replace(
+                "--output target/package/release-cargo-publish-dry-run.json",
+                "--output target/release-cargo-publish-dry-run.json",
+                1,
+            ),
+            "candidate_verifier": original.replace(
+                dist_verifier,
+                "          true\n",
+                1,
+            ),
+            "candidate_comparison_verifier": original.replace(
+                "--receipt target/baseline-release/release-cargo-publish-dry-run.json",
+                "--receipt target/baseline-release/unverified.json",
+                1,
+            ),
+            "tag_authorization_verifier": original.replace(
+                "--receipt target/attested-candidate-release/"
+                "release-cargo-publish-dry-run.json",
+                "--receipt target/attested-candidate-release/unverified.json",
+                1,
+            ),
+            "post_download_verifier": original.replace(
+                '--receipt "$smoke/assets/release-cargo-publish-dry-run.json"',
+                '--receipt "$smoke/assets/unverified.json"',
+                1,
+            ),
+            "candidate_manifest_upload": original.replace(
+                "            target/reproducibility/rxls-release-candidate-manifest.json\n",
+                "",
+                1,
+            ),
+            "tag_comparison": original.replace(
+                "          cp target/publication-attestation/rxls-tag-release-comparison.json dist/\n",
+                "",
+                1,
+            ),
+            "manifest_input_count": original.replace(
+                "[[ ${#artifacts[@]} -eq 50 ]]",
+                "[[ ${#artifacts[@]} -eq 49 ]]",
+                1,
+            ),
+            "candidate_file_count": original.replace(
+                "--expected-files 48",
+                "--expected-files 47",
+                1,
+            ),
+            "publication_file_count": original.replace(
+                "--expected-files 52",
+                "--expected-files 51",
+                1,
+            ),
+            "github_release_reconciler": original.replace(
+                "python3 scripts/reconcile_github_release.py \\\n",
+                "true \\\n",
+                1,
+            ),
+            "github_release_revision": original.replace(
+                '--target-commitish "$GITHUB_SHA" \\\n',
+                '--target-commitish "$GITHUB_REF_NAME" \\\n',
+                1,
+            ),
+            "github_release_inventory": original.replace(
+                "            --dist dist \\\n            --expected-files 52 \\\n",
+                "            --dist dist \\\n            --expected-files 51 \\\n",
+                1,
+            ),
+            "github_release_failure_bypass": original.replace(
+                "      - name: Create or update GitHub release\n",
+                "      - name: Create or update GitHub release\n        continue-on-error: true\n",
+                1,
+            ),
+            "release_main_ancestor_only": original.replace(
+                'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+                'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+                1,
+            ),
+            "release_concurrency_cancel": original.replace(
+                "cancel-in-progress: false",
+                "cancel-in-progress: true",
+                1,
+            ),
+            "publish_registry_unbound": original.replace(
+                "cargo publish --locked --registry crates-io",
+                "cargo publish --locked",
+                1,
+            ),
+            "publish_token_in_argv": original.replace(
+                "cargo publish --locked --registry crates-io",
+                'cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"',
+                1,
+            ),
+            "publish_tag_revalidation": original.replace(
+                '          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags\n'
+                '          test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"\n',
+                "",
+                1,
+            ),
+            "github_release_wildcard": original.replace(
+                "python3 scripts/reconcile_github_release.py \\\n",
+                'gh release upload "$tag" dist/* --clobber \\\n',
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(workflow, original)
+                self.assertTrue(
+                    self.policy.audit_core_release_evidence(
+                        Path("release.yml"), workflow
+                    )
+                )
+
+    def test_github_release_reconciler_invariants_are_mutation_guarded(self) -> None:
+        path = Path("scripts/reconcile_github_release.py")
+        original = (ROOT / path).read_text(encoding="utf-8")
+        self.assertEqual(
+            self.policy.audit_github_release_reconciler(path, original), []
+        )
+        mutations = {
+            "local_count": original.replace(
+                "if len(entries) != expected_files:", "if False:", 1
+            ),
+            "stale_asset_delete": original.replace(
+                "client.delete_release_asset(asset_id)", "pass", 1
+            ),
+            "replacement_empty_guard": original.replace(
+                "if remaining_assets != []:", "if False:", 1
+            ),
+            "upload_all": original.replace(
+                "client.upload_release_asset(release_id, local_assets[name])",
+                "pass",
+                1,
+            ),
+            "release_state": original.replace(
+                '{"draft": False, "prerelease": False}',
+                '{"draft": True, "prerelease": True}',
+                1,
+            ),
+            "published_state_verification": original.replace(
+                "require_published=True", "require_published=False", 1
+            ),
+            "asset_count": original.replace(
+                "if len(remote_assets) != len(local_assets):", "if False:", 1
+            ),
+            "uploaded_state": original.replace(
+                'if raw.get("state") != "uploaded":', "if False:", 1
+            ),
+            "byte_size": original.replace("size != local.size", "False", 1),
+            "remote_digest": original.replace(
+                "if digest != local.digest:", "if False:", 1
+            ),
+            "exact_name_set": original.replace(
+                "if seen_names != set(local_assets):", "if False:", 1
+            ),
+            "target_sha": original.replace(
+                "if SHA_RE.fullmatch(target_commitish) is None:", "if False:", 1
+            ),
+            "tag_commit_preflight": original.replace(
+                "if client.get_tag_commit_sha(tag) != target_commitish:",
+                "if False:",
+                1,
+            ),
+            "exact_release_noop": original.replace(
+                "        return\n    immutable = release.get",
+                "        pass\n    immutable = release.get",
+                1,
+            ),
+            "immutable_release": original.replace(
+                "if immutable is True:", "if False:", 1
+            ),
+            "published_release_guard": original.replace(
+                'if release.get("draft") is not True:', "if False:", 1
+            ),
+            "external_dependency": original.replace(
+                "import urllib.request", "import requests", 1
+            ),
+        }
+        for name, source in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(source, original)
+                self.assertTrue(
+                    self.policy.audit_github_release_reconciler(path, source)
+                )
+
     def test_mutable_fuzz_workflow_toolchain_is_rejected(self) -> None:
         text = """
 env:
@@ -364,18 +584,24 @@ steps:
 
         errors = self.policy.audit_fuzz_workflow(Path("fuzz.yml"), text)
 
-        self.assertTrue(any("expected exact FUZZ_NIGHTLY_VERSION" in error for error in errors))
-        self.assertTrue(any("must not install mutable nightly" in error for error in errors))
-        self.assertTrue(any("must not invoke mutable nightly" in error for error in errors))
+        self.assertTrue(
+            any("expected exact FUZZ_NIGHTLY_VERSION" in error for error in errors)
+        )
+        self.assertTrue(
+            any("must not install mutable nightly" in error for error in errors)
+        )
+        self.assertTrue(
+            any("must not invoke mutable nightly" in error for error in errors)
+        )
 
     def test_exact_fuzz_workflow_tools_are_accepted(self) -> None:
         text = FUZZ_WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertEqual(
-            self.policy.audit_fuzz_workflow(Path("fuzz.yml"), text), []
-        )
+        self.assertEqual(self.policy.audit_fuzz_workflow(Path("fuzz.yml"), text), [])
 
-    def test_fuzz_dispatch_bridge_rejects_accidental_or_unbound_oracle_runs(self) -> None:
+    def test_fuzz_dispatch_bridge_rejects_accidental_or_unbound_oracle_runs(
+        self,
+    ) -> None:
         original = FUZZ_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
             "oracle_default": original.replace(
@@ -437,10 +663,14 @@ steps:
 
         self.assertTrue(any("no workflows found" in error for error in errors))
 
-    def test_render_oracle_rejects_mutable_python_pip_apt_and_identity_status(self) -> None:
+    def test_render_oracle_rejects_mutable_python_pip_apt_and_identity_status(
+        self,
+    ) -> None:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
-            "python": original.replace('python-version: "3.13.14"', 'python-version: "3.13"'),
+            "python": original.replace(
+                'python-version: "3.13.14"', 'python-version: "3.13"'
+            ),
             "pip": original.replace("            --require-hashes \\\n", ""),
             "apt": original.replace(
                 'sudo apt-get "${APT_OPTIONS[@]}" install \\',
@@ -533,9 +763,7 @@ steps:
     def test_checked_in_render_oracle_reproducibility_policy_passes(self) -> None:
         text = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
-            self.policy.audit_render_oracle_workflow(
-                Path("render-oracle.yml"), text
-            ),
+            self.policy.audit_render_oracle_workflow(Path("render-oracle.yml"), text),
             [],
         )
 
@@ -575,7 +803,10 @@ steps:
                 "retry_delay_seconds=$((build_attempt * 5))",
                 "retry_delay_seconds=$((build_attempt * 60))",
             ),
-            "continue_after_success": ("\n              break\n", "\n              continue\n"),
+            "continue_after_success": (
+                "\n              break\n",
+                "\n              continue\n",
+            ),
             "retry_integrity_failure": (
                 'if ! retryable_oracle_download_failure "$build_log"; then\n'
                 '              exit "$build_status"',
@@ -719,9 +950,7 @@ steps:
                         result = subprocess.run(
                             ["bash"],
                             input=(
-                                "set -euo pipefail\n"
-                                "mock_attempt=0\n"
-                                f"{retry_script}"
+                                f"set -euo pipefail\nmock_attempt=0\n{retry_script}"
                             ),
                             text=True,
                             cwd=root,
@@ -746,18 +975,14 @@ steps:
         action_sha = "a" * 40
         injected_steps = {
             "sha_pinned_build_push": (
-                "      - uses: docker/build-push-action@"
-                f"{action_sha} # v6.18.0\n"
+                f"      - uses: docker/build-push-action@{action_sha} # v6.18.0\n"
             ),
             "local_composite": (
                 "      - uses: ./.github/actions/unreviewed-oracle-build\n"
             ),
-            "injected_remote": (
-                f"      - uses: actions/cache@{action_sha} # v4.3.0\n"
-            ),
+            "injected_remote": (f"      - uses: actions/cache@{action_sha} # v4.3.0\n"),
             "extra_make_step": (
-                "      - name: Alternate oracle build\n"
-                "        run: make oracle-image\n"
+                "      - name: Alternate oracle build\n        run: make oracle-image\n"
             ),
             "download_chmod_execute_step": (
                 "      - name: Download alternate build tool\n"
@@ -796,8 +1021,7 @@ steps:
             )
             mutated_build_block = original.replace(
                 build_invocation,
-                "          echo unreviewed-build-block-mutation\n"
-                + build_invocation,
+                "          echo unreviewed-build-block-mutation\n" + build_invocation,
                 1,
             )
             self.assertNotEqual(mutated_build_block, original)
@@ -830,9 +1054,7 @@ steps:
         )
         self.assertNotEqual(image_job, reusable_image_job)
         reusable_hardening = (
-            hardening[:image_start]
-            + reusable_image_job
-            + hardening[image_end:]
+            hardening[:image_start] + reusable_image_job + hardening[image_end:]
         )
         self.assertTrue(
             self.policy.audit_render_hardening_workflow(
@@ -883,8 +1105,7 @@ steps:
             if "    env:\n" in job:
                 job_docker_host = job.replace(
                     "    env:\n",
-                    "    env:\n"
-                    "      DOCKER_HOST: unix:///tmp/unreviewed-docker.sock\n",
+                    "    env:\n      DOCKER_HOST: unix:///tmp/unreviewed-docker.sock\n",
                     1,
                 )
             else:
@@ -1001,8 +1222,8 @@ steps:
                 1,
             ),
             "native_pdf_smoke_poppler_optional": original.replace(
-                "          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test",
-                "          cargo +1.85.0 test",
+                '          RXLS_REQUIRE_POPPLER: "1"',
+                '          RXLS_REQUIRE_POPPLER: "0"',
                 1,
             ),
             "native_common_raster": original.replace(
@@ -1173,7 +1394,7 @@ steps:
                 1,
             ),
             "failure_overview_uploads_full_json": original.replace(
-                '          python3 - "$GITHUB_STEP_SUMMARY" <<\'PY\'',
+                "          python3 - \"$GITHUB_STEP_SUMMARY\" <<'PY'",
                 (
                     "          cat target/render-oracle-failure/"
                     "render-oracle-failure-summary.json "
@@ -1248,6 +1469,77 @@ steps:
                     )
                 )
 
+    def test_render_oracle_rejects_weakened_pinned_type0_pdf_gate(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "step_removed": original.replace(
+                "- name: Run the project-native Type0 PDF Poppler smoke",
+                "- name: Unreviewed Type0 PDF smoke",
+                1,
+            ),
+            "manifest_reassigned": original.replace(
+                "          RXLS_TEST_FONT_PACK_MANIFEST: "
+                "${{ github.workspace }}/local/render-fonts/pack/manifest.json\n",
+                "          RXLS_TEST_FONT_PACK_MANIFEST: "
+                "${{ github.workspace }}/local/unverified/manifest.json\n",
+                1,
+            ),
+            "workspace_guard_removed": original.replace(
+                '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = '
+                '"$GITHUB_WORKSPACE/"* ]]\n',
+                "",
+                1,
+            ),
+            "poppler_optional": original.replace(
+                '          RXLS_REQUIRE_POPPLER: "1"\n',
+                '          RXLS_REQUIRE_POPPLER: "0"\n',
+                1,
+            ),
+            "raw_descriptor_test_removed": original.replace(
+                "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics",
+                "embed::tests::unreviewed_descriptor_metrics",
+                1,
+            ),
+            "scaled_descriptor_test_removed": original.replace(
+                "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics",
+                "pdf::tests::unreviewed_descriptor_metrics",
+                1,
+            ),
+            "poppler_box_test_removed": original.replace(
+                "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics",
+                "pdf::tests::unreviewed_poppler_boxes",
+                1,
+            ),
+            "discovery_assertion_removed": original.replace(
+                "            | grep -Fqx "
+                "'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'\n",
+                "            | true\n",
+                1,
+            ),
+            "exact_filter_removed": original.replace(
+                "            --lib "
+                "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
+                "            -- --exact\n",
+                "            --lib "
+                "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
+                "            --\n",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_oracle_workflow(
+                    Path("render-oracle.yml"), workflow
+                )
+                self.assertTrue(
+                    any(
+                        "pinned Type0 PDF descriptor and Poppler gate" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
     def test_render_oracle_rejects_weakened_pinned_font_cli_regression(self) -> None:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
@@ -1263,22 +1555,31 @@ steps:
             ),
             "manifest_reassigned": original.replace(
                 "RXLS_TEST_FONT_PACK_MANIFEST: "
-                "${{ github.workspace }}/local/render-fonts/pack/manifest.json",
+                "${{ github.workspace }}/local/render-fonts/pack/manifest.json\n"
+                "          RXLS_TEST_FONT_FAMILY: Arimo",
                 "RXLS_TEST_FONT_PACK_MANIFEST: "
-                "${{ github.workspace }}/local/unverified/manifest.json",
+                "${{ github.workspace }}/local/unverified/manifest.json\n"
+                "          RXLS_TEST_FONT_FAMILY: Arimo",
                 1,
             ),
             "manifest_made_relative": original.replace(
                 "RXLS_TEST_FONT_PACK_MANIFEST: "
-                "${{ github.workspace }}/local/render-fonts/pack/manifest.json",
+                "${{ github.workspace }}/local/render-fonts/pack/manifest.json\n"
+                "          RXLS_TEST_FONT_FAMILY: Arimo",
                 "RXLS_TEST_FONT_PACK_MANIFEST: "
-                "local/render-fonts/pack/manifest.json",
+                "local/render-fonts/pack/manifest.json\n"
+                "          RXLS_TEST_FONT_FAMILY: Arimo",
                 1,
             ),
             "workspace_guard_removed": original.replace(
+                "          RXLS_TEST_FONT_FAMILY: Arimo\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
                 '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = '
                 '"$GITHUB_WORKSPACE/"* ]]\n',
-                "",
+                "          RXLS_TEST_FONT_FAMILY: Arimo\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
                 1,
             ),
             "family_reassigned": original.replace(
@@ -1296,6 +1597,12 @@ steps:
                 "            --test printing "
                 "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n",
                 "            --test printing cli_single_page \\\n",
+                1,
+            ),
+            "discovery_assertion_removed": original.replace(
+                "            | grep -Fqx "
+                "'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'\n",
+                "            | true\n",
                 1,
             ),
             "exact_filter_removed": original.replace(
@@ -1326,9 +1633,7 @@ steps:
             "scripts/render_parity_geometry_gate.py": (
                 "shared render-parity geometry gate"
             ),
-            "scripts/strict_json_contract.py": (
-                "shared type-exact JSON contract"
-            ),
+            "scripts/strict_json_contract.py": ("shared type-exact JSON contract"),
         }
         for dependency, expected_error in dependencies.items():
             trigger = f'      - "{dependency}"\n'
@@ -1422,9 +1727,7 @@ steps:
             "\n\n          root = pathlib.Path",
             "\n\n          baseline_gate_keys =",
         ):
-            start = workflow.index(
-                "          def reject_path_bearing_strings", cursor
-            )
+            start = workflow.index("          def reject_path_bearing_strings", cursor)
             end = workflow.index(terminator, start)
             namespace = {
                 "re": re,
@@ -1452,9 +1755,7 @@ steps:
                         guard({adversarial_key: 0})
 
         bootstrap_guard, aggregate_guard = blocks
-        approved = {
-            "metric_policy": {"paths_or_content_retained": False}
-        }
+        approved = {"metric_policy": {"paths_or_content_retained": False}}
         with self.assertRaises(AssertionError):
             bootstrap_guard(approved)
         with self.assertRaises(AssertionError):
@@ -1467,9 +1768,7 @@ steps:
         ):
             with self.subTest(near_match=near_match):
                 with self.assertRaises(AssertionError):
-                    aggregate_guard(
-                        near_match, allow_retention_policy=True
-                    )
+                    aggregate_guard(near_match, allow_retention_policy=True)
 
     def test_render_oracle_pr_campaigns_are_same_repo_label_guarded(self) -> None:
         original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
@@ -1612,7 +1911,7 @@ steps:
     def test_render_oracle_campaign_artifacts_are_aggregate_only(self) -> None:
         text = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertIn("--profile \"$RXLS_ORACLE_CAMPAIGN\"", text)
+        self.assertIn('--profile "$RXLS_ORACLE_CAMPAIGN"', text)
         self.assertIn("run_full_campaign a", text)
         self.assertIn("run_full_campaign b", text)
         self.assertIn("scripts/merge-render-parity-reports.py", text)
@@ -1622,8 +1921,7 @@ steps:
         self.assertIn("--print-mode authored", text)
         self.assertIn("--required-feature print-settings", text)
         self.assertIn(
-            '"pages_per_workbook_by_scale_mode"\n'
-            '          ] == {"fit": 1, "scale": 4}',
+            '"pages_per_workbook_by_scale_mode"\n          ] == {"fit": 1, "scale": 4}',
             text,
         )
         self.assertIn("--require-hosted-full-800", text)
@@ -1662,13 +1960,11 @@ steps:
             text,
         )
         self.assertNotIn(
-            "cat target/render-oracle-failure/"
-            "render-oracle-failure-summary.json",
+            "cat target/render-oracle-failure/render-oracle-failure-summary.json",
             text,
         )
         self.assertIn(
-            "path: target/render-oracle-failure/"
-            "render-oracle-failure-summary.json",
+            "path: target/render-oracle-failure/render-oracle-failure-summary.json",
             text,
         )
         self.assertIn(
@@ -1683,12 +1979,8 @@ steps:
         )
         self.assertIn("continue-on-error: true", text)
         self.assertLess(
-            text.index(
-                "- name: Upload sanitized Render Oracle failure summary"
-            ),
-            text.index(
-                "- name: Append bounded Render Oracle failure overview"
-            ),
+            text.index("- name: Upload sanitized Render Oracle failure summary"),
+            text.index("- name: Append bounded Render Oracle failure overview"),
         )
         self.assertIn(
             '== ("metric_policy", "paths_or_content_retained")',
@@ -1704,7 +1996,9 @@ steps:
             text,
         )
 
-    def test_render_hardening_rejects_mutable_apt_and_path_bearing_evidence(self) -> None:
+    def test_render_hardening_rejects_mutable_apt_and_path_bearing_evidence(
+        self,
+    ) -> None:
         original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
             original.replace(
@@ -1735,12 +2029,18 @@ steps:
                 '          echo "bootstrap accepted"\n',
             ),
             original.replace(
-                '              raise SystemExit(1)\n',
+                "              raise SystemExit(1)\n",
                 '              print("bootstrap accepted")\n',
             ),
             original.replace(
                 '          assert evidence["image_identity_status"] == "pinned_match", evidence\n',
                 '          assert evidence["image_identity_status"] != "mismatch", evidence\n',
+            ),
+            original.replace(
+                "            | grep -Fqx "
+                "'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'\n",
+                "            | true\n",
+                1,
             ),
         )
         for workflow in mutations:
@@ -1749,6 +2049,57 @@ steps:
                     Path("render-hardening.yml"), workflow
                 )
                 self.assertTrue(errors)
+
+    def test_render_hardening_runs_policy_mutation_suite_fail_closed(self) -> None:
+        original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "trigger_removed": (
+                original.replace(
+                    '      - "scripts/test_workflow_policy.py"\n',
+                    "",
+                    1,
+                ),
+                "pull requests must trigger hardening",
+            ),
+            "checker_removed": (
+                original.replace(
+                    "          python3 scripts/check_workflow_policy.py\n",
+                    "",
+                    1,
+                ),
+                "focused mutation suite",
+            ),
+            "mutation_suite_removed": (
+                original.replace(
+                    "          python3 scripts/test_workflow_policy.py\n",
+                    "",
+                    1,
+                ),
+                "focused mutation suite",
+            ),
+            "shell_weakened": (
+                original.replace(
+                    "          set -euo pipefail\n"
+                    "          python3 scripts/check_workflow_policy.py\n"
+                    "          python3 scripts/test_workflow_policy.py\n",
+                    "          set +e\n"
+                    "          python3 scripts/check_workflow_policy.py\n"
+                    "          python3 scripts/test_workflow_policy.py\n",
+                    1,
+                ),
+                "focused mutation suite",
+            ),
+        }
+        for name, (workflow, expected_error) in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_hardening_workflow(
+                    Path("render-hardening.yml"), workflow
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in errors),
+                    errors,
+                )
 
     def test_render_hardening_rejects_unscoped_or_commented_oci_guards(self) -> None:
         original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
@@ -1954,12 +2305,12 @@ steps:
             "steps:\n  - run: env -S 'docker build .'\n",
             "steps:\n  - run: docker --context default build .\n",
             "steps:\n  - run: docker buildx bake .\n",
-            "steps:\n  - run: docker buildx \"$SUBCOMMAND\" .\n",
-            "steps:\n  - run: docker buildx \"${SUBCOMMAND:-build}\" .\n",
+            'steps:\n  - run: docker buildx "$SUBCOMMAND" .\n',
+            'steps:\n  - run: docker buildx "${SUBCOMMAND:-build}" .\n',
             "steps:\n  - run: bash -c 'docker build .'\n",
             "steps:\n  - run: bash /tmp/generated-build-script.sh\n",
-            "steps:\n  - run: sh -c \"$BUILD_COMMAND\"\n",
-            "steps:\n  - run: eval \"$BUILD_COMMAND\"\n",
+            'steps:\n  - run: sh -c "$BUILD_COMMAND"\n',
+            'steps:\n  - run: eval "$BUILD_COMMAND"\n',
             "steps:\n  - run: IMAGE_ID=`docker build .`\n",
             "steps:\n  - run: echo `docker buildx build .`\n",
             (
@@ -1970,9 +2321,9 @@ steps:
             "steps:\n  - run: find . -exec docker build {} ;\n",
             "steps:\n  - run: timeout 30 docker build .\n",
             "steps:\n  - run: . /tmp/generated-build-script.sh\n",
-            "steps:\n  - run: \"$UNKNOWN_COMMAND\" .\n",
+            'steps:\n  - run: "$UNKNOWN_COMMAND" .\n',
             "steps:\n  - run: 'docker build .\n",
-            "steps:\n  - run: |\n      DOCKER=docker\n      SUBCOMMAND=build\n      \"$DOCKER\" \"$SUBCOMMAND\" .\n",
+            'steps:\n  - run: |\n      DOCKER=docker\n      SUBCOMMAND=build\n      "$DOCKER" "$SUBCOMMAND" .\n',
             "steps:\n  - run: |\n      COMMAND='docker buildx bake'\n      $COMMAND .\n",
             "steps:\n  - run: |\n      COMMAND=dock\n      COMMAND+=er\n      $COMMAND build .\n",
             "steps:\n  - run: >-\n      docker buildx\n      build .\n",
@@ -1983,9 +2334,7 @@ steps:
         )
         for workflow in workflows:
             with self.subTest(workflow=workflow):
-                self.assertTrue(
-                    self.policy._direct_docker_build_commands(workflow)
-                )
+                self.assertTrue(self.policy._direct_docker_build_commands(workflow))
 
         safe = """
 steps:
@@ -2002,9 +2351,7 @@ steps:
         text = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertEqual(
-            self.policy.audit_render_browser_workflow(
-                Path("render-browser.yml"), text
-            ),
+            self.policy.audit_render_browser_workflow(Path("render-browser.yml"), text),
             [],
         )
         self.assertEqual(text.count("rxls-render-worker-0.1.3.tgz"), 2)
@@ -2179,7 +2526,7 @@ steps:
                 1,
             ),
             "runtime_pass_artifact": original.replace(
-                '          printf \'%s\\n\' "PASS pinned Chromium runtime closure resolved" \\\n'
+                "          printf '%s\\n' \"PASS pinned Chromium runtime closure resolved\" \\\n"
                 "            > target/render-browser-evidence/chromium-runtime.txt\n",
                 "",
                 1,
@@ -2362,9 +2709,22 @@ steps:
     def test_render_package_release_rejects_unsafe_publication_paths(self) -> None:
         original = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
-            "tag": original.replace('test "$GITHUB_REF_NAME" = "render-v$version"', "true"),
+            "tag": original.replace(
+                'test "$GITHUB_REF_NAME" = "render-v$version"', "true"
+            ),
             "main": original.replace(
-                'git merge-base --is-ancestor "$GITHUB_SHA" origin/main', "true"
+                'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"', "true"
+            ),
+            "commented_main": original.replace(
+                '            test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+                '            # test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+                1,
+            ),
+            "publish_tag_revalidation": original.replace(
+                '          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags\n'
+                '          test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"\n',
+                "",
+                1,
             ),
             "ci_gate": original.replace(
                 "require_successful_run ci.yml .github/workflows/ci.yml push CI",
@@ -2520,12 +2880,91 @@ steps:
                 "package-manager-cache: false", "package-manager-cache: true", 1
             ),
             "force": original.replace(
-                "--ignore-scripts --access public", "--ignore-scripts --access public --force", 1
+                "--ignore-scripts --access public",
+                "--ignore-scripts --access public --force",
+                1,
             ),
             "credential": original.replace(
                 "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}",
                 "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n"
                 "          SECOND_TOKEN: ${{ secrets.NPM_TOKEN }}",
+            ),
+            "registry_preflight": original.replace(
+                "      - name: Detect an identical immutable registry release",
+                "      - name: Skip immutable registry preflight",
+            ),
+            "registry_mismatch": original.replace(
+                "existing immutable registry version differs from the verified candidate",
+                "existing release accepted without comparison",
+            ),
+            "registry_error_class": original.replace(
+                "if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' \"$error_log\"; then",
+                "if false; then",
+            ),
+            "registry_idempotency": original.replace(
+                "if: steps.registry.outputs.already_published != 'true'",
+                "if: always()",
+            ),
+            "registry_provenance": original.replace(
+                "https://slsa.dev/provenance/v1",
+                "https://example.invalid/provenance",
+                1,
+            ),
+            "registry_attestation_query": original.replace(
+                "version dist.integrity repository.url dist.attestations --json",
+                "version dist.integrity repository.url --json",
+                1,
+            ),
+            "registry_signature_audit": original.replace(
+                "npm audit signatures --json --include-attestations",
+                "npm audit --json",
+            ),
+            "registry_evidence_validator": original.replace(
+                'python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py"',
+                "true",
+            ),
+            "registry_evidence_workflow": original.replace(
+                "--workflow .github/workflows/render-package-release.yml",
+                "--workflow .github/workflows/attacker.yml",
+            ),
+            "registry_evidence_sha": original.replace(
+                '--git-sha "$GITHUB_SHA"', '--git-sha "$GITHUB_REF_NAME"'
+            ),
+            "registry_evidence_ref": original.replace(
+                '--git-ref "$GITHUB_REF"', '--git-ref "$GITHUB_SHA"'
+            ),
+            "registry_invocation_state": original.replace(
+                "ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}",
+                'ALREADY_PUBLISHED: "true"',
+            ),
+            "registry_current_invocation_policy": original.replace(
+                '          invocation_policy="current-run"\n',
+                '          invocation_policy="existing-release"\n',
+                1,
+            ),
+            "registry_existing_invocation_policy": original.replace(
+                '            invocation_policy="existing-release"\n',
+                '            invocation_policy="current-run"\n',
+                1,
+            ),
+            "registry_invocation_policy_branch": original.replace(
+                '          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then\n',
+                "          if true; then\n",
+                1,
+            ),
+            "registry_invocation_policy_fail_closed": original.replace(
+                '          elif [[ "$ALREADY_PUBLISHED" != "false" ]]; then\n',
+                "          else\n",
+                1,
+            ),
+            "registry_invocation_policy_argument": original.replace(
+                '--invocation-policy "$invocation_policy"',
+                "--invocation-policy existing-release",
+                1,
+            ),
+            "registry_evidence_test": original.replace(
+                "python3 scripts/test_check_npm_registry_evidence.py",
+                "true",
             ),
             "nested_manifest": original.replace(
                 "manifest-path: bindings/render-wasm/Cargo.toml",
@@ -2540,7 +2979,9 @@ steps:
                 "--check bindings/render-wasm/THIRD_PARTY_NOTICES.txt",
                 "--output target/notice.txt",
             ),
-            "sbom_determinism": original.replace("cmp --silent \\", "cmp --silently \\", 1),
+            "sbom_determinism": original.replace(
+                "cmp --silent \\", "cmp --silently \\", 1
+            ),
             "wasm_build_rust": original.replace(
                 'WASM_BINDGEN_BUILD_RUST: "1.88.0"',
                 'WASM_BINDGEN_BUILD_RUST: "1.88"',
@@ -2656,9 +3097,7 @@ steps:
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
-                errors = self.policy.audit_codeql_workflow(
-                    Path("codeql.yml"), workflow
-                )
+                errors = self.policy.audit_codeql_workflow(Path("codeql.yml"), workflow)
                 self.assertTrue(errors)
 
     def test_installed_product_lane_covers_linux_macos_and_windows(self) -> None:

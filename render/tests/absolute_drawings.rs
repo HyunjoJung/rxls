@@ -60,7 +60,7 @@ fn imported_ooxml_absolute_chart(right_to_left: bool) -> Workbook {
         ("xl/drawings/drawing1.xml", drawing.as_bytes()),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            br#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#
+            br#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#
                 .as_slice(),
         ),
         (

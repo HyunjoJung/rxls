@@ -400,15 +400,49 @@ jobs:
       - name: Run the project-native Type0 PDF Poppler smoke
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         shell: bash
+        env:
+          RXLS_REQUIRE_POPPLER: "1"
+          RXLS_TEST_FONT_PACK_MANIFEST: ${{ github.workspace }}/local/render-fonts/pack/manifest.json
         run: |
           set -euo pipefail
+          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]
+          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
           command -v pdffonts
           command -v pdfinfo
           command -v pdftoppm
           command -v pdftotext
-          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \
+            -- --exact --list \
+            | grep -Fqx 'pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens: test'
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \
             -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \
+            -- --exact --list \
+            | grep -Fqx 'embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics: test'
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \
+            -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \
+            -- --exact --list \
+            | grep -Fqx 'pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics: test'
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \
+            -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \
+            -- --exact --list \
+            | grep -Fqx 'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \
+            -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact --list \
+            | grep -Fqx 'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
             -- --exact
@@ -425,7 +459,15 @@ jobs:
           test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \
+            -- --exact --list \
+            | grep -Fqx 'layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height: test'
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --lib layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \
             -- --exact
+          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+            --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
+            -- --exact --list \
+            | grep -Fqx 'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'
           cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
             -- --exact

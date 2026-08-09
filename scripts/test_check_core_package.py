@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import tarfile
 import tempfile
+import tomllib
 import unittest
 
 
@@ -40,6 +41,21 @@ rust-version = "1.85"
 {FEATURES}
 {DEPENDENCIES}
 """
+
+# This inventory is intentionally independent from the production checker. A
+# missing checker entry must fail the test instead of silently reducing its
+# generated test cases.
+EXPECTED_CI_RELEASE_ONLY_SCRIPTS = {
+    "check_cargo_publish_dry_run.py",
+    "check_npm_registry_evidence.py",
+    "check_workflow_policy.py",
+    "reconcile_github_release.py",
+    "test_check_cargo_publish_dry_run.py",
+    "test_check_npm_registry_evidence.py",
+    "test_reconcile_github_release.py",
+    "test_release_tools.py",
+    "test_workflow_policy.py",
+}
 
 
 def write_crate(
@@ -104,6 +120,29 @@ class CorePackageGateTests(unittest.TestCase):
             "render-only script entered the core package: libreoffice-render-parity.py",
             errors,
         )
+
+    def test_rejects_release_only_scripts(self) -> None:
+        self.assertEqual(
+            MODULE.FORBIDDEN_RELEASE_SCRIPTS,
+            EXPECTED_CI_RELEASE_ONLY_SCRIPTS,
+        )
+        for name in sorted(EXPECTED_CI_RELEASE_ONLY_SCRIPTS):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                crate = Path(directory) / "rxls.crate"
+                write_crate(crate, {f"scripts/{name}": b"hosted release tooling"})
+                errors, _ = MODULE.validate(crate)
+            self.assertIn(
+                f"release-only script entered the core package: {name}",
+                errors,
+            )
+
+    def test_manifest_excludes_ci_and_release_only_scripts(self) -> None:
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        excluded = set(manifest["package"]["exclude"])
+        expected = {
+            f"scripts/{name}" for name in EXPECTED_CI_RELEASE_ONLY_SCRIPTS
+        }
+        self.assertEqual(expected - excluded, set())
 
     def test_rejects_absolute_fidelity_gate_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

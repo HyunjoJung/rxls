@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 use rxls::{
     Border, BorderStyle, Cell, CellStyle, CfRule, Chart, ChartBarDirection, ChartCachedPoint,
-    ChartFrameFill, ChartKind, ChartMarkerSymbol, ChartSeriesStyle, Color, DisplayCell,
-    DrawingAnchorBehavior, DrawingMetadata, DrawingObjectKind, DvOp, Font, FormatPattern,
-    FormatScript, HAlign, ImportedAxisMeasure, OoxmlImplicitRowHeight, Sheet, Sparkline,
-    SparklineKind, StyleFidelity, StyleLossKind, VAlign, Workbook, XlsbDefaultColumnWidth,
+    ChartFrameFill, ChartKind, ChartMarkerSymbol, ChartSeriesStyle, ChartTextStyle, Color,
+    DisplayCell, DrawingAnchorBehavior, DrawingMetadata, DrawingObjectKind, DvOp, Font,
+    FormatPattern, FormatScript, HAlign, ImportedAxisMeasure, OoxmlImplicitRowHeight, Sheet,
+    Sparkline, SparklineKind, StyleFidelity, StyleLossKind, VAlign, Workbook,
+    XlsbDefaultColumnWidth,
 };
 
 use crate::error::{LimitKind, RenderError};
 use crate::font::{
-    BaseDirection, FontId, FontOutlineCommand, FontPack, FontPackError, FontRequest, ShapeOptions,
-    ShapedText, StyledFontRequest, FONT_OUTLINE_UNITS,
+    helvetica_text_advance_units, BaseDirection, FontId, FontOutlineCommand, FontPack,
+    FontPackError, FontRequest, ShapeOptions, ShapedText, StyledFontRequest, FONT_OUTLINE_UNITS,
 };
 use crate::media::decode_image;
 use crate::scene::{
@@ -252,7 +253,9 @@ impl Default for RenderLimits {
 pub struct RenderOptions {
     /// Visual used range or explicit rectangular grid selection.
     pub selection: RenderSelection,
-    /// Paint worksheet gridlines unless the source sheet explicitly hides them.
+    /// Request worksheet gridlines. Ordinary rendering also honors the source
+    /// sheet-view flag; print rendering instead combines this request with the
+    /// source print-gridline setting.
     pub gridlines: bool,
     /// Give hidden rows and columns their normal geometry instead of omitting them.
     pub include_hidden: bool,
@@ -668,6 +671,28 @@ enum AxisEndpointPolicy {
     PerTrackFixed,
     SourceNative,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridlinePolicy {
+    WorksheetView,
+    AuthoredPrint,
+    CalcSinglePagePrint,
+}
+
+// Calc paints print gridlines as black 0.1-point hairlines. The scene uses
+// 1/1024 CSS-pixel units and the PDF backend applies 3/4 point per CSS pixel,
+// so 137 raw units is the closest backend-neutral representation.
+pub(crate) const PRINT_GRIDLINE_WIDTH: Fixed = Fixed::from_raw(137);
+const PRINT_GRIDLINE_FRAME_TOP_INSET: Fixed = Fixed::from_raw(39);
+const PRINT_GRIDLINE_FRAME_LEFT_INSET: Fixed = Fixed::from_raw(155);
+const PRINT_GRIDLINE_FRAME_TRAILING_INSET: Fixed = Fixed::from_raw(1_355);
+
+// Calc's SinglePageSheets path serializes cell-grid offsets in a Map10thMM-like
+// coordinate space while the page and cell content remain in normal PDF
+// points. Relative to scene CSS pixels this is an exact 127/36 expansion:
+// (127/48 tenth-mm per CSS pixel) / (3/4 point per CSS pixel).
+const CALC_SINGLE_PAGE_GRIDLINE_SCALE_NUMERATOR: i64 = 127;
+const CALC_SINGLE_PAGE_GRIDLINE_SCALE_DENOMINATOR: i64 = 36;
 
 /// Immutable, per-operation effective-style capture. Every selected grid
 /// coordinate (plus an intersecting merge anchor) resolves worksheet, axis,
@@ -1130,11 +1155,43 @@ pub(crate) fn build_auxiliary_text_node(
     style: TextStyle,
     options: &RenderOptions,
 ) -> Result<SceneNode, RenderError> {
+    build_auxiliary_text_node_with_kerning(text, bounds, horizontal_padding, style, true, options)
+}
+
+fn build_auxiliary_text_node_with_kerning(
+    text: String,
+    bounds: Rect,
+    horizontal_padding: Fixed,
+    style: TextStyle,
+    kerning: bool,
+    options: &RenderOptions,
+) -> Result<SceneNode, RenderError> {
+    build_auxiliary_text_node_with_clip_and_kerning(
+        text,
+        bounds,
+        bounds,
+        horizontal_padding,
+        style,
+        kerning,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_auxiliary_text_node_with_clip_and_kerning(
+    text: String,
+    bounds: Rect,
+    clip_bounds: Rect,
+    horizontal_padding: Fixed,
+    style: TextStyle,
+    kerning: bool,
+    options: &RenderOptions,
+) -> Result<SceneNode, RenderError> {
     let Some(font_pack) = options.font_pack.as_ref() else {
         return Ok(SceneNode::Text(TextNode {
             text,
             bounds,
-            clip_bounds: bounds,
+            clip_bounds,
             horizontal_padding,
             style,
             hyperlink: None,
@@ -1153,6 +1210,7 @@ pub(crate) fn build_auxiliary_text_node(
         hyperlink: None,
         numeric_default: false,
         text_can_overflow: false,
+        ods_fixed_height_row: false,
     };
     let mut auxiliary_options = options.clone();
     auxiliary_options.horizontal_padding = horizontal_padding;
@@ -1162,9 +1220,10 @@ pub(crate) fn build_auxiliary_text_node(
         font_pack,
         &region,
         bounds,
-        bounds,
+        clip_bounds,
         &style,
         false,
+        kerning,
         &auxiliary_options,
         &mut statistics,
         &mut warnings,
@@ -1211,6 +1270,7 @@ struct Region {
     hyperlink: Option<String>,
     numeric_default: bool,
     text_can_overflow: bool,
+    ods_fixed_height_row: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1260,7 +1320,7 @@ enum DrawingPlacement {
     Unavailable,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TypographyStats {
     text_bytes: u64,
     shaped_glyphs: u64,
@@ -1313,7 +1373,7 @@ impl TypographyStats {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Warnings(BTreeMap<WarningCode, (u64, Option<CellCoordinate>)>);
 
 impl Warnings {
@@ -1371,9 +1431,11 @@ pub fn build_sheet_scene(
         None,
         UsedDrawingTerminalColumnPolicy::Indexed,
         AxisEndpointPolicy::PerTrackFixed,
+        GridlinePolicy::WorksheetView,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_single_page_sheet_scene(
     sheet: &Sheet,
     sheet_index: usize,
@@ -1386,9 +1448,27 @@ pub(crate) fn build_single_page_sheet_scene(
         None,
         UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
         AxisEndpointPolicy::SourceNative,
+        GridlinePolicy::WorksheetView,
     )
 }
 
+pub(crate) fn build_single_page_sheet_scene_for_print(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        None,
+        UsedDrawingTerminalColumnPolicy::CalcOoxmlSinglePage,
+        AxisEndpointPolicy::SourceNative,
+        GridlinePolicy::CalcSinglePagePrint,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn build_sheet_scene_with_geometry(
     sheet: &Sheet,
     sheet_index: usize,
@@ -1402,6 +1482,40 @@ pub(crate) fn build_sheet_scene_with_geometry(
         Some(geometry),
         UsedDrawingTerminalColumnPolicy::Indexed,
         AxisEndpointPolicy::PerTrackFixed,
+        GridlinePolicy::WorksheetView,
+    )
+}
+
+pub(crate) fn build_sheet_scene_with_geometry_for_print(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    geometry: SheetGeometryOverride<'_>,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        Some(geometry),
+        UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
+        GridlinePolicy::AuthoredPrint,
+    )
+}
+
+pub(crate) fn build_sheet_scene_for_print(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        None,
+        UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
+        GridlinePolicy::AuthoredPrint,
     )
 }
 
@@ -1412,6 +1526,7 @@ fn build_sheet_scene_inner(
     geometry: Option<SheetGeometryOverride<'_>>,
     terminal_column_policy: UsedDrawingTerminalColumnPolicy,
     endpoint_policy: AxisEndpointPolicy,
+    gridline_policy: GridlinePolicy,
 ) -> Result<SceneBuild, RenderError> {
     let mut style_snapshot = RenderStyleSnapshot::new(sheet);
     let used_selection = matches!(options.selection, RenderSelection::Used);
@@ -1459,6 +1574,10 @@ fn build_sheet_scene_inner(
         sheet.conditional_formats().len() as u64,
     )?;
     let calc_line_layout_available = calc_line_layout_available(sheet, options);
+    let ods_native_sheet = matches!(
+        sheet.imported_default_row_axis_measure(),
+        Some(ImportedAxisMeasure::MillimeterHundredths(_))
+    );
     let unsupported_shapes = sheet
         .drawing_metadata()
         .iter()
@@ -1861,6 +1980,7 @@ fn build_sheet_scene_inner(
                 hyperlink,
                 numeric_default,
                 text_can_overflow,
+                ods_fixed_height_row: ods_native_sheet && !has_adjustable_row,
             });
         }
     }
@@ -1895,7 +2015,8 @@ fn build_sheet_scene_inner(
 
     let mut nodes = Vec::new();
     let row_regions = regions_by_visual_row(&regions)?;
-    let show_gridlines = options.gridlines && !sheet.sheet_view().hide_gridlines;
+    let show_gridlines = options.gridlines
+        && (gridline_policy != GridlinePolicy::WorksheetView || !sheet.sheet_view().hide_gridlines);
     let _ = resolve_conditional_paints(
         sheet,
         &display_cells,
@@ -1922,13 +2043,31 @@ fn build_sheet_scene_inner(
             )?;
         }
     }
-    let composed_edges = compose_edges(&regions, &suppresses_gridlines, show_gridlines, options)?;
-    push_composed_edges(
-        &mut nodes,
-        &composed_edges,
-        EdgeClaimKind::Gridline,
+    let composed_edges = compose_edges(
+        &regions,
+        &suppresses_gridlines,
+        show_gridlines,
+        gridline_policy,
         options,
     )?;
+    let scene_bounds = Rect {
+        x: Fixed::ZERO,
+        y: Fixed::ZERO,
+        width: canvas_width,
+        height: canvas_height,
+    };
+    if gridline_policy == GridlinePolicy::WorksheetView {
+        push_composed_edges(
+            &mut nodes,
+            &composed_edges,
+            EdgeClaimKind::Gridline,
+            gridline_policy,
+            viewport.cell,
+            scene_bounds,
+            sheet_right_to_left,
+            options,
+        )?;
+    }
     for region in &regions {
         if let Some(bar) = region.conditional.data_bar {
             push_data_bar(&mut nodes, region.rect, bar, options)?;
@@ -1949,6 +2088,7 @@ fn build_sheet_scene_inner(
                 clip_bounds,
                 &style,
                 sheet_right_to_left,
+                true,
                 options,
                 &mut typography_stats,
                 &mut warnings,
@@ -1968,8 +2108,33 @@ fn build_sheet_scene_inner(
         &mut nodes,
         &composed_edges,
         EdgeClaimKind::Explicit,
+        gridline_policy,
+        viewport.cell,
+        scene_bounds,
+        sheet_right_to_left,
         options,
     )?;
+    if show_gridlines && gridline_policy != GridlinePolicy::WorksheetView {
+        // Calc paints print gridlines above cell content and borders but below
+        // anchored drawing objects such as images and charts.
+        push_composed_edges(
+            &mut nodes,
+            &composed_edges,
+            EdgeClaimKind::Gridline,
+            gridline_policy,
+            viewport.cell,
+            scene_bounds,
+            sheet_right_to_left,
+            options,
+        )?;
+        push_print_gridline_leading_frame(
+            &mut nodes,
+            viewport.cell,
+            scene_bounds,
+            sheet_right_to_left,
+            options,
+        )?;
+    }
     push_drawing_placeholders(
         &mut nodes,
         sheet,
@@ -4268,6 +4433,7 @@ fn resolve_conditional_layout_cells(
             hyperlink: None,
             numeric_default: false,
             text_can_overflow: false,
+            ods_fixed_height_row: false,
         })
         .collect::<Vec<_>>();
     let mut measurement_warnings = Warnings::default();
@@ -5192,6 +5358,7 @@ fn expand_automatic_row_heights(
                 hyperlink: None,
                 numeric_default: false,
                 text_can_overflow: false,
+                ods_fixed_height_row: false,
             };
             measure_automatic_cell_height(
                 pack,
@@ -5457,8 +5624,15 @@ fn apply_numeric_overflow(
         if text_width <= available {
             continue;
         }
-        let count = available.raw().max(1) / hash_width.raw().max(1);
-        let count = usize::try_from(count.max(1)).map_err(|_| RenderError::CoordinateOverflow)?;
+        // Calc renders an overflowing date/time with its fixed three-hash
+        // indicator. Other numeric values retain the width-filling behavior,
+        // so this parity rule cannot silently change ordinary numeric output.
+        let count = if cell_is_date_or_time(display_cell.value, region.style.as_ref()) {
+            3
+        } else {
+            let count = available.raw().max(1) / hash_width.raw().max(1);
+            usize::try_from(count.max(1)).map_err(|_| RenderError::CoordinateOverflow)?
+        };
         enforce(LimitKind::Glyphs, options.limits.max_glyphs, count as u64)?;
         region.text = "#".repeat(count);
         region.rich_text = None;
@@ -8207,8 +8381,8 @@ fn try_push_chart(
     if matches!(chart.kind, ChartKind::Pie | ChartKind::Doughnut)
         && ((chart.kind == ChartKind::Pie && series.len() != 1)
             || series.iter().any(|series| {
-                series.values.iter().any(|value| *value < 0.0)
-                    || series.values.iter().sum::<f64>() <= 0.0
+                let total = series.values.iter().sum::<f64>();
+                series.values.iter().any(|value| *value < 0.0) || !total.is_finite() || total <= 0.0
             }))
     {
         *chart_points = initial_points;
@@ -8232,27 +8406,392 @@ fn try_push_chart(
         return Ok(false);
     }
 
-    let title_height = if chart.title.is_some() { 24 } else { 8 };
-    let legend_width = if chart.legend { 96 } else { 8 };
+    let chart_title = chart.title.as_deref().filter(|text| !text.is_empty());
+    let raw_x_axis_title = chart
+        .x_axis_title
+        .as_deref()
+        .filter(|text| !text.is_empty());
+    let raw_y_axis_title = chart
+        .y_axis_title
+        .as_deref()
+        .filter(|text| !text.is_empty());
+    let chart_font_family = metadata
+        .and_then(|metadata| metadata.chart_default_latin_font_family.as_deref())
+        .unwrap_or(&options.default_font_family);
+    let typography_before_chart_text = typography_stats.clone();
+    let warnings_before_chart_text = warnings.clone();
+
+    let palette = metadata.map_or(&[][..], |metadata| metadata.chart_palette.as_slice());
+    let cartesian = matches!(
+        chart.kind,
+        ChartKind::Bar | ChartKind::Line | ChartKind::Scatter | ChartKind::Area | ChartKind::Bubble
+    );
+    let horizontal_bar = chart.kind == ChartKind::Bar
+        && metadata
+            .is_some_and(|metadata| metadata.chart_bar_direction == ChartBarDirection::Horizontal);
+    let category_axis_visible = metadata
+        .and_then(|metadata| metadata.chart_category_axis_visible)
+        .unwrap_or(true);
+    let value_axis_visible = metadata
+        .and_then(|metadata| metadata.chart_value_axis_visible)
+        .unwrap_or(true);
+    let (horizontal_axis_visible, vertical_axis_visible) = if horizontal_bar {
+        (value_axis_visible, category_axis_visible)
+    } else {
+        (category_axis_visible, value_axis_visible)
+    };
+    let x_axis_title = raw_x_axis_title.filter(|_| horizontal_axis_visible);
+    let y_axis_title = raw_y_axis_title.filter(|_| vertical_axis_visible);
+    let Some(text_styles) = ResolvedChartTextStyles::resolve(metadata, chart_font_family) else {
+        *chart_points = initial_points;
+        return Ok(false);
+    };
+    let (x_axis_title_style, y_axis_title_style) = text_styles.physical_axis_titles(horizontal_bar);
+    let (horizontal_axis_style, vertical_axis_style) = if horizontal_bar {
+        (
+            &text_styles.value_axis_labels,
+            &text_styles.category_axis_labels,
+        )
+    } else {
+        (
+            &text_styles.category_axis_labels,
+            &text_styles.value_axis_labels,
+        )
+    };
+    let cartesian_axis = if cartesian {
+        let Some(axis) = chart_nice_value_axis(
+            &series,
+            matches!(chart.kind, ChartKind::Bar | ChartKind::Area),
+        ) else {
+            *chart_points = initial_points;
+            return Ok(false);
+        };
+        Some(axis)
+    } else {
+        None
+    };
+    let x_value_axis = if matches!(chart.kind, ChartKind::Scatter | ChartKind::Bubble) {
+        let Some(axis) = chart_nice_x_axis(&series) else {
+            *chart_points = initial_points;
+            return Ok(false);
+        };
+        Some(axis)
+    } else {
+        None
+    };
+    let x_data_bounds = if matches!(chart.kind, ChartKind::Scatter | ChartKind::Bubble) {
+        let Some(bounds) = chart_x_data_bounds(&series) else {
+            *chart_points = initial_points;
+            return Ok(false);
+        };
+        Some(bounds)
+    } else {
+        None
+    };
+    let radar_axis = if chart.kind == ChartKind::Radar {
+        let Some(axis) = chart_nice_value_axis(&series, true) else {
+            *chart_points = initial_points;
+            return Ok(false);
+        };
+        Some(axis)
+    } else {
+        None
+    };
+    let legend_entries = if chart.legend {
+        if matches!(chart.kind, ChartKind::Pie | ChartKind::Doughnut) {
+            series[0]
+                .labels
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect::<Vec<_>>()
+        } else {
+            series
+                .iter()
+                .map(|series| series.name.clone())
+                .enumerate()
+                .collect::<Vec<_>>()
+        }
+    } else {
+        Vec::new()
+    };
+    let has_chart_text = chart_title.is_some()
+        || x_axis_title.is_some()
+        || y_axis_title.is_some()
+        || legend_entries.iter().any(|(_, text)| !text.is_empty())
+        || chart.data_labels
+        || ((cartesian || chart.kind == ChartKind::Radar)
+            && (category_axis_visible || value_axis_visible));
+    if options.font_pack.is_none() && has_chart_text {
+        // Fontless chart text is still deterministic because measurement and
+        // backend emission share the same Helvetica byte/advance mapping. It
+        // cannot, however, reproduce source kerning or selected-font metrics,
+        // so retain explicit provenance instead of replacing the whole chart.
+        warnings.add(WarningCode::ApproximateTextMetrics, Some(warning_cell));
+    }
+
+    let value_axis_text = if value_axis_visible {
+        cartesian_axis.as_ref().or(radar_axis.as_ref()).map(|axis| {
+            axis.ticks
+                .iter()
+                .map(|value| chart_axis_number(*value, axis.major))
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    }
+    .unwrap_or_default();
+    let value_axis_metrics = max_chart_text_metrics_with_style(
+        value_axis_text.iter().map(String::as_str),
+        &text_styles.value_axis_labels,
+        options,
+        typography_stats,
+        warnings,
+        warning_cell,
+    )?;
+    let category_axis_metrics = if !category_axis_visible {
+        ChartTextMetrics::default()
+    } else if matches!(chart.kind, ChartKind::Scatter | ChartKind::Bubble) {
+        let x_axis = x_value_axis
+            .as_ref()
+            .expect("scatter and bubble charts have a retained x-value axis");
+        let x_data_bounds = x_data_bounds.expect("scatter and bubble charts have x-data bounds");
+        let labels = x_axis
+            .ticks
+            .iter()
+            .filter(|value| **value >= x_data_bounds.0 && **value <= x_data_bounds.1)
+            .map(|value| chart_axis_number(*value, x_axis.major))
+            .collect::<Vec<_>>();
+        max_chart_text_metrics_with_style(
+            labels.iter().map(String::as_str),
+            &text_styles.category_axis_labels,
+            options,
+            typography_stats,
+            warnings,
+            warning_cell,
+        )?
+    } else if cartesian || chart.kind == ChartKind::Radar {
+        let categories = series
+            .first()
+            .map(|series| series.labels.as_slice())
+            .unwrap_or_default();
+        let stride = chart_category_label_stride(categories.len());
+        max_chart_text_metrics_with_style(
+            categories
+                .iter()
+                .enumerate()
+                .filter_map(|(index, category)| {
+                    chart_category_label_is_retained(index, categories.len(), stride)
+                        .then_some(category.as_str())
+                }),
+            &text_styles.category_axis_labels,
+            options,
+            typography_stats,
+            warnings,
+            warning_cell,
+        )?
+    } else {
+        ChartTextMetrics::default()
+    };
+    let (horizontal_axis_metrics, vertical_axis_metrics) = if horizontal_bar {
+        (value_axis_metrics, category_axis_metrics)
+    } else {
+        (category_axis_metrics, value_axis_metrics)
+    };
+    let title_metrics = chart_title
+        .map(|title| {
+            measure_chart_text_with_style(
+                title,
+                &text_styles.chart_title,
+                options,
+                Some((typography_stats, warnings, warning_cell)),
+            )
+        })
+        .transpose()?;
+    let x_axis_title_metrics = x_axis_title
+        .map(|title| {
+            measure_chart_text_with_style(
+                title,
+                x_axis_title_style,
+                options,
+                Some((typography_stats, warnings, warning_cell)),
+            )
+        })
+        .transpose()?;
+    let y_axis_title_metrics = y_axis_title
+        .map(|title| {
+            measure_chart_text_with_style(
+                title,
+                y_axis_title_style,
+                options,
+                Some((typography_stats, warnings, warning_cell)),
+            )
+        })
+        .transpose()?;
+    let legend_metrics = max_chart_text_metrics_with_style(
+        legend_entries.iter().map(|(_, name)| name.as_str()),
+        &text_styles.legend,
+        options,
+        typography_stats,
+        warnings,
+        warning_cell,
+    )?;
+    let horizontal_axis_extents =
+        horizontal_axis_metrics.rotated(horizontal_axis_style.rotation_degrees(0))?;
+    let vertical_axis_extents =
+        vertical_axis_metrics.rotated(vertical_axis_style.rotation_degrees(0))?;
+    let title_extents = title_metrics
+        .map(|metrics| metrics.rotated(text_styles.chart_title.rotation_degrees(0)))
+        .transpose()?;
+    let x_axis_title_extents = x_axis_title_metrics
+        .map(|metrics| metrics.rotated(x_axis_title_style.rotation_degrees(0)))
+        .transpose()?;
+    let y_axis_title_extents = y_axis_title_metrics
+        .map(|metrics| metrics.rotated(y_axis_title_style.rotation_degrees(-90)))
+        .transpose()?;
+    let legend_extents = legend_metrics.rotated(text_styles.legend.rotation_degrees(0))?;
+
+    let frame_padding = Fixed::from_pixels(8);
+    let text_gap = Fixed::from_pixels(4);
+    let horizontal_overhang = Fixed::from_raw(horizontal_axis_extents.width.raw() / 2);
+    let vertical_axis_space = if vertical_axis_extents.width > Fixed::ZERO {
+        vertical_axis_extents
+            .width
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        Fixed::ZERO
+    };
+    let left_axis_space = vertical_axis_space.max(horizontal_overhang);
+    let y_axis_title_space = y_axis_title_extents.map_or(Ok(Fixed::ZERO), |extents| {
+        extents
+            .width
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)
+    })?;
+    let left_gutter = sum_fixed([frame_padding, y_axis_title_space, left_axis_space])?;
+    let vertical_axis_overhang = Fixed::from_raw(
+        vertical_axis_extents
+            .height
+            .raw()
+            .max(if chart.kind == ChartKind::Radar {
+                horizontal_axis_extents.height.raw()
+            } else {
+                0
+            })
+            / 2,
+    );
+    let title_band = match title_extents {
+        Some(extents) => extents
+            .height
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        None => frame_padding,
+    };
+    let top_gutter = title_band
+        .checked_add(vertical_axis_overhang)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let horizontal_axis_space = if horizontal_axis_extents.height > Fixed::ZERO {
+        horizontal_axis_extents
+            .height
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        Fixed::ZERO
+    };
+    let x_axis_title_space = x_axis_title_extents.map_or(Ok(Fixed::ZERO), |extents| {
+        extents
+            .height
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)
+    })?;
+    let bottom_text_space = sum_fixed([horizontal_axis_space, x_axis_title_space])?;
+    let bottom_gutter = frame_padding
+        .checked_add(bottom_text_space.max(vertical_axis_overhang))
+        .ok_or(RenderError::CoordinateOverflow)?;
+
+    let legend_layout = if legend_entries.is_empty() {
+        None
+    } else {
+        let row_height = legend_extents
+            .height
+            .max(Fixed::from_pixels(10))
+            .checked_add(Fixed::from_pixels(2))
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let available_height = rect
+            .height
+            .checked_sub(top_gutter)
+            .and_then(|value| value.checked_sub(bottom_gutter))
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let rows_per_column = if available_height > Fixed::ZERO {
+            usize::try_from(available_height.raw() / row_height.raw())
+                .map_err(|_| RenderError::CoordinateOverflow)?
+                .min(legend_entries.len())
+        } else {
+            0
+        };
+        if rows_per_column == 0 {
+            *typography_stats = typography_before_chart_text;
+            *warnings = warnings_before_chart_text;
+            *chart_points = initial_points;
+            return Ok(false);
+        }
+        let columns = legend_entries.len().div_ceil(rows_per_column);
+        let column_width = sum_fixed([
+            Fixed::from_pixels(10),
+            Fixed::from_pixels(2),
+            legend_extents.width,
+        ])?;
+        let column_step = column_width
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let total_width = multiply_fixed(
+            column_width,
+            i64::try_from(columns).map_err(|_| RenderError::CoordinateOverflow)?,
+        )?
+        .checked_add(multiply_fixed(
+            text_gap,
+            i64::try_from(columns.saturating_sub(1))
+                .map_err(|_| RenderError::CoordinateOverflow)?,
+        )?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+        let plot_offset = horizontal_overhang
+            .checked_add(text_gap)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        Some(ChartLegendLayout {
+            row_height,
+            rows_per_column,
+            column_step,
+            plot_offset,
+            total_width,
+        })
+    };
+    let right_gutter = match legend_layout {
+        Some(layout) => sum_fixed([frame_padding, layout.plot_offset, layout.total_width])?,
+        None => sum_fixed([frame_padding, horizontal_overhang])?,
+    };
+
     let left = rect
         .x
-        .checked_add(Fixed::from_pixels(40))
+        .checked_add(left_gutter)
         .ok_or(RenderError::CoordinateOverflow)?;
     let top = rect
         .y
-        .checked_add(Fixed::from_pixels(title_height))
+        .checked_add(top_gutter)
         .ok_or(RenderError::CoordinateOverflow)?;
     let right = rect
         .x
         .checked_add(rect.width)
-        .and_then(|value| value.checked_sub(Fixed::from_pixels(legend_width)))
+        .and_then(|value| value.checked_sub(right_gutter))
         .ok_or(RenderError::CoordinateOverflow)?;
     let bottom = rect
         .y
         .checked_add(rect.height)
-        .and_then(|value| value.checked_sub(Fixed::from_pixels(30)))
+        .and_then(|value| value.checked_sub(bottom_gutter))
         .ok_or(RenderError::CoordinateOverflow)?;
     if right <= left || bottom <= top {
+        *typography_stats = typography_before_chart_text;
+        *warnings = warnings_before_chart_text;
         *chart_points = initial_points;
         return Ok(false);
     }
@@ -8266,11 +8805,6 @@ fn try_push_chart(
             .checked_sub(top)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
-    let palette = metadata.map_or(&[][..], |metadata| metadata.chart_palette.as_slice());
-    let cartesian = matches!(
-        chart.kind,
-        ChartKind::Bar | ChartKind::Line | ChartKind::Scatter | ChartKind::Area | ChartKind::Bubble
-    );
     let frame_fill = match metadata.map_or(ChartFrameFill::Automatic, |metadata| {
         metadata.chart_frame_fill
     }) {
@@ -8284,31 +8818,33 @@ fn try_push_chart(
     };
     push_chart_frame(nodes, rect, frame_fill, options)?;
     let mut labels = Vec::<ChartLabel>::new();
-    let horizontal_bar = chart.kind == ChartKind::Bar
-        && metadata
-            .is_some_and(|metadata| metadata.chart_bar_direction == ChartBarDirection::Horizontal);
-    let cartesian_axis = cartesian.then(|| {
-        chart_nice_value_axis(
-            &series,
-            matches!(chart.kind, ChartKind::Bar | ChartKind::Area),
-        )
-    });
+    let mut category_labels = Vec::<ChartLabel>::new();
+    let mut value_labels = Vec::<ChartLabel>::new();
     let category_major_gridlines = metadata
         .and_then(|metadata| metadata.chart_category_major_gridlines)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && category_axis_visible;
     let value_major_gridlines = metadata
         .and_then(|metadata| metadata.chart_value_major_gridlines)
-        .unwrap_or(true);
+        .unwrap_or(true)
+        && value_axis_visible;
     if let Some(axis) = cartesian_axis.as_ref() {
         push_cartesian_chart_axes(
             nodes,
+            rect,
             plot,
             chart.kind,
             horizontal_bar,
             axis,
+            x_value_axis.as_ref(),
+            x_data_bounds,
             &series,
+            category_axis_visible,
+            value_axis_visible,
             category_major_gridlines,
             value_major_gridlines,
+            &text_styles.category_axis_labels,
+            &text_styles.value_axis_labels,
             text_bytes,
             glyphs,
             typography_stats,
@@ -8343,17 +8879,27 @@ fn try_push_chart(
             )?;
         }
         ChartKind::Radar => {
-            let bounds = chart_value_bounds(&series, true);
+            let axis = radar_axis
+                .as_ref()
+                .expect("radar charts have a retained value axis");
             push_radar_chart(
                 nodes,
                 plot,
                 &series,
-                bounds,
+                axis,
                 palette,
+                category_axis_visible,
+                value_axis_visible,
+                category_major_gridlines,
+                value_major_gridlines,
+                &mut category_labels,
+                &mut value_labels,
                 chart.data_labels,
                 &mut labels,
                 typography_stats,
                 options,
+                warnings,
+                warning_cell,
             )?;
         }
         _ => {
@@ -8378,6 +8924,9 @@ fn try_push_chart(
                     plot,
                     &series,
                     bounds,
+                    x_value_axis
+                        .as_ref()
+                        .expect("scatter charts have a retained x-value axis"),
                     palette,
                     chart.data_labels,
                     &mut labels,
@@ -8425,6 +8974,9 @@ fn try_push_chart(
                     plot,
                     &series,
                     bounds,
+                    x_value_axis
+                        .as_ref()
+                        .expect("bubble charts have a retained x-value axis"),
                     palette,
                     chart.data_labels,
                     &mut labels,
@@ -8438,114 +8990,153 @@ fn try_push_chart(
         }
     }
 
-    if let Some(title) = chart.title.as_ref() {
-        let bounds = Rect {
+    if let Some(title) = chart_title {
+        let extents = title_extents.expect("chart title extents were measured");
+        let paint_bounds = Rect {
             x: rect.x,
             y: rect.y,
             width: rect.width,
-            height: Fixed::from_pixels(22),
+            height: extents.height,
         };
-        push_chart_text(
+        push_chart_text_with_style(
             nodes,
-            title.clone(),
-            bounds,
+            title.to_string(),
+            paint_bounds,
+            rect,
             TextAnchor::Middle,
             0,
-            Fixed::from_pixels(13),
+            &text_styles.chart_title,
             text_bytes,
             glyphs,
             typography_stats,
             options,
         )?;
     }
-    if let Some(title) = chart.x_axis_title.as_ref() {
-        push_chart_text(
+    if let Some(title) = x_axis_title {
+        let extents = x_axis_title_extents.expect("x-axis title extents were measured");
+        let paint_bounds = Rect {
+            x: left,
+            y: bottom
+                .checked_add(horizontal_axis_space)
+                .and_then(|value| value.checked_add(text_gap))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            width: plot.width,
+            height: extents.height,
+        };
+        push_chart_text_with_style(
             nodes,
-            title.clone(),
-            Rect {
-                x: left,
-                y: bottom
-                    .checked_add(Fixed::from_pixels(14))
-                    .ok_or(RenderError::CoordinateOverflow)?,
-                width: plot.width,
-                height: Fixed::from_pixels(16),
-            },
+            title.to_string(),
+            paint_bounds,
+            rect,
             TextAnchor::Middle,
             0,
-            Fixed::from_pixels(10),
+            x_axis_title_style,
             text_bytes,
             glyphs,
             typography_stats,
             options,
         )?;
     }
-    if let Some(title) = chart.y_axis_title.as_ref() {
-        push_chart_text(
+    if let Some(title) = y_axis_title {
+        let extents = y_axis_title_extents.expect("y-axis title extents were measured");
+        let paint_bounds = Rect {
+            x: rect
+                .x
+                .checked_add(frame_padding)
+                .ok_or(RenderError::CoordinateOverflow)?,
+            y: top,
+            width: extents.width,
+            height: plot.height,
+        };
+        push_chart_text_with_style(
             nodes,
-            title.clone(),
-            Rect {
-                x: rect.x,
-                y: top,
-                width: Fixed::from_pixels(18),
-                height: plot.height,
-            },
+            title.to_string(),
+            paint_bounds,
+            rect,
             TextAnchor::Middle,
             -90,
-            Fixed::from_pixels(10),
+            y_axis_title_style,
             text_bytes,
             glyphs,
             typography_stats,
             options,
         )?;
     }
-    if chart.legend {
-        let entries = if matches!(chart.kind, ChartKind::Pie | ChartKind::Doughnut) {
-            series[0]
-                .labels
-                .iter()
-                .cloned()
-                .enumerate()
-                .collect::<Vec<_>>()
-        } else {
-            series
-                .iter()
-                .map(|series| series.name.clone())
-                .enumerate()
-                .collect::<Vec<_>>()
-        };
-        for (row, (index, name)) in entries.into_iter().enumerate() {
-            let y = top
-                .checked_add(Fixed::from_pixels(row as i64 * 16))
+    if let Some(layout) = legend_layout {
+        for (entry_index, (index, name)) in legend_entries.into_iter().enumerate() {
+            let column = entry_index / layout.rows_per_column;
+            let row = entry_index % layout.rows_per_column;
+            let column_offset = multiply_fixed(
+                layout.column_step,
+                i64::try_from(column).map_err(|_| RenderError::CoordinateOverflow)?,
+            )?;
+            let legend_x = right
+                .checked_add(layout.plot_offset)
+                .and_then(|value| value.checked_add(column_offset))
                 .ok_or(RenderError::CoordinateOverflow)?;
+            let row_offset = multiply_fixed(
+                layout.row_height,
+                i64::try_from(row).map_err(|_| RenderError::CoordinateOverflow)?,
+            )?;
+            let y = top
+                .checked_add(row_offset)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let metrics = measure_chart_text_with_style(&name, &text_styles.legend, options, None)?;
+            let entry_extents = metrics.rotated(text_styles.legend.rotation_degrees(0))?;
+            let swatch_offset = Fixed::from_raw(
+                layout
+                    .row_height
+                    .raw()
+                    .checked_sub(Fixed::from_pixels(10).raw())
+                    .ok_or(RenderError::CoordinateOverflow)?
+                    / 2,
+            );
             push_solid_rect(
                 nodes,
-                right
-                    .checked_add(Fixed::from_pixels(8))
+                legend_x,
+                y.checked_add(swatch_offset)
                     .ok_or(RenderError::CoordinateOverflow)?,
-                y.checked_add(Fixed::from_pixels(3))
+                legend_x
+                    .checked_add(Fixed::from_pixels(10))
                     .ok_or(RenderError::CoordinateOverflow)?,
-                right
-                    .checked_add(Fixed::from_pixels(18))
-                    .ok_or(RenderError::CoordinateOverflow)?,
-                y.checked_add(Fixed::from_pixels(13))
+                y.checked_add(swatch_offset)
+                    .and_then(|value| value.checked_add(Fixed::from_pixels(10)))
                     .ok_or(RenderError::CoordinateOverflow)?,
                 chart_color(index, palette),
                 options,
             )?;
-            push_chart_text(
+            let paint_bounds = Rect {
+                x: legend_x
+                    .checked_add(Fixed::from_pixels(12))
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                y,
+                width: entry_extents.width,
+                height: layout.row_height,
+            };
+            let (bounds, anchor) = if text_styles.legend.rotation_degrees(0).rem_euclid(360) == 0 {
+                (
+                    Rect {
+                        x: paint_bounds.x,
+                        y,
+                        width: metrics.width,
+                        height: metrics.height,
+                    },
+                    TextAnchor::Start,
+                )
+            } else {
+                (
+                    centered_chart_text_bounds(paint_bounds, metrics)?,
+                    TextAnchor::Middle,
+                )
+            };
+            push_chart_text_with_style(
                 nodes,
                 name,
-                Rect {
-                    x: right
-                        .checked_add(Fixed::from_pixels(20))
-                        .ok_or(RenderError::CoordinateOverflow)?,
-                    y,
-                    width: Fixed::from_pixels(72),
-                    height: Fixed::from_pixels(16),
-                },
-                TextAnchor::Start,
+                bounds,
+                rect,
+                anchor,
                 0,
-                Fixed::from_pixels(9),
+                &text_styles.legend,
                 text_bytes,
                 glyphs,
                 typography_stats,
@@ -8553,19 +9144,102 @@ fn try_push_chart(
             )?;
         }
     }
-    for label in labels {
-        push_chart_text(
+    for label in value_labels {
+        let metrics = measure_chart_text_with_style(
+            &label.text,
+            &text_styles.value_axis_labels,
+            options,
+            None,
+        )?;
+        let extents = metrics.rotated(text_styles.value_axis_labels.rotation_degrees(0))?;
+        let paint_bounds = Rect {
+            x: label
+                .x
+                .checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            y: label
+                .y
+                .checked_sub(Fixed::from_raw(extents.height.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            width: extents.width,
+            height: extents.height,
+        };
+        push_chart_text_with_style(
             nodes,
             label.text,
-            Rect {
-                x: Fixed::from_raw(label.x.raw() - Fixed::from_pixels(24).raw()),
-                y: Fixed::from_raw(label.y.raw() - Fixed::from_pixels(7).raw()),
-                width: Fixed::from_pixels(48),
-                height: Fixed::from_pixels(14),
-            },
+            centered_chart_text_bounds(paint_bounds, metrics)?,
+            rect,
             TextAnchor::Middle,
             0,
-            Fixed::from_pixels(8),
+            &text_styles.value_axis_labels,
+            text_bytes,
+            glyphs,
+            typography_stats,
+            options,
+        )?;
+    }
+    for label in category_labels {
+        let metrics = measure_chart_text_with_style(
+            &label.text,
+            &text_styles.category_axis_labels,
+            options,
+            None,
+        )?;
+        let extents = metrics.rotated(text_styles.category_axis_labels.rotation_degrees(0))?;
+        let paint_bounds = Rect {
+            x: label
+                .x
+                .checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            y: label
+                .y
+                .checked_sub(Fixed::from_raw(extents.height.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            width: extents.width,
+            height: extents.height,
+        };
+        push_chart_text_with_style(
+            nodes,
+            label.text,
+            centered_chart_text_bounds(paint_bounds, metrics)?,
+            rect,
+            TextAnchor::Middle,
+            0,
+            &text_styles.category_axis_labels,
+            text_bytes,
+            glyphs,
+            typography_stats,
+            options,
+        )?;
+    }
+    for label in labels {
+        let metrics = measure_chart_text_with_style(
+            &label.text,
+            &text_styles.data_labels,
+            options,
+            Some((typography_stats, warnings, warning_cell)),
+        )?;
+        let extents = metrics.rotated(text_styles.data_labels.rotation_degrees(0))?;
+        let paint_bounds = Rect {
+            x: label
+                .x
+                .checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            y: label
+                .y
+                .checked_sub(Fixed::from_raw(extents.height.raw() / 2))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            width: extents.width,
+            height: extents.height,
+        };
+        push_chart_text_with_style(
+            nodes,
+            label.text,
+            centered_chart_text_bounds(paint_bounds, metrics)?,
+            rect,
+            TextAnchor::Middle,
+            0,
+            &text_styles.data_labels,
             text_bytes,
             glyphs,
             typography_stats,
@@ -8590,6 +9264,556 @@ struct ChartLabel {
     y: Fixed,
 }
 
+#[cfg(test)]
+const CALC_MISSING_THEME_CHART_LATIN_FAMILY: &str = "Liberation Sans";
+const CHART_BODY_TEXT_POINTS: f32 = 10.0;
+const CHART_TITLE_TEXT_POINTS: f32 = 18.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartTextRole {
+    ChartTitle,
+    AxisTitle,
+    AxisLabel,
+    Legend,
+    DataLabel,
+}
+
+impl ChartTextRole {
+    fn points(self) -> f32 {
+        match self {
+            Self::ChartTitle => CHART_TITLE_TEXT_POINTS,
+            Self::AxisTitle | Self::AxisLabel | Self::Legend | Self::DataLabel => {
+                CHART_BODY_TEXT_POINTS
+            }
+        }
+    }
+
+    fn size(self) -> Fixed {
+        points_to_fixed(self.points()).expect("static chart point size is valid")
+    }
+
+    fn bold(self) -> bool {
+        matches!(self, Self::ChartTitle | Self::AxisTitle)
+    }
+
+    #[cfg(test)]
+    fn style(self, family: &str, anchor: TextAnchor, rotation_degrees: i16) -> TextStyle {
+        ResolvedChartTextStyle::for_role(self, family).text_style(anchor, rotation_degrees)
+    }
+
+    #[cfg(test)]
+    fn resolved_style(self, family: &str) -> ResolvedRunStyle {
+        ResolvedChartTextStyle::for_role(self, family).resolved_run_style()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedChartTextStyle {
+    family: String,
+    size: Fixed,
+    size_hundredths_of_point: u32,
+    color: Rgb,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    kerning_minimum_hundredths_of_point: Option<u32>,
+    rotation_degrees: Option<i16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedChartTextStyles {
+    chart_title: ResolvedChartTextStyle,
+    category_axis_title: ResolvedChartTextStyle,
+    value_axis_title: ResolvedChartTextStyle,
+    legend: ResolvedChartTextStyle,
+    category_axis_labels: ResolvedChartTextStyle,
+    value_axis_labels: ResolvedChartTextStyle,
+    data_labels: ResolvedChartTextStyle,
+}
+
+impl ResolvedChartTextStyles {
+    fn resolve(metadata: Option<&DrawingMetadata>, fallback_family: &str) -> Option<Self> {
+        let imported = metadata.map(|metadata| &metadata.chart_text_styles);
+        let resolve = |style: Option<&ChartTextStyle>, role| match style {
+            Some(style) => ResolvedChartTextStyle::imported(style),
+            None => Some(ResolvedChartTextStyle::for_role(role, fallback_family)),
+        };
+        Some(Self {
+            chart_title: resolve(
+                imported.and_then(|styles| styles.chart_title.as_ref()),
+                ChartTextRole::ChartTitle,
+            )?,
+            category_axis_title: resolve(
+                imported.and_then(|styles| styles.category_axis_title.as_ref()),
+                ChartTextRole::AxisTitle,
+            )?,
+            value_axis_title: resolve(
+                imported.and_then(|styles| styles.value_axis_title.as_ref()),
+                ChartTextRole::AxisTitle,
+            )?,
+            legend: resolve(
+                imported.and_then(|styles| styles.legend.as_ref()),
+                ChartTextRole::Legend,
+            )?,
+            category_axis_labels: resolve(
+                imported.and_then(|styles| styles.category_axis_labels.as_ref()),
+                ChartTextRole::AxisLabel,
+            )?,
+            value_axis_labels: resolve(
+                imported.and_then(|styles| styles.value_axis_labels.as_ref()),
+                ChartTextRole::AxisLabel,
+            )?,
+            data_labels: resolve(
+                imported.and_then(|styles| styles.data_labels.as_ref()),
+                ChartTextRole::DataLabel,
+            )?,
+        })
+    }
+
+    fn physical_axis_titles(
+        &self,
+        horizontal_bar: bool,
+    ) -> (&ResolvedChartTextStyle, &ResolvedChartTextStyle) {
+        if horizontal_bar {
+            (&self.value_axis_title, &self.category_axis_title)
+        } else {
+            (&self.category_axis_title, &self.value_axis_title)
+        }
+    }
+}
+
+impl ResolvedChartTextStyle {
+    fn for_role(role: ChartTextRole, family: &str) -> Self {
+        let size_hundredths_of_point = match role {
+            ChartTextRole::ChartTitle => 1_800,
+            ChartTextRole::AxisTitle
+            | ChartTextRole::AxisLabel
+            | ChartTextRole::Legend
+            | ChartTextRole::DataLabel => 1_000,
+        };
+        Self {
+            family: family.to_string(),
+            size: role.size(),
+            size_hundredths_of_point,
+            color: Rgb::BLACK,
+            bold: role.bold(),
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            kerning_minimum_hundredths_of_point: None,
+            rotation_degrees: None,
+        }
+    }
+
+    fn imported(style: &ChartTextStyle) -> Option<Self> {
+        if style.latin_font_family.trim().is_empty()
+            || style.latin_font_family.len() > 255
+            || !(100..=400_000).contains(&style.size_hundredths_of_point)
+            || style
+                .kerning_minimum_hundredths_of_point
+                .is_some_and(|value| value > 400_000)
+        {
+            return None;
+        }
+        Some(Self {
+            family: style.latin_font_family.clone(),
+            size: chart_text_size_to_fixed(style.size_hundredths_of_point)?,
+            size_hundredths_of_point: style.size_hundredths_of_point,
+            color: rgb(style.color),
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            strikethrough: style.strikethrough,
+            kerning_minimum_hundredths_of_point: style.kerning_minimum_hundredths_of_point,
+            rotation_degrees: style.rotation_degrees,
+        })
+    }
+
+    fn text_style(&self, anchor: TextAnchor, fallback_rotation_degrees: i16) -> TextStyle {
+        TextStyle {
+            family: self.family.clone(),
+            size: self.size,
+            color: self.color,
+            bold: self.bold,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            anchor,
+            baseline: TextBaseline::Middle,
+            rotation_degrees: self.rotation_degrees(fallback_rotation_degrees),
+        }
+    }
+
+    fn resolved_run_style(&self) -> ResolvedRunStyle {
+        ResolvedRunStyle {
+            family: self.family.clone(),
+            size: self.size,
+            color: self.color,
+            bold: self.bold,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            script: FormatScript::None,
+        }
+    }
+
+    fn kerning(&self) -> bool {
+        self.kerning_minimum_hundredths_of_point
+            .is_none_or(|minimum| self.size_hundredths_of_point >= minimum)
+    }
+
+    fn rotation_degrees(&self, fallback_rotation_degrees: i16) -> i16 {
+        normalize_chart_text_rotation(self.rotation_degrees.unwrap_or(fallback_rotation_degrees))
+    }
+}
+
+fn normalize_chart_text_rotation(rotation_degrees: i16) -> i16 {
+    let normalized = rotation_degrees.rem_euclid(360);
+    if normalized > 180 {
+        normalized - 360
+    } else {
+        normalized
+    }
+}
+
+// Q62 sine coefficients for each whole degree in the closed first quadrant.
+// Non-cardinal values are rounded toward positive infinity. Combining those
+// coefficients with an outward integer division therefore cannot shrink the
+// exact axis-aligned bounds of rotated chart text, while avoiding libm and its
+// platform-dependent boundary behavior entirely.
+const CHART_TEXT_TRIG_SCALE: u128 = 1_u128 << 62;
+const CHART_TEXT_SINE_Q62_CEIL: [u64; 91] = [
+    0,
+    80_485_018_754_732_518,
+    160_945_520_993_076_460,
+    241_356_997_666_611_640,
+    321_694_954_660_579_833,
+    401_934_920_255_029_412,
+    482_052_452_579_138_307,
+    562_023_147_056_444_632,
+    641_822_643_838_717_085,
+    721_426_635_226_200_705,
+    800_810_873_071_977_682,
+    879_951_176_168_187_814,
+    958_823_437_611_858_663,
+    1_037_403_632_148_101_736,
+    1_115_667_823_488_437_854,
+    1_193_592_171_602_022_506,
+    1_271_152_939_977_550_183,
+    1_348_326_502_853_625_666,
+    1_425_089_352_415_399_811,
+    1_501_418_105_955_277_681,
+    1_577_289_512_995_517_789,
+    1_652_680_462_370_552_856,
+    1_727_567_989_266_874_720,
+    1_801_929_282_218_338_998,
+    1_875_741_690_054_758_654,
+    1_948_982_728_801_669_865,
+    2_021_630_088_529_168_447,
+    2_093_661_640_147_730_629,
+    2_165_055_442_148_948_087,
+    2_235_789_747_289_123_961,
+    2_305_843_009_213_693_952,
+    2_375_193_889_020_454_652,
+    2_443_821_261_759_599_862,
+    2_511_704_222_868_584_951,
+    2_578_822_094_539_859_112,
+    2_645_154_432_019_525_853,
+    2_710_681_029_835_013_084,
+    2_775_381_927_949_855_802,
+    2_839_237_417_843_716_553,
+    2_902_228_048_515_791_645,
+    2_964_334_632_409_774_424,
+    3_025_538_251_258_570_794,
+    3_085_820_261_846_986_643,
+    3_145_162_301_690_631_791,
+    3_203_546_294_629_310_615,
+    3_260_954_456_333_195_554,
+    3_317_369_299_720_106_254,
+    3_372_773_640_282_244_205,
+    3_427_150_601_320_760_279,
+    3_480_483_619_086_560_694,
+    3_532_756_447_825_785_445,
+    3_583_953_164_728_422_300,
+    3_634_058_174_778_548_983,
+    3_683_056_215_504_726_095,
+    3_730_932_361_629_093_763,
+    3_777_672_029_613_755_864,
+    3_823_260_982_103_066_937,
+    3_867_685_332_260_468_641,
+    3_910_931_547_998_554_687,
+    3_952_986_456_101_075_756,
+    3_993_837_246_235_628_776,
+    4_033_471_474_855_808_273,
+    4_071_877_068_991_631_147,
+    4_109_042_329_927_080_280,
+    4_144_955_936_763_646_770,
+    4_179_606_949_868_785_275,
+    4_212_984_814_208_232_070,
+    4_245_079_362_561_170_726,
+    4_275_880_818_617_266_068,
+    4_305_379_799_954_623_004,
+    4_333_567_320_897_763_126,
+    4_360_434_795_254_748_507,
+    4_385_974_038_932_618_941,
+    4_410_177_272_430_345_940,
+    4_433_037_123_208_544_108,
+    4_454_546_627_935_218_059,
+    4_474_699_234_606_860_798,
+    4_493_488_804_544_257_457,
+    4_510_909_614_262_386_454,
+    4_526_956_357_213_848_474,
+    4_541_624_145_405_292_213,
+    4_554_908_510_886_344_501,
+    4_566_805_407_110_591_272,
+    4_577_311_210_168_194_800,
+    4_586_422_719_889_771_738,
+    4_594_137_160_821_195_717,
+    4_600_452_183_069_027_559,
+    4_605_365_863_016_315_580,
+    4_608_876_703_908_547_948,
+    4_610_983_636_309_578_612,
+    4_611_686_018_427_387_904,
+];
+
+fn chart_text_size_to_fixed(size_hundredths_of_point: u32) -> Option<Fixed> {
+    if !(100..=400_000).contains(&size_hundredths_of_point) {
+        return None;
+    }
+    let raw = u64::from(size_hundredths_of_point)
+        .checked_mul(4)?
+        .checked_mul(FIXED_UNITS_PER_PIXEL as u64)?
+        .checked_add(150)?
+        .checked_div(300)?;
+    i64::try_from(raw).ok().map(Fixed::from_raw)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChartTextMetrics {
+    width: Fixed,
+    height: Fixed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartLegendLayout {
+    row_height: Fixed,
+    rows_per_column: usize,
+    column_step: Fixed,
+    plot_offset: Fixed,
+    total_width: Fixed,
+}
+
+impl ChartTextMetrics {
+    fn max(self, other: Self) -> Self {
+        Self {
+            width: self.width.max(other.width),
+            height: self.height.max(other.height),
+        }
+    }
+
+    fn rotated(self, rotation_degrees: i16) -> Result<Self, RenderError> {
+        let normalized = rotation_degrees.rem_euclid(360);
+        match normalized {
+            0 | 180 => Ok(self),
+            90 | 270 => Ok(Self {
+                width: self.height,
+                height: self.width,
+            }),
+            degrees => {
+                let first_half = degrees.min(360 - degrees);
+                let acute = first_half.min(180 - first_half) as usize;
+                let sine = CHART_TEXT_SINE_Q62_CEIL[acute];
+                let cosine = CHART_TEXT_SINE_Q62_CEIL[90 - acute];
+                Ok(Self {
+                    width: chart_text_rotated_extent(self.width, cosine, self.height, sine)?,
+                    height: chart_text_rotated_extent(self.width, sine, self.height, cosine)?,
+                })
+            }
+        }
+    }
+}
+
+fn chart_text_rotated_extent(
+    primary: Fixed,
+    primary_coefficient: u64,
+    secondary: Fixed,
+    secondary_coefficient: u64,
+) -> Result<Fixed, RenderError> {
+    let primary = u128::try_from(primary.raw()).map_err(|_| RenderError::CoordinateOverflow)?;
+    let secondary = u128::try_from(secondary.raw()).map_err(|_| RenderError::CoordinateOverflow)?;
+    let numerator = primary
+        .checked_mul(u128::from(primary_coefficient))
+        .and_then(|value| {
+            secondary
+                .checked_mul(u128::from(secondary_coefficient))
+                .and_then(|secondary| value.checked_add(secondary))
+        })
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let extent = numerator.div_ceil(CHART_TEXT_TRIG_SCALE);
+    Ok(Fixed::from_raw(
+        i64::try_from(extent).map_err(|_| RenderError::CoordinateOverflow)?,
+    ))
+}
+
+fn centered_chart_text_bounds(
+    container: Rect,
+    metrics: ChartTextMetrics,
+) -> Result<Rect, RenderError> {
+    let x_offset = container
+        .width
+        .raw()
+        .checked_sub(metrics.width.raw())
+        .ok_or(RenderError::CoordinateOverflow)?
+        / 2;
+    let y_offset = container
+        .height
+        .raw()
+        .checked_sub(metrics.height.raw())
+        .ok_or(RenderError::CoordinateOverflow)?
+        / 2;
+    Ok(Rect {
+        x: container
+            .x
+            .checked_add(Fixed::from_raw(x_offset))
+            .ok_or(RenderError::CoordinateOverflow)?,
+        y: container
+            .y
+            .checked_add(Fixed::from_raw(y_offset))
+            .ok_or(RenderError::CoordinateOverflow)?,
+        width: metrics.width,
+        height: metrics.height,
+    })
+}
+
+#[cfg(test)]
+fn measure_chart_text(
+    text: &str,
+    role: ChartTextRole,
+    family: &str,
+    options: &RenderOptions,
+    accounting: Option<(&mut TypographyStats, &mut Warnings, CellCoordinate)>,
+) -> Result<ChartTextMetrics, RenderError> {
+    let style = ResolvedChartTextStyle::for_role(role, family);
+    measure_chart_text_with_style(text, &style, options, accounting)
+}
+
+fn measure_chart_text_with_style(
+    text: &str,
+    chart_style: &ResolvedChartTextStyle,
+    options: &RenderOptions,
+    mut accounting: Option<(&mut TypographyStats, &mut Warnings, CellCoordinate)>,
+) -> Result<ChartTextMetrics, RenderError> {
+    if text.is_empty() {
+        return Ok(ChartTextMetrics::default());
+    }
+    if let Some((stats, _, _)) = accounting.as_mut() {
+        let scalar_count = text.chars().count() as u64;
+        let work = scalar_count
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(RenderError::CoordinateOverflow)?;
+        stats.text_work = stats
+            .text_work
+            .checked_add(work)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(
+            LimitKind::TextRuns,
+            options.limits.max_text_runs,
+            stats.text_work,
+        )?;
+    }
+    let style = chart_style.resolved_run_style();
+    let (width, height) = if let Some(pack) = options.font_pack.as_ref() {
+        let shaped = shape_text_with_kerning(
+            pack,
+            text,
+            style.request(),
+            text_base_direction(text, false),
+            chart_style.kerning(),
+            options,
+        )?;
+        if let Some((stats, warnings, warning_cell)) = accounting.as_mut() {
+            account_shaping(pack, &shaped, options, stats)?;
+            warnings.add_count(
+                WarningCode::MissingGlyph,
+                shaped.missing_glyphs as u64,
+                Some(*warning_cell),
+            );
+            if !shaped.requested_family_matched {
+                warnings.add(WarningCode::FontFamilySubstituted, Some(*warning_cell));
+            }
+        }
+        let width = shaped_width(pack, &shaped, style.size)?;
+        let metrics = styled_line_metrics(
+            pack,
+            &shaped,
+            std::slice::from_ref(&style),
+            CellLineLayoutPolicy::Native,
+            1,
+            1,
+        )?;
+        (
+            width,
+            line_height_from_metrics(metrics, CellLineLayoutPolicy::Native)?,
+        )
+    } else {
+        // Preserve deterministic, backend-neutral geometry for callers that
+        // deliberately render without a verified pack. Hosted release paths
+        // use the shaped branch above.
+        let advance_units =
+            helvetica_text_advance_units(text).ok_or(RenderError::CoordinateOverflow)?;
+        let width = style
+            .size
+            .raw()
+            .checked_mul(advance_units)
+            .and_then(|value| value.checked_div(1_000))
+            .map(Fixed::from_raw)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        (width, scale_ratio(style.size, 6, 5)?)
+    };
+    if let Some((stats, _, _)) = accounting.as_mut() {
+        stats.text_lines = stats
+            .text_lines
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        enforce(
+            LimitKind::TextLines,
+            options.limits.max_text_lines,
+            stats.text_lines,
+        )?;
+    }
+    let padding = Fixed::from_pixels(4);
+    Ok(ChartTextMetrics {
+        width: width
+            .checked_add(padding)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: height
+            .checked_add(padding)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    })
+}
+
+fn max_chart_text_metrics_with_style<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    style: &ResolvedChartTextStyle,
+    options: &RenderOptions,
+    typography_stats: &mut TypographyStats,
+    warnings: &mut Warnings,
+    warning_cell: CellCoordinate,
+) -> Result<ChartTextMetrics, RenderError> {
+    texts
+        .into_iter()
+        .try_fold(ChartTextMetrics::default(), |metrics, text| {
+            Ok(metrics.max(measure_chart_text_with_style(
+                text,
+                style,
+                options,
+                Some((typography_stats, warnings, warning_cell)),
+            )?))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct NiceChartAxis {
     minimum: f64,
@@ -8602,12 +9826,15 @@ const CHART_AXIS_TARGET_INTERVALS: f64 = 8.0;
 const MAX_CHART_AXIS_INTERVALS: usize = 12;
 const MAX_CHART_CATEGORY_LABELS: usize = 64;
 
-fn nice_chart_step(value: f64) -> f64 {
+fn nice_chart_step(value: f64) -> Option<f64> {
     if !value.is_finite() || value <= 0.0 {
-        return 1.0;
+        return None;
     }
     let exponent = value.log10().floor();
     let magnitude = 10_f64.powf(exponent);
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
     let normalized = value / magnitude;
     let factor = if normalized <= 1.0 {
         1.0
@@ -8618,20 +9845,33 @@ fn nice_chart_step(value: f64) -> f64 {
     } else {
         10.0
     };
-    factor * magnitude
+    let step = factor * magnitude;
+    (step.is_finite() && step > 0.0).then_some(step)
 }
 
-fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> NiceChartAxis {
+fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> Option<NiceChartAxis> {
     let mut raw_minimum = f64::INFINITY;
     let mut raw_maximum = f64::NEG_INFINITY;
     for value in values {
+        if !value.is_finite() {
+            return None;
+        }
         raw_minimum = raw_minimum.min(value);
         raw_maximum = raw_maximum.max(value);
     }
+    if !raw_minimum.is_finite() || !raw_maximum.is_finite() {
+        return None;
+    }
     if raw_maximum <= raw_minimum {
         let padding = raw_maximum.abs().max(1.0) * 0.5;
+        if !padding.is_finite() || padding <= 0.0 {
+            return None;
+        }
         raw_minimum -= padding;
         raw_maximum += padding;
+        if !raw_minimum.is_finite() || !raw_maximum.is_finite() || raw_maximum <= raw_minimum {
+            return None;
+        }
     }
     let include_zero = force_zero
         || (raw_minimum >= 0.0 && raw_minimum <= raw_maximum * 0.5)
@@ -8646,9 +9886,16 @@ fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> NiceC
     } else {
         raw_maximum
     };
-    let span = (data_maximum - data_minimum).max(f64::EPSILON);
-    let major = nice_chart_step(span / CHART_AXIS_TARGET_INTERVALS);
+    let span = data_maximum - data_minimum;
+    if !span.is_finite() || span <= 0.0 {
+        return None;
+    }
+    let step_input = span / CHART_AXIS_TARGET_INTERVALS;
+    let major = nice_chart_step(if step_input > 0.0 { step_input } else { span })?;
     let padding = span * 0.05;
+    if !padding.is_finite() {
+        return None;
+    }
     let padded_minimum = if include_zero && data_minimum == 0.0 {
         0.0
     } else {
@@ -8659,8 +9906,14 @@ fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> NiceC
     } else {
         data_maximum + padding
     };
+    if !padded_minimum.is_finite() || !padded_maximum.is_finite() {
+        return None;
+    }
     let mut minimum = (padded_minimum / major).floor() * major;
     let mut maximum = (padded_maximum / major).ceil() * major;
+    if !minimum.is_finite() || !maximum.is_finite() {
+        return None;
+    }
     if include_zero {
         minimum = minimum.min(0.0);
         maximum = maximum.max(0.0);
@@ -8668,28 +9921,55 @@ fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> NiceC
     if maximum <= minimum {
         maximum = minimum + major;
     }
-    let intervals =
-        (((maximum - minimum) / major).round() as usize).clamp(1, MAX_CHART_AXIS_INTERVALS);
+    let axis_span = maximum - minimum;
+    if !axis_span.is_finite() || axis_span <= 0.0 {
+        return None;
+    }
+    let interval_count = (axis_span / major).round();
+    if !interval_count.is_finite() || interval_count <= 0.0 {
+        return None;
+    }
+    if interval_count > MAX_CHART_AXIS_INTERVALS as f64 {
+        return None;
+    }
+    let intervals = interval_count as usize;
     maximum = minimum + major * intervals as f64;
+    let final_span = maximum - minimum;
+    if !maximum.is_finite()
+        || !final_span.is_finite()
+        || final_span <= 0.0
+        || minimum > data_minimum
+        || maximum < data_maximum
+    {
+        return None;
+    }
     let ticks = (0..=intervals)
         .map(|index| {
             let value = minimum + major * index as f64;
-            if value.abs() < major.abs() * 1e-10 {
-                0.0
+            if !value.is_finite() {
+                None
+            } else if value.abs() < major.abs() * 1e-10 {
+                Some(0.0)
             } else {
-                value
+                Some(value)
             }
         })
-        .collect();
-    NiceChartAxis {
+        .collect::<Option<Vec<_>>>()?;
+    if ticks.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return None;
+    }
+    Some(NiceChartAxis {
         minimum,
         maximum,
         major,
         ticks,
-    }
+    })
 }
 
-fn chart_nice_value_axis(series: &[ResolvedChartSeries], force_zero: bool) -> NiceChartAxis {
+fn chart_nice_value_axis(
+    series: &[ResolvedChartSeries],
+    force_zero: bool,
+) -> Option<NiceChartAxis> {
     chart_nice_axis(
         series
             .iter()
@@ -8698,7 +9978,18 @@ fn chart_nice_value_axis(series: &[ResolvedChartSeries], force_zero: bool) -> Ni
     )
 }
 
-fn chart_x_value_bounds(series: &[ResolvedChartSeries]) -> (f64, f64) {
+fn chart_nice_x_axis(series: &[ResolvedChartSeries]) -> Option<NiceChartAxis> {
+    chart_nice_axis(
+        series
+            .iter()
+            .filter_map(|series| series.x_values.as_ref())
+            .flatten()
+            .copied(),
+        false,
+    )
+}
+
+fn chart_x_data_bounds(series: &[ResolvedChartSeries]) -> Option<(f64, f64)> {
     let mut minimum = f64::INFINITY;
     let mut maximum = f64::NEG_INFINITY;
     for value in series
@@ -8706,13 +9997,33 @@ fn chart_x_value_bounds(series: &[ResolvedChartSeries]) -> (f64, f64) {
         .filter_map(|series| series.x_values.as_ref())
         .flatten()
     {
+        if !value.is_finite() {
+            return None;
+        }
         minimum = minimum.min(*value);
         maximum = maximum.max(*value);
     }
+    if !minimum.is_finite() || !maximum.is_finite() {
+        return None;
+    }
     if maximum <= minimum {
-        (minimum - 0.5, maximum + 0.5)
+        let lower = minimum - 0.5;
+        let upper = maximum + 0.5;
+        (lower.is_finite() && upper.is_finite() && upper > lower).then_some((lower, upper))
     } else {
-        (minimum, maximum)
+        Some((minimum, maximum))
+    }
+}
+
+fn chart_category_label_is_retained(index: usize, count: usize, stride: usize) -> bool {
+    index < count && (index % stride.max(1) == 0 || index + 1 == count)
+}
+
+fn chart_category_label_stride(count: usize) -> usize {
+    if count <= MAX_CHART_CATEGORY_LABELS {
+        1
+    } else {
+        (count - 1).div_ceil(MAX_CHART_CATEGORY_LABELS - 1)
     }
 }
 
@@ -8735,20 +10046,6 @@ fn chart_axis_number(value: f64, major: f64) -> String {
         "0".to_string()
     } else {
         output
-    }
-}
-
-fn chart_value_bounds(series: &[ResolvedChartSeries], include_zero: bool) -> (f64, f64) {
-    let mut minimum = if include_zero { 0.0 } else { f64::INFINITY };
-    let mut maximum = if include_zero { 0.0 } else { f64::NEG_INFINITY };
-    for value in series.iter().flat_map(|series| series.values.iter()) {
-        minimum = minimum.min(*value);
-        maximum = maximum.max(*value);
-    }
-    if maximum <= minimum {
-        (minimum - 0.5, maximum + 0.5)
-    } else {
-        (minimum, maximum)
     }
 }
 
@@ -8814,13 +10111,20 @@ fn chart_x(plot: Rect, ratio: f64) -> Result<Fixed, RenderError> {
 #[allow(clippy::too_many_arguments)]
 fn push_cartesian_chart_axes(
     nodes: &mut Vec<SceneNode>,
+    chart_clip_bounds: Rect,
     plot: Rect,
     chart_kind: ChartKind,
     horizontal_bar: bool,
     axis: &NiceChartAxis,
+    x_value_axis: Option<&NiceChartAxis>,
+    x_data_bounds: Option<(f64, f64)>,
     series: &[ResolvedChartSeries],
+    category_axis_visible: bool,
+    value_axis_visible: bool,
     category_major_gridlines: bool,
     value_major_gridlines: bool,
+    category_axis_style: &ResolvedChartTextStyle,
+    value_axis_style: &ResolvedChartTextStyle,
     text_bytes: &mut u64,
     glyphs: &mut u64,
     typography_stats: &mut TypographyStats,
@@ -8837,95 +10141,180 @@ fn push_cartesian_chart_axes(
         .checked_add(plot.height)
         .ok_or(RenderError::CoordinateOverflow)?;
     let grid = Rgb::new(217, 217, 217);
-    for value in &axis.ticks {
-        if horizontal_bar {
-            let x = chart_x(
-                plot,
-                (*value - axis.minimum) / (axis.maximum - axis.minimum),
-            )?;
-            if value_major_gridlines {
-                push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
+    let text_gap = Fixed::from_pixels(4);
+    if value_axis_visible {
+        for value in &axis.ticks {
+            let label = chart_axis_number(*value, axis.major);
+            let metrics = measure_chart_text_with_style(&label, value_axis_style, options, None)?;
+            let extents = metrics.rotated(value_axis_style.rotation_degrees(0))?;
+            if horizontal_bar {
+                let x = chart_x(
+                    plot,
+                    (*value - axis.minimum) / (axis.maximum - axis.minimum),
+                )?;
+                if value_major_gridlines {
+                    push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
+                }
+                let paint_bounds = Rect {
+                    x: x.checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                    y: plot_bottom
+                        .checked_add(text_gap)
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                    width: extents.width,
+                    height: extents.height,
+                };
+                push_chart_text_with_style(
+                    nodes,
+                    label,
+                    centered_chart_text_bounds(paint_bounds, metrics)?,
+                    chart_clip_bounds,
+                    TextAnchor::Middle,
+                    0,
+                    value_axis_style,
+                    text_bytes,
+                    glyphs,
+                    typography_stats,
+                    options,
+                )?;
+            } else {
+                let y = chart_y(plot, *value, (axis.minimum, axis.maximum))?;
+                if value_major_gridlines {
+                    push_placeholder_line(nodes, plot.x, y, plot_right, y, grid, options)?;
+                }
+                let paint_bounds = Rect {
+                    x: plot
+                        .x
+                        .checked_sub(text_gap)
+                        .and_then(|value| value.checked_sub(extents.width))
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                    y: y.checked_sub(Fixed::from_raw(extents.height.raw() / 2))
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                    width: extents.width,
+                    height: extents.height,
+                };
+                let (bounds, anchor) = if value_axis_style.rotation_degrees(0).rem_euclid(360) == 0
+                {
+                    (
+                        Rect {
+                            x: plot
+                                .x
+                                .checked_sub(text_gap)
+                                .and_then(|value| value.checked_sub(metrics.width))
+                                .ok_or(RenderError::CoordinateOverflow)?,
+                            y: y.checked_sub(Fixed::from_raw(metrics.height.raw() / 2))
+                                .ok_or(RenderError::CoordinateOverflow)?,
+                            width: metrics.width,
+                            height: metrics.height,
+                        },
+                        TextAnchor::End,
+                    )
+                } else {
+                    (
+                        centered_chart_text_bounds(paint_bounds, metrics)?,
+                        TextAnchor::Middle,
+                    )
+                };
+                push_chart_text_with_style(
+                    nodes,
+                    label,
+                    bounds,
+                    chart_clip_bounds,
+                    anchor,
+                    0,
+                    value_axis_style,
+                    text_bytes,
+                    glyphs,
+                    typography_stats,
+                    options,
+                )?;
             }
-            push_chart_text(
-                nodes,
-                chart_axis_number(*value, axis.major),
-                Rect {
-                    x: Fixed::from_raw(x.raw() - Fixed::from_pixels(24).raw()),
-                    y: plot_bottom,
-                    width: Fixed::from_pixels(48),
-                    height: Fixed::from_pixels(14),
-                },
-                TextAnchor::Middle,
-                0,
-                Fixed::from_pixels(9),
-                text_bytes,
-                glyphs,
-                typography_stats,
-                options,
-            )?;
-        } else {
-            let y = chart_y(plot, *value, (axis.minimum, axis.maximum))?;
-            if value_major_gridlines {
-                push_placeholder_line(nodes, plot.x, y, plot_right, y, grid, options)?;
-            }
-            push_chart_text(
-                nodes,
-                chart_axis_number(*value, axis.major),
-                Rect {
-                    x: Fixed::from_raw(plot.x.raw() - Fixed::from_pixels(38).raw()),
-                    y: Fixed::from_raw(y.raw() - Fixed::from_pixels(7).raw()),
-                    width: Fixed::from_pixels(34),
-                    height: Fixed::from_pixels(14),
-                },
-                TextAnchor::End,
-                0,
-                Fixed::from_pixels(9),
-                text_bytes,
-                glyphs,
-                typography_stats,
-                options,
-            )?;
         }
     }
-    if matches!(chart_kind, ChartKind::Scatter | ChartKind::Bubble) && category_major_gridlines {
-        let x_bounds = chart_x_value_bounds(series);
-        let x_axis = chart_nice_axis(
-            series
-                .iter()
-                .filter_map(|series| series.x_values.as_ref())
-                .flatten()
-                .copied(),
-            false,
-        );
+    if matches!(chart_kind, ChartKind::Scatter | ChartKind::Bubble) && category_axis_visible {
+        let x_axis = x_value_axis.ok_or(RenderError::Typography {
+            reason: "missing_chart_x_value_axis",
+        })?;
+        let x_data_bounds = x_data_bounds.ok_or(RenderError::Typography {
+            reason: "missing_chart_x_data_bounds",
+        })?;
         for value in x_axis
             .ticks
             .iter()
-            .filter(|value| **value >= x_bounds.0 && **value <= x_bounds.1)
+            .filter(|value| **value >= x_data_bounds.0 && **value <= x_data_bounds.1)
         {
-            let x = chart_x(plot, (*value - x_bounds.0) / (x_bounds.1 - x_bounds.0))?;
-            push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
+            let x = chart_x(
+                plot,
+                (*value - x_axis.minimum) / (x_axis.maximum - x_axis.minimum),
+            )?;
+            if category_major_gridlines {
+                push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
+            }
+            let label = chart_axis_number(*value, x_axis.major);
+            let metrics =
+                measure_chart_text_with_style(&label, category_axis_style, options, None)?;
+            let extents = metrics.rotated(category_axis_style.rotation_degrees(0))?;
+            let paint_bounds = Rect {
+                x: x.checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                y: plot_bottom
+                    .checked_add(text_gap)
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                width: extents.width,
+                height: extents.height,
+            };
+            push_chart_text_with_style(
+                nodes,
+                label,
+                centered_chart_text_bounds(paint_bounds, metrics)?,
+                chart_clip_bounds,
+                TextAnchor::Middle,
+                0,
+                category_axis_style,
+                text_bytes,
+                glyphs,
+                typography_stats,
+                options,
+            )?;
         }
     }
-    push_placeholder_line(
-        nodes,
-        plot.x,
-        plot.y,
-        plot.x,
-        plot_bottom,
-        Rgb::BLACK,
-        options,
-    )?;
-    push_placeholder_line(
-        nodes,
-        plot.x,
-        plot_bottom,
-        plot_right,
-        plot_bottom,
-        Rgb::BLACK,
-        options,
-    )?;
+    let physical_vertical_axis_visible = if horizontal_bar {
+        category_axis_visible
+    } else {
+        value_axis_visible
+    };
+    let physical_horizontal_axis_visible = if horizontal_bar {
+        value_axis_visible
+    } else {
+        category_axis_visible
+    };
+    if physical_vertical_axis_visible {
+        push_placeholder_line(
+            nodes,
+            plot.x,
+            plot.y,
+            plot.x,
+            plot_bottom,
+            Rgb::BLACK,
+            options,
+        )?;
+    }
+    if physical_horizontal_axis_visible {
+        push_placeholder_line(
+            nodes,
+            plot.x,
+            plot_bottom,
+            plot_right,
+            plot_bottom,
+            Rgb::BLACK,
+            options,
+        )?;
+    }
 
     if matches!(chart_kind, ChartKind::Scatter | ChartKind::Bubble) {
+        return Ok(());
+    }
+    if !category_axis_visible {
         return Ok(());
     }
     let Some(categories) = series.first().map(|series| series.labels.as_slice()) else {
@@ -8934,11 +10323,11 @@ fn push_cartesian_chart_axes(
     if categories.is_empty() {
         return Ok(());
     }
-    let stride = categories.len().div_ceil(MAX_CHART_CATEGORY_LABELS).max(1);
+    let stride = chart_category_label_stride(categories.len());
     let retained = categories
         .iter()
         .enumerate()
-        .filter(|(index, _)| index % stride == 0 || index + 1 == categories.len())
+        .filter(|(index, _)| chart_category_label_is_retained(*index, categories.len(), stride))
         .count();
     warnings.add_count(
         WarningCode::ChartMetadataSimplified,
@@ -8946,24 +10335,28 @@ fn push_cartesian_chart_axes(
         Some(warning_cell),
     );
     for (index, category) in categories.iter().enumerate() {
-        if index % stride != 0 && index + 1 != categories.len() {
+        if !chart_category_label_is_retained(index, categories.len(), stride) {
             continue;
         }
-        let (bounds, anchor) = if horizontal_bar {
+        let metrics = measure_chart_text_with_style(category, category_axis_style, options, None)?;
+        let extents = metrics.rotated(category_axis_style.rotation_degrees(0))?;
+        let paint_bounds = if horizontal_bar {
             let ratio = (index as f64 + 0.5) / categories.len() as f64;
             let y = interpolate_fixed(plot.y, plot.height, ratio)?;
             if category_major_gridlines {
                 push_placeholder_line(nodes, plot.x, y, plot_right, y, grid, options)?;
             }
-            (
-                Rect {
-                    x: Fixed::from_raw(plot.x.raw() - Fixed::from_pixels(38).raw()),
-                    y: Fixed::from_raw(y.raw() - Fixed::from_pixels(7).raw()),
-                    width: Fixed::from_pixels(34),
-                    height: Fixed::from_pixels(14),
-                },
-                TextAnchor::End,
-            )
+            Rect {
+                x: plot
+                    .x
+                    .checked_sub(text_gap)
+                    .and_then(|value| value.checked_sub(extents.width))
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                y: y.checked_sub(Fixed::from_raw(extents.height.raw() / 2))
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                width: extents.width,
+                height: extents.height,
+            }
         } else {
             let ratio = if chart_kind == ChartKind::Bar {
                 (index as f64 + 0.5) / categories.len() as f64
@@ -8976,23 +10369,48 @@ fn push_cartesian_chart_axes(
             if category_major_gridlines {
                 push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
             }
-            (
-                Rect {
-                    x: Fixed::from_raw(x.raw() - Fixed::from_pixels(24).raw()),
-                    y: plot_bottom,
-                    width: Fixed::from_pixels(48),
-                    height: Fixed::from_pixels(14),
-                },
-                TextAnchor::Middle,
-            )
+            Rect {
+                x: x.checked_sub(Fixed::from_raw(extents.width.raw() / 2))
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                y: plot_bottom
+                    .checked_add(text_gap)
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                width: extents.width,
+                height: extents.height,
+            }
         };
-        push_chart_text(
+        let (bounds, anchor) =
+            if horizontal_bar && category_axis_style.rotation_degrees(0).rem_euclid(360) == 0 {
+                let ratio = (index as f64 + 0.5) / categories.len() as f64;
+                let y = interpolate_fixed(plot.y, plot.height, ratio)?;
+                (
+                    Rect {
+                        x: plot
+                            .x
+                            .checked_sub(text_gap)
+                            .and_then(|value| value.checked_sub(metrics.width))
+                            .ok_or(RenderError::CoordinateOverflow)?,
+                        y: y.checked_sub(Fixed::from_raw(metrics.height.raw() / 2))
+                            .ok_or(RenderError::CoordinateOverflow)?,
+                        width: metrics.width,
+                        height: metrics.height,
+                    },
+                    TextAnchor::End,
+                )
+            } else {
+                (
+                    centered_chart_text_bounds(paint_bounds, metrics)?,
+                    TextAnchor::Middle,
+                )
+            };
+        push_chart_text_with_style(
             nodes,
             category.clone(),
             bounds,
+            chart_clip_bounds,
             anchor,
             0,
-            Fixed::from_pixels(9),
+            category_axis_style,
             text_bytes,
             glyphs,
             typography_stats,
@@ -9071,13 +10489,13 @@ fn push_scatter_chart(
     plot: Rect,
     series: &[ResolvedChartSeries],
     y_bounds: (f64, f64),
+    x_axis: &NiceChartAxis,
     palette: &[Color],
     data_labels: bool,
     labels: &mut Vec<ChartLabel>,
     typography_stats: &mut TypographyStats,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
-    let (x_min, x_max) = chart_x_value_bounds(series);
     for (series_index, series) in series.iter().enumerate() {
         let x_values = series.x_values.as_ref().expect("scatter x values");
         let palette_color = chart_color(series_index, palette);
@@ -9089,7 +10507,10 @@ fn push_scatter_chart(
             && (series.style.line_width_emu.is_some() || series.style.line_color.is_some());
         let mut previous = None;
         for (x_value, y_value) in x_values.iter().zip(&series.values) {
-            let x = chart_x(plot, (*x_value - x_min) / (x_max - x_min))?;
+            let x = chart_x(
+                plot,
+                (*x_value - x_axis.minimum) / (x_axis.maximum - x_axis.minimum),
+            )?;
             let y = chart_y(plot, *y_value, y_bounds)?;
             if draw_retained_line {
                 if let Some((previous_x, previous_y)) = previous {
@@ -9254,6 +10675,22 @@ fn push_chart_path(
     )
 }
 
+fn preflight_chart_path_commands(
+    typography_stats: &TypographyStats,
+    additional: usize,
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    let actual = typography_stats
+        .path_commands
+        .checked_add(u64::try_from(additional).map_err(|_| RenderError::CoordinateOverflow)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    enforce(
+        LimitKind::PathCommands,
+        options.limits.max_path_commands,
+        actual,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_chart_path_with_width(
     nodes: &mut Vec<SceneNode>,
@@ -9378,7 +10815,7 @@ fn push_doughnut_chart(
             if *value == 0.0 {
                 continue;
             }
-            let end = start + std::f64::consts::TAU * *value / total;
+            let end = start + std::f64::consts::TAU * (*value / total);
             let segments = ((end - start).abs() / std::f64::consts::TAU * 64.0)
                 .ceil()
                 .max(1.0) as usize;
@@ -9430,12 +10867,20 @@ fn push_radar_chart(
     nodes: &mut Vec<SceneNode>,
     plot: Rect,
     series: &[ResolvedChartSeries],
-    bounds: (f64, f64),
+    axis: &NiceChartAxis,
     palette: &[Color],
+    category_axis_visible: bool,
+    value_axis_visible: bool,
+    category_major_gridlines: bool,
+    value_major_gridlines: bool,
+    category_labels: &mut Vec<ChartLabel>,
+    value_labels: &mut Vec<ChartLabel>,
     data_labels: bool,
     labels: &mut Vec<ChartLabel>,
     typography_stats: &mut TypographyStats,
     options: &RenderOptions,
+    warnings: &mut Warnings,
+    warning_cell: CellCoordinate,
 ) -> Result<(), RenderError> {
     let center_x = Fixed::from_raw(plot.x.raw() + plot.width.raw() / 2);
     let center_y = Fixed::from_raw(plot.y.raw() + plot.height.raw() / 2);
@@ -9453,43 +10898,93 @@ fn push_radar_chart(
             pixels_as_fixed(fixed_as_pixels(center_y) + radius * scale * angle.sin())?,
         ))
     };
-    for ring in 1..=4 {
-        let mut commands = Vec::with_capacity(categories.saturating_add(2));
+    let scale =
+        |value: f64| ((value - axis.minimum) / (axis.maximum - axis.minimum)).clamp(0.0, 1.0);
+    if value_axis_visible && value_major_gridlines {
+        for value in &axis.ticks {
+            let ring_scale = scale(*value);
+            if ring_scale <= 0.0 {
+                continue;
+            }
+            preflight_chart_path_commands(typography_stats, categories.saturating_add(1), options)?;
+            let mut commands = Vec::with_capacity(categories.saturating_add(1));
+            for index in 0..categories {
+                let (x, y) = polar(index, ring_scale)?;
+                commands.push(if index == 0 {
+                    PathCommand::MoveTo { x, y }
+                } else {
+                    PathCommand::LineTo { x, y }
+                });
+            }
+            commands.push(PathCommand::Close);
+            push_chart_path(
+                nodes,
+                commands,
+                None,
+                Some(Rgb::new(205, 205, 205)),
+                typography_stats,
+                options,
+            )?;
+        }
+    }
+    if category_axis_visible && category_major_gridlines {
         for index in 0..categories {
-            let (x, y) = polar(index, f64::from(ring) / 4.0)?;
-            commands.push(if index == 0 {
-                PathCommand::MoveTo { x, y }
-            } else {
-                PathCommand::LineTo { x, y }
+            let (x, y) = polar(index, 1.0)?;
+            push_placeholder_line(
+                nodes,
+                center_x,
+                center_y,
+                x,
+                y,
+                Rgb::new(205, 205, 205),
+                options,
+            )?;
+        }
+    }
+    if category_axis_visible {
+        if let Some(labels) = series.first().map(|series| series.labels.as_slice()) {
+            let label_count = labels.len().min(categories);
+            let stride = chart_category_label_stride(label_count);
+            let retained = (0..label_count)
+                .filter(|index| chart_category_label_is_retained(*index, label_count, stride))
+                .count();
+            warnings.add_count(
+                WarningCode::ChartMetadataSimplified,
+                label_count.saturating_sub(retained) as u64,
+                Some(warning_cell),
+            );
+            for (index, text) in labels.iter().take(label_count).enumerate() {
+                if !chart_category_label_is_retained(index, label_count, stride) {
+                    continue;
+                }
+                let (x, y) = polar(index, 1.12)?;
+                category_labels.push(ChartLabel {
+                    text: text.clone(),
+                    x,
+                    y,
+                });
+            }
+        }
+    }
+    if value_axis_visible {
+        for value in &axis.ticks {
+            let (x, y) = polar(0, scale(*value))?;
+            value_labels.push(ChartLabel {
+                text: chart_axis_number(*value, axis.major),
+                x,
+                y,
             });
         }
-        commands.push(PathCommand::Close);
-        push_chart_path(
-            nodes,
-            commands,
-            None,
-            Some(Rgb::new(205, 205, 205)),
-            typography_stats,
-            options,
-        )?;
-    }
-    for index in 0..categories {
-        let (x, y) = polar(index, 1.0)?;
-        push_placeholder_line(
-            nodes,
-            center_x,
-            center_y,
-            x,
-            y,
-            Rgb::new(205, 205, 205),
-            options,
-        )?;
     }
     for (series_index, series) in series.iter().enumerate() {
+        preflight_chart_path_commands(
+            typography_stats,
+            series.values.len().saturating_add(1),
+            options,
+        )?;
         let mut commands = Vec::with_capacity(series.values.len().saturating_add(2));
         for (index, value) in series.values.iter().enumerate() {
-            let scale = ((*value - bounds.0) / (bounds.1 - bounds.0)).clamp(0.0, 1.0);
-            let (x, y) = polar(index, scale)?;
+            let (x, y) = polar(index, scale(*value))?;
             commands.push(if index == 0 {
                 PathCommand::MoveTo { x, y }
             } else {
@@ -9531,13 +11026,13 @@ fn push_bubble_chart(
     plot: Rect,
     series: &[ResolvedChartSeries],
     y_bounds: (f64, f64),
+    x_axis: &NiceChartAxis,
     palette: &[Color],
     data_labels: bool,
     labels: &mut Vec<ChartLabel>,
     typography_stats: &mut TypographyStats,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
-    let (x_min, x_max) = chart_x_value_bounds(series);
     let max_size = series
         .iter()
         .filter_map(|series| series.bubble_sizes.as_ref())
@@ -9549,7 +11044,10 @@ fn push_bubble_chart(
         let x_values = series.x_values.as_ref().expect("bubble x values");
         let sizes = series.bubble_sizes.as_ref().expect("bubble sizes");
         for ((x_value, y_value), size) in x_values.iter().zip(&series.values).zip(sizes) {
-            let x = chart_x(plot, (*x_value - x_min) / (x_max - x_min))?;
+            let x = chart_x(
+                plot,
+                (*x_value - x_axis.minimum) / (x_axis.maximum - x_axis.minimum),
+            )?;
             let y = chart_y(plot, *y_value, y_bounds)?;
             let radius = (maximum_radius * (*size / max_size).sqrt()).max(2.0);
             let segments = 24_usize;
@@ -9612,7 +11110,7 @@ fn push_pie_chart(
         if *value == 0.0 {
             continue;
         }
-        let end = start + std::f64::consts::TAU * *value / total;
+        let end = start + std::f64::consts::TAU * (*value / total);
         let segments = ((end - start).abs() / std::f64::consts::TAU * 64.0)
             .ceil()
             .max(1.0) as usize;
@@ -9804,18 +11302,53 @@ fn push_chart_marker(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn push_chart_text(
     nodes: &mut Vec<SceneNode>,
     text: String,
     bounds: Rect,
     anchor: TextAnchor,
     rotation_degrees: i16,
-    size: Fixed,
+    role: ChartTextRole,
+    family: &str,
     text_bytes: &mut u64,
     glyphs: &mut u64,
     typography_stats: &mut TypographyStats,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
+    let style = ResolvedChartTextStyle::for_role(role, family);
+    push_chart_text_with_style(
+        nodes,
+        text,
+        bounds,
+        bounds,
+        anchor,
+        rotation_degrees,
+        &style,
+        text_bytes,
+        glyphs,
+        typography_stats,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_chart_text_with_style(
+    nodes: &mut Vec<SceneNode>,
+    text: String,
+    bounds: Rect,
+    clip_bounds: Rect,
+    anchor: TextAnchor,
+    fallback_rotation_degrees: i16,
+    chart_style: &ResolvedChartTextStyle,
+    text_bytes: &mut u64,
+    glyphs: &mut u64,
+    typography_stats: &mut TypographyStats,
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    if text.is_empty() {
+        return Ok(());
+    }
     *text_bytes = text_bytes
         .checked_add(text.len() as u64)
         .ok_or(RenderError::CoordinateOverflow)?;
@@ -9828,22 +11361,13 @@ fn push_chart_text(
         .checked_add(text.chars().count() as u64)
         .ok_or(RenderError::CoordinateOverflow)?;
     enforce(LimitKind::Glyphs, options.limits.max_glyphs, *glyphs)?;
-    let node = build_auxiliary_text_node(
+    let node = build_auxiliary_text_node_with_clip_and_kerning(
         text,
         bounds,
+        clip_bounds,
         Fixed::from_pixels(2),
-        TextStyle {
-            family: options.default_font_family.clone(),
-            size,
-            color: Rgb::BLACK,
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            anchor,
-            baseline: TextBaseline::Middle,
-            rotation_degrees,
-        },
+        chart_style.text_style(anchor, fallback_rotation_degrees),
+        chart_style.kerning(),
         options,
     )?;
     if let SceneNode::GlyphRun(run) = &node {
@@ -11134,7 +12658,15 @@ fn measure_automatic_cell_height(
     calc_pattern_points: Option<u16>,
 ) -> Result<Fixed, RenderError> {
     let style = text_style(region, options, sheet_right_to_left);
-    let prepared = prepare_styled_text(pack, region, &style, sheet_right_to_left, options, stats)?;
+    let prepared = prepare_styled_text(
+        pack,
+        region,
+        &style,
+        sheet_right_to_left,
+        true,
+        options,
+        stats,
+    )?;
     if let Some(source) = calc_metric_source {
         if let Some(height) = calc_verified_automatic_cell_height(
             pack,
@@ -11407,13 +12939,21 @@ fn build_glyph_run(
     clip_bounds: Rect,
     style: &TextStyle,
     sheet_right_to_left: bool,
+    kerning: bool,
     options: &RenderOptions,
     stats: &mut TypographyStats,
     warnings: &mut Warnings,
 ) -> Result<GlyphRunNode, RenderError> {
     let alignment = region.style.as_ref().and_then(|style| style.align.as_ref());
-    let mut prepared =
-        prepare_styled_text(pack, region, style, sheet_right_to_left, options, stats)?;
+    let mut prepared = prepare_styled_text(
+        pack,
+        region,
+        style,
+        sheet_right_to_left,
+        kerning,
+        options,
+        stats,
+    )?;
     warnings.add_count(
         WarningCode::MissingGlyph,
         prepared.missing_glyphs,
@@ -11462,7 +13002,19 @@ fn build_glyph_run(
         .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
         .collect::<Result<Vec<_>, _>>()?;
     let block_height = sum_fixed(line_heights.iter().copied())?;
-    let top = vertical_block_top(layout_bounds, block_height, style.baseline)?;
+    let top = if region.ods_fixed_height_row
+        && block_height > region.rect.height
+        && alignment.is_some_and(|alignment| {
+            alignment.wrap && alignment.vertical.is_none() && alignment.rotation == 0
+        }) {
+        // Calc preserves the beginning of implicitly aligned wrapped ODS text
+        // in a fixed-height row. Its generic bottom default would otherwise
+        // translate the beginning above the clip and retain only the tail.
+        let top_bounds = calc_cell_text_layout_bounds(region.rect, TextBaseline::Top)?;
+        vertical_block_top(top_bounds, block_height, TextBaseline::Top)?
+    } else {
+        vertical_block_top(layout_bounds, block_height, style.baseline)?
+    };
 
     let mut commands = Vec::new();
     let mut clusters = Vec::new();
@@ -11569,6 +13121,7 @@ fn prepare_styled_text(
     region: &Region,
     base: &TextStyle,
     sheet_right_to_left: bool,
+    kerning: bool,
     options: &RenderOptions,
     stats: &mut TypographyStats,
 ) -> Result<PreparedText, RenderError> {
@@ -11628,6 +13181,7 @@ fn prepare_styled_text(
                 &spans,
                 &styles,
                 direction,
+                kerning,
                 options,
             )?;
             let width = styled_shaped_width(pack, &shaped, &styles, 1, 1)?;
@@ -11651,6 +13205,7 @@ fn prepare_styled_text(
             &spans,
             &styles,
             direction,
+            kerning,
             options,
         )?;
         account_shaping(pack, &shaped, options, stats)?;
@@ -11795,6 +13350,7 @@ fn shape_styled_range(
     spans: &[StyledSourceSpan],
     styles: &[ResolvedRunStyle],
     direction: BaseDirection,
+    kerning: bool,
     options: &RenderOptions,
 ) -> Result<ShapedText, RenderError> {
     let value = text.get(source.clone()).ok_or(RenderError::Typography {
@@ -11827,6 +13383,7 @@ fn shape_styled_range(
             direction,
             max_glyphs: glyph_limit,
             max_runs: run_limit,
+            kerning,
         },
     )
     .map_err(map_font_error)
@@ -11895,6 +13452,17 @@ fn shape_text(
     direction: BaseDirection,
     options: &RenderOptions,
 ) -> Result<ShapedText, RenderError> {
+    shape_text_with_kerning(pack, text, request, direction, true, options)
+}
+
+fn shape_text_with_kerning(
+    pack: &FontPack,
+    text: &str,
+    request: FontRequest<'_>,
+    direction: BaseDirection,
+    kerning: bool,
+    options: &RenderOptions,
+) -> Result<ShapedText, RenderError> {
     let glyph_limit = usize::try_from(options.limits.max_glyphs).unwrap_or(usize::MAX);
     let run_limit = usize::try_from(options.limits.max_text_runs).unwrap_or(usize::MAX);
     pack.shape(
@@ -11904,6 +13472,7 @@ fn shape_text(
             direction,
             max_glyphs: glyph_limit,
             max_runs: run_limit,
+            kerning,
         },
     )
     .map_err(map_font_error)
@@ -12856,19 +14425,36 @@ fn map_font_error(error: FontPackError) -> RenderError {
     }
 }
 
+fn cached_cell_value(mut cell: &Cell) -> &Cell {
+    while let Cell::Formula { cached, .. } = cell {
+        cell = cached;
+    }
+    cell
+}
+
+fn cell_is_date_or_time(cell: &Cell, style: Option<&CellStyle>) -> bool {
+    match cached_cell_value(cell) {
+        Cell::Date(_) => true,
+        Cell::Number(value) => style
+            .and_then(|style| style.num_fmt.as_deref())
+            .is_some_and(|format| rxls::number_format_displays_datetime(*value, format)),
+        Cell::Text(_) | Cell::Bool(_) | Cell::Error(_) | Cell::Formula { .. } => false,
+    }
+}
+
 fn cell_defaults_to_right_alignment(cell: &Cell) -> bool {
-    match cell {
+    match cached_cell_value(cell) {
         Cell::Number(_) | Cell::Date(_) => true,
-        Cell::Formula { cached, .. } => cell_defaults_to_right_alignment(cached),
-        Cell::Text(_) | Cell::Bool(_) | Cell::Error(_) => false,
+        Cell::Text(_) | Cell::Bool(_) | Cell::Error(_) | Cell::Formula { .. } => false,
     }
 }
 
 fn cell_allows_horizontal_overflow(cell: &Cell) -> bool {
-    match cell {
+    match cached_cell_value(cell) {
         Cell::Text(_) => true,
-        Cell::Formula { cached, .. } => cell_allows_horizontal_overflow(cached),
-        Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) | Cell::Error(_) => false,
+        Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) | Cell::Error(_) | Cell::Formula { .. } => {
+            false
+        }
     }
 }
 
@@ -13017,6 +14603,7 @@ fn compose_edges(
     regions: &[Region],
     suppresses_gridlines: &[bool],
     show_gridlines: bool,
+    gridline_policy: GridlinePolicy,
     options: &RenderOptions,
 ) -> Result<Vec<(ComposedEdgeKey, EdgeClaim)>, RenderError> {
     #[derive(Debug, Clone, Copy)]
@@ -13143,7 +14730,7 @@ fn compose_edges(
                 continue;
             }
             let Some(winner) = active.values().copied().reduce(|current, candidate| {
-                if edge_claim_precedes(candidate, current) {
+                if edge_claim_precedes(candidate, current, gridline_policy) {
                     candidate
                 } else {
                     current
@@ -13165,10 +14752,15 @@ fn compose_edges(
     Ok(coalesce_composed_edges(composed))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_composed_edges(
     nodes: &mut Vec<SceneNode>,
     composed: &[(ComposedEdgeKey, EdgeClaim)],
     layer: EdgeClaimKind,
+    gridline_policy: GridlinePolicy,
+    grid_bounds: Rect,
+    scene_bounds: Rect,
+    right_to_left: bool,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
     debug_assert!(matches!(
@@ -13179,16 +14771,217 @@ fn push_composed_edges(
         if claim.kind != layer {
             continue;
         }
+        let print_gridline =
+            layer == EdgeClaimKind::Gridline && gridline_policy != GridlinePolicy::WorksheetView;
+        if print_gridline && is_print_gridline_leading_edge(key, grid_bounds, right_to_left)? {
+            continue;
+        }
+        let key = if layer == EdgeClaimKind::Gridline
+            && gridline_policy == GridlinePolicy::CalcSinglePagePrint
+        {
+            let mapped = map_calc_single_page_gridline_key(key, grid_bounds, right_to_left)?;
+            let Some(clipped) = clip_composed_edge(mapped, scene_bounds)? else {
+                continue;
+            };
+            clipped
+        } else {
+            key
+        };
         if claim.style == BorderStyle::Double {
             push_double_edge(nodes, key, claim, options)?;
             continue;
         }
-        let Some(width) = border_width(claim.style) else {
+        let (color, width) = if print_gridline {
+            (Rgb::BLACK, PRINT_GRIDLINE_WIDTH)
+        } else {
+            let Some(width) = border_width(claim.style) else {
+                continue;
+            };
+            (claim.color, width)
+        };
+        push_node(
+            nodes,
+            SceneNode::Line(edge_line(key, Fixed::ZERO, color, width)?),
+            options,
+        )?;
+    }
+    Ok(())
+}
+
+fn is_print_gridline_leading_edge(
+    key: ComposedEdgeKey,
+    grid_bounds: Rect,
+    right_to_left: bool,
+) -> Result<bool, RenderError> {
+    let right = grid_bounds
+        .x
+        .checked_add(grid_bounds.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(match key.orientation {
+        ComposedEdgeOrientation::Vertical => {
+            key.axis == if right_to_left { right } else { grid_bounds.x }
+        }
+        ComposedEdgeOrientation::Horizontal => key.axis == grid_bounds.y,
+    })
+}
+
+fn map_calc_single_page_gridline_key(
+    key: ComposedEdgeKey,
+    grid_bounds: Rect,
+    right_to_left: bool,
+) -> Result<ComposedEdgeKey, RenderError> {
+    let right = grid_bounds
+        .x
+        .checked_add(grid_bounds.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let map_x = |value: Fixed| -> Result<Fixed, RenderError> {
+        if right_to_left {
+            let distance = right
+                .checked_sub(value)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            grid_bounds
+                .x
+                .checked_sub(scale_ratio(
+                    distance,
+                    CALC_SINGLE_PAGE_GRIDLINE_SCALE_NUMERATOR,
+                    CALC_SINGLE_PAGE_GRIDLINE_SCALE_DENOMINATOR,
+                )?)
+                .ok_or(RenderError::CoordinateOverflow)
+        } else {
+            let distance = value
+                .checked_sub(grid_bounds.x)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            grid_bounds
+                .x
+                .checked_add(scale_ratio(
+                    distance,
+                    CALC_SINGLE_PAGE_GRIDLINE_SCALE_NUMERATOR,
+                    CALC_SINGLE_PAGE_GRIDLINE_SCALE_DENOMINATOR,
+                )?)
+                .ok_or(RenderError::CoordinateOverflow)
+        }
+    };
+    let map_y = |value: Fixed| -> Result<Fixed, RenderError> {
+        let distance = value
+            .checked_sub(grid_bounds.y)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        grid_bounds
+            .y
+            .checked_add(scale_ratio(
+                distance,
+                CALC_SINGLE_PAGE_GRIDLINE_SCALE_NUMERATOR,
+                CALC_SINGLE_PAGE_GRIDLINE_SCALE_DENOMINATOR,
+            )?)
+            .ok_or(RenderError::CoordinateOverflow)
+    };
+    Ok(match key.orientation {
+        ComposedEdgeOrientation::Vertical => ComposedEdgeKey {
+            orientation: key.orientation,
+            axis: map_x(key.axis)?,
+            start: map_y(key.start)?,
+            end: map_y(key.end)?,
+        },
+        ComposedEdgeOrientation::Horizontal => ComposedEdgeKey {
+            orientation: key.orientation,
+            axis: map_y(key.axis)?,
+            start: map_x(key.start)?,
+            end: map_x(key.end)?,
+        },
+    })
+}
+
+fn clip_composed_edge(
+    mut key: ComposedEdgeKey,
+    clip: Rect,
+) -> Result<Option<ComposedEdgeKey>, RenderError> {
+    let right = clip
+        .x
+        .checked_add(clip.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bottom = clip
+        .y
+        .checked_add(clip.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    match key.orientation {
+        ComposedEdgeOrientation::Vertical => {
+            if key.axis < clip.x || key.axis > right {
+                return Ok(None);
+            }
+            key.start = std::cmp::max(key.start, clip.y);
+            key.end = std::cmp::min(key.end, bottom);
+        }
+        ComposedEdgeOrientation::Horizontal => {
+            if key.axis < clip.y || key.axis > bottom {
+                return Ok(None);
+            }
+            key.start = std::cmp::max(key.start, clip.x);
+            key.end = std::cmp::min(key.end, right);
+        }
+    }
+    Ok((key.start < key.end).then_some(key))
+}
+
+fn push_print_gridline_leading_frame(
+    nodes: &mut Vec<SceneNode>,
+    grid_bounds: Rect,
+    scene_bounds: Rect,
+    right_to_left: bool,
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    let grid_right = grid_bounds
+        .x
+        .checked_add(grid_bounds.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let grid_bottom = grid_bounds
+        .y
+        .checked_add(grid_bounds.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    // Calc keeps the leading frame in normal page space, but it is inset by
+    // its integer Map100thMM stroke rectangle rather than centered on the
+    // MediaBox. This makes both frame edges survive PDF clipping at 96 DPI.
+    let left = grid_bounds
+        .x
+        .checked_add(PRINT_GRIDLINE_FRAME_LEFT_INSET)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right = grid_right
+        .checked_sub(PRINT_GRIDLINE_FRAME_TRAILING_INSET)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let top = grid_bounds
+        .y
+        .checked_add(PRINT_GRIDLINE_FRAME_TOP_INSET)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bottom = grid_bottom
+        .checked_sub(PRINT_GRIDLINE_FRAME_TRAILING_INSET)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    if left >= right || top >= bottom {
+        return Ok(());
+    }
+    let leading_x = if right_to_left { right } else { left };
+    for key in [
+        ComposedEdgeKey {
+            orientation: ComposedEdgeOrientation::Vertical,
+            axis: leading_x,
+            start: top,
+            end: bottom,
+        },
+        ComposedEdgeKey {
+            orientation: ComposedEdgeOrientation::Horizontal,
+            axis: top,
+            start: left,
+            end: right,
+        },
+    ] {
+        let Some(key) = clip_composed_edge(key, scene_bounds)? else {
             continue;
         };
         push_node(
             nodes,
-            SceneNode::Line(edge_line(key, Fixed::ZERO, claim.color, width)?),
+            SceneNode::Line(edge_line(
+                key,
+                Fixed::ZERO,
+                Rgb::BLACK,
+                PRINT_GRIDLINE_WIDTH,
+            )?),
             options,
         )?;
     }
@@ -13239,12 +15032,32 @@ fn border_edge_style_and_color(border: &Border, side: CellEdge) -> (BorderStyle,
     }
 }
 
-fn edge_claim_precedes(candidate: EdgeClaim, current: EdgeClaim) -> bool {
-    let candidate_strength = (candidate.kind, border_precedence(candidate.style));
-    let current_strength = (current.kind, border_precedence(current.style));
+fn edge_claim_precedes(
+    candidate: EdgeClaim,
+    current: EdgeClaim,
+    gridline_policy: GridlinePolicy,
+) -> bool {
+    let candidate_strength = (
+        edge_claim_kind_precedence(candidate.kind, gridline_policy),
+        border_precedence(candidate.style),
+    );
+    let current_strength = (
+        edge_claim_kind_precedence(current.kind, gridline_policy),
+        border_precedence(current.style),
+    );
     candidate_strength > current_strength
         || (candidate_strength == current_strength
             && (candidate.owner, candidate.side) < (current.owner, current.side))
+}
+
+fn edge_claim_kind_precedence(kind: EdgeClaimKind, gridline_policy: GridlinePolicy) -> u8 {
+    match (kind, gridline_policy) {
+        (EdgeClaimKind::Explicit, _) => 2,
+        (EdgeClaimKind::GridlineSuppression, GridlinePolicy::WorksheetView) => 1,
+        (EdgeClaimKind::Gridline, GridlinePolicy::WorksheetView) => 0,
+        (EdgeClaimKind::Gridline, _) => 1,
+        (EdgeClaimKind::GridlineSuppression, _) => 0,
+    }
 }
 
 fn border_precedence(style: BorderStyle) -> u8 {
@@ -14577,14 +16390,33 @@ mod tests {
             hyperlink: None,
             numeric_default: false,
             text_can_overflow: false,
+            ods_fixed_height_row: false,
         };
         let base = text_style(&region, &options, false);
         let (styles, spans) = resolve_rich_styles(&region, &base).unwrap();
         let direction = text_base_direction(text, false);
-        let full_atom =
-            shape_styled_range(&pack, text, 0..3, &spans, &styles, direction, &options).unwrap();
-        let prefix =
-            shape_styled_range(&pack, text, 0..2, &spans, &styles, direction, &options).unwrap();
+        let full_atom = shape_styled_range(
+            &pack,
+            text,
+            0..3,
+            &spans,
+            &styles,
+            direction,
+            true,
+            &options,
+        )
+        .unwrap();
+        let prefix = shape_styled_range(
+            &pack,
+            text,
+            0..2,
+            &spans,
+            &styles,
+            direction,
+            true,
+            &options,
+        )
+        .unwrap();
         let full_width = styled_shaped_width(&pack, &full_atom, &styles, 1, 1).unwrap();
         let prefix_width = styled_shaped_width(&pack, &prefix, &styles, 1, 1).unwrap();
         assert!(full_width > prefix_width);
@@ -14599,8 +16431,16 @@ mod tests {
         });
 
         let mut statistics = TypographyStats::default();
-        let prepared =
-            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        let prepared = prepare_styled_text(
+            &pack,
+            &region,
+            &base,
+            false,
+            true,
+            &options,
+            &mut statistics,
+        )
+        .unwrap();
         assert_eq!(prepared.lines[0].source, 0..3);
         assert_eq!(prepared.lines[0].width, prefix_width);
         assert!(prepared.lines[0]
@@ -14617,6 +16457,7 @@ mod tests {
             region.rect,
             &base,
             false,
+            true,
             &options,
             &mut statistics,
             &mut Warnings::default(),
@@ -14838,10 +16679,9 @@ mod tests {
             for fragment in ["Latin", "한글", "a\u{301}"] {
                 assert!(extracted.contains(fragment), "{extracted:?}");
             }
-            // Poppler wraps strong RTL text in directional controls and emits
-            // its visual glyph order without inventing a leading gap;
-            // displaying this substring reads `אב`.
-            assert!(extracted.contains("\u{202b}בא\u{202c}"), "{extracted:?}");
+            // Poppler preserves the logical RTL source order inside its
+            // directional controls without inventing a leading gap.
+            assert!(extracted.contains("\u{202b}אב\u{202c}"), "{extracted:?}");
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -15963,6 +17803,7 @@ mod tests {
             hyperlink: None,
             numeric_default: false,
             text_can_overflow: false,
+            ods_fixed_height_row: false,
         };
         let text_style = text_style(&region, &options, false);
         let mut statistics = TypographyStats::default();
@@ -15971,6 +17812,7 @@ mod tests {
             &region,
             &text_style,
             false,
+            true,
             &options,
             &mut statistics,
         )
@@ -16254,6 +18096,7 @@ mod tests {
             hyperlink: None,
             numeric_default: false,
             text_can_overflow: false,
+            ods_fixed_height_row: false,
         };
         let mut native_statistics = TypographyStats::default();
         let native_height = measure_automatic_cell_height(
@@ -16296,6 +18139,7 @@ mod tests {
             &native_region,
             &native_style,
             false,
+            true,
             &options,
             &mut prepared_statistics,
         )
@@ -17226,12 +19070,21 @@ mod tests {
             hyperlink: None,
             numeric_default: false,
             text_can_overflow: false,
+            ods_fixed_height_row: false,
         };
         let mut statistics = TypographyStats::default();
         let region = make_region("Latin 한국어 العربية");
         let base = text_style(&region, &options, false);
-        let prepared =
-            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        let prepared = prepare_styled_text(
+            &pack,
+            &region,
+            &base,
+            false,
+            true,
+            &options,
+            &mut statistics,
+        )
+        .unwrap();
         assert_eq!(
             prepared_asian_face(&prepared, &region.text, &options, &mut statistics).unwrap(),
             PreparedAsianFace::Verified(FontId(0)),
@@ -17241,8 +19094,16 @@ mod tests {
         let mut statistics = TypographyStats::default();
         let region = make_region("Latin العربية");
         let base = text_style(&region, &options, false);
-        let prepared =
-            prepare_styled_text(&pack, &region, &base, false, &options, &mut statistics).unwrap();
+        let prepared = prepare_styled_text(
+            &pack,
+            &region,
+            &base,
+            false,
+            true,
+            &options,
+            &mut statistics,
+        )
+        .unwrap();
         assert_eq!(
             prepared_asian_face(&prepared, &region.text, &options, &mut statistics).unwrap(),
             PreparedAsianFace::None
@@ -17950,6 +19811,169 @@ mod tests {
     }
 
     #[test]
+    fn single_page_print_gridlines_use_calc_hairline_mapping_and_frame() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("print-grid");
+        sheet.write(0, 0, "A");
+        sheet.write(1, 1, "B");
+
+        let build = build_single_page_sheet_scene_for_print(
+            sheet,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 1, 1)),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let print_grid = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.width == Fixed::from_raw(137) =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(print_grid.len(), 2);
+        assert!(!build
+            .scene
+            .nodes
+            .iter()
+            .any(|node| matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE)));
+        assert!(print_grid.iter().any(|line| {
+            line.x1 == PRINT_GRIDLINE_FRAME_LEFT_INSET
+                && line.x2 == PRINT_GRIDLINE_FRAME_LEFT_INSET
+                && line.y1 == PRINT_GRIDLINE_FRAME_TOP_INSET
+                && line.y2
+                    == build
+                        .scene
+                        .height
+                        .checked_sub(PRINT_GRIDLINE_FRAME_TRAILING_INSET)
+                        .unwrap()
+        }));
+        assert!(print_grid.iter().any(|line| {
+            line.x1 == PRINT_GRIDLINE_FRAME_LEFT_INSET
+                && line.x2
+                    == build
+                        .scene
+                        .width
+                        .checked_sub(PRINT_GRIDLINE_FRAME_TRAILING_INSET)
+                        .unwrap()
+                && line.y1 == PRINT_GRIDLINE_FRAME_TOP_INSET
+                && line.y2 == PRINT_GRIDLINE_FRAME_TOP_INSET
+        }));
+    }
+
+    #[test]
+    fn print_gridline_modes_keep_view_authored_and_calc_geometry_distinct() {
+        fn print_gridlines(scene: &Scene) -> Vec<&LineNode> {
+            scene
+                .nodes
+                .iter()
+                .filter_map(|node| match node {
+                    SceneNode::Line(line)
+                        if line.color == Rgb::BLACK && line.width == PRINT_GRIDLINE_WIDTH =>
+                    {
+                        Some(line)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("print-grid");
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 17, 5)),
+            ..RenderOptions::default()
+        };
+
+        let view = build_sheet_scene(&workbook.sheets[0], 0, &options).unwrap();
+        let view_gridlines = view
+            .scene
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE && line.width == Fixed::from_pixels(1))
+            })
+            .count();
+        assert_eq!(view_gridlines, 26);
+        assert!(print_gridlines(&view.scene).is_empty());
+
+        let authored = build_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
+        assert_eq!(print_gridlines(&authored.scene).len(), 26);
+        assert!(!authored
+            .scene
+            .nodes
+            .iter()
+            .any(|node| matches!(node, SceneNode::Line(line) if line.color == Rgb::GRIDLINE)));
+
+        let single_page =
+            build_single_page_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
+        assert_eq!(print_gridlines(&single_page.scene).len(), 8);
+
+        workbook.sheets[0].set_right_to_left(true);
+        let rtl =
+            build_single_page_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
+        assert_eq!(print_gridlines(&rtl.scene).len(), 2);
+    }
+
+    #[test]
+    fn print_gridline_precedence_retains_shared_unfilled_edge() {
+        fn vertical_line_at(scene: &Scene, x: Fixed, color: Rgb, width: Fixed) -> bool {
+            scene.nodes.iter().any(|node| {
+                matches!(node, SceneNode::Line(line) if line.x1 == x && line.x2 == x && line.color == color && line.width == width)
+            })
+        }
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("fill-boundary");
+        sheet.write_with_format(
+            0,
+            0,
+            "filled",
+            &Format::new().set_background_color([0xFF, 0xCC, 0x00]),
+        );
+        sheet.write(0, 1, "plain");
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 1)),
+            ..RenderOptions::default()
+        };
+
+        let view = build_sheet_scene(sheet, 0, &options).unwrap();
+        let filled = view
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Rect(rect) if rect.fill.is_some() => Some(rect.rect),
+                _ => None,
+            })
+            .expect("filled cell rectangle");
+        let shared_x = filled.x.checked_add(filled.width).unwrap();
+        assert!(!vertical_line_at(
+            &view.scene,
+            shared_x,
+            Rgb::GRIDLINE,
+            Fixed::from_pixels(1)
+        ));
+
+        let print = build_sheet_scene_for_print(sheet, 0, &options).unwrap();
+        assert!(vertical_line_at(
+            &print.scene,
+            shared_x,
+            Rgb::BLACK,
+            PRINT_GRIDLINE_WIDTH
+        ));
+    }
+
+    #[test]
     fn shared_grid_edges_are_painted_once_and_coalesced_per_axis() {
         let mut workbook = Workbook::new();
         workbook.add_sheet("grid").write(0, 0, "A");
@@ -18350,6 +20374,135 @@ mod tests {
         assert_eq!(build.scene.height.raw(), 74_140);
     }
 
+    #[test]
+    fn ods_fixed_height_wrapped_text_keeps_implicit_start_and_explicit_alignment_controls() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.45in"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="0.25in" style:use-optimal-row-height="false"/></style:style><style:style style:name="ce-default" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap"/></style:style><style:style style:name="ce-top" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="top"/></style:style><style:style style:name="ce-middle" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="middle"/></style:style><style:style style:name="ce-bottom" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="bottom"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Clip"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-default" office:value-type="string"><text:p>implicit one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-top" office:value-type="string"><text:p>top one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-middle" office:value-type="string"><text:p>middle one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-bottom" office:value-type="string"><text:p>bottom one two three four five six seven</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 3, 0)),
+        )
+        .unwrap();
+
+        let span = |text: &str| {
+            let run = glyph_run(&build.scene, text);
+            let minimum = run
+                .cluster_metrics
+                .iter()
+                .map(|metric| metric.baseline_y)
+                .min()
+                .unwrap();
+            let maximum = run
+                .cluster_metrics
+                .iter()
+                .map(|metric| metric.baseline_y)
+                .max()
+                .unwrap();
+            (run.clip_bounds, minimum, maximum)
+        };
+        let (implicit_clip, implicit_min, implicit_max) =
+            span("implicit one two three four five six seven");
+        let (top_clip, top_min, top_max) = span("top one two three four five six seven");
+        let (middle_clip, middle_min, middle_max) =
+            span("middle one two three four five six seven");
+        let (bottom_clip, bottom_min, bottom_max) =
+            span("bottom one two three four five six seven");
+        let bottom = |clip: Rect| clip.y.checked_add(clip.height).unwrap();
+
+        assert!(implicit_min >= implicit_clip.y);
+        assert!(implicit_max > bottom(implicit_clip));
+        assert!(top_min >= top_clip.y);
+        assert!(top_max > bottom(top_clip));
+        assert!(middle_min < middle_clip.y);
+        assert!(middle_max > bottom(middle_clip));
+        assert!(bottom_min < bottom_clip.y);
+        assert!(bottom_max <= bottom(bottom_clip));
+    }
+
+    #[test]
+    fn ods_rotated_fixed_height_wrap_retains_generic_bottom_alignment() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.45in"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="0.25in" style:use-optimal-row-height="false"/></style:style><style:style style:name="ce-implicit" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:rotation-angle="45"/></style:style><style:style style:name="ce-bottom" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:rotation-angle="45" style:vertical-align="bottom"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Rotated"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-implicit" office:value-type="string"><text:p>rotated one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-bottom" office:value-type="string"><text:p>rotated one two three four five six seven</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 1, 0)),
+        )
+        .unwrap();
+        let runs = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::GlyphRun(run)
+                    if run.text == "rotated one two three four five six seven" =>
+                {
+                    Some(run)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.rotation_degrees == 45));
+
+        let relative_baselines = |run: &GlyphRunNode| {
+            run.cluster_metrics
+                .iter()
+                .map(|metric| metric.baseline_y.raw() - run.clip_bounds.y.raw())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            relative_baselines(runs[0]),
+            relative_baselines(runs[1]),
+            "implicit rotated ODS text must retain the generic bottom-aligned path"
+        );
+        assert!(
+            runs[0]
+                .cluster_metrics
+                .iter()
+                .map(|metric| metric.baseline_y)
+                .min()
+                .unwrap()
+                < runs[0].clip_bounds.y,
+            "a multi-line bottom-aligned block begins above a fixed row's clip"
+        );
+    }
+
+    #[test]
+    fn ods_optimal_height_wrapped_text_expands_instead_of_using_the_fixed_clip_override() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.45in"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="0.25in" style:use-optimal-row-height="true"/></style:style><style:style style:name="ce" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Optimal"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce" office:value-type="string"><text:p>automatic one two three four five six seven</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+        assert!(!sheet.row_height_is_manual(0));
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let options = outlined_options(range);
+        let (rows, _) = measure_sheet_axes(sheet, range, &options).unwrap();
+        assert!(rows[0].size > points_to_fixed(18.0).unwrap());
+
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        let run = glyph_run(&build.scene, "automatic one two three four five six seven");
+        let clip_bottom = run
+            .clip_bounds
+            .y
+            .checked_add(run.clip_bounds.height)
+            .unwrap();
+        for metrics in &run.cluster_metrics {
+            assert!(
+                metrics.baseline_y.checked_sub(metrics.ascent).unwrap() >= run.clip_bounds.y,
+                "an optimal row must retain the first glyph outline inside its expanded clip"
+            );
+            assert!(
+                metrics.baseline_y.checked_sub(metrics.descent).unwrap() <= clip_bottom,
+                "an optimal row must retain the last glyph outline inside its expanded clip"
+            );
+        }
+    }
+
     fn ods_workbook(content: &str, styles: &str) -> Workbook {
         use std::io::Write;
 
@@ -18620,6 +20773,95 @@ mod tests {
         assert!(build.report.warnings.iter().any(|warning| {
             warning.code == WarningCode::NumericOverflowHashed && warning.occurrences == 1
         }));
+    }
+
+    #[test]
+    fn date_overflow_uses_effective_format_for_authored_numbers_and_cached_formulas() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("date-overflow");
+        sheet.set_col_width(0, 1.0);
+        sheet.set_col_width(1, 20.0);
+        sheet.set_col_width(2, 1.0);
+        sheet.set_col_width(3, 1.0);
+        let format = Format::new().set_num_format("yyyy-mm-dd");
+        // These are deliberately authored as ordinary numeric cells. Their
+        // effective resolved number format, not their storage variant, gives
+        // them date display semantics.
+        sheet.write_number_with_format(0, 0, 45_366.0, &format);
+        sheet.write_number_with_format(0, 1, 45_366.0, &format);
+        sheet.write_with_format(
+            0,
+            2,
+            Cell::Formula {
+                formula: "B1".to_string(),
+                cached: Box::new(Cell::Number(45_366.0)),
+            },
+            &format,
+        );
+        sheet.write_number(0, 3, 123_456_789);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 0, 3)),
+        )
+        .unwrap();
+        let texts = build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::GlyphRun(node) => Some(node.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["###", "2024-03-15", "###", "#"]);
+        assert!(build.report.warnings.iter().any(|warning| {
+            warning.code == WarningCode::NumericOverflowHashed && warning.occurrences == 3
+        }));
+    }
+
+    #[test]
+    fn date_overflow_is_stable_across_xlsx_serialize_and_reopen() {
+        let mut authored = Workbook::new();
+        let sheet = authored.add_sheet("roundtrip-date-overflow");
+        sheet.set_col_width(0, 1.0);
+        sheet.write_number_with_format(0, 0, 45_366.0, &Format::new().set_num_format("yyyy-mm-dd"));
+        assert!(matches!(sheet.cell(0, 0), Some(Cell::Number(_))));
+
+        let options = outlined_options(RenderRange::new(0, 0, 0, 0));
+        let authored_build = build_scene(&authored, 0, &options).unwrap();
+        assert_eq!(glyph_run(&authored_build.scene, "###").text, "###");
+
+        let imported = Workbook::open(&authored.to_xlsx()).expect("round-tripped workbook");
+        assert!(matches!(imported.sheets[0].cell(0, 0), Some(Cell::Date(_))));
+        let imported_build = build_scene(&imported, 0, &options).unwrap();
+        assert_eq!(glyph_run(&imported_build.scene, "###").text, "###");
+    }
+
+    #[test]
+    fn imported_formula_dates_and_ods_formula_times_use_fixed_three_hashes() {
+        let xlsx = imported_xlsx(
+            r#"<styleSheet><numFmts count="1"><numFmt numFmtId="165" formatCode="yyyy-mm-dd"/></numFmts><cellXfs count="1"><xf numFmtId="165" applyNumberFormat="1"/></cellXfs></styleSheet>"#,
+            r#"<worksheet><cols><col min="1" max="1" width="1" customWidth="1"/></cols><sheetData><row r="1"><c r="A1" s="0"><f>TODAY()</f><v>45366</v></c></row></sheetData></worksheet>"#,
+        );
+        match xlsx.sheets[0].cell(0, 0).expect("formula date") {
+            Cell::Formula { cached, .. } => assert!(matches!(cached.as_ref(), Cell::Date(_))),
+            other => panic!("expected imported formula, got {other:?}"),
+        }
+        let xlsx_build =
+            build_scene(&xlsx, 0, &outlined_options(RenderRange::new(0, 0, 0, 0))).unwrap();
+        assert_eq!(glyph_run(&xlsx_build.scene, "###").text, "###");
+
+        let ods_content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.08in"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Time"><table:table-column table:style-name="co"/><table:table-row><table:table-cell table:formula="of:=TIME(12;0;0)" office:value-type="time" office:time-value="PT12H"/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let ods_styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let ods = ods_workbook(ods_content, ods_styles);
+        match ods.sheets[0].cell(0, 0).expect("formula time") {
+            Cell::Formula { cached, .. } => assert!(matches!(cached.as_ref(), Cell::Date(_))),
+            other => panic!("expected imported ODS formula, got {other:?}"),
+        }
+        let ods_build =
+            build_scene(&ods, 0, &outlined_options(RenderRange::new(0, 0, 0, 0))).unwrap();
+        assert_eq!(glyph_run(&ods_build.scene, "###").text, "###");
     }
 
     #[test]
@@ -19534,6 +21776,27 @@ mod tests {
                 _ => false,
             }));
         }
+        for (text, role) in [
+            ("Line", ChartTextRole::ChartTitle),
+            ("Month", ChartTextRole::AxisTitle),
+            ("Value", ChartTextRole::AxisTitle),
+            ("Revenue", ChartTextRole::Legend),
+            ("Jan", ChartTextRole::AxisLabel),
+            ("10", ChartTextRole::DataLabel),
+        ] {
+            assert!(
+                build.scene.nodes.iter().any(|node| match node {
+                    SceneNode::Text(node) => {
+                        node.text == text
+                            && node.style.family == options.default_font_family
+                            && node.style.size == role.size()
+                            && node.style.bold == role.bold()
+                    }
+                    _ => false,
+                }),
+                "missing exact {role:?} style for {text:?}"
+            );
+        }
 
         let mut limited = options;
         limited.limits.max_chart_points = 5;
@@ -19544,6 +21807,1180 @@ mod tests {
                 limit: 5,
                 actual: 6,
             })
+        );
+    }
+
+    #[test]
+    fn authored_chart_text_uses_point_defaults_with_the_configured_family() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Render");
+        for (column, category) in ["Q1", "Q2", "Q3", "Q4"].into_iter().enumerate() {
+            sheet.write(5, column as u16 + 1, category);
+        }
+        sheet.write(6, 0, "Series 0000");
+        for (column, value) in [28.0, 41.0, 54.0, 67.0].into_iter().enumerate() {
+            sheet.write_number(6, column as u16 + 1, value);
+        }
+        sheet.add_chart(
+            Chart::new(ChartKind::Line, (7, 0), (18, 6)).add_series(
+                Series::new("Render!$B$7:$E$7")
+                    .with_categories("Render!$B$6:$E$6")
+                    .with_name("Series 0000"),
+            ),
+        );
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 18, 6)),
+            gridlines: false,
+            default_font_family: "Noto Sans CJK KR".to_string(),
+            ..RenderOptions::default()
+        };
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        assert!(!build
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::ChartPlaceholder));
+
+        let chart_size = points_to_fixed(10.0).unwrap();
+        for expected in [
+            "Q1", "Q2", "Q3", "Q4", "0", "10", "20", "30", "40", "50", "60", "70", "80",
+        ] {
+            assert!(
+                build.scene.nodes.iter().any(|node| match node {
+                    SceneNode::Text(node) => {
+                        node.text == expected
+                            && node.style.family == options.default_font_family
+                            && node.style.size == chart_size
+                            && !node.style.bold
+                    }
+                    _ => false,
+                }),
+                "missing xlsx-0000-like chart label {expected:?}"
+            );
+        }
+        assert!(build.scene.nodes.iter().any(|node| match node {
+            SceneNode::Text(node) => {
+                node.text == "Q1"
+                    && node.style.family == "Noto Sans CJK KR"
+                    && node.style.size == options.default_font_size
+            }
+            _ => false,
+        }));
+
+        let horizontal_axis = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.y1 == line.y2 && line.x1 < line.x2 =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .expect("chart horizontal axis");
+        let vertical_axis = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.x1 == line.x2 && line.y1 < line.y2 =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .expect("chart vertical axis");
+        assert_eq!(vertical_axis.x1, horizontal_axis.x1);
+        assert_eq!(vertical_axis.y2, horizontal_axis.y1);
+        assert!(build
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) if line.color == Rgb::new(0x44, 0x72, 0xC4) => Some(line),
+                _ => None,
+            })
+            .all(|line| {
+                line.x1 >= horizontal_axis.x1
+                    && line.x1 <= horizontal_axis.x2
+                    && line.x2 >= horizontal_axis.x1
+                    && line.x2 <= horizontal_axis.x2
+                    && line.y1 >= vertical_axis.y1
+                    && line.y1 <= vertical_axis.y2
+                    && line.y2 >= vertical_axis.y1
+                    && line.y2 <= vertical_axis.y2
+            }));
+    }
+
+    #[test]
+    fn chart_text_roles_are_source_exact_and_do_not_change_non_chart_text() {
+        for (role, points, bold) in [
+            (ChartTextRole::ChartTitle, 18.0, true),
+            (ChartTextRole::AxisTitle, 10.0, true),
+            (ChartTextRole::AxisLabel, 10.0, false),
+            (ChartTextRole::Legend, 10.0, false),
+            (ChartTextRole::DataLabel, 10.0, false),
+        ] {
+            let style = role.style("Theme Sans", TextAnchor::Start, 0);
+            assert_eq!(style.family, "Theme Sans");
+            assert_eq!(style.size, points_to_fixed(points).unwrap());
+            assert_eq!(style.bold, bold);
+        }
+
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("control").write(0, 0, "worksheet-only");
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 0)),
+            gridlines: false,
+            default_font_family: "Noto Sans CJK KR".to_string(),
+            default_font_size: points_to_fixed(11.0).unwrap(),
+            ..RenderOptions::default()
+        };
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        let text = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Text(node) if node.text == "worksheet-only" => Some(node),
+                _ => None,
+            })
+            .expect("non-chart control text");
+        assert_eq!(text.style.family, options.default_font_family);
+        assert_eq!(text.style.size, options.default_font_size);
+        assert!(!text.style.bold);
+    }
+
+    #[test]
+    fn chart_gutters_use_verified_shaped_advances_when_a_pack_is_present() {
+        let pack = synthetic_test_pack();
+        let options = RenderOptions {
+            default_font_family: "worksheet-family-must-not-leak".to_string(),
+            font_pack: Some(pack.clone()),
+            ..RenderOptions::default()
+        };
+        let role = ChartTextRole::AxisLabel;
+        let style = role.resolved_style(CALC_MISSING_THEME_CHART_LATIN_FAMILY);
+        let shaped = shape_text(
+            &pack,
+            "WWW",
+            style.request(),
+            BaseDirection::LeftToRight,
+            &options,
+        )
+        .unwrap();
+        let expected_width = shaped_width(&pack, &shaped, style.size)
+            .unwrap()
+            .checked_add(Fixed::from_pixels(4))
+            .unwrap();
+        let expected_height = line_height_from_metrics(
+            styled_line_metrics(
+                &pack,
+                &shaped,
+                std::slice::from_ref(&style),
+                CellLineLayoutPolicy::Native,
+                1,
+                1,
+            )
+            .unwrap(),
+            CellLineLayoutPolicy::Native,
+        )
+        .unwrap()
+        .checked_add(Fixed::from_pixels(4))
+        .unwrap();
+        let measured = measure_chart_text(
+            "WWW",
+            role,
+            CALC_MISSING_THEME_CHART_LATIN_FAMILY,
+            &options,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            measured,
+            ChartTextMetrics {
+                width: expected_width,
+                height: expected_height,
+            }
+        );
+
+        let mut nodes = Vec::new();
+        let mut text_bytes = 0;
+        let mut glyphs = 0;
+        let mut typography_stats = TypographyStats::default();
+        push_chart_text(
+            &mut nodes,
+            "WWW".to_string(),
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: measured.width,
+                height: measured.height,
+            },
+            TextAnchor::Start,
+            0,
+            role,
+            CALC_MISSING_THEME_CHART_LATIN_FAMILY,
+            &mut text_bytes,
+            &mut glyphs,
+            &mut typography_stats,
+            &options,
+        )
+        .unwrap();
+        let SceneNode::GlyphRun(run) = &nodes[0] else {
+            panic!("verified chart text must be outlined");
+        };
+        assert_eq!(run.clip_bounds.width, measured.width);
+        assert_eq!(run.clip_bounds.height, measured.height);
+        assert!(run.glyphs.iter().all(|glyph| glyph.size == role.size()));
+    }
+
+    #[test]
+    fn packless_chart_gutters_use_the_same_proportional_helvetica_advances_as_pdf() {
+        let options = RenderOptions::default();
+        let role = ChartTextRole::AxisLabel;
+        let wide = measure_chart_text("WWW", role, "Chart Sans", &options, None).unwrap();
+        let narrow = measure_chart_text("iii", role, "Chart Sans", &options, None).unwrap();
+        let padding = Fixed::from_pixels(4);
+        let expected_wide = Fixed::from_raw(role.size().raw() * (944 * 3) / 1_000)
+            .checked_add(padding)
+            .unwrap();
+        let expected_narrow = Fixed::from_raw(role.size().raw() * (222 * 3) / 1_000)
+            .checked_add(padding)
+            .unwrap();
+
+        assert_eq!(wide.width, expected_wide);
+        assert_eq!(narrow.width, expected_narrow);
+        assert!(wide.width > narrow.width);
+    }
+
+    #[test]
+    fn packless_chart_kerning_falls_back_with_explicit_approximation_provenance() {
+        let options = RenderOptions::default();
+        let mut style = ResolvedChartTextStyle::for_role(ChartTextRole::AxisLabel, "Chart Sans");
+        style.kerning_minimum_hundredths_of_point =
+            Some(style.size_hundredths_of_point.saturating_add(1));
+        assert!(!style.kerning());
+        assert!(measure_chart_text_with_style("AV", &style, &options, None).is_ok());
+        let node = build_auxiliary_text_node_with_kerning(
+            "AV".to_string(),
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(80),
+                height: Fixed::from_pixels(24),
+            },
+            Fixed::from_pixels(2),
+            style.text_style(TextAnchor::Start, 0),
+            style.kerning(),
+            &options,
+        )
+        .unwrap();
+        assert!(matches!(node, SceneNode::Text(_)));
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("chart");
+        for (row, (category, value)) in [("A", 1.0), ("B", 2.0)].into_iter().enumerate() {
+            sheet.write(row as u32, 0, category);
+            sheet.write_number(row as u32, 1, value);
+        }
+        let chart = Chart::new(ChartKind::Line, (0, 0), (10, 8))
+            .add_series(Series::new("chart!$B$1:$B$2").with_categories("chart!$A$1:$A$2"));
+        let warning_cell = CellCoordinate { row: 0, col: 0 };
+        let mut nodes = Vec::new();
+        let mut warnings = Warnings::default();
+        assert!(try_push_chart(
+            &mut nodes,
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(500),
+                height: Fixed::from_pixels(300),
+            },
+            &chart,
+            None,
+            sheet,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut warnings,
+            warning_cell,
+        )
+        .unwrap());
+        assert!(nodes.iter().any(|node| matches!(node, SceneNode::Text(_))));
+        assert_eq!(
+            warnings.finish(),
+            [RenderWarning {
+                code: WarningCode::ApproximateTextMetrics,
+                occurrences: 1,
+                first_cell: Some(warning_cell),
+            }]
+        );
+
+        let pie = Chart::new(ChartKind::Pie, (0, 0), (10, 8))
+            .add_series(Series::new("chart!$B$1:$B$2").with_categories("chart!$A$1:$A$2"));
+        let mut pie_warnings = Warnings::default();
+        assert!(try_push_chart(
+            &mut Vec::new(),
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(500),
+                height: Fixed::from_pixels(300),
+            },
+            &pie,
+            None,
+            sheet,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut pie_warnings,
+            warning_cell,
+        )
+        .unwrap());
+        assert!(pie_warnings.finish().is_empty());
+    }
+
+    #[test]
+    fn scatter_and_bubble_points_share_the_nice_x_axis_used_by_labels() {
+        let mut style = ChartSeriesStyle::default();
+        style.marker = ChartMarkerSymbol::None;
+        style.line_color = Some(Color::rgb(0x12, 0x34, 0x56));
+        let series = [ResolvedChartSeries {
+            name: "Series".to_string(),
+            values: vec![1.0, 2.0],
+            x_values: Some(vec![11.0, 19.0]),
+            labels: Vec::new(),
+            bubble_sizes: Some(vec![1.0, 1.0]),
+            style,
+        }];
+        let axis = chart_nice_x_axis(&series).unwrap();
+        assert_eq!((axis.minimum, axis.maximum), (10.0, 20.0));
+        assert_eq!(axis.ticks.first(), Some(&axis.minimum));
+        assert_eq!(axis.ticks.last(), Some(&axis.maximum));
+        let data_bounds = chart_x_data_bounds(&series).unwrap();
+        let retained_ticks = axis
+            .ticks
+            .iter()
+            .copied()
+            .filter(|value| *value >= data_bounds.0 && *value <= data_bounds.1)
+            .collect::<Vec<_>>();
+        assert_eq!(retained_ticks.first(), Some(&11.0));
+        assert_eq!(retained_ticks.last(), Some(&19.0));
+        let plot = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(100),
+            height: Fixed::from_pixels(100),
+        };
+        let options = RenderOptions::default();
+
+        let mut scatter_nodes = Vec::new();
+        push_scatter_chart(
+            &mut scatter_nodes,
+            plot,
+            &series,
+            (0.0, 2.0),
+            &axis,
+            &[],
+            false,
+            &mut Vec::new(),
+            &mut TypographyStats::default(),
+            &options,
+        )
+        .unwrap();
+        let scatter_line = scatter_nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Line(line) if line.color == Rgb::new(0x12, 0x34, 0x56) => Some(line),
+                _ => None,
+            })
+            .expect("retained scatter line");
+        assert_eq!(scatter_line.x1, Fixed::from_pixels(10));
+        assert_eq!(scatter_line.x2, Fixed::from_pixels(90));
+
+        let mut bubble_nodes = Vec::new();
+        push_bubble_chart(
+            &mut bubble_nodes,
+            plot,
+            &series,
+            (0.0, 2.0),
+            &axis,
+            &[],
+            false,
+            &mut Vec::new(),
+            &mut TypographyStats::default(),
+            &options,
+        )
+        .unwrap();
+        let bubble_centers = bubble_nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Path(path) => {
+                    let x_values = path.commands.iter().filter_map(|command| match command {
+                        PathCommand::MoveTo { x, .. }
+                        | PathCommand::LineTo { x, .. }
+                        | PathCommand::QuadraticTo { x, .. }
+                        | PathCommand::CubicTo { x, .. } => Some(x.raw()),
+                        PathCommand::Close => None,
+                    });
+                    let (minimum, maximum) = x_values
+                        .fold((i64::MAX, i64::MIN), |(minimum, maximum), value| {
+                            (minimum.min(value), maximum.max(value))
+                        });
+                    Some(Fixed::from_raw(minimum + (maximum - minimum) / 2))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bubble_centers,
+            [Fixed::from_pixels(10), Fixed::from_pixels(90)]
+        );
+    }
+
+    #[test]
+    fn chart_category_sampling_preserves_endpoints_without_exceeding_its_bound() {
+        for count in 0..=4_096_usize {
+            let stride = chart_category_label_stride(count);
+            let retained = (0..count)
+                .filter(|index| chart_category_label_is_retained(*index, count, stride))
+                .collect::<Vec<_>>();
+            assert!(retained.len() <= MAX_CHART_CATEGORY_LABELS, "count={count}");
+            if count == 0 {
+                assert!(retained.is_empty());
+            } else {
+                assert_eq!(retained.first(), Some(&0), "count={count}");
+                assert_eq!(retained.last(), Some(&(count - 1)), "count={count}");
+                if count <= MAX_CHART_CATEGORY_LABELS {
+                    assert_eq!(retained.len(), count, "count={count}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finite_extreme_chart_axes_fail_closed_before_nonfinite_geometry() {
+        let mut style = ChartSeriesStyle::default();
+        style.marker = ChartMarkerSymbol::None;
+        let constant_extreme_value = [ResolvedChartSeries {
+            name: "Constant extreme value".to_string(),
+            values: vec![f64::MAX],
+            x_values: None,
+            labels: vec!["A".to_string()],
+            bubble_sizes: None,
+            style: style.clone(),
+        }];
+        assert!(chart_nice_value_axis(&constant_extreme_value, false).is_none());
+        let derived_extreme_value_span = [ResolvedChartSeries {
+            name: "Derived extreme value span".to_string(),
+            values: vec![-f64::MAX, f64::MAX],
+            x_values: None,
+            labels: vec!["A".to_string(), "B".to_string()],
+            bubble_sizes: None,
+            style: style.clone(),
+        }];
+        assert!(chart_nice_value_axis(&derived_extreme_value_span, false).is_none());
+        let subnormal_value_span = [ResolvedChartSeries {
+            name: "Subnormal value span".to_string(),
+            values: vec![0.0, f64::from_bits(1)],
+            x_values: None,
+            labels: vec!["A".to_string(), "B".to_string()],
+            bubble_sizes: None,
+            style: style.clone(),
+        }];
+        assert!(chart_nice_value_axis(&subnormal_value_span, false).is_none());
+        let extreme_x = [ResolvedChartSeries {
+            name: "Extreme x".to_string(),
+            values: vec![1.0, 2.0],
+            x_values: Some(vec![-f64::MAX, f64::MAX]),
+            labels: Vec::new(),
+            bubble_sizes: None,
+            style,
+        }];
+        assert!(chart_nice_x_axis(&extreme_x).is_none());
+
+        let options = RenderOptions::default();
+        let rect = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(300),
+        };
+        let mut value_workbook = Workbook::new();
+        let value_sheet = value_workbook.add_sheet("extreme_value");
+        for (row, (category, value)) in [("A", -f64::MAX), ("B", f64::MAX)].into_iter().enumerate()
+        {
+            value_sheet.write(row as u32, 0, category);
+            value_sheet.write_number(row as u32, 1, value);
+        }
+        let value_chart = Chart::new(ChartKind::Line, (0, 0), (10, 8)).add_series(
+            Series::new("extreme_value!$B$1:$B$2").with_categories("extreme_value!$A$1:$A$2"),
+        );
+        let mut chart_points = 0;
+        assert!(!try_push_chart(
+            &mut Vec::new(),
+            rect,
+            &value_chart,
+            None,
+            value_sheet,
+            &mut chart_points,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            CellCoordinate { row: 0, col: 0 },
+        )
+        .unwrap());
+        assert_eq!(chart_points, 0);
+
+        let mut x_workbook = Workbook::new();
+        let x_sheet = x_workbook.add_sheet("extreme_x");
+        for (row, (x, y)) in [(-f64::MAX, 1.0), (f64::MAX, 2.0)].into_iter().enumerate() {
+            x_sheet.write_number(row as u32, 0, x);
+            x_sheet.write_number(row as u32, 1, y);
+        }
+        let x_chart = Chart::new(ChartKind::Scatter, (0, 0), (10, 8))
+            .add_series(Series::new("extreme_x!$B$1:$B$2").with_categories("extreme_x!$A$1:$A$2"));
+        assert!(!try_push_chart(
+            &mut Vec::new(),
+            rect,
+            &x_chart,
+            None,
+            x_sheet,
+            &mut chart_points,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            CellCoordinate { row: 0, col: 0 },
+        )
+        .unwrap());
+        assert_eq!(chart_points, 0);
+    }
+
+    #[test]
+    fn pie_and_doughnut_nonfinite_totals_fail_closed_to_placeholders() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("extreme_totals");
+        for (row, category) in ["A", "B"].into_iter().enumerate() {
+            sheet.write(row as u32, 0, category);
+            sheet.write_number(row as u32, 1, f64::MAX);
+        }
+        let series =
+            || Series::new("extreme_totals!$B$1:$B$2").with_categories("extreme_totals!$A$1:$A$2");
+        sheet.add_chart(Chart::new(ChartKind::Pie, (0, 2), (10, 8)).add_series(series()));
+        sheet.add_chart(Chart::new(ChartKind::Doughnut, (11, 2), (21, 8)).add_series(series()));
+
+        let rect = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(300),
+        };
+        let options = RenderOptions::default();
+        for chart in sheet.charts() {
+            let mut nodes = Vec::new();
+            let mut chart_points = 0;
+            assert!(!try_push_chart(
+                &mut nodes,
+                rect,
+                chart,
+                None,
+                sheet,
+                &mut chart_points,
+                &mut 0,
+                &mut 0,
+                &mut TypographyStats::default(),
+                &options,
+                &mut Warnings::default(),
+                CellCoordinate { row: 0, col: 0 },
+            )
+            .unwrap());
+            assert_eq!(chart_points, 0);
+            assert!(nodes.is_empty());
+        }
+
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 21, 8)),
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(build.report.warnings.iter().any(|warning| {
+            warning.code == WarningCode::ChartPlaceholder && warning.occurrences == 2
+        }));
+    }
+
+    #[test]
+    fn pie_and_doughnut_finite_extreme_totals_normalize_before_multiplication() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("finite_extreme_total");
+        sheet.write(0, 0, "A");
+        sheet.write_number(0, 1, f64::MAX);
+        let series = || {
+            Series::new("finite_extreme_total!$B$1").with_categories("finite_extreme_total!$A$1")
+        };
+        let charts = [
+            Chart::new(ChartKind::Pie, (0, 0), (10, 8)).add_series(series()),
+            Chart::new(ChartKind::Doughnut, (0, 0), (10, 8)).add_series(series()),
+        ];
+        let rect = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(300),
+        };
+        let options = RenderOptions::default();
+        for chart in &charts {
+            let mut nodes = Vec::new();
+            assert!(try_push_chart(
+                &mut nodes,
+                rect,
+                chart,
+                None,
+                sheet,
+                &mut 0,
+                &mut 0,
+                &mut 0,
+                &mut TypographyStats::default(),
+                &options,
+                &mut Warnings::default(),
+                CellCoordinate { row: 0, col: 0 },
+            )
+            .unwrap());
+            assert!(nodes.iter().any(|node| matches!(node, SceneNode::Path(_))));
+        }
+    }
+
+    #[test]
+    fn radar_axes_gridlines_and_labels_obey_visibility_and_bounds() {
+        let mut style = ChartSeriesStyle::default();
+        style.marker = ChartMarkerSymbol::None;
+        let category_count = 128_usize;
+        let series = [ResolvedChartSeries {
+            name: "Radar".to_string(),
+            values: (1..=category_count).map(|value| value as f64).collect(),
+            x_values: None,
+            labels: (0..category_count)
+                .map(|index| format!("C{index:03}"))
+                .collect(),
+            bubble_sizes: None,
+            style,
+        }];
+        let axis = chart_nice_value_axis(&series, true).unwrap();
+        let plot = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(400),
+            height: Fixed::from_pixels(300),
+        };
+        let options = RenderOptions::default();
+        let warning_cell = CellCoordinate { row: 4, col: 2 };
+        let mut nodes = Vec::new();
+        let mut category_labels = Vec::new();
+        let mut value_labels = Vec::new();
+        let mut warnings = Warnings::default();
+        push_radar_chart(
+            &mut nodes,
+            plot,
+            &series,
+            &axis,
+            &[],
+            true,
+            true,
+            false,
+            false,
+            &mut category_labels,
+            &mut value_labels,
+            false,
+            &mut Vec::new(),
+            &mut TypographyStats::default(),
+            &options,
+            &mut warnings,
+            warning_cell,
+        )
+        .unwrap();
+        assert!(category_labels.len() <= MAX_CHART_CATEGORY_LABELS);
+        assert_eq!(
+            category_labels.first().map(|label| label.text.as_str()),
+            Some("C000")
+        );
+        assert_eq!(
+            category_labels.last().map(|label| label.text.as_str()),
+            Some("C127")
+        );
+        assert_eq!(value_labels.len(), axis.ticks.len());
+        assert!(!nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::new(205, 205, 205),
+            SceneNode::Path(path) => path.stroke == Some(Rgb::new(205, 205, 205)),
+            _ => false,
+        }));
+        let retained = category_labels.len();
+        assert_eq!(
+            warnings.finish(),
+            [RenderWarning {
+                code: WarningCode::ChartMetadataSimplified,
+                occurrences: category_count.saturating_sub(retained) as u64,
+                first_cell: Some(warning_cell),
+            }]
+        );
+
+        let mut hidden_nodes = Vec::new();
+        let mut hidden_category_labels = Vec::new();
+        let mut hidden_value_labels = Vec::new();
+        push_radar_chart(
+            &mut hidden_nodes,
+            plot,
+            &series,
+            &axis,
+            &[],
+            false,
+            false,
+            true,
+            true,
+            &mut hidden_category_labels,
+            &mut hidden_value_labels,
+            false,
+            &mut Vec::new(),
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            warning_cell,
+        )
+        .unwrap();
+        assert!(hidden_category_labels.is_empty());
+        assert!(hidden_value_labels.is_empty());
+        assert!(!hidden_nodes.iter().any(|node| match node {
+            SceneNode::Line(line) => line.color == Rgb::new(205, 205, 205),
+            SceneNode::Path(path) => path.stroke == Some(Rgb::new(205, 205, 205)),
+            _ => false,
+        }));
+
+        let mut grid_nodes = Vec::new();
+        push_radar_chart(
+            &mut grid_nodes,
+            plot,
+            &series,
+            &axis,
+            &[],
+            true,
+            true,
+            true,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            false,
+            &mut Vec::new(),
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            warning_cell,
+        )
+        .unwrap();
+        assert_eq!(
+            grid_nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node,
+                        SceneNode::Line(line) if line.color == Rgb::new(205, 205, 205)
+                    )
+                })
+                .count(),
+            category_count
+        );
+        assert!(grid_nodes.iter().any(|node| {
+            matches!(
+                node,
+                SceneNode::Path(path) if path.stroke == Some(Rgb::new(205, 205, 205))
+            )
+        }));
+
+        let mut limited = options;
+        limited.limits.max_path_commands = 16;
+        assert_eq!(
+            push_radar_chart(
+                &mut Vec::new(),
+                plot,
+                &series,
+                &axis,
+                &[],
+                true,
+                true,
+                false,
+                true,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                false,
+                &mut Vec::new(),
+                &mut TypographyStats::default(),
+                &limited,
+                &mut Warnings::default(),
+                warning_cell,
+            ),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::PathCommands,
+                limit: 16,
+                actual: 129,
+            })
+        );
+    }
+
+    #[test]
+    fn chart_measurement_aggregates_limits_faces_and_warnings() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("chart_accounting");
+        for (row, (label, value)) in [("A", 1.0), ("B", 2.0)].into_iter().enumerate() {
+            sheet.write(row as u32, 0, label);
+            sheet.write_number(row as u32, 1, value);
+        }
+        let chart = Chart::new(ChartKind::Line, (0, 0), (10, 8))
+            .with_title("📈")
+            .add_series(
+                Series::new("chart_accounting!$B$1:$B$2")
+                    .with_categories("chart_accounting!$A$1:$A$2")
+                    .with_name("Legacy series"),
+            );
+        let mut metadata = DrawingMetadata::default();
+        metadata.chart_default_latin_font_family = Some("Legacy Sans".to_string());
+        let pack = synthetic_test_pack();
+        let options = RenderOptions {
+            default_font_family: pack.default_family().to_string(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let rect = Rect {
+            x: Fixed::from_pixels(10),
+            y: Fixed::from_pixels(20),
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(300),
+        };
+        let warning_cell = CellCoordinate { row: 0, col: 0 };
+        let mut nodes = Vec::new();
+        let mut chart_points = 0;
+        let mut text_bytes = 0;
+        let mut glyphs = 0;
+        let mut typography = TypographyStats::default();
+        let mut warnings = Warnings::default();
+        assert!(try_push_chart(
+            &mut nodes,
+            rect,
+            &chart,
+            Some(&metadata),
+            sheet,
+            &mut chart_points,
+            &mut text_bytes,
+            &mut glyphs,
+            &mut typography,
+            &options,
+            &mut warnings,
+            warning_cell,
+        )
+        .unwrap());
+
+        assert!(typography
+            .clone()
+            .finish_font_faces()
+            .iter()
+            .any(|face| face.family == "Wide Sans" && face.substituted));
+        let warnings = warnings.finish();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::FontFamilySubstituted));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::MissingGlyph));
+
+        let mut limited = options;
+        limited.limits.max_text_runs = 7;
+        let style = ResolvedChartTextStyle::for_role(ChartTextRole::AxisLabel, "Legacy Sans");
+        let mut limited_typography = TypographyStats::default();
+        let mut limited_warnings = Warnings::default();
+        assert_eq!(
+            max_chart_text_metrics_with_style(
+                ["A", "BC"],
+                &style,
+                &limited,
+                &mut limited_typography,
+                &mut limited_warnings,
+                warning_cell,
+            ),
+            Err(RenderError::LimitExceeded {
+                kind: LimitKind::TextRuns,
+                limit: 7,
+                actual: 8,
+            })
+        );
+        assert_eq!(limited_typography.text_work, 8);
+        assert_eq!(limited_typography.text_lines, 1);
+    }
+
+    #[test]
+    fn short_chart_legend_columnizes_without_leaving_the_frame() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("legend");
+        let mut chart = Chart::new(ChartKind::Line, (0, 0), (4, 14)).with_legend(true);
+        for index in 0_u16..12 {
+            sheet.write_number(0, index, f64::from(index + 1));
+            let column = char::from(b'A' + u8::try_from(index).unwrap());
+            chart = chart.add_series(
+                Series::new(format!("legend!${column}$1")).with_name(format!("S{index:02}")),
+            );
+        }
+        let rect = Rect {
+            x: Fixed::from_pixels(7),
+            y: Fixed::from_pixels(11),
+            width: Fixed::from_pixels(900),
+            height: Fixed::from_pixels(100),
+        };
+        let options = RenderOptions::default();
+        let mut nodes = Vec::new();
+        assert!(try_push_chart(
+            &mut nodes,
+            rect,
+            &chart,
+            None,
+            sheet,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            CellCoordinate { row: 0, col: 0 },
+        )
+        .unwrap());
+
+        let legend_text = nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Text(text) if text.text.len() == 3 && text.text.starts_with('S') => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(legend_text.len(), 12);
+        assert!(
+            legend_text
+                .iter()
+                .map(|text| text.bounds.x.raw())
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
+            "a short chart must use more than one legend column"
+        );
+        assert!(legend_text
+            .iter()
+            .all(|text| rect_contains(rect, text.bounds)));
+
+        let swatches = nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Rect(node)
+                    if node.rect.width == Fixed::from_pixels(10)
+                        && node.rect.height == Fixed::from_pixels(10) =>
+                {
+                    Some(node.rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(swatches.len(), 12);
+        assert!(swatches
+            .iter()
+            .copied()
+            .all(|swatch| rect_contains(rect, swatch)));
+    }
+
+    #[test]
+    fn vertical_axis_endpoint_labels_stay_inside_a_short_chart() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("axis_bounds");
+        for (row, (label, value)) in [("A", 0.0), ("B", 100.0)].into_iter().enumerate() {
+            sheet.write(row as u32, 0, label);
+            sheet.write_number(row as u32, 1, value);
+        }
+        let chart = Chart::new(ChartKind::Line, (0, 0), (4, 8)).add_series(
+            Series::new("axis_bounds!$B$1:$B$2").with_categories("axis_bounds!$A$1:$A$2"),
+        );
+        let rect = Rect {
+            x: Fixed::from_pixels(13),
+            y: Fixed::from_pixels(17),
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(80),
+        };
+        let options = RenderOptions::default();
+        let mut nodes = Vec::new();
+        assert!(try_push_chart(
+            &mut nodes,
+            rect,
+            &chart,
+            None,
+            sheet,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+            &mut TypographyStats::default(),
+            &options,
+            &mut Warnings::default(),
+            CellCoordinate { row: 0, col: 0 },
+        )
+        .unwrap());
+
+        let vertical_axis = nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.x1 == line.x2 && line.y1 < line.y2 =>
+                {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .expect("vertical chart axis");
+        let mut endpoint_centers = nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Text(text) if text.style.anchor == TextAnchor::End => {
+                    assert!(rect_contains(rect, text.bounds), "{:?}", text.bounds);
+                    Some(
+                        text.bounds
+                            .y
+                            .checked_add(Fixed::from_raw(text.bounds.height.raw() / 2))
+                            .unwrap(),
+                    )
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        endpoint_centers.sort_unstable_by_key(|center| center.raw());
+        assert_eq!(endpoint_centers.first(), Some(&vertical_axis.y1));
+        assert_eq!(endpoint_centers.last(), Some(&vertical_axis.y2));
+    }
+
+    #[test]
+    fn pinned_missing_theme_chart_roles_resolve_to_the_verified_arimo_alias() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = FontPack::load_manifest(manifest).expect("load pinned render font pack");
+        for role in [
+            ChartTextRole::ChartTitle,
+            ChartTextRole::AxisTitle,
+            ChartTextRole::AxisLabel,
+            ChartTextRole::Legend,
+            ChartTextRole::DataLabel,
+        ] {
+            let request = role.resolved_style(CALC_MISSING_THEME_CHART_LATIN_FAMILY);
+            let resolution = pack.resolve(request.request());
+            assert!(!resolution.exact_family, "{role:?}");
+            assert!(resolution.declared_alias, "{role:?}");
+            assert!(resolution.exact_style, "{role:?}");
+            let identity = pack.selected_face_identity(resolution.id).unwrap();
+            assert_eq!(identity.family, "Arimo", "{role:?}");
+            assert_eq!(identity.weight, if role.bold() { 700 } else { 400 });
+        }
+    }
+
+    #[test]
+    fn chart_text_rotation_bounds_are_exact_for_representative_angles() {
+        let metrics = ChartTextMetrics {
+            width: Fixed::from_raw(100),
+            height: Fixed::from_raw(40),
+        };
+        for (angle, width, height) in [
+            (0, 100, 40),
+            (30, 107, 85),
+            (45, 99, 99),
+            (90, 40, 100),
+            (135, 99, 99),
+        ] {
+            assert_eq!(
+                metrics.rotated(angle).unwrap(),
+                ChartTextMetrics {
+                    width: Fixed::from_raw(width),
+                    height: Fixed::from_raw(height),
+                },
+                "angle {angle}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_text_rotation_bounds_normalize_turns_and_negative_angles() {
+        let metrics = ChartTextMetrics {
+            width: Fixed::from_raw(137),
+            height: Fixed::from_raw(53),
+        };
+        for equivalent in [390, -330] {
+            assert_eq!(metrics.rotated(equivalent), metrics.rotated(30));
+        }
+        for equivalent in [-30, 330, -390] {
+            assert_eq!(metrics.rotated(equivalent), metrics.rotated(30));
+        }
+        for equivalent in [495, -225] {
+            assert_eq!(metrics.rotated(equivalent), metrics.rotated(135));
+        }
+    }
+
+    #[test]
+    fn chart_text_rotation_coefficients_saturate_and_extents_fail_closed() {
+        assert_eq!(CHART_TEXT_SINE_Q62_CEIL[0], 0);
+        assert_eq!(
+            u128::from(CHART_TEXT_SINE_Q62_CEIL[90]),
+            CHART_TEXT_TRIG_SCALE
+        );
+        assert!(CHART_TEXT_SINE_Q62_CEIL
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert!(CHART_TEXT_SINE_Q62_CEIL
+            .iter()
+            .all(|coefficient| u128::from(*coefficient) <= CHART_TEXT_TRIG_SCALE));
+
+        let maximum_width = ChartTextMetrics {
+            width: Fixed::from_raw(i64::MAX),
+            height: Fixed::ZERO,
+        };
+        assert_eq!(maximum_width.rotated(0).unwrap(), maximum_width);
+        assert_eq!(
+            maximum_width.rotated(90).unwrap(),
+            ChartTextMetrics {
+                width: Fixed::ZERO,
+                height: Fixed::from_raw(i64::MAX),
+            }
+        );
+        assert!(maximum_width.rotated(1).is_ok());
+
+        let maximum_square = ChartTextMetrics {
+            width: Fixed::from_raw(i64::MAX),
+            height: Fixed::from_raw(i64::MAX),
+        };
+        assert_eq!(
+            maximum_square.rotated(45),
+            Err(RenderError::CoordinateOverflow)
+        );
+        assert_eq!(
+            ChartTextMetrics {
+                width: Fixed::from_raw(-1),
+                height: Fixed::ZERO,
+            }
+            .rotated(30),
+            Err(RenderError::CoordinateOverflow)
         );
     }
 
@@ -19578,15 +23015,18 @@ mod tests {
             ),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
             ),
             (
                 "xl/charts/chart1.xml",
-                r#"<chartSpace><chart><plotArea><lineChart><ser>
+                r#"<chartSpace><chart><plotArea><lineChart><ser><idx val="0"/><order val="0"/>
                   <marker><symbol val="circle"/><size val="3"/></marker>
                   <cat><strRef><f>Render!$A$1:$A$4</f></strRef></cat>
                   <val><numRef><f>Render!$B$1:$B$4</f></numRef></val>
-                </ser></lineChart></plotArea></chart></chartSpace>"#,
+                </ser><axId val="1"/><axId val="2"/></lineChart>
+                <catAx><axId val="1"/><crossAx val="2"/></catAx>
+                <valAx><axId val="2"/><crossAx val="1"/></valAx>
+                </plotArea></chart></chartSpace>"#,
             ),
         ] {
             writer.start_file(name, options).unwrap();
@@ -19825,11 +23265,13 @@ mod tests {
         }));
 
         let mut scatter_nodes = Vec::new();
+        let x_axis = chart_nice_x_axis(&series).unwrap();
         push_scatter_chart(
             &mut scatter_nodes,
             plot,
             &series,
             (0.0, 2.0),
+            &x_axis,
             &[],
             false,
             &mut Vec::new(),
@@ -19959,7 +23401,7 @@ mod tests {
             ),
             (
                 "xl/theme/theme1.xml",
-                r#"<theme><themeElements><clrScheme><accent1><srgbClr val="123456"/></accent1></clrScheme></themeElements></theme>"#,
+                r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:accent1><a:srgbClr val="123456"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme><a:majorFont><a:latin typeface="Liberation Sans"/></a:majorFont><a:minorFont><a:latin typeface="Liberation Sans"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
             ),
             (
                 "xl/worksheets/sheet1.xml",
@@ -19979,11 +23421,11 @@ mod tests {
             ),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
             ),
             (
                 "xl/charts/chart1.xml",
-                r#"<chartSpace><chart><plotArea><barChart><barDir val="bar"/><ser><tx><strRef><f>Data!$C$1</f><strCache><pt idx="0"><v>Cached revenue</v></pt></strCache></strRef></tx><cat><strRef><f>Data!$A$1:$A$3</f><strCache><pt idx="0"><v>A</v></pt><pt idx="1"><v>B</v></pt><pt idx="2"><v>C</v></pt></strCache></strRef></cat><val><numRef><f>Data!$B$1:$B$3</f><numCache><pt idx="0"><v>2</v></pt><pt idx="1"><v>5</v></pt><pt idx="2"><v>3</v></pt></numCache></numRef></val></ser></barChart></plotArea><legend/></chart></chartSpace>"#,
+                r#"<chartSpace><chart><plotArea><barChart><barDir val="bar"/><ser><idx val="0"/><order val="0"/><tx><strRef><f>Data!$C$1</f><strCache><pt idx="0"><v>Cached revenue</v></pt></strCache></strRef></tx><cat><strRef><f>Data!$A$1:$A$3</f><strCache><pt idx="0"><v>A</v></pt><pt idx="1"><v>B</v></pt><pt idx="2"><v>C</v></pt></strCache></strRef></cat><val><numRef><f>Data!$B$1:$B$3</f><numCache><pt idx="0"><v>2</v></pt><pt idx="1"><v>5</v></pt><pt idx="2"><v>3</v></pt></numCache></numRef></val></ser><axId val="1"/><axId val="2"/></barChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea><legend/></chart></chartSpace>"#,
             ),
         ];
         for (name, body) in parts {
@@ -19998,6 +23440,10 @@ mod tests {
             .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
             .expect("chart sidecar");
         assert_eq!(metadata.chart_bar_direction, ChartBarDirection::Horizontal);
+        assert_eq!(
+            metadata.chart_default_latin_font_family.as_deref(),
+            Some(CALC_MISSING_THEME_CHART_LATIN_FAMILY)
+        );
         let build = build_scene(
             &workbook,
             0,
@@ -20008,13 +23454,20 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!build
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code == WarningCode::ChartPlaceholder));
+        assert!(
+            !build
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == WarningCode::ChartPlaceholder),
+            "chart reasons: {:?}",
+            metadata.chart_unsupported_reasons
+        );
         assert!(build.scene.nodes.iter().any(|node| match node {
-            SceneNode::Text(text) => text.text == "Cached revenue",
+            SceneNode::Text(text) => {
+                text.text == "Cached revenue"
+                    && text.style.family == CALC_MISSING_THEME_CHART_LATIN_FAMILY
+            }
             _ => false,
         }));
         let horizontal_bars = build
@@ -20068,7 +23521,7 @@ mod tests {
             ),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
             ),
             (
                 "xl/charts/chart1.xml",
@@ -20085,7 +23538,27 @@ mod tests {
             .iter()
             .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
             .expect("retained unsupported chart");
-        assert_eq!(metadata.chart_unsupported_reasons.len(), 4);
+        let expected_reasons = [
+            rxls::ChartUnsupportedReason::Combo,
+            rxls::ChartUnsupportedReason::ThreeDimensional,
+            rxls::ChartUnsupportedReason::Pivot,
+            rxls::ChartUnsupportedReason::ExternalData,
+            rxls::ChartUnsupportedReason::UnsupportedAxisTopology,
+            rxls::ChartUnsupportedReason::UnsupportedPlotSemantics,
+        ];
+        assert_eq!(
+            metadata.chart_unsupported_reasons.len(),
+            expected_reasons.len(),
+            "unexpected reasons: {:?}",
+            metadata.chart_unsupported_reasons
+        );
+        for reason in expected_reasons {
+            assert!(
+                metadata.chart_unsupported_reasons.contains(&reason),
+                "missing {reason:?} in {:?}",
+                metadata.chart_unsupported_reasons
+            );
+        }
         let build = build_scene(
             &workbook,
             0,

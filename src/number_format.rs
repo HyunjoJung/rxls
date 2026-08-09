@@ -84,6 +84,24 @@ pub(super) fn render_number(value: f64, code: &str, date1904: bool) -> Option<St
     bounded(result)
 }
 
+/// Whether the numeric section selected for `value` has date/time semantics.
+///
+/// This deliberately shares the bounded parser and section-selection rules
+/// with [`render_number`], so layout decisions cannot classify a different
+/// section from the one that produced the displayed text.
+pub(super) fn displays_datetime(value: f64, code: &str) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    let Some(sections) = parse(code) else {
+        return false;
+    };
+    let Some((section, _, _)) = select_numeric(&sections, value) else {
+        return false;
+    };
+    super::classify_string(section.raw).is_datetime()
+}
+
 /// Apply a text section (`@`, normally the fourth section) to authored text.
 pub(super) fn render_text(text: &str, code: &str) -> Option<String> {
     let sections = parse(code)?;
@@ -1310,6 +1328,18 @@ mod tests {
         assert_eq!(number(150.0, code), "150 high");
         assert_eq!(number(-2.0, code), "-2 low");
         assert_eq!(number(42.0, code), "42 mid");
+    }
+
+    #[test]
+    fn datetime_semantics_follow_the_selected_bounded_numeric_section() {
+        let conditional = "[>=1]yyyy-mm-dd;0";
+        assert!(displays_datetime(45_366.0, conditional));
+        assert!(!displays_datetime(0.0, conditional));
+        assert!(displays_datetime(0.5, "hh:mm:ss"));
+        assert!(displays_datetime(1.5, "[h]:mm:ss"));
+        assert!(!displays_datetime(12.5, "0.00"));
+        assert!(!displays_datetime(1.0, "\"unterminated"));
+        assert!(!displays_datetime(1.0, &"y".repeat(MAX_FORMAT_BYTES + 1)));
     }
 
     #[test]

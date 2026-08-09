@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::embed::{glyph_id_for_char, subset_face, EmbeddedFace, FontProgramKind};
 use crate::error::{LimitKind, RenderError};
-use crate::font::FontPack;
+use crate::font::{
+    helvetica_advance_units, helvetica_text_advance_units, standard_fallback_byte, FontPack,
+};
 use crate::print::PrintDocument;
 use crate::scene::{
     backend_image_trace, backend_text_trace, format_fixed, BackendGeometryTrace,
@@ -115,6 +117,19 @@ struct PdfGlyphPlacement {
 struct PdfGlyphSemanticSpan {
     source: std::ops::Range<usize>,
     glyphs: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfGlyphSourceOrder {
+    Forward,
+    Reverse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfGlyphSemanticSegment {
+    source: std::ops::Range<usize>,
+    glyphs: Vec<usize>,
+    source_order: PdfGlyphSourceOrder,
 }
 
 #[derive(Debug)]
@@ -967,7 +982,7 @@ fn embedded_font_dictionaries(
 ) -> (String, String, String) {
     let face = &entry.face;
     let upem = i64::from(face.units_per_em.max(1));
-    let scale = |value: i16| i64::from(value) * 1000 / upem;
+    let scale = |value: i64| value * 1000 / upem;
     let name = format!("RXLSEM+EmbeddedSubset{index:04}");
     let (subtype, program_key) = match face.kind {
         FontProgramKind::Cff => ("CIDFontType0", "FontFile3"),
@@ -998,14 +1013,14 @@ fn embedded_font_dictionaries(
     );
     let descriptor = format!(
         "<< /Type /FontDescriptor /FontName /{name} /Flags {flags} /FontBBox [{} {} {} {}] /ItalicAngle {} /Ascent {} /Descent {} /CapHeight {} /StemV 80 /{program_key} {} 0 R >>",
-        scale(face.bbox.0),
-        scale(face.bbox.1),
-        scale(face.bbox.2),
-        scale(face.bbox.3),
+        scale(i64::from(face.bbox.0)),
+        scale(i64::from(face.bbox.1)),
+        scale(i64::from(face.bbox.2)),
+        scale(i64::from(face.bbox.3)),
         pdf_decimal_value(f64::from(face.italic_angle)),
-        scale(face.ascender),
-        scale(face.descender),
-        scale(face.cap_height),
+        scale(i64::from(face.pdf_ascent)),
+        scale(i64::from(face.pdf_descent)),
+        scale(i64::from(face.cap_height)),
         ids.program,
     );
     (font, descendant, descriptor)
@@ -1746,6 +1761,95 @@ fn zlib_compress(bytes: &[u8]) -> Result<Vec<u8>, RenderError> {
     })
 }
 
+fn push_semantic_separator(
+    content: &mut BoundedContent,
+    font_registry: &mut PdfFontRegistry<'_>,
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+    anchor: PdfSemanticBoundaryAnchor,
+    text: &str,
+) -> Result<(), RenderError> {
+    let separator = font_registry.register_semantic_separator(anchor)?;
+    push_actual_text_begin(content, text)?;
+    match separator {
+        PdfSemanticSeparator::Embedded(separator) => {
+            embedded_fonts.insert(separator.font_index);
+            // Rendering mode 3 makes the boundary unpainted even for a
+            // malformed space outline. Isolate the text state so the
+            // following visible run returns to normal rendering.
+            content.push(&format!(
+                "q\nBT /RE{} {} Tf 3 Tr 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\nQ\n",
+                separator.font_index,
+                format_fixed(separator.size),
+                format_fixed(separator.origin_x),
+                format_fixed(separator.origin_y),
+                separator.cid
+            ))?;
+        }
+        PdfSemanticSeparator::Outlined(separator) => {
+            subset_fonts.insert(separator.subset_index);
+            content.push(&format!(
+                "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                separator.subset_index,
+                TYPE3_TEXT_SCALE,
+                type3_height_scale(separator.height, separator.reverse_y),
+                format_fixed(separator.origin_x),
+                format_fixed(separator.origin_y),
+                separator.code
+            ))?;
+        }
+    }
+    content.push("EMC\n")
+}
+
+fn push_pdf_glyph_cluster(
+    content: &mut BoundedContent,
+    node: &GlyphRunNode,
+    glyph_index: usize,
+    glyph: PdfGlyphReference,
+    embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+) -> Result<(), RenderError> {
+    match embedded.and_then(|plan| plan.get(glyph_index)) {
+        Some(placed_glyphs) => {
+            // Type 3 CharProcs carry their own colour, so the outlined path
+            // never sets one here. Text shown from an embedded font instead
+            // inherits the current fill, which at this point is the page
+            // background.
+            push_rgb_fill(content, cluster_paint_color(node, glyph_index))?;
+            for placed in placed_glyphs {
+                embedded_fonts.insert(placed.font_index);
+                // The page matrix flips y, so the text matrix flips back; the
+                // font size then lands in `Tf` where a reader expects it,
+                // rather than being folded into the matrix as the Type 3 path
+                // must do.
+                content.push(&format!(
+                    "BT /RE{} {} Tf 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
+                    placed.font_index,
+                    format_fixed(placed.size),
+                    format_fixed(placed.origin_x),
+                    format_fixed(placed.origin_y),
+                    placed.cid
+                ))?;
+            }
+        }
+        None => {
+            subset_fonts.insert(glyph.subset_index);
+            content.push(&format!(
+                "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                glyph.subset_index,
+                TYPE3_TEXT_SCALE,
+                type3_height_scale(glyph.height, glyph.reverse_y),
+                format_fixed(glyph.origin_x),
+                format_fixed(glyph.origin_y),
+                glyph.code
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_glyph_run(
     content: &mut BoundedContent,
@@ -1802,37 +1906,14 @@ fn push_glyph_run(
         });
     if let (Some(previous), Some(current)) = (*semantic_boundary_anchor, first_glyph) {
         if previous.shares_layout_line_with(current) {
-            let separator = font_registry.register_semantic_separator(current)?;
-            push_actual_text_begin(content, " ")?;
-            match separator {
-                PdfSemanticSeparator::Embedded(separator) => {
-                    embedded_fonts.insert(separator.font_index);
-                    // Rendering mode 3 makes the boundary unpainted even for a
-                    // malformed space outline. Isolate the text state so the
-                    // following visible run returns to normal rendering.
-                    content.push(&format!(
-                        "q\nBT /RE{} {} Tf 3 Tr 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\nQ\n",
-                        separator.font_index,
-                        format_fixed(separator.size),
-                        format_fixed(separator.origin_x),
-                        format_fixed(separator.origin_y),
-                        separator.cid
-                    ))?;
-                }
-                PdfSemanticSeparator::Outlined(separator) => {
-                    subset_fonts.insert(separator.subset_index);
-                    content.push(&format!(
-                        "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
-                        separator.subset_index,
-                        TYPE3_TEXT_SCALE,
-                        type3_height_scale(separator.height, separator.reverse_y),
-                        format_fixed(separator.origin_x),
-                        format_fixed(separator.origin_y),
-                        separator.code
-                    ))?;
-                }
-            }
-            content.push("EMC\n")?;
+            push_semantic_separator(
+                content,
+                font_registry,
+                subset_fonts,
+                embedded_fonts,
+                current,
+                " ",
+            )?;
         }
     }
     let mut current_boundary_anchor = None;
@@ -1862,63 +1943,87 @@ fn push_glyph_run(
             } else {
                 span_end
             };
-            let semantic_text = &node.text[word_start..semantic_end];
+            let semantic_text =
+                node.text
+                    .get(word_start..semantic_end)
+                    .ok_or(RenderError::Backend {
+                        reason: "invalid_glyph_metadata",
+                    })?;
             let marked = !semantic_text.chars().all(char::is_whitespace);
-            if marked {
-                push_actual_text_begin(content, semantic_text)?;
-            } else {
+            if !marked {
                 content.push("/Artifact BMC\n")?;
+                for &glyph_index in &span.glyphs {
+                    push_pdf_glyph_cluster(
+                        content,
+                        node,
+                        glyph_index,
+                        glyphs[glyph_index],
+                        embedded.as_deref(),
+                        subset_fonts,
+                        embedded_fonts,
+                    )?;
+                    let embedded_separator = embedded
+                        .as_ref()
+                        .and_then(|plan| plan.get(glyph_index))
+                        .and_then(|placed| placed.first())
+                        .copied();
+                    current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
+                        node,
+                        glyphs[glyph_index],
+                        embedded_separator,
+                    ));
+                }
+                content.push("EMC\n")?;
+                continue;
             }
-            for glyph_index in &span.glyphs {
-                let glyph = glyphs[*glyph_index];
-                let embedded_separator = embedded
-                    .as_ref()
-                    .and_then(|plan| plan.get(*glyph_index))
-                    .and_then(|placed| placed.first())
-                    .copied();
-                current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
-                    node,
-                    glyph,
-                    embedded_separator,
-                ));
-                match embedded.as_ref().and_then(|plan| plan.get(*glyph_index)) {
-                    Some(placed_glyphs) => {
-                        // Type 3 CharProcs carry their own colour, so the
-                        // outlined path never sets one here. Text shown from an
-                        // embedded font instead inherits the current fill,
-                        // which at this point is the page background.
-                        push_rgb_fill(content, cluster_paint_color(node, *glyph_index))?;
-                        for placed in placed_glyphs {
-                            embedded_fonts.insert(placed.font_index);
-                            // The page matrix flips y, so the text matrix flips
-                            // back; the font size then lands in `Tf` where a
-                            // reader expects it, rather than being folded into
-                            // the matrix as the Type 3 path must do.
-                            content.push(&format!(
-                                "BT /RE{} {} Tf 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
-                                placed.font_index,
-                                format_fixed(placed.size),
-                                format_fixed(placed.origin_x),
-                                format_fixed(placed.origin_y),
-                                placed.cid
-                            ))?;
-                        }
-                    }
-                    None => {
-                        subset_fonts.insert(glyph.subset_index);
-                        content.push(&format!(
-                            "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
-                            glyph.subset_index,
-                            TYPE3_TEXT_SCALE,
-                            type3_height_scale(glyph.height, glyph.reverse_y),
-                            format_fixed(glyph.origin_x),
-                            format_fixed(glyph.origin_y),
-                            glyph.code
-                        ))?;
-                    }
+
+            let mut segments = glyph_semantic_segments(node, span)?;
+            if semantic_end > span_end {
+                if let Some(last) = segments.last_mut() {
+                    last.source.end = semantic_end;
                 }
             }
-            content.push("EMC\n")?;
+            for segment in segments {
+                let reversed = segment.source_order == PdfGlyphSourceOrder::Reverse;
+                let text = node
+                    .text
+                    .get(segment.source.clone())
+                    .ok_or(RenderError::Backend {
+                        reason: "invalid_glyph_metadata",
+                    })?;
+                if reversed {
+                    content.push("/ReversedChars BMC\n")?;
+                    let reverse = reversed_unicode_scalars(text);
+                    push_actual_text_begin(content, &reverse)?;
+                } else {
+                    push_actual_text_begin(content, text)?;
+                }
+                for &glyph_index in &segment.glyphs {
+                    push_pdf_glyph_cluster(
+                        content,
+                        node,
+                        glyph_index,
+                        glyphs[glyph_index],
+                        embedded.as_deref(),
+                        subset_fonts,
+                        embedded_fonts,
+                    )?;
+                    let embedded_separator = embedded
+                        .as_ref()
+                        .and_then(|plan| plan.get(glyph_index))
+                        .and_then(|placed| placed.first())
+                        .copied();
+                    current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
+                        node,
+                        glyphs[glyph_index],
+                        embedded_separator,
+                    ));
+                }
+                content.push("EMC\n")?;
+                if reversed {
+                    content.push("EMC\n")?;
+                }
+            }
         }
     }
     *semantic_boundary_anchor = current_boundary_anchor;
@@ -1938,6 +2043,127 @@ fn push_glyph_run(
     }
     content.push("Q\n")?;
     Ok(visible_glyph)
+}
+
+fn glyph_cluster_source_range(
+    node: &GlyphRunNode,
+    index: usize,
+) -> Result<std::ops::Range<usize>, RenderError> {
+    let cluster = node.clusters.get(index).ok_or(RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    let start = usize::try_from(cluster.source_start).map_err(|_| RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    let end = usize::try_from(cluster.source_end).map_err(|_| RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    node.text.get(start..end).ok_or(RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    Ok(start..end)
+}
+
+fn adjacent_glyph_source_order(
+    left: &std::ops::Range<usize>,
+    right: &std::ops::Range<usize>,
+) -> Option<PdfGlyphSourceOrder> {
+    if left.end == right.start {
+        Some(PdfGlyphSourceOrder::Forward)
+    } else if right.end == left.start {
+        Some(PdfGlyphSourceOrder::Reverse)
+    } else {
+        None
+    }
+}
+
+fn source_range_uses_strong_rtl(
+    node: &GlyphRunNode,
+    source: std::ops::Range<usize>,
+) -> Result<bool, RenderError> {
+    let text = node.text.get(source).ok_or(RenderError::Backend {
+        reason: "invalid_glyph_metadata",
+    })?;
+    Ok(text.chars().any(|character| {
+        matches!(
+            unicode_bidi::bidi_class(character),
+            unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+        )
+    }))
+}
+
+/// Split one whitespace-free semantic span into monotonic bidi segments.
+///
+/// A mixed-direction span can contain several monotonic visual runs, so
+/// treating the whole span as either forward or reverse is not sufficient.
+fn glyph_semantic_segments(
+    node: &GlyphRunNode,
+    span: &PdfGlyphSemanticSpan,
+) -> Result<Vec<PdfGlyphSemanticSegment>, RenderError> {
+    let Some(&first_index) = span.glyphs.first() else {
+        return Ok(Vec::new());
+    };
+    let first_source = glyph_cluster_source_range(node, first_index)?;
+    let mut segments = Vec::<PdfGlyphSemanticSegment>::new();
+    let mut glyphs = vec![first_index];
+    let mut source = first_source.clone();
+    let mut order = None::<PdfGlyphSourceOrder>;
+    let mut previous_source = first_source;
+
+    for &index in span.glyphs.iter().skip(1) {
+        let next_source = glyph_cluster_source_range(node, index)?;
+        let next_order = adjacent_glyph_source_order(&previous_source, &next_source);
+        let continues = match (order, next_order) {
+            (_, None) => false,
+            (None, Some(next_order)) => {
+                order = Some(next_order);
+                true
+            }
+            (Some(order), Some(next_order)) => order == next_order,
+        };
+        if continues {
+            source.start = source.start.min(next_source.start);
+            source.end = source.end.max(next_source.end);
+            glyphs.push(index);
+        } else {
+            let source_order = match order {
+                Some(order) => order,
+                None if source_range_uses_strong_rtl(node, source.clone())? => {
+                    PdfGlyphSourceOrder::Reverse
+                }
+                None => PdfGlyphSourceOrder::Forward,
+            };
+            segments.push(PdfGlyphSemanticSegment {
+                source,
+                glyphs,
+                source_order,
+            });
+            source = next_source.clone();
+            glyphs = vec![index];
+            order = None;
+        }
+        previous_source = next_source;
+    }
+    let source_order = match order {
+        Some(order) => order,
+        None if source_range_uses_strong_rtl(node, source.clone())? => PdfGlyphSourceOrder::Reverse,
+        None => PdfGlyphSourceOrder::Forward,
+    };
+    segments.push(PdfGlyphSemanticSegment {
+        source,
+        glyphs,
+        source_order,
+    });
+
+    // Emit directional segments in source order. Retain the shaped visual
+    // order within each segment so text geometry and Poppler bbox inference
+    // remain identical to the visible glyph sequence.
+    segments.sort_unstable_by_key(|segment| (segment.source.start, segment.source.end));
+    Ok(segments)
+}
+
+fn reversed_unicode_scalars(text: &str) -> String {
+    text.chars().rev().collect()
 }
 
 fn glyph_spans_are_on_distinct_lines(
@@ -2689,7 +2915,7 @@ fn pdf_text_fragment_plan(
         let source_end = characters
             .peek()
             .map_or(node.text.len(), |(start, _)| *start);
-        let encoded = pdf_fallback_byte(character);
+        let encoded = standard_fallback_byte(character);
         let advance_units = i64::from(helvetica_advance_units(encoded));
         let next_x = cursor_x + font_size * advance_units as f64 / 1_000.0;
         let min_x = cursor_x.min(next_x);
@@ -2820,49 +3046,22 @@ fn point_in_half_open_clip(point: [f64; 2], clip: Rect) -> Result<bool, RenderEr
         && point[1] < fixed_as_f64(bottom))
 }
 
-fn pdf_fallback_byte(character: char) -> u8 {
-    match character {
-        '\n' => b'\n',
-        '\r' => b'\r',
-        '\t' => b'\t',
-        character if character.is_ascii() && !character.is_ascii_control() => character as u8,
-        _ => b'?',
-    }
-}
-
 fn pdf_fallback_has_ink(encoded: u8) -> bool {
     encoded.is_ascii_graphic()
 }
 
-fn helvetica_advance_units(encoded: u8) -> u16 {
-    match encoded {
-        b'\n' | b'\r' | b'\t' => 0,
-        b' ' | b'!' => 278,
-        b'"' => 355,
-        b'#' | b'$' | b'0'..=b'9' | b'?' => 556,
-        b'%' => 889,
-        b'&' | b'A' | b'B' | b'E' | b'K' | b'P' | b'S' | b'V' | b'X' | b'Y' => 667,
-        b'\'' => 191,
-        b'(' | b')' | b'-' | b'`' | b'r' => 333,
-        b'*' => 389,
-        b'+' | b'<' | b'=' | b'>' | b'~' => 584,
-        b',' | b'.' | b'/' | b':' | b';' | b'I' | b'[' | b'\\' | b']' | b'f' | b't' => 278,
-        b'@' => 1_015,
-        b'C' | b'D' | b'H' | b'N' | b'R' | b'U' => 722,
-        b'F' | b'T' | b'Z' => 611,
-        b'G' | b'O' | b'Q' => 778,
-        b'J' | b'c' | b'k' | b's' | b'v' | b'x' | b'y' | b'z' => 500,
-        b'L' | b'_' | b'a' | b'b' | b'd' | b'e' | b'g' | b'h' | b'n' | b'o' | b'p' | b'q'
-        | b'u' => 556,
-        b'M' | b'm' => 833,
-        b'W' => 944,
-        b'^' => 469,
-        b'i' | b'j' | b'l' => 222,
-        b'w' => 722,
-        b'{' | b'}' => 334,
-        b'|' => 260,
-        _ => 556,
-    }
+/// Measure standard-font fallback text in the same Helvetica glyph space used
+/// by [`pdf_text_fragment_plan`]. The scene already bounds source text; checked
+/// accumulation and scaling keep this backend calculation fail-closed too.
+fn pdf_fallback_text_width(text: &str, size: Fixed) -> Result<Fixed, RenderError> {
+    let advance_units =
+        helvetica_text_advance_units(text).ok_or(RenderError::CoordinateOverflow)?;
+    let raw = size
+        .raw()
+        .checked_mul(advance_units)
+        .and_then(|value| value.checked_div(1_000))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    Ok(Fixed::from_raw(raw))
 }
 
 fn push_text(
@@ -2871,21 +3070,14 @@ fn push_text(
     effective_clip: Option<Rect>,
 ) -> Result<bool, RenderError> {
     let (anchor_x, y) = text_anchor_point(node)?;
-    let approximate_width = Fixed::from_raw(
-        node.style
-            .size
-            .raw()
-            .checked_mul(node.text.chars().count() as i64)
-            .and_then(|value| value.checked_div(2))
-            .ok_or(RenderError::CoordinateOverflow)?,
-    );
+    let width = pdf_fallback_text_width(&node.text, node.style.size)?;
     let x = match node.style.anchor {
         TextAnchor::Start => anchor_x,
         TextAnchor::Middle => anchor_x
-            .checked_sub(Fixed::from_raw(approximate_width.raw() / 2))
+            .checked_sub(Fixed::from_raw(width.raw() / 2))
             .ok_or(RenderError::CoordinateOverflow)?,
         TextAnchor::End => anchor_x
-            .checked_sub(approximate_width)
+            .checked_sub(width)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
     let transform = PdfTransform::rotation(node.style.rotation_degrees, anchor_x, y);
@@ -3586,8 +3778,8 @@ fn document_id(
             digest.update(advance.to_le_bytes());
         }
         digest.update(entry.face.units_per_em.to_le_bytes());
-        digest.update(entry.face.ascender.to_le_bytes());
-        digest.update(entry.face.descender.to_le_bytes());
+        digest.update(entry.face.pdf_ascent.to_le_bytes());
+        digest.update(entry.face.pdf_descent.to_le_bytes());
         for value in [
             entry.face.bbox.0,
             entry.face.bbox.1,
@@ -3792,7 +3984,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::font::{synthetic_cff_test_pack, synthetic_test_pack};
+    use crate::font::{synthetic_cff_test_pack, synthetic_test_pack, FontPack, FontRequest};
     use crate::layout::RenderOptions;
     use crate::png::render_print_page_png_with_trace;
     use crate::print::{build_print_document, PrintOptions};
@@ -3943,8 +4135,8 @@ mod tests {
                 gids: vec![0, 1, 2],
                 advances: vec![500, 600, 250],
                 units_per_em: 1_000,
-                ascender: 800,
-                descender: -200,
+                pdf_ascent: 800,
+                pdf_descent: -200,
                 bbox: (0, -200, 1_000, 800),
                 cap_height: 700,
                 italic_angle: 0.0,
@@ -4017,8 +4209,8 @@ mod tests {
                 gids: Vec::new(),
                 advances: Vec::new(),
                 units_per_em: 1_000,
-                ascender: 800,
-                descender: -200,
+                pdf_ascent: 800,
+                pdf_descent: -200,
                 bbox: (0, -200, 1_000, 800),
                 cap_height: 700,
                 italic_angle: 0.0,
@@ -4043,8 +4235,8 @@ mod tests {
             gids: vec![0, 1],
             advances: vec![0, 684],
             units_per_em: 2_048,
-            ascender: 1_600,
-            descender: -400,
+            pdf_ascent: 1_600,
+            pdf_descent: -400,
             bbox: (0, -400, 2_048, 1_600),
             cap_height: 1_400,
             italic_angle: 0.0,
@@ -4052,6 +4244,100 @@ mod tests {
         };
 
         assert_eq!(embedded_widths_array(&face), "[0 [0 334]]");
+    }
+
+    #[test]
+    fn fallback_text_width_uses_exact_bounded_helvetica_advances() {
+        let size = Fixed::from_pixels(18);
+        assert_eq!(
+            pdf_fallback_text_width("MWij?", size).unwrap(),
+            Fixed::from_raw(51_185),
+            "833+944+222+222+556 Helvetica units at 18px"
+        );
+        assert_eq!(pdf_fallback_text_width("\n\t", size).unwrap(), Fixed::ZERO);
+        assert_eq!(
+            pdf_fallback_text_width("한", size).unwrap(),
+            pdf_fallback_text_width("?", size).unwrap(),
+            "measurement and emission must use the same fallback byte"
+        );
+        assert_eq!(
+            pdf_fallback_text_width("WW", Fixed::from_raw(i64::MAX)),
+            Err(RenderError::CoordinateOverflow)
+        );
+    }
+
+    #[test]
+    fn embedded_descriptor_uses_windows_metrics_in_pdf_glyph_space() {
+        let pack = synthetic_test_pack();
+        let id = pack
+            .resolve(FontRequest {
+                family: "Wide Sans",
+                weight: 400,
+                italic: false,
+            })
+            .id;
+        let identity = pack.selected_face_identity(id).unwrap();
+        let bytes = pack.face_program(identity.face_sha256).unwrap();
+        let glyph = glyph_id_for_char(bytes, 'Q').unwrap();
+        let entry = PdfEmbeddedFace {
+            digest: identity.face_sha256.to_string(),
+            face: subset_face(bytes, &[glyph]).unwrap(),
+            semantic_space_cid: None,
+            to_unicode: BTreeMap::new(),
+        };
+        let ids = PdfEmbeddedObjectIds {
+            font: 1,
+            descendant: 2,
+            descriptor: 3,
+            program: 4,
+            to_unicode: 5,
+        };
+
+        let (_, _, descriptor) = embedded_font_dictionaries(0, &entry, &ids);
+        assert!(
+            descriptor.contains("/Ascent 900 /Descent -300"),
+            "{descriptor}"
+        );
+    }
+
+    #[test]
+    fn pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = FontPack::load_manifest(manifest).unwrap();
+        let ids = PdfEmbeddedObjectIds {
+            font: 1,
+            descendant: 2,
+            descriptor: 3,
+            program: 4,
+            to_unicode: 5,
+        };
+
+        for (family, expected) in [
+            ("Arimo", "/Ascent 1042 /Descent -389"),
+            ("Noto Sans CJK KR", "/Ascent 1160 /Descent -288"),
+        ] {
+            let id = pack
+                .resolve(FontRequest {
+                    family,
+                    weight: 400,
+                    italic: false,
+                })
+                .id;
+            let identity = pack.selected_face_identity(id).unwrap();
+            assert_eq!(identity.family, family);
+            let bytes = pack.face_program(identity.face_sha256).unwrap();
+            let glyph = glyph_id_for_char(bytes, 'Q').unwrap();
+            let entry = PdfEmbeddedFace {
+                digest: identity.face_sha256.to_string(),
+                face: subset_face(bytes, &[glyph]).unwrap(),
+                semantic_space_cid: None,
+                to_unicode: BTreeMap::new(),
+            };
+            let (_, _, descriptor) = embedded_font_dictionaries(0, &entry, &ids);
+            assert!(descriptor.contains(expected), "{family}: {descriptor}");
+        }
     }
 
     #[test]
@@ -4064,8 +4350,8 @@ mod tests {
                 gids: vec![0, 7],
                 advances: vec![500, 600],
                 units_per_em: 1_000,
-                ascender: 800,
-                descender: -200,
+                pdf_ascent: 800,
+                pdf_descent: -200,
                 bbox: (0, -200, 1_000, 800),
                 cap_height: 700,
                 italic_angle: 0.0,
@@ -5065,6 +5351,29 @@ mod tests {
             .expect("font-pack layout must emit a GlyphRun")
     }
 
+    fn font_pack_pdf_variants(text: &str) -> [Vec<u8>; 2] {
+        let pack = synthetic_test_pack();
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("pdf-text-semantics");
+        sheet.set_col_width(0, 60.0);
+        sheet.write(0, 0, text);
+        let options = PrintOptions {
+            single_page_sheets: true,
+            render: RenderOptions {
+                gridlines: false,
+                default_font_family: pack.default_family().to_string(),
+                font_pack: Some(pack.clone()),
+                ..RenderOptions::default()
+            },
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        [
+            render_print_document_pdf(&document).unwrap(),
+            render_print_document_pdf_with_fonts(&document, &pack).unwrap(),
+        ]
+    }
+
     fn fallback_text_node(text: &str) -> TextNode {
         let bounds = Rect {
             x: Fixed::from_pixels(20),
@@ -5159,6 +5468,33 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         Some(String::from_utf8(output.stdout).unwrap())
+    }
+
+    fn normalized_poppler_logical_text(text: &str) -> String {
+        let without_controls = text
+            .chars()
+            .filter(|character| {
+                !matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'
+                        | '\u{202b}'
+                        | '\u{202c}'
+                        | '\u{202d}'
+                        | '\u{202e}'
+                        | '\u{2066}'
+                        | '\u{2067}'
+                        | '\u{2068}'
+                        | '\u{2069}'
+                )
+            })
+            .collect::<String>();
+        without_controls
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn poppler_text_pages(pdf: &[u8]) -> Option<Vec<String>> {
@@ -6464,11 +6800,19 @@ mod tests {
             source.contains("<0002> <0020>"),
             "the embedded space CID must map to U+0020"
         );
+        if let Some(text) = poppler_text(&pdf) {
+            assert!(text.contains(left), "{text:?}");
+            assert!(text.contains(right), "{text:?}");
+        }
         if let Some(xml) = poppler_bbox_layout(&pdf) {
             let words = poppler_words(&xml);
             assert_eq!(words.len(), 2, "{words:?}");
-            assert!(words.contains(&left), "{words:?}");
-            assert!(words.contains(&right), "{words:?}");
+            let visual_left = left.chars().rev().collect::<String>();
+            let visual_right = right.chars().rev().collect::<String>();
+            let expected_left = if right_to_left { &visual_left } else { left };
+            let expected_right = if right_to_left { &visual_right } else { right };
+            assert!(words.contains(&expected_left), "{words:?}");
+            assert!(words.contains(&expected_right), "{words:?}");
         }
     }
 
@@ -6560,8 +6904,8 @@ mod tests {
         if let Some(xml) = poppler_bbox_layout(&pdf) {
             let words = poppler_words(&xml);
             assert_eq!(words.len(), 2, "{words:?}");
-            assert!(words.contains(&"אב"), "{words:?}");
-            assert!(words.contains(&"גד"), "{words:?}");
+            assert!(words.contains(&"בא"), "{words:?}");
+            assert!(words.contains(&"דג"), "{words:?}");
         }
     }
 
@@ -7034,11 +7378,11 @@ mod tests {
         let pdf = render_print_document_pdf(&document).unwrap();
         assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
         let source = String::from_utf8_lossy(&pdf);
-        assert!(source.contains("/ActualText <FEFF05D005D1>"));
-        assert!(!source.contains("/ActualText <FEFF05D005D10020>"));
+        assert!(source.contains("/ActualText <FEFF05D105D0>"));
+        assert!(!source.contains("/ActualText <FEFF002005D105D0>"));
         if let Some(xml) = poppler_bbox_layout(&pdf) {
-            assert_eq!(poppler_words(&xml), ["אב", "גד"]);
-            assert!(!xml.contains(">אב </word>"), "{xml}");
+            assert_eq!(poppler_words(&xml), ["בא", "דג"]);
+            assert!(!xml.contains(">בא </word>"), "{xml}");
         }
     }
 
@@ -7514,8 +7858,8 @@ mod tests {
         assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
         let source = String::from_utf8_lossy(&pdf);
         assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE))));
-        let first = "HORIZONTAL-SEMANTIC-SEAM-ABCD";
-        let second = "EFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
+        let first = "HORIZONTAL-SEMANTIC-SEAM-ABCDEFGHIJK";
+        let second = "LMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
         assert_eq!(
             source
                 .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(first)))
@@ -7587,11 +7931,56 @@ mod tests {
             for bounds in [alpha, beta, gamma] {
                 assert!(bounds[0] < bounds[2], "{bounds:?}");
                 assert!(bounds[1] < bounds[3], "{bounds:?}");
+                assert!(
+                    (bounds[3] - bounds[1] - 13.2).abs() <= 0.002,
+                    "the synthetic 900/-300 descriptor at 11pt must yield a 13.2pt box: {bounds:?}"
+                );
             }
             assert!(alpha[2] < beta[0], "{alpha:?} {beta:?}");
             assert!(beta[2] < gamma[0], "{beta:?} {gamma:?}");
             assert!((alpha[1] - beta[1]).abs() < 0.01);
             assert!((beta[1] - gamma[1]).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = FontPack::load_manifest(manifest).unwrap();
+
+        for (family, descriptor, expected_height) in [
+            ("Arimo", "/Ascent 1042 /Descent -389", 15.741),
+            ("Noto Sans CJK KR", "/Ascent 1160 /Descent -288", 15.928),
+        ] {
+            let mut workbook = rxls::Workbook::new();
+            let sheet = workbook.add_sheet("descriptor");
+            sheet.set_col_width(0, 40.0);
+            sheet.write(0, 0, "Q1");
+            let options = PrintOptions {
+                single_page_sheets: true,
+                render: RenderOptions {
+                    gridlines: false,
+                    default_font_family: family.to_string(),
+                    font_pack: Some(pack.clone()),
+                    ..RenderOptions::default()
+                },
+                ..PrintOptions::default()
+            };
+            let document = build_print_document(&workbook, 0, &options).unwrap();
+            let pdf = render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+            let source = String::from_utf8_lossy(&pdf);
+            assert!(source.contains(descriptor), "{family}: {source}");
+            if let Some(xml) = poppler_bbox_layout(&pdf) {
+                assert_eq!(poppler_words(&xml), ["Q1"], "{family}: {xml}");
+                let bounds = poppler_word_bbox(&xml, "Q1");
+                let height = bounds[3] - bounds[1];
+                assert!(
+                    (height - expected_height).abs() <= 0.002,
+                    "{family} Poppler height {height} does not match the descriptor: {bounds:?}"
+                );
+            }
         }
     }
 
@@ -7641,8 +8030,8 @@ mod tests {
         let pdf = render_print_document_pdf(&document).unwrap();
         assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
         if let Some(xml) = poppler_bbox_layout(&pdf) {
-            assert_eq!(poppler_words(&xml), ["אב"]);
-            assert_poppler_bbox_close(poppler_word_bbox(&xml, "אב"), expected);
+            assert_eq!(poppler_words(&xml), ["בא"]);
+            assert_poppler_bbox_close(poppler_word_bbox(&xml, "בא"), expected);
         }
     }
 
@@ -7726,22 +8115,114 @@ mod tests {
         let document = build_print_document(&workbook, 0, &options).unwrap();
         let pdf = render_print_document_pdf(&document).unwrap();
         let source = String::from_utf8_lossy(&pdf);
-        assert!(source.contains("/ActualText <FEFF05D005D1>"));
-        assert!(source.contains("/ActualText <FEFF05D205D3>"));
+        for word in ["בא", "דג"] {
+            assert!(
+                source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(word))),
+                "{word:?}"
+            );
+        }
+        assert_eq!(source.matches("/ReversedChars BMC").count(), 2);
         assert!(source.contains("/ActualText <FEFF6F225B57>"));
         if let Some(text) = poppler_text(&pdf) {
             assert!(text.contains('\u{202b}'), "{text:?}");
             assert!(text.contains('\u{202c}'), "{text:?}");
+            assert!(text.contains("אב גד"), "{text:?}");
             assert!(text.contains("漢字"), "{text:?}");
         }
         if let Some(xml) = poppler_bbox_layout(&pdf) {
-            assert_eq!(poppler_words(&xml), ["left", "גד", "אב", "漢字"]);
-            let first_logical_rtl_word = poppler_word_bbox(&xml, "אב");
-            let second_logical_rtl_word = poppler_word_bbox(&xml, "גד");
+            // Poppler's bbox mode exposes the visual spelling and ignores the
+            // standard ReversedChars marker; plain pdftotext above consumes it
+            // and is the semantic extraction contract.
+            assert_eq!(poppler_words(&xml), ["left", "דג", "בא", "漢字"]);
+            let first_logical_rtl_word = poppler_word_bbox(&xml, "בא");
+            let second_logical_rtl_word = poppler_word_bbox(&xml, "דג");
             assert!(
                 second_logical_rtl_word[0] < first_logical_rtl_word[0],
                 "{first_logical_rtl_word:?} {second_logical_rtl_word:?}"
             );
+        }
+    }
+
+    #[test]
+    fn poppler_extracts_pure_arabic_in_logical_order() {
+        const LOGICAL: &str = "مرحبا بالعالم";
+        for (kind, pdf) in ["outlined", "embedded"]
+            .into_iter()
+            .zip(font_pack_pdf_variants(LOGICAL))
+        {
+            let source = String::from_utf8_lossy(&pdf);
+            assert_eq!(source.matches("/ReversedChars BMC").count(), 2, "{kind}");
+            if let Some(text) = poppler_text(&pdf) {
+                assert!(text.contains('\u{202b}'), "{kind}: {text:?}");
+                assert!(text.contains('\u{202c}'), "{kind}: {text:?}");
+                assert_eq!(normalized_poppler_logical_text(&text), LOGICAL, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn poppler_extracts_arabic_base_mixed_text_in_logical_order() {
+        const LOGICAL: &str = "مرحبا بالعالم rxls";
+        for (kind, pdf) in ["outlined", "embedded"]
+            .into_iter()
+            .zip(font_pack_pdf_variants(LOGICAL))
+        {
+            if let Some(text) = poppler_text(&pdf) {
+                assert!(text.contains('\u{202b}'), "{kind}: {text:?}");
+                assert!(text.contains('\u{202a}'), "{kind}: {text:?}");
+                assert!(text.contains('\u{202c}'), "{kind}: {text:?}");
+                assert_eq!(normalized_poppler_logical_text(&text), LOGICAL, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn poppler_ltr_base_mixed_text_keeps_logical_rtl_words_and_controls() {
+        const SOURCE: &str = "left مرحبا بالعالم right";
+        for (kind, pdf) in ["outlined", "embedded"]
+            .into_iter()
+            .zip(font_pack_pdf_variants(SOURCE))
+        {
+            if let Some(text) = poppler_text(&pdf) {
+                assert!(text.contains('\u{202b}'), "{kind}: {text:?}");
+                assert!(text.contains('\u{202a}'), "{kind}: {text:?}");
+                assert!(text.contains('\u{202c}'), "{kind}: {text:?}");
+                assert!(text.contains("مرحبا بالعالم"), "{kind}: {text:?}");
+                assert!(!text.contains("ابحرم"), "{kind}: {text:?}");
+                assert!(!text.contains("ملاعلاب"), "{kind}: {text:?}");
+                assert!(text.contains("left"), "{kind}: {text:?}");
+                assert!(text.contains("right"), "{kind}: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn poppler_exactly_extracts_rtl_marks_ligatures_and_mixed_runs() {
+        let cases = [
+            ("arabic-ligature-marks", "لَا", "\u{202b}لَا\u{202c}"),
+            ("arabic-combining", "اللّٰه", "\u{202b}اللّٰه\u{202c}"),
+            ("arabic-many-marks", "مَرْحَبًا", "\u{202b}مَرْحَبًا\u{202c}"),
+            ("hebrew-niqqud", "שָׁלוֹם", "\u{202b}שָׁלוֹם\u{202c}"),
+            (
+                "mixed-no-whitespace",
+                "rxlsمرحبا42",
+                "\u{202b}مرحبا\u{202a}rxls42\u{202c}\u{202c}",
+            ),
+            (
+                "mixed-digits",
+                "مرحبا 123 بالعالم",
+                "\u{202b}مرحبا \u{202a} 123\u{202c}بالعالم\u{202c}",
+            ),
+        ];
+        for (case, source_text, expected) in cases {
+            let variants = font_pack_pdf_variants(source_text);
+            assert_eq!(variants, font_pack_pdf_variants(source_text), "{case}");
+            for (kind, pdf) in ["outlined", "embedded"].into_iter().zip(variants) {
+                if let Some(text) = poppler_text(&pdf) {
+                    let actual = text.trim_end_matches(['\r', '\n', '\u{000c}']);
+                    assert_eq!(actual, expected, "{case}/{kind}");
+                }
+            }
         }
     }
 }

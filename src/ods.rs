@@ -299,6 +299,7 @@ struct OdsStyleProps {
     hidden_formula: Option<bool>,
     row_height_pt: Option<f32>,
     row_axis_measure: Option<ImportedAxisMeasure>,
+    use_optimal_row_height: Option<bool>,
     col_width_chars: Option<f32>,
     col_width_points: Option<f32>,
     col_axis_measure: Option<ImportedAxisMeasure>,
@@ -356,6 +357,7 @@ impl OdsStyleProps {
             locked,
             hidden_formula,
             row_height_pt,
+            use_optimal_row_height,
             col_width_chars,
             col_width_points,
             hidden,
@@ -1529,6 +1531,13 @@ fn apply_ods_style_properties(
             }
             if let Some(display) = attr(e, b"display") {
                 props.hidden = Some(!ods_bool(&display));
+            }
+            if let Some(value) = attr(e, b"use-optimal-row-height") {
+                if let Some(value) = ods_bool_value(&value) {
+                    props.use_optimal_row_height = Some(value);
+                } else {
+                    add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+                }
             }
             apply_ods_page_break_properties(e, props, losses);
         }
@@ -3544,6 +3553,7 @@ fn apply_ods_row_style(
     row_formats: &mut BTreeMap<u32, CellStyle>,
     row_number_format_states: &mut BTreeMap<u32, OdsNumberFormatState>,
     row_heights: &mut BTreeMap<u32, f32>,
+    automatic_row_height_candidates: &mut std::collections::BTreeSet<u32>,
     imported_row_axis_measures: &mut BTreeMap<u32, ImportedAxisMeasure>,
     hidden_rows: &mut std::collections::BTreeSet<u32>,
     losses: &mut Vec<StyleLoss>,
@@ -3579,6 +3589,7 @@ fn apply_ods_row_style(
             .len()
             .max(row_number_format_states.len())
             .max(row_heights.len())
+            .max(automatic_row_height_candidates.len())
             .max(imported_row_axis_measures.len())
             .max(hidden_rows.len())
             >= MAX_ODS_LAYOUT_ENTRIES
@@ -3598,6 +3609,13 @@ fn apply_ods_row_style(
         }
         if let Some(height) = layout.and_then(|style| style.row_height_pt) {
             row_heights.insert(row, height);
+        }
+        if row_heights.contains_key(&row)
+            && layout.and_then(|style| style.use_optimal_row_height) == Some(true)
+        {
+            automatic_row_height_candidates.insert(row);
+        } else {
+            automatic_row_height_candidates.remove(&row);
         }
         if let Some(measure) = layout.and_then(|style| style.row_axis_measure) {
             imported_row_axis_measures.insert(row, measure);
@@ -3817,6 +3835,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
     let mut col_number_format_states: BTreeMap<u16, OdsNumberFormatState> = BTreeMap::new();
     let mut blank_styles: BTreeMap<(u32, u16), CellStyle> = BTreeMap::new();
     let mut row_heights: BTreeMap<u32, f32> = BTreeMap::new();
+    let mut automatic_row_height_candidates = std::collections::BTreeSet::new();
     let mut col_widths: BTreeMap<u16, f32> = BTreeMap::new();
     let mut physical_col_widths: BTreeMap<u16, f32> = BTreeMap::new();
     let mut imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure> = BTreeMap::new();
@@ -4035,6 +4054,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         &mut row_formats,
                         &mut row_number_format_states,
                         &mut row_heights,
+                        &mut automatic_row_height_candidates,
                         &mut imported_row_axis_measures,
                         &mut hidden_rows,
                         &mut style_losses,
@@ -4400,6 +4420,7 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         &mut row_formats,
                         &mut row_number_format_states,
                         &mut row_heights,
+                        &mut automatic_row_height_candidates,
                         &mut imported_row_axis_measures,
                         &mut hidden_rows,
                         &mut style_losses,
@@ -4804,6 +4825,9 @@ fn parse_content(xml: &str, styles: &OdsResolvedStyles, image_parts: &ImageParts
                         col_formats: std::mem::take(&mut col_formats),
                         blank_styles: std::mem::take(&mut blank_styles),
                         row_heights: std::mem::take(&mut row_heights),
+                        automatic_row_height_candidates: std::mem::take(
+                            &mut automatic_row_height_candidates,
+                        ),
                         col_widths: std::mem::take(&mut col_widths),
                         physical_col_widths: std::mem::take(&mut physical_col_widths),
                         imported_row_axis_measures: std::mem::take(&mut imported_row_axis_measures),
@@ -5123,7 +5147,10 @@ fn build_cell(a: &CellAttrs, text: &str) -> Option<(Cell, String)> {
             } else {
                 text.to_string()
             };
-            Some((Cell::Number(frac), disp))
+            // `Cell::Date` represents date, time, and datetime serials. Keep
+            // that semantic provenance even when an ODS time cell has no
+            // explicit data style, and through formula cached values.
+            Some((Cell::Date(frac), disp))
         }
         // "string" or untyped → the displayed text.
         _ => {
@@ -5460,7 +5487,7 @@ mod tests {
         assert_eq!(sheet.cell(0, 0), Some(&Cell::Number(0.5)));
         assert_eq!(sheet.formatted(0, 0), Some("50%"));
         assert_eq!(range.formatted_abs(0, 0), Some("50%"));
-        assert_eq!(sheet.cell(0, 1), Some(&Cell::Number(0.5)));
+        assert_eq!(sheet.cell(0, 1), Some(&Cell::Date(0.5)));
         assert_eq!(sheet.formatted(0, 1), Some("12:00:00"));
         assert_eq!(range.formatted_abs(0, 1), Some("12:00:00"));
         assert_eq!(sheet.formatted(0, 2), Some("quarter"));
@@ -7402,6 +7429,37 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(runs[0].font.italic);
         assert_eq!(runs[0].font.color, Some(Color::rgb(0x00, 0x88, 0x00)));
+    }
+
+    #[test]
+    fn ods_optimal_row_height_is_retained_through_direct_default_and_parent_styles() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Rows"><table:table-row><table:table-cell/></table:table-row><table:table-row table:style-name="DirectAuto"><table:table-cell/></table:table-row><table:table-row table:style-name="InheritedAuto"><table:table-cell/></table:table-row><table:table-row table:style-name="ManualOverride"><table:table-cell/></table:table-row><table:table-row table:style-name="DirectManual"><table:table-cell/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles><style:default-style style:family="table-row"><style:table-row-properties style:row-height="0.20in" style:use-optimal-row-height="true"/></style:default-style><style:style style:name="DirectAuto" style:family="table-row"><style:table-row-properties style:row-height="0.25in" style:use-optimal-row-height="true"/></style:style><style:style style:name="AutoParent" style:family="table-row"><style:table-row-properties style:row-height="0.30in" style:use-optimal-row-height="true"/></style:style><style:style style:name="InheritedAuto" style:family="table-row" style:parent-style-name="AutoParent"/><style:style style:name="ManualOverride" style:family="table-row" style:parent-style-name="AutoParent"><style:table-row-properties style:use-optimal-row-height="false"/></style:style><style:style style:name="DirectManual" style:family="table-row"><style:table-row-properties style:row-height="0.35in" style:use-optimal-row-height="false"/></style:style></office:styles></office:document-styles>"#;
+
+        let workbook = Workbook::open(&ods_bytes_with_styles(content, styles)).expect("ods");
+        let sheet = &workbook.sheets[0];
+
+        assert_eq!(
+            sheet
+                .automatic_row_height_candidates
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        for row in 0..=2 {
+            assert!(sheet.row_heights().contains_key(&row));
+            assert!(!sheet.row_height_is_manual(row));
+        }
+        for row in 3..=4 {
+            assert!(sheet.row_heights().contains_key(&row));
+            assert!(sheet.row_height_is_manual(row));
+        }
+        assert!((sheet.row_heights()[&0] - 14.4).abs() < 0.001);
+        assert!((sheet.row_heights()[&1] - 18.0).abs() < 0.001);
+        assert!((sheet.row_heights()[&2] - 21.6).abs() < 0.001);
+        assert!((sheet.row_heights()[&3] - 21.6).abs() < 0.001);
+        assert!((sheet.row_heights()[&4] - 25.2).abs() < 0.001);
     }
 
     #[test]

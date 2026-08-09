@@ -23,12 +23,12 @@ use crate::{
     format, Alignment, Border, BorderStyle, Cell, CellEntry, CellProtection, CellStyle, CfRule,
     Chart, ChartBarDirection, ChartCachedPoint, ChartFrameFill, ChartFrameStyleLossKind, ChartKind,
     ChartMarkerSymbol, ChartSeriesCache, ChartSeriesStyle, ChartSeriesStyleLossKind,
-    ChartUnsupportedReason, Color, Comment, CondFormat, ConditionalFormatMetadata, DataValidation,
-    DocProperties, DrawingAnchorBehavior, DrawingCrop, DrawingMetadata, DrawingObjectKind, DvKind,
-    DvOp, Fill, Font, FormatPattern, FormatScript, HAlign, HeaderFooterKind, Image, ImageFmt,
-    PageSetup, PrintLossKind, PrintMetadata, PrintPageOrder, ProtectionOptions, Series, Sheet,
-    SheetType, Sparkline, SparklineKind, StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign,
-    Workbook,
+    ChartTextStyle, ChartTextStyles, ChartUnsupportedReason, Color, Comment, CondFormat,
+    ConditionalFormatMetadata, DataValidation, DocProperties, DrawingAnchorBehavior, DrawingCrop,
+    DrawingMetadata, DrawingObjectKind, DvKind, DvOp, Fill, Font, FormatPattern, FormatScript,
+    HAlign, HeaderFooterKind, Image, ImageFmt, PageSetup, PrintLossKind, PrintMetadata,
+    PrintPageOrder, ProtectionOptions, Series, Sheet, SheetType, Sparkline, SparklineKind,
+    StyleFidelity, StyleLoss, StyleLossKind, Table, VAlign, Workbook,
 };
 
 /// Detect the ZIP/OOXML magic (`PK\x03\x04`).
@@ -41,46 +41,53 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         .map_err(|_| Error::Zip("not a valid spreadsheet ZIP container"))?;
     crate::ziputil::validate_compression(&mut zip)?;
 
-    let mut workbook_path =
-        office_document_path(&mut zip).unwrap_or_else(|| "xl/workbook.xml".to_string());
-    let workbook_xml = match part(&mut zip, &workbook_path) {
-        Some(xml) => xml,
-        None if workbook_path != "xl/workbook.xml" => {
-            workbook_path = "xl/workbook.xml".to_string();
-            part(&mut zip, &workbook_path).ok_or(Error::MissingWorkbook)?
-        }
-        None => return Err(Error::MissingWorkbook),
-    };
+    let discovered_workbook_path = office_document_path(&mut zip)?;
+    let workbook_path = discovered_workbook_path
+        .clone()
+        .unwrap_or_else(|| "xl/workbook.xml".to_string());
+    let workbook_xml = part(&mut zip, &workbook_path).ok_or(Error::MissingWorkbook)?;
     let workbook_rels_xml = part(&mut zip, &sheet_rels_path(&workbook_path)).unwrap_or_default();
-    let rels = parse_rels(&workbook_rels_xml);
-    let rel_types = parse_rel_types(&workbook_rels_xml);
-    let shared_xml =
-        workbook_related_part(&mut zip, &workbook_path, &rels, &rel_types, "sharedStrings")
-            .or_else(|| {
-                part(
-                    &mut zip,
-                    &normalize_part_target(&workbook_path, "sharedStrings.xml"),
-                )
-            })
-            .unwrap_or_default();
-    let theme = workbook_related_part(&mut zip, &workbook_path, &rels, &rel_types, "theme")
-        .or_else(|| {
-            part(
-                &mut zip,
-                &normalize_part_target(&workbook_path, "theme/theme1.xml"),
-            )
-        })
-        .map(|s| parse_theme(&s))
-        .unwrap_or_default();
-    let styles = workbook_related_part(&mut zip, &workbook_path, &rels, &rel_types, "styles")
-        .or_else(|| {
-            part(
-                &mut zip,
-                &normalize_part_target(&workbook_path, "styles.xml"),
-            )
-        })
-        .map(|s| parse_styles(&s, &theme))
-        .unwrap_or_default();
+    let workbook_relationships = parse_ooxml_relationships(&workbook_rels_xml);
+    let shared_xml = match workbook_related_part(
+        &mut zip,
+        &workbook_path,
+        &workbook_rels_xml,
+        "sharedStrings",
+    ) {
+        RelatedPartRead::Present(xml) => xml,
+        RelatedPartRead::MissingRelationship => part(
+            &mut zip,
+            &normalize_part_target(&workbook_path, "sharedStrings.xml"),
+        )
+        .unwrap_or_default(),
+        RelatedPartRead::Invalid => {
+            return Err(Error::Zip("invalid shared-strings relationship"));
+        }
+    };
+    let theme = match workbook_related_part(&mut zip, &workbook_path, &workbook_rels_xml, "theme") {
+        RelatedPartRead::Present(xml) => parse_theme(&xml),
+        RelatedPartRead::MissingRelationship => part(
+            &mut zip,
+            &normalize_part_target(&workbook_path, "theme/theme1.xml"),
+        )
+        .map(|xml| parse_theme(&xml))
+        .unwrap_or_default(),
+        RelatedPartRead::Invalid => ThemeColors {
+            source_valid: false,
+            ..ThemeColors::default()
+        },
+    };
+    let styles = match workbook_related_part(&mut zip, &workbook_path, &workbook_rels_xml, "styles")
+    {
+        RelatedPartRead::Present(xml) => parse_styles(&xml, &theme),
+        RelatedPartRead::MissingRelationship => part(
+            &mut zip,
+            &normalize_part_target(&workbook_path, "styles.xml"),
+        )
+        .map(|xml| parse_styles(&xml, &theme))
+        .unwrap_or_default(),
+        RelatedPartRead::Invalid => return Err(Error::Zip("invalid styles relationship")),
+    };
     let shared = parse_shared_strings(&shared_xml, &theme, &styles.indexed_colors);
     let parsed = parse_workbook(&workbook_xml);
     let ParsedWorkbook {
@@ -99,6 +106,7 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
 
     // Per-workbook text budget (shared across sheets) — see MAX_TEXT_BYTES.
     let mut budget = crate::MAX_TEXT_BYTES;
+    let mut chart_budget = ChartImportBudget::default();
     let mut sheets = Vec::with_capacity(sheet_refs.len().min(1 << 16));
     let mut tab_selected_sheet = None;
     for (
@@ -110,22 +118,48 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         },
     ) in sheet_refs.into_iter().enumerate()
     {
-        let has_relationship = rels.contains_key(&rid);
-        let target = rels.get(&rid).cloned().unwrap_or_default();
-        let path = normalize_part_target(&workbook_path, &target);
-        let sheet_type = if rid.is_empty() || !has_relationship {
-            SheetType::Vba
-        } else {
-            let rel_kind = rel_types
-                .get(&rid)
-                .and_then(|t| t.rsplit('/').next())
-                .unwrap_or("worksheet");
-            match rel_kind.to_ascii_lowercase().as_str() {
-                "chartsheet" => SheetType::ChartSheet,
-                "dialogsheet" => SheetType::DialogSheet,
-                "macrosheet" | "xlmacrosheet" | "xlintlmacrosheet" => SheetType::MacroSheet,
-                _ => SheetType::WorkSheet,
-            }
+        let relationship = workbook_relationships.as_deref().and_then(|relationships| {
+            relationships
+                .iter()
+                .find(|relationship| relationship.id == rid)
+        });
+        let path = relationship
+            .filter(|relationship| !relationship.external)
+            .and_then(|relationship| {
+                resolve_internal_relationship_part(&workbook_path, &relationship.target)
+            })
+            .unwrap_or_default();
+        let sheet_type = match relationship.filter(|relationship| {
+            !relationship.external
+                && resolve_internal_relationship_part(&workbook_path, &relationship.target)
+                    .is_some()
+        }) {
+            None => SheetType::Vba,
+            Some(relationship) => match relationship.rel_type.as_deref() {
+                // Missing Type remains a compatibility concession, but only
+                // for a real, internal, resolvable relationship.
+                None => SheetType::WorkSheet,
+                Some(rel_type) if relationship_type_matches(rel_type, "worksheet") => {
+                    SheetType::WorkSheet
+                }
+                Some(rel_type) if relationship_type_matches(rel_type, "chartsheet") => {
+                    SheetType::ChartSheet
+                }
+                Some(rel_type) if relationship_type_matches(rel_type, "dialogsheet") => {
+                    SheetType::DialogSheet
+                }
+                Some(rel_type)
+                    if relationship_type_matches(rel_type, "macrosheet")
+                        || matches!(
+                            rel_type,
+                            "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet"
+                                | "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet"
+                        ) =>
+                {
+                    SheetType::MacroSheet
+                }
+                Some(_) => SheetType::Vba,
+            },
         };
         let is_worksheet = sheet_type == SheetType::WorkSheet;
         let parsed_sheet = if is_worksheet {
@@ -209,17 +243,26 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
         let sheet_rels_xml = is_worksheet
             .then(|| part(&mut zip, &sheet_rels_path(&path)))
             .flatten();
+        let sheet_relationships = sheet_rels_xml
+            .as_deref()
+            .and_then(parse_ooxml_relationships);
         let read_hyperlinks = if hyperlink_refs.is_empty() {
             Vec::new()
         } else {
-            let sheet_rels = sheet_rels_xml
-                .as_deref()
-                .map(parse_rels)
-                .unwrap_or_default();
             hyperlink_refs
                 .into_iter()
                 .filter_map(|(row, col, rid)| {
-                    sheet_rels.get(&rid).map(|url| (row, col, url.clone()))
+                    sheet_relationships
+                        .as_deref()
+                        .and_then(|relationships| {
+                            relationships.iter().find(|relationship| {
+                                relationship.id == rid
+                                    && relationship.rel_type.as_deref().is_some_and(|rel_type| {
+                                        relationship_type_matches(rel_type, "hyperlink")
+                                    })
+                            })
+                        })
+                        .map(|relationship| (row, col, relationship.target.clone()))
                 })
                 .collect()
         };
@@ -275,8 +318,13 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
             application.definition = table_style.definition;
             table_region_formats.insert(parsed.table.name, application);
         }
-        let (images, charts, drawing_metadata, mut drawing_losses) =
-            read_sheet_drawings(&mut zip, &path, sheet_rels_xml.as_deref(), &theme);
+        let (images, charts, drawing_metadata, mut drawing_losses) = read_sheet_drawings(
+            &mut zip,
+            &path,
+            sheet_rels_xml.as_deref(),
+            &theme,
+            &mut chart_budget,
+        );
         for loss in table_style_losses {
             add_drawing_loss(&mut drawing_losses, loss.kind, loss.occurrences);
         }
@@ -405,35 +453,418 @@ fn canonical_part_name(name: &str) -> String {
     name.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
-fn office_document_path(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<String> {
-    let root_rels = part(zip, "_rels/.rels")?;
-    let rels = parse_rels(&root_rels);
-    let rel_types = parse_rel_types(&root_rels);
-    rel_types.into_iter().find_map(|(id, ty)| {
-        if ty.rsplit('/').next() == Some("officeDocument") {
-            rels.get(&id).map(|target| canonical_part_name(target))
-        } else {
-            None
+/// Resolve an OPC internal relationship target to a package part name.
+///
+/// Relationship targets are URI references, not raw ZIP paths. Package-part
+/// lookup therefore uses only the URI path component (a query or fragment
+/// identifies content within the resolved part), rejects absolute/network URI
+/// references, and resolves dot segments against the source part's directory.
+/// Backslashes remain accepted as a compatibility extension because package
+/// lookup elsewhere in rxls already canonicalizes them.
+pub(crate) fn resolve_internal_relationship_part(base: &str, target: &str) -> Option<String> {
+    let base = base.replace('\\', "/");
+    let target = target.replace('\\', "/");
+    let path_end = target.find(['?', '#']).unwrap_or(target.len());
+    let path = &target[..path_end];
+
+    // RFC 3986 relative references cannot contain a scheme, and a network-path
+    // reference (`//authority/path`) is likewise not an OPC package-part name.
+    if path.starts_with("//") || has_uri_scheme(path) {
+        return None;
+    }
+
+    // A fragment-only or query-only reference denotes the source part itself.
+    if path.is_empty() {
+        return (!base.is_empty()).then(|| canonical_part_name(&base));
+    }
+
+    let mut parts: Vec<&str> = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        base.rsplit_once('/')
+            .map(|(dir, _)| {
+                dir.split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(segment),
         }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn has_uri_scheme(path: &str) -> bool {
+    let Some(colon) = path.find(':') else {
+        return false;
+    };
+    let candidate = &path[..colon];
+    !candidate.is_empty()
+        && candidate.as_bytes()[0].is_ascii_alphabetic()
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelationshipTarget {
+    Missing,
+    Internal(String),
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OoxmlRelationship {
+    pub(crate) id: String,
+    pub(crate) rel_type: Option<String>,
+    pub(crate) target: String,
+    pub(crate) external: bool,
+}
+
+pub(crate) fn relationship_type_matches(value: &str, rel_kind: &str) -> bool {
+    [
+        OOXML_RELATIONSHIPS_NAMESPACE_TRANSITIONAL,
+        OOXML_RELATIONSHIPS_NAMESPACE_STRICT,
+    ]
+    .into_iter()
+    .any(|namespace| {
+        value
+            .strip_prefix(namespace)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            == Some(rel_kind)
     })
+}
+
+struct RelationshipRootContext {
+    qualified_name: Vec<u8>,
+    namespace: Option<String>,
+    namespaces: HashMap<Vec<u8>, String>,
+}
+
+fn relationship_root_context(
+    element: &quick_xml::events::BytesStart<'_>,
+    allow_extension_attributes: bool,
+) -> Option<RelationshipRootContext> {
+    if local(element.name().as_ref()) != b"Relationships" {
+        return None;
+    }
+    let mut namespaces = HashMap::<Vec<u8>, String>::new();
+    for attribute in element.attributes() {
+        let attribute = attribute.ok()?;
+        let qualified_name = attribute.key.as_ref();
+        let prefix = if qualified_name == b"xmlns" {
+            Vec::new()
+        } else if let Some(prefix) = qualified_name.strip_prefix(b"xmlns:") {
+            prefix.to_vec()
+        } else if allow_extension_attributes {
+            continue;
+        } else {
+            return None;
+        };
+        let value = attribute
+            .decoded_and_normalized_value_with(
+                XmlVersion::Implicit1_0,
+                element.decoder(),
+                1,
+                quick_xml::escape::resolve_xml_entity,
+            )
+            .ok()?
+            .into_owned();
+        if namespaces.insert(prefix, value).is_some() {
+            return None;
+        }
+    }
+    let root_name = element.name().as_ref().to_vec();
+    let prefix = qualified_prefix(&root_name).unwrap_or_default();
+    let namespace = namespaces.get(prefix).cloned();
+    if (!prefix.is_empty() && namespace.is_none())
+        || namespace.as_deref().is_some_and(|namespace| {
+            !matches!(
+                namespace,
+                OOXML_PACKAGE_RELATIONSHIPS_NAMESPACE_TRANSITIONAL
+                    | OOXML_PACKAGE_RELATIONSHIPS_NAMESPACE_STRICT
+            )
+        })
+    {
+        return None;
+    }
+    Some(RelationshipRootContext {
+        qualified_name: root_name,
+        namespace,
+        namespaces,
+    })
+}
+
+/// Parse a package relationship part without applying last-entry-wins
+/// semantics. Duplicate IDs, malformed structure, unknown target modes, and
+/// foreign relationship namespaces invalidate the complete part. `Type`
+/// remains optional here for compatibility with producer fixtures; selectors
+/// that depend on a type require an exact Transitional or Strict URI below.
+/// Unmodeled producer attributes are ignored, but they cannot substitute for
+/// or override the required unqualified `Id` and `Target` attributes.
+pub(crate) fn parse_ooxml_relationships(xml: &str) -> Option<Vec<OoxmlRelationship>> {
+    parse_ooxml_relationships_with_policy(xml, true)
+}
+
+pub(crate) fn parse_ooxml_relationships_preserving_extensions(
+    xml: &str,
+) -> Option<Vec<OoxmlRelationship>> {
+    parse_ooxml_relationships_with_policy(xml, true)
+}
+
+fn parse_ooxml_relationships_with_policy(
+    xml: &str,
+    allow_extension_attributes: bool,
+) -> Option<Vec<OoxmlRelationship>> {
+    const MAX_RELATIONSHIPS: usize = 65_536;
+    const MAX_RELATIONSHIP_FIELD_BYTES: usize = 4_096;
+
+    if xml.trim().is_empty() || !crate::xml_reference_work_within_budget(xml) {
+        return None;
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut ids = BTreeSet::new();
+    let mut relationships = Vec::new();
+    let mut root: Option<RelationshipRootContext> = None;
+    let mut root_open = false;
+    let mut root_closed = false;
+    let mut open_relationship: Option<(Vec<u8>, OoxmlRelationship)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::End(element)) if open_relationship.is_some() => {
+                let (qualified_name, relationship) = open_relationship.take()?;
+                if element.name().as_ref() != qualified_name.as_slice() {
+                    return None;
+                }
+                if relationships.len() >= MAX_RELATIONSHIPS || !ids.insert(relationship.id.clone())
+                {
+                    return None;
+                }
+                relationships.push(relationship);
+            }
+            Ok(Event::Text(text))
+                if open_relationship.is_some()
+                    && text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::PI(_) | Event::Comment(_)) if open_relationship.is_some() => {}
+            Ok(_) if open_relationship.is_some() => return None,
+            Ok(Event::Start(element)) if root.is_none() && !root_closed => {
+                root = Some(relationship_root_context(
+                    &element,
+                    allow_extension_attributes,
+                )?);
+                root_open = true;
+            }
+            Ok(Event::Empty(element)) if root.is_none() && !root_closed => {
+                root = Some(relationship_root_context(
+                    &element,
+                    allow_extension_attributes,
+                )?);
+                root_closed = true;
+            }
+            Ok(Event::Empty(element)) if root_open => {
+                let root = root.as_ref()?;
+                let relationship = parse_ooxml_relationship_element(
+                    &element,
+                    root,
+                    allow_extension_attributes,
+                    MAX_RELATIONSHIP_FIELD_BYTES,
+                )?;
+                if relationships.len() >= MAX_RELATIONSHIPS || !ids.insert(relationship.id.clone())
+                {
+                    return None;
+                }
+                relationships.push(relationship);
+            }
+            Ok(Event::Start(element)) if root_open => {
+                let root = root.as_ref()?;
+                let relationship = parse_ooxml_relationship_element(
+                    &element,
+                    root,
+                    allow_extension_attributes,
+                    MAX_RELATIONSHIP_FIELD_BYTES,
+                )?;
+                open_relationship = Some((element.name().as_ref().to_vec(), relationship));
+            }
+            Ok(Event::End(element)) if root_open => {
+                let root = root.as_ref()?;
+                if element.name().as_ref() != root.qualified_name.as_slice() {
+                    return None;
+                }
+                root_open = false;
+                root_closed = true;
+            }
+            Ok(Event::Text(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Decl(_) | Event::PI(_) | Event::Comment(_)) => {}
+            Ok(Event::Eof) => break,
+            Err(_) | Ok(_) => return None,
+        }
+    }
+    if root.is_none() || root_open || !root_closed || open_relationship.is_some() {
+        None
+    } else {
+        Some(relationships)
+    }
+}
+
+fn parse_ooxml_relationship_element(
+    element: &quick_xml::events::BytesStart<'_>,
+    root: &RelationshipRootContext,
+    allow_extension_attributes: bool,
+    max_field_bytes: usize,
+) -> Option<OoxmlRelationship> {
+    if local(element.name().as_ref()) != b"Relationship" {
+        return None;
+    }
+    let element_name = element.name();
+    let prefix = qualified_prefix(element_name.as_ref()).unwrap_or_default();
+    let namespace = root.namespaces.get(prefix).map(String::as_str);
+    if (!prefix.is_empty() && namespace.is_none()) || namespace != root.namespace.as_deref() {
+        return None;
+    }
+
+    let mut id = None;
+    let mut rel_type = None;
+    let mut target = None;
+    let mut target_mode = None;
+    for attribute in element.attributes() {
+        let attribute = attribute.ok()?;
+        let slot = match attribute.key.as_ref() {
+            b"Id" => Some(&mut id),
+            b"Type" => Some(&mut rel_type),
+            b"Target" => Some(&mut target),
+            b"TargetMode" => Some(&mut target_mode),
+            _ if allow_extension_attributes => None,
+            _ => return None,
+        };
+        let Some(slot) = slot else {
+            continue;
+        };
+        if slot.is_some() {
+            return None;
+        }
+        let value = attribute
+            .decoded_and_normalized_value_with(
+                XmlVersion::Implicit1_0,
+                element.decoder(),
+                1,
+                quick_xml::escape::resolve_xml_entity,
+            )
+            .ok()?
+            .into_owned();
+        if value.len() > max_field_bytes {
+            return None;
+        }
+        *slot = Some(value);
+    }
+
+    let id = id.filter(|id| !id.is_empty())?;
+    let target = target.filter(|target| !target.is_empty())?;
+    let external = match target_mode.as_deref() {
+        None | Some("Internal") => false,
+        Some("External") => true,
+        Some(_) => return None,
+    };
+    Some(OoxmlRelationship {
+        id,
+        rel_type,
+        target,
+        external,
+    })
+}
+
+/// Select exactly one internal package relationship of `rel_kind` in source
+/// order. Ambiguous, malformed, duplicate-ID, or external relationships are
+/// rejected instead of inheriting `HashMap` iteration order or falling back to
+/// a conventional part path.
+pub(crate) fn unique_internal_relationship_target(xml: &str, rel_kind: &str) -> RelationshipTarget {
+    if xml.trim().is_empty() {
+        return RelationshipTarget::Missing;
+    }
+    let Some(relationships) = parse_ooxml_relationships(xml) else {
+        return RelationshipTarget::Invalid;
+    };
+    let mut selected = None;
+    for relationship in relationships {
+        if relationship
+            .rel_type
+            .as_deref()
+            .is_some_and(|value| relationship_type_matches(value, rel_kind))
+            && (relationship.external || selected.replace(relationship.target).is_some())
+        {
+            return RelationshipTarget::Invalid;
+        }
+    }
+    selected.map_or(RelationshipTarget::Missing, RelationshipTarget::Internal)
+}
+
+pub(crate) fn internal_relationship_target_by_id(
+    relationships: &[OoxmlRelationship],
+    id: &str,
+    rel_kind: &str,
+) -> RelationshipTarget {
+    let Some(relationship) = relationships
+        .iter()
+        .find(|relationship| relationship.id == id)
+    else {
+        return RelationshipTarget::Missing;
+    };
+    if relationship.external
+        || !relationship
+            .rel_type
+            .as_deref()
+            .is_some_and(|value| relationship_type_matches(value, rel_kind))
+    {
+        RelationshipTarget::Invalid
+    } else {
+        RelationshipTarget::Internal(relationship.target.clone())
+    }
+}
+
+fn office_document_path(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+) -> Result<Option<String>> {
+    let Some(root_rels) = part(zip, "_rels/.rels") else {
+        return Ok(None);
+    };
+    match unique_internal_relationship_target(&root_rels, "officeDocument") {
+        RelationshipTarget::Missing => Ok(None),
+        RelationshipTarget::Internal(target) => resolve_internal_relationship_part("", &target)
+            .map(Some)
+            .ok_or(Error::Zip("invalid office-document relationship target")),
+        RelationshipTarget::Invalid => Err(Error::Zip("invalid office-document relationship")),
+    }
+}
+
+enum RelatedPartRead {
+    MissingRelationship,
+    Present(String),
+    Invalid,
 }
 
 fn workbook_related_part(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     workbook_path: &str,
-    rels: &HashMap<String, String>,
-    rel_types: &HashMap<String, String>,
+    workbook_rels_xml: &str,
     rel_kind: &str,
-) -> Option<String> {
-    let path = rel_types.iter().find_map(|(id, ty)| {
-        if ty.rsplit('/').next() == Some(rel_kind) {
-            rels.get(id)
-                .map(|target| normalize_part_target(workbook_path, target))
-        } else {
-            None
+) -> RelatedPartRead {
+    match unique_internal_relationship_target(workbook_rels_xml, rel_kind) {
+        RelationshipTarget::Missing => RelatedPartRead::MissingRelationship,
+        RelationshipTarget::Internal(target) => {
+            let Some(path) = resolve_internal_relationship_part(workbook_path, &target) else {
+                return RelatedPartRead::Invalid;
+            };
+            part(zip, &path).map_or(RelatedPartRead::Invalid, RelatedPartRead::Present)
         }
-    })?;
-    part(zip, &path)
+        RelationshipTarget::Invalid => RelatedPartRead::Invalid,
+    }
 }
 
 /// The rels path for a source part: `xl/worksheets/sheet1.xml` →
@@ -555,6 +986,195 @@ fn local(name: &[u8]) -> &[u8] {
         Some(i) => &name[i + 1..],
         None => name,
     }
+}
+
+const OOXML_CHART_NAMESPACE_TRANSITIONAL: &str =
+    "http://schemas.openxmlformats.org/drawingml/2006/chart";
+const OOXML_CHART_NAMESPACE_STRICT: &str = "http://purl.oclc.org/ooxml/drawingml/chart";
+const OOXML_DRAWING_NAMESPACE_TRANSITIONAL: &str =
+    "http://schemas.openxmlformats.org/drawingml/2006/main";
+const OOXML_DRAWING_NAMESPACE_STRICT: &str = "http://purl.oclc.org/ooxml/drawingml/main";
+const OOXML_RELATIONSHIPS_NAMESPACE_TRANSITIONAL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const OOXML_RELATIONSHIPS_NAMESPACE_STRICT: &str =
+    "http://purl.oclc.org/ooxml/officeDocument/relationships";
+const OOXML_PACKAGE_RELATIONSHIPS_NAMESPACE_TRANSITIONAL: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships";
+const OOXML_PACKAGE_RELATIONSHIPS_NAMESPACE_STRICT: &str =
+    "http://purl.oclc.org/ooxml/package/relationships";
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
+fn chart_element_namespace_is_supported(namespace: &str) -> bool {
+    matches!(
+        namespace,
+        OOXML_CHART_NAMESPACE_TRANSITIONAL
+            | OOXML_CHART_NAMESPACE_STRICT
+            | OOXML_DRAWING_NAMESPACE_TRANSITIONAL
+            | OOXML_DRAWING_NAMESPACE_STRICT
+    )
+}
+
+fn drawing_element_namespace_is_supported(namespace: &str) -> bool {
+    matches!(
+        namespace,
+        OOXML_DRAWING_NAMESPACE_TRANSITIONAL | OOXML_DRAWING_NAMESPACE_STRICT
+    )
+}
+
+fn qualified_prefix(name: &[u8]) -> Option<&[u8]> {
+    name.iter()
+        .position(|byte| *byte == b':')
+        .map(|index| &name[..index])
+}
+
+/// Validate namespace scoping before any local-name chart pass runs. Extension
+/// namespaces and Markup Compatibility branches fail closed because selecting
+/// `mc:Choice` versus `mc:Fallback` requires feature negotiation; traversing
+/// both would combine mutually exclusive chart semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkupNamespacePolicy {
+    Chart,
+    DrawingOnly,
+}
+
+fn markup_is_supported(xml: &str, policy: MarkupNamespacePolicy) -> bool {
+    fn decoded_attribute_value(
+        element: &quick_xml::events::BytesStart<'_>,
+        attribute: &quick_xml::events::attributes::Attribute<'_>,
+    ) -> Option<String> {
+        attribute
+            .decoded_and_normalized_value_with(
+                XmlVersion::Implicit1_0,
+                element.decoder(),
+                1,
+                quick_xml::escape::resolve_xml_entity,
+            )
+            .ok()
+            .map(|value| value.into_owned())
+    }
+
+    fn inspect_element(
+        element: &quick_xml::events::BytesStart<'_>,
+        namespaces: &mut HashMap<Vec<u8>, String>,
+        policy: MarkupNamespacePolicy,
+    ) -> Option<Vec<(Vec<u8>, Option<String>)>> {
+        let mut changes = Vec::new();
+        let mut declared = BTreeSet::new();
+        let attributes = element
+            .attributes()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        for attribute in &attributes {
+            let name = attribute.key.as_ref();
+            let prefix = if name == b"xmlns" {
+                Some(Vec::new())
+            } else {
+                name.strip_prefix(b"xmlns:").map(<[u8]>::to_vec)
+            };
+            let Some(prefix) = prefix else {
+                continue;
+            };
+            if !declared.insert(prefix.clone()) {
+                return None;
+            }
+            let value = decoded_attribute_value(element, attribute)?;
+            let previous = namespaces.insert(prefix.clone(), value);
+            changes.push((prefix, previous));
+        }
+
+        let element_name = element.name();
+        let element_name = element_name.as_ref();
+        let element_prefix = qualified_prefix(element_name).unwrap_or_default();
+        let element_namespace = namespaces.get(element_prefix).map(String::as_str);
+        match policy {
+            MarkupNamespacePolicy::Chart => match element_namespace {
+                Some(namespace) if chart_element_namespace_is_supported(namespace) => {}
+                None if element_prefix.is_empty() => {}
+                _ => return None,
+            },
+            MarkupNamespacePolicy::DrawingOnly => match element_namespace {
+                Some(namespace) if drawing_element_namespace_is_supported(namespace) => {}
+                _ => return None,
+            },
+        }
+        if matches!(
+            local(element_name),
+            b"AlternateContent" | b"Choice" | b"Fallback"
+        ) {
+            return None;
+        }
+
+        for attribute in &attributes {
+            let name = attribute.key.as_ref();
+            if name == b"xmlns" || name.starts_with(b"xmlns:") {
+                continue;
+            }
+            let Some(prefix) = qualified_prefix(name) else {
+                continue;
+            };
+            let namespace = namespaces.get(prefix)?;
+            let attribute_local_name = local(name);
+            let supported = (matches!(
+                namespace.as_str(),
+                OOXML_RELATIONSHIPS_NAMESPACE_TRANSITIONAL | OOXML_RELATIONSHIPS_NAMESPACE_STRICT
+            ) && attribute_local_name == b"id")
+                || (namespace == XML_NAMESPACE && attribute_local_name == b"space");
+            if !supported {
+                return None;
+            }
+        }
+        Some(changes)
+    }
+
+    fn restore_namespaces(
+        namespaces: &mut HashMap<Vec<u8>, String>,
+        changes: Vec<(Vec<u8>, Option<String>)>,
+    ) {
+        for (prefix, previous) in changes.into_iter().rev() {
+            if let Some(previous) = previous {
+                namespaces.insert(prefix, previous);
+            } else {
+                namespaces.remove(&prefix);
+            }
+        }
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut namespaces = HashMap::new();
+    let mut scopes = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let Some(changes) = inspect_element(&element, &mut namespaces, policy) else {
+                    return false;
+                };
+                scopes.push(changes);
+            }
+            Ok(Event::Empty(element)) => {
+                let Some(changes) = inspect_element(&element, &mut namespaces, policy) else {
+                    return false;
+                };
+                restore_namespaces(&mut namespaces, changes);
+            }
+            Ok(Event::End(_)) => {
+                let Some(changes) = scopes.pop() else {
+                    return false;
+                };
+                restore_namespaces(&mut namespaces, changes);
+            }
+            Ok(Event::Eof) => return scopes.is_empty(),
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+fn chart_markup_is_supported(xml: &str) -> bool {
+    markup_is_supported(xml, MarkupNamespacePolicy::Chart)
+}
+
+fn theme_markup_is_supported(xml: &str) -> bool {
+    markup_is_supported(xml, MarkupNamespacePolicy::DrawingOnly)
 }
 
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
@@ -694,9 +1314,37 @@ const OOXML_DEFAULT_INDEXED_COLORS: [Color; 64] = [
     Color::rgb(0x33, 0x33, 0x33),
 ];
 
-#[derive(Clone, Copy, Default)]
-struct ThemeColors {
+#[derive(Clone)]
+pub(crate) struct ThemeColors {
+    // Canonical DrawingML order: lt1, dk1, lt2, dk2, accent1..6,
+    // hyperlink, followed-hyperlink.
     colors: [Option<Color>; 12],
+    major_latin_font_family: Option<String>,
+    minor_latin_font_family: Option<String>,
+    /// False only when a present theme part contained ambiguous or malformed
+    /// data. A missing theme uses the deterministic application fallback and
+    /// therefore keeps this true.
+    source_valid: bool,
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        Self {
+            colors: [None; 12],
+            major_latin_font_family: None,
+            minor_latin_font_family: None,
+            source_valid: true,
+        }
+    }
+}
+
+const MAX_IMPORTED_CHART_LATIN_FONT_FAMILY_BYTES: usize = 255;
+pub(crate) const CALC_IMPORTED_CHART_LATIN_FONT_FAMILY: &str = "Liberation Sans";
+
+pub(crate) fn bounded_imported_chart_latin_font_family(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= MAX_IMPORTED_CHART_LATIN_FONT_FAMILY_BYTES)
+        .then(|| value.to_string())
 }
 
 const OFFICE_CHART_ACCENTS: [Color; 6] = [
@@ -719,6 +1367,67 @@ impl ThemeColors {
             .map(|index| self.colors[index + 4].unwrap_or(OFFICE_CHART_ACCENTS[index]))
             .collect()
     }
+
+    fn chart_default_latin_font_family(&self) -> &str {
+        self.minor_latin_font_family
+            .as_deref()
+            .unwrap_or(CALC_IMPORTED_CHART_LATIN_FONT_FAMILY)
+    }
+
+    fn chart_major_latin_font_family(&self) -> &str {
+        self.major_latin_font_family
+            .as_deref()
+            .unwrap_or(CALC_IMPORTED_CHART_LATIN_FONT_FAMILY)
+    }
+
+    pub(crate) fn source_valid(&self) -> bool {
+        self.source_valid
+    }
+
+    #[cfg(feature = "xlsb")]
+    pub(crate) fn xlsb_ordered_colors(&self) -> [Option<Color>; 12] {
+        [
+            self.colors[1],
+            self.colors[0],
+            self.colors[3],
+            self.colors[2],
+            self.colors[4],
+            self.colors[5],
+            self.colors[6],
+            self.colors[7],
+            self.colors[8],
+            self.colors[9],
+            self.colors[10],
+            self.colors[11],
+        ]
+    }
+
+    #[cfg(feature = "xlsb")]
+    pub(crate) fn source_major_latin_font_family(&self) -> Option<&str> {
+        self.major_latin_font_family.as_deref()
+    }
+
+    #[cfg(feature = "xlsb")]
+    pub(crate) fn source_minor_latin_font_family(&self) -> Option<&str> {
+        self.minor_latin_font_family.as_deref()
+    }
+}
+
+#[cfg(feature = "xlsb")]
+pub(crate) fn chart_theme(
+    colors: [Option<Color>; 12],
+    major_latin_font_family: Option<&str>,
+    minor_latin_font_family: Option<&str>,
+    source_valid: bool,
+) -> ThemeColors {
+    ThemeColors {
+        colors,
+        major_latin_font_family: major_latin_font_family
+            .and_then(bounded_imported_chart_latin_font_family),
+        minor_latin_font_family: minor_latin_font_family
+            .and_then(bounded_imported_chart_latin_font_family),
+        source_valid,
+    }
 }
 
 fn theme_color_slot(name: &[u8]) -> Option<usize> {
@@ -739,40 +1448,300 @@ fn theme_color_slot(name: &[u8]) -> Option<usize> {
     }
 }
 
-fn parse_theme(xml: &str) -> ThemeColors {
+pub(crate) fn parse_theme(xml: &str) -> ThemeColors {
+    fn retain_theme_color(
+        theme: &mut ThemeColors,
+        active_slot: &mut Option<(usize, bool)>,
+        name: &[u8],
+        element: &quick_xml::events::BytesStart<'_>,
+    ) {
+        let Some((slot, painted)) = active_slot.as_mut() else {
+            return;
+        };
+        if *painted {
+            theme.source_valid = false;
+            return;
+        }
+        *painted = true;
+        let color = match name {
+            b"srgbClr" => {
+                if !chart_text_attributes_are_subset(element, &[b"val"]) {
+                    None
+                } else {
+                    unique_attr(element, b"val")
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        .and_then(parse_chart_rgb)
+                }
+            }
+            b"sysClr" => {
+                if !chart_text_attributes_are_subset(element, &[b"val", b"lastClr"])
+                    || !matches!(unique_attr(element, b"val"), Ok(Some(value)) if !value.is_empty())
+                {
+                    None
+                } else {
+                    unique_attr(element, b"lastClr")
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        .and_then(parse_chart_rgb)
+                }
+            }
+            _ => None,
+        };
+        if let Some(color) = color {
+            theme.colors[*slot] = Some(color);
+        } else {
+            theme.source_valid = false;
+        }
+    }
+
+    fn retain_theme_latin(
+        theme: &mut ThemeColors,
+        in_major_font: bool,
+        in_minor_font: bool,
+        element: &quick_xml::events::BytesStart<'_>,
+    ) {
+        if !in_major_font && !in_minor_font {
+            return;
+        }
+        let family = if chart_text_attributes_are_subset(element, &[b"typeface"]) {
+            unique_attr(element, b"typeface")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(bounded_imported_chart_latin_font_family)
+        } else {
+            None
+        };
+        let target = if in_major_font {
+            &mut theme.major_latin_font_family
+        } else {
+            &mut theme.minor_latin_font_family
+        };
+        if family.is_none() || target.is_some() {
+            theme.source_valid = false;
+        } else {
+            *target = family;
+        }
+    }
+
     let mut r = Reader::from_str(xml);
-    let mut theme = ThemeColors::default();
-    let mut slot = None;
+    let mut theme = ThemeColors {
+        source_valid: theme_markup_is_supported(xml),
+        ..ThemeColors::default()
+    };
+    let mut active_slot: Option<(usize, bool)> = None;
+    let mut seen_slots = [false; 12];
+    let mut element_stack = Vec::<Vec<u8>>::new();
+    let mut theme_seen = false;
+    let mut theme_open = false;
+    let mut theme_elements_seen = false;
+    let mut theme_elements_open = false;
+    let mut in_color_scheme = false;
+    let mut color_scheme_seen = false;
+    let mut in_font_scheme = false;
+    let mut font_scheme_seen = false;
+    let mut in_major_font = false;
+    let mut in_minor_font = false;
+    let mut major_font_seen = false;
+    let mut minor_font_seen = false;
     loop {
         match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(Event::Start(e)) => {
                 let qname = e.name();
                 let name = local(qname.as_ref());
-                if let Some(next_slot) = theme_color_slot(name) {
-                    slot = Some(next_slot);
-                } else if name == b"srgbClr" {
-                    if let (Some(slot), Some(color)) =
-                        (slot, attr(&e, b"val").as_deref().and_then(parse_color))
-                    {
-                        theme.colors[slot] = Some(color);
+                let depth = element_stack.len();
+                if name == b"theme" {
+                    if theme_seen || theme_open || depth != 0 {
+                        theme.source_valid = false;
                     }
-                } else if name == b"sysClr" {
-                    if let (Some(slot), Some(color)) =
-                        (slot, attr(&e, b"lastClr").as_deref().and_then(parse_color))
-                    {
-                        theme.colors[slot] = Some(color);
+                    theme_seen = true;
+                    theme_open = true;
+                } else if name == b"themeElements" {
+                    if theme_elements_seen || theme_elements_open || !theme_open || depth != 1 {
+                        theme.source_valid = false;
                     }
+                    theme_elements_seen = true;
+                    theme_elements_open = true;
+                } else if name == b"clrScheme" {
+                    if color_scheme_seen || in_color_scheme || !theme_elements_open || depth != 2 {
+                        theme.source_valid = false;
+                    }
+                    color_scheme_seen = true;
+                    in_color_scheme = true;
+                } else if name == b"fontScheme" {
+                    if font_scheme_seen || in_font_scheme || !theme_elements_open || depth != 2 {
+                        theme.source_valid = false;
+                    }
+                    font_scheme_seen = true;
+                    in_font_scheme = true;
+                } else if name == b"majorFont" && in_font_scheme {
+                    if major_font_seen || in_major_font || in_minor_font || depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    major_font_seen = true;
+                    in_major_font = true;
+                } else if name == b"minorFont" && in_font_scheme {
+                    if minor_font_seen || in_major_font || in_minor_font || depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    minor_font_seen = true;
+                    in_minor_font = true;
+                } else if let Some(next_slot) =
+                    in_color_scheme.then(|| theme_color_slot(name)).flatten()
+                {
+                    if active_slot.is_some() || seen_slots[next_slot] || depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    seen_slots[next_slot] = true;
+                    active_slot = Some((next_slot, false));
+                } else if matches!(name, b"srgbClr" | b"sysClr") {
+                    if active_slot.is_some() && depth != 4 {
+                        theme.source_valid = false;
+                    }
+                    retain_theme_color(&mut theme, &mut active_slot, name, &e);
+                } else if name == b"latin" {
+                    if (in_major_font || in_minor_font) && depth != 4 {
+                        theme.source_valid = false;
+                    }
+                    retain_theme_latin(&mut theme, in_major_font, in_minor_font, &e);
+                } else if active_slot.is_some() {
+                    // Theme slot color choices and transforms outside the exact
+                    // sRGB/system-color subset cannot be resolved portably.
+                    theme.source_valid = false;
+                }
+                if element_stack.len() >= 64 {
+                    theme.source_valid = false;
+                    break;
+                }
+                element_stack.push(name.to_vec());
+            }
+            Ok(Event::Empty(e)) => {
+                let qname = e.name();
+                let name = local(qname.as_ref());
+                let depth = element_stack.len();
+                if matches!(
+                    name,
+                    b"theme"
+                        | b"themeElements"
+                        | b"clrScheme"
+                        | b"fontScheme"
+                        | b"majorFont"
+                        | b"minorFont"
+                ) {
+                    theme.source_valid = false;
+                } else if let Some(next_slot) =
+                    in_color_scheme.then(|| theme_color_slot(name)).flatten()
+                {
+                    if seen_slots[next_slot] || depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    seen_slots[next_slot] = true;
+                    // An empty color slot has no deterministic color and must
+                    // not leak into the following sibling.
+                    theme.source_valid = false;
+                } else if matches!(name, b"srgbClr" | b"sysClr") {
+                    if active_slot.is_some() && depth != 4 {
+                        theme.source_valid = false;
+                    }
+                    retain_theme_color(&mut theme, &mut active_slot, name, &e);
+                } else if name == b"latin" {
+                    if (in_major_font || in_minor_font) && depth != 4 {
+                        theme.source_valid = false;
+                    }
+                    retain_theme_latin(&mut theme, in_major_font, in_minor_font, &e);
+                } else if active_slot.is_some() {
+                    theme.source_valid = false;
                 }
             }
             Ok(Event::End(e)) => {
                 let qname = e.name();
-                if theme_color_slot(local(qname.as_ref())).is_some() {
-                    slot = None;
+                let name = local(qname.as_ref());
+                let Some(open_name) = element_stack.pop() else {
+                    theme.source_valid = false;
+                    break;
+                };
+                if open_name.as_slice() != name {
+                    theme.source_valid = false;
+                }
+                let depth = element_stack.len();
+                if name == b"clrScheme" {
+                    if active_slot.is_some() || depth != 2 {
+                        theme.source_valid = false;
+                        active_slot = None;
+                    }
+                    in_color_scheme = false;
+                } else if name == b"fontScheme" {
+                    if depth != 2 {
+                        theme.source_valid = false;
+                    }
+                    in_font_scheme = false;
+                    in_major_font = false;
+                    in_minor_font = false;
+                } else if name == b"majorFont" {
+                    if depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    in_major_font = false;
+                } else if name == b"minorFont" {
+                    if depth != 3 {
+                        theme.source_valid = false;
+                    }
+                    in_minor_font = false;
+                } else if name == b"themeElements" {
+                    if depth != 1 {
+                        theme.source_valid = false;
+                    }
+                    theme_elements_open = false;
+                } else if name == b"theme" {
+                    if depth != 0 {
+                        theme.source_valid = false;
+                    }
+                    theme_open = false;
+                }
+                if let Some(slot) = theme_color_slot(name) {
+                    if depth == 3
+                        && active_slot.is_some_and(|(active, painted)| active == slot && painted)
+                    {
+                        active_slot = None;
+                    } else if in_color_scheme {
+                        theme.source_valid = false;
+                        active_slot = None;
+                    }
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                theme.source_valid = false;
+                break;
+            }
             _ => {}
         }
+    }
+    if active_slot.is_some()
+        || !element_stack.is_empty()
+        || theme_open
+        || theme_elements_open
+        || in_color_scheme
+        || in_font_scheme
+        || in_major_font
+        || in_minor_font
+    {
+        theme.source_valid = false;
+    }
+    if !theme_seen
+        || !theme_elements_seen
+        || !color_scheme_seen
+        || seen_slots.iter().any(|seen| !seen)
+        || !font_scheme_seen
+        || !major_font_seen
+        || !minor_font_seen
+        || theme.major_latin_font_family.is_none()
+        || theme.minor_latin_font_family.is_none()
+    {
+        theme.source_valid = false;
     }
     theme
 }
@@ -1123,6 +2092,9 @@ fn retain_cell_xf_number_format(styles: &mut Styles, e: &quick_xml::events::Byte
 fn parse_styles(xml: &str, theme: &ThemeColors) -> Styles {
     let mut r = Reader::from_str(xml);
     let mut styles = Styles::default();
+    if !theme.source_valid() {
+        add_differential_loss(&mut styles.losses, StyleLossKind::UnsupportedProperty, 1);
+    }
     styles.indexed_colors = parse_indexed_colors(xml, &mut styles.losses);
     let mut in_cell_xfs = false;
     loop {
@@ -3179,48 +4151,13 @@ pub(crate) fn part_str(
 }
 
 /// `xl/_rels/workbook.xml.rels`: `<Relationship Id Target/>`. Shared with `.xlsb`.
+#[cfg(test)]
 pub(crate) fn parse_rels(xml: &str) -> HashMap<String, String> {
-    if !crate::xml_reference_work_within_budget(xml) {
-        return HashMap::new();
-    }
-    let mut r = Reader::from_str(xml);
-    let mut map = HashMap::new();
-    loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if local(e.name().as_ref()) == b"Relationship" =>
-            {
-                if let (Some(id), Some(target)) = (attr(&e, b"Id"), attr(&e, b"Target")) {
-                    map.insert(id, target);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    map
-}
-
-pub(crate) fn parse_rel_types(xml: &str) -> HashMap<String, String> {
-    if !crate::xml_reference_work_within_budget(xml) {
-        return HashMap::new();
-    }
-    let mut r = Reader::from_str(xml);
-    let mut map = HashMap::new();
-    loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if local(e.name().as_ref()) == b"Relationship" =>
-            {
-                if let (Some(id), Some(ty)) = (attr(&e, b"Id"), attr(&e, b"Type")) {
-                    map.insert(id, ty);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-    }
-    map
+    parse_ooxml_relationships(xml)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|relationship| (relationship.id, relationship.target))
+        .collect()
 }
 
 /// Find the `commentsN.xml` target in a worksheet's rels by its relationship
@@ -3228,23 +4165,9 @@ pub(crate) fn parse_rel_types(xml: &str) -> HashMap<String, String> {
 /// `Target` (typically `../comments1.xml`), to be resolved against the worksheet
 /// path by [`normalize_part_target`].
 fn comments_target(xml: &str) -> Option<String> {
-    let mut r = Reader::from_str(xml);
-    loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if local(e.name().as_ref()) == b"Relationship" =>
-            {
-                let is_comments =
-                    attr(&e, b"Type").is_some_and(|t| t.rsplit('/').next() == Some("comments"));
-                if is_comments {
-                    if let Some(target) = attr(&e, b"Target") {
-                        return Some(target);
-                    }
-                }
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            _ => {}
-        }
+    match unique_internal_relationship_target(xml, "comments") {
+        RelationshipTarget::Internal(target) => Some(target),
+        RelationshipTarget::Missing | RelationshipTarget::Invalid => None,
     }
 }
 
@@ -3253,23 +4176,20 @@ fn comments_target(xml: &str) -> Option<String> {
 /// `Target`s (typically `../tables/table1.xml`), each to be resolved against the
 /// worksheet path by [`normalize_part_target`].
 fn table_targets(xml: &str) -> Vec<String> {
-    let mut r = Reader::from_str(xml);
+    let Some(relationships) = parse_ooxml_relationships(xml) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if local(e.name().as_ref()) == b"Relationship" =>
-            {
-                let is_table =
-                    attr(&e, b"Type").is_some_and(|t| t.rsplit('/').next() == Some("table"));
-                if is_table {
-                    if let Some(target) = attr(&e, b"Target") {
-                        out.push(target);
-                    }
-                }
+    for relationship in relationships {
+        if relationship
+            .rel_type
+            .as_deref()
+            .is_some_and(|value| relationship_type_matches(value, "table"))
+        {
+            if relationship.external {
+                return Vec::new();
             }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
+            out.push(relationship.target);
         }
     }
     out
@@ -3278,30 +4198,62 @@ fn table_targets(xml: &str) -> Vec<String> {
 /// `xl/tables/table{N}.xml`: `<table name displayName ref="A1:C3">` with a
 /// `<tableColumns><tableColumn name/>…>` list. Parses into a [`Table`] (range,
 /// name, header column names, style). Returns `None` if the `ref` is unparseable.
-fn drawing_target(xml: &str) -> Option<String> {
-    let mut r = Reader::from_str(xml);
-    loop {
-        match r.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e))
-                if local(e.name().as_ref()) == b"Relationship" =>
-            {
-                let is_drawing =
-                    attr(&e, b"Type").is_some_and(|t| t.rsplit('/').next() == Some("drawing"));
-                if is_drawing {
-                    if let Some(target) = attr(&e, b"Target") {
-                        return Some(target);
-                    }
-                }
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            _ => {}
+const MAX_XLSX_DRAWINGS: usize = 16_384;
+const MAX_XLSX_DRAWING_TEXT: usize = 4_096;
+const MAX_XLSX_DRAWING_NUMBER_TEXT: usize = 128;
+const MAX_XLSX_CHARTS_PER_WORKBOOK: usize = 16_384;
+
+pub(crate) struct ChartImportBudget {
+    pub(crate) charts_remaining: usize,
+    pub(crate) cache_points_remaining: usize,
+    pub(crate) series_remaining: usize,
+    pub(crate) xml_work_remaining: usize,
+    pub(crate) xml_work_limit: usize,
+}
+
+impl Default for ChartImportBudget {
+    fn default() -> Self {
+        Self {
+            charts_remaining: MAX_XLSX_CHARTS_PER_WORKBOOK,
+            cache_points_remaining: MAX_XLSX_CHART_CACHE_POINTS_PER_WORKBOOK,
+            series_remaining: MAX_XLSX_CHART_SERIES_PER_WORKBOOK,
+            xml_work_remaining: MAX_XLSX_CHART_XML_WORK_BYTES_PER_WORKBOOK,
+            xml_work_limit: MAX_XLSX_CHART_XML_WORK_BYTES_PER_WORKBOOK,
         }
     }
 }
 
-const MAX_XLSX_DRAWINGS: usize = 16_384;
-const MAX_XLSX_DRAWING_TEXT: usize = 4_096;
-const MAX_XLSX_DRAWING_NUMBER_TEXT: usize = 128;
+impl ChartImportBudget {
+    pub(crate) fn reserve_chart(&mut self) -> bool {
+        if self.charts_remaining == 0 {
+            false
+        } else {
+            self.charts_remaining -= 1;
+            true
+        }
+    }
+
+    pub(crate) fn reserve_xml_work(&mut self, work: usize) -> bool {
+        if work > self.xml_work_remaining {
+            false
+        } else {
+            self.xml_work_remaining -= work;
+            true
+        }
+    }
+
+    pub(crate) fn reconcile_xml_work(&mut self, declared: usize, actual: usize) -> bool {
+        if actual > declared {
+            self.reserve_xml_work(actual - declared)
+        } else {
+            self.xml_work_remaining = self
+                .xml_work_remaining
+                .saturating_add(declared - actual)
+                .min(self.xml_work_limit);
+            true
+        }
+    }
+}
 
 struct DrawingRef {
     kind: DrawingRefKind,
@@ -3844,6 +4796,14 @@ enum DrawingPartRead {
     Data(Vec<u8>),
 }
 
+fn drawing_part_declared_size(
+    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    path: &str,
+) -> Option<u64> {
+    let index = part_index(zip, path)?;
+    zip.by_index(index).ok().map(|file| file.size())
+}
+
 fn drawing_part_bytes(
     zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     path: &str,
@@ -3886,11 +4846,29 @@ fn read_sheet_drawings(
     sheet_path: &str,
     sheet_rels_xml: Option<&str>,
     theme: &ThemeColors,
+    chart_budget: &mut ChartImportBudget,
 ) -> DrawingReadResult {
     const MAX_IMAGE_PART: u64 = 64 << 20;
     const MAX_IMAGE_TOTAL: usize = 256 << 20;
-    let Some(drawing_target) = sheet_rels_xml.and_then(drawing_target) else {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let drawing_target = match sheet_rels_xml
+        .map(|xml| unique_internal_relationship_target(xml, "drawing"))
+        .unwrap_or(RelationshipTarget::Missing)
+    {
+        RelationshipTarget::Internal(target) => target,
+        RelationshipTarget::Missing => {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        RelationshipTarget::Invalid => {
+            return (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![StyleLoss {
+                    kind: StyleLossKind::DrawingMetadataPartial,
+                    occurrences: 1,
+                }],
+            );
+        }
     };
     let drawing_path = normalize_part_target(sheet_path, &drawing_target);
     let Some(drawing_xml) = part(zip, &drawing_path) else {
@@ -3906,26 +4884,36 @@ fn read_sheet_drawings(
     };
     let mut losses = Vec::new();
     let refs = parse_drawing_refs_bounded(&drawing_xml, &mut losses);
-    let drawing_rels = part(zip, &sheet_rels_path(&drawing_path))
-        .map(|s| parse_rels(&s))
-        .unwrap_or_default();
+    let drawing_rels =
+        part(zip, &sheet_rels_path(&drawing_path)).and_then(|xml| parse_ooxml_relationships(&xml));
     let mut images = Vec::new();
     let mut charts = Vec::new();
     let mut metadata = Vec::new();
     let mut image_bytes = 0usize;
-    let mut chart_cache_points_remaining = MAX_XLSX_CHART_CACHE_POINTS_PER_SHEET;
-    let mut chart_series_remaining = MAX_XLSX_CHART_SERIES_PER_SHEET;
 
     for drawing in refs {
         match drawing.kind {
             DrawingRefKind::Image => {
-                let Some(target) = drawing.rid.as_ref().and_then(|rid| drawing_rels.get(rid))
-                else {
-                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
-                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
-                    continue;
-                };
-                let media_path = normalize_part_target(&drawing_path, target);
+                let target =
+                    match drawing
+                        .rid
+                        .as_deref()
+                        .map_or(RelationshipTarget::Missing, |rid| {
+                            drawing_rels.as_deref().map_or(
+                                RelationshipTarget::Invalid,
+                                |relationships| {
+                                    internal_relationship_target_by_id(relationships, rid, "image")
+                                },
+                            )
+                        }) {
+                        RelationshipTarget::Internal(target) => target,
+                        RelationshipTarget::Missing | RelationshipTarget::Invalid => {
+                            retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                            add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                            continue;
+                        }
+                    };
+                let media_path = normalize_part_target(&drawing_path, &target);
                 let Some(format) = image_format(&media_path) else {
                     retain_unrepresented_drawing(drawing.metadata, &mut metadata);
                     add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
@@ -3963,24 +4951,92 @@ fn read_sheet_drawings(
                 metadata.push(sidecar);
             }
             DrawingRefKind::Chart => {
-                let Some(target) = drawing.rid.as_ref().and_then(|rid| drawing_rels.get(rid))
+                let target =
+                    match drawing
+                        .rid
+                        .as_deref()
+                        .map_or(RelationshipTarget::Missing, |rid| {
+                            drawing_rels.as_deref().map_or(
+                                RelationshipTarget::Invalid,
+                                |relationships| {
+                                    internal_relationship_target_by_id(relationships, rid, "chart")
+                                },
+                            )
+                        }) {
+                        RelationshipTarget::Internal(target) => target,
+                        RelationshipTarget::Missing | RelationshipTarget::Invalid => {
+                            retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                            add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                            continue;
+                        }
+                    };
+                if !chart_budget.reserve_chart() {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let chart_path = normalize_part_target(&drawing_path, &target);
+                let Some(declared_size) = drawing_part_declared_size(zip, &chart_path) else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    continue;
+                };
+                let Some(declared_work) = usize::try_from(declared_size)
+                    .ok()
+                    .and_then(|size| size.checked_mul(XLSX_CHART_XML_SCAN_PASSES))
                 else {
                     retain_unrepresented_drawing(drawing.metadata, &mut metadata);
-                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
                     continue;
                 };
-                let chart_path = normalize_part_target(&drawing_path, target);
-                let Some(chart_xml) = part(zip, &chart_path) else {
+                if declared_size > MAX_XLSX_CHART_XML_BYTES
+                    || !chart_budget.reserve_xml_work(declared_work)
+                {
                     retain_unrepresented_drawing(drawing.metadata, &mut metadata);
-                    add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let chart_bytes =
+                    match drawing_part_bytes(zip, &chart_path, MAX_XLSX_CHART_XML_BYTES) {
+                        DrawingPartRead::Data(data) => data,
+                        DrawingPartRead::Missing => {
+                            retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                            add_drawing_loss(&mut losses, StyleLossKind::DrawingMetadataPartial, 1);
+                            continue;
+                        }
+                        DrawingPartRead::LimitExceeded => {
+                            retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                            add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                            continue;
+                        }
+                    };
+                let Some(chart_work) = chart_bytes.len().checked_mul(XLSX_CHART_XML_SCAN_PASSES)
+                else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
                     continue;
                 };
+                if !chart_budget.reconcile_xml_work(declared_work, chart_work) {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
+                let Ok(chart_xml) = String::from_utf8(chart_bytes) else {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::UnsupportedProperty, 1);
+                    continue;
+                };
+                if !crate::xml_reference_work_within_budget(&chart_xml) {
+                    retain_unrepresented_drawing(drawing.metadata, &mut metadata);
+                    add_drawing_loss(&mut losses, StyleLossKind::LimitExceeded, 1);
+                    continue;
+                }
                 let Some(parsed) = parse_chart_with_theme(
                     &chart_xml,
                     drawing.from,
                     drawing.to.unwrap_or(drawing.from),
-                    &mut chart_cache_points_remaining,
-                    &mut chart_series_remaining,
+                    &mut chart_budget.cache_points_remaining,
+                    &mut chart_budget.series_remaining,
                     theme,
                 ) else {
                     retain_unrepresented_drawing(drawing.metadata, &mut metadata);
@@ -3999,12 +5055,17 @@ fn read_sheet_drawings(
                 sidecar.kind = DrawingObjectKind::Chart;
                 sidecar.object_index = index;
                 sidecar.chart_palette = theme.chart_palette();
+                sidecar.chart_default_latin_font_family =
+                    Some(theme.chart_default_latin_font_family().to_string());
+                sidecar.chart_text_styles = parsed.text_styles;
                 sidecar.chart_series_caches = parsed.series_caches;
                 sidecar.chart_series_styles = parsed.series_styles;
                 sidecar.chart_frame_fill = parsed.frame_fill;
                 sidecar.chart_frame_style_losses = parsed.frame_style_losses;
                 sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
                 sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
+                sidecar.chart_category_axis_visible = parsed.category_axis_visible;
+                sidecar.chart_value_axis_visible = parsed.value_axis_visible;
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;
                 metadata.push(sidecar);
@@ -4031,13 +5092,22 @@ struct ParsedChartSeries {
     categories: Option<String>,
     values: Option<String>,
     bubble_sizes: Option<String>,
+    invalid_text_fields: u8,
+    source_position: usize,
+    source_index_seen: bool,
+    source_order_seen: bool,
     cache: ChartSeriesCache,
     style: ChartSeriesStyle,
 }
 
-const MAX_XLSX_CHART_SERIES_PER_SHEET: usize = 4_096;
-const MAX_XLSX_CHART_CACHE_POINTS_PER_SHEET: usize = 1_000_000;
+const MAX_XLSX_CHART_SERIES_PER_WORKBOOK: usize = 4_096;
+const MAX_XLSX_CHART_CACHE_POINTS_PER_WORKBOOK: usize = 1_000_000;
 const MAX_XLSX_CHART_CACHE_VALUE_BYTES: usize = 4_096;
+const MAX_XLSX_CHART_TEXT_FIELD_BYTES: usize = 32_768;
+const MAX_XLSX_CHART_AXIS_ITEMS: usize = 32;
+pub(crate) const MAX_XLSX_CHART_XML_BYTES: u64 = 8 << 20;
+pub(crate) const XLSX_CHART_XML_SCAN_PASSES: usize = 6;
+pub(crate) const MAX_XLSX_CHART_XML_WORK_BYTES_PER_WORKBOOK: usize = 128 << 20;
 // ECMA-376 Part 1 §20.1.10.35 (`ST_LineWidth`), in English Metric Units.
 const MAX_OOXML_CHART_LINE_WIDTH_EMU: u32 = 20_116_800;
 
@@ -4045,10 +5115,13 @@ pub(crate) struct ParsedChart {
     pub(crate) chart: Chart,
     pub(crate) series_caches: Vec<ChartSeriesCache>,
     pub(crate) series_styles: Vec<ChartSeriesStyle>,
+    pub(crate) text_styles: ChartTextStyles,
     pub(crate) frame_fill: ChartFrameFill,
     pub(crate) frame_style_losses: Vec<ChartFrameStyleLossKind>,
     pub(crate) category_major_gridlines: bool,
     pub(crate) value_major_gridlines: bool,
+    pub(crate) category_axis_visible: Option<bool>,
+    pub(crate) value_axis_visible: Option<bool>,
     pub(crate) limit_exceeded: bool,
     pub(crate) unsupported_reasons: Vec<ChartUnsupportedReason>,
     pub(crate) bar_direction: ChartBarDirection,
@@ -4062,7 +5135,7 @@ enum ChartSeriesField {
     BubbleSizes,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChartAxisContext {
     Category,
     Value,
@@ -4071,8 +5144,1860 @@ enum ChartAxisContext {
 #[derive(Clone, Copy)]
 enum ChartTitleTarget {
     Main,
-    XAxis,
-    YAxis,
+    CategoryAxis,
+    ValueAxis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartTextSemanticRole {
+    ChartDefault,
+    ChartTitle,
+    CategoryAxisTitle,
+    ValueAxisTitle,
+    Legend,
+    CategoryAxisLabels,
+    ValueAxisLabels,
+    DataLabels,
+}
+
+impl ChartTextSemanticRole {
+    const COUNT: usize = 8;
+
+    fn index(self) -> usize {
+        match self {
+            Self::ChartDefault => 0,
+            Self::ChartTitle => 1,
+            Self::CategoryAxisTitle => 2,
+            Self::ValueAxisTitle => 3,
+            Self::Legend => 4,
+            Self::CategoryAxisLabels => 5,
+            Self::ValueAxisLabels => 6,
+            Self::DataLabels => 7,
+        }
+    }
+
+    fn default_style(self, theme: &ThemeColors, color_map: &ChartTextColorMap) -> ChartTextStyle {
+        let (size_hundredths_of_point, bold) = match self {
+            Self::ChartDefault => (1_000, false),
+            Self::ChartTitle => (1_800, true),
+            Self::CategoryAxisTitle | Self::ValueAxisTitle => (1_000, true),
+            Self::Legend | Self::CategoryAxisLabels | Self::ValueAxisLabels | Self::DataLabels => {
+                (1_000, false)
+            }
+        };
+        ChartTextStyle {
+            latin_font_family: theme.chart_default_latin_font_family().to_string(),
+            size_hundredths_of_point,
+            color: chart_scheme_color(theme, color_map, "tx1")
+                .unwrap_or_else(|| Color::rgb(0, 0, 0)),
+            bold,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            kerning_minimum_hundredths_of_point: None,
+            rotation_degrees: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PartialChartTextStyle {
+    latin_font_family: Option<String>,
+    size_hundredths_of_point: Option<u32>,
+    color: Option<Color>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+    kerning_minimum_hundredths_of_point: Option<u32>,
+}
+
+impl PartialChartTextStyle {
+    fn merge_from(&mut self, overlay: &Self) {
+        if overlay.latin_font_family.is_some() {
+            self.latin_font_family
+                .clone_from(&overlay.latin_font_family);
+        }
+        if overlay.size_hundredths_of_point.is_some() {
+            self.size_hundredths_of_point = overlay.size_hundredths_of_point;
+        }
+        if overlay.color.is_some() {
+            self.color = overlay.color;
+        }
+        if overlay.bold.is_some() {
+            self.bold = overlay.bold;
+        }
+        if overlay.italic.is_some() {
+            self.italic = overlay.italic;
+        }
+        if overlay.underline.is_some() {
+            self.underline = overlay.underline;
+        }
+        if overlay.strikethrough.is_some() {
+            self.strikethrough = overlay.strikethrough;
+        }
+        if overlay.kerning_minimum_hundredths_of_point.is_some() {
+            self.kerning_minimum_hundredths_of_point = overlay.kerning_minimum_hundredths_of_point;
+        }
+    }
+
+    fn apply_to(&self, style: &mut ChartTextStyle) {
+        if let Some(family) = self.latin_font_family.as_ref() {
+            style.latin_font_family.clone_from(family);
+        }
+        if let Some(size) = self.size_hundredths_of_point {
+            style.size_hundredths_of_point = size;
+        }
+        if let Some(color) = self.color {
+            style.color = color;
+        }
+        if let Some(bold) = self.bold {
+            style.bold = bold;
+        }
+        if let Some(italic) = self.italic {
+            style.italic = italic;
+        }
+        if let Some(underline) = self.underline {
+            style.underline = underline;
+        }
+        if let Some(strikethrough) = self.strikethrough {
+            style.strikethrough = strikethrough;
+        }
+        if let Some(kerning) = self.kerning_minimum_hundredths_of_point {
+            style.kerning_minimum_hundredths_of_point = Some(kerning);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+enum ChartTextStyleObservation {
+    #[default]
+    Unseen,
+    Uniform(ChartTextStyle),
+    Mixed,
+    Unsupported,
+}
+
+impl ChartTextStyleObservation {
+    fn observe(&mut self, style: ChartTextStyle) {
+        match self {
+            Self::Unseen => *self = Self::Uniform(style),
+            Self::Uniform(previous) if *previous == style => {}
+            Self::Uniform(_) => *self = Self::Mixed,
+            Self::Mixed | Self::Unsupported => {}
+        }
+    }
+
+    fn mark_unsupported(&mut self) {
+        *self = Self::Unsupported;
+    }
+
+    fn mark_mixed(&mut self) {
+        if !matches!(self, Self::Unsupported) {
+            *self = Self::Mixed;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChartTextStyleObservations {
+    chart_default: ChartTextStyleObservation,
+    chart_title: ChartTextStyleObservation,
+    category_axis_title: ChartTextStyleObservation,
+    value_axis_title: ChartTextStyleObservation,
+    legend: ChartTextStyleObservation,
+    category_axis_labels: ChartTextStyleObservation,
+    value_axis_labels: ChartTextStyleObservation,
+    data_labels: ChartTextStyleObservation,
+}
+
+impl ChartTextStyleObservations {
+    fn get_mut(&mut self, role: ChartTextSemanticRole) -> &mut ChartTextStyleObservation {
+        match role {
+            ChartTextSemanticRole::ChartDefault => &mut self.chart_default,
+            ChartTextSemanticRole::ChartTitle => &mut self.chart_title,
+            ChartTextSemanticRole::CategoryAxisTitle => &mut self.category_axis_title,
+            ChartTextSemanticRole::ValueAxisTitle => &mut self.value_axis_title,
+            ChartTextSemanticRole::Legend => &mut self.legend,
+            ChartTextSemanticRole::CategoryAxisLabels => &mut self.category_axis_labels,
+            ChartTextSemanticRole::ValueAxisLabels => &mut self.value_axis_labels,
+            ChartTextSemanticRole::DataLabels => &mut self.data_labels,
+        }
+    }
+
+    fn finish(self, unsupported_reasons: &mut Vec<ChartUnsupportedReason>) -> ChartTextStyles {
+        fn finish_one(
+            observation: ChartTextStyleObservation,
+            unsupported_reasons: &mut Vec<ChartUnsupportedReason>,
+        ) -> Option<ChartTextStyle> {
+            match observation {
+                ChartTextStyleObservation::Unseen => None,
+                ChartTextStyleObservation::Uniform(style) => Some(style),
+                ChartTextStyleObservation::Mixed => {
+                    add_chart_unsupported(
+                        unsupported_reasons,
+                        ChartUnsupportedReason::MixedTextStyle,
+                    );
+                    None
+                }
+                ChartTextStyleObservation::Unsupported => {
+                    add_chart_unsupported(
+                        unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedTextStyle,
+                    );
+                    None
+                }
+            }
+        }
+
+        let _ = finish_one(self.chart_default, unsupported_reasons);
+        ChartTextStyles {
+            chart_title: finish_one(self.chart_title, unsupported_reasons),
+            category_axis_title: finish_one(self.category_axis_title, unsupported_reasons),
+            value_axis_title: finish_one(self.value_axis_title, unsupported_reasons),
+            legend: finish_one(self.legend, unsupported_reasons),
+            category_axis_labels: finish_one(self.category_axis_labels, unsupported_reasons),
+            value_axis_labels: finish_one(self.value_axis_labels, unsupported_reasons),
+            data_labels: finish_one(self.data_labels, unsupported_reasons),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChartTextContext {
+    kind: ChartKind,
+    axis: Option<ChartAxisContext>,
+    axis_roles: Vec<ChartAxisContext>,
+    axis_occurrence: usize,
+    series_depth: usize,
+    title_role: Option<ChartTextSemanticRole>,
+    title_depth: usize,
+    legend_depth: usize,
+    data_labels_depth: usize,
+    display_units_label_depth: usize,
+}
+
+impl ChartTextContext {
+    fn new(kind: ChartKind, axis_roles: &[ChartAxisContext]) -> Self {
+        Self {
+            kind,
+            axis: None,
+            axis_roles: axis_roles.to_vec(),
+            axis_occurrence: 0,
+            series_depth: 0,
+            title_role: None,
+            title_depth: 0,
+            legend_depth: 0,
+            data_labels_depth: 0,
+            display_units_label_depth: 0,
+        }
+    }
+
+    fn start(&mut self, name: &[u8]) {
+        match name {
+            b"ser" => self.series_depth = self.series_depth.saturating_add(1),
+            b"catAx" | b"dateAx" | b"valAx" => {
+                self.axis = self
+                    .axis_roles
+                    .get(self.axis_occurrence)
+                    .copied()
+                    .or(match name {
+                        b"catAx" | b"dateAx" => Some(ChartAxisContext::Category),
+                        b"valAx" if matches!(self.kind, ChartKind::Scatter | ChartKind::Bubble) => {
+                            Some(ChartAxisContext::Value)
+                        }
+                        b"valAx" => Some(ChartAxisContext::Value),
+                        _ => None,
+                    });
+                self.axis_occurrence = self.axis_occurrence.saturating_add(1);
+            }
+            b"title" if self.series_depth == 0 => {
+                if self.title_depth == 0 {
+                    self.title_role = Some(match self.axis {
+                        Some(ChartAxisContext::Category) => {
+                            ChartTextSemanticRole::CategoryAxisTitle
+                        }
+                        Some(ChartAxisContext::Value) => ChartTextSemanticRole::ValueAxisTitle,
+                        None => ChartTextSemanticRole::ChartTitle,
+                    });
+                }
+                self.title_depth = self.title_depth.saturating_add(1);
+            }
+            b"legend" => self.legend_depth = self.legend_depth.saturating_add(1),
+            b"dLbls" | b"dLbl" => {
+                self.data_labels_depth = self.data_labels_depth.saturating_add(1);
+            }
+            b"dispUnitsLbl" => {
+                self.display_units_label_depth = self.display_units_label_depth.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, name: &[u8]) {
+        match name {
+            b"ser" => self.series_depth = self.series_depth.saturating_sub(1),
+            b"catAx" | b"dateAx" | b"valAx" => self.axis = None,
+            b"title" if self.title_depth > 0 => {
+                self.title_depth -= 1;
+                if self.title_depth == 0 {
+                    self.title_role = None;
+                }
+            }
+            b"legend" => self.legend_depth = self.legend_depth.saturating_sub(1),
+            b"dLbls" | b"dLbl" => {
+                self.data_labels_depth = self.data_labels_depth.saturating_sub(1);
+            }
+            b"dispUnitsLbl" => {
+                self.display_units_label_depth = self.display_units_label_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn text_body_role(&self, rich: bool) -> Option<ChartTextSemanticRole> {
+        if self.display_units_label_depth > 0 {
+            return None;
+        }
+        if self.title_depth > 0 {
+            return self.title_role;
+        }
+        if self.legend_depth > 0 {
+            Some(ChartTextSemanticRole::Legend)
+        } else if self.data_labels_depth > 0 {
+            Some(ChartTextSemanticRole::DataLabels)
+        } else if rich {
+            None
+        } else {
+            match self.axis {
+                Some(ChartAxisContext::Category) => Some(ChartTextSemanticRole::CategoryAxisLabels),
+                Some(ChartAxisContext::Value) => Some(ChartTextSemanticRole::ValueAxisLabels),
+                None if self.series_depth == 0 => Some(ChartTextSemanticRole::ChartDefault),
+                None => None,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChartTextColorCapture {
+    color: Color,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChartTextPropertyCapture {
+    style: PartialChartTextStyle,
+    unsupported: bool,
+    in_solid_fill: bool,
+    solid_fill_seen: bool,
+    color_transform_count: usize,
+    color: Option<ChartTextColorCapture>,
+}
+
+// A single transform is evaluated exactly enough for the retained RGB model.
+// Multiple sequential transforms would require preserving higher-precision
+// DrawingML color state between operations, so they fail closed.
+const MAX_CHART_TEXT_COLOR_TRANSFORMS: usize = 1;
+
+const MIN_OOXML_CHART_TEXT_SIZE: u32 = 100;
+const MAX_OOXML_CHART_TEXT_SIZE: u32 = 400_000;
+
+fn chart_text_bounded_size(value: &str) -> Option<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| (MIN_OOXML_CHART_TEXT_SIZE..=MAX_OOXML_CHART_TEXT_SIZE).contains(value))
+}
+
+fn chart_text_bounded_kerning(value: &str) -> Option<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value <= MAX_OOXML_CHART_TEXT_SIZE)
+}
+
+fn parse_chart_bool_attr(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_chart_boolean_element(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> std::result::Result<bool, ()> {
+    match unique_attr(element, b"val")? {
+        Some(value) => parse_chart_bool_attr(&value).ok_or(()),
+        None => Ok(true),
+    }
+}
+
+fn resolve_chart_latin_typeface(value: &str, theme: &ThemeColors) -> Option<String> {
+    match value.trim() {
+        "+mn-lt" => Some(theme.chart_default_latin_font_family().to_string()),
+        "+mj-lt" => Some(theme.chart_major_latin_font_family().to_string()),
+        value if value.starts_with('+') => None,
+        value => bounded_imported_chart_latin_font_family(value),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChartTextColorMap(HashMap<String, String>);
+
+impl ChartTextColorMap {
+    fn resolve<'a>(&'a self, value: &'a str) -> &'a str {
+        self.0.get(value).map(String::as_str).unwrap_or(value)
+    }
+}
+
+fn parse_chart_text_color_map(xml: &str) -> (ChartTextColorMap, bool) {
+    const SOURCE_SLOTS: [&str; 12] = [
+        "bg1", "tx1", "bg2", "tx2", "accent1", "accent2", "accent3", "accent4", "accent5",
+        "accent6", "hlink", "folHlink",
+    ];
+    const TARGET_SLOTS: [&str; 12] = [
+        "lt1", "dk1", "lt2", "dk2", "accent1", "accent2", "accent3", "accent4", "accent5",
+        "accent6", "hlink", "folHlink",
+    ];
+
+    fn read_override_mapping(
+        element: &quick_xml::events::BytesStart<'_>,
+        map: &mut ChartTextColorMap,
+    ) -> bool {
+        let mut unsupported = false;
+        for slot in SOURCE_SLOTS {
+            match unique_attr(element, slot.as_bytes()) {
+                Ok(Some(value)) if TARGET_SLOTS.contains(&value.as_str()) => {
+                    map.0.insert(slot.to_string(), value);
+                }
+                Ok(Some(_)) | Ok(None) | Err(()) => unsupported = true,
+            }
+        }
+        for attribute in element.attributes() {
+            match attribute {
+                Ok(attribute) => {
+                    let qualified_name = attribute.key.as_ref();
+                    let name = local(qualified_name);
+                    if !SOURCE_SLOTS.iter().any(|slot| slot.as_bytes() == name)
+                        && qualified_name != b"xmlns"
+                        && !qualified_name.starts_with(b"xmlns:")
+                    {
+                        unsupported = true;
+                    }
+                }
+                Err(_) => unsupported = true,
+            }
+        }
+        unsupported
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut chart_space_depth = None;
+    let mut override_depth = None;
+    let mut seen_override = false;
+    let mut override_child_seen = false;
+    let mut map = ChartTextColorMap::default();
+    let mut unsupported = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if name == b"chartSpace" && chart_space_depth.is_none() {
+                    chart_space_depth = Some(depth);
+                } else if chart_space_depth.is_some_and(|root| depth == root + 1)
+                    && name == b"clrMapOvr"
+                {
+                    if seen_override {
+                        unsupported = true;
+                    }
+                    seen_override = true;
+                    override_depth = Some(depth);
+                    override_child_seen = false;
+                } else if override_depth.is_some_and(|parent| depth == parent + 1) {
+                    if override_child_seen {
+                        unsupported = true;
+                    }
+                    override_child_seen = true;
+                    match name {
+                        b"masterClrMapping" => {}
+                        b"overrideClrMapping" => {
+                            unsupported |= read_override_mapping(&element, &mut map);
+                        }
+                        _ => unsupported = true,
+                    }
+                } else if override_depth.is_some_and(|parent| depth > parent + 1) {
+                    unsupported = true;
+                }
+                depth = depth.saturating_add(1);
+            }
+            Ok(Event::Empty(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if chart_space_depth.is_some_and(|root| depth == root + 1) && name == b"clrMapOvr" {
+                    seen_override = true;
+                    unsupported = true;
+                } else if override_depth.is_some_and(|parent| depth == parent + 1) {
+                    if override_child_seen {
+                        unsupported = true;
+                    }
+                    override_child_seen = true;
+                    match name {
+                        b"masterClrMapping" => {}
+                        b"overrideClrMapping" => {
+                            unsupported |= read_override_mapping(&element, &mut map);
+                        }
+                        _ => unsupported = true,
+                    }
+                } else if override_depth.is_some_and(|parent| depth > parent + 1) {
+                    unsupported = true;
+                }
+            }
+            Ok(Event::End(element)) => {
+                depth = depth.saturating_sub(1);
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if name == b"clrMapOvr" && override_depth == Some(depth) {
+                    unsupported |= !override_child_seen;
+                    override_depth = None;
+                    override_child_seen = false;
+                }
+                if name == b"chartSpace" && chart_space_depth == Some(depth) {
+                    chart_space_depth = None;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                unsupported = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    unsupported |= override_depth.is_some();
+    (map, unsupported)
+}
+
+fn chart_scheme_color(
+    theme: &ThemeColors,
+    color_map: &ChartTextColorMap,
+    value: &str,
+) -> Option<Color> {
+    let value = color_map.resolve(value);
+    let fallback = match value.as_bytes() {
+        b"bg1" | b"lt1" => Some(Color::rgb(255, 255, 255)),
+        b"tx1" | b"dk1" => Some(Color::rgb(0, 0, 0)),
+        b"bg2" | b"lt2" => Some(Color::rgb(238, 236, 225)),
+        b"tx2" | b"dk2" => Some(Color::rgb(31, 73, 125)),
+        _ => None,
+    };
+    let slot_name = match value.as_bytes() {
+        b"bg1" => b"lt1".as_slice(),
+        b"tx1" => b"dk1".as_slice(),
+        b"bg2" => b"lt2".as_slice(),
+        b"tx2" => b"dk2".as_slice(),
+        value => value,
+    };
+    theme_color_slot(slot_name)
+        .and_then(|slot| theme.color(slot, None))
+        .or_else(|| {
+            let index = match value.as_bytes() {
+                b"accent1" => 0,
+                b"accent2" => 1,
+                b"accent3" => 2,
+                b"accent4" => 3,
+                b"accent5" => 4,
+                b"accent6" => 5,
+                _ => return fallback,
+            };
+            theme.chart_palette().get(index).copied()
+        })
+        .or(fallback)
+}
+
+fn rgb_to_hsl(color: Color) -> (f64, f64, f64) {
+    let [red, green, blue] = color.as_rgb();
+    let red = f64::from(red) / 255.0;
+    let green = f64::from(green) / 255.0;
+    let blue = f64::from(blue) / 255.0;
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let lightness = (maximum + minimum) / 2.0;
+    let difference = maximum - minimum;
+    if difference == 0.0 {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = difference / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if maximum == red {
+        ((green - blue) / difference).rem_euclid(6.0)
+    } else if maximum == green {
+        (blue - red) / difference + 2.0
+    } else {
+        (red - green) / difference + 4.0
+    } / 6.0;
+    (hue, saturation, lightness)
+}
+
+fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let hue_sector = hue.rem_euclid(1.0) * 6.0;
+    let intermediate = chroma * (1.0 - (hue_sector.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = if hue_sector < 1.0 {
+        (chroma, intermediate, 0.0)
+    } else if hue_sector < 2.0 {
+        (intermediate, chroma, 0.0)
+    } else if hue_sector < 3.0 {
+        (0.0, chroma, intermediate)
+    } else if hue_sector < 4.0 {
+        (0.0, intermediate, chroma)
+    } else if hue_sector < 5.0 {
+        (intermediate, 0.0, chroma)
+    } else {
+        (chroma, 0.0, intermediate)
+    };
+    let match_value = lightness - chroma / 2.0;
+    let channel = |value: f64| ((value + match_value) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::rgb(channel(red), channel(green), channel(blue))
+}
+
+fn apply_chart_luminance(color: Color, modulation: u32, offset: u32) -> Color {
+    let (hue, saturation, lightness) = rgb_to_hsl(color);
+    let lightness = (lightness * f64::from(modulation) / 100_000.0 + f64::from(offset) / 100_000.0)
+        .clamp(0.0, 1.0);
+    hsl_to_rgb(hue, saturation, lightness)
+}
+
+fn parse_chart_color_transform(value: Option<String>) -> Option<u32> {
+    value
+        .as_deref()?
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value <= 100_000)
+}
+
+fn parse_chart_rgb(value: &str) -> Option<Color> {
+    if value.len() != 6 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(Color::rgb(
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ))
+}
+
+fn chart_text_unique_attr(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+    unsupported: &mut bool,
+) -> Option<String> {
+    match unique_attr(element, name) {
+        Ok(value) => value,
+        Err(()) => {
+            *unsupported = true;
+            None
+        }
+    }
+}
+
+fn chart_text_attributes_are_subset(
+    element: &quick_xml::events::BytesStart<'_>,
+    allowed: &[&[u8]],
+) -> bool {
+    element.attributes().all(|attribute| {
+        let Ok(attribute) = attribute else {
+            return false;
+        };
+        let qualified_name = attribute.key.as_ref();
+        qualified_name == b"xmlns"
+            || qualified_name.starts_with(b"xmlns:")
+            || allowed.contains(&qualified_name)
+    })
+}
+
+fn chart_text_partial_from_attributes(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> ChartTextPropertyCapture {
+    let mut capture = ChartTextPropertyCapture::default();
+    if !chart_text_attributes_are_subset(
+        element,
+        &[
+            b"sz",
+            b"b",
+            b"i",
+            b"u",
+            b"strike",
+            b"kern",
+            b"baseline",
+            b"spc",
+            b"cap",
+            b"normalizeH",
+            b"kumimoji",
+        ],
+    ) {
+        capture.unsupported = true;
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"sz", &mut capture.unsupported) {
+        match chart_text_bounded_size(&value) {
+            Some(value) => capture.style.size_hundredths_of_point = Some(value),
+            None => capture.unsupported = true,
+        }
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"b", &mut capture.unsupported) {
+        match parse_chart_bool_attr(&value) {
+            Some(value) => capture.style.bold = Some(value),
+            None => capture.unsupported = true,
+        }
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"i", &mut capture.unsupported) {
+        match parse_chart_bool_attr(&value) {
+            Some(value) => capture.style.italic = Some(value),
+            None => capture.unsupported = true,
+        }
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"u", &mut capture.unsupported) {
+        match value.as_str() {
+            "none" => capture.style.underline = Some(false),
+            "sng" => capture.style.underline = Some(true),
+            _ => capture.unsupported = true,
+        }
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"strike", &mut capture.unsupported) {
+        match value.as_str() {
+            "noStrike" => capture.style.strikethrough = Some(false),
+            "sngStrike" => capture.style.strikethrough = Some(true),
+            _ => capture.unsupported = true,
+        }
+    }
+    if let Some(value) = chart_text_unique_attr(element, b"kern", &mut capture.unsupported) {
+        match chart_text_bounded_kerning(&value) {
+            Some(value) => capture.style.kerning_minimum_hundredths_of_point = Some(value),
+            None => capture.unsupported = true,
+        }
+    }
+    for name in [b"baseline".as_slice(), b"spc".as_slice()] {
+        if chart_text_unique_attr(element, name, &mut capture.unsupported)
+            .as_deref()
+            .is_some_and(|value| value.parse::<i32>().ok() != Some(0))
+        {
+            capture.unsupported = true;
+        }
+    }
+    if chart_text_unique_attr(element, b"cap", &mut capture.unsupported)
+        .as_deref()
+        .is_some_and(|value| value != "none")
+    {
+        capture.unsupported = true;
+    }
+    for name in [b"normalizeH".as_slice(), b"kumimoji".as_slice()] {
+        if let Some(value) = chart_text_unique_attr(element, name, &mut capture.unsupported) {
+            if parse_chart_bool_attr(&value) != Some(false) {
+                capture.unsupported = true;
+            }
+        }
+    }
+    capture
+}
+
+fn update_chart_text_property_capture(
+    capture: &mut ChartTextPropertyCapture,
+    element: &quick_xml::events::BytesStart<'_>,
+    theme: &ThemeColors,
+    color_map: &ChartTextColorMap,
+    empty: bool,
+) {
+    let qualified_name = element.name();
+    let name = local(qualified_name.as_ref());
+    match name {
+        b"latin" => {
+            if !chart_text_attributes_are_subset(element, &[b"typeface"]) {
+                capture.unsupported = true;
+            }
+            let family = unique_attr(element, b"typeface")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(|value| resolve_chart_latin_typeface(value, theme));
+            if family.is_none() || capture.style.latin_font_family.is_some() {
+                capture.unsupported = true;
+            } else {
+                capture.style.latin_font_family = family;
+            }
+        }
+        b"ea" | b"cs" => {
+            if !chart_text_attributes_are_subset(element, &[b"typeface"]) {
+                capture.unsupported = true;
+            }
+            match unique_attr(element, b"typeface") {
+                Ok(None) => {}
+                Ok(Some(value)) if value.trim().is_empty() => {}
+                _ => capture.unsupported = true,
+            }
+        }
+        b"solidFill" => {
+            if !chart_text_attributes_are_subset(element, &[]) {
+                capture.unsupported = true;
+            }
+            if capture.solid_fill_seen || capture.in_solid_fill {
+                capture.unsupported = true;
+            }
+            capture.solid_fill_seen = true;
+            capture.in_solid_fill = true;
+            if empty {
+                capture.unsupported = true;
+                capture.in_solid_fill = false;
+            }
+        }
+        b"srgbClr" | b"schemeClr" | b"sysClr" if capture.in_solid_fill => {
+            let allowed: &[&[u8]] = if name == b"sysClr" {
+                &[b"val", b"lastClr"]
+            } else {
+                &[b"val"]
+            };
+            if !chart_text_attributes_are_subset(element, allowed) {
+                capture.unsupported = true;
+            }
+            let duplicate_color = capture.color.is_some() || capture.style.color.is_some();
+            if duplicate_color {
+                capture.unsupported = true;
+            }
+            let color = match name {
+                b"srgbClr" => unique_attr(element, b"val")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .and_then(parse_chart_rgb),
+                b"schemeClr" => unique_attr(element, b"val")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .and_then(|value| chart_scheme_color(theme, color_map, value)),
+                b"sysClr" => unique_attr(element, b"lastClr")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .and_then(parse_chart_rgb),
+                _ => unreachable!("guarded chart text color"),
+            };
+            match color {
+                Some(color) if !duplicate_color => {
+                    capture.color = Some(ChartTextColorCapture { color });
+                }
+                Some(_) => {}
+                None => capture.unsupported = true,
+            }
+            if empty {
+                if let Some(color) = capture.color.take() {
+                    capture.style.color = Some(color.color);
+                }
+            }
+        }
+        b"lumMod" | b"lumOff" | b"tint" | b"shade" if capture.color.is_some() => {
+            if !chart_text_attributes_are_subset(element, &[b"val"]) {
+                capture.unsupported = true;
+            }
+            capture.color_transform_count = capture.color_transform_count.saturating_add(1);
+            if capture.color_transform_count > MAX_CHART_TEXT_COLOR_TRANSFORMS {
+                capture.unsupported = true;
+                return;
+            }
+            let Some(value) = unique_attr(element, b"val")
+                .ok()
+                .flatten()
+                .and_then(|value| parse_chart_color_transform(Some(value)))
+            else {
+                capture.unsupported = true;
+                return;
+            };
+            let color = capture.color.as_mut().expect("chart color checked above");
+            color.color = match name {
+                b"lumMod" => apply_chart_luminance(color.color, value, 0),
+                b"lumOff" => apply_chart_luminance(color.color, 100_000, value),
+                b"tint" => apply_chart_luminance(color.color, value, 100_000 - value),
+                b"shade" => apply_chart_luminance(color.color, value, 0),
+                _ => unreachable!("guarded luminance transform"),
+            };
+        }
+        b"lumMod" | b"lumOff" | b"tint" | b"shade" => capture.unsupported = true,
+        b"noFill" | b"gradFill" | b"pattFill" | b"blipFill" | b"grpFill" | b"highlight"
+        | b"uLn" | b"uLnTx" | b"uFill" | b"uFillTx" | b"rtl" | b"sym" | b"ln" | b"effectLst"
+        | b"effectDag" | b"scene3d" | b"sp3d" | b"glow" | b"outerShdw" | b"innerShdw"
+        | b"reflection" | b"softEdge" | b"hlinkClick" | b"hlinkMouseOver" => {
+            capture.unsupported = true;
+        }
+        b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff" | b"green"
+        | b"greenMod" | b"greenOff" | b"hue" | b"hueMod" | b"hueOff" | b"lum" | b"red"
+        | b"redMod" | b"redOff" | b"sat" | b"satMod" | b"satOff" | b"comp" | b"gamma" | b"gray"
+        | b"inv" | b"invGamma" => capture.unsupported = true,
+        _ => capture.unsupported = true,
+    }
+}
+
+fn finish_chart_text_property_element(capture: &mut ChartTextPropertyCapture, name: &[u8]) {
+    match name {
+        b"srgbClr" | b"schemeClr" | b"sysClr" if capture.in_solid_fill => {
+            if let Some(color) = capture.color.take() {
+                capture.style.color = Some(color.color);
+            } else {
+                capture.unsupported = true;
+            }
+        }
+        b"solidFill" => {
+            if capture.style.color.is_none() {
+                capture.unsupported = true;
+            }
+            capture.in_solid_fill = false;
+            capture.color = None;
+        }
+        _ => {}
+    }
+}
+
+const MAX_CHART_TEXT_STYLE_FACTS_PER_ROLE: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ChartTextRotationState {
+    #[default]
+    Inherit,
+    Automatic,
+    Degrees(i16),
+}
+
+#[derive(Debug, Clone, Default)]
+enum PartialChartTextStyleObservation {
+    #[default]
+    Unseen,
+    Uniform {
+        style: PartialChartTextStyle,
+        rotation: ChartTextRotationState,
+    },
+    Mixed,
+    Unsupported,
+}
+
+impl PartialChartTextStyleObservation {
+    fn observe(&mut self, style: PartialChartTextStyle, rotation: ChartTextRotationState) {
+        match self {
+            Self::Unseen => *self = Self::Uniform { style, rotation },
+            Self::Uniform {
+                style: previous_style,
+                rotation: previous_rotation,
+            } if *previous_style == style && *previous_rotation == rotation => {}
+            Self::Uniform { .. } => *self = Self::Mixed,
+            Self::Mixed | Self::Unsupported => {}
+        }
+    }
+
+    fn mark_unsupported(&mut self) {
+        *self = Self::Unsupported;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaintedChartTextStyleFact {
+    style: PartialChartTextStyle,
+    rotation: ChartTextRotationState,
+    unsupported: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChartTextPropertyTarget {
+    List(usize),
+    Paragraph,
+    Run,
+}
+
+#[derive(Debug)]
+struct UnifiedChartTextBody {
+    rich: bool,
+    role: ChartTextSemanticRole,
+    rotation: ChartTextRotationState,
+    body_unsupported: bool,
+    body_properties_seen: bool,
+    body_properties_open: bool,
+    autofit_seen: bool,
+    list_style_seen: bool,
+    list_style_open: bool,
+    paragraph_open: bool,
+    paragraph_properties_open: bool,
+    paragraph_content_started: bool,
+    run_open: bool,
+    list_styles: [PartialChartTextStyle; 9],
+    list_unsupported: [bool; 9],
+    list_property_seen: [bool; 9],
+    list_level_context: Option<usize>,
+    paragraph_level: usize,
+    paragraph_style: PartialChartTextStyle,
+    paragraph_unsupported: bool,
+    paragraph_property_seen: bool,
+    run_style: PartialChartTextStyle,
+    run_unsupported: bool,
+    run_property_seen: bool,
+    in_text: bool,
+    current_run_painted: bool,
+    current_paragraph_painted: bool,
+    paragraph_seen: bool,
+    painted_paragraphs: usize,
+    default_candidate: Option<PartialChartTextStyle>,
+    default_candidate_mixed: bool,
+    default_candidate_unsupported: bool,
+}
+
+impl UnifiedChartTextBody {
+    fn new(rich: bool, role: ChartTextSemanticRole) -> Self {
+        Self {
+            rich,
+            role,
+            rotation: ChartTextRotationState::Inherit,
+            body_unsupported: false,
+            body_properties_seen: false,
+            body_properties_open: false,
+            autofit_seen: false,
+            list_style_seen: false,
+            list_style_open: false,
+            paragraph_open: false,
+            paragraph_properties_open: false,
+            paragraph_content_started: false,
+            run_open: false,
+            list_styles: std::array::from_fn(|_| PartialChartTextStyle::default()),
+            list_unsupported: [false; 9],
+            list_property_seen: [false; 9],
+            list_level_context: None,
+            paragraph_level: 0,
+            paragraph_style: PartialChartTextStyle::default(),
+            paragraph_unsupported: false,
+            paragraph_property_seen: false,
+            run_style: PartialChartTextStyle::default(),
+            run_unsupported: false,
+            run_property_seen: false,
+            in_text: false,
+            current_run_painted: false,
+            current_paragraph_painted: false,
+            paragraph_seen: false,
+            painted_paragraphs: 0,
+            default_candidate: None,
+            default_candidate_mixed: false,
+            default_candidate_unsupported: false,
+        }
+    }
+
+    fn reset_paragraph(&mut self) {
+        self.paragraph_level = 0;
+        self.paragraph_style = PartialChartTextStyle::default();
+        self.paragraph_unsupported = false;
+        self.paragraph_property_seen = false;
+        self.paragraph_content_started = false;
+        self.run_style = PartialChartTextStyle::default();
+        self.run_unsupported = false;
+        self.run_property_seen = false;
+        self.current_run_painted = false;
+        self.current_paragraph_painted = false;
+    }
+
+    fn reset_run(&mut self) {
+        self.run_style = PartialChartTextStyle::default();
+        self.run_unsupported = false;
+        self.run_property_seen = false;
+        self.current_run_painted = false;
+    }
+
+    fn effective_partial(&self, include_run: bool) -> PartialChartTextStyle {
+        let mut style = self.list_styles[self.paragraph_level].clone();
+        style.merge_from(&self.paragraph_style);
+        if include_run {
+            style.merge_from(&self.run_style);
+        }
+        style
+    }
+
+    fn observe_default_candidate(&mut self) {
+        if self.rich {
+            return;
+        }
+        self.default_candidate_unsupported |=
+            self.list_unsupported[self.paragraph_level] || self.paragraph_unsupported;
+        let candidate = self.effective_partial(false);
+        match self.default_candidate.as_ref() {
+            Some(previous) if previous != &candidate => self.default_candidate_mixed = true,
+            None => self.default_candidate = Some(candidate),
+            _ => {}
+        }
+    }
+
+    fn property_target(&self, run: bool) -> ChartTextPropertyTarget {
+        if run {
+            ChartTextPropertyTarget::Run
+        } else if let Some(level) = self.list_level_context {
+            ChartTextPropertyTarget::List(level)
+        } else {
+            ChartTextPropertyTarget::Paragraph
+        }
+    }
+
+    fn apply_property(
+        &mut self,
+        target: ChartTextPropertyTarget,
+        capture: ChartTextPropertyCapture,
+    ) {
+        match target {
+            ChartTextPropertyTarget::List(level) => {
+                if self.list_property_seen[level] {
+                    self.list_unsupported[level] = true;
+                }
+                self.list_property_seen[level] = true;
+                self.list_unsupported[level] |= capture.unsupported;
+                self.list_styles[level].merge_from(&capture.style);
+            }
+            ChartTextPropertyTarget::Paragraph => {
+                if self.paragraph_property_seen {
+                    self.paragraph_unsupported = true;
+                }
+                self.paragraph_property_seen = true;
+                self.paragraph_unsupported |= capture.unsupported;
+                self.paragraph_style.merge_from(&capture.style);
+            }
+            ChartTextPropertyTarget::Run => {
+                if self.run_property_seen {
+                    self.run_unsupported = true;
+                }
+                self.run_property_seen = true;
+                self.run_unsupported |= capture.unsupported;
+                self.run_style.merge_from(&capture.style);
+            }
+        }
+    }
+
+    fn current_fact(&mut self) -> PaintedChartTextStyleFact {
+        self.current_run_painted = true;
+        if !self.current_paragraph_painted {
+            self.current_paragraph_painted = true;
+            self.painted_paragraphs = self.painted_paragraphs.saturating_add(1);
+        }
+        PaintedChartTextStyleFact {
+            style: self.effective_partial(true),
+            rotation: self.rotation,
+            unsupported: self.body_unsupported
+                || self.list_unsupported[self.paragraph_level]
+                || self.paragraph_unsupported
+                || self.run_unsupported
+                || self.painted_paragraphs > 1,
+        }
+    }
+}
+
+fn chart_text_list_level(name: &[u8]) -> Option<usize> {
+    match name {
+        b"lvl1pPr" => Some(0),
+        b"lvl2pPr" => Some(1),
+        b"lvl3pPr" => Some(2),
+        b"lvl4pPr" => Some(3),
+        b"lvl5pPr" => Some(4),
+        b"lvl6pPr" => Some(5),
+        b"lvl7pPr" => Some(6),
+        b"lvl8pPr" => Some(7),
+        b"lvl9pPr" => Some(8),
+        _ => None,
+    }
+}
+
+fn normalize_imported_chart_rotation(degrees: i32) -> Option<i16> {
+    let normalized = degrees.rem_euclid(360);
+    i16::try_from(if normalized > 180 {
+        normalized - 360
+    } else {
+        normalized
+    })
+    .ok()
+}
+
+fn parse_chart_body_rotation_state(
+    element: &quick_xml::events::BytesStart<'_>,
+    role: ChartTextSemanticRole,
+) -> std::result::Result<ChartTextRotationState, ()> {
+    if !chart_text_attributes_are_subset(element, &[b"vert", b"rot"]) {
+        return Err(());
+    }
+    if unique_attr(element, b"vert")?
+        .as_deref()
+        .is_some_and(|value| value != "horz")
+    {
+        return Err(());
+    }
+    let Some(value) = unique_attr(element, b"rot")? else {
+        return Ok(ChartTextRotationState::Inherit);
+    };
+    if value == "-60000000" {
+        return if matches!(
+            role,
+            ChartTextSemanticRole::CategoryAxisLabels | ChartTextSemanticRole::ValueAxisLabels
+        ) {
+            Ok(ChartTextRotationState::Automatic)
+        } else {
+            Err(())
+        };
+    }
+    let value = value.parse::<i32>().map_err(|_| ())?;
+    if value % 60_000 != 0 {
+        return Err(());
+    }
+    normalize_imported_chart_rotation(value / 60_000)
+        .map(ChartTextRotationState::Degrees)
+        .ok_or(())
+}
+
+fn resolve_chart_text_rotation(
+    inherited: Option<i16>,
+    overlay: ChartTextRotationState,
+) -> Option<i16> {
+    match overlay {
+        ChartTextRotationState::Inherit => inherited,
+        ChartTextRotationState::Automatic => None,
+        ChartTextRotationState::Degrees(degrees) => Some(degrees),
+    }
+}
+
+fn chart_text_norm_autofit_is_neutral(element: &quick_xml::events::BytesStart<'_>) -> bool {
+    if !chart_text_attributes_are_subset(element, &[b"fontScale", b"lnSpcReduction"]) {
+        return false;
+    }
+    let font_scale = match unique_attr(element, b"fontScale") {
+        Ok(None) => 100_000,
+        Ok(Some(value)) => match value.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        Err(()) => return false,
+    };
+    let line_spacing_reduction = match unique_attr(element, b"lnSpcReduction") {
+        Ok(None) => 0,
+        Ok(Some(value)) => match value.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        Err(()) => return false,
+    };
+    font_scale == 100_000 && line_spacing_reduction == 0
+}
+
+fn apply_chart_text_paragraph_properties(
+    body: &mut UnifiedChartTextBody,
+    element: &quick_xml::events::BytesStart<'_>,
+) {
+    if !chart_text_attributes_are_subset(element, &[b"lvl"]) {
+        body.paragraph_unsupported = true;
+    }
+    match unique_parsed_attr::<usize>(element, b"lvl") {
+        Ok(Some(level)) if level <= 8 => body.paragraph_level = level,
+        Ok(None) => {}
+        _ => body.paragraph_unsupported = true,
+    }
+}
+
+fn resolve_unified_chart_text_style(
+    role: ChartTextSemanticRole,
+    theme: &ThemeColors,
+    color_map: &ChartTextColorMap,
+    chart_default: Option<(&PartialChartTextStyle, ChartTextRotationState)>,
+    role_default: Option<(&PartialChartTextStyle, ChartTextRotationState)>,
+    fact: Option<&PaintedChartTextStyleFact>,
+) -> ChartTextStyle {
+    let mut style = role.default_style(theme, color_map);
+    let mut rotation = None;
+    if let Some((partial, state)) = chart_default {
+        partial.apply_to(&mut style);
+        rotation = resolve_chart_text_rotation(rotation, state);
+    }
+    if let Some((partial, state)) = role_default {
+        partial.apply_to(&mut style);
+        rotation = resolve_chart_text_rotation(rotation, state);
+    }
+    if let Some(fact) = fact {
+        fact.style.apply_to(&mut style);
+        rotation = resolve_chart_text_rotation(rotation, fact.rotation);
+    }
+    style.rotation_degrees = rotation;
+    style
+}
+
+fn push_chart_text_style_fact(
+    role: ChartTextSemanticRole,
+    fact: PaintedChartTextStyleFact,
+    facts: &mut [Vec<PaintedChartTextStyleFact>; ChartTextSemanticRole::COUNT],
+    role_unsupported: &mut [bool; ChartTextSemanticRole::COUNT],
+    limit_exceeded: &mut bool,
+) {
+    let target = &mut facts[role.index()];
+    if target.last() == Some(&fact) {
+        return;
+    }
+    if target.len() == MAX_CHART_TEXT_STYLE_FACTS_PER_ROLE {
+        role_unsupported[role.index()] = true;
+        *limit_exceeded = true;
+    } else if target.len() < MAX_CHART_TEXT_STYLE_FACTS_PER_ROLE {
+        target.push(fact);
+    }
+}
+
+fn parse_chart_text_styles_unified(
+    xml: &str,
+    kind: ChartKind,
+    axis_roles: &[ChartAxisContext],
+    theme: &ThemeColors,
+    unsupported_reasons: &mut Vec<ChartUnsupportedReason>,
+    limit_exceeded: &mut bool,
+) -> ChartTextStyles {
+    let (color_map, invalid_color_map) = parse_chart_text_color_map(xml);
+    if invalid_color_map {
+        add_chart_unsupported(
+            unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedTextStyle,
+        );
+        return ChartTextStyles::default();
+    }
+    let mut reader = Reader::from_str(xml);
+    let mut context = ChartTextContext::new(kind, axis_roles);
+    let mut defaults: [PartialChartTextStyleObservation; ChartTextSemanticRole::COUNT] =
+        std::array::from_fn(|_| PartialChartTextStyleObservation::default());
+    let mut facts: [Vec<PaintedChartTextStyleFact>; ChartTextSemanticRole::COUNT] =
+        std::array::from_fn(|_| Vec::new());
+    let mut role_unsupported = [false; ChartTextSemanticRole::COUNT];
+    let mut body: Option<UnifiedChartTextBody> = None;
+    let mut property: Option<(ChartTextPropertyTarget, ChartTextPropertyCapture, usize)> = None;
+    let mut ignored_end_paragraph_depth = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if ignored_end_paragraph_depth > 0 {
+                    ignored_end_paragraph_depth = ignored_end_paragraph_depth.saturating_add(1);
+                    continue;
+                }
+                if let Some((_, capture, depth)) = property.as_mut() {
+                    update_chart_text_property_capture(capture, &element, theme, &color_map, false);
+                    *depth = depth.saturating_add(1);
+                    continue;
+                }
+                context.start(name);
+                if name == b"txPr" || name == b"rich" {
+                    let rich = name == b"rich";
+                    if let Some(active) = body.as_mut() {
+                        active.body_unsupported = true;
+                    } else {
+                        body = context
+                            .text_body_role(rich)
+                            .map(|role| UnifiedChartTextBody::new(rich, role));
+                    }
+                } else if let Some(body) = body.as_mut() {
+                    if name == b"endParaRPr" {
+                        if !body.paragraph_open || body.run_open {
+                            body.body_unsupported = true;
+                        }
+                        ignored_end_paragraph_depth = 1;
+                    } else if name == b"bodyPr" {
+                        if body.body_properties_seen || body.list_style_open || body.paragraph_open
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.body_properties_seen = true;
+                        body.body_properties_open = true;
+                        match parse_chart_body_rotation_state(&element, body.role) {
+                            Ok(rotation) => body.rotation = rotation,
+                            Err(()) => body.body_unsupported = true,
+                        }
+                    } else if name == b"lstStyle" {
+                        if body.list_style_seen || body.body_properties_open || body.paragraph_open
+                        {
+                            body.body_unsupported = true;
+                        }
+                        if !chart_text_attributes_are_subset(&element, &[]) {
+                            body.body_unsupported = true;
+                        }
+                        body.list_style_seen = true;
+                        body.list_style_open = true;
+                    } else if let Some(level) = chart_text_list_level(name) {
+                        if !body.list_style_open
+                            || body.list_level_context.is_some()
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.list_level_context = Some(level);
+                    } else if name == b"p" {
+                        if body.body_properties_open
+                            || body.list_style_open
+                            || body.paragraph_open
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_open = true;
+                        body.paragraph_seen = true;
+                        body.reset_paragraph();
+                    } else if name == b"pPr" {
+                        if !body.paragraph_open
+                            || body.paragraph_properties_open
+                            || body.paragraph_content_started
+                            || body.run_open
+                        {
+                            body.paragraph_unsupported = true;
+                        }
+                        body.paragraph_properties_open = true;
+                        apply_chart_text_paragraph_properties(body, &element);
+                    } else if name == b"r" || name == b"fld" {
+                        if !body.paragraph_open
+                            || body.paragraph_properties_open
+                            || body.run_open
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_content_started = true;
+                        body.run_open = true;
+                        body.reset_run();
+                    } else if name == b"defRPr" || name == b"rPr" {
+                        let valid_parent = if name == b"rPr" {
+                            body.run_open && !body.current_run_painted && !body.in_text
+                        } else {
+                            body.paragraph_properties_open || body.list_level_context.is_some()
+                        };
+                        if valid_parent {
+                            let target = body.property_target(name == b"rPr");
+                            property =
+                                Some((target, chart_text_partial_from_attributes(&element), 1));
+                        } else {
+                            body.body_unsupported = true;
+                        }
+                    } else if name == b"t" {
+                        if !body.run_open || body.in_text {
+                            body.body_unsupported = true;
+                        }
+                        body.in_text = true;
+                    } else if name == b"br" {
+                        if !body.paragraph_open || body.paragraph_properties_open || body.run_open {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_content_started = true;
+                        role_unsupported[body.role.index()] = true;
+                    } else if matches!(name, b"noAutofit" | b"normAutofit" | b"spAutoFit") {
+                        if !body.body_properties_open || body.autofit_seen {
+                            body.body_unsupported = true;
+                        }
+                        body.autofit_seen = true;
+                        match name {
+                            b"noAutofit" => {
+                                body.body_unsupported |=
+                                    !chart_text_attributes_are_subset(&element, &[]);
+                            }
+                            b"normAutofit" => {
+                                body.body_unsupported |=
+                                    !chart_text_norm_autofit_is_neutral(&element);
+                            }
+                            b"spAutoFit" => body.body_unsupported = true,
+                            _ => unreachable!("guarded chart text autofit"),
+                        }
+                    } else {
+                        body.body_unsupported = true;
+                    }
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if ignored_end_paragraph_depth > 0 {
+                    continue;
+                }
+                if let Some((_, capture, _)) = property.as_mut() {
+                    update_chart_text_property_capture(capture, &element, theme, &color_map, true);
+                    continue;
+                }
+                if name == b"txPr" || name == b"rich" {
+                    if let Some(role) = context.text_body_role(name == b"rich") {
+                        role_unsupported[role.index()] = true;
+                    }
+                } else if let Some(body) = body.as_mut() {
+                    if name == b"endParaRPr" {
+                        if !body.paragraph_open || body.run_open {
+                            body.body_unsupported = true;
+                        }
+                    } else if name == b"bodyPr" {
+                        if body.body_properties_seen || body.list_style_open || body.paragraph_open
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.body_properties_seen = true;
+                        match parse_chart_body_rotation_state(&element, body.role) {
+                            Ok(rotation) => body.rotation = rotation,
+                            Err(()) => body.body_unsupported = true,
+                        }
+                    } else if name == b"lstStyle" {
+                        if body.list_style_seen
+                            || body.body_properties_open
+                            || body.paragraph_open
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.list_style_seen = true;
+                    } else if chart_text_list_level(name).is_some() {
+                        if !body.list_style_open
+                            || body.list_level_context.is_some()
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                    } else if name == b"p" {
+                        if body.body_properties_open
+                            || body.list_style_open
+                            || body.paragraph_open
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_seen = true;
+                        body.reset_paragraph();
+                        body.observe_default_candidate();
+                        body.reset_paragraph();
+                    } else if name == b"pPr" {
+                        if !body.paragraph_open
+                            || body.paragraph_properties_open
+                            || body.paragraph_content_started
+                            || body.run_open
+                        {
+                            body.paragraph_unsupported = true;
+                        }
+                        apply_chart_text_paragraph_properties(body, &element);
+                    } else if name == b"r" || name == b"fld" {
+                        if !body.paragraph_open
+                            || body.paragraph_properties_open
+                            || body.run_open
+                            || !chart_text_attributes_are_subset(&element, &[])
+                        {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_content_started = true;
+                    } else if name == b"defRPr" || name == b"rPr" {
+                        let valid_parent = if name == b"rPr" {
+                            body.run_open && !body.current_run_painted && !body.in_text
+                        } else {
+                            body.paragraph_properties_open || body.list_level_context.is_some()
+                        };
+                        if valid_parent {
+                            let target = body.property_target(name == b"rPr");
+                            body.apply_property(
+                                target,
+                                chart_text_partial_from_attributes(&element),
+                            );
+                        } else {
+                            body.body_unsupported = true;
+                        }
+                    } else if name == b"t" {
+                        if !body.run_open || !chart_text_attributes_are_subset(&element, &[]) {
+                            body.body_unsupported = true;
+                        }
+                    } else if name == b"br" {
+                        if !body.paragraph_open || body.paragraph_properties_open || body.run_open {
+                            body.body_unsupported = true;
+                        }
+                        body.paragraph_content_started = true;
+                        role_unsupported[body.role.index()] = true;
+                    } else if matches!(name, b"noAutofit" | b"normAutofit" | b"spAutoFit") {
+                        if !body.body_properties_open || body.autofit_seen {
+                            body.body_unsupported = true;
+                        }
+                        body.autofit_seen = true;
+                        match name {
+                            b"noAutofit" => {
+                                body.body_unsupported |=
+                                    !chart_text_attributes_are_subset(&element, &[]);
+                            }
+                            b"normAutofit" => {
+                                body.body_unsupported |=
+                                    !chart_text_norm_autofit_is_neutral(&element);
+                            }
+                            b"spAutoFit" => body.body_unsupported = true,
+                            _ => unreachable!("guarded chart text autofit"),
+                        }
+                    } else {
+                        body.body_unsupported = true;
+                    }
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if let Some(body) = body.as_mut().filter(|body| body.in_text) {
+                    if !text_of(&text).is_empty() {
+                        let role = body.role;
+                        let fact = body.current_fact();
+                        push_chart_text_style_fact(
+                            role,
+                            fact,
+                            &mut facts,
+                            &mut role_unsupported,
+                            limit_exceeded,
+                        );
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Some(body) = body.as_mut().filter(|body| body.in_text) {
+                    with_general_ref_text(&reference, |text| {
+                        if !text.is_empty() {
+                            let role = body.role;
+                            let fact = body.current_fact();
+                            push_chart_text_style_fact(
+                                role,
+                                fact,
+                                &mut facts,
+                                &mut role_unsupported,
+                                limit_exceeded,
+                            );
+                        }
+                    });
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if let Some(body) = body.as_mut().filter(|body| body.in_text) {
+                    if !text.as_ref().is_empty() {
+                        let role = body.role;
+                        let fact = body.current_fact();
+                        push_chart_text_style_fact(
+                            role,
+                            fact,
+                            &mut facts,
+                            &mut role_unsupported,
+                            limit_exceeded,
+                        );
+                    }
+                }
+            }
+            Ok(Event::End(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if ignored_end_paragraph_depth > 0 {
+                    ignored_end_paragraph_depth = ignored_end_paragraph_depth.saturating_sub(1);
+                    continue;
+                }
+                if let Some((_, capture, depth)) = property.as_mut() {
+                    *depth = depth.saturating_sub(1);
+                    if *depth > 0 {
+                        finish_chart_text_property_element(capture, name);
+                        continue;
+                    }
+                    let (target, capture, _) = property.take().expect("text property is active");
+                    if let Some(body) = body.as_mut() {
+                        body.apply_property(target, capture);
+                    }
+                    continue;
+                }
+                match name {
+                    b"t" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.in_text {
+                                body.body_unsupported = true;
+                            }
+                            body.in_text = false;
+                        }
+                    }
+                    b"r" | b"fld" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.run_open {
+                                body.body_unsupported = true;
+                            }
+                            if body.run_unsupported && body.current_run_painted {
+                                role_unsupported[body.role.index()] = true;
+                            }
+                            body.run_open = false;
+                            body.reset_run();
+                        }
+                    }
+                    b"pPr" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.paragraph_properties_open {
+                                body.paragraph_unsupported = true;
+                            }
+                            body.paragraph_properties_open = false;
+                        }
+                    }
+                    b"p" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.paragraph_open
+                                || body.paragraph_properties_open
+                                || body.run_open
+                            {
+                                body.body_unsupported = true;
+                            }
+                            if body.current_paragraph_painted
+                                && (body.paragraph_unsupported
+                                    || body.list_unsupported[body.paragraph_level])
+                            {
+                                role_unsupported[body.role.index()] = true;
+                            }
+                            body.observe_default_candidate();
+                            body.paragraph_open = false;
+                            body.reset_paragraph();
+                        }
+                    }
+                    b"bodyPr" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.body_properties_open {
+                                body.body_unsupported = true;
+                            }
+                            body.body_properties_open = false;
+                        }
+                    }
+                    b"lstStyle" => {
+                        if let Some(body) = body.as_mut() {
+                            if !body.list_style_open || body.list_level_context.is_some() {
+                                body.body_unsupported = true;
+                            }
+                            body.list_style_open = false;
+                        }
+                    }
+                    b"lvl1pPr" | b"lvl2pPr" | b"lvl3pPr" | b"lvl4pPr" | b"lvl5pPr" | b"lvl6pPr"
+                    | b"lvl7pPr" | b"lvl8pPr" | b"lvl9pPr" => {
+                        if let Some(body) = body.as_mut() {
+                            body.list_level_context = None;
+                        }
+                    }
+                    b"txPr" | b"rich" => {
+                        if let Some(mut completed) = body.take() {
+                            completed.body_unsupported |= completed.body_properties_open
+                                || completed.list_style_open
+                                || completed.list_level_context.is_some()
+                                || completed.paragraph_open
+                                || completed.paragraph_properties_open
+                                || completed.run_open
+                                || completed.in_text
+                                || !completed.body_properties_seen
+                                || !completed.paragraph_seen;
+                            if completed.painted_paragraphs > 1 {
+                                role_unsupported[completed.role.index()] = true;
+                            }
+                            if !completed.rich {
+                                if completed.default_candidate.is_none() {
+                                    completed.observe_default_candidate();
+                                }
+                                let observation = &mut defaults[completed.role.index()];
+                                if completed.body_unsupported
+                                    || completed.default_candidate_mixed
+                                    || completed.default_candidate_unsupported
+                                {
+                                    observation.mark_unsupported();
+                                } else {
+                                    observation.observe(
+                                        completed.default_candidate.unwrap_or_default(),
+                                        completed.rotation,
+                                    );
+                                }
+                            } else if completed.body_unsupported && completed.painted_paragraphs > 0
+                            {
+                                role_unsupported[completed.role.index()] = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                context.end(name);
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                add_chart_unsupported(
+                    unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedTextStyle,
+                );
+                return ChartTextStyles::default();
+            }
+            _ => {}
+        }
+    }
+    if body.is_some() || property.is_some() || ignored_end_paragraph_depth > 0 {
+        add_chart_unsupported(
+            unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedTextStyle,
+        );
+        return ChartTextStyles::default();
+    }
+
+    let chart_default = match &defaults[ChartTextSemanticRole::ChartDefault.index()] {
+        PartialChartTextStyleObservation::Uniform { style, rotation } => Some((style, *rotation)),
+        PartialChartTextStyleObservation::Unseen => None,
+        PartialChartTextStyleObservation::Mixed => {
+            add_chart_unsupported(unsupported_reasons, ChartUnsupportedReason::MixedTextStyle);
+            return ChartTextStyles::default();
+        }
+        PartialChartTextStyleObservation::Unsupported => {
+            add_chart_unsupported(
+                unsupported_reasons,
+                ChartUnsupportedReason::UnsupportedTextStyle,
+            );
+            return ChartTextStyles::default();
+        }
+    };
+
+    let mut resolved = ChartTextStyleObservations::default();
+    for role in [
+        ChartTextSemanticRole::ChartTitle,
+        ChartTextSemanticRole::CategoryAxisTitle,
+        ChartTextSemanticRole::ValueAxisTitle,
+        ChartTextSemanticRole::Legend,
+        ChartTextSemanticRole::CategoryAxisLabels,
+        ChartTextSemanticRole::ValueAxisLabels,
+        ChartTextSemanticRole::DataLabels,
+    ] {
+        let role_default = match &defaults[role.index()] {
+            PartialChartTextStyleObservation::Uniform { style, rotation } => {
+                Some((style, *rotation))
+            }
+            PartialChartTextStyleObservation::Unseen => None,
+            PartialChartTextStyleObservation::Mixed => {
+                resolved.get_mut(role).mark_mixed();
+                continue;
+            }
+            PartialChartTextStyleObservation::Unsupported => {
+                resolved.get_mut(role).mark_unsupported();
+                continue;
+            }
+        };
+        if role_unsupported[role.index()] {
+            resolved.get_mut(role).mark_unsupported();
+            continue;
+        }
+        if facts[role.index()].is_empty() {
+            if chart_default.is_some() || role_default.is_some() {
+                resolved
+                    .get_mut(role)
+                    .observe(resolve_unified_chart_text_style(
+                        role,
+                        theme,
+                        &color_map,
+                        chart_default,
+                        role_default,
+                        None,
+                    ));
+            }
+            continue;
+        }
+        for fact in &facts[role.index()] {
+            if fact.unsupported {
+                resolved.get_mut(role).mark_unsupported();
+                break;
+            }
+            resolved
+                .get_mut(role)
+                .observe(resolve_unified_chart_text_style(
+                    role,
+                    theme,
+                    &color_map,
+                    chart_default,
+                    role_default,
+                    Some(fact),
+                ));
+        }
+    }
+    resolved.finish(unsupported_reasons)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4084,6 +7009,7 @@ fn append_chart_text(
     title_target: Option<ChartTitleTarget>,
     in_title_text: bool,
     title_text: &mut String,
+    title_text_valid: &mut bool,
     text: &str,
     limit_exceeded: &mut bool,
     cache_value_valid: &mut bool,
@@ -4098,16 +7024,40 @@ fn append_chart_text(
         }
     } else if let Some(field) = capture_series_field {
         if let Some(series) = current_series.as_mut() {
+            let invalid_bit = match field {
+                ChartSeriesField::Name => 1 << 0,
+                ChartSeriesField::Categories => 1 << 1,
+                ChartSeriesField::Values => 1 << 2,
+                ChartSeriesField::BubbleSizes => 1 << 3,
+            };
+            if series.invalid_text_fields & invalid_bit != 0 {
+                return;
+            }
             let slot = match field {
                 ChartSeriesField::Name => &mut series.name,
                 ChartSeriesField::Categories => &mut series.categories,
                 ChartSeriesField::Values => &mut series.values,
                 ChartSeriesField::BubbleSizes => &mut series.bubble_sizes,
             };
-            slot.get_or_insert_with(String::new).push_str(text);
+            let current_len = slot.as_ref().map_or(0, String::len);
+            if text.len() <= MAX_XLSX_CHART_TEXT_FIELD_BYTES.saturating_sub(current_len) {
+                slot.get_or_insert_with(String::new).push_str(text);
+            } else {
+                *slot = None;
+                series.invalid_text_fields |= invalid_bit;
+                *limit_exceeded = true;
+            }
         }
     } else if title_target.is_some() && in_title_text {
-        title_text.push_str(text);
+        if *title_text_valid
+            && text.len() <= MAX_XLSX_CHART_TEXT_FIELD_BYTES.saturating_sub(title_text.len())
+        {
+            title_text.push_str(text);
+        } else {
+            title_text.clear();
+            *title_text_valid = false;
+            *limit_exceeded = true;
+        }
     }
 }
 
@@ -4209,34 +7159,35 @@ fn retain_chart_series_line_width(style: &mut ChartSeriesStyle, value: Option<&s
 }
 
 fn chart_series_line_color(
-    element: &[u8],
-    value: Option<&str>,
+    name: &[u8],
+    element: &quick_xml::events::BytesStart<'_>,
     theme: &ThemeColors,
+    color_map: &ChartTextColorMap,
 ) -> Option<Color> {
-    match element {
-        b"srgbClr" => value.and_then(parse_color),
-        b"sysClr" => value.and_then(parse_color),
-        element => {
-            let name = if element == b"schemeClr" {
-                value?.as_bytes()
-            } else {
-                element
-            };
-            theme_color_slot(name)
-                .and_then(|slot| theme.color(slot, None))
-                .or_else(|| {
-                    let index = match name {
-                        b"accent1" => 0,
-                        b"accent2" => 1,
-                        b"accent3" => 2,
-                        b"accent4" => 3,
-                        b"accent5" => 4,
-                        b"accent6" => 5,
-                        _ => return None,
-                    };
-                    theme.chart_palette().get(index).copied()
-                })
+    match name {
+        b"srgbClr" => chart_text_attributes_are_subset(element, &[b"val"])
+            .then(|| unique_attr(element, b"val").ok().flatten())
+            .flatten()
+            .as_deref()
+            .and_then(parse_chart_rgb),
+        b"sysClr" => {
+            if !chart_text_attributes_are_subset(element, &[b"val", b"lastClr"])
+                || !matches!(unique_attr(element, b"val"), Ok(Some(value)) if !value.is_empty())
+            {
+                return None;
+            }
+            unique_attr(element, b"lastClr")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(parse_chart_rgb)
         }
+        b"schemeClr" => chart_text_attributes_are_subset(element, &[b"val"])
+            .then(|| unique_attr(element, b"val").ok().flatten())
+            .flatten()
+            .as_deref()
+            .and_then(|value| chart_scheme_color(theme, color_map, value)),
+        _ => None,
     }
 }
 
@@ -4267,7 +7218,915 @@ fn is_external_chart_reference(reference: &str) -> bool {
     reference[close + 1..].contains('!')
 }
 
+fn chart_plot_option_supported(
+    kind: Option<ChartKind>,
+    name: &[u8],
+    element: &quick_xml::events::BytesStart<'_>,
+) -> Option<bool> {
+    if !matches!(
+        name,
+        b"grouping"
+            | b"overlap"
+            | b"gapWidth"
+            | b"smooth"
+            | b"varyColors"
+            | b"firstSliceAng"
+            | b"holeSize"
+            | b"explosion"
+            | b"showNegBubbles"
+            | b"bubble3D"
+            | b"showDLblsOverMax"
+            | b"dispBlanksAs"
+            | b"plotVisOnly"
+            | b"scatterStyle"
+            | b"radarStyle"
+            | b"gapDepth"
+            | b"bubbleScale"
+            | b"sizeRepresents"
+            | b"secondPieSize"
+            | b"splitType"
+            | b"splitPos"
+            | b"custSplit"
+            | b"ofPieType"
+            | b"serLines"
+            | b"dropLines"
+            | b"hiLowLines"
+            | b"upDownBars"
+            | b"shape"
+    ) {
+        return None;
+    }
+    if !chart_text_attributes_are_subset(element, &[b"val"]) {
+        return Some(false);
+    }
+    let value = || unique_attr(element, b"val");
+    let numeric = || {
+        value()
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+    };
+    let boolean = || parse_chart_boolean_element(element).ok();
+    Some(match name {
+        b"grouping" => match (kind, value()) {
+            (Some(ChartKind::Bar), Ok(Some(value))) => value == "clustered",
+            (Some(ChartKind::Line | ChartKind::Area), Ok(Some(value))) => value == "standard",
+            _ => false,
+        },
+        b"overlap" => kind == Some(ChartKind::Bar) && numeric() == Some(0),
+        b"gapWidth" => kind == Some(ChartKind::Bar) && numeric() == Some(150),
+        b"smooth" => {
+            matches!(kind, Some(ChartKind::Line | ChartKind::Scatter)) && boolean() == Some(false)
+        }
+        b"varyColors" => {
+            boolean() == Some(matches!(kind, Some(ChartKind::Pie | ChartKind::Doughnut)))
+        }
+        b"firstSliceAng" => {
+            matches!(kind, Some(ChartKind::Pie | ChartKind::Doughnut)) && numeric() == Some(0)
+        }
+        b"holeSize" => kind == Some(ChartKind::Doughnut) && numeric() == Some(50),
+        b"explosion" => {
+            matches!(kind, Some(ChartKind::Pie | ChartKind::Doughnut)) && numeric() == Some(0)
+        }
+        b"showNegBubbles" | b"bubble3D" => {
+            kind == Some(ChartKind::Bubble) && boolean() == Some(false)
+        }
+        b"showDLblsOverMax" => boolean() == Some(false),
+        b"dispBlanksAs" => matches!(value(), Ok(Some(value)) if value == "gap"),
+        b"plotVisOnly" => boolean() == Some(true),
+        b"scatterStyle" => {
+            kind == Some(ChartKind::Scatter)
+                && matches!(value(), Ok(Some(value)) if value == "marker")
+        }
+        b"radarStyle" => {
+            kind == Some(ChartKind::Radar)
+                && matches!(value(), Ok(Some(value)) if value == "standard")
+        }
+        b"gapDepth" | b"bubbleScale" | b"sizeRepresents" | b"secondPieSize" | b"splitType"
+        | b"splitPos" | b"custSplit" | b"ofPieType" | b"serLines" | b"dropLines"
+        | b"hiLowLines" | b"upDownBars" | b"shape" => false,
+        _ => return None,
+    })
+}
+
+fn retain_chart_series_position(
+    series: &mut ParsedChartSeries,
+    name: &[u8],
+    element: &quick_xml::events::BytesStart<'_>,
+) -> bool {
+    let seen = if name == b"idx" {
+        &mut series.source_index_seen
+    } else {
+        &mut series.source_order_seen
+    };
+    if *seen {
+        return false;
+    }
+    *seen = true;
+    unique_attr(element, b"val")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok())
+        == Some(series.source_position)
+}
+
+#[derive(Debug, Default)]
+struct ChartDataLabelCapture {
+    show_value: Option<bool>,
+    deleted: Option<bool>,
+    show_legend_key: Option<bool>,
+    show_category_name: Option<bool>,
+    show_series_name: Option<bool>,
+    show_percent: Option<bool>,
+    show_bubble_size: Option<bool>,
+    show_leader_lines: Option<bool>,
+    unsupported_formatting: bool,
+    unsupported: bool,
+}
+
+impl ChartDataLabelCapture {
+    fn set_boolean(
+        target: &mut Option<bool>,
+        element: &quick_xml::events::BytesStart<'_>,
+    ) -> std::result::Result<(), ()> {
+        if target.is_some() {
+            return Err(());
+        }
+        let value = match unique_attr(element, b"val")? {
+            Some(value) => parse_chart_bool_attr(&value).ok_or(())?,
+            None => true,
+        };
+        *target = Some(value);
+        Ok(())
+    }
+
+    fn observe(&mut self, element: &quick_xml::events::BytesStart<'_>) {
+        let qualified_name = element.name();
+        let name = local(qualified_name.as_ref());
+        let result = match name {
+            b"showVal" => Self::set_boolean(&mut self.show_value, element),
+            b"delete" => Self::set_boolean(&mut self.deleted, element),
+            b"showLegendKey" => Self::set_boolean(&mut self.show_legend_key, element),
+            b"showCatName" => Self::set_boolean(&mut self.show_category_name, element),
+            b"showSerName" => Self::set_boolean(&mut self.show_series_name, element),
+            b"showPercent" => Self::set_boolean(&mut self.show_percent, element),
+            b"showBubbleSize" => Self::set_boolean(&mut self.show_bubble_size, element),
+            b"showLeaderLines" => Self::set_boolean(&mut self.show_leader_lines, element),
+            b"dLblPos" | b"numFmt" | b"separator" | b"tx" | b"leaderLines" | b"spPr"
+            | b"layout" => {
+                self.unsupported_formatting = true;
+                Ok(())
+            }
+            b"txPr" => Ok(()),
+            b"dLbl" | b"extLst" => {
+                self.unsupported = true;
+                Ok(())
+            }
+            _ => {
+                self.unsupported = true;
+                Ok(())
+            }
+        };
+        if result.is_err() {
+            self.unsupported = true;
+        }
+    }
+
+    fn finish(self) -> std::result::Result<bool, ()> {
+        let unsupported_content = [
+            self.show_legend_key,
+            self.show_category_name,
+            self.show_series_name,
+            self.show_percent,
+            self.show_bubble_size,
+            self.show_leader_lines,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value);
+        let deleted = self.deleted.unwrap_or(false);
+        let visible = !deleted && self.show_value.unwrap_or(false);
+        if self.unsupported
+            || (!deleted && unsupported_content)
+            || (visible && self.unsupported_formatting)
+        {
+            Err(())
+        } else {
+            Ok(visible)
+        }
+    }
+}
+
+fn parse_chart_data_labels(xml: &str) -> (bool, bool) {
+    fn retain_policy(
+        target: Option<usize>,
+        policy: std::result::Result<bool, ()>,
+        global: &mut Option<bool>,
+        per_series: &mut Vec<Option<bool>>,
+        unsupported: &mut bool,
+    ) {
+        let Ok(policy) = policy else {
+            *unsupported = true;
+            return;
+        };
+        match target {
+            Some(index) => {
+                if per_series.len() <= index {
+                    per_series.resize(index + 1, None);
+                }
+                if per_series[index].replace(policy).is_some() {
+                    *unsupported = true;
+                }
+            }
+            None => {
+                if global.replace(policy).is_some() {
+                    *unsupported = true;
+                }
+            }
+        }
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut current_series = None;
+    let mut next_series = 0usize;
+    let mut capture: Option<(usize, Option<usize>, ChartDataLabelCapture)> = None;
+    let mut global = None;
+    let mut per_series = Vec::<Option<bool>>::new();
+    let mut unsupported = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if let Some((depth, _, policy)) = capture.as_mut() {
+                    if *depth == 1 {
+                        policy.observe(&element);
+                    }
+                    *depth = depth.saturating_add(1);
+                } else if name == b"dLbls" {
+                    capture = Some((1, current_series, ChartDataLabelCapture::default()));
+                } else if name == b"ser" {
+                    if next_series < MAX_XLSX_CHART_SERIES_PER_WORKBOOK {
+                        current_series = Some(next_series);
+                        next_series += 1;
+                    } else {
+                        current_series = None;
+                        unsupported = true;
+                    }
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if let Some((depth, _, policy)) = capture.as_mut() {
+                    if *depth == 1 {
+                        policy.observe(&element);
+                    }
+                } else if name == b"dLbls" {
+                    retain_policy(
+                        current_series,
+                        Ok(false),
+                        &mut global,
+                        &mut per_series,
+                        &mut unsupported,
+                    );
+                }
+            }
+            Ok(Event::End(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if let Some((depth, _, _)) = capture.as_mut() {
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        let (_, target, policy) = capture.take().expect("label capture is active");
+                        retain_policy(
+                            target,
+                            policy.finish(),
+                            &mut global,
+                            &mut per_series,
+                            &mut unsupported,
+                        );
+                    }
+                } else if name == b"ser" {
+                    current_series = None;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                unsupported = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if capture.is_some() {
+        unsupported = true;
+    }
+
+    let series_count = next_series.max(per_series.len());
+    let effective = if series_count == 0 {
+        vec![global.unwrap_or(false)]
+    } else {
+        (0..series_count)
+            .map(|index| {
+                per_series
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .or(global)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>()
+    };
+    if effective.iter().any(|value| *value != effective[0]) {
+        unsupported = true;
+    }
+    (
+        effective.first().copied().unwrap_or(false) && !unsupported,
+        unsupported,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawChartAxisKind {
+    Category,
+    Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawChartAxisPosition {
+    Bottom,
+    Left,
+}
+
+#[derive(Debug)]
+struct RawChartAxis {
+    id: Option<u32>,
+    cross_axis_id: Option<u32>,
+    kind: RawChartAxisKind,
+    visible: bool,
+    visibility_valid: bool,
+    major_gridlines: bool,
+    unsupported_presentation: bool,
+    scaling_open: bool,
+    major_gridlines_open: bool,
+    tick_label_position_seen: bool,
+    position: Option<RawChartAxisPosition>,
+    number_format_seen: bool,
+    crosses_seen: bool,
+    auto_seen: bool,
+    label_alignment_seen: bool,
+    label_offset_seen: bool,
+    cross_between_seen: bool,
+}
+
+#[derive(Debug)]
+struct RawChartPlot {
+    kind: ChartKind,
+    axis_ids: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct ChartAxisSemantics {
+    axis_roles: Vec<ChartAxisContext>,
+    category_visible: Option<bool>,
+    value_visible: Option<bool>,
+    category_major_gridlines: bool,
+    value_major_gridlines: bool,
+    category_position: Option<RawChartAxisPosition>,
+    value_position: Option<RawChartAxisPosition>,
+    invalid_visibility: bool,
+    unsupported_topology: bool,
+    unsupported_presentation: bool,
+}
+
+fn parse_chart_axis_semantics(xml: &str) -> ChartAxisSemantics {
+    fn element_u32(element: &quick_xml::events::BytesStart<'_>) -> std::result::Result<u32, ()> {
+        unique_attr(element, b"val")?
+            .ok_or(())?
+            .parse::<u32>()
+            .map_err(|_| ())
+    }
+
+    fn element_bool(element: &quick_xml::events::BytesStart<'_>) -> std::result::Result<bool, ()> {
+        match unique_attr(element, b"val")? {
+            Some(value) => parse_chart_bool_attr(&value).ok_or(()),
+            None => Ok(true),
+        }
+    }
+
+    fn observe_axis_presentation(
+        axis: &mut RawChartAxis,
+        name: &[u8],
+        element: &quick_xml::events::BytesStart<'_>,
+        start: bool,
+    ) {
+        let value = || unique_attr(element, b"val");
+        match name {
+            b"majorGridlines" => {
+                axis.major_gridlines = true;
+                axis.major_gridlines_open = start;
+                axis.unsupported_presentation |= !chart_text_attributes_are_subset(element, &[]);
+            }
+            b"scaling" => {
+                axis.scaling_open = start;
+                axis.unsupported_presentation |= !chart_text_attributes_are_subset(element, &[]);
+            }
+            b"tickLblPos" => {
+                if axis.tick_label_position_seen {
+                    axis.unsupported_presentation = true;
+                }
+                axis.tick_label_position_seen = true;
+                match value() {
+                    Ok(Some(value)) if value == "nextTo" => {}
+                    Ok(Some(_)) | Ok(None) | Err(()) => axis.unsupported_presentation = true,
+                }
+            }
+            b"axPos" => {
+                if axis.position.is_some() || !chart_text_attributes_are_subset(element, &[b"val"])
+                {
+                    axis.unsupported_presentation = true;
+                }
+                let position = match value() {
+                    Ok(Some(value)) if value == "b" => Some(RawChartAxisPosition::Bottom),
+                    Ok(Some(value)) if value == "l" => Some(RawChartAxisPosition::Left),
+                    Ok(Some(_)) | Ok(None) | Err(()) => None,
+                };
+                if position.is_none() {
+                    axis.unsupported_presentation = true;
+                } else if axis.position.is_none() {
+                    axis.position = position;
+                }
+            }
+            b"numFmt" => {
+                if axis.number_format_seen {
+                    axis.unsupported_presentation = true;
+                }
+                axis.number_format_seen = true;
+                let format_code = unique_attr(element, b"formatCode");
+                let source_linked = unique_attr(element, b"sourceLinked");
+                let source_linked_is_default = matches!(source_linked, Ok(None))
+                    || matches!(source_linked, Ok(Some(ref value)) if value == "1" || value == "true");
+                if !chart_text_attributes_are_subset(element, &[b"formatCode", b"sourceLinked"])
+                    || !matches!(format_code, Ok(Some(ref value)) if value == "General")
+                    || !source_linked_is_default
+                {
+                    axis.unsupported_presentation = true;
+                }
+            }
+            b"crosses" => {
+                if axis.crosses_seen || !chart_text_attributes_are_subset(element, &[b"val"]) {
+                    axis.unsupported_presentation = true;
+                }
+                axis.crosses_seen = true;
+                // `autoZero` is the canonical default emitted by spreadsheet
+                // producers. It carries the same retained semantics as an
+                // omitted crossing policy; explicit coordinates and the
+                // non-default edge policies remain unsupported.
+                if !matches!(value(), Ok(Some(ref value)) if value == "autoZero") {
+                    axis.unsupported_presentation = true;
+                }
+            }
+            b"auto" => {
+                if axis.auto_seen
+                    || axis.kind != RawChartAxisKind::Category
+                    || !chart_text_attributes_are_subset(element, &[b"val"])
+                    || element_bool(element) != Ok(true)
+                {
+                    axis.unsupported_presentation = true;
+                }
+                axis.auto_seen = true;
+            }
+            b"lblAlgn" => {
+                if axis.label_alignment_seen
+                    || axis.kind != RawChartAxisKind::Category
+                    || !chart_text_attributes_are_subset(element, &[b"val"])
+                    || !matches!(value(), Ok(Some(ref value)) if value == "ctr")
+                {
+                    axis.unsupported_presentation = true;
+                }
+                axis.label_alignment_seen = true;
+            }
+            b"lblOffset" => {
+                if axis.label_offset_seen
+                    || axis.kind != RawChartAxisKind::Category
+                    || !chart_text_attributes_are_subset(element, &[b"val"])
+                    || !matches!(value(), Ok(Some(ref value)) if value == "100")
+                {
+                    axis.unsupported_presentation = true;
+                }
+                axis.label_offset_seen = true;
+            }
+            b"crossBetween" => {
+                if axis.cross_between_seen
+                    || axis.kind != RawChartAxisKind::Value
+                    || !chart_text_attributes_are_subset(element, &[b"val"])
+                    || !matches!(value(), Ok(Some(ref value)) if value == "between")
+                {
+                    axis.unsupported_presentation = true;
+                }
+                axis.cross_between_seen = true;
+            }
+            b"majorTickMark" | b"minorTickMark" => match value() {
+                Ok(Some(value)) if value == "none" => {}
+                Ok(Some(_)) | Ok(None) | Err(()) => axis.unsupported_presentation = true,
+            },
+            b"axId" | b"delete" | b"crossAx" | b"title" | b"txPr" => {}
+            b"minorGridlines" | b"majorUnit" | b"minorUnit" | b"tickLblSkip" | b"tickMarkSkip"
+            | b"crossesAt" | b"dispUnits" | b"spPr" | b"extLst" | b"noMultiLvlLbl" => {
+                axis.unsupported_presentation = true;
+            }
+            _ => axis.unsupported_presentation = true,
+        }
+    }
+
+    fn observe_axis_scaling_child(
+        axis: &mut RawChartAxis,
+        name: &[u8],
+        element: &quick_xml::events::BytesStart<'_>,
+    ) {
+        match name {
+            b"orientation" => match unique_attr(element, b"val") {
+                Ok(Some(value)) if value == "minMax" => {}
+                Ok(Some(_)) | Ok(None) | Err(()) => axis.unsupported_presentation = true,
+            },
+            b"logBase" | b"min" | b"max" | b"extLst" => {
+                axis.unsupported_presentation = true;
+            }
+            _ => axis.unsupported_presentation = true,
+        }
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut plots = Vec::<RawChartPlot>::new();
+    let mut plot: Option<(usize, RawChartPlot)> = None;
+    let mut axes = Vec::<RawChartAxis>::new();
+    let mut axis: Option<(usize, RawChartAxis, bool)> = None;
+    let mut malformed = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if let Some((depth, current, delete_seen)) = axis.as_mut() {
+                    let current_depth = *depth;
+                    if current_depth == 1 {
+                        match name {
+                            b"axId" => match element_u32(&element) {
+                                Ok(id) if current.id.replace(id).is_none() => {}
+                                _ => malformed = true,
+                            },
+                            b"delete" => {
+                                if *delete_seen {
+                                    current.visibility_valid = false;
+                                } else {
+                                    *delete_seen = true;
+                                    match element_bool(&element) {
+                                        Ok(deleted) => current.visible = !deleted,
+                                        Err(()) => current.visibility_valid = false,
+                                    }
+                                }
+                            }
+                            b"crossAx" => match element_u32(&element) {
+                                Ok(id) if current.cross_axis_id.replace(id).is_none() => {}
+                                _ => malformed = true,
+                            },
+                            _ => observe_axis_presentation(current, name, &element, true),
+                        }
+                    } else if current.scaling_open && current_depth == 2 {
+                        observe_axis_scaling_child(current, name, &element);
+                    } else if current.major_gridlines_open && current_depth >= 2 {
+                        current.unsupported_presentation = true;
+                    }
+                    *depth = depth.saturating_add(1);
+                } else if matches!(name, b"catAx" | b"dateAx" | b"valAx") {
+                    axis = Some((
+                        1,
+                        RawChartAxis {
+                            id: None,
+                            cross_axis_id: None,
+                            kind: if name == b"valAx" {
+                                RawChartAxisKind::Value
+                            } else {
+                                RawChartAxisKind::Category
+                            },
+                            visible: true,
+                            visibility_valid: true,
+                            major_gridlines: false,
+                            unsupported_presentation: name == b"dateAx",
+                            scaling_open: false,
+                            major_gridlines_open: false,
+                            tick_label_position_seen: false,
+                            position: None,
+                            number_format_seen: false,
+                            crosses_seen: false,
+                            auto_seen: false,
+                            label_alignment_seen: false,
+                            label_offset_seen: false,
+                            cross_between_seen: false,
+                        },
+                        false,
+                    ));
+                } else if let Some((depth, current)) = plot.as_mut() {
+                    let direct_child = *depth == 1;
+                    *depth = depth.saturating_add(1);
+                    if direct_child && name == b"axId" {
+                        match element_u32(&element) {
+                            Ok(id) if current.axis_ids.len() < MAX_XLSX_CHART_AXIS_ITEMS => {
+                                current.axis_ids.push(id);
+                            }
+                            Err(()) => malformed = true,
+                            Ok(_) => malformed = true,
+                        }
+                    }
+                } else if let Some(kind) =
+                    chart_kind_element(name).or_else(|| chart_3d_kind_element(name))
+                {
+                    plot = Some((
+                        1,
+                        RawChartPlot {
+                            kind,
+                            axis_ids: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            Ok(Event::Empty(element)) => {
+                let qualified_name = element.name();
+                let name = local(qualified_name.as_ref());
+                if let Some((depth, current, delete_seen)) = axis.as_mut() {
+                    if *depth == 1 {
+                        match name {
+                            b"axId" => match element_u32(&element) {
+                                Ok(id) if current.id.replace(id).is_none() => {}
+                                _ => malformed = true,
+                            },
+                            b"delete" => {
+                                if *delete_seen {
+                                    current.visibility_valid = false;
+                                } else {
+                                    *delete_seen = true;
+                                    match element_bool(&element) {
+                                        Ok(deleted) => current.visible = !deleted,
+                                        Err(()) => current.visibility_valid = false,
+                                    }
+                                }
+                            }
+                            b"crossAx" => match element_u32(&element) {
+                                Ok(id) if current.cross_axis_id.replace(id).is_none() => {}
+                                _ => malformed = true,
+                            },
+                            _ => observe_axis_presentation(current, name, &element, false),
+                        }
+                    } else if current.scaling_open && *depth == 2 {
+                        observe_axis_scaling_child(current, name, &element);
+                    } else if current.major_gridlines_open && *depth >= 2 {
+                        current.unsupported_presentation = true;
+                    }
+                } else if matches!(name, b"catAx" | b"dateAx" | b"valAx") {
+                    if axes.len() < MAX_XLSX_CHART_AXIS_ITEMS {
+                        axes.push(RawChartAxis {
+                            id: None,
+                            cross_axis_id: None,
+                            kind: if name == b"valAx" {
+                                RawChartAxisKind::Value
+                            } else {
+                                RawChartAxisKind::Category
+                            },
+                            visible: true,
+                            visibility_valid: true,
+                            major_gridlines: false,
+                            unsupported_presentation: name == b"dateAx",
+                            scaling_open: false,
+                            major_gridlines_open: false,
+                            tick_label_position_seen: false,
+                            position: None,
+                            number_format_seen: false,
+                            crosses_seen: false,
+                            auto_seen: false,
+                            label_alignment_seen: false,
+                            label_offset_seen: false,
+                            cross_between_seen: false,
+                        });
+                    }
+                    malformed = true;
+                } else if let Some((depth, current)) = plot.as_mut() {
+                    if *depth == 1 && name == b"axId" {
+                        match element_u32(&element) {
+                            Ok(id) if current.axis_ids.len() < MAX_XLSX_CHART_AXIS_ITEMS => {
+                                current.axis_ids.push(id);
+                            }
+                            Err(()) => malformed = true,
+                            Ok(_) => malformed = true,
+                        }
+                    }
+                } else if let Some(kind) =
+                    chart_kind_element(name).or_else(|| chart_3d_kind_element(name))
+                {
+                    if plots.len() < MAX_XLSX_CHART_AXIS_ITEMS {
+                        plots.push(RawChartPlot {
+                            kind,
+                            axis_ids: Vec::new(),
+                        });
+                    } else {
+                        malformed = true;
+                    }
+                }
+            }
+            Ok(Event::End(element)) => {
+                if let Some((depth, current, _)) = axis.as_mut() {
+                    let qualified_name = element.name();
+                    let name = local(qualified_name.as_ref());
+                    if *depth == 2 && name == b"scaling" {
+                        current.scaling_open = false;
+                    }
+                    if *depth == 2 && name == b"majorGridlines" {
+                        current.major_gridlines_open = false;
+                    }
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        let (_, completed, _) = axis.take().expect("axis capture is active");
+                        if axes.len() < MAX_XLSX_CHART_AXIS_ITEMS {
+                            axes.push(completed);
+                        } else {
+                            malformed = true;
+                        }
+                    }
+                } else if let Some((depth, _)) = plot.as_mut() {
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        let (_, completed) = plot.take().expect("plot capture is active");
+                        if plots.len() < MAX_XLSX_CHART_AXIS_ITEMS {
+                            plots.push(completed);
+                        } else {
+                            malformed = true;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                malformed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if axis.is_some() || plot.is_some() {
+        malformed = true;
+    }
+
+    let mut semantics = ChartAxisSemantics {
+        invalid_visibility: axes.iter().any(|axis| !axis.visibility_valid),
+        unsupported_topology: malformed || plots.len() > 1,
+        unsupported_presentation: axes.iter().any(|axis| axis.unsupported_presentation),
+        ..Default::default()
+    };
+    if axes.is_empty() {
+        if plots.first().is_some_and(|plot| {
+            !plot.axis_ids.is_empty()
+                || matches!(
+                    plot.kind,
+                    ChartKind::Bar
+                        | ChartKind::Line
+                        | ChartKind::Scatter
+                        | ChartKind::Area
+                        | ChartKind::Radar
+                        | ChartKind::Bubble
+                )
+        }) {
+            semantics.unsupported_topology = true;
+        }
+        return semantics;
+    }
+
+    let mut id_to_index = HashMap::<u32, usize>::new();
+    for (index, axis) in axes.iter().enumerate() {
+        let Some(id) = axis.id else {
+            semantics.unsupported_topology = true;
+            continue;
+        };
+        if id_to_index.insert(id, index).is_some() {
+            semantics.unsupported_topology = true;
+        }
+    }
+
+    let plot_kind = plots.first().map(|plot| plot.kind);
+    let axis_based_plot = matches!(
+        plot_kind,
+        Some(
+            ChartKind::Bar
+                | ChartKind::Line
+                | ChartKind::Scatter
+                | ChartKind::Area
+                | ChartKind::Radar
+                | ChartKind::Bubble
+        )
+    );
+    if !axis_based_plot || plots.is_empty() {
+        semantics.unsupported_topology = true;
+    }
+    if let Some(plot) = plots.first() {
+        let mut unique_axis_ids = plot.axis_ids.clone();
+        unique_axis_ids.sort_unstable();
+        unique_axis_ids.dedup();
+        if plot.axis_ids.len() != 2 || unique_axis_ids.len() != 2 {
+            semantics.unsupported_topology = true;
+        }
+    }
+    let mut roles = vec![None; axes.len()];
+    if matches!(plot_kind, Some(ChartKind::Scatter | ChartKind::Bubble)) {
+        let Some(plot) = plots.first() else {
+            semantics.unsupported_topology = true;
+            return semantics;
+        };
+        if plot.axis_ids.len() != 2 {
+            semantics.unsupported_topology = true;
+        } else {
+            for (role, id) in [ChartAxisContext::Category, ChartAxisContext::Value]
+                .into_iter()
+                .zip(plot.axis_ids.iter())
+            {
+                match id_to_index.get(id).copied() {
+                    Some(index)
+                        if axes[index].kind == RawChartAxisKind::Value
+                            && roles[index].replace(role).is_none() => {}
+                    _ => semantics.unsupported_topology = true,
+                }
+            }
+        }
+    } else {
+        for (index, axis) in axes.iter().enumerate() {
+            roles[index] = Some(match axis.kind {
+                RawChartAxisKind::Category => ChartAxisContext::Category,
+                RawChartAxisKind::Value => ChartAxisContext::Value,
+            });
+        }
+        if let Some(plot) = plots.first() {
+            if plot.axis_ids.iter().any(|id| !id_to_index.contains_key(id)) {
+                semantics.unsupported_topology = true;
+            }
+        }
+    }
+
+    let category_count = roles
+        .iter()
+        .filter(|role| **role == Some(ChartAxisContext::Category))
+        .count();
+    let value_count = roles
+        .iter()
+        .filter(|role| **role == Some(ChartAxisContext::Value))
+        .count();
+    if category_count != 1 || value_count != 1 || roles.iter().any(Option::is_none) {
+        semantics.unsupported_topology = true;
+    } else {
+        let category_index = roles
+            .iter()
+            .position(|role| *role == Some(ChartAxisContext::Category))
+            .expect("validated category axis role");
+        let value_index = roles
+            .iter()
+            .position(|role| *role == Some(ChartAxisContext::Value))
+            .expect("validated value axis role");
+        let category_axis = &axes[category_index];
+        let value_axis = &axes[value_index];
+        if category_axis.cross_axis_id != value_axis.id
+            || value_axis.cross_axis_id != category_axis.id
+        {
+            semantics.unsupported_topology = true;
+        }
+    }
+
+    semantics.axis_roles = roles
+        .into_iter()
+        .zip(axes.iter())
+        .map(|(role, axis)| {
+            let role = role.unwrap_or(match axis.kind {
+                RawChartAxisKind::Category => ChartAxisContext::Category,
+                RawChartAxisKind::Value => ChartAxisContext::Value,
+            });
+            match role {
+                ChartAxisContext::Category => {
+                    semantics.category_visible = Some(axis.visible);
+                    semantics.category_major_gridlines |= axis.major_gridlines;
+                    semantics.category_position = axis.position;
+                }
+                ChartAxisContext::Value => {
+                    semantics.value_visible = Some(axis.visible);
+                    semantics.value_major_gridlines |= axis.major_gridlines;
+                    semantics.value_position = axis.position;
+                }
+            }
+            role
+        })
+        .collect();
+    semantics
+}
+
 #[cfg(any(test, feature = "xlsb"))]
+#[cfg(test)]
 pub(crate) fn parse_chart(
     xml: &str,
     from: (u32, u16),
@@ -4285,7 +8144,7 @@ pub(crate) fn parse_chart(
     )
 }
 
-fn parse_chart_with_theme(
+pub(crate) fn parse_chart_with_theme(
     xml: &str,
     from: (u32, u16),
     to: (u32, u16),
@@ -4293,20 +8152,28 @@ fn parse_chart_with_theme(
     chart_series_remaining: &mut usize,
     theme: &ThemeColors,
 ) -> Option<ParsedChart> {
+    if xml.len() > usize::try_from(MAX_XLSX_CHART_XML_BYTES).unwrap_or(usize::MAX) {
+        return None;
+    }
+    let unsupported_markup = !chart_markup_is_supported(xml);
+    let axis_semantics = parse_chart_axis_semantics(xml);
+    let (chart_color_map, unsupported_chart_color_map) = parse_chart_text_color_map(xml);
     let mut r = Reader::from_str(xml);
     let mut kind: Option<ChartKind> = None;
     let mut title: Option<String> = None;
-    let mut x_axis_title: Option<String> = None;
-    let mut y_axis_title: Option<String> = None;
+    let mut category_axis_title: Option<String> = None;
+    let mut value_axis_title: Option<String> = None;
     let mut title_text = String::new();
+    let mut title_text_valid = true;
     let mut title_target: Option<ChartTitleTarget> = None;
     let mut in_title_text = false;
     let mut legend = false;
-    let mut data_labels = false;
+    let (data_labels, unsupported_data_labels) = parse_chart_data_labels(xml);
     let mut series = Vec::new();
     let mut series_caches = Vec::new();
     let mut series_styles = Vec::new();
     let mut current_series: Option<ParsedChartSeries> = None;
+    let mut source_series_position = 0usize;
     let mut series_field: Option<ChartSeriesField> = None;
     let mut capture_series_field: Option<ChartSeriesField> = None;
     let mut series_cache_depth = 0usize;
@@ -4317,23 +8184,76 @@ fn parse_chart_with_theme(
     let mut capture_cache_value = false;
     let mut limit_exceeded = false;
     let mut unsupported_reasons = Vec::new();
+    if unsupported_markup {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedMarkup,
+        );
+    }
+    if !theme.source_valid() {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedChartStyle,
+        );
+    }
+    if unsupported_data_labels {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedDataLabels,
+        );
+    }
+    if unsupported_chart_color_map {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedChartStyle,
+        );
+    }
+    if axis_semantics.invalid_visibility {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::InvalidAxisVisibility,
+        );
+    }
+    if axis_semantics.unsupported_topology {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedAxisTopology,
+        );
+    }
+    if axis_semantics.unsupported_presentation {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedAxisPresentation,
+        );
+    }
     let mut frame_fill = ChartFrameFill::Automatic;
     let mut frame_style_losses = Vec::new();
-    let mut category_major_gridlines = false;
-    let mut value_major_gridlines = false;
+    let category_major_gridlines = axis_semantics.category_major_gridlines;
+    let value_major_gridlines = axis_semantics.value_major_gridlines;
     let mut bar_direction = ChartBarDirection::Column;
     let mut bar_chart_depth = 0usize;
     let mut chart_depth = 0usize;
     let mut axis_context: Option<ChartAxisContext> = None;
-    let mut val_axis_count = 0usize;
+    let mut axis_occurrence = 0usize;
+    let mut in_legend = false;
     let mut marker_depth = 0usize;
+    let mut marker_symbol_seen = false;
+    let mut marker_size_seen = false;
     let mut data_point_depth = 0usize;
+    let mut data_label_container_depth = 0usize;
     let mut trendline_depth = 0usize;
     let mut error_bars_depth = 0usize;
     let mut series_shape_depth = 0usize;
+    let mut series_shape_seen = false;
     let mut series_line_depth = 0usize;
+    let mut series_line_seen = false;
+    let mut series_line_paint_seen = false;
+    let mut series_line_color_seen = false;
     let mut series_line_solid_fill_depth = 0usize;
     let mut frame_shape_depth = 0usize;
+    let mut frame_shape_seen = false;
+    let mut frame_fill_choice_seen = false;
+    let mut frame_solid_fill_color_seen = false;
     let mut frame_line_depth = 0usize;
     let mut frame_solid_fill_depth = 0usize;
     let mut frame_solid_fill_resolved = false;
@@ -4378,7 +8298,7 @@ fn parse_chart_with_theme(
                         );
                     }
                 }
-                b"view3D" | b"bubble3D" => add_chart_unsupported(
+                b"view3D" => add_chart_unsupported(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::ThreeDimensional,
                 ),
@@ -4389,36 +8309,62 @@ fn parse_chart_with_theme(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::ExternalData,
                 ),
-                b"barDir" if bar_chart_depth > 0 => {
-                    bar_direction = if attr(&e, b"val").as_deref() == Some("bar") {
-                        ChartBarDirection::Horizontal
-                    } else {
-                        ChartBarDirection::Column
-                    };
-                }
-                b"catAx" | b"dateAx" => axis_context = Some(ChartAxisContext::Category),
-                b"valAx" => {
-                    val_axis_count += 1;
-                    axis_context = if matches!(kind, Some(ChartKind::Scatter | ChartKind::Bubble))
-                        && val_axis_count == 1
-                    {
-                        Some(ChartAxisContext::Category)
-                    } else {
-                        Some(ChartAxisContext::Value)
-                    };
-                }
-                b"majorGridlines" => match axis_context {
-                    Some(ChartAxisContext::Category) => category_major_gridlines = true,
-                    Some(ChartAxisContext::Value) => value_major_gridlines = true,
-                    None => {}
+                b"barDir" if bar_chart_depth > 0 => match unique_attr(&e, b"val") {
+                    Ok(Some(value)) if value == "bar" => {
+                        bar_direction = ChartBarDirection::Horizontal;
+                    }
+                    Ok(Some(value)) if value == "col" => {
+                        bar_direction = ChartBarDirection::Column;
+                    }
+                    _ => add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    ),
                 },
+                name if chart_plot_option_supported(kind, name, &e).is_some() => {
+                    if chart_plot_option_supported(kind, name, &e) != Some(true) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                        );
+                        if name == b"bubble3D" {
+                            add_chart_unsupported(
+                                &mut unsupported_reasons,
+                                ChartUnsupportedReason::ThreeDimensional,
+                            );
+                        }
+                    }
+                }
+                b"style" if chart_depth == 0 && current_series.is_none() => {
+                    if !matches!(
+                        unique_attr(&e, b"val"),
+                        Ok(Some(value)) if value == "2"
+                    ) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedChartStyle,
+                        );
+                    }
+                }
+                b"catAx" | b"dateAx" | b"valAx" => {
+                    axis_context = axis_semantics
+                        .axis_roles
+                        .get(axis_occurrence)
+                        .copied()
+                        .or_else(|| {
+                            (local(e.name().as_ref()) != b"valAx")
+                                .then_some(ChartAxisContext::Category)
+                                .or(Some(ChartAxisContext::Value))
+                        });
+                    axis_occurrence = axis_occurrence.saturating_add(1);
+                }
                 b"title" if current_series.is_none() => {
                     let target = match axis_context {
-                        Some(ChartAxisContext::Category) if x_axis_title.is_none() => {
-                            Some(ChartTitleTarget::XAxis)
+                        Some(ChartAxisContext::Category) if category_axis_title.is_none() => {
+                            Some(ChartTitleTarget::CategoryAxis)
                         }
-                        Some(ChartAxisContext::Value) if y_axis_title.is_none() => {
-                            Some(ChartTitleTarget::YAxis)
+                        Some(ChartAxisContext::Value) if value_axis_title.is_none() => {
+                            Some(ChartTitleTarget::ValueAxis)
                         }
                         None if title.is_none() => Some(ChartTitleTarget::Main),
                         _ => None,
@@ -4426,31 +8372,123 @@ fn parse_chart_with_theme(
                     if let Some(target) = target {
                         title_target = Some(target);
                         title_text.clear();
+                        title_text_valid = true;
                     }
                 }
-                b"legend" => legend = true,
-                b"dLbls" => data_labels = true,
+                b"legend" => {
+                    legend = true;
+                    in_legend = true;
+                }
+                b"legendPos" => {
+                    if !matches!(
+                        unique_attr(&e, b"val"),
+                        Ok(Some(value)) if value == "r"
+                    ) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedLegend,
+                        );
+                    }
+                }
+                b"legendEntry" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedLegend,
+                ),
+                b"overlay" => {
+                    if parse_chart_boolean_element(&e) != Ok(false) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedLegend,
+                        );
+                    }
+                }
+                b"manualLayout" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedPlotSemantics,
+                ),
+                b"ser" if current_series.is_some() => return None,
                 b"ser" => {
-                    current_series = Some(ParsedChartSeries::default());
+                    current_series = Some(ParsedChartSeries {
+                        source_position: source_series_position,
+                        ..ParsedChartSeries::default()
+                    });
+                    source_series_position = source_series_position.saturating_add(1);
                     series_field = None;
                     capture_series_field = None;
                     series_cache_depth = 0;
                     marker_depth = 0;
+                    marker_symbol_seen = false;
+                    marker_size_seen = false;
                     data_point_depth = 0;
+                    data_label_container_depth = 0;
                     trendline_depth = 0;
                     error_bars_depth = 0;
                     series_shape_depth = 0;
+                    series_shape_seen = false;
                     series_line_depth = 0;
+                    series_line_seen = false;
+                    series_line_paint_seen = false;
+                    series_line_color_seen = false;
                     series_line_solid_fill_depth = 0;
                 }
                 b"marker" if current_series.is_some() => marker_depth = 1,
-                b"dPt" if current_series.is_some() => data_point_depth = 1,
-                b"trendline" if current_series.is_some() => trendline_depth = 1,
-                b"errBars" if current_series.is_some() => error_bars_depth = 1,
+                b"dPt" if current_series.is_some() => {
+                    data_point_depth = 1;
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"dLbls" | b"dLbl" if current_series.is_some() => {
+                    data_label_container_depth = data_label_container_depth.saturating_add(1);
+                }
+                b"trendline" if current_series.is_some() => {
+                    trendline_depth = 1;
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"errBars" if current_series.is_some() => {
+                    error_bars_depth = 1;
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"invertIfNegative" | b"pictureOptions" if current_series.is_some() => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"spPr" if in_legend => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedLegend,
+                ),
                 b"spPr"
                     if chart_depth == 0 && current_series.is_none() && frame_shape_depth == 0 =>
                 {
+                    if frame_shape_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_shape_seen = true;
                     frame_shape_depth = 1;
+                }
+                b"spPr"
+                    if current_series.is_some()
+                        && (marker_depth > 0
+                            || data_point_depth > 0
+                            || trendline_depth > 0
+                            || error_bars_depth > 0) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
                 }
                 b"spPr"
                     if current_series.is_some()
@@ -4460,21 +8498,64 @@ fn parse_chart_with_theme(
                         && error_bars_depth == 0
                         && series_shape_depth == 0 =>
                 {
+                    if series_shape_seen {
+                        if let Some(series) = current_series.as_mut() {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
+                    series_shape_seen = true;
                     series_shape_depth = 1;
                 }
-                b"ln" if frame_shape_depth > 0 => frame_line_depth = 1,
+                b"spPr" if current_series.is_none() && chart_depth > 0 => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"ln" if frame_shape_depth > 0 => {
+                    frame_line_depth = 1;
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
                 b"solidFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    if frame_fill_choice_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_fill_choice_seen = true;
                     frame_solid_fill_depth = 1;
                     frame_solid_fill_resolved = false;
+                    frame_solid_fill_color_seen = false;
                 }
                 b"noFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    if frame_fill_choice_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_fill_choice_seen = true;
                     frame_fill = ChartFrameFill::NoFill;
                 }
                 b"srgbClr" | b"schemeClr" if frame_solid_fill_depth > 0 => {
                     let qualified_name = e.name();
                     let name = local(qualified_name.as_ref());
-                    let value = attr(&e, b"val");
-                    if let Some(color) = chart_series_line_color(name, value.as_deref(), theme) {
+                    if frame_solid_fill_color_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_solid_fill_color_seen = true;
+                    if let Some(color) = chart_series_line_color(name, &e, theme, &chart_color_map)
+                    {
                         frame_fill = ChartFrameFill::Solid(color);
                         frame_solid_fill_resolved = true;
                     } else {
@@ -4485,8 +8566,15 @@ fn parse_chart_with_theme(
                     }
                 }
                 b"sysClr" if frame_solid_fill_depth > 0 => {
-                    let value = attr(&e, b"lastClr");
-                    if let Some(color) = chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                    if frame_solid_fill_color_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_solid_fill_color_seen = true;
+                    if let Some(color) =
+                        chart_series_line_color(b"sysClr", &e, theme, &chart_color_map)
                     {
                         frame_fill = ChartFrameFill::Solid(color);
                         frame_solid_fill_resolved = true;
@@ -4505,7 +8593,13 @@ fn parse_chart_with_theme(
                         ChartFrameStyleLossKind::UnsupportedPaint,
                     );
                 }
-                b"tint" | b"shade" | b"lumMod" | b"lumOff" if frame_solid_fill_depth > 0 => {
+                b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"
+                | b"comp" | b"gamma" | b"gray" | b"green" | b"greenMod" | b"greenOff" | b"hue"
+                | b"hueMod" | b"hueOff" | b"inv" | b"invGamma" | b"lum" | b"lumMod" | b"lumOff"
+                | b"red" | b"redMod" | b"redOff" | b"sat" | b"satMod" | b"satOff" | b"shade"
+                | b"tint"
+                    if frame_solid_fill_depth > 0 =>
+                {
                     add_chart_frame_style_loss(
                         &mut frame_style_losses,
                         ChartFrameStyleLossKind::UnsupportedPaint,
@@ -4514,6 +8608,15 @@ fn parse_chart_with_theme(
                 b"ln" if series_shape_depth > 0 => {
                     series_line_depth = 1;
                     if let Some(series) = current_series.as_mut() {
+                        if series_line_seen || !chart_text_attributes_are_subset(&e, &[b"w"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_seen = true;
+                        series_line_paint_seen = false;
+                        series_line_color_seen = false;
                         retain_chart_series_line_width(
                             &mut series.style,
                             attr(&e, b"w").as_deref(),
@@ -4523,11 +8626,26 @@ fn parse_chart_with_theme(
                 b"solidFill" if series_line_depth > 0 => {
                     series_line_solid_fill_depth = 1;
                     if let Some(series) = current_series.as_mut() {
+                        if series_line_paint_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_paint_seen = true;
+                        series_line_color_seen = false;
                         series.style.line_visible = true;
                     }
                 }
                 b"noFill" if series_line_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
+                        if series_line_paint_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_paint_seen = true;
                         series.style.line_visible = false;
                         series.style.line_color = None;
                     }
@@ -4536,8 +8654,15 @@ fn parse_chart_with_theme(
                     let qualified_name = e.name();
                     let name = local(qualified_name.as_ref());
                     if let Some(series) = current_series.as_mut() {
-                        let value = attr(&e, b"val");
-                        if let Some(color) = chart_series_line_color(name, value.as_deref(), theme)
+                        if series_line_color_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_color_seen = true;
+                        if let Some(color) =
+                            chart_series_line_color(name, &e, theme, &chart_color_map)
                         {
                             series.style.line_color = Some(color);
                         } else {
@@ -4550,9 +8675,15 @@ fn parse_chart_with_theme(
                 }
                 b"sysClr" if series_line_solid_fill_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        let value = attr(&e, b"lastClr");
+                        if series_line_color_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_color_seen = true;
                         if let Some(color) =
-                            chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                            chart_series_line_color(b"sysClr", &e, theme, &chart_color_map)
                         {
                             series.style.line_color = Some(color);
                         } else {
@@ -4572,7 +8703,9 @@ fn parse_chart_with_theme(
                     }
                 }
                 b"prstDash" if series_line_depth > 0 => {
-                    if attr(&e, b"val").as_deref() != Some("solid") {
+                    if !chart_text_attributes_are_subset(&e, &[b"val"])
+                        || !matches!(unique_attr(&e, b"val"), Ok(Some(value)) if value == "solid")
+                    {
                         if let Some(series) = current_series.as_mut() {
                             add_chart_series_style_loss(
                                 &mut series.style,
@@ -4581,7 +8714,13 @@ fn parse_chart_with_theme(
                         }
                     }
                 }
-                b"tint" | b"shade" | b"lumMod" | b"lumOff" if series_line_solid_fill_depth > 0 => {
+                b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"
+                | b"comp" | b"gamma" | b"gray" | b"green" | b"greenMod" | b"greenOff" | b"hue"
+                | b"hueMod" | b"hueOff" | b"inv" | b"invGamma" | b"lum" | b"lumMod" | b"lumOff"
+                | b"red" | b"redMod" | b"redOff" | b"sat" | b"satMod" | b"satOff" | b"shade"
+                | b"tint"
+                    if series_line_solid_fill_depth > 0 =>
+                {
                     if let Some(series) = current_series.as_mut() {
                         add_chart_series_style_loss(
                             &mut series.style,
@@ -4589,14 +8728,66 @@ fn parse_chart_with_theme(
                         );
                     }
                 }
+                b"custDash" | b"round" | b"bevel" | b"miter" | b"headEnd" | b"tailEnd"
+                    if series_line_depth > 0 =>
+                {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"solidFill" | b"noFill" | b"gradFill" | b"pattFill" | b"blipFill" | b"grpFill"
+                    if series_shape_depth > 0 && series_line_depth == 0 =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
                 b"symbol" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        retain_chart_marker_symbol(&mut series.style, attr(&e, b"val").as_deref());
+                        if marker_symbol_seen || !chart_text_attributes_are_subset(&e, &[b"val"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedMarkerSymbol,
+                            );
+                        }
+                        marker_symbol_seen = true;
+                        let value = unique_attr(&e, b"val").ok().flatten();
+                        retain_chart_marker_symbol(&mut series.style, value.as_deref());
                     }
                 }
                 b"size" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        retain_chart_marker_size(&mut series.style, attr(&e, b"val").as_deref());
+                        if marker_size_seen || !chart_text_attributes_are_subset(&e, &[b"val"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::InvalidMarkerSize,
+                            );
+                        }
+                        marker_size_seen = true;
+                        let value = unique_attr(&e, b"val").ok().flatten();
+                        retain_chart_marker_size(&mut series.style, value.as_deref());
+                    }
+                }
+                b"idx" | b"order"
+                    if current_series.is_some()
+                        && data_point_depth == 0
+                        && data_label_container_depth == 0
+                        && marker_depth == 0
+                        && trendline_depth == 0
+                        && error_bars_depth == 0
+                        && series_cache_depth == 0 =>
+                {
+                    if current_series.as_mut().is_some_and(|series| {
+                        !retain_chart_series_position(series, local(e.name().as_ref()), &e)
+                    }) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                        );
                     }
                 }
                 b"tx" if current_series.is_some() => series_field = Some(ChartSeriesField::Name),
@@ -4681,7 +8872,7 @@ fn parse_chart_with_theme(
                         );
                     }
                 }
-                b"view3D" | b"bubble3D" => add_chart_unsupported(
+                b"view3D" => add_chart_unsupported(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::ThreeDimensional,
                 ),
@@ -4692,34 +8883,164 @@ fn parse_chart_with_theme(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::ExternalData,
                 ),
-                b"barDir" if bar_chart_depth > 0 => {
-                    bar_direction = if attr(&e, b"val").as_deref() == Some("bar") {
-                        ChartBarDirection::Horizontal
-                    } else {
-                        ChartBarDirection::Column
-                    };
-                }
-                b"majorGridlines" => match axis_context {
-                    Some(ChartAxisContext::Category) => category_major_gridlines = true,
-                    Some(ChartAxisContext::Value) => value_major_gridlines = true,
-                    None => {}
+                b"barDir" if bar_chart_depth > 0 => match unique_attr(&e, b"val") {
+                    Ok(Some(value)) if value == "bar" => {
+                        bar_direction = ChartBarDirection::Horizontal;
+                    }
+                    Ok(Some(value)) if value == "col" => {
+                        bar_direction = ChartBarDirection::Column;
+                    }
+                    _ => add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    ),
                 },
+                name if chart_plot_option_supported(kind, name, &e).is_some() => {
+                    if chart_plot_option_supported(kind, name, &e) != Some(true) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                        );
+                        if name == b"bubble3D" {
+                            add_chart_unsupported(
+                                &mut unsupported_reasons,
+                                ChartUnsupportedReason::ThreeDimensional,
+                            );
+                        }
+                    }
+                }
+                b"style" if chart_depth == 0 && current_series.is_none() => {
+                    if !matches!(
+                        unique_attr(&e, b"val"),
+                        Ok(Some(value)) if value == "2"
+                    ) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedChartStyle,
+                        );
+                    }
+                }
                 b"legend" => legend = true,
-                b"dLbls" => data_labels = true,
+                b"legendPos" => {
+                    if !matches!(
+                        unique_attr(&e, b"val"),
+                        Ok(Some(value)) if value == "r"
+                    ) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedLegend,
+                        );
+                    }
+                }
+                b"legendEntry" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedLegend,
+                ),
+                b"overlay" => {
+                    if parse_chart_boolean_element(&e) != Ok(false) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedLegend,
+                        );
+                    }
+                }
+                b"manualLayout" => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedPlotSemantics,
+                ),
+                b"ser" => {
+                    source_series_position = source_series_position.saturating_add(1);
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"dPt" | b"trendline" | b"errBars" | b"invertIfNegative" | b"pictureOptions"
+                    if current_series.is_some() =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"spPr"
+                    if current_series.is_some()
+                        && (marker_depth > 0
+                            || data_point_depth > 0
+                            || trendline_depth > 0
+                            || error_bars_depth > 0) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                }
+                b"spPr" if in_legend => add_chart_unsupported(
+                    &mut unsupported_reasons,
+                    ChartUnsupportedReason::UnsupportedLegend,
+                ),
+                b"idx" | b"order"
+                    if current_series.is_some()
+                        && data_point_depth == 0
+                        && data_label_container_depth == 0
+                        && marker_depth == 0
+                        && trendline_depth == 0
+                        && error_bars_depth == 0
+                        && series_cache_depth == 0 =>
+                {
+                    if current_series.as_mut().is_some_and(|series| {
+                        !retain_chart_series_position(series, local(e.name().as_ref()), &e)
+                    }) {
+                        add_chart_unsupported(
+                            &mut unsupported_reasons,
+                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                        );
+                    }
+                }
                 b"symbol" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        retain_chart_marker_symbol(&mut series.style, attr(&e, b"val").as_deref());
+                        if marker_symbol_seen || !chart_text_attributes_are_subset(&e, &[b"val"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedMarkerSymbol,
+                            );
+                        }
+                        marker_symbol_seen = true;
+                        let value = unique_attr(&e, b"val").ok().flatten();
+                        retain_chart_marker_symbol(&mut series.style, value.as_deref());
                     }
                 }
                 b"size" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        retain_chart_marker_size(&mut series.style, attr(&e, b"val").as_deref());
+                        if marker_size_seen || !chart_text_attributes_are_subset(&e, &[b"val"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::InvalidMarkerSize,
+                            );
+                        }
+                        marker_size_seen = true;
+                        let value = unique_attr(&e, b"val").ok().flatten();
+                        retain_chart_marker_size(&mut series.style, value.as_deref());
                     }
                 }
+                b"ln" if frame_shape_depth > 0 => {
+                    add_chart_frame_style_loss(
+                        &mut frame_style_losses,
+                        ChartFrameStyleLossKind::UnsupportedPaint,
+                    );
+                }
                 b"noFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    if frame_fill_choice_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_fill_choice_seen = true;
                     frame_fill = ChartFrameFill::NoFill;
                 }
                 b"solidFill" if frame_shape_depth > 0 && frame_line_depth == 0 => {
+                    frame_fill_choice_seen = true;
                     add_chart_frame_style_loss(
                         &mut frame_style_losses,
                         ChartFrameStyleLossKind::UnsupportedPaint,
@@ -4728,8 +9049,15 @@ fn parse_chart_with_theme(
                 b"srgbClr" | b"schemeClr" if frame_solid_fill_depth > 0 => {
                     let qualified_name = e.name();
                     let name = local(qualified_name.as_ref());
-                    let value = attr(&e, b"val");
-                    if let Some(color) = chart_series_line_color(name, value.as_deref(), theme) {
+                    if frame_solid_fill_color_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_solid_fill_color_seen = true;
+                    if let Some(color) = chart_series_line_color(name, &e, theme, &chart_color_map)
+                    {
                         frame_fill = ChartFrameFill::Solid(color);
                         frame_solid_fill_resolved = true;
                     } else {
@@ -4740,8 +9068,15 @@ fn parse_chart_with_theme(
                     }
                 }
                 b"sysClr" if frame_solid_fill_depth > 0 => {
-                    let value = attr(&e, b"lastClr");
-                    if let Some(color) = chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                    if frame_solid_fill_color_seen {
+                        add_chart_frame_style_loss(
+                            &mut frame_style_losses,
+                            ChartFrameStyleLossKind::UnsupportedPaint,
+                        );
+                    }
+                    frame_solid_fill_color_seen = true;
+                    if let Some(color) =
+                        chart_series_line_color(b"sysClr", &e, theme, &chart_color_map)
                     {
                         frame_fill = ChartFrameFill::Solid(color);
                         frame_solid_fill_resolved = true;
@@ -4760,7 +9095,13 @@ fn parse_chart_with_theme(
                         ChartFrameStyleLossKind::UnsupportedPaint,
                     );
                 }
-                b"tint" | b"shade" | b"lumMod" | b"lumOff" if frame_solid_fill_depth > 0 => {
+                b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"
+                | b"comp" | b"gamma" | b"gray" | b"green" | b"greenMod" | b"greenOff" | b"hue"
+                | b"hueMod" | b"hueOff" | b"inv" | b"invGamma" | b"lum" | b"lumMod" | b"lumOff"
+                | b"red" | b"redMod" | b"redOff" | b"sat" | b"satMod" | b"satOff" | b"shade"
+                | b"tint"
+                    if frame_solid_fill_depth > 0 =>
+                {
                     add_chart_frame_style_loss(
                         &mut frame_style_losses,
                         ChartFrameStyleLossKind::UnsupportedPaint,
@@ -4768,6 +9109,13 @@ fn parse_chart_with_theme(
                 }
                 b"ln" if series_shape_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
+                        if series_line_seen || !chart_text_attributes_are_subset(&e, &[b"w"]) {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_seen = true;
                         retain_chart_series_line_width(
                             &mut series.style,
                             attr(&e, b"w").as_deref(),
@@ -4776,6 +9124,13 @@ fn parse_chart_with_theme(
                 }
                 b"noFill" if series_line_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
+                        if series_line_paint_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_paint_seen = true;
                         series.style.line_visible = false;
                         series.style.line_color = None;
                     }
@@ -4784,8 +9139,15 @@ fn parse_chart_with_theme(
                     let qualified_name = e.name();
                     let name = local(qualified_name.as_ref());
                     if let Some(series) = current_series.as_mut() {
-                        let value = attr(&e, b"val");
-                        if let Some(color) = chart_series_line_color(name, value.as_deref(), theme)
+                        if series_line_color_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_color_seen = true;
+                        if let Some(color) =
+                            chart_series_line_color(name, &e, theme, &chart_color_map)
                         {
                             series.style.line_color = Some(color);
                         } else {
@@ -4798,9 +9160,15 @@ fn parse_chart_with_theme(
                 }
                 b"sysClr" if series_line_solid_fill_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
-                        let value = attr(&e, b"lastClr");
+                        if series_line_color_seen {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                        series_line_color_seen = true;
                         if let Some(color) =
-                            chart_series_line_color(b"sysClr", value.as_deref(), theme)
+                            chart_series_line_color(b"sysClr", &e, theme, &chart_color_map)
                         {
                             series.style.line_color = Some(color);
                         } else {
@@ -4820,7 +9188,9 @@ fn parse_chart_with_theme(
                     }
                 }
                 b"prstDash" if series_line_depth > 0 => {
-                    if attr(&e, b"val").as_deref() != Some("solid") {
+                    if !chart_text_attributes_are_subset(&e, &[b"val"])
+                        || !matches!(unique_attr(&e, b"val"), Ok(Some(value)) if value == "solid")
+                    {
                         if let Some(series) = current_series.as_mut() {
                             add_chart_series_style_loss(
                                 &mut series.style,
@@ -4829,13 +9199,45 @@ fn parse_chart_with_theme(
                         }
                     }
                 }
-                b"tint" | b"shade" | b"lumMod" | b"lumOff" if series_line_solid_fill_depth > 0 => {
+                b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"
+                | b"comp" | b"gamma" | b"gray" | b"green" | b"greenMod" | b"greenOff" | b"hue"
+                | b"hueMod" | b"hueOff" | b"inv" | b"invGamma" | b"lum" | b"lumMod" | b"lumOff"
+                | b"red" | b"redMod" | b"redOff" | b"sat" | b"satMod" | b"satOff" | b"shade"
+                | b"tint"
+                    if series_line_solid_fill_depth > 0 =>
+                {
                     if let Some(series) = current_series.as_mut() {
                         add_chart_series_style_loss(
                             &mut series.style,
                             ChartSeriesStyleLossKind::UnsupportedLinePaint,
                         );
                     }
+                }
+                b"solidFill" if series_line_depth > 0 => {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"custDash" | b"round" | b"bevel" | b"miter" | b"headEnd" | b"tailEnd"
+                    if series_line_depth > 0 =>
+                {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
+                    }
+                }
+                b"solidFill" | b"noFill" | b"gradFill" | b"pattFill" | b"blipFill" | b"grpFill"
+                    if series_shape_depth > 0 && series_line_depth == 0 =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
                 }
                 _ => {}
             },
@@ -4848,6 +9250,7 @@ fn parse_chart_with_theme(
                     title_target,
                     in_title_text,
                     &mut title_text,
+                    &mut title_text_valid,
                     &text_of(&t),
                     &mut limit_exceeded,
                     &mut cache_value_valid,
@@ -4863,6 +9266,7 @@ fn parse_chart_with_theme(
                         title_target,
                         in_title_text,
                         &mut title_text,
+                        &mut title_text_valid,
                         text,
                         &mut limit_exceeded,
                         &mut cache_value_valid,
@@ -4879,6 +9283,7 @@ fn parse_chart_with_theme(
                     title_target,
                     in_title_text,
                     &mut title_text,
+                    &mut title_text_valid,
                     &text,
                     &mut limit_exceeded,
                     &mut cache_value_valid,
@@ -4886,11 +9291,15 @@ fn parse_chart_with_theme(
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
                 b"chart" if chart_depth > 0 => chart_depth -= 1,
+                b"legend" => in_legend = false,
                 b"barChart" if bar_chart_depth > 0 => {
                     bar_chart_depth -= 1;
                 }
                 b"marker" if marker_depth > 0 => marker_depth = 0,
                 b"dPt" if data_point_depth > 0 => data_point_depth = 0,
+                b"dLbls" | b"dLbl" if data_label_container_depth > 0 => {
+                    data_label_container_depth -= 1;
+                }
                 b"trendline" if trendline_depth > 0 => trendline_depth = 0,
                 b"errBars" if error_bars_depth > 0 => error_bars_depth = 0,
                 b"solidFill" if frame_solid_fill_depth > 0 => {
@@ -4902,6 +9311,7 @@ fn parse_chart_with_theme(
                     }
                     frame_solid_fill_depth = 0;
                     frame_solid_fill_resolved = false;
+                    frame_solid_fill_color_seen = false;
                 }
                 b"ln" if frame_line_depth > 0 => frame_line_depth = 0,
                 b"spPr" if frame_shape_depth > 0 => {
@@ -4909,33 +9319,52 @@ fn parse_chart_with_theme(
                     frame_line_depth = 0;
                     frame_solid_fill_depth = 0;
                     frame_solid_fill_resolved = false;
+                    frame_solid_fill_color_seen = false;
                 }
                 b"solidFill" if series_line_solid_fill_depth > 0 => {
+                    if !series_line_color_seen {
+                        if let Some(series) = current_series.as_mut() {
+                            add_chart_series_style_loss(
+                                &mut series.style,
+                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                            );
+                        }
+                    }
                     series_line_solid_fill_depth = 0;
+                    series_line_color_seen = false;
                 }
                 b"ln" if series_line_depth > 0 => {
                     series_line_depth = 0;
                     series_line_solid_fill_depth = 0;
+                    series_line_paint_seen = false;
+                    series_line_color_seen = false;
                 }
                 b"spPr" if series_shape_depth > 0 => {
                     series_shape_depth = 0;
                     series_line_depth = 0;
                     series_line_solid_fill_depth = 0;
+                    series_line_paint_seen = false;
+                    series_line_color_seen = false;
                 }
                 b"v" if capture_cache_value => capture_cache_value = false,
                 b"t" | b"v" if in_title_text => in_title_text = false,
                 b"title" if title_target.is_some() => {
                     let text = title_text.trim();
-                    if !text.is_empty() {
+                    if title_text_valid && !text.is_empty() {
                         match title_target.expect("title target checked above") {
                             ChartTitleTarget::Main => title = Some(text.to_string()),
-                            ChartTitleTarget::XAxis => x_axis_title = Some(text.to_string()),
-                            ChartTitleTarget::YAxis => y_axis_title = Some(text.to_string()),
+                            ChartTitleTarget::CategoryAxis => {
+                                category_axis_title = Some(text.to_string());
+                            }
+                            ChartTitleTarget::ValueAxis => {
+                                value_axis_title = Some(text.to_string());
+                            }
                         }
                     }
                     title_target = None;
                     in_title_text = false;
                     title_text.clear();
+                    title_text_valid = true;
                 }
                 b"catAx" | b"dateAx" | b"valAx" => axis_context = None,
                 b"f" | b"v" if capture_series_field.is_some() => capture_series_field = None,
@@ -4981,6 +9410,12 @@ fn parse_chart_with_theme(
                 }
                 b"ser" => {
                     if let Some(parsed) = current_series.take() {
+                        if !parsed.source_index_seen || !parsed.source_order_seen {
+                            add_chart_unsupported(
+                                &mut unsupported_reasons,
+                                ChartUnsupportedReason::UnsupportedPlotSemantics,
+                            );
+                        }
                         if [
                             parsed.name.as_deref(),
                             parsed.categories.as_deref(),
@@ -5021,23 +9456,65 @@ fn parse_chart_with_theme(
                     cache_value_valid = true;
                     capture_cache_value = false;
                     marker_depth = 0;
+                    marker_symbol_seen = false;
+                    marker_size_seen = false;
                     data_point_depth = 0;
+                    data_label_container_depth = 0;
                     trendline_depth = 0;
                     error_bars_depth = 0;
                     series_shape_depth = 0;
+                    series_shape_seen = false;
                     series_line_depth = 0;
+                    series_line_seen = false;
+                    series_line_paint_seen = false;
+                    series_line_color_seen = false;
                     series_line_solid_fill_depth = 0;
                 }
                 _ => {}
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
             _ => {}
         }
     }
 
+    let kind = kind?;
+    let (expected_category_position, expected_value_position) =
+        if kind == ChartKind::Bar && bar_direction == ChartBarDirection::Horizontal {
+            (RawChartAxisPosition::Left, RawChartAxisPosition::Bottom)
+        } else {
+            (RawChartAxisPosition::Bottom, RawChartAxisPosition::Left)
+        };
+    if axis_semantics
+        .category_position
+        .is_some_and(|position| position != expected_category_position)
+        || axis_semantics
+            .value_position
+            .is_some_and(|position| position != expected_value_position)
+    {
+        add_chart_unsupported(
+            &mut unsupported_reasons,
+            ChartUnsupportedReason::UnsupportedAxisPresentation,
+        );
+    }
+    let text_styles = parse_chart_text_styles_unified(
+        xml,
+        kind,
+        &axis_semantics.axis_roles,
+        theme,
+        &mut unsupported_reasons,
+        &mut limit_exceeded,
+    );
+    let (x_axis_title, y_axis_title) =
+        if kind == ChartKind::Bar && bar_direction == ChartBarDirection::Horizontal {
+            (value_axis_title, category_axis_title)
+        } else {
+            (category_axis_title, value_axis_title)
+        };
+
     Some(ParsedChart {
         chart: Chart {
-            kind: kind?,
+            kind,
             title,
             series,
             legend,
@@ -5049,10 +9526,13 @@ fn parse_chart_with_theme(
         },
         series_caches,
         series_styles,
+        text_styles,
         frame_fill,
         frame_style_losses,
         category_major_gridlines,
         value_major_gridlines,
+        category_axis_visible: axis_semantics.category_visible,
+        value_axis_visible: axis_semantics.value_visible,
         limit_exceeded,
         unsupported_reasons,
         bar_direction,
@@ -5170,29 +9650,11 @@ fn parse_table(xml: &str) -> Option<ParsedTable> {
 /// Resolve a rels `Target` (relative to the source part's directory) to a ZIP
 /// part path. A leading `/` is workbook-root-absolute; otherwise the target is
 /// relative to the directory of `base` (the worksheet path), resolving any
-/// leading `../` segments. E.g. base `xl/worksheets/sheet1.xml` + target
+/// leading `../` segments. Excess parent segments clamp at the package root
+/// under RFC 3986 section 5.2.4. E.g. base `xl/worksheets/sheet1.xml` + target
 /// `../comments1.xml` → `xl/comments1.xml`.
 fn normalize_part_target(base: &str, target: &str) -> String {
-    let base = base.replace('\\', "/");
-    let target = target.replace('\\', "/");
-    if let Some(abs) = target.strip_prefix('/') {
-        return abs.to_string();
-    }
-    // Directory segments of the base part (everything before the final `/`).
-    let mut dir: Vec<&str> = match base.rfind('/') {
-        Some(i) => base[..i].split('/').collect(),
-        None => Vec::new(),
-    };
-    for seg in target.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                dir.pop();
-            }
-            other => dir.push(other),
-        }
-    }
-    dir.join("/")
+    resolve_internal_relationship_part(base, target).unwrap_or_default()
 }
 
 /// `xl/comments{N}.xml`: an `<authors><author>` table followed by a
@@ -7476,6 +11938,17 @@ fn retained_cell_style_heap_bytes(style: Option<&CellStyle>) -> usize {
 mod tests {
     use super::*;
 
+    fn complete_theme_xml(
+        major_latin: &str,
+        minor_latin: &str,
+        accent1: &str,
+        accent2: &str,
+    ) -> String {
+        format!(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:accent1><a:srgbClr val="{accent1}"/></a:accent1><a:accent2><a:srgbClr val="{accent2}"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme><a:majorFont><a:latin typeface="{major_latin}"/></a:majorFont><a:minorFont><a:latin typeface="{minor_latin}"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#
+        )
+    }
+
     fn overlay_is_empty(overlay: &CellStyleOverlay) -> bool {
         !overlay.replace_font
             && !overlay.replace_fill
@@ -7513,6 +11986,196 @@ mod tests {
             zip.write_all(body.as_bytes()).unwrap();
         }
         Workbook::open(&zip.finish().unwrap().into_inner()).unwrap()
+    }
+
+    #[test]
+    fn relationship_selection_is_exact_deterministic_and_internal_only() {
+        let transitional = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="drawings/drawing1.xml"/></Relationships>"#;
+        let strict = r#"<Relationships xmlns="http://purl.oclc.org/ooxml/package/relationships"><Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/drawing" Target="drawings/drawing1.xml"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(transitional, "drawing"),
+            RelationshipTarget::Internal("drawings/drawing1.xml".to_string())
+        );
+        assert_eq!(
+            unique_internal_relationship_target(strict, "drawing"),
+            RelationshipTarget::Internal("drawings/drawing1.xml".to_string())
+        );
+
+        let attacker_type = r#"<Relationships><Relationship Id="rId1" Type="https://attacker.invalid/officeDocument/2006/relationships/drawing" Target="evil.xml"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(attacker_type, "drawing"),
+            RelationshipTarget::Missing
+        );
+
+        let duplicate_id = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="a.xml"/><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="b.xml"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(duplicate_id, "drawing"),
+            RelationshipTarget::Invalid
+        );
+        assert!(parse_rels(duplicate_id).is_empty());
+
+        let external = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="https://example.invalid/drawing.xml" TargetMode="External"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(external, "drawing"),
+            RelationshipTarget::Invalid
+        );
+
+        let foreign_namespace = r#"<Relationships xmlns="https://attacker.invalid/package/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="evil.xml"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(foreign_namespace, "drawing"),
+            RelationshipTarget::Invalid
+        );
+
+        let explicitly_closed = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="drawings/drawing1.xml"></Relationship></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(explicitly_closed, "drawing"),
+            RelationshipTarget::Internal("drawings/drawing1.xml".to_string())
+        );
+
+        let child_content = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="evil.xml"><extension/></Relationship></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(child_content, "drawing"),
+            RelationshipTarget::Invalid
+        );
+
+        let text_content = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="evil.xml">content</Relationship></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(text_content, "drawing"),
+            RelationshipTarget::Invalid
+        );
+    }
+
+    #[test]
+    fn relationship_extensions_do_not_weaken_core_attribute_validation() {
+        let extended = r#"<Relationships xmlns:ext="urn:producer:relationships" ext:producer="example"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="drawings/drawing1.xml" ext:metadata="kept-by-package-editor"/></Relationships>"#;
+        assert_eq!(
+            unique_internal_relationship_target(extended, "drawing"),
+            RelationshipTarget::Internal("drawings/drawing1.xml".to_string())
+        );
+
+        for malformed in [
+            r#"<Relationships xmlns:ext="urn:producer:relationships"><Relationship ext:Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="drawings/drawing1.xml"/></Relationships>"#,
+            r#"<Relationships xmlns:ext="urn:producer:relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" ext:Target="drawings/drawing1.xml"/></Relationships>"#,
+            r#"<Relationships xmlns:ext="urn:producer:relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="drawings/drawing1.xml" TargetMode="invalid" ext:TargetMode="External"/></Relationships>"#,
+        ] {
+            assert_eq!(
+                unique_internal_relationship_target(malformed, "drawing"),
+                RelationshipTarget::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn drawing_relationship_ids_require_the_exact_internal_object_type() {
+        let xml = r#"<Relationships><Relationship Id="chart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/><Relationship Id="image" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/><Relationship Id="external" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="https://example.invalid/chart.xml" TargetMode="External"/></Relationships>"#;
+        let relationships = parse_ooxml_relationships(xml).expect("valid relationship part");
+        assert!(matches!(
+            internal_relationship_target_by_id(&relationships, "chart", "chart"),
+            RelationshipTarget::Internal(target) if target == "../charts/chart1.xml"
+        ));
+        assert_eq!(
+            internal_relationship_target_by_id(&relationships, "image", "chart"),
+            RelationshipTarget::Invalid
+        );
+        assert_eq!(
+            internal_relationship_target_by_id(&relationships, "external", "chart"),
+            RelationshipTarget::Invalid
+        );
+    }
+
+    #[test]
+    fn chart_count_and_xml_work_budgets_are_shared_across_sheets() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        const CHART_XML: &str = r#"<chartSpace xmlns="http://schemas.openxmlformats.org/drawingml/2006/chart"><chart><plotArea><lineChart><grouping val="standard"/><varyColors val="0"/><axId val="1"/><axId val="2"/></lineChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        for index in 1..=2 {
+            writer
+                .start_file(format!("xl/drawings/drawing{index}.xml"), options)
+                .unwrap();
+            writer
+                .write_all(
+                    format!(r#"<wsDr><twoCellAnchor><from><col>0</col><row>0</row></from><to><col>4</col><row>8</row></to><graphicFrame><graphic><graphicData><chart r:id="rIdChart{index}"/></graphicData></graphic></graphicFrame></twoCellAnchor></wsDr>"#).as_bytes(),
+                )
+                .unwrap();
+            writer
+                .start_file(
+                    format!("xl/drawings/_rels/drawing{index}.xml.rels"),
+                    options,
+                )
+                .unwrap();
+            writer
+                .write_all(
+                    format!(r#"<Relationships><Relationship Id="rIdChart{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{index}.xml"/></Relationships>"#).as_bytes(),
+                )
+                .unwrap();
+            writer
+                .start_file(format!("xl/charts/chart{index}.xml"), options)
+                .unwrap();
+            writer.write_all(CHART_XML.as_bytes()).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let sheet_rels = |index| {
+            format!(
+                r#"<Relationships><Relationship Id="rIdDraw{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{index}.xml"/></Relationships>"#
+            )
+        };
+
+        let mut count_budget = ChartImportBudget {
+            charts_remaining: 1,
+            ..ChartImportBudget::default()
+        };
+        let first = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.xml",
+            Some(&sheet_rels(1)),
+            &ThemeColors::default(),
+            &mut count_budget,
+        );
+        let second = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet2.xml",
+            Some(&sheet_rels(2)),
+            &ThemeColors::default(),
+            &mut count_budget,
+        );
+        assert_eq!(first.1.len(), 1);
+        assert!(second.1.is_empty());
+        assert!(second
+            .3
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::LimitExceeded));
+
+        let chart_work = CHART_XML.len() * XLSX_CHART_XML_SCAN_PASSES;
+        let mut work_budget = ChartImportBudget {
+            charts_remaining: 2,
+            xml_work_remaining: chart_work,
+            xml_work_limit: chart_work,
+            ..ChartImportBudget::default()
+        };
+        let first = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet1.xml",
+            Some(&sheet_rels(1)),
+            &ThemeColors::default(),
+            &mut work_budget,
+        );
+        let second = read_sheet_drawings(
+            &mut zip,
+            "xl/worksheets/sheet2.xml",
+            Some(&sheet_rels(2)),
+            &ThemeColors::default(),
+            &mut work_budget,
+        );
+        assert_eq!(first.1.len(), 1);
+        assert!(second.1.is_empty());
+        assert!(second
+            .3
+            .iter()
+            .any(|loss| loss.kind == StyleLossKind::LimitExceeded));
     }
 
     #[test]
@@ -7679,11 +12342,11 @@ mod tests {
             ("xl/drawings/drawing1.xml", drawing.as_bytes()),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                br#"<Relationships><Relationship Id="rIdImage" Target="../media/image1.png"/><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#.as_slice(),
+                br#"<Relationships><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#.as_slice(),
             ),
             (
                 "xl/charts/chart1.xml",
-                br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart/></c:plotArea></c:chart></c:chartSpace>"#.as_slice(),
+                br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart><c:axId val="1"/><c:axId val="2"/></c:lineChart><c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#.as_slice(),
             ),
             ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n".as_slice()),
         ];
@@ -8638,7 +13301,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_xlsx_with_root_office_document_part() {
+    fn reads_xlsx_with_root_office_document_part_and_above_root_target() {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -8646,7 +13309,7 @@ mod tests {
         let parts = [
             (
                 "_rels/.rels",
-                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="workbook.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="../../workbook.xml"/></Relationships>"#,
             ),
             (
                 "workbook.xml",
@@ -8772,7 +13435,7 @@ mod tests {
             ),
             (
                 "xl/theme/theme1.xml",
-                r#"<theme><themeElements><clrScheme><accent1><srgbClr val="010203"/></accent1><accent2><srgbClr val="A0B0C0"/></accent2></clrScheme></themeElements></theme>"#,
+                r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:accent1><a:srgbClr val="010203"/></a:accent1><a:accent2><a:srgbClr val="A0B0C0"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme><a:majorFont><a:latin typeface="Ignored Major"/></a:majorFont><a:minorFont><a:latin typeface="Source Sans 3"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
             ),
             (
                 "xl/worksheets/sheet1.xml",
@@ -8800,7 +13463,7 @@ mod tests {
             ),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
             ),
             (
                 "xl/charts/chart1.xml",
@@ -8840,6 +13503,10 @@ mod tests {
             .expect("chart rendering sidecar");
         assert_eq!(sidecar.chart_palette[0], Color::rgb(1, 2, 3));
         assert_eq!(sidecar.chart_palette[1], Color::rgb(160, 176, 192));
+        assert_eq!(
+            sidecar.chart_default_latin_font_family.as_deref(),
+            Some("Source Sans 3")
+        );
         assert_eq!(sidecar.chart_series_caches.len(), 1);
         assert_eq!(sidecar.chart_series_styles.len(), 1);
         assert_eq!(
@@ -8872,6 +13539,659 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["10", "20", "30"]
         );
+    }
+
+    #[test]
+    fn chart_sidecar_uses_calc_latin_fallback_when_package_theme_is_missing() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        let parts = [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><sheetData/><drawing r:id="rIdDraw"/></worksheet>"#,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                r#"<Relationships><Relationship Id="rIdDraw" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/drawings/drawing1.xml",
+                r#"<wsDr><twoCellAnchor><from><col>2</col><row>4</row></from><to><col>8</col><row>16</row></to><graphicFrame><graphic><graphicData><chart r:id="rIdChart"/></graphicData></graphic></graphicFrame></twoCellAnchor></wsDr>"#,
+            ),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/charts/chart1.xml",
+                r#"<chartSpace><chart><plotArea><lineChart/></plotArea></chart></chartSpace>"#,
+            ),
+        ];
+        for (name, body) in parts {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+
+        let bytes = writer.finish().unwrap().into_inner();
+        let workbook = Workbook::open(&bytes).unwrap();
+        let sidecar = workbook.sheets[0]
+            .drawing_metadata()
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("chart rendering sidecar");
+
+        assert_eq!(
+            sidecar.chart_default_latin_font_family.as_deref(),
+            Some(CALC_IMPORTED_CHART_LATIN_FONT_FAMILY)
+        );
+    }
+
+    #[test]
+    fn minor_theme_latin_font_family_is_trimmed_and_bounded() {
+        let theme = parse_theme(&complete_theme_xml(
+            "Ignored Major",
+            "  Theme Sans  ",
+            "4472C4",
+            "ED7D31",
+        ));
+        assert!(theme.source_valid);
+        assert_eq!(theme.minor_latin_font_family.as_deref(), Some("Theme Sans"));
+
+        let boundary = "x".repeat(MAX_IMPORTED_CHART_LATIN_FONT_FAMILY_BYTES);
+        let xml = complete_theme_xml("Major", &boundary, "4472C4", "ED7D31");
+        assert_eq!(
+            parse_theme(&xml).minor_latin_font_family.as_deref(),
+            Some(boundary.as_str())
+        );
+
+        assert_eq!(
+            parse_theme(r#"<a:theme><a:themeElements><a:fontScheme/></a:themeElements></a:theme>"#)
+                .chart_default_latin_font_family(),
+            CALC_IMPORTED_CHART_LATIN_FONT_FAMILY
+        );
+
+        for invalid in [String::new(), " ".to_string(), "x".repeat(256)] {
+            let xml = complete_theme_xml("Major", &invalid, "4472C4", "ED7D31");
+            let theme = parse_theme(&xml);
+            assert!(!theme.source_valid);
+            assert!(theme.minor_latin_font_family.is_none());
+            assert_eq!(
+                theme.chart_default_latin_font_family(),
+                CALC_IMPORTED_CHART_LATIN_FONT_FAMILY
+            );
+        }
+    }
+
+    #[test]
+    fn theme_requires_complete_structural_and_namespace_exact_source() {
+        let valid = complete_theme_xml("Major", "Minor", "4472C4", "ED7D31");
+        assert!(parse_theme(&valid).source_valid);
+
+        let missing_slot = valid.replace(r#"<a:accent6><a:srgbClr val="70AD47"/></a:accent6>"#, "");
+        let missing_scheme = valid
+            .replace("<a:fontScheme>", "<a:notFontScheme>")
+            .replace("</a:fontScheme>", "</a:notFontScheme>");
+        let duplicate_slot = valid.replace(
+            "<a:accent1>",
+            r#"<a:accent1><a:srgbClr val="010203"/></a:accent1><a:accent1>"#,
+        );
+        let wrong_namespace = valid.replace(
+            OOXML_DRAWING_NAMESPACE_TRANSITIONAL,
+            OOXML_CHART_NAMESPACE_TRANSITIONAL,
+        );
+        let foreign_paint = valid
+            .replace(
+                "<a:theme ",
+                r#"<a:theme xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" "#,
+            )
+            .replacen(
+                r#"<a:srgbClr val="E7E6E6"/>"#,
+                r#"<c:srgbClr val="E7E6E6"/>"#,
+                1,
+            );
+        let wrapped_scheme = valid
+            .replacen("<a:clrScheme>", "<a:wrapper><a:clrScheme>", 1)
+            .replacen("</a:clrScheme>", "</a:clrScheme></a:wrapper>", 1);
+        let hash_rgb = valid.replacen("4472C4", "#4472C4", 1);
+        let argb = valid.replacen("4472C4", "FF4472C4", 1);
+        let malformed = valid.trim_end_matches("</a:theme>").to_string();
+
+        for invalid in [
+            missing_slot,
+            missing_scheme,
+            duplicate_slot,
+            wrong_namespace,
+            foreign_paint,
+            wrapped_scheme,
+            hash_rgb,
+            argb,
+            malformed,
+        ] {
+            assert!(!parse_theme(&invalid).source_valid, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn chart_rgb_is_exact_and_drawingml_tint_endpoints_are_correct() {
+        assert_eq!(
+            parse_chart_rgb("112233"),
+            Some(Color::rgb(0x11, 0x22, 0x33))
+        );
+        for invalid in ["#112233", " 112233", "112233 ", "FF112233", "11223G"] {
+            assert_eq!(parse_chart_rgb(invalid), None, "{invalid}");
+        }
+
+        let source = Color::rgb(0x20, 0x40, 0x80);
+        assert_eq!(apply_chart_luminance(source, 100_000, 0), source);
+        let white = Color::rgb(255, 255, 255);
+        assert_eq!(apply_chart_luminance(source, 0, 100_000), white);
+        let midpoint = apply_chart_luminance(source, 50_000, 50_000);
+        assert_ne!(midpoint, source);
+        assert_ne!(midpoint, white);
+    }
+
+    #[test]
+    fn foreign_chart_markup_and_alternate_content_are_never_applied_silently() {
+        fn reasons(xml: &str) -> Vec<ChartUnsupportedReason> {
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series)
+                .expect("local-name parser still identifies the chart")
+                .unsupported_reasons
+        }
+
+        let foreign_kind = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:evil="urn:evil"><c:chart><c:plotArea><evil:pieChart/></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(reasons(foreign_kind).contains(&ChartUnsupportedReason::UnsupportedMarkup));
+
+        let foreign_val = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:pieChart><c:varyColors a:val="0"/></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(reasons(foreign_val).contains(&ChartUnsupportedReason::UnsupportedMarkup));
+
+        let alternate = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><c:chart><c:plotArea><mc:AlternateContent><mc:Choice Requires="c"><c:pieChart/></mc:Choice><mc:Fallback><c:barChart/></mc:Fallback></mc:AlternateContent></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(reasons(alternate).contains(&ChartUnsupportedReason::UnsupportedMarkup));
+    }
+
+    #[test]
+    fn imported_chart_title_retains_uniform_painted_run_style() {
+        let theme = parse_theme(&complete_theme_xml(
+            "Major Face",
+            "Minor Face",
+            "4472C4",
+            "ED7D31",
+        ));
+        assert!(theme.source_valid);
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich>
+            <a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1000" b="0">
+                <a:latin typeface="Calibri"/>
+            </a:defRPr></a:pPr><a:r><a:rPr sz="2400" b="1" i="0" u="none" strike="noStrike">
+                <a:solidFill><a:sysClr val="windowText" lastClr="000000"/></a:solidFill>
+                <a:latin typeface="Eurostile"/>
+            </a:rPr><a:t>Sales</a:t></a:r>
+            <a:endParaRPr sz="2400" b="1" u="sng" strike="sngStrike"><a:latin typeface="Eurostile"/></a:endParaRPr>
+            </a:p></c:rich></c:tx></c:title><c:plotArea><c:lineChart><c:axId val="1"/><c:axId val="2"/></c:lineChart><c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart_with_theme(
+            xml,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+            &theme,
+        )
+        .unwrap();
+
+        assert!(parsed.unsupported_reasons.is_empty());
+        assert_eq!(parsed.chart.title.as_deref(), Some("Sales"));
+        assert_eq!(
+            parsed.text_styles.chart_title,
+            Some(ChartTextStyle {
+                latin_font_family: "Eurostile".to_string(),
+                size_hundredths_of_point: 2_400,
+                color: Color::rgb(0, 0, 0),
+                bold: true,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                kerning_minimum_hundredths_of_point: None,
+                rotation_degrees: None,
+            })
+        );
+    }
+
+    #[test]
+    fn imported_chart_text_resolves_theme_roles_and_rejects_mixed_runs() {
+        let theme = parse_theme(&complete_theme_xml(
+            "Major Face",
+            "Minor Face",
+            "4472C4",
+            "ED7D31",
+        ));
+        assert!(theme.source_valid);
+        let uniform = r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><title><tx><rich><a:bodyPr/><a:lstStyle/><a:p>
+            <a:r><a:rPr sz="1400"><a:latin typeface="+mj-lt"/></a:rPr><a:t>A</a:t></a:r>
+            <a:r><a:rPr sz="1400"><a:latin typeface="+mj-lt"/></a:rPr><a:t>B</a:t></a:r>
+            </a:p></rich></tx></title><plotArea><lineChart><axId val="1"/><axId val="2"/></lineChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart_with_theme(
+            uniform,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+            &theme,
+        )
+        .unwrap();
+        let style = parsed.text_styles.chart_title.unwrap();
+        assert_eq!(style.latin_font_family, "Major Face");
+        assert_eq!(style.size_hundredths_of_point, 1_400);
+        assert!(parsed.unsupported_reasons.is_empty());
+
+        let mixed = uniform.replacen(
+            r#"sz="1400"><a:latin typeface="+mj-lt"/></a:rPr><a:t>B"#,
+            r#"sz="1600"><a:latin typeface="+mn-lt"/></a:rPr><a:t>B"#,
+            1,
+        );
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart_with_theme(
+            &mixed,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+            &theme,
+        )
+        .unwrap();
+        assert!(parsed.text_styles.chart_title.is_none());
+        assert_eq!(
+            parsed.unsupported_reasons,
+            [ChartUnsupportedReason::MixedTextStyle]
+        );
+    }
+
+    #[test]
+    fn imported_horizontal_bar_maps_semantic_axis_titles_after_direction() {
+        let xml = r#"<chartSpace><chart><plotArea><barChart><barDir val="bar"/></barChart>
+            <catAx><title><tx><rich><a:bodyPr/><a:p><a:r><a:rPr sz="900"><a:latin typeface="Category Face"/></a:rPr><a:t>Category</a:t></a:r></a:p></rich></tx></title></catAx>
+            <valAx><title><tx><rich><a:bodyPr/><a:p><a:r><a:rPr sz="1200"><a:latin typeface="Value Face"/></a:rPr><a:t>Value</a:t></a:r></a:p></rich></tx></title></valAx>
+            </plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+
+        assert_eq!(parsed.chart.x_axis_title.as_deref(), Some("Value"));
+        assert_eq!(parsed.chart.y_axis_title.as_deref(), Some("Category"));
+        assert_eq!(
+            parsed
+                .text_styles
+                .category_axis_title
+                .as_ref()
+                .map(|style| style.latin_font_family.as_str()),
+            Some("Category Face")
+        );
+        assert_eq!(
+            parsed
+                .text_styles
+                .value_axis_title
+                .as_ref()
+                .map(|style| style.latin_font_family.as_str()),
+            Some("Value Face")
+        );
+    }
+
+    #[test]
+    fn imported_chart_text_enforces_size_family_and_decoration_boundaries() {
+        for size in ["100", "400000"] {
+            assert_eq!(chart_text_bounded_size(size), Some(size.parse().unwrap()));
+        }
+        for size in ["99", "400001", "-1", "large"] {
+            assert_eq!(chart_text_bounded_size(size), None);
+        }
+        assert!(bounded_imported_chart_latin_font_family(&"x".repeat(255)).is_some());
+        assert!(bounded_imported_chart_latin_font_family(&"x".repeat(256)).is_none());
+
+        for attributes in [
+            r#"sz="99""#,
+            r#"sz="400001""#,
+            r#"u="dbl""#,
+            r#"strike="dblStrike""#,
+            r#"baseline="30000""#,
+            r#"spc="150""#,
+        ] {
+            let xml = format!(
+                r#"<chartSpace><chart><title><tx><rich><a:bodyPr/><a:p><a:r><a:rPr {attributes}><a:latin typeface="Face"/></a:rPr><a:t>X</a:t></a:r></a:p></rich></tx></title><plotArea><lineChart/></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            assert!(parsed
+                .unsupported_reasons
+                .contains(&ChartUnsupportedReason::UnsupportedTextStyle));
+        }
+    }
+
+    #[test]
+    fn chart_data_label_visibility_is_effective_and_extensions_fail_closed() {
+        for (labels, expected_visible, expected_unsupported) in [
+            ("<dLbls/>", false, false),
+            ("<dLbls><showVal val=\"0\"/></dLbls>", false, false),
+            ("<dLbls><showVal/></dLbls>", true, false),
+            ("<dLbls><showVal/><delete/></dLbls>", false, false),
+            ("<dLbls><showCatName/></dLbls>", false, true),
+            (
+                "<dLbls><extLst><ext><showVal/></ext></extLst></dLbls>",
+                false,
+                true,
+            ),
+            (
+                "<dLbls><showVal/><dLbl><idx val=\"0\"/><delete/></dLbl></dLbls>",
+                false,
+                true,
+            ),
+            ("<dLbls><showVal val=\"TRUE\"/></dLbls>", false, true),
+        ] {
+            let xml = format!(
+                "<chartSpace><chart><plotArea><pieChart>{labels}</pieChart></plotArea></chart></chartSpace>"
+            );
+            assert_eq!(
+                parse_chart_data_labels(&xml),
+                (expected_visible, expected_unsupported),
+                "{labels}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_axis_semantics_follow_plot_ids_visibility_and_cross_links() {
+        let xml = r#"<chartSpace><chart><plotArea>
+            <scatterChart><axId val="10"/><axId val="20"/></scatterChart>
+            <valAx><axId val="20"/><majorGridlines/><delete val="0"/><crossAx val="10"/></valAx>
+            <valAx><axId val="10"/><delete/><crossAx val="20"/></valAx>
+        </plotArea></chart></chartSpace>"#;
+        let semantics = parse_chart_axis_semantics(xml);
+        assert!(!semantics.unsupported_topology);
+        assert!(!semantics.invalid_visibility);
+        assert_eq!(
+            semantics.axis_roles,
+            [ChartAxisContext::Value, ChartAxisContext::Category]
+        );
+        assert_eq!(semantics.category_visible, Some(false));
+        assert_eq!(semantics.value_visible, Some(true));
+        assert!(!semantics.category_major_gridlines);
+        assert!(semantics.value_major_gridlines);
+
+        let invalid_cross = xml.replace(r#"crossAx val="10""#, r#"crossAx val="99""#);
+        assert!(parse_chart_axis_semantics(&invalid_cross).unsupported_topology);
+
+        for (plot, unsupported) in [
+            ("<lineChart/>", true),
+            ("<scatterChart/>", true),
+            ("<pieChart/>", false),
+            ("<doughnutChart/>", false),
+        ] {
+            let xml =
+                format!("<chartSpace><chart><plotArea>{plot}</plotArea></chart></chartSpace>");
+            assert_eq!(
+                parse_chart_axis_semantics(&xml).unsupported_topology,
+                unsupported,
+                "{plot}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_axis_generated_defaults_preserve_supported_chart_semantics() {
+        fn parsed_chart(xml: &str) -> ParsedChart {
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).expect("chart")
+        }
+
+        let default_axes = r#"<catAx><axId val="1"/><scaling><orientation val="minMax"/></scaling><delete val="0"/><axPos val="b"/><tickLblPos val="nextTo"/><crossAx val="2"/><crosses val="autoZero"/><auto val="1"/><lblAlgn val="ctr"/><lblOffset val="100"/></catAx><valAx><axId val="2"/><scaling><orientation val="minMax"/></scaling><delete val="0"/><axPos val="l"/><numFmt formatCode="General" sourceLinked="1"/><tickLblPos val="nextTo"/><crossAx val="1"/><crosses val="autoZero"/><crossBetween val="between"/></valAx>"#;
+        for (plot, expected_kind) in [
+            (
+                r#"<lineChart><grouping val="standard"/><varyColors val="0"/><axId val="1"/><axId val="2"/></lineChart>"#,
+                ChartKind::Line,
+            ),
+            (
+                r#"<barChart><barDir val="col"/><grouping val="clustered"/><axId val="1"/><axId val="2"/></barChart>"#,
+                ChartKind::Bar,
+            ),
+        ] {
+            let xml = format!(
+                "<chartSpace><chart><plotArea>{plot}{default_axes}</plotArea></chart></chartSpace>"
+            );
+            let semantics = parse_chart_axis_semantics(&xml);
+            assert!(!semantics.unsupported_topology, "{expected_kind:?}");
+            assert!(!semantics.unsupported_presentation, "{expected_kind:?}");
+            assert_eq!(semantics.category_visible, Some(true));
+            assert_eq!(semantics.value_visible, Some(true));
+            let parsed = parsed_chart(&xml);
+            assert_eq!(parsed.chart.kind, expected_kind);
+            assert!(
+                parsed.unsupported_reasons.is_empty(),
+                "{expected_kind:?}: {:?}",
+                parsed.unsupported_reasons
+            );
+        }
+
+        let pie = parsed_chart(
+            r#"<chartSpace><chart><plotArea><pieChart><varyColors val="1"/></pieChart></plotArea></chart></chartSpace>"#,
+        );
+        assert_eq!(pie.chart.kind, ChartKind::Pie);
+        assert!(pie.unsupported_reasons.is_empty());
+    }
+
+    #[test]
+    fn chart_axis_positions_and_non_default_presentation_fail_closed() {
+        fn unsupported_reasons(xml: &str) -> Vec<ChartUnsupportedReason> {
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series)
+                .expect("chart")
+                .unsupported_reasons
+        }
+
+        let column = r#"<chartSpace><chart><plotArea><barChart><barDir val="col"/><axId val="1"/><axId val="2"/></barChart><catAx><axId val="1"/><axPos val="b"/><crossAx val="2"/></catAx><valAx><axId val="2"/><axPos val="l"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#;
+        assert!(!unsupported_reasons(column)
+            .contains(&ChartUnsupportedReason::UnsupportedAxisPresentation));
+
+        let horizontal = column
+            .replace(r#"val="col""#, r#"val="bar""#)
+            .replace(
+                r#"<catAx><axId val="1"/><axPos val="b"/>"#,
+                r#"<catAx><axId val="1"/><axPos val="l"/>"#,
+            )
+            .replace(
+                r#"<valAx><axId val="2"/><axPos val="l"/>"#,
+                r#"<valAx><axId val="2"/><axPos val="b"/>"#,
+            );
+        assert!(!unsupported_reasons(&horizontal)
+            .contains(&ChartUnsupportedReason::UnsupportedAxisPresentation));
+
+        let reversed = horizontal.replace(r#"val="bar""#, r#"val="col""#);
+        assert!(unsupported_reasons(&reversed)
+            .contains(&ChartUnsupportedReason::UnsupportedAxisPresentation));
+
+        let generated_defaults = column
+            .replace(
+                r#"<crossAx val="2"/>"#,
+                r#"<crossAx val="2"/><crosses val="autoZero"/><auto val="1"/><lblAlgn val="ctr"/><lblOffset val="100"/>"#,
+            )
+            .replace(
+                r#"<crossAx val="1"/>"#,
+                r#"<crossAx val="1"/><crosses val="autoZero"/><crossBetween val="between"/>"#,
+            );
+        assert!(!unsupported_reasons(&generated_defaults)
+            .contains(&ChartUnsupportedReason::UnsupportedAxisPresentation));
+
+        for (supported, unsupported) in [
+            (r#"crosses val="autoZero""#, r#"crosses val="max""#),
+            (r#"crosses val="autoZero""#, r#"crossesAt val="0""#),
+            (r#"auto val="1""#, r#"auto val="0""#),
+            (r#"lblAlgn val="ctr""#, r#"lblAlgn val="l""#),
+            (r#"lblOffset val="100""#, r#"lblOffset val="101""#),
+            (
+                r#"crossBetween val="between""#,
+                r#"crossBetween val="midCat""#,
+            ),
+        ] {
+            let xml = generated_defaults.replacen(supported, unsupported, 1);
+            assert!(
+                unsupported_reasons(&xml)
+                    .contains(&ChartUnsupportedReason::UnsupportedAxisPresentation),
+                "{unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_text_inheritance_merges_chart_list_paragraph_and_run_properties() {
+        let xml = r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><title><tx><rich>
+            <a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr sz="1200"><a:latin typeface="List Face"/></a:defRPr></a:lvl1pPr></a:lstStyle>
+            <a:p><a:pPr lvl="0"><a:defRPr b="1"/></a:pPr><a:r><a:rPr i="1"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:rPr><a:t>X</a:t></a:r></a:p>
+        </rich></tx></title><plotArea><pieChart/></plotArea></chart>
+        <txPr><a:bodyPr/><a:p><a:pPr><a:defRPr sz="1600"><a:latin typeface="Chart Face"/></a:defRPr></a:pPr></a:p></txPr>
+        </chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+        assert!(parsed.unsupported_reasons.is_empty());
+        let title = parsed.text_styles.chart_title.unwrap();
+        assert_eq!(title.latin_font_family, "List Face");
+        assert_eq!(title.size_hundredths_of_point, 1_200);
+        assert_eq!(title.color, Color::rgb(0x11, 0x22, 0x33));
+        assert!(title.bold);
+        assert!(title.italic);
+
+        let category = parsed.text_styles.category_axis_labels.unwrap();
+        assert_eq!(category.latin_font_family, "Chart Face");
+        assert_eq!(category.size_hundredths_of_point, 1_600);
+    }
+
+    #[test]
+    fn chart_text_ignores_unpainted_invalid_runs_but_rejects_late_properties() {
+        let valid = r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><title><tx><rich><a:bodyPr/><a:p>
+            <a:r><a:rPr sz="99"/><a:t/></a:r>
+            <a:r><a:rPr sz="1400"><a:latin typeface="Face"/></a:rPr><a:t>X</a:t></a:r>
+        </a:p></rich></tx></title><plotArea><pieChart/></plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(valid, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+        assert!(parsed.unsupported_reasons.is_empty());
+        assert_eq!(
+            parsed
+                .text_styles
+                .chart_title
+                .as_ref()
+                .map(|style| style.size_hundredths_of_point),
+            Some(1_400)
+        );
+
+        for late in [
+            r#"<a:r><a:t>X</a:t><a:rPr b="1"/></a:r>"#,
+            r#"<a:r><a:t>X</a:t></a:r><a:pPr lvl="0"/>"#,
+        ] {
+            let xml = format!(
+                r#"<chartSpace><chart><title><tx><rich><a:bodyPr/><a:p>{late}</a:p></rich></tx></title><plotArea><pieChart/></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            assert!(parsed
+                .unsupported_reasons
+                .contains(&ChartUnsupportedReason::UnsupportedTextStyle));
+        }
+    }
+
+    #[test]
+    fn chart_text_color_map_and_fact_budget_are_strict_and_semantic() {
+        let theme = parse_theme(&complete_theme_xml(
+            "Theme Major",
+            "Theme Face",
+            "4472C4",
+            "102030",
+        ));
+        assert!(theme.source_valid);
+        let entities = "&amp;".repeat(MAX_CHART_TEXT_STYLE_FACTS_PER_ROLE + 1);
+        let xml = format!(
+            r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><clrMapOvr><overrideClrMapping bg1="lt1" tx1="accent2" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/></clrMapOvr><chart><title><tx><rich><a:bodyPr/><a:p><a:r><a:t>{entities}</a:t></a:r></a:p></rich></tx></title><plotArea><pieChart/></plotArea></chart></chartSpace>"#
+        );
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart_with_theme(
+            &xml,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+            &theme,
+        )
+        .unwrap();
+        assert!(!parsed.limit_exceeded);
+        assert!(parsed.unsupported_reasons.is_empty());
+        assert_eq!(
+            parsed.text_styles.chart_title.unwrap().color,
+            Color::rgb(0x10, 0x20, 0x30)
+        );
+
+        let partial = xml.replace(
+            r#" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink""#,
+            "",
+        );
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart_with_theme(
+            &partial,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+            &theme,
+        )
+        .unwrap();
+        assert!(parsed
+            .unsupported_reasons
+            .contains(&ChartUnsupportedReason::UnsupportedTextStyle));
+    }
+
+    #[test]
+    fn chart_text_fields_use_exact_non_truncating_byte_limits() {
+        for (length, retained) in [
+            (MAX_XLSX_CHART_TEXT_FIELD_BYTES, true),
+            (MAX_XLSX_CHART_TEXT_FIELD_BYTES + 1, false),
+        ] {
+            let title = "x".repeat(length);
+            let xml = format!(
+                r#"<chartSpace><chart><title><tx><rich><a:bodyPr/><a:p><a:r><a:t>{title}</a:t></a:r></a:p></rich></tx></title><plotArea><pieChart/></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            assert_eq!(
+                parsed.chart.title.as_deref(),
+                retained.then_some(title.as_str())
+            );
+            assert_eq!(parsed.limit_exceeded, !retained);
+        }
     }
 
     #[test]
@@ -8924,6 +14244,66 @@ mod tests {
     }
 
     #[test]
+    fn visible_series_legend_and_line_semantics_are_never_dropped_silently() {
+        fn parse_with_series_markup(markup: &str) -> ParsedChart {
+            let xml = format!(
+                r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><plotArea><barChart><barDir val="col"/><ser><idx val="0"/><order val="0"/>{markup}<val><numRef><f>S!$A$1:$A$2</f></numRef></val></ser></barChart></plotArea></chart></chartSpace>"#
+            );
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).expect("chart")
+        }
+
+        for markup in [
+            "<dPt><idx val=\"0\"/></dPt>",
+            "<trendline/>",
+            "<errBars/>",
+            "<invertIfNegative/>",
+            "<pictureOptions/>",
+            "<marker><spPr/></marker>",
+            r#"<spPr><a:solidFill><a:srgbClr val="112233"/></a:solidFill></spPr>"#,
+        ] {
+            assert!(parse_with_series_markup(markup)
+                .unsupported_reasons
+                .contains(&ChartUnsupportedReason::UnsupportedPlotSemantics));
+        }
+
+        let line = parse_with_series_markup(
+            r#"<spPr><a:ln cap="rnd"><a:solidFill><a:srgbClr val="112233"><a:tint val="50000"/></a:srgbClr></a:solidFill><a:headEnd/></a:ln></spPr>"#,
+        );
+        assert!(line.series_styles[0]
+            .losses
+            .contains(&ChartSeriesStyleLossKind::UnsupportedLinePaint));
+
+        let legend = r#"<chartSpace><chart><plotArea><pieChart/></plotArea><legend><spPr/></legend></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart(
+            legend,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+        )
+        .expect("chart");
+        assert!(parsed
+            .unsupported_reasons
+            .contains(&ChartUnsupportedReason::UnsupportedLegend));
+    }
+
+    #[test]
+    fn multiple_chart_text_color_transforms_fail_closed() {
+        let xml = r#"<chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><chart><title><tx><rich><a:bodyPr/><a:p><a:r><a:rPr><a:solidFill><a:srgbClr val="204080"><a:tint val="50000"/><a:shade val="50000"/></a:srgbClr></a:solidFill><a:latin typeface="Face"/></a:rPr><a:t>X</a:t></a:r></a:p></rich></tx></title><plotArea><pieChart/></plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed =
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).expect("chart");
+        assert!(parsed
+            .unsupported_reasons
+            .contains(&ChartUnsupportedReason::UnsupportedTextStyle));
+    }
+
+    #[test]
     fn chart_space_fill_and_axis_gridline_presence_are_retained() {
         let xml = r#"<chartSpace><chart><plotArea><lineChart><ser>
             <spPr><a:ln><a:noFill/></a:ln></spPr>
@@ -8945,7 +14325,10 @@ mod tests {
             parsed.frame_fill,
             ChartFrameFill::Solid(Color::rgb(0x12, 0x34, 0x56))
         );
-        assert!(parsed.frame_style_losses.is_empty());
+        assert_eq!(
+            parsed.frame_style_losses,
+            [ChartFrameStyleLossKind::UnsupportedPaint]
+        );
         assert!(parsed.category_major_gridlines);
         assert!(!parsed.value_major_gridlines);
         assert!(!parsed.series_styles[0].line_visible);
@@ -9033,6 +14416,97 @@ mod tests {
                 parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
             assert_eq!(parsed.chart.kind, ChartKind::Bar);
             assert_eq!(parsed.bar_direction, expected);
+        }
+    }
+
+    #[test]
+    fn chart_plot_order_style_and_legend_semantics_fail_closed() {
+        let supported = r#"<chartSpace><style val="2"/><chart><plotArea>
+            <lineChart><grouping val="standard"/><ser><idx val="0"/><order val="0"/>
+                <val><numRef><f>Data!$A$1:$A$2</f></numRef></val>
+            </ser><axId val="1"/><axId val="2"/></lineChart>
+            <catAx><axId val="1"/><crossAx val="2"/></catAx>
+            <valAx><axId val="2"/><crossAx val="1"/></valAx>
+        </plotArea><legend><legendPos val="r"/><overlay val="0"/></legend>
+        <plotVisOnly val="1"/><dispBlanksAs val="gap"/></chart></chartSpace>"#;
+
+        let parse_reasons = |xml: &str| {
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            parse_chart(xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series)
+                .unwrap()
+                .unsupported_reasons
+        };
+
+        assert!(parse_reasons(supported).is_empty());
+        for xml in [
+            supported.replace(r#"grouping val="standard""#, r#"grouping val="stacked""#),
+            supported.replace(r#"order val="0""#, r#"order val="1""#),
+            supported.replace(r#"<order val="0"/>"#, ""),
+            supported.replace(
+                r#"<grouping val="standard"/>"#,
+                r#"<grouping val="standard"/><overlap val="0"/>"#,
+            ),
+        ] {
+            assert!(
+                parse_reasons(&xml).contains(&ChartUnsupportedReason::UnsupportedPlotSemantics),
+                "{xml}"
+            );
+        }
+
+        let nondefault_style = supported.replace(r#"style val="2""#, r#"style val="3""#);
+        assert!(parse_reasons(&nondefault_style)
+            .contains(&ChartUnsupportedReason::UnsupportedChartStyle));
+
+        for xml in [
+            supported.replace(r#"legendPos val="r""#, r#"legendPos val="l""#),
+            supported.replace(r#"overlay val="0""#, r#"overlay val="1""#),
+            supported.replace(
+                r#"<legendPos val="r"/>"#,
+                r#"<legendPos val="r"/><legendEntry><idx val="0"/></legendEntry>"#,
+            ),
+        ] {
+            assert!(
+                parse_reasons(&xml).contains(&ChartUnsupportedReason::UnsupportedLegend),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn chart_kind_specific_plot_defaults_are_exact() {
+        let supported = r#"<chartSpace><chart><plotArea>
+            <bubbleChart><varyColors val="0"/><bubble3D val="0"/>
+                <ser><idx val="0"/><order val="0"/><xVal><numRef><f>S!$A$1:$A$2</f></numRef></xVal><yVal><numRef><f>S!$B$1:$B$2</f></numRef></yVal><bubbleSize><numRef><f>S!$C$1:$C$2</f></numRef></bubbleSize></ser>
+                <axId val="1"/><axId val="2"/>
+            </bubbleChart>
+            <valAx><axId val="1"/><crossAx val="2"/></valAx>
+            <valAx><axId val="2"/><crossAx val="1"/></valAx>
+        </plotArea></chart></chartSpace>"#;
+        let mut cache_points = 16;
+        let mut chart_series = 16;
+        let parsed = parse_chart(
+            supported,
+            (0, 0),
+            (10, 5),
+            &mut cache_points,
+            &mut chart_series,
+        )
+        .unwrap();
+        assert!(parsed.unsupported_reasons.is_empty());
+
+        for replacement in [
+            (r#"bubble3D val="0""#, r#"bubble3D val="1""#),
+            (r#"varyColors val="0""#, r#"varyColors val="1""#),
+        ] {
+            let xml = supported.replace(replacement.0, replacement.1);
+            let mut cache_points = 16;
+            let mut chart_series = 16;
+            let parsed =
+                parse_chart(&xml, (0, 0), (10, 5), &mut cache_points, &mut chart_series).unwrap();
+            assert!(parsed
+                .unsupported_reasons
+                .contains(&ChartUnsupportedReason::UnsupportedPlotSemantics));
         }
     }
 
@@ -9235,6 +14709,90 @@ mod tests {
     }
 
     #[test]
+    fn external_worksheet_relationship_never_dispatches_to_a_local_zip_part() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opt = SimpleFileOptions::default();
+        for (name, body) in [
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="External" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml" TargetMode="External"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>must-not-load</t></is></c></row></sheetData></worksheet>"#,
+            ),
+        ] {
+            zw.start_file(name, opt).unwrap();
+            zw.write_all(body.as_bytes()).unwrap();
+        }
+
+        let workbook = Workbook::open(&zw.finish().unwrap().into_inner()).unwrap();
+        assert_eq!(workbook.sheets[0].sheet_type(), SheetType::Vba);
+        assert!(workbook.sheets[0].cells.is_empty());
+    }
+
+    #[test]
+    fn internal_relationship_resolution_uses_only_the_uri_path_component() {
+        assert_eq!(
+            resolve_internal_relationship_part("xl/worksheets/sheet1.xml", "#Sheet2!A1"),
+            Some("xl/worksheets/sheet1.xml".to_string())
+        );
+        assert_eq!(
+            resolve_internal_relationship_part("xl/workbook.xml", "worksheets/sheet1.xml?q#f"),
+            Some("xl/worksheets/sheet1.xml".to_string())
+        );
+        assert_eq!(
+            resolve_internal_relationship_part("xl\\workbook.xml", "worksheets\\sheet1.xml"),
+            Some("xl/worksheets/sheet1.xml".to_string())
+        );
+        assert_eq!(
+            resolve_internal_relationship_part("xl/a.xml", "%2e%2e/kept.xml"),
+            Some("xl/%2e%2e/kept.xml".to_string())
+        );
+        assert_eq!(
+            resolve_internal_relationship_part("xl/workbook.xml", "https://evil.invalid/a.xml"),
+            None
+        );
+        assert_eq!(
+            resolve_internal_relationship_part("xl/workbook.xml", "//evil.invalid/a.xml"),
+            None
+        );
+    }
+
+    #[test]
+    fn office_document_fragment_resolves_but_absolute_internal_uri_is_rejected() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let package = |target: &str, workbook_part: &str| {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opt = SimpleFileOptions::default();
+            zw.start_file("_rels/.rels", opt).unwrap();
+            zw.write_all(
+                format!(r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{target}"/></Relationships>"#).as_bytes(),
+            )
+            .unwrap();
+            zw.start_file(workbook_part, opt).unwrap();
+            zw.write_all(b"<workbook><sheets/></workbook>").unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+
+        assert!(Workbook::open(&package("xl/workbook.xml#Sheet1", "xl/workbook.xml")).is_ok());
+        assert!(Workbook::open(&package(
+            "https://evil.invalid/workbook.xml",
+            "https:/evil.invalid/workbook.xml"
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn sheet_rels_path_inserts_rels_segment() {
         assert_eq!(
             sheet_rels_path("xl/worksheets/sheet1.xml"),
@@ -9267,7 +14825,7 @@ mod tests {
             ),
             (
                 "xl/worksheets/_rels/sheet1.xml.rels",
-                r#"<Relationships><Relationship Id="rId1" Target="https://example.com/" TargetMode="External"/></Relationships>"#,
+                r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/></Relationships>"#,
             ),
         ];
         for (name, body) in parts {
@@ -9300,6 +14858,18 @@ mod tests {
         assert_eq!(
             normalize_part_target("xl/worksheets/sheet1.xml", "/xl/comments1.xml"),
             "xl/comments1.xml"
+        );
+        assert_eq!(
+            normalize_part_target("xl/drawings/drawing1.xml", "../../xl/charts/chart1.xml"),
+            "xl/charts/chart1.xml"
+        );
+        assert_eq!(
+            normalize_part_target("xl/drawings/drawing1.xml", "../../../xl/charts/chart1.xml"),
+            "xl/charts/chart1.xml"
+        );
+        assert_eq!(
+            normalize_part_target("xl/drawings/drawing1.xml", "/../../xl/charts/chart1.xml"),
+            "xl/charts/chart1.xml"
         );
     }
 

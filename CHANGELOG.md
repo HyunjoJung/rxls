@@ -27,6 +27,9 @@ _Nothing yet._
 - Added pinned render and browser dependency locks, reviewed third-party
   notices, complete license-text inputs, and immutable package inspection to
   the render-worker supply-chain evidence.
+- Added a hosted crates.io publication dry-run receipt and bound the preserved
+  candidate manifest, two-candidate comparison, candidate attestation, and tag
+  comparison into the public release manifest.
 - Kept a row that is script-mixed only across internally-uniform cells on
   Calc's pattern row height, so a western/Asian or western/complex heading row
   no longer renders 3.34 pt taller than Calc while every other cohort agreed.
@@ -97,9 +100,9 @@ _Nothing yet._
 - Defaulted cells without an authored vertical alignment to the bottom of their
   row and matched Calc's 1 pt top and bottom in-cell offsets while preserving
   middle alignment and clipping behavior.
-- Matched Calc 26.2.3 by suppressing worksheet gridlines only in the
-  `SinglePageSheets` fidelity override; authored print still honors the source
-  print option and caller flag.
+- Matched Calc 26.2.3 by preserving the source print-gridline setting and
+  caller flag in the `SinglePageSheets` fidelity override as well as authored
+  print, while continuing to replace authored page geometry.
 - Distinguished exact authored page geometry from Calc's bounded imported-file
   quantization with a 15,000-micropoint acceptance envelope, and extended
   hosted oracle evidence to attest Type0 TrueType, Type0 CFF, and Type3
@@ -130,6 +133,18 @@ _Nothing yet._
 
 ### Fixed
 
+- Retained OOXML chart theme/default Latin fonts, uniform text styling by
+  semantic role, axis roles and visibility, and exact supported plot/legend
+  semantics. Unsupported visible chart constructs now fail closed to a typed
+  placeholder instead of inheriting an unrelated worksheet font or silently
+  approximating the source chart.
+- Hardened OOXML relationship selection and theme/chart parsing against
+  duplicate identifiers, mismatched relationship types, malformed targets,
+  incomplete themes, unsupported markup, and workbook-wide chart resource
+  amplification.
+- Rejected Pie and Doughnut charts whose nonnegative value total is not finite,
+  and normalized slice ratios before multiplying by a full turn so valid
+  extreme finite values render without intermediate floating-point overflow.
 - Evaluated numeric and duplicate conditional-format rules across their full
   authored ranges, including sparse cells beyond the rendered subset.
 - Prevented sparse CSV, HTML, Markdown, and WASM exports from performing

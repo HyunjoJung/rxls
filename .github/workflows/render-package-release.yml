@@ -66,7 +66,7 @@ jobs:
             test "$GITHUB_REF_TYPE" = "tag"
             test "$GITHUB_REF_NAME" = "render-v$version"
             git fetch origin main --no-tags
-            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+            test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
           else
             echo "workflow_dispatch is verification-only; npm publish will not run"
           fi
@@ -250,6 +250,7 @@ jobs:
           python3 scripts/test_workflow_policy.py
           python3 scripts/test_check_render_browser_release_evidence.py
           python3 scripts/test_check_render_package.py
+          python3 scripts/test_check_npm_registry_evidence.py
           python3 scripts/test_render_supply_chain.py
           python3 scripts/test_check_render_oracle_release_evidence.py
           python3 scripts/render_supply_chain.py notice \
@@ -542,6 +543,10 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
           git diff --exit-code
           git diff --cached --exit-code
           version=$(node -p 'require("./bindings/render-wasm/package.json").version')
@@ -816,7 +821,77 @@ jobs:
           ):
               raise SystemExit("Render Browser prerequisite evidence differs")
           PY
+      - name: Detect an identical immutable registry release
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          spec="@rxls/render-worker@$version"
+          registry="target/render-package/registry-preflight.json"
+          error_log="target/render-package/registry-preflight.stderr"
+          if npm view "$spec" \
+            version dist.integrity repository.url dist.attestations --json \
+            > "$registry" 2> "$error_log"; then
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/render-package/registry-preflight.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
+          if (
+              registry.get("version") != os.environ["VERSION"]
+              or registry.get("dist.integrity") != packed.get("integrity")
+              or registry.get("repository.url")
+              != "git+https://github.com/HyunjoJung/rxls.git"
+              or not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit(
+                  "existing immutable registry version differs from the verified candidate"
+              )
+          PY
+            rm -f "$error_log"
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' "$error_log"; then
+              cat "$error_log" >&2
+              exit "$status"
+            fi
+            rm -f "$error_log"
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("target/render-package/registry-preflight.json").write_text(
+              json.dumps(
+                  {"status": "absent", "version": os.environ["VERSION"]},
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish exact package with provenance
+        if: steps.registry.outputs.already_published != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -825,13 +900,23 @@ jobs:
             "target/render-package/rxls-render-worker-$version.tgz" \
             --ignore-scripts --access public
       - name: Verify the registry distribution and installed consumer
+        env:
+          ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}
         shell: bash
         run: |
           set -euo pipefail
+          invocation_policy="current-run"
+          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
+            invocation_policy="existing-release"
+          elif [[ "$ALREADY_PUBLISHED" != "false" ]]; then
+            echo "registry preflight did not produce a valid publication state" >&2
+            exit 1
+          fi
           version="${{ steps.package.outputs.version }}"
           spec="@rxls/render-worker@$version"
           for attempt in {1..12}; do
-            if npm view "$spec" version dist.integrity repository.url --json \
+            if npm view "$spec" \
+              version dist.integrity repository.url dist.attestations --json \
               > target/render-package/registry.json; then
               break
             fi
@@ -849,12 +934,24 @@ jobs:
           registry = json.loads(
               Path("target/render-package/registry.json").read_text(encoding="utf-8")
           )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
           if registry.get("version") != os.environ["VERSION"]:
               raise SystemExit("registry version differs")
           if registry.get("dist.integrity") != packed.get("integrity"):
               raise SystemExit("registry integrity differs from the verified candidate")
           if registry.get("repository.url") != "git+https://github.com/HyunjoJung/rxls.git":
               raise SystemExit("registry repository metadata differs")
+          if (
+              not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("registry provenance attestation is missing or invalid")
           PY
           consumer="$RUNNER_TEMP/render-worker-registry-consumer"
           rm -rf "$consumer"
@@ -862,6 +959,18 @@ jobs:
           cd "$consumer"
           npm init --yes >/dev/null
           npm install --ignore-scripts "$spec"
+          npm audit signatures --json --include-attestations \
+            > "$GITHUB_WORKSPACE/target/render-package/registry-signatures.json"
+          python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py" \
+            --audit "$GITHUB_WORKSPACE/target/render-package/registry-signatures.json" \
+            --pack "$GITHUB_WORKSPACE/target/render-package/npm-pack.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow .github/workflows/render-package-release.yml \
+            --git-sha "$GITHUB_SHA" \
+            --git-ref "$GITHUB_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --invocation-policy "$invocation_policy"
           node --input-type=module -e \
             'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v1") process.exit(1)'
       - name: Upload registry evidence
@@ -869,6 +978,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: render-worker-registry-${{ github.sha }}
-          path: target/render-package/registry.json
+          path: |
+            target/render-package/registry-preflight.json
+            target/render-package/registry.json
+            target/render-package/registry-signatures.json
           if-no-files-found: warn
           retention-days: 30

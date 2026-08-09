@@ -92,6 +92,17 @@ FORBIDDEN_RENDER_SCRIPTS = {
     "test_render_supply_chain.py",
     "test_summarize_render_oracle_failure.py",
 }
+FORBIDDEN_RELEASE_SCRIPTS = {
+    "check_cargo_publish_dry_run.py",
+    "check_npm_registry_evidence.py",
+    "check_workflow_policy.py",
+    "reconcile_github_release.py",
+    "test_check_cargo_publish_dry_run.py",
+    "test_check_npm_registry_evidence.py",
+    "test_reconcile_github_release.py",
+    "test_release_tools.py",
+    "test_workflow_policy.py",
+}
 
 
 def _safe_member_name(name: str) -> PurePosixPath | None:
@@ -173,6 +184,15 @@ def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
                         ):
                             errors.append(
                                 f"render-only script entered the core package: {relative[1]}"
+                            )
+                        if (
+                            len(relative) == 2
+                            and relative[0] == "scripts"
+                            and relative[1] in FORBIDDEN_RELEASE_SCRIPTS
+                        ):
+                            errors.append(
+                                "release-only script entered the core package: "
+                                f"{relative[1]}"
                             )
                         if (
                             len(relative) >= 2

@@ -212,7 +212,11 @@ The source workspace also contains a separate `rxls-render` crate and the
 `@rxls/render-worker@0.1.3` browser/WASM package. They are not bundled into the
 published core crate: the renderer builds one bounded fixed-point scene and
 replays it to deterministic SVG, PDF, and PNG, while the browser surface keeps
-parsing and virtual sheet/tile/page rendering inside a CSP-safe worker. See the
+parsing and virtual sheet/tile/page rendering inside a CSP-safe worker.
+Imported OOXML charts retain the effective theme/default Latin font, uniform
+semantic-role text styling, role-aware axes, and source axis visibility.
+Visible chart semantics outside the exact retained subset produce a typed
+placeholder and warning instead of a silent approximation. See the
 [renderer guide](render/README.md) and
 [worker package guide](bindings/render-wasm/README.md) for source builds,
 limits, font isolation, pagination, and distribution gates.
@@ -286,9 +290,12 @@ and every hosted gate pass. The second candidate emits an immutable
 exact-SHA attestation that also binds the candidate release-manifest digest.
 The tag-triggered job requires successful exact-SHA CI and CodeQL push runs,
 downloads the attested candidate, and fails before publishing unless its own
-47-file bundle compares cleanly. Post-publication verification downloads every
-release asset and validates full manifest coverage and checksums. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the exact sequence.
+48-file candidate bundle compares cleanly. It then binds the candidate
+manifest, two-candidate comparison, candidate attestation, and tag comparison
+into the final 52-file public bundle. Post-publication verification downloads
+every release asset and validates full manifest coverage and checksums. See the
+[Release workflow](.github/workflows/release.yml) for the exact hosted sequence
+and [CONTRIBUTING.md](CONTRIBUTING.md) for the local gate and release policy.
 
 Pinned public spreadsheet corpus for parity work:
 

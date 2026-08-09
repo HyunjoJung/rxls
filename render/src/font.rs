@@ -8,10 +8,10 @@ use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustybuzz::{Direction, Face as BuzzFace, UnicodeBuffer};
+use rustybuzz::{Direction, Face as BuzzFace, Feature, UnicodeBuffer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use ttf_parser::{name_id, Face, GlyphId, OutlineBuilder};
+use ttf_parser::{name_id, Face, GlyphId, OutlineBuilder, Tag};
 use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -19,6 +19,61 @@ const FONT_PACK_SCHEMA: &str = "rxls.render-font-pack.v1";
 const SHA256_HEX_LEN: usize = 64;
 const MAX_FONT_ALIASES: u64 = 128;
 const OUTLINE_UNITS: f32 = 64.0;
+
+/// Encode source text into the byte domain used by the deterministic PDF
+/// standard-font fallback. Unsupported scalars intentionally become `?` so
+/// geometry and emission select the same Helvetica glyph.
+pub(crate) fn standard_fallback_byte(character: char) -> u8 {
+    match character {
+        '\n' => b'\n',
+        '\r' => b'\r',
+        '\t' => b'\t',
+        character if character.is_ascii() && !character.is_ascii_control() => character as u8,
+        _ => b'?',
+    }
+}
+
+/// Return the Adobe Helvetica advance in 1/1000-em units for one encoded
+/// standard-font byte.
+pub(crate) fn helvetica_advance_units(encoded: u8) -> u16 {
+    match encoded {
+        b'\n' | b'\r' | b'\t' => 0,
+        b' ' | b'!' => 278,
+        b'"' => 355,
+        b'#' | b'$' | b'0'..=b'9' | b'?' => 556,
+        b'%' => 889,
+        b'&' | b'A' | b'B' | b'E' | b'K' | b'P' | b'S' | b'V' | b'X' | b'Y' => 667,
+        b'\'' => 191,
+        b'(' | b')' | b'-' | b'`' | b'r' => 333,
+        b'*' => 389,
+        b'+' | b'<' | b'=' | b'>' | b'~' => 584,
+        b',' | b'.' | b'/' | b':' | b';' | b'I' | b'[' | b'\\' | b']' | b'f' | b't' => 278,
+        b'@' => 1_015,
+        b'C' | b'D' | b'H' | b'N' | b'R' | b'U' => 722,
+        b'F' | b'T' | b'Z' => 611,
+        b'G' | b'O' | b'Q' => 778,
+        b'J' | b'c' | b'k' | b's' | b'v' | b'x' | b'y' | b'z' => 500,
+        b'L' | b'_' | b'a' | b'b' | b'd' | b'e' | b'g' | b'h' | b'n' | b'o' | b'p' | b'q'
+        | b'u' => 556,
+        b'M' | b'm' => 833,
+        b'W' => 944,
+        b'^' => 469,
+        b'i' | b'j' | b'l' => 222,
+        b'w' => 722,
+        b'{' | b'}' => 334,
+        b'|' => 260,
+        _ => 556,
+    }
+}
+
+/// Sum deterministic Helvetica advances, returning `None` on overflow.
+pub(crate) fn helvetica_text_advance_units(text: &str) -> Option<i64> {
+    text.chars().try_fold(0_i64, |total, character| {
+        total.checked_add(i64::from(helvetica_advance_units(standard_fallback_byte(
+            character,
+        ))))
+    })
+}
 
 /// Resource ceilings enforced while loading and using a verified font pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -450,6 +505,7 @@ pub(crate) struct ShapeOptions {
     pub(crate) direction: BaseDirection,
     pub(crate) max_glyphs: usize,
     pub(crate) max_runs: usize,
+    pub(crate) kerning: bool,
 }
 
 /// Selected face metrics in font units.
@@ -1637,7 +1693,13 @@ impl FontPack {
                             actual: runs.len() as u64 + 1,
                         });
                     }
-                    let shaped = self.shape_one_run(text, source.clone(), font_id, direction)?;
+                    let shaped = self.shape_one_run(
+                        text,
+                        source.clone(),
+                        font_id,
+                        direction,
+                        options.kerning,
+                    )?;
                     glyph_count = glyph_count.checked_add(shaped.len()).ok_or(
                         FontPackError::LimitExceeded {
                             resource: "shape_glyphs",
@@ -1801,6 +1863,7 @@ impl FontPack {
         source: Range<usize>,
         font_id: FontId,
         direction: BaseDirection,
+        kerning: bool,
     ) -> Result<Vec<ShapedGlyph>, FontPackError> {
         let value = text
             .get(source.clone())
@@ -1814,7 +1877,9 @@ impl FontPack {
             BaseDirection::Auto | BaseDirection::LeftToRight => Direction::LeftToRight,
         });
         buffer.guess_segment_properties();
-        let glyphs = rustybuzz::shape(&face, &[], buffer);
+        let no_kerning = [Feature::new(Tag::from_bytes(b"kern"), 0, ..)];
+        let features = if kerning { &[][..] } else { &no_kerning[..] };
+        let glyphs = rustybuzz::shape(&face, features, buffer);
         let source_start =
             u32::try_from(source.start).map_err(|_| FontPackError::InvalidTextRange)?;
         glyphs
@@ -2109,6 +2174,20 @@ fn write_synthetic_test_pack() -> PathBuf {
 
 #[cfg(test)]
 fn synthetic_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
+    synthetic_font_with_optional_kerning(family, groups, false)
+}
+
+#[cfg(test)]
+fn synthetic_kerning_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
+    synthetic_font_with_optional_kerning(family, groups, true)
+}
+
+#[cfg(test)]
+fn synthetic_font_with_optional_kerning(
+    family: &str,
+    groups: &[(u32, u32, u32)],
+    include_kerning: bool,
+) -> Vec<u8> {
     let mut tables = vec![
         (*b"cmap", synthetic_cmap(groups)),
         (*b"glyf", synthetic_glyf()),
@@ -2121,6 +2200,9 @@ fn synthetic_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
         (*b"OS/2", synthetic_os2()),
         (*b"post", synthetic_post()),
     ];
+    if include_kerning {
+        tables.push((*b"kern", synthetic_kern()));
+    }
     tables.sort_by_key(|(tag, _)| *tag);
     let table_count = tables.len() as u16;
     let directory_bytes = 12 + tables.len() * 16;
@@ -2149,6 +2231,25 @@ fn synthetic_font(family: &str, groups: &[(u32, u32, u32)]) -> Vec<u8> {
         }
     }
     font
+}
+
+#[cfg(test)]
+fn synthetic_kern() -> Vec<u8> {
+    let mut table = Vec::with_capacity(24);
+    be_u16(&mut table, 0); // kern table version
+    be_u16(&mut table, 1); // one subtable
+    be_u16(&mut table, 0); // subtable version
+    be_u16(&mut table, 20); // complete format-0 subtable length
+    be_u16(&mut table, 1); // horizontal, format 0
+    be_u16(&mut table, 1); // one pair
+    be_u16(&mut table, 6); // largest power-of-two pair search range
+    be_u16(&mut table, 0); // entry selector
+    be_u16(&mut table, 0); // range shift
+    be_u16(&mut table, 1); // left glyph
+    be_u16(&mut table, 1); // right glyph
+    be_i16(&mut table, -100); // pair adjustment in font units
+    assert_eq!(table.len(), 24);
+    table
 }
 
 /// Construct a minimal OpenType/CFF1 face without external fixture bytes.
@@ -2448,8 +2549,11 @@ fn synthetic_os2() -> Vec<u8> {
     be_i16(&mut table, 800); // sTypoAscender
     be_i16(&mut table, -200); // sTypoDescender
     be_i16(&mut table, 200); // sTypoLineGap
-    be_u16(&mut table, 800); // usWinAscent
-    be_u16(&mut table, 200); // usWinDescent
+
+    // Deliberately differ from hhea so PDF descriptor regressions prove that
+    // the OS/2 Windows clipping metrics are selected independently of layout.
+    be_u16(&mut table, 900); // usWinAscent
+    be_u16(&mut table, 300); // usWinDescent
     be_u32(&mut table, 0); // ulCodePageRange1
     be_u32(&mut table, 0); // ulCodePageRange2
     be_i16(&mut table, 500); // sxHeight
@@ -2553,6 +2657,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 1_000,
                     max_runs: 100,
+                    kerning: true,
                 },
             )
             .unwrap();
@@ -2576,6 +2681,71 @@ mod tests {
             Some(FontOutlineCommand::MoveTo(..))
         ));
         assert!(matches!(outline.last(), Some(FontOutlineCommand::Close)));
+    }
+
+    #[test]
+    fn shape_options_disable_pair_kerning_without_changing_run_identity() {
+        let family = "Kerning Sans";
+        let bytes = synthetic_kerning_font(family, &[(0x20, 0x20, 2), (0x21, 0x7e, 1)]);
+        let face = Face::parse(&bytes, 0).expect("synthetic kerning face");
+        let digest = sha256_hex(&bytes);
+        let pack_digest = sha256_hex(b"synthetic-kerning-pack");
+        let pack = FontPack {
+            inner: Arc::new(FontPackInner {
+                pack_sha256: pack_digest.clone(),
+                faces: vec![FontEntry {
+                    family: family.to_string(),
+                    normalized_family: normalize_family(family),
+                    weight: 400,
+                    italic: false,
+                    glyph_count: face.number_of_glyphs(),
+                    bytes: Arc::from(bytes),
+                    sha256: digest,
+                    source_pack_sha256: pack_digest,
+                }],
+                layers: vec![FontLayer {
+                    face_start: 0,
+                    face_end: 1,
+                    aliases: BTreeMap::new(),
+                    default_face: FontId(0),
+                }],
+                default_face: FontId(0),
+                limits: FontPackLimits::default(),
+            }),
+        };
+        let request = FontRequest {
+            family,
+            weight: 400,
+            italic: false,
+        };
+        let shape = |kerning| {
+            pack.shape(
+                "AV",
+                request,
+                ShapeOptions {
+                    direction: BaseDirection::LeftToRight,
+                    max_glyphs: 8,
+                    max_runs: 8,
+                    kerning,
+                },
+            )
+            .unwrap()
+        };
+        let kerned = shape(true);
+        let unkerned = shape(false);
+        let advance = |shaped: &ShapedText| {
+            shaped
+                .runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .map(|glyph| i64::from(glyph.x_advance))
+                .sum::<i64>()
+        };
+        assert_eq!(advance(&kerned), 1_100);
+        assert_eq!(advance(&unkerned), 1_200);
+        assert_eq!(kerned.selected_faces, unkerned.selected_faces);
+        assert_eq!(kerned.runs.len(), unkerned.runs.len());
+        assert_eq!(kerned.runs[0].source, unkerned.runs[0].source);
     }
 
     #[test]
@@ -2610,6 +2780,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 32,
                     max_runs: 32,
+                    kerning: true,
                 },
             )
             .unwrap();
@@ -2621,6 +2792,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 32,
                     max_runs: 32,
+                    kerning: true,
                 },
             )
             .unwrap();
@@ -2652,6 +2824,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 32,
                     max_runs: 32,
+                    kerning: true,
                 },
             ),
             Err(FontPackError::InvalidTextRange)
@@ -2673,6 +2846,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 2,
                     max_runs: 2,
+                    kerning: true,
                 },
             )
             .unwrap_err();
@@ -2730,6 +2904,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 100,
                     max_runs: 10,
+                    kerning: true,
                 },
             )
             .unwrap();
@@ -2790,6 +2965,7 @@ mod tests {
                     direction: BaseDirection::Auto,
                     max_glyphs: 32,
                     max_runs: 8,
+                    kerning: true,
                 },
             )
             .unwrap();

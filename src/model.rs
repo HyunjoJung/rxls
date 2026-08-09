@@ -5560,6 +5560,69 @@ pub enum ChartFrameStyleLossKind {
     UnsupportedPaint,
 }
 
+/// Uniform effective text style retained for one semantic imported-chart role.
+///
+/// OOXML rich text can vary formatting between individual runs. Readers retain
+/// this compact style only when every painted run for the role resolves to the
+/// same supported properties. Mixed or otherwise unrepresentable formatting is
+/// reported through [`DrawingMetadata::chart_unsupported_reasons`] instead of
+/// being flattened silently.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ChartTextStyle {
+    /// Effective Latin font family, bounded to 255 UTF-8 bytes by readers.
+    pub latin_font_family: String,
+    /// Effective font size in hundredths of a point.
+    ///
+    /// Imported DrawingML values are constrained to the `ST_TextFontSize`
+    /// range `100..=400_000`.
+    pub size_hundredths_of_point: u32,
+    /// Effective text color after supported theme-color transformations.
+    pub color: Color,
+    /// Whether the text is bold.
+    pub bold: bool,
+    /// Whether the text is italic.
+    pub italic: bool,
+    /// Whether the text has a single underline.
+    pub underline: bool,
+    /// Whether the text has a single strikethrough.
+    pub strikethrough: bool,
+    /// Minimum size in hundredths of a point at which pair kerning is enabled.
+    ///
+    /// `None` retains the shaping engine's default. DrawingML `kern` values are
+    /// constrained to the same bounded point-size domain as other text metrics.
+    pub kerning_minimum_hundredths_of_point: Option<u32>,
+    /// Explicit integer text-body rotation in degrees, when present.
+    ///
+    /// `None` keeps the renderer's semantic-role orientation (for example, a
+    /// vertical value-axis title). Fractional and unsupported vertical-text
+    /// modes are surfaced as unsupported chart text instead.
+    pub rotation_degrees: Option<i16>,
+}
+
+/// Fixed-cardinality text-style sidecar for semantic imported-chart roles.
+///
+/// Keeping category and value axes semantic avoids swapping their styling when
+/// a horizontal bar chart places the value axis along the display X axis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ChartTextStyles {
+    /// Main chart-title style.
+    pub chart_title: Option<ChartTextStyle>,
+    /// Category-axis title style.
+    pub category_axis_title: Option<ChartTextStyle>,
+    /// Value-axis title style.
+    pub value_axis_title: Option<ChartTextStyle>,
+    /// Legend-entry style.
+    pub legend: Option<ChartTextStyle>,
+    /// Category-axis label style.
+    pub category_axis_labels: Option<ChartTextStyle>,
+    /// Value-axis label style.
+    pub value_axis_labels: Option<ChartTextStyle>,
+    /// Data-label style.
+    pub data_labels: Option<ChartTextStyle>,
+}
+
 /// Unsupported source-chart construct retained for explicit placeholder rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -5574,6 +5637,26 @@ pub enum ChartUnsupportedReason {
     ExternalData,
     /// The plot kind is not represented by [`ChartKind`].
     UnsupportedKind,
+    /// Painted runs or role-specific overrides resolve to different text styles.
+    MixedTextStyle,
+    /// A chart text property is invalid or outside the exactly rendered subset.
+    UnsupportedTextStyle,
+    /// Data-label policy cannot be represented as uniform value-only labels.
+    UnsupportedDataLabels,
+    /// An imported axis visibility value is malformed or contradictory.
+    InvalidAxisVisibility,
+    /// The imported chart uses an axis topology outside the retained primary pair.
+    UnsupportedAxisTopology,
+    /// Axis scaling, positioning, labels, ticks, or formatting cannot be rendered exactly.
+    UnsupportedAxisPresentation,
+    /// Plot grouping, ordering, spacing, smoothing, or kind-specific geometry is unsupported.
+    UnsupportedPlotSemantics,
+    /// Legend placement, entry filtering, or per-entry formatting is unsupported.
+    UnsupportedLegend,
+    /// A non-default built-in or external chart style is not represented exactly.
+    UnsupportedChartStyle,
+    /// Compatibility markup or a foreign namespace could not be selected safely.
+    UnsupportedMarkup,
 }
 
 /// Orientation of an OOXML `barChart` retained beside [`ChartKind::Bar`].
@@ -5634,6 +5717,30 @@ pub struct DrawingMetadata {
     /// Empty for non-chart drawings. Readers may use deterministic Office
     /// defaults for theme slots omitted by the source package.
     pub chart_palette: Vec<Color>,
+    /// Effective Latin font family inherited by imported OOXML chart text.
+    ///
+    /// XLSX and XLSB readers retain the source theme's minor Latin typeface
+    /// when it is non-empty and at most 255 UTF-8 bytes. When that source
+    /// value or the package theme is absent, they retain Calc's
+    /// `Liberation Sans` fallback instead. `None` preserves authored-chart,
+    /// non-chart, and legacy-reader behavior.
+    pub chart_default_latin_font_family: Option<String>,
+    /// Uniform effective text styling retained by semantic imported-chart role.
+    ///
+    /// Empty for authored charts, non-chart drawings, and readers that do not
+    /// expose OOXML chart text. Mixed or unsupported styles instead add a typed
+    /// entry to [`Self::chart_unsupported_reasons`].
+    pub chart_text_styles: ChartTextStyles,
+    /// Whether the semantic category axis is visible for an imported chart.
+    ///
+    /// `None` preserves authored-chart, non-chart, and legacy-reader behavior;
+    /// retained OOXML charts use `Some(false)` for a deleted axis.
+    pub chart_category_axis_visible: Option<bool>,
+    /// Whether the semantic value axis is visible for an imported chart.
+    ///
+    /// `None` preserves authored-chart, non-chart, and legacy-reader behavior;
+    /// retained OOXML charts use `Some(false)` for a deleted axis.
+    pub chart_value_axis_visible: Option<bool>,
     /// Bounded cached chart data, aligned with the matching chart's series.
     ///
     /// Empty for authored charts and readers that cannot retain chart caches.
@@ -5928,10 +6035,12 @@ pub struct Sheet {
     pub(crate) imported_default_column_axis_measure: Option<ImportedAxisMeasure>,
     /// Per-row heights in points, populated by readers and authoring.
     pub(crate) row_heights: BTreeMap<u32, f32>,
-    /// Imported XLSX rows whose retained height is an automatic cached value.
+    /// Imported rows whose retained height is an automatic cached value.
     ///
-    /// Other readers retain only authoritative per-row heights. In particular,
-    /// XLSB accepts `BrtRowHdr.miyRw` only when its `fUnsynced` flag is set.
+    /// XLSX rows without `customHeight` and ODS rows whose resolved row style
+    /// enables `style:use-optimal-row-height` remain eligible for automatic
+    /// expansion. XLSB accepts `BrtRowHdr.miyRw` only when its `fUnsynced` flag
+    /// is set and therefore retains only authoritative per-row heights.
     pub(crate) automatic_row_height_candidates: BTreeSet<u32>,
     /// Exact imported per-row source geometry used only by renderers.
     pub(crate) imported_row_axis_measures: BTreeMap<u32, ImportedAxisMeasure>,
@@ -8460,9 +8569,10 @@ impl Sheet {
     /// Whether a retained per-row height is a manual geometry override.
     ///
     /// This is an internal cross-crate contract for `rxls-render`. XLSX rows
-    /// with valid cached heights but without `customHeight` retain source
-    /// geometry while remaining eligible for automatic height expansion.
-    /// Other retained per-row heights are authoritative.
+    /// with valid cached heights but without `customHeight`, and ODS rows whose
+    /// resolved row style enables `style:use-optimal-row-height`, retain source
+    /// geometry while remaining eligible for automatic height expansion. Other
+    /// retained per-row heights are authoritative.
     #[doc(hidden)]
     pub fn row_height_is_manual(&self, row: u32) -> bool {
         self.row_heights.contains_key(&row) && !self.automatic_row_height_candidates.contains(&row)
@@ -11225,6 +11335,18 @@ impl CellStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_charts_do_not_gain_imported_font_provenance() {
+        let mut sheet = Sheet::new("authored");
+        sheet.add_chart(Chart::new(ChartKind::Line, (0, 0), (10, 5)));
+
+        assert_eq!(sheet.charts().len(), 1);
+        assert!(sheet.drawing_metadata().is_empty());
+        assert!(DrawingMetadata::default()
+            .chart_default_latin_font_family
+            .is_none());
+    }
 
     #[test]
     fn decimal_ratio_parser_preserves_normal_and_scientific_values_exactly() {

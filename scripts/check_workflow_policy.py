@@ -100,9 +100,7 @@ ORACLE_TIMEOUT_EXPRESSION = (
 ORACLE_BUILDX_ACTION = (
     "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
 )
-ORACLE_CHECKOUT_ACTION = (
-    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
-)
+ORACLE_CHECKOUT_ACTION = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
 ORACLE_SETUP_PYTHON_ACTION = (
     "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
 )
@@ -119,8 +117,8 @@ ORACLE_RENDER_STEP_SHA256 = (
     "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
     "ca9d4b75751b6960f4ee6e43b45ba9b4ab660812f74e69d282a9e73005b901ec",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
-    "70fb927413f6ba0e98a8b745ae63ea2afa1d36fb5974dbbf3caecebeccdbae1a",
-    "919c12743484c191a2b1022b682926e0c2fc7d130ee882974be8cdd4168f96a6",
+    "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
+    "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
     "0b7845de075b054b21434bd0c1f308f267886103a00959b2735ae0622a586ac0",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
@@ -143,10 +141,10 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "36c0b9d3fc6f1fb0f2cc3147f802ba64a1f67aa37a7690a7670a5f1b214395ee"
+    "0f8c372052cfa06e392dcbede146c71aa9f713cda42c20134aa8cca6e8d7d706"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "270792ffcc76508a0b83b462efd55b56f2bfd864cccfe0275717bf3877e272ee"
+    "227ec48eaafd9dc4896fce146557872b8eee19d49eaa872c62d39c8c5454834b"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -333,7 +331,9 @@ def _workflow_trigger_names(text: str) -> tuple[set[str], list[str]]:
             entry = _yaml_mapping_entry(line)
             name = None if entry is None else entry[0]
         if name is None:
-            return set(), ["workflow on trigger block is not a supported YAML collection"]
+            return set(), [
+                "workflow on trigger block is not a supported YAML collection"
+            ]
         names.add(name)
     return names, []
 
@@ -579,9 +579,7 @@ _UNSAFE_SHELL_EXECUTORS = {
     "xargs",
 }
 _SHELL_INTERPRETERS = {"bash", "dash", "ksh", "sh", "zsh"}
-_PYTHON_INTERPRETER_RE = re.compile(
-    r"(?:python|pypy)(?:\d+(?:\.\d+)*)?\Z"
-)
+_PYTHON_INTERPRETER_RE = re.compile(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?\Z")
 _INLINE_EVAL_OPTIONS = {
     "lua": {"-e"},
     "node": {"-e", "--eval", "-p", "--print"},
@@ -692,15 +690,12 @@ def _inline_interpreter_is_unsafe(
     if _PYTHON_INTERPRETER_RE.fullmatch(executable):
         for index, argument in enumerate(arguments):
             if argument == "-c":
-                return (
-                    index + 1 >= len(arguments)
-                    or not _python_inline_is_policy_safe(arguments[index + 1])
+                return index + 1 >= len(arguments) or not _python_inline_is_policy_safe(
+                    arguments[index + 1]
                 )
             if argument.startswith("-c") and len(argument) > 2:
                 return not _python_inline_is_policy_safe(argument[2:])
-            if "$" in argument and (
-                index == 0 or argument.startswith("-")
-            ):
+            if "$" in argument and (index == 0 or argument.startswith("-")):
                 return True
         return False
     options = _INLINE_EVAL_OPTIONS.get(executable)
@@ -809,8 +804,10 @@ def _unwrap_executable_wrapper(
         token = tokens[index]
         if token == "--":
             return tokens, index + 1
-        if wrapper == "command" and token.startswith("-") and any(
-            flag in token[1:] for flag in ("v", "V")
+        if (
+            wrapper == "command"
+            and token.startswith("-")
+            and any(flag in token[1:] for flag in ("v", "V"))
         ):
             return [], 0
         option = token.split("=", 1)[0]
@@ -832,9 +829,7 @@ def _unwrap_executable_wrapper(
                 except ValueError:
                     return [], 0
                 return (
-                    tokens[: index - 1]
-                    + split_tokens
-                    + tokens[remaining_index:],
+                    tokens[: index - 1] + split_tokens + tokens[remaining_index:],
                     index - 1,
                 )
             index += 1
@@ -859,10 +854,7 @@ def _segment_invokes_docker_build(
     index = _command_index(tokens)
     if unresolved_executable or (
         index < len(tokens)
-        and (
-            _variable_name(tokens[index]) is not None
-            or tokens[index].startswith("$")
-        )
+        and (_variable_name(tokens[index]) is not None or tokens[index].startswith("$"))
     ):
         # A computed executable is precisely the kind of construct this
         # lightweight policy cannot prove safe.  Oracle build workflows must
@@ -899,8 +891,7 @@ def _segment_invokes_docker_build(
     if _inline_interpreter_is_unsafe(executable, tokens[index + 1 :]):
         return True
     if executable == "find" and any(
-        token in {"-exec", "-execdir", "-ok", "-okdir"}
-        for token in tokens[index + 1 :]
+        token in {"-exec", "-execdir", "-ok", "-okdir"} for token in tokens[index + 1 :]
     ):
         return True
     if executable != "docker":
@@ -924,16 +915,14 @@ def _segment_invokes_docker_build(
     if (
         arguments[0] in {"builder", "buildx", "compose", "image"}
         and len(arguments) >= 2
-        and (
-            _variable_name(arguments[1]) is not None
-            or "$" in arguments[1]
-        )
+        and (_variable_name(arguments[1]) is not None or "$" in arguments[1])
     ):
         return True
     return (
         arguments[0] == "build"
         or len(arguments) >= 2
-        and arguments[:2] in (
+        and arguments[:2]
+        in (
             ["builder", "build"],
             ["buildx", "bake"],
             ["buildx", "build"],
@@ -1001,9 +990,7 @@ def _workflow_run_scripts(text: str) -> list[str]:
     for line in _without_commented_lines(text).splitlines():
         if not line.strip():
             continue
-        entry = _yaml_mapping_entry(
-            _strip_yaml_inline_comment(line.lstrip(" "))
-        )
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
         if entry is not None and entry[0] == "steps" and entry[1] != "":
             scripts.append("\0")
     for blocks in _workflow_step_sequences(text):
@@ -1020,10 +1007,7 @@ def _workflow_run_scripts(text: str) -> list[str]:
                     effective_indent = mapping_indent
                 if effective_indent != mapping_indent or not content:
                     continue
-                if (
-                    _yaml_mapping_entry(_strip_yaml_inline_comment(content))
-                    is None
-                ):
+                if _yaml_mapping_entry(_strip_yaml_inline_comment(content)) is None:
                     has_unreadable_step = True
             names = [name for name, _, _, _ in entries]
             if len(names) != len(set(names)):
@@ -1157,9 +1141,7 @@ def _direct_docker_build_commands(text: str) -> list[str]:
     return commands
 
 
-def _audit_oracle_buildx_setup(
-    path: Path, text: str, errors: list[str]
-) -> None:
+def _audit_oracle_buildx_setup(path: Path, text: str, errors: list[str]) -> None:
     setup = _single_yaml_block(
         path,
         text,
@@ -1230,9 +1212,7 @@ def _audit_exact_wasm_bindgen_install(
     build_commands = _normalized_active_commands(build_step)
     workflow_commands = _normalized_active_commands(workflow_text)
     step_installs = [
-        command
-        for command in step_commands
-        if "install wasm-bindgen-cli" in command
+        command for command in step_commands if "install wasm-bindgen-cli" in command
     ]
     workflow_installs = [
         command
@@ -1286,9 +1266,9 @@ def _audit_exact_wasm_bindgen_install(
         for command in required_install_commands
         if step_commands.count(command) == 1
     ]
-    if len(install_positions) != len(required_install_commands) or install_positions != sorted(
-        install_positions
-    ):
+    if len(install_positions) != len(
+        required_install_commands
+    ) or install_positions != sorted(install_positions):
         errors.append(
             f"{path}: {label} must clean the temporary root before installing and "
             "export it only after exact-version verification"
@@ -1483,7 +1463,9 @@ def _workflow_job_step_sequences(
                 jobs.append((name, []))
                 continue
         if len(sequences) != 1:
-            errors.append(f"job {name!r} must contain exactly one inline steps sequence")
+            errors.append(
+                f"job {name!r} must contain exactly one inline steps sequence"
+            )
             continue
         jobs.append((name, sequences[0]))
     return jobs, errors
@@ -1549,9 +1531,7 @@ def _nested_mapping_values(
     return values
 
 
-def _step_values(
-    entries: list[tuple[str, str, int, int]], key: str
-) -> list[str]:
+def _step_values(entries: list[tuple[str, str, int, int]], key: str) -> list[str]:
     return [_yaml_unquote_scalar(value) for name, value, _, _ in entries if name == key]
 
 
@@ -1584,9 +1564,7 @@ def _audit_exact_job_step_sequence(
         indent = len(line) - len(line.lstrip(" "))
         if indent != 4:
             continue
-        entry = _yaml_mapping_entry(
-            _strip_yaml_inline_comment(line.lstrip(" "))
-        )
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
         if entry is not None and entry[0] == "uses":
             errors.append(
                 f"{path}: oracle-build job {job_name!r} cannot call a reusable workflow"
@@ -1596,9 +1574,7 @@ def _audit_exact_job_step_sequence(
     actual_step_sha256: list[str] = []
     unsupported = False
     for step_indent, block in matches[0]:
-        canonical_block = "\n".join(
-            _strip_yaml_inline_comment(line) for line in block
-        )
+        canonical_block = "\n".join(_strip_yaml_inline_comment(line) for line in block)
         actual_step_sha256.append(
             hashlib.sha256(canonical_block.encode("utf-8")).hexdigest()
         )
@@ -1703,8 +1679,7 @@ def _audit_snapshot_apt_block(
             errors.append(f"{path}: {label} {message}")
     for scope in scopes:
         command = (
-            "python3 scripts/render-oracle-host-tools.py "
-            f"apt-specs --scope {scope}"
+            f"python3 scripts/render-oracle-host-tools.py apt-specs --scope {scope}"
         )
         if block.count(command) != 1:
             errors.append(
@@ -1712,7 +1687,9 @@ def _audit_snapshot_apt_block(
             )
 
     commands = _normalized_active_commands(block)
-    apt_commands = [command for command in commands if command.startswith("sudo apt-get ")]
+    apt_commands = [
+        command for command in commands if command.startswith("sudo apt-get ")
+    ]
     if apt_commands != [
         'sudo apt-get "${APT_OPTIONS[@]}" update',
         (
@@ -1926,7 +1903,7 @@ def audit_tool_commands(path: Path, text: str) -> list[str]:
         ):
             errors.append(
                 f"{path}:{line_number}: cargo-fuzz install must use exact version "
-                f'{RELEASE_VERSIONS["CARGO_FUZZ_VERSION"]}'
+                f"{RELEASE_VERSIONS['CARGO_FUZZ_VERSION']}"
             )
 
     if re.search(r"rustup\s+toolchain\s+install\s+nightly(?:\s|$)", text):
@@ -1940,6 +1917,544 @@ def audit_release_versions(path: Path, text: str) -> list[str]:
     """Return violations for release toolchain and cargo-fuzz version pins."""
 
     return audit_fuzz_tools(path, text, tuple(RELEASE_VERSIONS))
+
+
+def audit_core_release_evidence(path: Path, text: str) -> list[str]:
+    """Require dry-run and immutable provenance evidence in the public bundle."""
+
+    active = _without_commented_lines(text)
+    errors: list[str] = []
+    required = {
+        "scripts/check_cargo_publish_dry_run.py": (
+            "must use the dependency-free crates.io dry-run runner and verifier"
+        ),
+        "target/package/release-cargo-publish-dry-run.json": (
+            "must retain the crates.io dry-run receipt"
+        ),
+        "dist/release-cargo-publish-dry-run.json": (
+            "must bind the crates.io dry-run receipt into the release manifest"
+        ),
+        "target/reproducibility/rxls-release-candidate-manifest.json": (
+            "must preserve the exact candidate manifest with reproducibility evidence"
+        ),
+        "target/reproducibility/rxls-release-reproducibility.json": (
+            "must retain the two-candidate comparison"
+        ),
+        "target/reproducibility/rxls-release-candidate-attestation.json": (
+            "must retain the immutable two-candidate attestation"
+        ),
+        "target/publication-attestation/rxls-tag-release-comparison.json": (
+            "must retain the exact tag-to-candidate comparison"
+        ),
+        "- name: Bind publication provenance into release manifest": (
+            "must assemble public provenance before registry publication"
+        ),
+        "cp target/publication-attestation/rxls-release-candidate-manifest.json dist/": (
+            "public bundle must contain the attested candidate manifest"
+        ),
+        "cp target/publication-attestation/rxls-release-reproducibility.json dist/": (
+            "public bundle must contain the two-candidate comparison"
+        ),
+        "cp target/publication-attestation/rxls-release-candidate-attestation.json dist/": (
+            "public bundle must contain the candidate attestation"
+        ),
+        "cp target/publication-attestation/rxls-tag-release-comparison.json dist/": (
+            "public bundle must contain the tag comparison"
+        ),
+        "target/release-public-hygiene-publication.json": (
+            "must rerun public hygiene after adding provenance"
+        ),
+        "! -name rxls-release-manifest.json": (
+            "final manifest assembly must exclude only its own output"
+        ),
+        "! -name public-hygiene.json": (
+            "final manifest assembly must bind hygiene through its evidence record"
+        ),
+        "[[ ${#artifacts[@]} -eq 50 ]]": (
+            "must fail closed on the exact final manifest input count"
+        ),
+        '"${artifacts[@]}"': ("must bind every enumerated publication artifact"),
+        "group: core-release-${{ github.ref }}": (
+            "must serialize publication attempts for the same ref"
+        ),
+        "cancel-in-progress: false": (
+            "must not cancel an in-flight external publication"
+        ),
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"': (
+            "must require the release tag to equal the exact public main head"
+        ),
+        "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}": (
+            "must pass the crates.io token without embedding it in command argv"
+        ),
+        "cargo publish --locked --registry crates-io": (
+            "must bind real publication to the attested crates.io registry"
+        ),
+        'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags': (
+            "must refetch the hosted release tag before irreversible publication"
+        ),
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"': (
+            "must bind the refetched release tag to the publication commit"
+        ),
+    }
+    for snippet, message in required.items():
+        if snippet not in active:
+            errors.append(f"{path}: {message}")
+
+    run_pattern = re.compile(
+        r"^[ \t]*python3 scripts/check_cargo_publish_dry_run\.py run [\\]\n"
+        r"[ \t]+--manifest Cargo\.toml [\\]\n"
+        r'[ \t]+--git-sha "\$GITHUB_SHA" [\\]\n'
+        r"[ \t]+--output target/package/"
+        r"release-cargo-publish-dry-run\.json[ \t]*$",
+        re.MULTILINE,
+    )
+    verify_pattern = re.compile(
+        r"^[ \t]*python3 scripts/check_cargo_publish_dry_run\.py verify [\\]\n"
+        r"[ \t]+--manifest Cargo\.toml [\\]\n"
+        r'[ \t]+--git-sha "\$GITHUB_SHA" [\\]\n'
+        r"[ \t]+--receipt ([^\r\n]+?)[ \t]*$",
+        re.MULTILINE,
+    )
+    if len(run_pattern.findall(active)) != 1:
+        errors.append(
+            f"{path}: expected exactly one dependency-free crates.io dry-run runner"
+        )
+    if len(verify_pattern.findall(active)) != 7:
+        errors.append(
+            f"{path}: expected seven exact crates.io dry-run evidence verifications"
+        )
+    if "cargo publish --dry-run" in active:
+        errors.append(
+            f"{path}: bare or inline cargo publish dry runs are forbidden; "
+            "the evidence runner must execute the exact argv"
+        )
+    if "cargo publish --locked --token" in active:
+        errors.append(
+            f"{path}: crates.io token must not be interpolated into command argv"
+        )
+
+    identity_step = _single_yaml_block(
+        path,
+        active,
+        "- name: Validate release identity",
+        6,
+        "release identity step",
+        errors,
+    )
+    exact_main = 'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"'
+    if identity_step.count(exact_main) != 1:
+        errors.append(
+            f"{path}: release identity step must bind the tag to exact origin/main"
+        )
+    if active.count(exact_main) != 2:
+        errors.append(
+            f"{path}: exact origin/main must be checked at tag validation and again "
+            "immediately before crates.io publication"
+        )
+    if "git merge-base --is-ancestor" in identity_step:
+        errors.append(f"{path}: ancestor-only release tag validation is forbidden")
+
+    canonical_step = _single_yaml_block(
+        path,
+        active,
+        "- name: Run canonical release gate",
+        6,
+        "canonical release gate step",
+        errors,
+    )
+    package_gate = (
+        "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate"
+    )
+    release_build = "cargo build --release --all-features --locked"
+    package_index = canonical_step.find(package_gate)
+    runner_match = run_pattern.search(canonical_step)
+    build_index = canonical_step.find(release_build)
+    if not (
+        package_index >= 0
+        and runner_match is not None
+        and package_index < runner_match.start() < build_index
+    ):
+        errors.append(
+            f"{path}: the exact crates.io dry-run runner must follow package validation"
+        )
+    if runner_match is not None and build_index >= 0:
+        dry_run_slice = canonical_step[runner_match.start() : build_index]
+        if "<<" in dry_run_slice or "write_text" in dry_run_slice:
+            errors.append(f"{path}: inline or heredoc dry-run receipts are forbidden")
+
+    verification_contracts = (
+        (
+            "- name: Generate release evidence",
+            ["dist/release-cargo-publish-dry-run.json"],
+            "candidate evidence generation",
+        ),
+        (
+            "- name: Compare clean release candidates",
+            [
+                "target/baseline-release/release-cargo-publish-dry-run.json",
+                "dist/release-cargo-publish-dry-run.json",
+            ],
+            "candidate comparison",
+        ),
+        (
+            "- name: Require exact-SHA two-candidate publication attestation",
+            [
+                "target/attested-candidate-release/release-cargo-publish-dry-run.json",
+                "dist/release-cargo-publish-dry-run.json",
+            ],
+            "tag authorization",
+        ),
+        (
+            "- name: Bind publication provenance into release manifest",
+            ["dist/release-cargo-publish-dry-run.json"],
+            "final publication assembly",
+        ),
+        (
+            "- name: Verify published crate, WASM, docs, assets, and checksums",
+            ['"$smoke/assets/release-cargo-publish-dry-run.json"'],
+            "post-download release verification",
+        ),
+    )
+    verification_steps: dict[str, str] = {}
+    for header, expected_receipts, label in verification_contracts:
+        step = _single_yaml_block(path, active, header, 6, label, errors)
+        verification_steps[header] = step
+        actual_receipts = verify_pattern.findall(step)
+        if actual_receipts != expected_receipts:
+            errors.append(f"{path}: {label} must verify exactly {expected_receipts!r}")
+        if "continue-on-error:" in step:
+            errors.append(f"{path}: {label} must fail closed")
+
+    generation_step = verification_steps.get("- name: Generate release evidence", "")
+    crate_copy_index = generation_step.find(
+        'cp "target/package/rxls-${version}.crate" dist/'
+    )
+    receipt_copy_index = generation_step.find(
+        "cp target/package/release-cargo-publish-dry-run.json dist/"
+    )
+    generation_verify = verify_pattern.search(generation_step)
+    if not (
+        crate_copy_index >= 0
+        and receipt_copy_index >= 0
+        and generation_verify is not None
+        and crate_copy_index < generation_verify.start()
+        and receipt_copy_index < generation_verify.start()
+    ):
+        errors.append(
+            f"{path}: candidate evidence must verify the copied adjacent crate and receipt"
+        )
+
+    comparison_step = verification_steps.get(
+        "- name: Compare clean release candidates", ""
+    )
+    if not (
+        0
+        <= comparison_step.find('gh run download "$baseline_run_id"')
+        < (
+            verify_pattern.search(comparison_step).start()
+            if verify_pattern.search(comparison_step)
+            else -1
+        )
+    ):
+        errors.append(
+            f"{path}: candidate comparison must verify evidence after artifact download"
+        )
+
+    authorization_step = verification_steps.get(
+        "- name: Require exact-SHA two-candidate publication attestation", ""
+    )
+    authorization_verify = verify_pattern.search(authorization_step)
+    if not (
+        0
+        <= authorization_step.find('gh run download "$selected_run"')
+        < (authorization_verify.start() if authorization_verify else -1)
+    ):
+        errors.append(
+            f"{path}: tag authorization must verify the downloaded candidate receipt"
+        )
+
+    final_step = verification_steps.get(
+        "- name: Bind publication provenance into release manifest", ""
+    )
+    final_verify = verify_pattern.search(final_step)
+    if final_verify is None or not (
+        final_verify.start()
+        < final_step.find("python3 scripts/public_hygiene_audit.py --json dist")
+        < final_step.find("python3 scripts/release_manifest.py")
+    ):
+        errors.append(
+            f"{path}: final assembly must verify dry-run evidence before hygiene and manifest generation"
+        )
+
+    post_step = verification_steps.get(
+        "- name: Verify published crate, WASM, docs, assets, and checksums", ""
+    )
+    post_verify = verify_pattern.search(post_step)
+    if post_verify is None or not (
+        0
+        <= post_step.find('gh release download "$tag"')
+        < post_verify.start()
+        < post_step.find("python3 scripts/release_manifest.py")
+    ):
+        errors.append(
+            f"{path}: post-download verification must validate dry-run evidence before the bundle"
+        )
+
+    if active.count("--expected-files 48") != 2:
+        errors.append(
+            f"{path}: candidate bundle must be verified twice at exactly 48 files"
+        )
+    if active.count("--expected-files 52") != 3:
+        errors.append(
+            f"{path}: public bundle must be assembled, published, and downloaded "
+            "at exactly 52 files"
+        )
+    if re.search(r"--expected-files\s+47\b", active):
+        errors.append(f"{path}: stale pre-evidence release-bundle count is forbidden")
+
+    candidate_manifest_upload = (
+        "            target/reproducibility/rxls-release-candidate-manifest.json"
+    )
+    if active.count(candidate_manifest_upload) != 1:
+        errors.append(
+            f"{path}: reproducibility upload must contain one candidate-manifest copy"
+        )
+
+    provenance_index = active.find(
+        "- name: Bind publication provenance into release manifest"
+    )
+    crates_publish_index = active.find("- name: Publish to crates.io")
+    github_release_index = active.find("- name: Create or update GitHub release")
+    if not (0 <= provenance_index < crates_publish_index < github_release_index):
+        errors.append(
+            f"{path}: provenance binding must precede registry and GitHub publication"
+        )
+
+    provenance_step = final_step
+    if "continue-on-error:" in provenance_step:
+        errors.append(f"{path}: publication provenance assembly must fail closed")
+    for command in (
+        "python3 scripts/public_hygiene_audit.py --json dist",
+        "python3 scripts/release_manifest.py",
+        "--verify-bundle dist",
+        "--expected-files 52",
+    ):
+        if command not in provenance_step:
+            errors.append(f"{path}: publication provenance step is missing {command!r}")
+
+    crates_publish_step = _single_yaml_block(
+        path,
+        active,
+        "- name: Publish to crates.io",
+        6,
+        "crates.io publication step",
+        errors,
+    )
+    publish_commands = _normalized_active_commands(crates_publish_step)
+    prepublication_commands = (
+        "git fetch origin main --no-tags",
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+        'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags',
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+    )
+    publish_command = "cargo publish --locked --registry crates-io"
+    if any(publish_commands.count(command) != 1 for command in prepublication_commands):
+        errors.append(
+            f"{path}: crates.io publication must revalidate exact remote main and tag refs"
+        )
+    if publish_commands.count(publish_command) != 1:
+        errors.append(
+            f"{path}: crates.io publication must use one exact registry-bound command"
+        )
+    command_positions = [
+        crates_publish_step.find(command)
+        for command in (*prepublication_commands, publish_command)
+    ]
+    if not all(
+        left >= 0 and left < right
+        for left, right in zip(command_positions, command_positions[1:])
+    ):
+        errors.append(
+            f"{path}: remote ref revalidation must immediately precede crates.io publication"
+        )
+
+    github_release_step = _single_yaml_block(
+        path,
+        active,
+        "- name: Create or update GitHub release",
+        6,
+        "exact GitHub Release reconciliation step",
+        errors,
+    )
+    required_release_step = {
+        "if: github.event_name == 'push'": (
+            "GitHub Release reconciliation must run only for a tag push"
+        ),
+        "GH_TOKEN: ${{ github.token }}": (
+            "GitHub Release reconciliation must use the scoped workflow token"
+        ),
+        "shell: bash": "GitHub Release reconciliation must use Bash",
+        "set -euo pipefail": "GitHub Release reconciliation must fail closed",
+        'tag="$GITHUB_REF_NAME"': (
+            "GitHub Release reconciliation must bind the pushed tag"
+        ),
+    }
+    for snippet, message in required_release_step.items():
+        if github_release_step.count(snippet) != 1:
+            errors.append(f"{path}: {message}")
+    exact_reconciliation = (
+        "python3 scripts/reconcile_github_release.py "
+        '--repository "$GITHUB_REPOSITORY" '
+        '--tag "$tag" '
+        '--target-commitish "$GITHUB_SHA" '
+        "--dist dist "
+        "--expected-files 52 "
+        "--token-env GH_TOKEN"
+    )
+    commands = _normalized_active_commands(github_release_step)
+    if commands.count(exact_reconciliation) != 1:
+        errors.append(
+            f"{path}: GitHub Release reconciliation must retain every exact binding"
+        )
+    if "continue-on-error:" in github_release_step:
+        errors.append(f"{path}: GitHub Release reconciliation must not be bypassable")
+    if re.search(
+        r"\bgh\s+release\s+(?:create|edit|upload|delete)\b", github_release_step
+    ):
+        errors.append(
+            f"{path}: unchecked gh release mutation must not bypass the reconciler"
+        )
+    if "dist/*" in github_release_step:
+        errors.append(
+            f"{path}: wildcard GitHub Release upload must not bypass exact inventory"
+        )
+    return errors
+
+
+def audit_github_release_reconciler(path: Path, text: str) -> list[str]:
+    """Freeze the fail-closed behaviors behind GitHub Release publication."""
+
+    active = _without_commented_lines(text)
+    errors: list[str] = []
+    required = {
+        "if len(entries) != expected_files:": (
+            "must inventory the exact local file count"
+        ),
+        "if path.is_symlink() or not path.is_file():": (
+            "must reject non-regular and symlinked local assets"
+        ),
+        "asset_ids = validate_reconcilable_remote_assets(current_assets)": (
+            "must validate the complete hosted inventory before mutation"
+        ),
+        "client.delete_release_asset(asset_id)": (
+            "must delete stale, duplicate-name, and replaced hosted assets"
+        ),
+        "if remaining_assets != []:": (
+            "must prove hosted assets were cleared before replacement"
+        ),
+        "client.upload_release_asset(release_id, local_assets[name])": (
+            "must upload every expected local asset"
+        ),
+        '{"draft": False, "prerelease": False}': (
+            "must normalize draft and prerelease state"
+        ),
+        "require_published=True": (
+            "must require a published release after normalization"
+        ),
+        "validate_published_assets(": ("must run the exact hosted-asset verifier"),
+        "if len(remote_assets) != len(local_assets):": (
+            "must verify the exact hosted asset count"
+        ),
+        "if name in seen_names:": ("must reject duplicate hosted asset names"),
+        'if raw.get("state") != "uploaded":': (
+            "must require uploaded hosted asset state"
+        ),
+        "size != local.size": ("must compare hosted and local byte sizes"),
+        "DIGEST_RE.fullmatch(digest) is None": (
+            "must require canonical hosted SHA-256 metadata"
+        ),
+        "if digest != local.digest:": ("must compare hosted and local SHA-256 digests"),
+        "if seen_names != set(local_assets):": (
+            "must compare the exact hosted and local asset-name sets"
+        ),
+        "SHA_RE.fullmatch(target_commitish) is None": (
+            "must require a canonical expected commit SHA"
+        ),
+        'self._api(f"/git/ref/tags/{encoded_tag}")': (
+            "must resolve the explicit hosted tag-ref namespace"
+        ),
+        "client.get_tag_commit_sha(tag) != target_commitish": (
+            "must verify that the hosted tag resolves to the expected commit"
+        ),
+        "if already_exact:": (
+            "must leave an exact published release unchanged on rerun"
+        ),
+        "if immutable is True:": ("must fail closed for an inexact immutable release"),
+        'if release.get("draft") is not True:': (
+            "must replace hosted assets only while the release is an explicit draft"
+        ),
+    }
+    for snippet, message in required.items():
+        if snippet not in active:
+            errors.append(f"{path}: GitHub Release reconciler {message}")
+    if active.count("client.get_tag_commit_sha(tag) != target_commitish") != 3:
+        errors.append(
+            f"{path}: GitHub Release reconciler must verify the tag commit "
+            "before mutation and after either idempotent or mutable publication"
+        )
+    if active.count("require_published=True") != 2:
+        errors.append(
+            f"{path}: GitHub Release reconciler must require published state "
+            "for both idempotent and mutable completion"
+        )
+    if "        return\n    immutable = release.get" not in active:
+        errors.append(
+            f"{path}: GitHub Release reconciler exact-release rerun must be a no-op"
+        )
+    draft_guard = active.find('if release.get("draft") is not True:')
+    mutation_start = active.find(
+        "asset_ids = validate_reconcilable_remote_assets(current_assets)"
+    )
+    if draft_guard < 0 or mutation_start < 0 or draft_guard >= mutation_start:
+        errors.append(
+            f"{path}: GitHub Release reconciler must reject a non-draft release "
+            "before any destructive asset mutation"
+        )
+
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as error:
+        errors.append(f"{path}: GitHub Release reconciler is invalid Python: {error}")
+        return errors
+    allowed_imports = {
+        "__future__",
+        "argparse",
+        "dataclasses",
+        "datetime",
+        "hashlib",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "ssl",
+        "sys",
+        "time",
+        "typing",
+        "urllib",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name.split(".", 1)[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module.split(".", 1)[0] if node.module else ""]
+        else:
+            continue
+        for module in modules:
+            if module not in allowed_imports:
+                errors.append(
+                    f"{path}: GitHub Release reconciler dependency {module!r} is forbidden"
+                )
+    return errors
 
 
 def audit_semver_gate(path: Path, text: str) -> list[str]:
@@ -2087,6 +2602,97 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "target/render-oracle-hosted/build.stderr",
         errors,
     )
+    pinned_type0_pdf_gate = _single_yaml_block(
+        path,
+        active,
+        "- name: Run the project-native Type0 PDF Poppler smoke",
+        6,
+        "pinned Type0 PDF descriptor and Poppler gate step",
+        errors,
+    )
+    expected_pinned_type0_pdf_gate = (
+        "      - name: Run the project-native Type0 PDF Poppler smoke\n"
+        "        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}\n"
+        "        shell: bash\n"
+        "        env:\n"
+        '          RXLS_REQUIRE_POPPLER: "1"\n'
+        "          RXLS_TEST_FONT_PACK_MANIFEST: "
+        "${{ github.workspace }}/local/render-fonts/pack/manifest.json\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]\n'
+        '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
+        "          command -v pdffonts\n"
+        "          command -v pdfinfo\n"
+        "          command -v pdftoppm\n"
+        "          command -v pdftotext\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
+        "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
+        "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
+        "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
+        "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --test printing "
+        "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --test printing "
+        "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
+        "            -- --exact"
+    )
+    if pinned_type0_pdf_gate != expected_pinned_type0_pdf_gate:
+        errors.append(
+            f"{path}: pinned Type0 PDF descriptor and Poppler gate must retain "
+            "the exact verified manifest, fail-closed Poppler environment, and "
+            "reviewed exact tests"
+        )
     pinned_font_cli_regression = _single_yaml_block(
         path,
         active,
@@ -2112,7 +2718,21 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "render/Cargo.toml \\\n"
         "            --lib "
         "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height: test'\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --lib "
+        "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
         "            -- --exact\n"
+        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "render/Cargo.toml \\\n"
+        "            --test printing "
+        "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'\n"
         "          cargo +1.85.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
@@ -2127,6 +2747,9 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     type0_smoke_index = active.find(
         "- name: Run the project-native Type0 PDF Poppler smoke"
     )
+    font_acquisition_index = active.find(
+        "- name: Acquire fonts and generate the selected deterministic corpus"
+    )
     pinned_font_regression_index = active.find(
         "- name: Run the pinned-font SinglePageSheets CLI geometry regression"
     )
@@ -2135,13 +2758,14 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     )
     if not (
         0
-        <= type0_smoke_index
+        <= font_acquisition_index
+        < type0_smoke_index
         < pinned_font_regression_index
         < oracle_image_build_index
     ):
         errors.append(
-            f"{path}: pinned-font CLI regression must run after renderer integration "
-            "test availability and before the oracle image build"
+            f"{path}: pinned Type0 and CLI regressions must run after verified font "
+            "pack acquisition and before the oracle image build"
         )
     host_acquisition = _single_yaml_block(
         path,
@@ -2352,16 +2976,12 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             '"paths_or_content_retained")\n'
             "                          and item is False\n"
             "                      )"
-        ): (
-            "must allow only the exact false repeatability retention assertion"
-        ),
+        ): ("must allow only the exact false repeatability retention assertion"),
         (
             "allow_retention_policy=(\n"
             '                          aggregate_path.name == "repeatability.json"\n'
             "                      )"
-        ): (
-            "must scope the retention-key exception to repeatability evidence"
-        ),
+        ): ("must scope the retention-key exception to repeatability evidence"),
         "item, (*key_path, index), allow_retention_policy": (
             "must preserve list position so the retention exception applies "
             "only at the exact direct key path"
@@ -2462,9 +3082,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         (
             "if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' "
             "&& env.RXLS_ORACLE_CAMPAIGN == 'pilot' }}"
-        ): (
-            "runtime smoke must run only for normal 40-case pilot campaigns"
-        ),
+        ): ("runtime smoke must run only for normal 40-case pilot campaigns"),
         "python3 scripts/smoke-render-oracle-runtime.py \\": (
             "runtime smoke must use the reviewed bounded adapter preflight"
         ),
@@ -2483,8 +3101,17 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens": (
             "must attest Type0 embedded text and exact Poppler word boxes"
         ),
-        "          RXLS_REQUIRE_POPPLER=1 cargo +1.85.0 test": (
+        '          RXLS_REQUIRE_POPPLER: "1"': (
             "must fail closed when the native PDF Poppler tools are unavailable"
+        ),
+        "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics": (
+            "must attest raw Arimo and Noto OS/2 Windows descriptor metrics"
+        ),
+        "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics": (
+            "must attest scaled Arimo and Noto PDF descriptor metrics"
+        ),
+        "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics": (
+            "must attest Arimo and Noto Poppler boxes from the pinned descriptors"
         ),
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text": (
             "must attest project-native PDF page order and extractable text"
@@ -2570,10 +3197,10 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '"scale": expected_authored_print // 2': (
             "must bind half of authored-print workbooks to explicit-scale mode"
         ),
-        '== expected_authored_print_pages': (
+        "== expected_authored_print_pages": (
             "must validate the mixed authored-print page total"
         ),
-        '== expected_authored_print_page_count_histogram': (
+        "== expected_authored_print_page_count_histogram": (
             "must validate authored-print page counts by pagination mode"
         ),
         '"pages_per_workbook_by_scale_mode"': (
@@ -2582,7 +3209,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         'authored_gate["evidence"]["oracle_libreoffice_artifact_sha256"]': (
             "must bind authored-print evidence to the locked LibreOffice artifact"
         ),
-        'for name, digest in poppler_sha256.items():': (
+        "for name, digest in poppler_sha256.items():": (
             "must cross-bind every gate to all four exact Poppler executables"
         ),
         'authored_gate["evidence"][f"{name}_sha256"] == digest': (
@@ -2639,13 +3266,13 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '"reviewed_baseline_available": (': (
             "must distinguish a reviewed ratchet from a bootstrap candidate"
         ),
-        'test ! -e scripts/render-parity-baseline-full.json || STATUS=1': (
+        "test ! -e scripts/render-parity-baseline-full.json || STATUS=1": (
             "candidate mode must require the reviewed baseline to be absent"
         ),
-        'git ls-files --error-unmatch scripts/render-parity-baseline-full.json': (
+        "git ls-files --error-unmatch scripts/render-parity-baseline-full.json": (
             "verify mode must require a tracked reviewed baseline"
         ),
-        'cmp --silent': (
+        "cmp --silent": (
             "candidate bootstrap must authenticate the emitted review candidate"
         ),
         'gate["evidence"]["oracle_build_contract_sha256"]': (
@@ -2730,7 +3357,9 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     if re.search(r"python-version:\s*[\"']?3\.13[\"']?\s*$", text, re.MULTILINE):
         errors.append(f"{path}: mutable Python minor selectors are forbidden")
     if "runtime_verified_unpinned" in text or "runtime_verified" in text:
-        errors.append(f"{path}: normal oracle gates must not accept unpinned identities")
+        errors.append(
+            f"{path}: normal oracle gates must not accept unpinned identities"
+        )
     candidate_branch = re.search(
         r"(?ms)^\s{14}candidate\)\s*$"
         r"(?P<body>.*?)"
@@ -2741,9 +3370,8 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         active.count("--create") != 1
         or candidate_branch is None
         or candidate_branch.group("body").count("--create") != 1
-        or "scripts/render-parity-baseline-full.json" not in candidate_branch.group(
-            "body"
-        )
+        or "scripts/render-parity-baseline-full.json"
+        not in candidate_branch.group("body")
     ):
         errors.append(
             f"{path}: baseline creation must be isolated to the fail-closed "
@@ -2809,44 +3437,43 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             "type: choice" not in body
             or "default: verify" not in body
             or len(re.findall(r"^\s+- verify\s*$", body, re.MULTILINE)) != 1
-            or len(re.findall(r"^\s+- candidate\s*$", body, re.MULTILINE))
-            != 1
+            or len(re.findall(r"^\s+- candidate\s*$", body, re.MULTILINE)) != 1
         ):
             errors.append(
                 f"{path}: workflow_dispatch baseline mode must be an exact "
                 "candidate/verify choice"
             )
 
-    if re.search(
-        r"--max-(?:similarity|blur|mask)-drift-ppm(?:=|\s)", text
-    ):
+    if re.search(r"--max-(?:similarity|blur|mask)-drift-ppm(?:=|\s)", text):
         errors.append(
             f"{path}: same-SHA drift thresholds must use the calibrated checked-in defaults"
         )
     if text.count('test "$FULL_REPEAT_COUNT" = "2"') != 1:
         errors.append(f"{path}: full mode must require exactly two same-SHA campaigns")
     if text.count('test "$FULL_SHARD_COUNT" = "4"') != 1:
-        errors.append(f"{path}: full mode must require exactly four deterministic shards")
+        errors.append(
+            f"{path}: full mode must require exactly four deterministic shards"
+        )
     if text.count('test "$MAX_PARALLEL_SHARDS" = "2"') != 1:
         errors.append(f"{path}: full mode must cap concurrent shard processes at two")
-    if len(
-        re.findall(
-            r"^\s*python3 scripts/check-render-fidelity-targets\.py\s+\\$",
-            text,
-            re.MULTILINE,
+    if (
+        len(
+            re.findall(
+                r"^\s*python3 scripts/check-render-fidelity-targets\.py\s+\\$",
+                text,
+                re.MULTILINE,
+            )
         )
-    ) != 2:
-        errors.append(f"{path}: pilot/full evidence needs one absolute gate per campaign")
+        != 2
+    ):
+        errors.append(
+            f"{path}: pilot/full evidence needs one absolute gate per campaign"
+        )
     if text.count("| tee target/render-oracle-hosted/fidelity-") != 2:
         errors.append(
             f"{path}: absolute-gate aggregate diagnostics must remain visible on failure"
         )
-    if (
-        text.count(
-            "| tee target/render-oracle-hosted/authored-print-gate.json"
-        )
-        != 1
-    ):
+    if text.count("| tee target/render-oracle-hosted/authored-print-gate.json") != 1:
         errors.append(
             f"{path}: authored-print aggregate diagnostics must remain visible on failure"
         )
@@ -2902,15 +3529,14 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
             line.strip() for line in upload.group("paths").splitlines() if line.strip()
         }
         if uploaded != allowed_artifacts:
-            errors.append(f"{path}: hosted artifacts must use the exact aggregate-only allowlist")
+            errors.append(
+                f"{path}: hosted artifacts must use the exact aggregate-only allowlist"
+            )
 
     failure_evidence = _single_yaml_block(
         path,
         active,
-        (
-            "- name: Generate and validate sanitized Render Oracle "
-            "failure evidence"
-        ),
+        ("- name: Generate and validate sanitized Render Oracle failure evidence"),
         6,
         "Render Oracle failure-evidence generation step",
         errors,
@@ -2929,7 +3555,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "--output target/render-oracle-failure/render-oracle-failure-summary.json",
         (
             'python3 - "$EXPECTED_HEAD_SHA" "$RXLS_ORACLE_CAMPAIGN" '
-            '"$RXLS_BASELINE_MODE" <<\'PY\''
+            "\"$RXLS_BASELINE_MODE\" <<'PY'"
         ),
         "from scripts.check_render_oracle_release_evidence import (",
         "validate_failure_summary,",
@@ -2938,10 +3564,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "profile=sys.argv[2]",
         "baseline_mode=sys.argv[3]",
     }
-    if any(
-        value not in failure_evidence
-        for value in failure_evidence_required
-    ):
+    if any(value not in failure_evidence for value in failure_evidence_required):
         errors.append(
             f"{path}: failed reports must pass through the exact bounded "
             "path-neutral summary and independent validation commands"
@@ -3007,7 +3630,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "continue-on-error: true",
         "shell: bash",
         "set -euo pipefail",
-        'python3 - "$GITHUB_STEP_SUMMARY" <<\'PY\'',
+        "python3 - \"$GITHUB_STEP_SUMMARY\" <<'PY'",
         '"### Sanitized Render Oracle failure evidence"',
         'summary["reports"]',
         "fidelity['semantic_visible_characters']['f1_ppm']",
@@ -3015,10 +3638,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "fidelity['poppler_lines']['f1_ppm']",
         "fidelity['raster']['similarity_ppm']",
     }
-    if any(
-        value not in failure_overview
-        for value in failure_overview_required
-    ):
+    if any(value not in failure_overview for value in failure_overview_required):
         errors.append(
             f"{path}: the failure overview must be bounded, non-blocking, "
             "and consume only successfully uploaded sanitized evidence"
@@ -3040,9 +3660,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     overview_position = active.find(
         "- name: Append bounded Render Oracle failure overview"
     )
-    if not (
-        0 <= evidence_position < upload_position < overview_position
-    ):
+    if not (0 <= evidence_position < upload_position < overview_position):
         errors.append(
             f"{path}: validated failure evidence must be uploaded before "
             "any best-effort presentation"
@@ -3083,6 +3701,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         '      - "scripts/render-oracle-container/**"',
         '      - "scripts/run-render-oracle-container.py"',
         '      - "scripts/test_render_oracle_container.py"',
+        '      - "scripts/test_workflow_policy.py"',
     ):
         if trigger_path not in pull_request.splitlines():
             errors.append(
@@ -3105,8 +3724,19 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "PDF policy step",
         errors,
     )
-    if "run: python3 scripts/check_workflow_policy.py" not in pdf_policy_step:
-        errors.append(f"{path}: PDF job must actively enforce hosted workflow policy")
+    expected_pdf_policy_step = (
+        "      - name: Enforce hosted workflow policy\n"
+        "        shell: bash\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          python3 scripts/check_workflow_policy.py\n"
+        "          python3 scripts/test_workflow_policy.py"
+    )
+    if pdf_policy_step != expected_pdf_policy_step:
+        errors.append(
+            f"{path}: PDF job must fail closed through the checker and its "
+            "focused mutation suite"
+        )
 
     host_bootstrap = _single_yaml_block(
         path,
@@ -3170,9 +3800,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
             'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
             "--no-install-recommends --allow-downgrades "
             '"${SYSTEM_PACKAGES[@]}"'
-        ): (
-            "strict PDF gate must install only exact locked package specs"
-        ),
+        ): ("strict PDF gate must install only exact locked package specs"),
         (
             "python3 scripts/render-oracle-host-tools.py verify --scope poppler "
             "--output target/poppler-identity.json"
@@ -3192,6 +3820,35 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     if bootstrap_index < 0 or strict_index < 0 or bootstrap_index >= strict_index:
         errors.append(f"{path}: host bootstrap must precede the strict PDF gate")
 
+    pdf_exact_test_gate = _single_yaml_block(
+        path,
+        pdf_job,
+        "- name: Reopen deterministic PDFs and extract Latin, Korean, and RTL text",
+        6,
+        "deterministic PDF exact-test gate",
+        errors,
+    )
+    expected_pdf_exact_test_gate = (
+        "      - name: Reopen deterministic PDFs and extract Latin, Korean, and RTL text\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+        "            --test printing "
+        "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'\n"
+        "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+        "            --test printing "
+        "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
+        "            -- --exact"
+    )
+    if pdf_exact_test_gate != expected_pdf_exact_test_gate:
+        errors.append(
+            f"{path}: deterministic PDF exact-test gate must prove one discovered "
+            "test before executing the reviewed selector"
+        )
+
     image_job = _single_yaml_block(
         path, active, "oracle-image:", 2, "oracle-image job", errors
     )
@@ -3207,9 +3864,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         ORACLE_HARDENING_IMAGE_STEP_SHA256,
         errors,
     )
-    image_runners = re.findall(
-        r"^\s{4}runs-on:\s*(\S+)\s*$", image_job, re.MULTILINE
-    )
+    image_runners = re.findall(r"^\s{4}runs-on:\s*(\S+)\s*$", image_job, re.MULTILINE)
     if image_runners != ["ubuntu-24.04"]:
         errors.append(f"{path}: oracle-image job must use only ubuntu-24.04")
     if "    name: locked LibreOffice oracle image" not in image_job.splitlines():
@@ -3404,7 +4059,9 @@ def audit_codeql_workflow(path: Path, text: str) -> list[str]:
         or init_index >= min(build_indices)
         or max(build_indices) >= analyze_index
     ):
-        errors.append(f"{path}: explicit Rust builds must run between CodeQL init and analysis")
+        errors.append(
+            f"{path}: explicit Rust builds must run between CodeQL init and analysis"
+        )
     return errors
 
 
@@ -3533,7 +4190,7 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
             "Chrome runtime inspection must fail on unresolved libraries"
         ),
         (
-            'printf \'%s\\n\' "PASS pinned Chromium runtime closure resolved" '
+            "printf '%s\\n' \"PASS pinned Chromium runtime closure resolved\" "
             "\\\n            > target/render-browser-evidence/chromium-runtime.txt"
         ): "Chrome runtime preflight must retain only path-neutral PASS evidence",
         (
@@ -3553,10 +4210,7 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
         ),
         (
             "- name: Pack and consume the publishable artifact",
-            (
-                "2>&1 | tee "
-                "../render-browser-evidence/installed-package-chromium.log"
-            ),
+            ("2>&1 | tee ../render-browser-evidence/installed-package-chromium.log"),
         ),
     ):
         step = _single_yaml_block(
@@ -3621,9 +4275,7 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
     for line in summary_step.splitlines()[1:]:
         if len(line) - len(line.lstrip(" ")) != 8:
             continue
-        entry = _yaml_mapping_entry(
-            _strip_yaml_inline_comment(line.lstrip(" "))
-        )
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
         if entry is not None:
             summary_top_keys.append(entry[0])
     if summary_top_keys != ["shell", "env", "run"]:
@@ -3631,15 +4283,11 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
             f"{path}: browser evidence build must use only exact shell, env, and run fields"
         )
     summary_requirements = {
-        "        shell: bash": (
-            "browser evidence build must run under explicit Bash"
-        ),
+        "        shell: bash": ("browser evidence build must run under explicit Bash"),
         f"          EXPECTED_SHA: {PR_HEAD_EXPRESSION}": (
             "browser evidence build must bind the immutable source SHA"
         ),
-        "          set -euo pipefail": (
-            "browser evidence build must use strict Bash"
-        ),
+        "          set -euo pipefail": ("browser evidence build must use strict Bash"),
         'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"': (
             "browser evidence build must reverify immutable HEAD"
         ),
@@ -3735,9 +4383,7 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
         errors,
     )
     upload_requirements = {
-        "        if: ${{ success() }}": (
-            "browser summary upload must be success-only"
-        ),
+        "        if: ${{ success() }}": ("browser summary upload must be success-only"),
         f"        uses: {ORACLE_UPLOAD_ARTIFACT_ACTION}": (
             "browser summary upload must use the pinned artifact action"
         ),
@@ -3765,9 +4411,11 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
     summary_index = worker_job.find(summary_name)
     upload_index = worker_job.find(upload_name)
     next_after_source = (
-        worker_job.find("\n      - ", final_index + len(
-            "- name: Verify evidence source remained exact and clean"
-        ))
+        worker_job.find(
+            "\n      - ",
+            final_index
+            + len("- name: Verify evidence source remained exact and clean"),
+        )
         if final_index >= 0
         else -1
     )
@@ -3776,19 +4424,11 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
         if summary_index >= 0
         else -1
     )
-    if (
-        final_index < 0
-        or summary_index < 0
-        or next_after_source + 7 != summary_index
-    ):
+    if final_index < 0 or summary_index < 0 or next_after_source + 7 != summary_index:
         errors.append(
             f"{path}: late exact-source verification must immediately precede summary build"
         )
-    if (
-        summary_index < 0
-        or upload_index < 0
-        or next_after_summary + 7 != upload_index
-    ):
+    if summary_index < 0 or upload_index < 0 or next_after_summary + 7 != upload_index:
         errors.append(
             f"{path}: verified browser summary build must immediately precede upload"
         )
@@ -3798,6 +4438,7 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
 def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     """Require a verification-only dispatch and protected, exact-tag npm publish."""
 
+    text = _without_commented_lines(text)
     errors: list[str] = []
     required = {
         'tags:\n      - "render-v*"': "must use the render-package-only tag namespace",
@@ -3808,8 +4449,8 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"': (
             "must reject publication from repository forks"
         ),
-        'git merge-base --is-ancestor "$GITHUB_SHA" origin/main': (
-            "must require the tagged commit to be on public main"
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"': (
+            "must require the tagged commit to equal the exact public main head"
         ),
         "require_successful_run ci.yml .github/workflows/ci.yml push CI": (
             "must require exact-SHA push CI"
@@ -3821,18 +4462,14 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             "render-hardening.yml \\\n"
             "            .github/workflows/render-hardening.yml \\\n"
             "            workflow_dispatch"
-        ): (
-            "must require an exact-SHA dispatched render-hardening run"
-        ),
+        ): ("must require an exact-SHA dispatched render-hardening run"),
         ".github/workflows/render-browser.yml": (
             "must require the exact-SHA push render-browser path"
         ),
         (
             'browser_artifact_name="render-browser-${GITHUB_SHA}-'
             '${browser_run_id}-${browser_run_attempt}"'
-        ): (
-            "must select the SHA-, run-, and attempt-bound browser summary artifact"
-        ),
+        ): ("must select the SHA-, run-, and attempt-bound browser summary artifact"),
         "actions/runs/$browser_run_id/artifacts": (
             "must inspect artifacts from the selected exact browser run"
         ),
@@ -3845,9 +4482,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         '&& "$expired" == "false"': (
             "must reject expired hosted prerequisite artifacts"
         ),
-        '&& "$size_bytes" -le 1048576': (
-            "must bound the browser summary archive size"
-        ),
+        '&& "$size_bytes" -le 1048576': ("must bound the browser summary archive size"),
         "python3 scripts/check_render_browser_release_evidence.py download": (
             "must authenticate, download, extract, and verify browser evidence"
         ),
@@ -3903,7 +4538,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         'artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-verify"': (
             "must select only the exact-SHA, run-bound full/verify artifact"
         ),
-        'actions/runs/$run_id/artifacts': (
+        "actions/runs/$run_id/artifacts": (
             "must inspect the selected run's artifact metadata"
         ),
         '"$digest" =~ ^sha256:[0-9a-f]{64}$': (
@@ -3918,9 +4553,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "--baseline-mode verify": (
             "release selection must reject candidate-mode oracle evidence"
         ),
-        "--campaign full": (
-            "release selection must reject pilot oracle evidence"
-        ),
+        "--campaign full": ("release selection must reject pilot oracle evidence"),
         'prerequisites.get("baseline_mode") != "verify"': (
             "release receipt must reverify baseline mode"
         ),
@@ -3951,7 +4584,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         '"$output/render-worker-sbom.cdx.json"': (
             "must generate nested CycloneDX evidence beside the package candidate"
         ),
-        'cmp --silent \\': "must prove deterministic nested CycloneDX generation",
+        "cmp --silent \\": "must prove deterministic nested CycloneDX generation",
         "render-worker-sbom.cdx.json.sha256": (
             "must checksum and reverify nested CycloneDX evidence"
         ),
@@ -3960,6 +4593,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         "python3 scripts/test_check_render_package.py": (
             "must run the focused immutable package tests"
+        ),
+        "python3 scripts/test_check_npm_registry_evidence.py": (
+            "must run the focused npm provenance evidence tests"
         ),
         "python3 scripts/test_render_supply_chain.py": (
             "must run the focused nested supply-chain tests"
@@ -3991,7 +4627,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             "registry mutation must pass through the protected deployment environment"
         ),
         "id-token: write": "npm publication must mint short-lived provenance identity",
-        "registry-url: \"https://registry.npmjs.org\"": (
+        'registry-url: "https://registry.npmjs.org"': (
             "publication must target the public npm registry explicitly"
         ),
         "package-manager-cache: false": (
@@ -4001,16 +4637,72 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             "the first-package bootstrap token must be scoped to the publish step"
         ),
         "npm publish \\": "must contain a real tag-only publication command",
-        "npm view \"$spec\" version dist.integrity repository.url --json": (
-            "must verify the published registry identity and integrity"
+        "id: registry": (
+            "must expose the immutable registry preflight result to the publish step"
         ),
-        "npm install --ignore-scripts \"$spec\"": (
+        "existing immutable registry version differs from the verified candidate": (
+            "must fail closed when an immutable version already has different evidence"
+        ),
+        "if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' \"$error_log\"": (
+            "registry absence must be distinguished from transient lookup failures"
+        ),
+        "if: steps.registry.outputs.already_published != 'true'": (
+            "an identical verified registry version must make publication idempotent"
+        ),
+        "https://slsa.dev/provenance/v1": (
+            "must require the npm SLSA provenance predicate"
+        ),
+        "version dist.integrity repository.url dist.attestations --json": (
+            "must verify registry identity, integrity, and provenance"
+        ),
+        "npm audit signatures --json --include-attestations": (
+            "must cryptographically verify registry signatures and provenance"
+        ),
+        'python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py"': (
+            "must bind the verified DSSE payload to the exact release identity"
+        ),
+        "--workflow .github/workflows/render-package-release.yml": (
+            "npm provenance must name the exact publishing workflow"
+        ),
+        '--git-sha "$GITHUB_SHA"': (
+            "npm provenance must name the exact release commit"
+        ),
+        '--git-ref "$GITHUB_REF"': ("npm provenance must name the exact release tag"),
+        '--run-id "$GITHUB_RUN_ID"': (
+            "npm provenance must receive the current publishing run"
+        ),
+        '--run-attempt "$GITHUB_RUN_ATTEMPT"': (
+            "npm provenance must receive the current publishing attempt"
+        ),
+        "ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}": (
+            "npm provenance policy must consume the immutable preflight state"
+        ),
+        '--invocation-policy "$invocation_policy"': (
+            "npm provenance must select an explicit invocation policy"
+        ),
+        'npm install --ignore-scripts "$spec"': (
             "must execute an exact registry-installed consumer"
         ),
     }
     for snippet, message in required.items():
         if snippet not in text:
             errors.append(f"{path}: {message}")
+
+    exact_main = 'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"'
+    if text.count(exact_main) != 2:
+        errors.append(
+            f"{path}: exact origin/main must be checked during candidate verification "
+            "and again immediately before npm publication"
+        )
+    if text.count('git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags') != 1:
+        errors.append(
+            f"{path}: npm publication must refetch the exact hosted release tag"
+        )
+    if (
+        text.count('test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"')
+        != 1
+    ):
+        errors.append(f"{path}: npm publication must revalidate the hosted tag commit")
 
     exact_assignments = {
         "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,
@@ -4037,21 +4729,96 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     ):
         errors.append(f"{path}: both release jobs must disable npm caching")
     if re.search(r"^\s*pull_request:\s*$", text, re.MULTILINE):
-        errors.append(f"{path}: pull requests must never enter the registry release workflow")
+        errors.append(
+            f"{path}: pull requests must never enter the registry release workflow"
+        )
     if re.search(r"\bnpm\s+publish\b[^\n]*--force\b", text):
         errors.append(f"{path}: forced npm publication is forbidden")
     if len(re.findall(r"^\s*npm publish\b", text, re.MULTILINE)) != 2:
         errors.append(f"{path}: expected exactly one dry-run and one real npm publish")
+    if text.count('npm view "$spec" \\') != 2:
+        errors.append(
+            f"{path}: registry preflight and postpublication verification must both run"
+        )
+    if (
+        text.count("version dist.integrity repository.url dist.attestations --json")
+        != 2
+    ):
+        errors.append(
+            f"{path}: both registry lookups must request identity, integrity, and attestations"
+        )
+    if text.count("https://slsa.dev/provenance/v1") != 2:
+        errors.append(
+            f"{path}: both registry checks must require exact SLSA provenance"
+        )
+    if text.count("npm audit signatures --json --include-attestations") != 1:
+        errors.append(
+            f"{path}: registry signature and attestation audit must run exactly once"
+        )
+    if text.count("check_npm_registry_evidence.py") != 2:
+        errors.append(
+            f"{path}: npm provenance validator and its focused tests must each run once"
+        )
+    registry_verification_step = _single_yaml_block(
+        path,
+        text,
+        "- name: Verify the registry distribution and installed consumer",
+        6,
+        "npm registry verification step",
+        errors,
+    )
+    if (
+        registry_verification_step.count(
+            "ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}"
+        )
+        != 1
+    ):
+        errors.append(
+            f"{path}: npm registry verification must bind exactly one invocation "
+            "policy input to the immutable preflight state"
+        )
+    expected_invocation_policy = (
+        '          invocation_policy="current-run"\n'
+        '          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then\n'
+        '            invocation_policy="existing-release"\n'
+        '          elif [[ "$ALREADY_PUBLISHED" != "false" ]]; then\n'
+        '            echo "registry preflight did not produce a valid publication state" >&2\n'
+        "            exit 1\n"
+        "          fi"
+    )
+    if registry_verification_step.count(expected_invocation_policy) != 1:
+        errors.append(
+            f"{path}: newly published npm evidence must require the current run, "
+            "while only a verified pre-existing release may use its original "
+            "same-repository run"
+        )
+    if (
+        registry_verification_step.count('--invocation-policy "$invocation_policy"')
+        != 1
+        or text.count('--invocation-policy "$invocation_policy"') != 1
+    ):
+        errors.append(
+            f"{path}: npm provenance validator must receive exactly one selected "
+            "invocation policy"
+        )
+    registry_preflight_index = text.find(
+        "- name: Detect an identical immutable registry release"
+    )
+    real_publish_index = text.find("- name: Publish exact package with provenance")
+    postpublish_index = text.find(
+        "- name: Verify the registry distribution and installed consumer"
+    )
+    if not (0 <= registry_preflight_index < real_publish_index < postpublish_index):
+        errors.append(
+            f"{path}: immutable registry preflight must precede publication and verification"
+        )
     if text.count("scripts/render_supply_chain.py sbom") != 3:
         errors.append(
             f"{path}: expected two deterministic SBOM generations and one exact validation"
         )
     if (
         text.count("browser-prerequisite.json") != 3
-        or text.count(
-            "scripts/check_render_browser_release_evidence.py download"
-        )
-        != 1
+        or text.count("scripts/check_render_browser_release_evidence.py download") != 1
     ):
         errors.append(
             f"{path}: browser evidence must produce one receipt and reverify it twice"
@@ -4060,7 +4827,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         r"^\s*require_successful_run(?:\s|\\)", text, re.MULTILINE
     )
     if len(hosted_gate_calls) != 4:
-        errors.append(f"{path}: expected exact-SHA CI, CodeQL, hardening, and browser gates")
+        errors.append(
+            f"{path}: expected exact-SHA CI, CodeQL, hardening, and browser gates"
+        )
     deny_index = text.find("EmbarkStudios/cargo-deny-action@")
     build_index = text.find("npm --prefix bindings/render-wasm run build:wasm")
     if deny_index < 0 or build_index < 0 or deny_index > build_index:
@@ -4081,9 +4850,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     for line in prerequisite_step.splitlines()[1:]:
         if len(line) - len(line.lstrip(" ")) != 8:
             continue
-        entry = _yaml_mapping_entry(
-            _strip_yaml_inline_comment(line.lstrip(" "))
-        )
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
         if entry is not None:
             prerequisite_top_keys.append(entry[0])
     if prerequisite_top_keys != ["if", "env", "shell", "run"]:
@@ -4108,8 +4875,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             '${browser_run_id}-${browser_run_attempt}"'
         ): "browser artifact lookup must bind exact SHA, run, and attempt",
         (
-            '"repos/$GITHUB_REPOSITORY/actions/runs/'
-            '$browser_run_id/artifacts"'
+            '"repos/$GITHUB_REPOSITORY/actions/runs/$browser_run_id/artifacts"'
         ): "browser artifact lookup must remain scoped to the selected run",
         (
             "--jq '.artifacts[] | [.id, .name, .expired, "
@@ -4136,9 +4902,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         '--artifact-digest "$digest"': (
             "browser download must bind the immutable artifact digest"
         ),
-        '--head-sha "$GITHUB_SHA"': (
-            "browser download must bind the release SHA"
-        ),
+        '--head-sha "$GITHUB_SHA"': ("browser download must bind the release SHA"),
         '--workflow-run-id "$browser_run_id"': (
             "browser download must bind the selected run"
         ),
@@ -4151,9 +4915,12 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     }.items():
         if snippet not in prerequisite_step:
             errors.append(f"{path}: {message}")
-    if prerequisite_step.count(
-        "python3 scripts/check_render_browser_release_evidence.py download"
-    ) != 1:
+    if (
+        prerequisite_step.count(
+            "python3 scripts/check_render_browser_release_evidence.py download"
+        )
+        != 1
+    ):
         errors.append(
             f"{path}: browser prerequisite artifact must be downloaded and verified exactly once"
         )
@@ -4198,9 +4965,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     prerequisite_positions = [
         prerequisite_step.find(value) for value in prerequisite_order
     ]
-    if any(index < 0 for index in prerequisite_positions) or prerequisite_positions != sorted(
-        prerequisite_positions
-    ):
+    if any(
+        index < 0 for index in prerequisite_positions
+    ) or prerequisite_positions != sorted(prerequisite_positions):
         errors.append(
             f"{path}: browser run, artifact, verifier, and oracle gates must retain exact order"
         )
@@ -4260,9 +5027,21 @@ def audit_repository(root: Path) -> list[str]:
     if not release.is_file():
         errors.append(f"{release.relative_to(root)}: missing release workflow")
     else:
+        release_text = release.read_text(encoding="utf-8")
+        errors.extend(audit_release_versions(release.relative_to(root), release_text))
         errors.extend(
-            audit_release_versions(
-                release.relative_to(root), release.read_text(encoding="utf-8")
+            audit_core_release_evidence(release.relative_to(root), release_text)
+        )
+    github_release_reconciler = root / "scripts" / "reconcile_github_release.py"
+    if not github_release_reconciler.is_file():
+        errors.append(
+            f"{github_release_reconciler.relative_to(root)}: missing GitHub Release reconciler"
+        )
+    else:
+        errors.extend(
+            audit_github_release_reconciler(
+                github_release_reconciler.relative_to(root),
+                github_release_reconciler.read_text(encoding="utf-8"),
             )
         )
     render_package_release = workflow_root / "render-package-release.yml"

@@ -138,7 +138,7 @@ impl Part {
 #[derive(Debug, Clone)]
 pub(crate) struct Rel {
     pub(crate) id: String,
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) rel_type: String,
     pub(crate) target: String,
     pub(crate) external: bool,
@@ -214,16 +214,16 @@ pub(crate) struct Package {
     /// edit calls [`Package::ensure_content_type`] or writes a `.rels` part
     /// while `ct_rels_injected` is set.
     ctypes: ContentTypes,
-    /// Parsed view of every `_rels/*.rels` part, keyed by the rels part's own
-    /// package name (e.g. `xl/_rels/workbook.xml.rels`).
+    /// Parsed view of every `_rels/*.rels` part, keyed by its lowercase,
+    /// slash-normalized package name (e.g. `xl/_rels/workbook.xml.rels`).
     #[cfg_attr(not(test), allow(dead_code))]
-    // consumed by upcoming roadmap slices; unit-tested
+    // Package primitive; covered by focused unit tests.
     rels: HashMap<String, Vec<Rel>>,
     /// Next relationship-id ordinal to allocate, seeded above every existing
-    /// `rIdN` in the source package. `u64` so seeding past a hostile
-    /// `rId18446744073709551615` still yields a fresh, non-colliding id.
+    /// `rIdN` in the source package. A saturated numeric namespace falls back
+    /// to a checked opaque `rxlsIdN` namespace.
     #[cfg_attr(not(test), allow(dead_code))]
-    // consumed by upcoming roadmap slices; unit-tested
+    // Package primitive; covered by focused unit tests.
     rid_next: u64,
     /// Parts added/replaced this session (via [`Package::replace_part`] or
     /// [`Package::set_part`]/[`Package::part_tree_mut`]). Only these are
@@ -250,7 +250,7 @@ pub(crate) struct Package {
     /// (re)written, `[Content_Types].xml` is force-regenerated too so the
     /// injected default actually reaches the output.
     #[cfg_attr(not(test), allow(dead_code))]
-    // consumed by upcoming roadmap slices; unit-tested
+    // Package primitive; covered by focused unit tests.
     ct_rels_injected: bool,
 }
 
@@ -390,7 +390,7 @@ impl Package {
             };
             match parse_rels(bytes) {
                 Some(entries) => {
-                    rels.insert(name.clone(), entries);
+                    rels.insert(canonical_rels_key(name), entries);
                 }
                 None => meta_lossy = true,
             }
@@ -470,7 +470,9 @@ impl Package {
                 if rel.external {
                     continue;
                 }
-                let target = Package::resolve_rel_target(&source_part, &rel.target);
+                let target = Package::try_resolve_rel_target(&source_part, &rel.target).ok_or(
+                    Error::Zip("relationship in a touched .rels part has an invalid target URI"),
+                )?;
                 if !self.has_part(&target) {
                     return Err(Error::Zip(
                         "relationship in a touched .rels part targets a missing part",
@@ -542,7 +544,7 @@ impl Package {
     /// not go through [`Package::part_tree_mut`] promotion). Errors if no part
     /// matches `name`. Returns the part's actual stored name, which may differ
     /// from `name` in case or leading-slash form.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn replace_part(&mut self, name: &str, data: Vec<u8>) -> Result<String> {
         if data.len() > max_part() {
             return Err(Error::Zip("OOXML package entry is too large"));
@@ -564,7 +566,7 @@ impl Package {
         self.touched.insert(key.clone());
         self.parts.remove(&key);
         if is_rels_part(&key) {
-            self.rels.remove(&key);
+            self.rels.remove(&canonical_rels_key(&key));
         }
         Some(key)
     }
@@ -575,7 +577,7 @@ impl Package {
     /// the part was first stored under. Marks the part touched. When
     /// `content_type` is `Some`, also ensures `[Content_Types].xml` resolves
     /// `name` to it (see [`Package::ensure_content_type`]).
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn set_part(&mut self, name: &str, bytes: Vec<u8>, content_type: Option<&str>) {
         self.set_part_raw(name, bytes);
         if let Some(ct) = content_type {
@@ -650,7 +652,7 @@ impl Package {
     /// that exact content type, otherwise adds (replacing any existing
     /// `Override` for `part`, since OPC requires unique `PartName`s) one and
     /// regenerates `[Content_Types].xml`, marking it touched.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn ensure_content_type(&mut self, part: &str, content_type: &str) {
         let pn = override_part_name(part);
         let already = self
@@ -718,27 +720,19 @@ impl Package {
 
     /// Resolve an internal relationship target against `src_part`'s directory
     /// and normalize dot segments to a canonical package part name (no
-    /// leading slash) suitable for [`Package::has_part`] lookup.
+    /// leading slash) suitable for [`Package::has_part`] lookup. Excess
+    /// parent segments clamp at the package root, as required by RFC 3986
+    /// section 5.2.4 (which ECMA-376-2 section 6.4 adopts unchanged).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resolve_rel_target(src_part: &str, target: &str) -> String {
-        let base: Vec<&str> = if target.starts_with('/') {
-            Vec::new()
-        } else {
-            src_part
-                .rsplit_once('/')
-                .map(|(dir, _)| dir.split('/').filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default()
-        };
-        let mut segs = base;
-        for seg in target.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    segs.pop();
-                }
-                s => segs.push(s),
-            }
-        }
-        segs.join("/")
+        Self::try_resolve_rel_target(src_part, target).unwrap_or_default()
+    }
+
+    /// Fallible form of [`Package::resolve_rel_target`]. Returns `None` for
+    /// absolute/network URI references and references that do not resolve to
+    /// a package part.
+    pub(crate) fn try_resolve_rel_target(src_part: &str, target: &str) -> Option<String> {
+        crate::xlsx::resolve_internal_relationship_part(src_part, target)
     }
 
     /// The `Target` string to write into `src_part`'s `.rels` XML when adding
@@ -746,7 +740,7 @@ impl Package {
     /// `new_part` lives under it, else an absolute (`/`-rooted) path. The
     /// mirror-image write-direction companion of
     /// [`Package::resolve_rel_target`].
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn rel_target(src_part: &str, new_part: &str) -> String {
         let src_dir = src_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if src_dir.is_empty() {
@@ -761,7 +755,7 @@ impl Package {
     /// The `.rels` package part name that stores `part`'s relationships
     /// (`xl/workbook.xml` -> `xl/_rels/workbook.xml.rels`; the package root
     /// (`""`) -> `_rels/.rels`).
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn rels_path_of(part: &str) -> String {
         match part.rsplit_once('/') {
             Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
@@ -772,10 +766,10 @@ impl Package {
 
     /// `part`'s parsed relationships (empty if it has no `.rels` part, or that
     /// part failed to parse).
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn relationships_of(&self, part: &str) -> &[Rel] {
         self.rels
-            .get(&Self::rels_path_of(part))
+            .get(&canonical_rels_key(&Self::rels_path_of(part)))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -810,29 +804,38 @@ impl Package {
 
     /// Add a new relationship from `src_part` to `target` (an internal
     /// package part name, or an external URI when `external` is `true`),
-    /// allocating a fresh `rId`. Regenerates `src_part`'s `.rels` XML and
+    /// allocating a fresh opaque ID. Regenerates `src_part`'s `.rels` XML and
     /// marks it touched; if `[Content_Types].xml` was missing the mandatory
     /// `rels` default (see [`Package::ct_rels_injected`] in the struct docs),
     /// also regenerates `[Content_Types].xml` so that injected default
     /// actually reaches the output. Returns the allocated relationship id.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     pub(crate) fn add_relationship(
         &mut self,
         src_part: &str,
         rel_type: &str,
         target: &str,
         external: bool,
-    ) -> String {
+    ) -> Result<String> {
         let rid = self.alloc_rid();
         let rels_path = Self::rels_path_of(src_part);
-        self.rels.entry(rels_path.clone()).or_default().push(Rel {
-            id: rid.clone(),
-            rel_type: rel_type.to_string(),
-            target: target.to_string(),
-            external,
-        });
-        self.regen_rels(&rels_path);
-        rid
+        // Promote an existing relationship part before changing the cache so
+        // regeneration can merge into its live tree and preserve namespaces,
+        // comments, and extension attributes on untouched relationships.
+        if self.find_part_key(&rels_path).is_some() {
+            self.part_tree_mut(&rels_path)?;
+        }
+        self.rels
+            .entry(canonical_rels_key(&rels_path))
+            .or_default()
+            .push(Rel {
+                id: rid.clone(),
+                rel_type: rel_type.to_string(),
+                target: target.to_string(),
+                external,
+            });
+        self.regen_rels(&rels_path)?;
+        Ok(rid)
     }
 
     /// Remove every relationship with the exact opaque `id` from
@@ -840,7 +843,15 @@ impl Package {
     /// previously promoted live XML tree synchronized.
     pub(crate) fn remove_relationship(&mut self, src_part: &str, id: &str) -> Result<bool> {
         let rels_path = Self::rels_path_of(src_part);
-        let removed_cached = self.rels.get_mut(&rels_path).is_some_and(|rels| {
+        let cache_key = canonical_rels_key(&rels_path);
+        let cached_match = self
+            .rels
+            .get(&cache_key)
+            .is_some_and(|rels| rels.iter().any(|rel| rel.id == id));
+        if cached_match && self.find_part_key(&rels_path).is_some() {
+            self.part_tree_mut(&rels_path)?;
+        }
+        let removed_cached = self.rels.get_mut(&cache_key).is_some_and(|rels| {
             let old_len = rels.len();
             rels.retain(|rel| rel.id != id);
             rels.len() != old_len
@@ -850,9 +861,6 @@ impl Package {
             return Ok(removed_cached);
         };
         if !matches!(self.parts.get(&key), Some(Part::Xml(_))) {
-            if removed_cached {
-                self.regen_rels(&rels_path);
-            }
             return Ok(removed_cached);
         }
 
@@ -895,26 +903,23 @@ impl Package {
         external: bool,
     ) -> Result<bool> {
         let rels_path = Self::rels_path_of(src_part);
-        let Some(relationship) = self
+        let cache_key = canonical_rels_key(&rels_path);
+        let Some(existing) = self
             .rels
-            .get_mut(&rels_path)
-            .and_then(|relationships| relationships.iter_mut().find(|rel| rel.id == id))
+            .get(&cache_key)
+            .and_then(|relationships| relationships.iter().find(|rel| rel.id == id))
+            .cloned()
         else {
             return Ok(false);
         };
-        if relationship.target == target && relationship.external == external {
+        if existing.target == target && existing.external == external {
             return Ok(true);
         }
-        relationship.target = target.to_string();
-        relationship.external = external;
 
         let Some(key) = self.find_part_key(&rels_path).cloned() else {
             return Ok(false);
         };
-        if !matches!(self.parts.get(&key), Some(Part::Xml(_))) {
-            self.regen_rels(&rels_path);
-            return Ok(true);
-        }
+        self.part_tree_mut(&rels_path)?;
         if let Some(Part::Xml(tree)) = self.parts.get_mut(&key) {
             let Some(root) = tree.root_element() else {
                 return Ok(false);
@@ -929,19 +934,50 @@ impl Package {
             tree.set_attr(node, b"Target", target.as_bytes())?;
             if external {
                 tree.set_attr(node, b"TargetMode", b"External")?;
-            } else {
+            } else if tree.attr_value(node, b"TargetMode") == Some(b"External") {
                 tree.remove_attr(node, b"TargetMode");
             }
         }
+        let Some(relationship) = self
+            .rels
+            .get_mut(&cache_key)
+            .and_then(|relationships| relationships.iter_mut().find(|rel| rel.id == id))
+        else {
+            return Ok(false);
+        };
+        relationship.target = target.to_string();
+        relationship.external = external;
         self.touched.insert(key);
         Ok(true)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     fn alloc_rid(&mut self) -> String {
-        let id = format!("rId{}", self.rid_next);
+        let numeric = format!("rId{}", self.rid_next);
         self.rid_next = self.rid_next.saturating_add(1);
-        id
+        if !self.relationship_id_is_used(&numeric) {
+            return numeric;
+        }
+
+        // A hostile `rId18446744073709551615` saturates the numeric seed.
+        // Relationship IDs are opaque XML IDs, so switch to a deterministic
+        // non-numeric namespace and scan until an actually unused value is
+        // found instead of returning the saturated duplicate forever.
+        for ordinal in 1..=u64::MAX {
+            let candidate = format!("rxlsId{ordinal}");
+            if !self.relationship_id_is_used(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("the package entry budget guarantees a free relationship id")
+    }
+
+    fn relationship_id_is_used(&self, id: &str) -> bool {
+        self.rels.values().any(|relationships| {
+            relationships
+                .iter()
+                .any(|relationship| relationship.id == id)
+        })
     }
 
     /// Regenerate `[Content_Types].xml` from `self.ctypes` and store it,
@@ -954,7 +990,7 @@ impl Package {
     /// silently discard any edit made through the tree API, with no error,
     /// the moment this function's caller next ran. See
     /// [`Package::merge_content_types_into_tree`].
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     fn regen_content_types(&mut self) {
         if let Some(key) = self.find_part_key(CONTENT_TYPES).cloned() {
             if matches!(self.parts.get(&key), Some(Part::Xml(_))) {
@@ -998,7 +1034,7 @@ impl Package {
     /// `add_relationship` are an established infallible API, and adding a
     /// `Result` return here would ripple across every caller in the crate
     /// for a case this narrow.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     fn merge_content_types_into_tree(&mut self, key: &str) {
         let defaults = self.ctypes.defaults.clone();
         let overrides = self.ctypes.overrides.clone();
@@ -1030,18 +1066,22 @@ impl Package {
     /// instead of overwriting it wholesale -- see
     /// [`Package::regen_content_types`]'s doc comment (same rationale, same
     /// hazard) and [`Package::merge_rels_into_tree`].
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
-    fn regen_rels(&mut self, rels_path: &str) {
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
+    fn regen_rels(&mut self, rels_path: &str) -> Result<()> {
         if let Some(key) = self.find_part_key(rels_path).cloned() {
             if matches!(self.parts.get(&key), Some(Part::Xml(_))) {
-                self.merge_rels_into_tree(&key, rels_path);
+                self.merge_rels_into_tree(&key, rels_path)?;
                 if self.ct_rels_injected {
                     self.regen_content_types();
                 }
-                return;
+                return Ok(());
             }
         }
-        let entries = self.rels.get(rels_path).cloned().unwrap_or_default();
+        let entries = self
+            .rels
+            .get(&canonical_rels_key(rels_path))
+            .cloned()
+            .unwrap_or_default();
         let mut xml = String::from(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
         );
@@ -1062,6 +1102,7 @@ impl Package {
         if self.ct_rels_injected {
             self.regen_content_types();
         }
+        Ok(())
     }
 
     /// Merge `self.rels[rels_path]`'s current entries into `key`'s *live*
@@ -1071,22 +1112,26 @@ impl Package {
     /// case-insensitive resolution applies): an existing `<Relationship>`
     /// with the same `Id` has its `Type`/`Target`/`TargetMode` updated in
     /// place if they differ; a missing one is appended as a new last child
-    /// of the root `<Relationships>` element. Mirrors
-    /// [`Package::merge_content_types_into_tree`]'s rationale and
-    /// error-swallowing behavior.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
-    fn merge_rels_into_tree(&mut self, key: &str, rels_path: &str) {
-        let entries = self.rels.get(rels_path).cloned().unwrap_or_default();
+    /// of the root `<Relationships>` element. Merge failures propagate so a
+    /// caller never falls back to a lossy raw rebuild.
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
+    fn merge_rels_into_tree(&mut self, key: &str, rels_path: &str) -> Result<()> {
+        let entries = self
+            .rels
+            .get(&canonical_rels_key(rels_path))
+            .cloned()
+            .unwrap_or_default();
         let Some(Part::Xml(tree)) = self.parts.get_mut(key) else {
-            return;
+            return Ok(());
         };
         let Some(root) = tree.root_element() else {
-            return;
+            return Ok(());
         };
         for rel in &entries {
-            merge_relationship_element(tree, root, rel);
+            merge_relationship_element(tree, root, rel)?;
         }
         self.touched.insert(key.to_string());
+        Ok(())
     }
 
     /// Shared implementation of [`Package::set_part`] (minus the
@@ -1094,7 +1139,7 @@ impl Package {
     /// lookup preserving original casing, push into `order` only when the
     /// part is genuinely new, mark touched, store as `Part::Raw`. Returns the
     /// stored key.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+    #[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
     fn set_part_raw(&mut self, name: &str, bytes: Vec<u8>) -> String {
         let key = self.find_part_key(name).cloned().unwrap_or_else(|| {
             self.order.push(name.to_string());
@@ -1193,6 +1238,10 @@ fn canonical_part_name(name: &str) -> String {
     name.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
+fn canonical_rels_key(name: &str) -> String {
+    canonical_part_name(name).to_ascii_lowercase()
+}
+
 /// Ensure a `<tag key_attr="key_val" val_attr="val"/>`-shaped child of
 /// `parent` exists: updates `val_attr` in place on the first existing child
 /// named `tag` whose `key_attr` value matches `key_val` case-insensitively,
@@ -1201,7 +1250,7 @@ fn canonical_part_name(name: &str) -> String {
 /// Extension=.. ContentType=..>` and `<Override PartName=.. ContentType=..>`
 /// entries. See that function's doc comment for why a failure here (the
 /// underlying tree edit erroring) is swallowed rather than propagated.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
+#[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
 fn merge_child_element(
     tree: &mut XmlTree,
     parent: NodeId,
@@ -1237,28 +1286,38 @@ fn merge_child_element(
 /// matching `rel`'s `Type`/`Target`/`TargetMode`: updates those attributes
 /// in place on the first existing `<Relationship>` with the same `Id`, else
 /// appends a freshly built element. Used by
-/// [`Package::merge_rels_into_tree`]; see
-/// [`merge_child_element`]/[`Package::merge_content_types_into_tree`]'s doc
-/// comments for the shared error-swallowing rationale.
-#[cfg_attr(not(test), allow(dead_code))] // consumed by upcoming roadmap slices; unit-tested
-fn merge_relationship_element(tree: &mut XmlTree, parent: NodeId, rel: &Rel) {
+/// [`Package::merge_rels_into_tree`]. Unlike the content-types compatibility
+/// helper, relationship merge errors propagate to prevent metadata loss.
+#[cfg_attr(not(test), allow(dead_code))] // Package primitive; covered by focused unit tests.
+fn merge_relationship_element(tree: &mut XmlTree, parent: NodeId, rel: &Rel) -> Result<()> {
     let children: Vec<NodeId> = tree.children_of(parent).to_vec();
     for id in children {
-        if tree.element_name(id) == Some(b"Relationship")
+        if tree
+            .element_name(id)
+            .is_some_and(|name| local_name(name).eq_ignore_ascii_case(b"Relationship"))
             && tree.attr_value(id, b"Id") == Some(rel.id.as_bytes())
         {
-            let _ = tree.set_attr(id, b"Type", rel.rel_type.as_bytes());
-            let _ = tree.set_attr(id, b"Target", rel.target.as_bytes());
+            tree.set_attr(id, b"Type", rel.rel_type.as_bytes())?;
+            tree.set_attr(id, b"Target", rel.target.as_bytes())?;
             if rel.external {
-                let _ = tree.set_attr(id, b"TargetMode", b"External");
-            } else {
+                tree.set_attr(id, b"TargetMode", b"External")?;
+            } else if tree.attr_value(id, b"TargetMode") == Some(b"External") {
                 tree.remove_attr(id, b"TargetMode");
             }
-            return;
+            return Ok(());
         }
     }
+    let root_name = tree.element_name(parent).unwrap_or(b"Relationships");
+    let prefix = root_name
+        .iter()
+        .position(|byte| *byte == b':')
+        .map(|colon| &root_name[..colon]);
+    let tag = prefix.map_or_else(
+        || "Relationship".to_string(),
+        |prefix| format!("{}:Relationship", String::from_utf8_lossy(prefix)),
+    );
     let mut frag = format!(
-        r#"<Relationship Id="{}" Type="{}" Target="{}""#,
+        r#"<{tag} Id="{}" Type="{}" Target="{}""#,
         esc_attr(&rel.id),
         esc_attr(&rel.rel_type),
         esc_attr(&rel.target)
@@ -1268,25 +1327,35 @@ fn merge_relationship_element(tree: &mut XmlTree, parent: NodeId, rel: &Rel) {
     }
     frag.push_str("/>");
     let idx = tree.children_of(parent).len();
-    let _ = tree.insert_fragment_at(parent, idx, frag.as_bytes());
+    tree.insert_fragment_at(parent, idx, frag.as_bytes())?;
+    Ok(())
 }
 
 /// Whether `name` is a `.rels` part path: its filename ends with `.rels` and
 /// its containing directory is (or ends with) `_rels`.
 fn is_rels_part(name: &str) -> bool {
-    match name.rsplit_once('/') {
-        Some((dir, file)) => file.ends_with(".rels") && (dir == "_rels" || dir.ends_with("/_rels")),
-        None => false,
-    }
+    let name = canonical_part_name(name);
+    let Some((dir, file)) = name.rsplit_once('/') else {
+        return false;
+    };
+    file.to_ascii_lowercase().ends_with(".rels")
+        && dir
+            .rsplit('/')
+            .next()
+            .is_some_and(|segment| segment.eq_ignore_ascii_case("_rels"))
 }
 
 /// The package part a `.rels` path describes the relationships *of* — the
 /// inverse of the `.rels`-path-construction convention: `_rels/.rels` -> `""`
 /// (the package root); `xl/_rels/workbook.xml.rels` -> `xl/workbook.xml`.
 fn source_part_of_rels_path(rels_path: &str) -> Option<String> {
+    let rels_path = canonical_part_name(rels_path);
     let (dir, file) = rels_path.rsplit_once('/')?;
-    let parent_dir = dir.strip_suffix("_rels")?.trim_end_matches('/');
-    let part_name = file.strip_suffix(".rels")?;
+    let (parent_dir, rels_dir) = dir.rsplit_once('/').unwrap_or(("", dir));
+    if !rels_dir.eq_ignore_ascii_case("_rels") || !file.to_ascii_lowercase().ends_with(".rels") {
+        return None;
+    }
+    let part_name = &file[..file.len() - ".rels".len()];
     if part_name.is_empty() {
         Some(parent_dir.to_string())
     } else if parent_dir.is_empty() {
@@ -1367,38 +1436,25 @@ fn parse_content_types(bytes: &[u8]) -> Option<(ContentTypes, bool)> {
     ))
 }
 
-/// Leniently parse a `.rels` part's `<Relationship>` entries. `None` on any
-/// malformed XML or a `Relationship` missing a required attribute.
+/// Strictly parse a `.rels` part's `<Relationship>` entries. `None` on
+/// malformed structure, duplicate IDs, invalid target modes, foreign package
+/// namespaces, or a relationship missing a required attribute.
 fn parse_rels(bytes: &[u8]) -> Option<Vec<Rel>> {
     if !crate::xml_reference_bytes_within_budget(bytes) {
         return None;
     }
-    let mut reader = Reader::from_reader(bytes);
-    let mut buf = Vec::new();
-    let mut rels = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Eof) => break,
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
-                if local_name(e.name().as_ref()) == b"Relationship" {
-                    let id = attr_value(&e, b"Id")?;
-                    let rel_type = attr_value(&e, b"Type")?;
-                    let target = attr_value(&e, b"Target")?;
-                    let external = attr_value(&e, b"TargetMode").as_deref() == Some("External");
-                    rels.push(Rel {
-                        id,
-                        rel_type,
-                        target,
-                        external,
-                    });
-                }
-            }
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-        buf.clear();
-    }
-    Some(rels)
+    let xml = std::str::from_utf8(bytes).ok()?;
+    crate::xlsx::parse_ooxml_relationships_preserving_extensions(xml)?
+        .into_iter()
+        .map(|relationship| {
+            Some(Rel {
+                id: relationship.id,
+                rel_type: relationship.rel_type?,
+                target: relationship.target,
+                external: relationship.external,
+            })
+        })
+        .collect()
 }
 
 /// Best-effort pre-flight: reject a ZIP whose End-Of-Central-Directory
@@ -1799,6 +1855,35 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_relationship_ids_set_meta_lossy_without_last_entry_wins() {
+        let input = zip_bytes(&[
+            ("[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/></Types>"#),
+            ("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/attacker.xml"/></Relationships>"#),
+        ]);
+
+        let package = Package::from_bytes(&input).unwrap();
+        assert!(package.is_meta_lossy());
+        assert!(package.relationships_of("").is_empty());
+    }
+
+    #[test]
+    fn invalid_relationship_target_mode_and_foreign_namespace_set_meta_lossy() {
+        for relationships in [
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml" TargetMode="Remote"/></Relationships>"#.as_slice(),
+            br#"<Relationships xmlns="https://attacker.invalid/package/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.as_slice(),
+        ] {
+            let input = zip_bytes(&[
+                ("[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/></Types>"#),
+                ("_rels/.rels", relationships),
+            ]);
+
+            let package = Package::from_bytes(&input).unwrap();
+            assert!(package.is_meta_lossy());
+            assert!(package.relationships_of("").is_empty());
+        }
+    }
+
+    #[test]
     fn ct_rels_default_missing_is_injected_not_meta_lossy() {
         let input = zip_bytes(&[(
             "[Content_Types].xml",
@@ -1991,6 +2076,40 @@ mod tests {
             Package::resolve_rel_target("", "xl/workbook.xml"),
             "xl/workbook.xml"
         );
+        assert_eq!(
+            Package::resolve_rel_target("xl/drawings/drawing1.xml", "../../xl/charts/chart1.xml"),
+            "xl/charts/chart1.xml"
+        );
+        assert_eq!(
+            Package::resolve_rel_target(
+                "xl/drawings/drawing1.xml",
+                "../../../xl/charts/chart1.xml"
+            ),
+            "xl/charts/chart1.xml"
+        );
+        assert_eq!(
+            Package::resolve_rel_target("", "../../xl/workbook.xml"),
+            "xl/workbook.xml"
+        );
+        assert_eq!(
+            Package::resolve_rel_target("xl/workbook.xml", "/../../xl/styles.xml"),
+            "xl/styles.xml"
+        );
+    }
+
+    #[test]
+    fn to_bytes_accepts_touched_rels_target_with_above_root_segments() {
+        let mut package = Package::from_bytes(&minimal_xlsx()).unwrap();
+        assert!(package
+            .update_relationship_target("", "rId1", "/../../xl/workbook.xml", false)
+            .unwrap());
+
+        let bytes = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            reread.relationships_of("")[0].target,
+            "/../../xl/workbook.xml"
+        );
     }
 
     #[test]
@@ -2024,12 +2143,14 @@ mod tests {
     fn add_relationship_allocates_rid_and_regenerates_rels_part() {
         let mut package = Package::from_bytes(&minimal_xlsx()).unwrap();
         package.set_part("xl/styles.xml", b"<styleSheet/>".to_vec(), None);
-        let rid = package.add_relationship(
-            "xl/workbook.xml",
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
-            "styles.xml",
-            false,
-        );
+        let rid = package
+            .add_relationship(
+                "xl/workbook.xml",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+                "styles.xml",
+                false,
+            )
+            .unwrap();
         // rId1 is already used by `_rels/.rels`'s officeDocument relationship,
         // so `rid_next` (seeded above every existing rId in the package) starts at 2.
         assert_eq!(rid, "rId2");
@@ -2048,6 +2169,106 @@ mod tests {
     }
 
     #[test]
+    fn backslash_relationship_part_uses_the_canonical_cache_without_losing_entries() {
+        let input = zip_bytes(&[
+            (
+                "[Content_Types].xml",
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            ),
+            ("xl/workbook.xml", b"<workbook/>"),
+            ("xl/worksheets/sheet1.xml", b"<worksheet/>"),
+            ("xl/styles.xml", b"<styleSheet/>"),
+            (
+                r"xl\_rels\workbook.xml.rels",
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+        ]);
+        let mut package = Package::from_bytes(&input).unwrap();
+        assert_eq!(package.relationships_of("xl/workbook.xml").len(), 1);
+        package
+            .add_relationship(
+                "xl/workbook.xml",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+                "styles.xml",
+                false,
+            )
+            .unwrap();
+
+        let output = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&output).unwrap();
+        let relationships = reread.relationships_of("xl/workbook.xml");
+        assert_eq!(relationships.len(), 2);
+        assert!(relationships
+            .iter()
+            .any(|relationship| relationship.id == "rId1"));
+        assert!(reread
+            .part_names()
+            .any(|name| name == r"xl\_rels\workbook.xml.rels"));
+    }
+
+    #[test]
+    fn adding_a_relationship_preserves_prefixed_extension_metadata() {
+        let input = zip_bytes(&[
+            (
+                "[Content_Types].xml",
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            ),
+            ("xl/workbook.xml", b"<workbook/>"),
+            (
+                "_rels/.rels",
+                br#"<?xml version="1.0"?><r:Relationships xmlns:r="http://schemas.openxmlformats.org/package/2006/relationships" xmlns:ext="urn:rxls:test"><!--keep-comment--><r:Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml" TargetMode="Internal" ext:keep="yes"/></r:Relationships>"#,
+            ),
+        ]);
+        let mut package = Package::from_bytes(&input).unwrap();
+        package
+            .add_relationship("", "urn:rxls:test:new", "xl/workbook.xml", false)
+            .unwrap();
+
+        let output = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&output).unwrap();
+        let relationships = String::from_utf8_lossy(
+            reread
+                .part_bytes("_rels/.rels")
+                .expect("saved relationships"),
+        );
+        assert!(relationships.contains(r#"ext:keep="yes""#));
+        assert!(relationships.contains("keep-comment"));
+        assert!(relationships.contains(r#"TargetMode="Internal""#));
+        assert!(relationships.contains("<r:Relationship"));
+    }
+
+    #[test]
+    fn saturated_numeric_relationship_id_uses_a_fresh_opaque_fallback() {
+        let input = zip_bytes(&[
+            (
+                "[Content_Types].xml",
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#,
+            ),
+            ("xl/workbook.xml", b"<workbook/>"),
+            (
+                "_rels/.rels",
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId18446744073709551615" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+        ]);
+        let mut package = Package::from_bytes(&input).unwrap();
+        let id = package
+            .add_relationship("", "urn:rxls:test:new", "xl/workbook.xml", false)
+            .unwrap();
+        assert_eq!(id, "rxlsId1");
+
+        let output = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&output).unwrap();
+        let ids: HashSet<_> = reread
+            .relationships_of("")
+            .iter()
+            .map(|relationship| relationship.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("rId18446744073709551615"));
+        assert!(ids.contains("rxlsId1"));
+    }
+
+    #[test]
     fn add_relationship_forces_content_types_regen_when_rels_default_was_injected() {
         let input = zip_bytes(&[(
             "[Content_Types].xml",
@@ -2056,7 +2277,9 @@ mod tests {
         let mut package = Package::from_bytes(&input).unwrap();
         assert!(package.ct_rels_injected);
         package.set_part("xl/styles.xml", b"<styleSheet/>".to_vec(), None);
-        package.add_relationship("xl/workbook.xml", "t", "styles.xml", false);
+        package
+            .add_relationship("xl/workbook.xml", "t", "styles.xml", false)
+            .unwrap();
         assert!(package
             .touched_parts()
             .contains(&"[Content_Types].xml".to_string()));
@@ -2108,7 +2331,9 @@ mod tests {
             "tree edit must be live before add_relationship is called"
         );
 
-        let rid = package.add_relationship("", "t2", "xl/workbook.xml", false);
+        let rid = package
+            .add_relationship("", "t2", "xl/workbook.xml", false)
+            .unwrap();
 
         let bytes = package.to_bytes().unwrap();
         let reread = Package::from_bytes(&bytes).unwrap();
@@ -2234,7 +2459,9 @@ mod tests {
     #[test]
     fn to_bytes_rejects_touched_rels_with_dangling_target() {
         let mut package = Package::from_bytes(&minimal_xlsx()).unwrap();
-        package.add_relationship("xl/workbook.xml", "t", "worksheets/missing.xml", false);
+        package
+            .add_relationship("xl/workbook.xml", "t", "worksheets/missing.xml", false)
+            .unwrap();
         assert!(package.to_bytes().is_err());
     }
 

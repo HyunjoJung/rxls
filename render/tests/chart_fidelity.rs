@@ -68,7 +68,7 @@ fn line_chart_workbook_with_metadata(
         ),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#
+            r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#
                 .to_string(),
         ),
         ("xl/charts/chart1.xml", chart),
@@ -128,7 +128,7 @@ fn scatter_chart_workbook(x_axis_style: &str, y_axis_style: &str) -> Workbook {
         ),
         (
             "xl/drawings/_rels/drawing1.xml.rels",
-            r#"<Relationships><Relationship Id="rIdChart" Target="../charts/chart1.xml"/></Relationships>"#
+            r#"<Relationships><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#
                 .to_string(),
         ),
         ("xl/charts/chart1.xml", chart),

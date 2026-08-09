@@ -78,6 +78,11 @@ pub(crate) fn render_format(value: f64, format_code: &str, is_1904: bool) -> Str
         .unwrap_or_else(|| crate::format_number(value))
 }
 
+/// Whether the effective numeric section displays `value` as a date or time.
+pub(crate) fn number_format_displays_datetime(value: f64, format_code: &str) -> bool {
+    number_format::displays_datetime(value, format_code)
+}
+
 /// Apply an explicit fourth text section to an authored text cell. Number
 /// formats without a text section leave the source text unchanged.
 pub(crate) fn render_text_format(value: &str, format_code: &str) -> String {

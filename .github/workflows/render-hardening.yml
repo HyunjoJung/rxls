@@ -20,6 +20,7 @@ on:
       - "scripts/test_render_oracle_host_tools.py"
       - "scripts/test_render_fuzz_assets.py"
       - "scripts/test_render_performance_gates.py"
+      - "scripts/test_workflow_policy.py"
       - "src/**"
   workflow_dispatch:
   schedule:
@@ -55,7 +56,11 @@ jobs:
         with:
           python-version: "3.13.14"
       - name: Enforce hosted workflow policy
-        run: python3 scripts/check_workflow_policy.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
       - name: Capture an unpinned host identity and fail closed
         shell: bash
         run: |
@@ -133,10 +138,15 @@ jobs:
             --scope poppler \
             --output target/poppler-identity.json
       - name: Reopen deterministic PDFs and extract Latin, Korean, and RTL text
-        run: >-
-          cargo test --locked --manifest-path render/Cargo.toml --test printing
-          deterministic_pdf_reopens_has_exact_page_count_and_extractable_text
-          -- --exact
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact --list \
+            | grep -Fqx 'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact
       - name: Upload verified Poppler identity
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

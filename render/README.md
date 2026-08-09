@@ -116,11 +116,11 @@ cargo run --manifest-path render/Cargo.toml -- \
 For LibreOffice `SinglePageSheets` differential runs, add
 `--single-page-sheets`. This opt-in override emits the selected visible sheet
 scene at 100% on one content-sized page. Like LibreOffice, it ignores authored
-paper, orientation, margins, scale, print gridlines/headings, repeated titles,
-and headers/footers. The `single_page_sheets` override is recorded in both the
-page report and bundle manifest. Default authored pagination is unchanged and
-continues to honor source print-gridline settings plus the caller's gridline
-flag.
+paper, orientation, margins, scale, headings, repeated titles, and
+headers/footers, while retaining gridlines only when both the source print
+setting and the caller's gridline flag enable them. The `single_page_sheets`
+override is recorded in both the page report and bundle manifest. Default
+authored pagination is unchanged and applies the same gridline-intent rule.
 
 Print layout honors the retained print area, paper/orientation, margins,
 percentage or fit-to-page scaling, repeated title rows and columns, horizontal

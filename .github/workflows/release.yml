@@ -14,6 +14,10 @@ permissions:
   actions: read
   contents: write
 
+concurrency:
+  group: core-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_SEMVER_CHECKS_VERSION: "0.48.0"
@@ -77,8 +81,8 @@ jobs:
               exit 1
             }
             git fetch origin main --no-tags
-            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
-              echo "release tag must point to a commit on origin/main" >&2
+            test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || {
+              echo "release tag must point to the exact origin/main head" >&2
               exit 1
             }
           else
@@ -112,6 +116,10 @@ jobs:
           python3 -m unittest discover -s scripts -p "test_*.py"
           cargo package --locked
           python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
+          python3 scripts/check_cargo_publish_dry_run.py run \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --output target/package/release-cargo-publish-dry-run.json
           cargo build --release --all-features --locked
           cargo build --release --example edit_save_benchmark --all-features --locked
           soffice --version | tee target/release-libreoffice-version.txt
@@ -329,6 +337,7 @@ jobs:
           cp target/fuzz-seed-manifest.json target/fuzz-seed-replay.json dist/
           cp target/release-toolchain-versions.json dist/
           cp target/release-crate-distribution-smoke.json dist/
+          cp target/package/release-cargo-publish-dry-run.json dist/
           cp tests/oracles/public-corpus-baseline.json tests/oracles/public-corpus-expectations.json dist/
           cp target/release-public-hygiene-source.json dist/public-hygiene-source.json
           cp target/rxls-sbom.cdx.json dist/
@@ -337,6 +346,10 @@ jobs:
           cp target/release-libreoffice-version.txt \
             target/release-libreoffice-xlsx-smoke.txt \
             target/release-libreoffice-xlsm-smoke.txt dist/
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
           (cd dist && sha256sum "rxls-${version}.crate" > "rxls-${version}.crate.sha256")
           (cd dist && sha256sum "rxls-wasm-${version}.tgz" > "rxls-wasm-${version}.tgz.sha256")
           python3 scripts/public_hygiene_audit.py --json dist > dist/public-hygiene.json
@@ -389,10 +402,11 @@ jobs:
             dist/fuzz-seed-manifest.json \
             dist/fuzz-seed-replay.json \
             dist/release-toolchain-versions.json \
-            dist/release-crate-distribution-smoke.json
+            dist/release-crate-distribution-smoke.json \
+            dist/release-cargo-publish-dry-run.json
           python3 scripts/release_manifest.py \
             --verify-bundle dist \
-            --expected-files 47 \
+            --expected-files 48 \
             --version "$version" \
             --git-rev "$GITHUB_SHA"
 
@@ -440,6 +454,14 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "rxls-${version}-release" \
             --dir target/baseline-release
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt target/baseline-release/release-cargo-publish-dry-run.json
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
           python3 scripts/compare_release_bundles.py \
             target/baseline-release dist \
             --output target/reproducibility/rxls-release-reproducibility.json
@@ -462,6 +484,10 @@ jobs:
           comparison_bytes = comparison_path.read_bytes()
           manifest_path = Path("dist/rxls-release-manifest.json")
           manifest_bytes = manifest_path.read_bytes()
+          candidate_manifest_path = Path(
+              "target/reproducibility/rxls-release-candidate-manifest.json"
+          )
+          candidate_manifest_path.write_bytes(manifest_bytes)
           attestation = {
               "schema": "rxls.release-candidate-attestation.v1",
               "version": expected_version,
@@ -476,7 +502,7 @@ jobs:
                   "sha256": hashlib.sha256(comparison_bytes).hexdigest(),
               },
               "release_manifest": {
-                  "name": manifest_path.name,
+                  "name": candidate_manifest_path.name,
                   "bytes": len(manifest_bytes),
                   "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
               },
@@ -495,6 +521,7 @@ jobs:
           path: |
             target/reproducibility/rxls-release-reproducibility.json
             target/reproducibility/rxls-release-candidate-attestation.json
+            target/reproducibility/rxls-release-candidate-manifest.json
           if-no-files-found: error
 
       - name: Require successful exact-SHA CI and CodeQL runs
@@ -581,7 +608,9 @@ jobs:
           root = Path("target/publication-attestation")
           comparison_path = root / "rxls-release-reproducibility.json"
           attestation_path = root / "rxls-release-candidate-attestation.json"
+          candidate_manifest_path = root / "rxls-release-candidate-manifest.json"
           comparison_bytes = comparison_path.read_bytes()
+          candidate_manifest_bytes = candidate_manifest_path.read_bytes()
           comparison = json.loads(comparison_bytes)
           attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
           expected_sha = os.environ["GITHUB_SHA"].lower()
@@ -613,12 +642,12 @@ jobs:
           manifest_record = attestation.get("release_manifest")
           if not isinstance(manifest_record, dict):
               raise SystemExit("candidate attestation has no release-manifest record")
-          if manifest_record.get("name") != "rxls-release-manifest.json":
+          if manifest_record.get("name") != candidate_manifest_path.name:
               raise SystemExit("candidate attestation release-manifest name is invalid")
-          if not isinstance(manifest_record.get("bytes"), int) or manifest_record["bytes"] <= 0:
+          if manifest_record.get("bytes") != len(candidate_manifest_bytes):
               raise SystemExit("candidate attestation release-manifest size is invalid")
           manifest_digest = manifest_record.get("sha256")
-          if not isinstance(manifest_digest, str) or len(manifest_digest) != 64:
+          if manifest_digest != hashlib.sha256(candidate_manifest_bytes).hexdigest():
               raise SystemExit("candidate attestation release-manifest digest is invalid")
           Path("target/publication-attestation/baseline-run-id").write_text(
               str(baseline_run_id), encoding="utf-8"
@@ -656,6 +685,14 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name "rxls-${version}-release" \
             --dir target/attested-candidate-release
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt target/attested-candidate-release/release-cargo-publish-dry-run.json
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
           VERSION="$version" python3 - <<'PY'
           import hashlib
           import json
@@ -670,6 +707,11 @@ jobs:
               "target/attested-candidate-release/rxls-release-manifest.json"
           )
           manifest_bytes = manifest_path.read_bytes()
+          candidate_manifest_bytes = Path(
+              "target/publication-attestation/rxls-release-candidate-manifest.json"
+          ).read_bytes()
+          if candidate_manifest_bytes != manifest_bytes:
+              raise SystemExit("attested candidate manifest copy differs from release artifact")
           record = attestation["release_manifest"]
           if record.get("bytes") != len(manifest_bytes):
               raise SystemExit("attested candidate release-manifest size differs")
@@ -683,7 +725,7 @@ jobs:
           PY
           python3 scripts/release_manifest.py \
             --verify-bundle target/attested-candidate-release \
-            --expected-files 47 \
+            --expected-files 48 \
             --version "$version" \
             --git-rev "$GITHUB_SHA"
           python3 scripts/compare_release_bundles.py \
@@ -691,10 +733,52 @@ jobs:
             --output target/publication-attestation/rxls-tag-release-comparison.json
           echo "publication authorized by candidate runs $selected_baseline and $selected_run; tag bundle matches the attested candidate"
 
-      - name: Publish to crates.io
+      - name: Bind publication provenance into release manifest
         if: github.event_name == 'push'
         shell: bash
         run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          cp target/publication-attestation/rxls-release-candidate-manifest.json dist/
+          cp target/publication-attestation/rxls-release-reproducibility.json dist/
+          cp target/publication-attestation/rxls-release-candidate-attestation.json dist/
+          cp target/publication-attestation/rxls-tag-release-comparison.json dist/
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
+          python3 scripts/public_hygiene_audit.py --json dist \
+            > target/release-public-hygiene-publication.json
+          cp target/release-public-hygiene-publication.json dist/public-hygiene.json
+          mapfile -t artifacts < <(find dist -maxdepth 1 -type f \
+            ! -name rxls-release-manifest.json \
+            ! -name public-hygiene.json -print | LC_ALL=C sort)
+          [[ ${#artifacts[@]} -eq 50 ]] || {
+            echo "publication manifest input count differs from the 0.1.3 contract" >&2
+            exit 1
+          }
+          python3 scripts/release_manifest.py \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA" \
+            --hygiene-report dist/public-hygiene.json \
+            --output dist/rxls-release-manifest.json \
+            "${artifacts[@]}"
+          python3 scripts/release_manifest.py \
+            --verify-bundle dist \
+            --expected-files 52 \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA"
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
           version="${{ steps.release.outputs.version }}"
           url="https://crates.io/api/v1/crates/rxls/${version}"
           local_checksum=$(sha256sum "dist/rxls-${version}.crate" | cut -d ' ' -f 1)
@@ -705,7 +789,7 @@ jobs:
               echo "rxls ${version} is already published; skipping"
               ;;
             404)
-              cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+              cargo publish --locked --registry crates-io
               ;;
             *)
               echo "crates.io version check failed with HTTP $status" >&2
@@ -771,12 +855,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --verify-tag --generate-notes --title "$tag"
-          fi
+          python3 scripts/reconcile_github_release.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$tag" \
+            --target-commitish "$GITHUB_SHA" \
+            --dist dist \
+            --expected-files 52 \
+            --token-env GH_TOKEN
 
       - name: Verify published crate, WASM, docs, assets, and checksums
         if: github.event_name == 'push'
@@ -845,9 +932,13 @@ jobs:
           }
 
           gh release download "$tag" --dir "$smoke/assets"
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt "$smoke/assets/release-cargo-publish-dry-run.json"
           python3 scripts/release_manifest.py \
             --verify-bundle "$smoke/assets" \
-            --expected-files 47 \
+            --expected-files 52 \
             --version "$version" \
             --git-rev "$GITHUB_SHA"
           (cd "$smoke/assets" && sha256sum --check ./*.sha256)
