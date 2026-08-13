@@ -8579,7 +8579,8 @@ fn try_push_chart(
     let cartesian_axis = if cartesian {
         let Some(axis) = chart_nice_value_axis(
             &series,
-            matches!(chart.kind, ChartKind::Bar | ChartKind::Area),
+            matches!(chart.kind, ChartKind::Bar | ChartKind::Area)
+                || (metadata.is_some() && chart.kind == ChartKind::Line),
         ) else {
             *chart_points = initial_points;
             return Ok(false);
@@ -22608,6 +22609,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn imported_line_chart_value_axis_keeps_calc_zero_baseline() {
+        let mut style = ChartSeriesStyle::default();
+        style.marker = ChartMarkerSymbol::None;
+        let series = [ResolvedChartSeries {
+            name: "Imported line".to_string(),
+            values: vec![51.0, 64.0, 77.0, 90.0],
+            x_values: None,
+            labels: vec![
+                "Q1".to_string(),
+                "Q2".to_string(),
+                "Q3".to_string(),
+                "Q4".to_string(),
+            ],
+            bubble_sizes: None,
+            style,
+        }];
+        let authored = chart_nice_value_axis(&series, false).unwrap();
+        let imported = chart_nice_value_axis(&series, true).unwrap();
+        assert_eq!((authored.minimum, authored.maximum), (45.0, 95.0));
+        assert_eq!((imported.minimum, imported.maximum), (0.0, 100.0));
+        assert_eq!(imported.ticks, vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0]);
     }
 
     #[test]
