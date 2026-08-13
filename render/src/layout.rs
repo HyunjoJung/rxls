@@ -7431,7 +7431,7 @@ fn push_drawing_placeholders(
     for (index, chart) in sheet.charts().iter().enumerate() {
         let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
         match drawing_rect(
-            &drawing_row_slots,
+            row_slots,
             col_slots,
             cell_viewport,
             sheet_viewport,
@@ -15688,15 +15688,15 @@ mod tests {
         let (drawing_object, object_relationship, object_part) = match kind {
             DrawingObjectKind::Image => (
                 r#"<pic><blipFill><blip r:embed="rIdObject"/></blipFill></pic>"#,
-                r#"<Relationship Id="rIdObject" Target="../media/image1.png"/>"#,
+                r#"<Relationship Id="rIdObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>"#,
                 ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n".as_slice()),
             ),
             DrawingObjectKind::Chart => (
                 r#"<graphicFrame><graphic><graphicData><chart r:id="rIdObject"/></graphicData></graphic></graphicFrame>"#,
-                r#"<Relationship Id="rIdObject" Target="../charts/chart1.xml"/>"#,
+                r#"<Relationship Id="rIdObject" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>"#,
                 (
                     "xl/charts/chart1.xml",
-                    br#"<chartSpace><chart><plotArea><lineChart/></plotArea></chart></chartSpace>"#
+                    br#"<chartSpace><chart><plotArea><lineChart><ser><idx val="0"/><order val="0"/><cat><strRef><f>Sheet1!$A$1:$A$4</f><strCache><pt idx="0"><v>Q1</v></pt><pt idx="1"><v>Q2</v></pt><pt idx="2"><v>Q3</v></pt><pt idx="3"><v>Q4</v></pt></strCache></strRef></cat><val><numRef><f>Sheet1!$B$1:$B$4</f><numCache><pt idx="0"><v>10</v></pt><pt idx="1"><v>20</v></pt><pt idx="2"><v>30</v></pt><pt idx="3"><v>40</v></pt></numCache></numRef></val></ser><axId val="1"/><axId val="2"/></lineChart><catAx><axId val="1"/><crossAx val="2"/></catAx><valAx><axId val="2"/><crossAx val="1"/></valAx></plotArea></chart></chartSpace>"#
                         .as_slice(),
                 ),
             ),
@@ -20069,6 +20069,91 @@ mod tests {
         assert_eq!(
             frame.height,
             Fixed::from_raw(CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT.raw() * 4)
+        );
+    }
+
+    #[test]
+    fn imported_xlsx_chart_anchors_follow_expanded_cell_rows() {
+        let mut workbook = imported_two_cell_drawing(DrawingObjectKind::Chart, (0, 0));
+        workbook.sheets[0].set_col_width(0, 8.0);
+        workbook.sheets[0].write_styled(
+            1,
+            0,
+            "wrapped imported chart anchor row must retain Calc automatic height",
+            &CellStyle::new().wrap(),
+        );
+        assert!(workbook.sheets[0].has_implicit_ooxml_row_height());
+        assert_eq!(
+            workbook.sheets[0].charts().len(),
+            1,
+            "imported chart fixture"
+        );
+
+        let range = RenderRange::new(0, 0, 8, 6);
+        let options = outlined_options(range);
+        let (rows, _) = measure_sheet_axes(&workbook.sheets[0], range, &options).unwrap();
+        let expanded_row = rows
+            .iter()
+            .find(|slot| slot.index == 1)
+            .expect("wrapped imported cell row");
+        assert!(
+            expanded_row.size > CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT,
+            "wrapped imported cell must expand its automatic row"
+        );
+        let control = imported_two_cell_drawing(DrawingObjectKind::Chart, (0, 0));
+        let (control_rows, _) = measure_sheet_axes(&control.sheets[0], range, &options).unwrap();
+        let expanded_anchor_offset = rows
+            .iter()
+            .find(|slot| slot.index == 3)
+            .expect("expanded chart anchor row")
+            .offset;
+        let control_anchor_offset = control_rows
+            .iter()
+            .find(|slot| slot.index == 3)
+            .expect("control chart anchor row")
+            .offset;
+        let drawing_anchor_delta = calc_drawing_row_slots(&workbook.sheets[0], &rows)
+            .iter()
+            .find(|slot| slot.index == 3)
+            .expect("expanded Calc drawing anchor row")
+            .offset
+            .raw()
+            - calc_drawing_row_slots(&control.sheets[0], &control_rows)
+                .iter()
+                .find(|slot| slot.index == 3)
+                .expect("control Calc drawing anchor row")
+                .offset
+                .raw();
+        let expected_delta = expanded_anchor_offset.raw() - control_anchor_offset.raw();
+        assert!(expected_delta > 0);
+        assert_ne!(
+            expected_delta, drawing_anchor_delta,
+            "expanded cell geometry must differ from the fixed drawing track"
+        );
+
+        let chart_frame = |workbook: &Workbook| {
+            let build = build_scene(workbook, 0, &options).unwrap();
+            let frame = build
+                .scene
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    SceneNode::Rect(RectNode { rect, stroke, .. })
+                        if stroke.is_some() && rect.width > Fixed::from_pixels(100) =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .expect("imported chart frame");
+            frame
+        };
+        let expanded_frame = chart_frame(&workbook);
+        let control_frame = chart_frame(&control);
+        assert_eq!(
+            expanded_frame.y.raw() - control_frame.y.raw(),
+            expected_delta,
+            "imported chart anchor must follow the expanded worksheet row track"
         );
     }
 
