@@ -63,7 +63,19 @@ fn render_scene_svg_impl(
     out.push("\"/>\n")?;
 
     let mut clip_index = 0_usize;
-    push_scene_nodes(&mut out, &scene.nodes, &mut clip_index, trace, 0)?;
+    push_scene_nodes(
+        &mut out,
+        &scene.nodes,
+        &mut clip_index,
+        trace,
+        0,
+        Some(Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: scene.width,
+            height: scene.height,
+        }),
+    )?;
     out.push("</svg>\n")?;
     Ok(out.finish())
 }
@@ -98,6 +110,7 @@ fn push_scene_nodes(
     clip_index: &mut usize,
     mut trace: Option<&mut BackendGeometryTrace>,
     depth: usize,
+    active_clip: Option<Rect>,
 ) -> Result<(), RenderError> {
     for node in nodes {
         match node {
@@ -117,12 +130,17 @@ fn push_scene_nodes(
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::ClipStart(group.clip));
                 }
+                let effective_group_clip = match active_clip {
+                    Some(active_clip) => intersect_rects(active_clip, group.clip)?,
+                    None => None,
+                };
                 push_scene_nodes(
                     out,
                     &group.nodes,
                     clip_index,
                     trace.as_deref_mut(),
                     depth + 1,
+                    effective_group_clip,
                 )?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::ClipEnd);
@@ -166,7 +184,12 @@ fn push_scene_nodes(
                     .ok_or(RenderError::CoordinateOverflow)?;
             }
             SceneNode::GlyphRun(glyphs) => {
-                let glyph_trace = push_glyph_run(out, glyphs, *clip_index, trace.is_some())?;
+                let effective_clip = match active_clip {
+                    Some(active_clip) => intersect_rects(active_clip, glyphs.clip_bounds)?,
+                    None => None,
+                };
+                let glyph_trace =
+                    push_glyph_run(out, glyphs, *clip_index, trace.is_some(), effective_clip)?;
                 if let (Some(trace), Some(glyph_trace)) = (trace.as_deref_mut(), glyph_trace) {
                     trace.push(BackendNodeTrace::Glyph(glyph_trace));
                 }
@@ -327,6 +350,7 @@ fn push_glyph_run(
     node: &GlyphRunNode,
     clip_index: usize,
     tracing: bool,
+    effective_clip: Option<Rect>,
 ) -> Result<Option<BackendGlyphTrace>, RenderError> {
     if !node.metadata_is_valid() {
         return Err(RenderError::Backend {
@@ -344,7 +368,7 @@ fn push_glyph_run(
                 .map_err(trace_error)?;
         }
     }
-    let visible_label = visible_glyph_label(node)?;
+    let visible_label = visible_glyph_label_in_clip(node, effective_clip)?;
     out.push("<g role=\"text\" aria-label=\"")?;
     push_xml_escaped(out, &node.text, true)?;
     out.push("\" data-rxls-visible-label=\"")?;
@@ -407,25 +431,34 @@ fn push_glyph_run(
         .map_err(trace_error)
 }
 
-/// Return the logical source text whose glyph outlines have non-empty overlap
-/// with the cell clip. The full source remains in `aria-label`; this bounded
-/// derivative lets parity tooling compare what can actually be painted.
+#[cfg(test)]
 fn visible_glyph_label(node: &GlyphRunNode) -> Result<String, RenderError> {
-    let clip_right = node
-        .clip_bounds
+    visible_glyph_label_in_clip(node, Some(node.clip_bounds))
+}
+
+/// Return the logical source text whose glyph outlines have non-empty overlap
+/// with every effective clip. The full source remains in `aria-label`; this
+/// bounded derivative lets parity tooling compare what can actually be painted.
+fn visible_glyph_label_in_clip(
+    node: &GlyphRunNode,
+    effective_clip: Option<Rect>,
+) -> Result<String, RenderError> {
+    let Some(effective_clip) = effective_clip else {
+        return Ok(String::new());
+    };
+    let clip_right = effective_clip
         .x
         .raw()
-        .checked_add(node.clip_bounds.width.raw())
+        .checked_add(effective_clip.width.raw())
         .ok_or(RenderError::CoordinateOverflow)?;
-    let clip_bottom = node
-        .clip_bounds
+    let clip_bottom = effective_clip
         .y
         .raw()
-        .checked_add(node.clip_bounds.height.raw())
+        .checked_add(effective_clip.height.raw())
         .ok_or(RenderError::CoordinateOverflow)?;
     let clip = (
-        node.clip_bounds.x.raw(),
-        node.clip_bounds.y.raw(),
+        effective_clip.x.raw(),
+        effective_clip.y.raw(),
         clip_right,
         clip_bottom,
     );
@@ -489,6 +522,49 @@ fn visible_glyph_label(node: &GlyphRunNode) -> Result<String, RenderError> {
         }
     }
     Ok(visible)
+}
+
+fn intersect_rects(left: Rect, right: Rect) -> Result<Option<Rect>, RenderError> {
+    if left.width <= Fixed::ZERO
+        || left.height <= Fixed::ZERO
+        || right.width <= Fixed::ZERO
+        || right.height <= Fixed::ZERO
+    {
+        return Ok(None);
+    }
+    let left_right = left
+        .x
+        .checked_add(left.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let left_bottom = left
+        .y
+        .checked_add(left.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_right = right
+        .x
+        .checked_add(right.width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_bottom = right
+        .y
+        .checked_add(right.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let end_x = left_right.min(right_right);
+    let end_y = left_bottom.min(right_bottom);
+    if end_x <= x || end_y <= y {
+        return Ok(None);
+    }
+    Ok(Some(Rect {
+        x,
+        y,
+        width: end_x
+            .checked_sub(x)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: end_y
+            .checked_sub(y)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    }))
 }
 
 fn glyph_commands_intersect_clip(commands: &[PathCommand], clip: (i64, i64, i64, i64)) -> bool {
@@ -1099,5 +1175,51 @@ mod tests {
             }],
         );
         assert_eq!(visible_glyph_label(&outside).unwrap(), "");
+    }
+
+    #[test]
+    fn glyph_visible_label_respects_scene_and_nested_clips() {
+        let mut root_commands = rectangle_commands(0, 4);
+        root_commands.extend(rectangle_commands(12, 16));
+        let mut nested_commands = rectangle_commands(0, 4);
+        nested_commands.extend(rectangle_commands(6, 8));
+        let clusters = vec![
+            GlyphCluster {
+                source_start: 0,
+                source_end: 6,
+                command_start: 0,
+                command_end: 5,
+            },
+            GlyphCluster {
+                source_start: 7,
+                source_end: 14,
+                command_start: 5,
+                command_end: 10,
+            },
+        ];
+        let root_clipped = glyph_node("inside outside", 0, 20, root_commands, clusters.clone());
+        let nested_clipped = glyph_node("inside outside", 0, 20, nested_commands, clusters);
+        let scene = Scene {
+            title: "effective clips".to_string(),
+            width: Fixed::from_raw(10),
+            height: Fixed::from_raw(10),
+            background: Rgb::WHITE,
+            nodes: vec![
+                SceneNode::GlyphRun(root_clipped),
+                SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip: Rect {
+                        x: Fixed::ZERO,
+                        y: Fixed::ZERO,
+                        width: Fixed::from_raw(5),
+                        height: Fixed::from_raw(10),
+                    },
+                    nodes: vec![SceneNode::GlyphRun(nested_clipped)],
+                }),
+            ],
+        };
+
+        let svg = render_scene_svg(&scene, 1 << 20).unwrap();
+        assert_eq!(svg.matches("data-rxls-visible-label=\"inside\"").count(), 2);
+        assert!(!svg.contains("data-rxls-visible-label=\"inside outside\""));
     }
 }

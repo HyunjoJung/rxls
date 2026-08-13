@@ -96,13 +96,19 @@ const AUTO_ROW_VERTICAL_PADDING_PIXELS: i64 = 2;
 /// Calc's default left and right EditEngine cell margins are each 20 twips.
 const CALC_CELL_HORIZONTAL_MARGIN_TWIPS: u64 = 20;
 /// Calc's `sc/source/ui/view/output2.cxx` offsets top-aligned text by
-/// `ATTR_MARGIN`'s top value and bottom-aligned text by its bottom value. The
-/// default cell item supplies 20 twips on each side: exactly one point. Keep
-/// that source quantity distinct from the device-pixel truncation used only by
-/// optimal-row measurement.
+/// `ATTR_MARGIN`'s top value and bottom-aligned text by its bottom value.
 const CALC_CELL_VERTICAL_MARGIN_TWIPS: i128 = 20;
+/// Calc's BIFF importer assigns a 40-twip `ATTR_MARGIN` to the imported default
+/// cell XF. Other imported formats retain Calc's ordinary 20-twip default.
+const CALC_BIFF_CELL_VERTICAL_MARGIN_TWIPS: i128 = 40;
 const CALC_CELL_VERTICAL_MARGIN: Fixed = Fixed::from_raw(
-    ((CALC_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128 + TWIPS_PER_CSS_PIXEL / 2)
+    ((CALC_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128
+        + TWIPS_PER_CSS_PIXEL / 2)
+        / TWIPS_PER_CSS_PIXEL) as i64,
+);
+const CALC_BIFF_CELL_VERTICAL_MARGIN: Fixed = Fixed::from_raw(
+    ((CALC_BIFF_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128
+        + TWIPS_PER_CSS_PIXEL / 2)
         / TWIPS_PER_CSS_PIXEL) as i64,
 );
 /// Calc removes one additional device pixel for the cell grid line before
@@ -1211,6 +1217,8 @@ fn build_auxiliary_text_node_with_clip_and_kerning(
         numeric_default: false,
         text_can_overflow: false,
         ods_fixed_height_row: false,
+        print_vertical_overflow: false,
+        vertical_margin: CALC_CELL_VERTICAL_MARGIN,
     };
     let mut auxiliary_options = options.clone();
     auxiliary_options.horizontal_padding = horizontal_padding;
@@ -1271,6 +1279,8 @@ struct Region {
     numeric_default: bool,
     text_can_overflow: bool,
     ods_fixed_height_row: bool,
+    print_vertical_overflow: bool,
+    vertical_margin: Fixed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1519,6 +1529,24 @@ pub(crate) fn build_sheet_scene_for_print(
     )
 }
 
+fn calc_cell_vertical_margin(sheet: &Sheet) -> Fixed {
+    let imported_biff = sheet.biff_uses_application_default_column_width()
+        || sheet.biff_uses_application_default_row_height()
+        || matches!(
+            sheet.imported_default_column_axis_measure(),
+            Some(ImportedAxisMeasure::CharacterWidth256(_))
+        )
+        || sheet
+            .imported_column_axis_measures()
+            .values()
+            .any(|measure| matches!(measure, ImportedAxisMeasure::CharacterWidth256(_)));
+    if imported_biff {
+        CALC_BIFF_CELL_VERTICAL_MARGIN
+    } else {
+        CALC_CELL_VERTICAL_MARGIN
+    }
+}
+
 fn build_sheet_scene_inner(
     sheet: &Sheet,
     sheet_index: usize,
@@ -1574,6 +1602,9 @@ fn build_sheet_scene_inner(
         sheet.conditional_formats().len() as u64,
     )?;
     let calc_line_layout_available = calc_line_layout_available(sheet, options);
+    let vertical_margin = calc_cell_vertical_margin(sheet);
+    let print_vertical_overflow_available = gridline_policy != GridlinePolicy::WorksheetView
+        && !has_conditional_text_layout_overlay(sheet);
     let ods_native_sheet = matches!(
         sheet.imported_default_row_axis_measure(),
         Some(ImportedAxisMeasure::MillimeterHundredths(_))
@@ -1981,6 +2012,8 @@ fn build_sheet_scene_inner(
                 numeric_default,
                 text_can_overflow,
                 ods_fixed_height_row: ods_native_sheet && !has_adjustable_row,
+                print_vertical_overflow: print_vertical_overflow_available && has_adjustable_row,
+                vertical_margin,
             });
         }
     }
@@ -2078,8 +2111,10 @@ fn build_sheet_scene_inner(
             continue;
         }
         let style = text_style(region, options, sheet_right_to_left);
-        let clip_bounds = text_clip_bounds(region_index, &regions, &row_regions, &style)?;
-        let layout_bounds = calc_cell_text_layout_bounds(region.rect, style.baseline)?;
+        let clip_bounds =
+            text_clip_bounds(region_index, &regions, &row_regions, &style, scene_bounds)?;
+        let layout_bounds =
+            calc_cell_text_layout_bounds(region.rect, style.baseline, region.vertical_margin)?;
         let node = match options.font_pack.as_ref() {
             Some(font_pack) => SceneNode::GlyphRun(build_glyph_run(
                 font_pack,
@@ -4434,6 +4469,8 @@ fn resolve_conditional_layout_cells(
             numeric_default: false,
             text_can_overflow: false,
             ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: calc_cell_vertical_margin(sheet),
         })
         .collect::<Vec<_>>();
     let mut measurement_warnings = Warnings::default();
@@ -5359,6 +5396,8 @@ fn expand_automatic_row_heights(
                 numeric_default: false,
                 text_can_overflow: false,
                 ods_fixed_height_row: false,
+                print_vertical_overflow: false,
+                vertical_margin: calc_cell_vertical_margin(sheet),
             };
             measure_automatic_cell_height(
                 pack,
@@ -13010,7 +13049,11 @@ fn build_glyph_run(
         // Calc preserves the beginning of implicitly aligned wrapped ODS text
         // in a fixed-height row. Its generic bottom default would otherwise
         // translate the beginning above the clip and retain only the tail.
-        let top_bounds = calc_cell_text_layout_bounds(region.rect, TextBaseline::Top)?;
+        let top_bounds = calc_cell_text_layout_bounds(
+            region.rect,
+            TextBaseline::Top,
+            region.vertical_margin,
+        )?;
         vertical_block_top(top_bounds, block_height, TextBaseline::Top)?
     } else {
         vertical_block_top(layout_bounds, block_height, style.baseline)?
@@ -13707,22 +13750,26 @@ fn vertical_block_top(
     }
 }
 
-fn calc_cell_text_layout_bounds(rect: Rect, baseline: TextBaseline) -> Result<Rect, RenderError> {
+fn calc_cell_text_layout_bounds(
+    rect: Rect,
+    baseline: TextBaseline,
+    vertical_margin: Fixed,
+) -> Result<Rect, RenderError> {
     // Calc applies the corresponding ATTR_MARGIN edge as a positional offset;
     // it does not resize the cell clip. Translating the backend-neutral layout
-    // bounds preserves the original clip and keeps the exact one-point inset
+    // bounds preserves the original clip and keeps the source-derived inset
     // even when a deliberately short row cannot contain the margin. Equal top
     // and bottom defaults cancel for middle alignment, so its bounds stay byte-
     // for-byte unchanged.
     let y = match baseline {
         TextBaseline::Top => rect
             .y
-            .checked_add(CALC_CELL_VERTICAL_MARGIN)
+            .checked_add(vertical_margin)
             .ok_or(RenderError::CoordinateOverflow)?,
         TextBaseline::Middle => rect.y,
         TextBaseline::Bottom => rect
             .y
-            .checked_sub(CALC_CELL_VERTICAL_MARGIN)
+            .checked_sub(vertical_margin)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
     Ok(Rect { y, ..rect })
@@ -14482,6 +14529,23 @@ fn regions_by_visual_row(regions: &[Region]) -> Result<BTreeMap<i64, Vec<usize>>
 }
 
 fn text_clip_bounds(
+    region_index: usize,
+    regions: &[Region],
+    rows: &BTreeMap<i64, Vec<usize>>,
+    text_style: &TextStyle,
+    scene_bounds: Rect,
+) -> Result<Rect, RenderError> {
+    let mut clip = horizontal_text_clip_bounds(region_index, regions, rows, text_style)?;
+    if regions[region_index].print_vertical_overflow {
+        // Calc's printer path suppresses vertical cell clipping for automatic
+        // rows. The enclosing page still clips paint at the printable scene.
+        clip.y = scene_bounds.y;
+        clip.height = scene_bounds.height;
+    }
+    Ok(clip)
+}
+
+fn horizontal_text_clip_bounds(
     region_index: usize,
     regions: &[Region],
     rows: &BTreeMap<i64, Vec<usize>>,
@@ -15692,7 +15756,7 @@ mod tests {
         // ECMA-376 Part 1 section 18.8.1 defaults `vertical` to `bottom`, and
         // both Excel and Calc render it that way. Centring instead lifts every
         // unaligned cell off the baseline Calc puts it on. Calc then applies
-        // the default 20-twip bottom ATTR_MARGIN before positioning the block.
+        // the ordinary 20-twip bottom ATTR_MARGIN before positioning the block.
         let rect = Rect {
             x: Fixed::ZERO,
             y: Fixed::ZERO,
@@ -15702,11 +15766,24 @@ mod tests {
         let block = Fixed::from_pixels(12);
         assert_eq!(
             CALC_CELL_VERTICAL_MARGIN,
-            points_to_fixed(1.0).expect("one point")
+            points_to_fixed(1.0).expect("one point"),
+            "20 twips are exactly one point"
         );
-        let bottom = calc_cell_text_layout_bounds(rect, TextBaseline::Bottom).unwrap();
-        let top = calc_cell_text_layout_bounds(rect, TextBaseline::Top).unwrap();
-        let middle = calc_cell_text_layout_bounds(rect, TextBaseline::Middle).unwrap();
+        let bottom =
+            calc_cell_text_layout_bounds(rect, TextBaseline::Bottom, CALC_CELL_VERTICAL_MARGIN)
+                .unwrap();
+        let top = calc_cell_text_layout_bounds(
+            rect,
+            TextBaseline::Top,
+            CALC_CELL_VERTICAL_MARGIN,
+        )
+        .unwrap();
+        let middle = calc_cell_text_layout_bounds(
+            rect,
+            TextBaseline::Middle,
+            CALC_CELL_VERTICAL_MARGIN,
+        )
+        .unwrap();
         assert_eq!(
             vertical_block_top(bottom, block, TextBaseline::Bottom).unwrap(),
             Fixed::from_pixels(28)
@@ -15810,6 +15887,42 @@ mod tests {
             top.clip_bounds.y.raw() + CALC_CELL_VERTICAL_MARGIN.raw(),
             "outlined top text starts exactly one point inside the original clip"
         );
+    }
+
+    #[test]
+    fn imported_biff_cells_use_their_two_point_default_margin() {
+        let biff = imported_biff8_default_row(false, ".");
+        assert_eq!(
+            calc_cell_vertical_margin(&biff.sheets[0]),
+            CALC_BIFF_CELL_VERTICAL_MARGIN
+        );
+
+        let mut authored = Workbook::new();
+        authored.add_sheet("authored");
+        assert_eq!(
+            calc_cell_vertical_margin(&authored.sheets[0]),
+            CALC_CELL_VERTICAL_MARGIN
+        );
+    }
+
+    #[test]
+    fn calc_print_text_uses_page_vertical_clip_for_automatic_rows() {
+        let automatic = imported_biff8_default_row(false, ".");
+        let manual = imported_biff8_default_row(true, ".");
+        let options = outlined_options(RenderRange::new(0, 0, 1, 0));
+        let build = |workbook: &Workbook| {
+            build_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap()
+        };
+
+        let automatic = build(&automatic);
+        let automatic_run = glyph_run(&automatic.scene, ".");
+        assert_eq!(automatic_run.clip_bounds.y, Fixed::ZERO);
+        assert_eq!(automatic_run.clip_bounds.height, automatic.scene.height);
+
+        let manual = build(&manual);
+        let manual_run = glyph_run(&manual.scene, ".");
+        assert_eq!(manual_run.clip_bounds.y, Fixed::ZERO);
+        assert!(manual_run.clip_bounds.height < manual.scene.height);
     }
 
     #[test]
@@ -16391,6 +16504,8 @@ mod tests {
             numeric_default: false,
             text_can_overflow: false,
             ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: CALC_CELL_VERTICAL_MARGIN,
         };
         let base = text_style(&region, &options, false);
         let (styles, spans) = resolve_rich_styles(&region, &base).unwrap();
@@ -17804,6 +17919,8 @@ mod tests {
             numeric_default: false,
             text_can_overflow: false,
             ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: CALC_CELL_VERTICAL_MARGIN,
         };
         let text_style = text_style(&region, &options, false);
         let mut statistics = TypographyStats::default();
@@ -18097,6 +18214,8 @@ mod tests {
             numeric_default: false,
             text_can_overflow: false,
             ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: CALC_CELL_VERTICAL_MARGIN,
         };
         let mut native_statistics = TypographyStats::default();
         let native_height = measure_automatic_cell_height(
@@ -19071,6 +19190,8 @@ mod tests {
             numeric_default: false,
             text_can_overflow: false,
             ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: CALC_CELL_VERTICAL_MARGIN,
         };
         let mut statistics = TypographyStats::default();
         let region = make_region("Latin 한국어 العربية");
