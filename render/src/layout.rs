@@ -7522,7 +7522,14 @@ fn push_drawing_placeholders(
         }
         ordinal = ordinal.saturating_add(1);
     }
+    // LibreOffice Calc currently retains imported OOXML sparkline metadata but
+    // does not paint those x14 worksheet extensions. Keep authored sparklines
+    // fully renderable while deferring the imported paint so parity does not
+    // invent an extra in-cell chart that the oracle omits.
     for (index, sparkline) in sheet.sparklines().iter().enumerate() {
+        if sheet.style_fidelity() != StyleFidelity::Authored {
+            continue;
+        }
         let source = CellCoordinate {
             row: sparkline.location.0,
             col: sparkline.location.1,
@@ -22153,6 +22160,33 @@ mod tests {
                 actual: 6,
             })
         );
+    }
+
+    #[test]
+    fn imported_sparklines_defer_paint_when_calc_omits_ooxml_extensions() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("imported_sparkline");
+        for (col, value) in [10.0, 20.0, 15.0, 25.0].into_iter().enumerate() {
+            sheet.write_number(0, (col + 1) as u16, value);
+        }
+        sheet.add_sparkline(Sparkline::new((0, 0), "imported_sparkline!$B$1:$E$1"));
+        let workbook = Workbook::open(&workbook.to_xlsx()).expect("reopen imported sparkline");
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 0, 4)),
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        assert!(!build
+            .scene
+            .nodes
+            .iter()
+            .any(|node| { matches!(node, SceneNode::Line(_) | SceneNode::Path(_)) }));
+        assert!(!build
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == WarningCode::SparklinePlaceholder));
     }
 
     #[test]
