@@ -36,9 +36,10 @@ pub use print::{
     PrintPage, PrintReport, PrintWarning, PrintWarningCode,
 };
 pub use scene::{
-    ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode, ImageNode,
-    LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneFontFace, SceneNode,
-    ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
+    ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode,
+    GlyphSemanticGroup, ImageNode, LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene,
+    SceneFontFace, SceneNode, ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle,
+    FIXED_UNITS_PER_PIXEL,
 };
 pub use svg::render_scene_svg;
 

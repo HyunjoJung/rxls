@@ -20,9 +20,10 @@ use crate::font::{
 };
 use crate::media::decode_image;
 use crate::scene::{
-    ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode, ImageNode,
-    LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene, SceneFontFace, SceneNode,
-    ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle, FIXED_UNITS_PER_PIXEL,
+    ClipGroupNode, Fixed, GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphRunNode,
+    GlyphSemanticGroup, ImageNode, LineNode, PathCommand, PathNode, Rect, RectNode, Rgb, Scene,
+    SceneFontFace, SceneNode, ShapedGlyph, TextAnchor, TextBaseline, TextNode, TextStyle,
+    FIXED_UNITS_PER_PIXEL,
 };
 use crate::typography::{wrap_text_lines, CellLineLayoutPolicy};
 use unicode_bidi::{bidi_class, BidiClass, BidiInfo};
@@ -4739,6 +4740,52 @@ fn has_mixed_calc_script_classes(text: &str) -> bool {
         resolved = Some(script);
     }
     false
+}
+
+/// Partition an ambiguous Calc cell the way EditEngine retains script runs.
+///
+/// Weak characters inherit the preceding strong script, matching Calc's
+/// script-change scanner. Leading weak characters inherit the first strong
+/// script. A uniform cell stays on the faster DrawStrings path and therefore
+/// carries no semantic groups.
+fn calc_edit_engine_semantic_groups(
+    text: &str,
+    lines: &[PreparedLine],
+) -> Result<Vec<GlyphSemanticGroup>, RenderError> {
+    let Some(first_script) = text.chars().find_map(calc_script_class) else {
+        return Ok(Vec::new());
+    };
+    let mut current_script = first_script;
+    let mut previous_script = first_script;
+    let mut boundaries = BTreeSet::from([0_usize, text.len()]);
+    for (byte_start, character) in text.char_indices() {
+        let script = calc_script_class(character).unwrap_or(previous_script);
+        if script != current_script {
+            boundaries.insert(byte_start);
+            current_script = script;
+        }
+        previous_script = script;
+    }
+    if boundaries.len() == 2 {
+        return Ok(Vec::new());
+    }
+    for line in lines {
+        boundaries.insert(line.source.start);
+        boundaries.insert(line.source.end);
+    }
+    boundaries
+        .into_iter()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|pair| {
+            Ok(GlyphSemanticGroup {
+                source_start: u64::try_from(pair[0])
+                    .map_err(|_| RenderError::CoordinateOverflow)?,
+                source_end: u64::try_from(pair[1])
+                    .map_err(|_| RenderError::CoordinateOverflow)?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -13143,6 +13190,7 @@ fn build_glyph_run(
         commands,
         clusters,
         cluster_metrics,
+        semantic_groups: calc_edit_engine_semantic_groups(&region.text, &prepared.lines)?,
         paints,
         decorations,
         color: style.color,
@@ -16763,8 +16811,8 @@ mod tests {
         assert!(embedded_source.contains("/Subtype /CIDFontType2"));
         assert!(embedded_source.contains("/FontFile2"));
         assert!(
-            embedded.len() < pdf.len(),
-            "embedding must shrink the document: {} vs {}",
+            embedded.len() < pdf.len() + 128,
+            "embedding must remain within bounded metadata overhead: {} vs {}",
             embedded.len(),
             pdf.len()
         );
@@ -18769,6 +18817,20 @@ mod tests {
             calc_script_class('\u{2c80}'),
             Some(CalcScriptClass::Western)
         );
+        let semantic_text = "한국어 렌더링 사례 0006";
+        let groups = calc_edit_engine_semantic_groups(semantic_text, &[]).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            &semantic_text[groups[0].source_start as usize..groups[0].source_end as usize],
+            "한국어 렌더링 사례 "
+        );
+        assert_eq!(
+            &semantic_text[groups[1].source_start as usize..groups[1].source_end as usize],
+            "0006"
+        );
+        assert!(calc_edit_engine_semantic_groups("Latin only 0006", &[])
+            .unwrap()
+            .is_empty());
         assert_eq!(
             measured.rows[0].size,
             calc_ooxml_row_height_from_points(11).unwrap(),

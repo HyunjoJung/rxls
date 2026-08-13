@@ -1892,6 +1892,7 @@ fn push_glyph_run(
         }
     };
     let visible_glyph = spans.iter().any(|span| !span.glyphs.is_empty());
+    let mut emitted_glyphs = vec![false; glyphs.len()];
     let first_glyph = spans
         .iter()
         .flat_map(|span| span.glyphs.iter())
@@ -1953,6 +1954,7 @@ fn push_glyph_run(
             if !marked {
                 content.push("/Artifact BMC\n")?;
                 for &glyph_index in &span.glyphs {
+                    emitted_glyphs[glyph_index] = true;
                     push_pdf_glyph_cluster(
                         content,
                         node,
@@ -1999,6 +2001,7 @@ fn push_glyph_run(
                     push_actual_text_begin(content, text)?;
                 }
                 for &glyph_index in &segment.glyphs {
+                    emitted_glyphs[glyph_index] = true;
                     push_pdf_glyph_cluster(
                         content,
                         node,
@@ -2025,6 +2028,26 @@ fn push_glyph_run(
                 }
             }
         }
+    }
+    if visible_glyph && emitted_glyphs.iter().any(|emitted| !emitted) {
+        // Semantic clipping must never become paint clipping. Emit clusters
+        // excluded from extracted text under empty ActualText; the already-
+        // active scene, group, and cell clips remain authoritative for ink.
+        push_actual_text_begin(content, "")?;
+        for (glyph_index, emitted) in emitted_glyphs.into_iter().enumerate() {
+            if !emitted {
+                push_pdf_glyph_cluster(
+                    content,
+                    node,
+                    glyph_index,
+                    glyphs[glyph_index],
+                    embedded.as_deref(),
+                    subset_fonts,
+                    embedded_fonts,
+                )?;
+            }
+        }
+        content.push("EMC\n")?;
     }
     *semantic_boundary_anchor = current_boundary_anchor;
     for decoration in &node.decorations {
@@ -2300,6 +2323,10 @@ fn glyph_semantic_spans(
         return Ok(Vec::new());
     }
     let transform = PdfTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
+    let clip_bottom = effective_clip
+        .y
+        .checked_add(effective_clip.height)
+        .ok_or(RenderError::CoordinateOverflow)?;
     let mut visible = vec![false; glyph_count];
     if node.clusters.is_empty() {
         visible[0] = glyph_bounds(&node.commands).is_some_and(|bounds| {
@@ -2322,11 +2349,20 @@ fn glyph_semantic_spans(
             let commands = node.commands.get(start..end).ok_or(RenderError::Backend {
                 reason: "invalid_glyph_metadata",
             })?;
-            visible[index] = glyph_bounds(commands).is_some_and(|bounds| {
-                transformed_bounds_intersect_clip(bounds, effective_clip, transform)
-            });
+            let semantic_clip_is_cell_clip = effective_clip == node.clip_bounds;
+            let nominal_baseline_visible = node.rotation_degrees != 0
+                || !semantic_clip_is_cell_clip
+                || node.cluster_metrics.is_empty()
+                || node.cluster_metrics.get(index).is_some_and(|metrics| {
+                    metrics.baseline_y >= effective_clip.y && metrics.baseline_y < clip_bottom
+                });
+            visible[index] = nominal_baseline_visible
+                && glyph_bounds(commands).is_some_and(|bounds| {
+                    transformed_bounds_intersect_clip(bounds, effective_clip, transform)
+                });
         }
     }
+    node.expand_semantic_visibility(&mut visible);
     let visible_glyphs = || -> Vec<usize> {
         visible
             .iter()
@@ -4521,6 +4557,7 @@ mod tests {
                 command_end: commands.len() as u64,
             }],
             cluster_metrics: Vec::new(),
+            semantic_groups: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: commands.len() as u64,
@@ -4874,6 +4911,7 @@ mod tests {
                     },
                 ],
                 cluster_metrics: Vec::new(),
+                semantic_groups: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -4930,6 +4968,7 @@ mod tests {
                     },
                 ],
                 cluster_metrics: Vec::new(),
+                semantic_groups: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -5123,6 +5162,7 @@ mod tests {
                     ascent: Fixed::from_pixels(12),
                     descent: Fixed::from_raw(-2 * FIXED_UNITS_PER_PIXEL - 640),
                 }],
+                semantic_groups: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -5168,6 +5208,7 @@ mod tests {
                     ascent: Fixed::from_pixels(8),
                     descent: Fixed::from_pixels(-6),
                 }],
+                semantic_groups: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -5267,6 +5308,7 @@ mod tests {
                     },
                 ],
                 cluster_metrics: Vec::new(),
+                semantic_groups: Vec::new(),
                 paints: vec![GlyphPaint {
                     command_start: 0,
                     command_end: commands.len() as u64,
@@ -5766,6 +5808,7 @@ mod tests {
                             },
                         ],
                         cluster_metrics: Vec::new(),
+                        semantic_groups: Vec::new(),
                         paints: vec![GlyphPaint {
                             command_start: 0,
                             command_end: 10,
@@ -5904,6 +5947,7 @@ mod tests {
                         },
                     ],
                     cluster_metrics: Vec::new(),
+                    semantic_groups: Vec::new(),
                     paints: vec![
                         GlyphPaint {
                             command_start: 0,
@@ -6413,6 +6457,7 @@ mod tests {
                 },
             ],
             cluster_metrics: Vec::new(),
+            semantic_groups: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: 15,
@@ -6680,6 +6725,7 @@ mod tests {
             commands,
             clusters,
             cluster_metrics: Vec::new(),
+            semantic_groups: Vec::new(),
             decorations: Vec::new(),
             color: Rgb::BLACK,
             rotation_degrees: 0,
@@ -7420,6 +7466,64 @@ mod tests {
         }
         if let Some(xml) = poppler_bbox_layout(&pdf) {
             assert_eq!(poppler_words(&xml), ["FONTCLIP"]);
+        }
+    }
+
+    #[test]
+    fn semantic_baseline_filter_preserves_glyph_paint_as_an_artifact() {
+        let mut artifact = font_pack_glyph_run("PAINTONLY");
+        artifact.clip_bounds.width = Fixed::from_pixels(180);
+        let clip_bottom = artifact
+            .clip_bounds
+            .y
+            .checked_add(artifact.clip_bounds.height)
+            .unwrap();
+        assert!(artifact.cluster_metrics.len() > 1);
+        for metrics in artifact.cluster_metrics.iter_mut().skip(1) {
+            metrics.baseline_y = clip_bottom;
+        }
+        let reference = artifact.clone();
+        let reference_clip = Rect {
+            width: artifact
+                .clip_bounds
+                .width
+                .checked_sub(Fixed::from_pixels(1))
+                .unwrap(),
+            ..artifact.clip_bounds
+        };
+        let bounds = glyph_bounds(&reference.commands).expect("font-pack glyph bounds");
+        let reference_right = reference_clip
+            .x
+            .checked_add(reference_clip.width)
+            .unwrap();
+        assert!(bounds.max_x < reference_right);
+        let reference_pdf = render_print_document_pdf(&document_with_nodes(
+            "semantic-paint-reference",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: reference_clip,
+                nodes: vec![SceneNode::GlyphRun(reference)],
+            })],
+        ))
+        .unwrap();
+        let artifact_pdf = render_print_document_pdf(&document_with_nodes(
+            "semantic-paint-artifact",
+            vec![SceneNode::GlyphRun(artifact)],
+        ))
+        .unwrap();
+        let artifact_source = String::from_utf8_lossy(&artifact_pdf);
+        assert!(artifact_source.contains("/ActualText <FEFF>"));
+
+        if let (Some(reference_text), Some(artifact_text)) =
+            (poppler_text(&reference_pdf), poppler_text(&artifact_pdf))
+        {
+            assert!(reference_text.contains("PAINTONLY"), "{reference_text:?}");
+            assert!(!artifact_text.contains("PAINTONLY"), "{artifact_text:?}");
+        }
+        if let (Some(reference_raster), Some(artifact_raster)) = (
+            poppler_raster(&reference_pdf, "semantic-paint-reference"),
+            poppler_raster(&artifact_pdf, "semantic-paint-artifact"),
+        ) {
+            assert_eq!(reference_raster.data(), artifact_raster.data());
         }
     }
 

@@ -578,6 +578,7 @@ fn outlined_multiscript_node() -> GlyphRunNode {
             },
         ],
         cluster_metrics: Vec::new(),
+        semantic_groups: Vec::new(),
         paints: vec![GlyphPaint {
             command_start: 0,
             command_end: 20,

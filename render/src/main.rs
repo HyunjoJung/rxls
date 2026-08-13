@@ -882,6 +882,11 @@ fn scene_sha256_hex(scene: &Scene) -> String {
                         digest.update(value.to_le_bytes());
                     }
                 }
+                digest.update((node.semantic_groups.len() as u64).to_le_bytes());
+                for group in &node.semantic_groups {
+                    digest.update(group.source_start.to_le_bytes());
+                    digest.update(group.source_end.to_le_bytes());
+                }
                 digest.update((node.cluster_metrics.len() as u64).to_le_bytes());
                 for metrics in &node.cluster_metrics {
                     for value in [
@@ -1043,7 +1048,7 @@ fn push_json_escaped(out: &mut String, value: &str) {
 mod tests {
     use std::ffi::OsString;
 
-    use rxls_render::{GlyphRunNode, SceneFontFace, ShapedGlyph};
+    use rxls_render::{GlyphRunNode, GlyphSemanticGroup, SceneFontFace, ShapedGlyph};
 
     use super::*;
 
@@ -1110,6 +1115,7 @@ mod tests {
                 commands: Vec::new(),
                 clusters: Vec::new(),
                 cluster_metrics: Vec::new(),
+                semantic_groups: Vec::new(),
                 paints: Vec::new(),
                 decorations: Vec::new(),
                 color: Rgb::BLACK,
@@ -1137,6 +1143,12 @@ mod tests {
         };
         let identity = scene_sha256_hex(&base);
         let mutations: &[fn(&mut GlyphRunNode)] = &[
+            |node| {
+                node.semantic_groups.push(GlyphSemanticGroup {
+                    source_start: 0,
+                    source_end: 1,
+                })
+            },
             |node| node.glyphs[0].face = 1,
             |node| node.glyphs[0].cluster = 1,
             |node| node.glyphs[0].glyph_id = 8,

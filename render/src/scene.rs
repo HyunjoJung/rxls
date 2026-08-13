@@ -310,6 +310,19 @@ pub struct GlyphClusterMetrics {
     pub descent: Fixed,
 }
 
+/// One source-text group whose semantics stay intact when any member is visible.
+///
+/// Calc's EditEngine submits mixed-script portions to PDF as logical runs. A
+/// clip can hide part of such a run without shortening its extracted text, so
+/// SVG and PDF backends retain the complete group while still clipping paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlyphSemanticGroup {
+    /// Inclusive UTF-8 source byte offset.
+    pub source_start: u64,
+    /// Exclusive UTF-8 source byte offset.
+    pub source_end: u64,
+}
+
 /// One contiguous outline paint span in visual command order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphPaint {
@@ -386,6 +399,11 @@ pub struct GlyphRunNode {
     /// retains compatibility with caller-authored scenes, whose PDF semantic
     /// geometry falls back to bounded outline placement.
     pub cluster_metrics: Vec<GlyphClusterMetrics>,
+    /// Optional source partition for Calc EditEngine semantic clipping.
+    ///
+    /// Empty keeps ordinary glyph-ink clipping. A non-empty vector must be a
+    /// complete, ordered partition of `text`.
+    pub semantic_groups: Vec<GlyphSemanticGroup>,
     /// Contiguous color spans covering every glyph-outline command.
     pub paints: Vec<GlyphPaint>,
     /// Underline and strike-through segments derived from pinned font metrics.
@@ -421,6 +439,7 @@ impl GlyphRunNode {
         let scalar_count = self.text.chars().count();
         if self.clusters.len() > scalar_count
             || self.paints.len() > self.commands.len()
+            || self.semantic_groups.len() > scalar_count
             || (!self.cluster_metrics.is_empty()
                 && self.cluster_metrics.len() != self.clusters.len())
             || self.glyphs.is_empty() != self.font_faces.is_empty()
@@ -462,6 +481,28 @@ impl GlyphRunNode {
             return false;
         }
 
+        let mut previous_source_end = 0_u64;
+        for group in &self.semantic_groups {
+            let Ok(start) = usize::try_from(group.source_start) else {
+                return false;
+            };
+            let Ok(end) = usize::try_from(group.source_end) else {
+                return false;
+            };
+            if group.source_start != previous_source_end
+                || group.source_start >= group.source_end
+                || group.source_end > text_len
+                || !self.text.is_char_boundary(start)
+                || !self.text.is_char_boundary(end)
+            {
+                return false;
+            }
+            previous_source_end = group.source_end;
+        }
+        if !self.semantic_groups.is_empty() && previous_source_end != text_len {
+            return false;
+        }
+
         if self.font_faces.iter().any(|face| {
             face.units_per_em == 0
                 || face.face_sha256.len() != 64
@@ -499,6 +540,34 @@ impl GlyphRunNode {
             previous_paint_end = paint.command_end;
         }
         previous_paint_end == command_len
+    }
+
+    /// Expand physical cluster visibility to complete retained semantic groups.
+    pub(crate) fn expand_semantic_visibility(&self, visible: &mut [bool]) {
+        debug_assert_eq!(visible.len(), self.clusters.len());
+        if self.semantic_groups.is_empty() {
+            return;
+        }
+        let overlapping_groups = |cluster: &GlyphCluster| {
+            let start = self
+                .semantic_groups
+                .partition_point(|group| group.source_end <= cluster.source_start);
+            let end = self.semantic_groups[start..]
+                .partition_point(|group| group.source_start < cluster.source_end)
+                + start;
+            start..end
+        };
+        let mut retained = vec![false; self.semantic_groups.len()];
+        for (cluster, visible) in self.clusters.iter().zip(visible.iter()) {
+            if *visible {
+                retained[overlapping_groups(cluster)].fill(true);
+            }
+        }
+        for (cluster, visible) in self.clusters.iter().zip(visible.iter_mut()) {
+            if retained[overlapping_groups(cluster)].iter().any(|value| *value) {
+                *visible = true;
+            }
+        }
     }
 }
 
@@ -888,6 +957,7 @@ mod tests {
                 },
             ],
             cluster_metrics: Vec::new(),
+            semantic_groups: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end: 3,
@@ -927,6 +997,31 @@ mod tests {
             "nominal metrics must remain parallel to source clusters"
         );
         node.cluster_metrics.push(metrics);
+        node.semantic_groups = vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: 1,
+        }];
+        assert!(
+            !node.metadata_is_valid(),
+            "semantic groups must partition the complete source"
+        );
+        node.semantic_groups = vec![
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 1,
+            },
+            GlyphSemanticGroup {
+                source_start: 1,
+                source_end: 5,
+            },
+        ];
+        assert!(node.metadata_is_valid());
+        node.semantic_groups[1].source_start = 2;
+        assert!(
+            !node.metadata_is_valid(),
+            "semantic group gaps are rejected"
+        );
+        node.semantic_groups.clear();
         node.cluster_metrics[0].origin_x = Fixed::from_raw(i64::MAX);
         assert!(
             !node.metadata_is_valid(),

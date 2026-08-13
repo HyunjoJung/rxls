@@ -466,8 +466,8 @@ fn visible_glyph_label_in_clip(
         return Ok(String::new());
     }
 
-    let mut ranges = Vec::new();
-    for cluster in &node.clusters {
+    let mut cluster_visible = Vec::with_capacity(node.clusters.len());
+    for (cluster_index, cluster) in node.clusters.iter().enumerate() {
         let start = usize::try_from(cluster.command_start).map_err(|_| RenderError::Backend {
             reason: "invalid_glyph_metadata",
         })?;
@@ -477,7 +477,21 @@ fn visible_glyph_label_in_clip(
         let commands = node.commands.get(start..end).ok_or(RenderError::Backend {
             reason: "invalid_glyph_metadata",
         })?;
-        if glyph_commands_intersect_clip(commands, clip) {
+        let semantic_clip_is_cell_clip = effective_clip == node.clip_bounds;
+        let nominal_baseline_visible = node.rotation_degrees != 0
+            || !semantic_clip_is_cell_clip
+            || node.cluster_metrics.is_empty()
+            || node.cluster_metrics.get(cluster_index).is_some_and(|metrics| {
+                metrics.baseline_y.raw() >= clip.1 && metrics.baseline_y.raw() < clip.3
+            });
+        cluster_visible.push(
+            nominal_baseline_visible && glyph_commands_intersect_clip(commands, clip),
+        );
+    }
+    node.expand_semantic_visibility(&mut cluster_visible);
+    let mut ranges = Vec::new();
+    for (cluster, visible) in node.clusters.iter().zip(cluster_visible) {
+        if visible {
             ranges.push((cluster.source_start, cluster.source_end));
         }
     }
@@ -946,7 +960,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::scene::{GlyphCluster, GlyphPaint};
+    use crate::scene::{
+        GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphSemanticGroup,
+    };
 
     fn rectangle_commands(left: i64, right: i64) -> Vec<PathCommand> {
         vec![
@@ -991,6 +1007,7 @@ mod tests {
             commands,
             clusters,
             cluster_metrics: Vec::new(),
+            semantic_groups: Vec::new(),
             paints: vec![GlyphPaint {
                 command_start: 0,
                 command_end,
@@ -1092,6 +1109,84 @@ mod tests {
         let svg = render_scene_svg(&scene, 1 << 20).unwrap();
         assert!(svg.contains("aria-label=\"alpha beta gamma\""));
         assert!(svg.contains("data-rxls-visible-label=\"alpha beta\""));
+    }
+
+    #[test]
+    fn glyph_visible_label_retains_a_visible_calc_edit_engine_script_group() {
+        let mut commands = rectangle_commands(0, 5);
+        commands.extend(rectangle_commands(20, 25));
+        commands.extend(rectangle_commands(30, 35));
+        let mut node = glyph_node(
+            "中文 0006",
+            0,
+            10,
+            commands,
+            vec![
+                GlyphCluster {
+                    source_start: 0,
+                    source_end: 3,
+                    command_start: 0,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 3,
+                    source_end: 6,
+                    command_start: 5,
+                    command_end: 10,
+                },
+                GlyphCluster {
+                    source_start: 6,
+                    source_end: 7,
+                    command_start: 10,
+                    command_end: 10,
+                },
+                GlyphCluster {
+                    source_start: 7,
+                    source_end: 11,
+                    command_start: 10,
+                    command_end: 15,
+                },
+            ],
+        );
+        node.semantic_groups = vec![
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 7,
+            },
+            GlyphSemanticGroup {
+                source_start: 7,
+                source_end: 11,
+            },
+        ];
+
+        assert!(node.metadata_is_valid());
+        assert_eq!(visible_glyph_label(&node).unwrap(), "中文 ");
+    }
+
+    #[test]
+    fn glyph_visible_label_omits_an_outline_sliver_below_the_semantic_baseline() {
+        let mut node = glyph_node(
+            "below",
+            0,
+            10,
+            rectangle_commands(0, 5),
+            vec![GlyphCluster {
+                source_start: 0,
+                source_end: 5,
+                command_start: 0,
+                command_end: 5,
+            }],
+        );
+        node.cluster_metrics = vec![GlyphClusterMetrics {
+            origin_x: Fixed::ZERO,
+            advance_x: Fixed::from_raw(5),
+            baseline_y: Fixed::from_raw(11),
+            ascent: Fixed::from_raw(10),
+            descent: Fixed::from_raw(-2),
+        }];
+
+        assert!(node.metadata_is_valid());
+        assert_eq!(visible_glyph_label(&node).unwrap(), "");
     }
 
     #[test]
