@@ -114,7 +114,10 @@ BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
     + BUILDKIT_INDEX_SHA256
 )
-BUILDKIT_SNAPSHOTTER = "overlayfs"
+# The hosted runner's overlayfs/containerd implementation changes the image
+# layer identity across runner generations.  BuildKit's native snapshotter
+# keeps the Docker-schema2 archive independent of that host overlay stack.
+BUILDKIT_SNAPSHOTTER = "native"
 # Stock Buildx v0.35.0 leaves SolveOpt.CompatibilityVersion unset. The pinned
 # BuildKit v0.31.2 daemon maps that zero value to its immutable default, 30.
 BUILDKIT_DEFAULT_COMPATIBILITY_VERSION = 30

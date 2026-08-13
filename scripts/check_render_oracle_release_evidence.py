@@ -1894,7 +1894,7 @@ def _validate_build(
         "rewrite_timestamp": True,
         "rootfs_diff_ids_sha256": [rootfs_sha256, rootfs_sha256],
         "sbom": False,
-        "snapshotter": "overlayfs",
+        "snapshotter": "native",
         "source_date_epoch": SOURCE_DATE_EPOCH,
         "status": "matched",
     }

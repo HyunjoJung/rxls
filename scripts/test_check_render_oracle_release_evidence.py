@@ -1135,7 +1135,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 identity["rootfs_diff_ids_sha256"],
             ],
             "sbom": False,
-            "snapshotter": "overlayfs",
+            "snapshotter": "native",
             "source_date_epoch": 1_783_900_800,
             "status": "matched",
         }

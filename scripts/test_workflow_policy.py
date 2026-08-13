@@ -1062,6 +1062,24 @@ steps:
             )
         )
 
+    def test_oracle_workflows_reject_overlayfs_snapshotter_reintroduction(self) -> None:
+        for workflow_path, audit in (
+            (RENDER_ORACLE_WORKFLOW, self.policy.audit_render_oracle_workflow),
+            (RENDER_HARDENING_WORKFLOW, self.policy.audit_render_hardening_workflow),
+        ):
+            original = workflow_path.read_text(encoding="utf-8")
+            mutated = original.replace(
+                "--oci-worker-snapshotter=native",
+                "--oci-worker-snapshotter=overlayfs",
+                1,
+            )
+            self.assertNotEqual(mutated, original)
+            errors = audit(Path(workflow_path.name), mutated)
+            self.assertTrue(
+                any("native snapshotting" in error for error in errors),
+                (workflow_path.name, errors),
+            )
+
     def test_oracle_workflows_reject_unreviewed_execution_context(self) -> None:
         oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")

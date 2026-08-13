@@ -74,6 +74,12 @@ explicit Docker-schema2 archive through a 4 GiB stdout cap, hashes the exact
 image-config blob, loads the archive explicitly, and then compares the complete
 config/manifest/descriptor/RootFS identities:
 
+The pinned BuildKit daemon uses its `native` worker snapshotter. The hosted
+runner's overlayfs/containerd layer implementation is not part of the image
+build contract because it produced different RootFS identities across runner
+generations. The wrapper, workflows, and lock must agree on this snapshotter;
+the policy gate rejects an `overlayfs` reintroduction.
+
 ```sh
 python3 scripts/run-render-oracle-container.py build \
   --engine docker \

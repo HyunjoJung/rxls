@@ -40,44 +40,12 @@
     },
     "platform": "linux/amd64",
     "reproducibility_builds": 2,
-    "snapshotter": "overlayfs"
+    "snapshotter": "native"
   },
   "built_image": {
-    "bootstrap_receipt": {
-      "artifact": {
-        "digest": "sha256:7f3bcacbfb1531dad135c9cd658de17d72d90fd1626eb6df0ecb61268e9f4ee4",
-        "id": 8710188097,
-        "name": "render-oracle-image-313ed2233799fe521b8b8ebe4e8eb41c6b8e7848-30415873016-1",
-        "size_in_bytes": 1754
-      },
-      "evidence": {
-        "bytes": 6948,
-        "member": "render-oracle-image-build.json",
-        "sha256": "bd1f219283df6aaf386fd05d4c1b815ef64ba6042f8411d532ab5041353ef2e9"
-      },
-      "job": {
-        "conclusion": "failure",
-        "id": 90462148398,
-        "name": "locked LibreOffice oracle image",
-        "run_attempt": 1,
-        "run_id": 30415873016
-      },
-      "repository": {
-        "full_name": "HyunjoJung/rxls",
-        "id": 1297467060
-      },
-      "run": {
-        "conclusion": "failure",
-        "event": "pull_request",
-        "head_sha": "313ed2233799fe521b8b8ebe4e8eb41c6b8e7848",
-        "id": 30415873016,
-        "run_attempt": 1,
-        "workflow": ".github/workflows/render-hardening.yml"
-      },
-      "schema": "rxls.render-oracle-bootstrap-receipt.v1"
-    },
-    "expected_id": "sha256:6745c2c359bba799864847408f96671313745f623cb4d5cbb059ff9cc56d3846",
-    "expected_manifest_digest": "sha256:d826f7b762e5b45b7c50b312b751b1f1a6445a34c7018385c54d080716834339",
+    "bootstrap_receipt": null,
+    "expected_id": null,
+    "expected_manifest_digest": null,
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
@@ -125,8 +93,8 @@
   },
   "schema": "rxls.render-oracle-container-lock.v3",
   "wrapper": {
-    "bytes": 128024,
+    "bytes": 128247,
     "path": "scripts/run-render-oracle-container.py",
-    "sha256": "9ed435af4ebd8ef95a3e8960c2d6e619aeab507c29c1d95adcc347e0e41338d0"
+    "sha256": "82ba4f250ee12e17675816b12c6566f9a5a2e3835637a640bdc4c125c71373eb"
   }
 }

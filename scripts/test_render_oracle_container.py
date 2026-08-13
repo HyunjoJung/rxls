@@ -1010,7 +1010,7 @@ class RenderOracleContainerTests(unittest.TestCase):
                 },
                 "platform": "linux/amd64",
                 "reproducibility_builds": 2,
-                "snapshotter": "overlayfs",
+                "snapshotter": MODULE.BUILDKIT_SNAPSHOTTER,
             },
         )
         for path, value in (
@@ -1024,7 +1024,7 @@ class RenderOracleContainerTests(unittest.TestCase):
                 ("builder", "driver_options", "provenance_add_gha"),
                 True,
             ),
-            (("builder", "snapshotter"), "native"),
+            (("builder", "snapshotter"), "overlayfs"),
             (("builder", "exporter", "rewrite_timestamp"), False),
             (("builder", "reproducibility_builds"), 1),
         ):
@@ -1643,7 +1643,7 @@ class RenderOracleContainerTests(unittest.TestCase):
                     result.identities[0].diff_ids_sha256,
                 ],
                 "sbom": False,
-                "snapshotter": "overlayfs",
+                "snapshotter": MODULE.BUILDKIT_SNAPSHOTTER,
                 "source_date_epoch": MODULE.SOURCE_DATE_EPOCH,
                 "status": "matched",
             },
@@ -1734,7 +1734,7 @@ class RenderOracleContainerTests(unittest.TestCase):
             self.assertIn(
                 (
                     "--buildkitd-flags",
-                    "--oci-worker-snapshotter=overlayfs",
+                    f"--oci-worker-snapshotter={MODULE.BUILDKIT_SNAPSHOTTER}",
                 ),
                 zip(create, create[1:]),
             )
@@ -1782,9 +1782,9 @@ class RenderOracleContainerTests(unittest.TestCase):
 
         descriptions = (
             b"BuildKit version: v0.31.1\n"
-            b"org.mobyproject.buildkit.worker.snapshotter: overlayfs\n",
-            b"BuildKit version: v0.31.2\n"
             b"org.mobyproject.buildkit.worker.snapshotter: native\n",
+            b"BuildKit version: v0.31.2\n"
+            b"org.mobyproject.buildkit.worker.snapshotter: overlayfs\n",
         )
         for description, error in zip(
             descriptions, ("buildkit_version", "buildkit_snapshotter")
@@ -3356,7 +3356,7 @@ class RenderOracleContainerTests(unittest.TestCase):
                 ("provenance", True),
                 ("rewrite_timestamp", False),
                 ("sbom", True),
-                ("snapshotter", "native"),
+                ("snapshotter", "overlayfs"),
                 ("status", "unmatched"),
                 ("config_ids", [image_id, "sha256:" + "e" * 64]),
                 (

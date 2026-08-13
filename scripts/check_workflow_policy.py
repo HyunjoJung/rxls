@@ -112,7 +112,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "bb2ff7258a91fd630b1cb20e19c8276a625f295c6f52b38fe37fc4e2424e9933",
     "1266e4280f579884aef9895f70988b7a58ac80f791e5b1dae6d63bfa1b001ede",
     "bb87d04b1e41f135497a80b94c55791c6f8fc109bc50d7941b704ebfa3a8a4eb",
-    "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
+    "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
     "736adb4fbe36521a6ca77d28b07fa4a62106b89cca089c048893a00b712ef2ab",
     "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
     "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
@@ -135,16 +135,16 @@ ORACLE_RENDER_STEP_SHA256 = (
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "82dcaaf5e601cb509cf5312a5caf66a1f08e651165b53a3758e346938a32b7f4",
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
-    "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
+    "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
     "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
     "5ac13b1b0327e245fb52c4e08fc1647ba6e89fa29fb82ef2f1860b17a3adabca",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "52b3f6c7f2fd24590042400d01c978236e5da65424b821d8eaa95a4e29255040"
+    "465f3a0fce7209afdc98871603f7352cc9d13c52e45547e7d93e8477cb959da3"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "3655cfa89a37f652c1144937789ffbc18b8f663eb5cb01eea624ecbaf31d587e"
+    "8981734e3e91f8e53f6c6773ec7b159d17bc2a86d9b2652a94a73d4cab615486"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "61a161d35ccf0d00839e0f78342750ef6d137c7e9f4cdae1d037768e12430211"
@@ -1176,12 +1176,12 @@ def _audit_oracle_buildx_setup(path: Path, text: str, errors: list[str]) -> None
         "platforms: linux/amd64",
         f"image={ORACLE_BUILDKIT_IMAGE}",
         "provenance-add-gha=false",
-        "buildkitd-flags: --oci-worker-snapshotter=overlayfs",
+        "buildkitd-flags: --oci-worker-snapshotter=native",
     )
     if any(setup.count(snippet) != 1 for snippet in required):
         errors.append(
             f"{path}: oracle builds must pin Buildx, BuildKit, linux/amd64, "
-            "overlayfs, and disabled GitHub provenance"
+            "native snapshotting, and disabled GitHub provenance"
         )
     if _direct_docker_build_commands(text):
         errors.append(
