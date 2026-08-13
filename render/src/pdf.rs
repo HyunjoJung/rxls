@@ -2029,7 +2029,8 @@ fn push_glyph_run(
             }
         }
     }
-    if visible_glyph && emitted_glyphs.iter().any(|emitted| !emitted) {
+    let semantic_cell_clip = effective_clip.is_some_and(|clip| clip == node.clip_bounds);
+    if (visible_glyph || semantic_cell_clip) && emitted_glyphs.iter().any(|emitted| !emitted) {
         // Semantic clipping must never become paint clipping. Emit clusters
         // excluded from extracted text under empty ActualText; the already-
         // active scene, group, and cell clips remain authoritative for ink.
@@ -7478,8 +7479,8 @@ mod tests {
             .y
             .checked_add(artifact.clip_bounds.height)
             .unwrap();
-        assert!(artifact.cluster_metrics.len() > 1);
-        for metrics in artifact.cluster_metrics.iter_mut().skip(1) {
+        assert!(!artifact.cluster_metrics.is_empty());
+        for metrics in &mut artifact.cluster_metrics {
             metrics.baseline_y = clip_bottom;
         }
         let reference = artifact.clone();
