@@ -8806,8 +8806,17 @@ fn try_push_chart(
             .ok_or(RenderError::CoordinateOverflow)?,
         None => frame_padding,
     };
+    // A shifted category axis keeps its first and last bands inside the
+    // diagram, so Calc does not reserve the endpoint half-label overhang in
+    // the vertical extent either.  Keep the title band, but avoid shrinking
+    // the plot by the value-label half-height used by endpoint axes.
+    let top_axis_overhang = if category_axis_shifted && !horizontal_bar {
+        Fixed::ZERO
+    } else {
+        vertical_axis_overhang
+    };
     let top_gutter = title_band
-        .checked_add(vertical_axis_overhang)
+        .checked_add(top_axis_overhang)
         .ok_or(RenderError::CoordinateOverflow)?;
     let horizontal_axis_space = if horizontal_axis_extents.height > Fixed::ZERO {
         horizontal_axis_extents
@@ -8886,7 +8895,20 @@ fn try_push_chart(
     };
     let right_gutter = match legend_layout {
         Some(layout) => sum_fixed([frame_padding, layout.plot_offset, layout.total_width])?,
-        None => sum_fixed([frame_padding, horizontal_overhang])?,
+        None => {
+            // Calc's `crossBetween=between` category axis places every
+            // category inside the plot bands.  The final category therefore
+            // does not need the endpoint overhang reserved by a legacy
+            // endpoint axis; retaining it shrinks the imported plot and
+            // moves the last marker left of Calc's position.  Authored and
+            // endpoint charts keep the historical overhang.
+            let endpoint_overhang = if category_axis_shifted && !horizontal_bar {
+                Fixed::ZERO
+            } else {
+                horizontal_overhang
+            };
+            sum_fixed([frame_padding, endpoint_overhang])?
+        }
     };
 
     let left = rect

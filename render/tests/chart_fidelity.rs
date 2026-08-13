@@ -401,6 +401,58 @@ fn imported_line_chart_cross_between_moves_series_into_category_bands() {
     assert_eq!(endpoints.len(), 4);
     assert!(shifted[0] > endpoints[0]);
     assert!(shifted[3] < endpoints[3]);
+
+    let between_output = render_sheet_svg(&between, 0, &chart_options()).unwrap();
+    let frame = between_output
+        .scene
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            SceneNode::Rect(frame)
+                if frame.stroke == Some(Rgb::new(127, 127, 127))
+                    && frame.stroke_width == Fixed::from_pixels(1) =>
+            {
+                Some(frame.rect)
+            }
+            _ => None,
+        })
+        .expect("imported chart frame");
+    let horizontal_axis = between_output
+        .scene
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            SceneNode::Line(line)
+                if line.color == Rgb::BLACK && line.y1 == line.y2 && line.x2 > line.x1 =>
+            {
+                Some(line.clone())
+            }
+            _ => None,
+        })
+        .expect("imported chart horizontal axis");
+    let vertical_axis = between_output
+        .scene
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            SceneNode::Line(line)
+                if line.color == Rgb::BLACK && line.x1 == line.x2 && line.y2 > line.y1 =>
+            {
+                Some(line.clone())
+            }
+            _ => None,
+        })
+        .expect("imported chart vertical axis");
+    assert_eq!(
+        Fixed::from_raw(frame.x.raw() + frame.width.raw() - horizontal_axis.x2.raw()),
+        Fixed::from_pixels(8),
+        "Calc keeps the final shifted category band inside the frame padding"
+    );
+    assert_eq!(
+        Fixed::from_raw(vertical_axis.y1.raw() - frame.y.raw()),
+        Fixed::from_pixels(8),
+        "Calc keeps the shifted value-axis top inside the frame padding"
+    );
 }
 
 #[test]
