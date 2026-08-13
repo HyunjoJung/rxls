@@ -308,7 +308,8 @@ jobs:
             --archive "$archive" \
             --git-rev "$GITHUB_SHA" \
             --write-report "$output/package-report.json"
-          ARCHIVE="$archive" python3 - <<'PY'
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            ARCHIVE="$archive" python3 - <<'PY'
           import hashlib
           import json
           import os
@@ -483,6 +484,10 @@ jobs:
                   "browser-proven package differs from release candidate"
               )
           PY
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            echo "workflow_dispatch verified the locally rebuilt package without publication prerequisites"
+          fi
           npm publish --dry-run --ignore-scripts --access public "$archive" \
             2>&1 | tee "$output/npm-publish-dry-run.txt"
           sha256sum "$archive" > "$archive.sha256"

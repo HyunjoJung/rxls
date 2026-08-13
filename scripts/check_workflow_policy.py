@@ -4971,6 +4971,38 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: browser run, artifact, verifier, and oracle gates must retain exact order"
         )
+    pack_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Pack, inspect, dry-run, and consume",
+        6,
+        "render package pack and dry-run step",
+        errors,
+    )
+    push_guard = 'if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then'
+    dispatch_guard = 'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"'
+    if pack_step.count(push_guard) != 1:
+        errors.append(
+            f"{path}: package-to-browser binding must use exactly one tag push guard"
+        )
+    if pack_step.count(dispatch_guard) != 1:
+        errors.append(
+            f"{path}: manual package verification must fail closed on the exact dispatch event"
+        )
+    pack_order = (
+        push_guard,
+        'Path("target/render-package/browser-prerequisite.json")',
+        "browser-proven package differs from release candidate",
+        dispatch_guard,
+        "npm publish --dry-run --ignore-scripts --access public",
+    )
+    pack_positions = [pack_step.find(value) for value in pack_order]
+    if any(index < 0 for index in pack_positions) or pack_positions != sorted(
+        pack_positions
+    ):
+        errors.append(
+            f"{path}: tag-only browser binding and dispatch dry run must retain exact order"
+        )
     build_step = _single_yaml_block(
         path,
         verify_job,

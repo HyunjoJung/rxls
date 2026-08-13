@@ -150,6 +150,59 @@ fn chart_options() -> RenderOptions {
 }
 
 #[test]
+fn imported_missing_theme_chart_labels_use_calc_latin_point_defaults() {
+    const CALC_LATIN_FALLBACK: &str = "Liberation Sans";
+    const CALLER_FALLBACK: &str = "Noto Sans CJK KR";
+    const CHART_TEXT_SIZE: Fixed = Fixed::from_raw(13_653);
+
+    let workbook = line_chart_workbook("");
+    let metadata = workbook.sheets[0]
+        .drawing_metadata()
+        .iter()
+        .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+        .expect("chart sidecar");
+    assert_eq!(
+        metadata.chart_default_latin_font_family.as_deref(),
+        Some(CALC_LATIN_FALLBACK)
+    );
+
+    let mut options = chart_options();
+    options.default_font_family = CALLER_FALLBACK.to_string();
+    let output = render_sheet_svg(&workbook, 0, &options).expect("render missing-theme chart");
+
+    for category in ["Q1", "Q2", "Q3", "Q4"] {
+        let text = output
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Text(text)
+                    if text.text == category && text.style.family == CALC_LATIN_FALLBACK =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing Calc-styled chart category {category}"));
+        assert_eq!(text.style.size, CHART_TEXT_SIZE, "{category}");
+        assert!(!text.style.bold, "{category}");
+    }
+
+    assert!(
+        output.scene.nodes.iter().any(|node| match node {
+            SceneNode::Text(text) => {
+                text.text == "Q1"
+                    && text.style.family == CALLER_FALLBACK
+                    && text.style.size == options.default_font_size
+                    && !text.style.bold
+            }
+            _ => false,
+        }),
+        "worksheet text must retain the caller fallback"
+    );
+}
+
+#[test]
 fn imported_line_chart_renders_categories_nice_axis_and_circle_markers() {
     let workbook = line_chart_workbook(
         r#"<c:marker><c:symbol val="circle"/><c:size val="5"/></c:marker>

@@ -2869,6 +2869,28 @@ steps:
                 "--reviewed-baseline scripts/render-parity-baseline-full.json",
                 "--reviewed-baseline /tmp/candidate.json",
             ),
+            "manual_pack_push_guard": original.replace(
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                "          if true; then\n"
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                1,
+            ),
+            "manual_dispatch_guard": original.replace(
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n',
+                "            true\n",
+                1,
+            ),
+            "manual_browser_binding_order": original.replace(
+                'Path("target/render-package/browser-prerequisite.json")',
+                'Path("target/render-package/browser-prerequisite-deferred.json")',
+                1,
+            ).replace(
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n',
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
+                '            echo \'Path("target/render-package/browser-prerequisite.json")\'\n',
+                1,
+            ),
             "dispatch_publish": original.replace(
                 "if: github.event_name == 'push'", "if: always()", 1
             ),
