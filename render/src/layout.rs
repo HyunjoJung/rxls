@@ -8973,6 +8973,7 @@ fn try_push_chart(
     // Authored charts retain the historical neutral outline for compatibility.
     let frame_stroke = imported_chart_frame.then_some(Rgb::new(217, 217, 217));
     push_chart_frame(nodes, rect, frame_fill, frame_stroke, options)?;
+    let category_data_plot = chart_category_data_plot(plot, category_axis_shifted, horizontal_bar)?;
     let mut labels = Vec::<ChartLabel>::new();
     let mut category_labels = Vec::<ChartLabel>::new();
     let mut value_labels = Vec::<ChartLabel>::new();
@@ -9067,7 +9068,7 @@ fn try_push_chart(
             match chart.kind {
                 ChartKind::Line => push_line_chart(
                     nodes,
-                    plot,
+                    category_data_plot,
                     &series,
                     bounds,
                     category_axis_shifted,
@@ -9106,7 +9107,7 @@ fn try_push_chart(
                     } else {
                         push_column_chart(
                             nodes,
-                            plot,
+                            category_data_plot,
                             &series,
                             bounds,
                             palette,
@@ -9118,7 +9119,7 @@ fn try_push_chart(
                 }
                 ChartKind::Area => push_area_chart(
                     nodes,
-                    plot,
+                    category_data_plot,
                     &series,
                     bounds,
                     category_axis_shifted,
@@ -10277,6 +10278,43 @@ fn chart_x(plot: Rect, ratio: f64) -> Result<Fixed, RenderError> {
     interpolate_fixed(plot.x, plot.width, ratio)
 }
 
+fn chart_category_data_plot(
+    plot: Rect,
+    category_axis_shifted: bool,
+    horizontal_bar: bool,
+) -> Result<Rect, RenderError> {
+    if !category_axis_shifted || horizontal_bar {
+        return Ok(plot);
+    }
+    // Calc keeps the category axis and value-axis bounds at the diagram edge,
+    // but reserves one frame-padding interval on either side for shifted
+    // category bands.  Keep that inset on labels and series while leaving
+    // value ticks/gridlines on the full plot rectangle.
+    let inset = Fixed::from_pixels(8);
+    let double_inset = Fixed::from_raw(
+        inset
+            .raw()
+            .checked_mul(2)
+            .ok_or(RenderError::CoordinateOverflow)?,
+    );
+    let width = plot
+        .width
+        .checked_sub(double_inset)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    if width <= Fixed::ZERO {
+        return Ok(plot);
+    }
+    Ok(Rect {
+        x: plot
+            .x
+            .checked_add(inset)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        y: plot.y,
+        width,
+        height: plot.height,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_cartesian_chart_axes(
     nodes: &mut Vec<SceneNode>,
@@ -10302,6 +10340,7 @@ fn push_cartesian_chart_axes(
     warnings: &mut Warnings,
     warning_cell: CellCoordinate,
 ) -> Result<(), RenderError> {
+    let category_plot = chart_category_data_plot(plot, category_axis_shifted, horizontal_bar)?;
     let plot_right = plot
         .x
         .checked_add(plot.width)
@@ -10414,7 +10453,7 @@ fn push_cartesian_chart_axes(
             .filter(|value| **value >= x_data_bounds.0 && **value <= x_data_bounds.1)
         {
             let x = chart_x(
-                plot,
+                category_plot,
                 (*value - x_axis.minimum) / (x_axis.maximum - x_axis.minimum),
             )?;
             if category_major_gridlines {
@@ -10533,7 +10572,7 @@ fn push_cartesian_chart_axes(
                 categories.len(),
                 category_axis_shifted || chart_kind == ChartKind::Bar,
             );
-            let x = chart_x(plot, ratio)?;
+            let x = chart_x(category_plot, ratio)?;
             if category_major_gridlines {
                 push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
             }
@@ -23631,6 +23670,23 @@ mod tests {
         assert_eq!(legacy, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]);
         assert_eq!(chart_category_ratio(0, 1, true), 0.5);
         assert_eq!(chart_category_ratio(0, 1, false), 0.5);
+    }
+
+    #[test]
+    fn shifted_category_data_plot_keeps_calc_frame_padding() {
+        let plot = Rect {
+            x: Fixed::from_pixels(10),
+            y: Fixed::from_pixels(20),
+            width: Fixed::from_pixels(100),
+            height: Fixed::from_pixels(40),
+        };
+        let shifted = chart_category_data_plot(plot, true, false).unwrap();
+        assert_eq!(shifted.x, Fixed::from_pixels(18));
+        assert_eq!(shifted.y, plot.y);
+        assert_eq!(shifted.width, Fixed::from_pixels(84));
+        assert_eq!(shifted.height, plot.height);
+        assert_eq!(chart_category_data_plot(plot, false, false).unwrap(), plot);
+        assert_eq!(chart_category_data_plot(plot, true, true).unwrap(), plot);
     }
 
     #[test]
