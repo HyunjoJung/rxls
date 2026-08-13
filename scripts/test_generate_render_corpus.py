@@ -101,10 +101,10 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         self.assertEqual(
             shard_format_counts,
             [
-                (55, 47, 59, 50),
-                (46, 37, 46, 54),
-                (56, 56, 46, 46),
-                (43, 60, 49, 50),
+                (55, 47, 44, 50),
+                (46, 47, 39, 54),
+                (56, 58, 60, 46),
+                (43, 48, 57, 50),
             ],
         )
 
@@ -222,9 +222,9 @@ class GenerateRenderCorpusTests(unittest.TestCase):
 
     def test_exact_bytes_are_reproducible_with_golden_hashes(self) -> None:
         expected = {
-            "xls-0000": "24d2ffb3e5df477e7d5a7cd64a02b6a18ca670a364b4c74019aeb82e8c1b8f71",
+            "xls-0000": "d4d4d7824c42b8552038ad51c1424082cceaf4025595d984edf31e86ea135afa",
             "xlsx-0000": "19e3c35c44ad71b5974721888b2234d29a3e39716f4d7f467e5c63b59ad2c62b",
-            "xlsb-0000": "12a2ae5f2baf0464a87ca900ec5b6e147fdf8a2ee369202a5b4d4e30a99546a1",
+            "xlsb-0000": "eb754fdd739554b1ed3036f79e46bc9fc3029a2db446b49b29a8ac7c084c070c",
             "ods-0000": "bc590b68230ad1acd484b7925b53bfa7aeeb16e8423fc039003b7ccc70ef770e",
         }
         for spec in (case for case in self.module.profile_specs("pilot") if case.index == 0):
@@ -379,6 +379,31 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         self.assertIn(self.module._biff_page_setup(), xls)
         no_print_xls = self.module.build_case(first_case(pilot, "xls", "print-settings", False))
         self.assertNotIn(self.module._biff_page_setup(), no_print_xls)
+
+        # The generator emits direct cell XFs.  Every direct component must
+        # be marked local, otherwise Calc inherits its application-default
+        # font for formatted cells even though the BIFF font record is present.
+        xls_with_number_formats = self.module.build_case(
+            first_case(pilot, "xls", "date-format")
+        )
+        direct_xf = bytearray(20)
+        direct_xf[9] = self.module.BIFF_DIRECT_XF_ATTRIBUTES
+        self.assertIn(
+            self.module._biff_record(0x00E0, bytes(direct_xf)),
+            xls_with_number_formats,
+        )
+        direct_date_xf = bytearray(direct_xf)
+        direct_date_xf[2:4] = self.module._u16(self.module.CUSTOM_DATE_FORMAT_ID)
+        self.assertIn(
+            self.module._biff_record(0x00E0, bytes(direct_date_xf)),
+            xls_with_number_formats,
+        )
+        direct_percent_xf = bytearray(direct_xf)
+        direct_percent_xf[2:4] = self.module._u16(10)
+        self.assertIn(
+            self.module._biff_record(0x00E0, bytes(direct_percent_xf)),
+            xls_with_number_formats,
+        )
 
         xlsb_spec = first_case(pilot, "xlsb", "print-settings")
         xlsb = self.module.build_case(xlsb_spec)
@@ -1070,7 +1095,7 @@ class GenerateRenderCorpusTests(unittest.TestCase):
         manifest, cases = self.module.materialize("pilot")
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["generator"], self.module.GENERATOR)
-        self.assertEqual(manifest["generator_version"], "1.4.0")
+        self.assertEqual(manifest["generator_version"], "1.5.0")
         self.assertEqual(manifest["license"], "MIT")
         self.assertEqual(manifest["redistribution"], "allowed")
         self.assertEqual(manifest["rights_tier"], "S")

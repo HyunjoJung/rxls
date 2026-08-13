@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "generate-ooxml-row-oracle.py"
 RELEASE_GENERATOR = ROOT / "scripts" / "generate-render-corpus.py"
 EXPECTED_FULL_MANIFEST_SHA256 = (
-    "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
+    "5c6466a53e4328bb50f04cd3c63d102bf53da1a6b3478380f3724574c31b248d"
 )
 EXPECTED_DIAGNOSTIC_MANIFEST_SHA256 = (
     "088db320a0d35494fa8e0a8c33ba95e12a824cfe1b7163c2071cf70528c5d0a2"

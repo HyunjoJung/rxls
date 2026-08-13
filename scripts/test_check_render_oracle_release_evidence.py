@@ -542,7 +542,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "kind": "project_generated_hosted_full",
             "profile": "full",
             "generator": "rxls-synthetic-render-corpus",
-            "generator_version": "1.4.0",
+            "generator_version": "1.5.0",
             "case_count": 800,
             "format_counts": copy.deepcopy(
                 self.checker.EXPECTED_FORMAT_COUNTS
@@ -1268,7 +1268,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                     self.checker.EXPECTED_FORMAT_COUNTS
                 ),
                 "generator": "rxls-synthetic-render-corpus",
-                "generator_version": "1.4.0",
+                "generator_version": "1.5.0",
                 "group_topology_sha256": (
                     self.checker.EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
                 ),

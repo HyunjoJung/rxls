@@ -366,10 +366,10 @@ jobs:
               ]
               shard_formats = ("ods", "xls", "xlsb", "xlsx")
               expected_shard_format_counts = (
-                  (55, 47, 59, 50),
-                  (46, 37, 46, 54),
-                  (56, 56, 46, 46),
-                  (43, 60, 49, 50),
+                  (55, 47, 44, 50),
+                  (46, 47, 39, 54),
+                  (56, 58, 60, 46),
+                  (43, 48, 57, 50),
               )
               shard_format_counts = tuple(
                   tuple(
@@ -1338,7 +1338,7 @@ jobs:
           corpus_manifest_sha256 = sha256(corpus_payload)
           if profile == "full":
               assert corpus_manifest_sha256 == (
-                  "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
+                  "5c6466a53e4328bb50f04cd3c63d102bf53da1a6b3478380f3724574c31b248d"
               )
           corpus_binding = manifest_binding(
               corpus["files"],
@@ -1352,10 +1352,10 @@ jobs:
           )
           if profile == "full":
               assert corpus_binding["input_set_sha256"] == (
-                  "1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"
+                  "0ed4f623a243da0b3bee6f6a5d05359fca2e5b7ce51c79e399f0a720a10ebd89"
               )
               assert corpus_campaign_input_set_sha256 == (
-                  "785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"
+                  "45dfaaac5e94e98da038c561d98eed48e8785f56749760d39bac8a720b132db9"
               )
               assert corpus_group_topology_sha256 == (
                   "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"

@@ -40,7 +40,7 @@ MANIFEST_NAME = "manifest.json"
 
 SCHEMA_VERSION = 1
 GENERATOR = "rxls-synthetic-render-corpus"
-GENERATOR_VERSION = "1.4.0"
+GENERATOR_VERSION = "1.5.0"
 LICENSE = "MIT"
 REDISTRIBUTION = "allowed"
 
@@ -84,6 +84,9 @@ CFB_END = 0xFFFFFFFE
 CFB_FAT = 0xFFFFFFFD
 CFB_SECTOR_SIZE = 512
 CFB_MINI_STREAM_CUTOFF = 4096
+# BIFF8 XF byte 9: all six fAtr* bits set means each component is local to the
+# cell XF.  The corpus writes complete direct XFs, not style-update deltas.
+BIFF_DIRECT_XF_ATTRIBUTES = 0xFC
 
 
 class CorpusError(RuntimeError):
@@ -593,12 +596,16 @@ def _build_xls(spec: CaseSpec) -> bytes:
     globals_prefix.extend(
         _biff_format(CUSTOM_DATE_FORMAT_ID, CUSTOM_DATE_FORMAT_CODE)
     )
-    globals_prefix.extend(_biff_record(0x00E0, bytes(20)))
+    direct_xf = bytearray(20)
+    direct_xf[9] = BIFF_DIRECT_XF_ATTRIBUTES
+    globals_prefix.extend(_biff_record(0x00E0, bytes(direct_xf)))
     date_xf = bytearray(20)
     date_xf[2:4] = _u16(CUSTOM_DATE_FORMAT_ID)
+    date_xf[9] = BIFF_DIRECT_XF_ATTRIBUTES
     globals_prefix.extend(_biff_record(0x00E0, bytes(date_xf)))
     percent_xf = bytearray(20)
     percent_xf[2:4] = _u16(10)
+    percent_xf[9] = BIFF_DIRECT_XF_ATTRIBUTES
     globals_prefix.extend(_biff_record(0x00E0, bytes(percent_xf)))
     placeholder = _biff_boundsheet(name, 0)
     sst = _biff_sst(texts)

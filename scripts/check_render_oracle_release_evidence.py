@@ -71,13 +71,13 @@ DOWNLOAD_TIMEOUT_SECONDS = 60
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_REPOSITORY_ID = 1_297_467_060
 EXPECTED_HOSTED_FULL_MANIFEST_SHA256 = (
-    "d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"
+    "5c6466a53e4328bb50f04cd3c63d102bf53da1a6b3478380f3724574c31b248d"
 )
 EXPECTED_HOSTED_FULL_INPUT_SET_SHA256 = (
-    "785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"
+    "45dfaaac5e94e98da038c561d98eed48e8785f56749760d39bac8a720b132db9"
 )
 EXPECTED_HOSTED_FULL_BINDING_INPUT_SET_SHA256 = (
-    "1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"
+    "0ed4f623a243da0b3bee6f6a5d05359fca2e5b7ce51c79e399f0a720a10ebd89"
 )
 EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256 = (
     "559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"
@@ -3259,7 +3259,7 @@ def _validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     _require(campaign.get("profile") == "full", "campaign_profile")
     _require(
         campaign.get("generator") == "rxls-synthetic-render-corpus"
-        and campaign.get("generator_version") == "1.4.0",
+        and campaign.get("generator_version") == "1.5.0",
         "campaign_generator",
     )
     _require(campaign.get("case_count") == 800, "campaign_case_count")
@@ -3726,7 +3726,7 @@ def validate(
             "feature_counts": candidate_campaign["feature_counts"],
             "format_counts": candidate_campaign["format_counts"],
             "generator": "rxls-synthetic-render-corpus",
-            "generator_version": "1.4.0",
+            "generator_version": "1.5.0",
             "group_topology_sha256": (
                 EXPECTED_HOSTED_FULL_GROUP_TOPOLOGY_SHA256
             ),

@@ -115,7 +115,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "63a6303f2a8a61524a3fa5e5f92fcb0fb4e013aebaec12b273a28bc4567b5559",
     "736adb4fbe36521a6ca77d28b07fa4a62106b89cca089c048893a00b712ef2ab",
     "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
-    "ca9d4b75751b6960f4ee6e43b45ba9b4ab660812f74e69d282a9e73005b901ec",
+    "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
     "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
@@ -124,7 +124,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "b17813565ec4ff504604982406e080f4576480b917d4e54cac1e190ce4f43336",
+    "00913cd52200ecd2863b8463b8a705917883b2eed1a3005bb1dafaf156a9659b",
     "940f6c80f0324bc5969d03134a1d1e5448c7c8c9f455cb5979a23a81cc9b2ce0",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
@@ -141,7 +141,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "0f8c372052cfa06e392dcbede146c71aa9f713cda42c20134aa8cca6e8d7d706"
+    "52b3f6c7f2fd24590042400d01c978236e5da65424b821d8eaa95a4e29255040"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "227ec48eaafd9dc4896fce146557872b8eee19d49eaa872c62d39c8c5454834b"
@@ -3128,7 +3128,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "expected_shard_format_counts = (": (
             "full shards must bind the deterministic corpus partition"
         ),
-        "(46, 37, 46, 54),": (
+        "(46, 47, 39, 54),": (
             "full shards must retain the exact low-tail format partition"
         ),
         "assert shard_format_counts == expected_shard_format_counts": (
@@ -3236,13 +3236,13 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         '"fidelity_gate_bytes": len(gate_payload)': (
             "hosted evidence runs must bind fidelity gate bytes"
         ),
-        '"d33e6b7f27e351dac45feab8a780ed77cc04241aafe5a280a3b009c47dd85f49"': (
+        '"5c6466a53e4328bb50f04cd3c63d102bf53da1a6b3478380f3724574c31b248d"': (
             "full hosted evidence must bind the authoritative manifest bytes"
         ),
-        '"785af267383dac43a1f5b36d862e0457fafab4f86ac53764471ac64baba2159a"': (
+        '"45dfaaac5e94e98da038c561d98eed48e8785f56749760d39bac8a720b132db9"': (
             "full hosted evidence must bind the authoritative campaign input identity"
         ),
-        '"1ed2d52232bd68cd8a4882ddef5baa80da3ec1986dc1e92c642d625cbf0941b2"': (
+        '"0ed4f623a243da0b3bee6f6a5d05359fca2e5b7ce51c79e399f0a720a10ebd89"': (
             "full hosted evidence must bind the authoritative renderer input digest set"
         ),
         '"559cf641df08738419af941f30c35a831ca9d000e85ab1e5753c391486f0d251"': (

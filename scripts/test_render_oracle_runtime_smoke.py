@@ -55,7 +55,7 @@ def _pilot_manifest(root: Path, selected_payload: bytes) -> Path:
                 "features": [],
                 "format": format_name,
                 "generator": "rxls-synthetic-render-corpus",
-                "generator_version": "1.4.0",
+                "generator_version": "1.5.0",
                 "license": "MIT",
                 "path": (
                     f"payload/{format_name}/{case_id}.{format_name}"
@@ -79,7 +79,7 @@ def _pilot_manifest(root: Path, selected_payload: bytes) -> Path:
         "format_counts": {name: 10 for name in SMOKE.FORMATS},
         "format_feature_counts": {},
         "generator": "rxls-synthetic-render-corpus",
-        "generator_version": "1.4.0",
+        "generator_version": "1.5.0",
         "license": "MIT",
         "profile": "pilot",
         "redistribution": "allowed",
