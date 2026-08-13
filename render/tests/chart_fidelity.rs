@@ -354,18 +354,10 @@ fn imported_line_chart_renders_categories_nice_axis_and_circle_markers() {
 #[test]
 fn imported_line_chart_cross_between_moves_series_into_category_bands() {
     let style = r#"<c:spPr><a:ln w="38100"><a:solidFill><a:srgbClr val="336699"/></a:solidFill></a:ln></c:spPr>"#;
-    let between = line_chart_workbook_with_metadata(
-        style,
-        "",
-        r#"<c:crossBetween val="between"/>"#,
-        "",
-    );
-    let mid_cat = line_chart_workbook_with_metadata(
-        style,
-        "",
-        r#"<c:crossBetween val="midCat"/>"#,
-        "",
-    );
+    let between =
+        line_chart_workbook_with_metadata(style, "", r#"<c:crossBetween val="between"/>"#, "");
+    let mid_cat =
+        line_chart_workbook_with_metadata(style, "", r#"<c:crossBetween val="midCat"/>"#, "");
     assert_eq!(
         between.sheets[0]
             .drawing_metadata()
