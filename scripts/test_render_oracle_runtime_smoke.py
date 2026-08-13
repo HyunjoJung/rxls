@@ -195,9 +195,27 @@ def _fixture(
         font_pack_sha256 = json.loads(
             (font_pack / "manifest.json").read_text(encoding="utf-8")
         )["pack_sha256"]
-        lock, _, lock_sha256 = WRAPPER.load_lock()
-        image_id = lock["built_image"]["expected_id"]
-        manifest_digest = lock["built_image"]["expected_manifest_digest"]
+        # The checked-in candidate lock is intentionally bootstrap-only.  The
+        # runtime smoke itself exercises the post-bootstrap pinned path, so
+        # stage a structurally identical temporary lock with synthetic,
+        # authenticated-looking identities instead of weakening the runtime
+        # contract or repinning the candidate lock.
+        lock, _, _ = WRAPPER.load_lock()
+        image_id = "sha256:" + "a" * 64
+        manifest_digest = "sha256:" + "b" * 64
+        lock["built_image"]["expected_id"] = image_id
+        lock["built_image"]["expected_manifest_digest"] = manifest_digest
+        lock["built_image"]["bootstrap_receipt"] = HELPERS.fake_bootstrap_receipt(
+            b"{}\n", HELPERS.fake_source_identity(lock)
+        )
+        for row in lock["files"]:
+            source = HELPERS.CONTAINER_DIR / row["path"]
+            destination = root / row["path"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+        lock_path = root / "locked-oracle-lock.json"
+        lock_path.write_bytes(WRAPPER.canonical_json_bytes(lock))
+        lock, lock_payload, lock_sha256 = WRAPPER.load_lock(lock_path)
         pdf = b"%PDF-1.4\nruntime smoke\n%%EOF\n"
         archive = root / "oracle.tar"
         HELPERS.make_tar(
@@ -221,7 +239,7 @@ def _fixture(
             diagnostic_state=diagnostic_state,
         )
         inputs = SMOKE.SmokeInputs(
-            lock=WRAPPER.DEFAULT_LOCK,
+            lock=lock_path,
             manifest=manifest,
             font_pack=font_pack,
             image=image_id,
