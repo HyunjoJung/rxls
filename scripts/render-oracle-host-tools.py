@@ -851,6 +851,20 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
         for item in lock["ubuntu_apt"]["bootstrap_packages"]
         if item["name"] == "libc6-dev:amd64"
     }
+    # libc6-dev has a strict libc-dev-bin (= libc6 version) dependency in the
+    # Ubuntu snapshot.  The bootstrap package list intentionally stays small,
+    # so derive this build-support pin from the already attested libc6 native
+    # library instead of seeding unrelated packages into the Poppler scope.
+    libc6_version = next(
+        (
+            row["package_version"]
+            for row in sources
+            if row["package_name"] == "libc6:amd64"
+        ),
+        None,
+    )
+    if libc6_version is not None:
+        packages["libc-dev-bin"] = libc6_version
     for row in sources:
         name = row["package_name"]
         version = row["package_version"]

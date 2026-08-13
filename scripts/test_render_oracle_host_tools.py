@@ -380,6 +380,10 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             "libc6-dev:amd64=2.39-0ubuntu8.7",
             MODULE.apt_specs(lock, "poppler"),
         )
+        self.assertIn(
+            "libc-dev-bin=2.39-0ubuntu8.7",
+            MODULE.apt_specs(lock, "poppler"),
+        )
         self.assertNotIn(
             "libcairo2:amd64=1.18.0-3build1",
             MODULE.apt_specs(lock, "poppler"),
