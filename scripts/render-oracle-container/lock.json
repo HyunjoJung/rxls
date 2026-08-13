@@ -76,8 +76,8 @@
       },
       "schema": "rxls.render-oracle-bootstrap-receipt.v1"
     },
-    "expected_id": "sha256:f65346681aff8077371f25bc0449d40b7fc8539c6ef55eeb1dda9d992c167d41",
-    "expected_manifest_digest": "sha256:a11ff9f5f1a471d1d62d35670be742759d3f40e98bd69c1da4971be2b8b5e54b",
+    "expected_id": "sha256:6745c2c359bba799864847408f96671313745f623cb4d5cbb059ff9cc56d3846",
+    "expected_manifest_digest": "sha256:d826f7b762e5b45b7c50b312b751b1f1a6445a34c7018385c54d080716834339",
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
