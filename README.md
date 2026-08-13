@@ -6,9 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-> **Release status:** This source is version `0.1.3`. Publication is accepted
-> only when the crate, tagged source, GitHub Release bundle, SBOM, checksums,
-> and provenance are bound by the release manifest to one exact revision.
+> **Release status:** This source is the `0.1.3` candidate and is not published
+> yet. Publication is accepted only when the crate, tagged source, GitHub
+> Release bundle, SBOM, checksums, and provenance are bound by the release
+> manifest to one exact revision.
 
 > **Development status:** Commits after the `v0.1.3` tag may contain additive,
 > unreleased work. The installation commands below select the versioned package;
@@ -22,13 +23,13 @@ panicking when bounded recovery is not possible.
 
 ## Install
 
-Add the exact `0.1.3` library:
+After the release gates pass, add the exact `0.1.3` library:
 
 ```sh
 cargo add rxls@0.1.3
 ```
 
-Install the CLI from the same exact release:
+After publication, install the CLI from the same exact release:
 
 ```sh
 cargo install rxls --version =0.1.3 --locked
