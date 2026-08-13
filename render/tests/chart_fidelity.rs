@@ -220,7 +220,7 @@ fn imported_implicit_chart_space_fill_is_transparent() {
             node,
             SceneNode::Rect(frame)
                 if frame.fill.is_none()
-                    && frame.stroke == Some(Rgb::new(127, 127, 127))
+                    && frame.stroke == Some(Rgb::new(217, 217, 217))
                     && frame.stroke_width == Fixed::from_pixels(1)
         )
     }));
@@ -409,7 +409,7 @@ fn imported_line_chart_cross_between_moves_series_into_category_bands() {
         .iter()
         .find_map(|node| match node {
             SceneNode::Rect(frame)
-                if frame.stroke == Some(Rgb::new(127, 127, 127))
+                if frame.stroke == Some(Rgb::new(217, 217, 217))
                     && frame.stroke_width == Fixed::from_pixels(1) =>
             {
                 Some(frame.rect)
@@ -580,7 +580,7 @@ fn explicit_no_fill_and_absent_major_gridlines_do_not_invent_chart_paint() {
             node,
             SceneNode::Rect(frame)
                 if frame.fill.is_none()
-                    && frame.stroke == Some(Rgb::new(127, 127, 127))
+                    && frame.stroke == Some(Rgb::new(217, 217, 217))
                     && frame.stroke_width == Fixed::from_pixels(1)
         )
     }));
@@ -623,7 +623,7 @@ fn explicit_solid_chart_space_fill_is_rendered_exactly() {
             node,
             SceneNode::Rect(frame)
                 if frame.fill == Some(Rgb::new(0x10, 0x20, 0x30))
-                    && frame.stroke == Some(Rgb::new(127, 127, 127))
+                    && frame.stroke == Some(Rgb::new(217, 217, 217))
                     && frame.stroke_width == Fixed::from_pixels(1)
         )
     }));

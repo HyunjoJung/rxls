@@ -8945,6 +8945,8 @@ fn try_push_chart(
             .checked_sub(top)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
+    let imported_chart_frame =
+        metadata.is_some_and(|metadata| metadata.chart_default_latin_font_family.is_some());
     let frame_fill = match metadata.map_or(ChartFrameFill::Automatic, |metadata| {
         metadata.chart_frame_fill
     }) {
@@ -8966,7 +8968,11 @@ fn try_push_chart(
         }
         _ => Some(Rgb::WHITE),
     };
-    push_chart_frame(nodes, rect, frame_fill, options)?;
+    // Calc's imported OOXML chart-space frame uses the light gray DrawingML
+    // default outline even when its fill is omitted or explicitly `noFill`.
+    // Authored charts retain the historical neutral outline for compatibility.
+    let frame_stroke = imported_chart_frame.then_some(Rgb::new(217, 217, 217));
+    push_chart_frame(nodes, rect, frame_fill, frame_stroke, options)?;
     let mut labels = Vec::<ChartLabel>::new();
     let mut category_labels = Vec::<ChartLabel>::new();
     let mut value_labels = Vec::<ChartLabel>::new();
@@ -12570,6 +12576,7 @@ fn push_chart_frame(
     nodes: &mut Vec<SceneNode>,
     rect: Rect,
     fill: Option<Rgb>,
+    stroke: Option<Rgb>,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
     push_node(
@@ -12577,7 +12584,7 @@ fn push_chart_frame(
         SceneNode::Rect(RectNode {
             rect,
             fill,
-            stroke: Some(Rgb::new(127, 127, 127)),
+            stroke: stroke.or(Some(Rgb::new(127, 127, 127))),
             stroke_width: Fixed::from_pixels(1),
         }),
         options,
