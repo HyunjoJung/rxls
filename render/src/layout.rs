@@ -8999,6 +8999,8 @@ fn try_push_chart(
         .and_then(|metadata| metadata.chart_value_major_gridlines)
         .unwrap_or(true)
         && value_axis_visible;
+    let axis_lines_visible =
+        metadata.is_none() || category_major_gridlines || value_major_gridlines;
     if let Some(axis) = cartesian_axis.as_ref() {
         push_cartesian_chart_axes(
             nodes,
@@ -9015,6 +9017,7 @@ fn try_push_chart(
             value_axis_visible,
             category_major_gridlines,
             value_major_gridlines,
+            axis_lines_visible,
             &text_styles.category_axis_labels,
             &text_styles.value_axis_labels,
             text_bytes,
@@ -10345,6 +10348,7 @@ fn push_cartesian_chart_axes(
     value_axis_visible: bool,
     category_major_gridlines: bool,
     value_major_gridlines: bool,
+    axis_lines_visible: bool,
     category_axis_style: &ResolvedChartTextStyle,
     value_axis_style: &ResolvedChartTextStyle,
     text_bytes: &mut u64,
@@ -10511,7 +10515,7 @@ fn push_cartesian_chart_axes(
     } else {
         category_axis_visible
     };
-    if physical_vertical_axis_visible {
+    if axis_lines_visible && physical_vertical_axis_visible {
         push_placeholder_line(
             nodes,
             plot.x,
@@ -10522,7 +10526,7 @@ fn push_cartesian_chart_axes(
             options,
         )?;
     }
-    if physical_horizontal_axis_visible {
+    if axis_lines_visible && physical_horizontal_axis_visible {
         push_placeholder_line(
             nodes,
             plot.x,

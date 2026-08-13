@@ -354,10 +354,18 @@ fn imported_line_chart_renders_categories_nice_axis_and_circle_markers() {
 #[test]
 fn imported_line_chart_cross_between_moves_series_into_category_bands() {
     let style = r#"<c:spPr><a:ln w="38100"><a:solidFill><a:srgbClr val="336699"/></a:solidFill></a:ln></c:spPr>"#;
-    let between =
-        line_chart_workbook_with_metadata(style, "", r#"<c:crossBetween val="between"/>"#, "");
-    let mid_cat =
-        line_chart_workbook_with_metadata(style, "", r#"<c:crossBetween val="midCat"/>"#, "");
+    let between = line_chart_workbook_with_metadata(
+        style,
+        "",
+        r#"<c:majorGridlines/><c:crossBetween val="between"/>"#,
+        "",
+    );
+    let mid_cat = line_chart_workbook_with_metadata(
+        style,
+        "",
+        r#"<c:majorGridlines/><c:crossBetween val="midCat"/>"#,
+        "",
+    );
     assert_eq!(
         between.sheets[0]
             .drawing_metadata()
@@ -453,6 +461,25 @@ fn imported_line_chart_cross_between_moves_series_into_category_bands() {
         Fixed::from_pixels(8),
         "Calc keeps the shifted value-axis top inside the frame padding"
     );
+}
+
+#[test]
+fn imported_chart_without_major_gridlines_omits_calc_axis_strokes() {
+    let workbook = line_chart_workbook_with_metadata(
+        r#"<c:spPr><a:ln w="38100"><a:solidFill><a:srgbClr val="336699"/></a:solidFill></a:ln></c:spPr>"#,
+        "",
+        "",
+        "",
+    );
+    let output = render_sheet_svg(&workbook, 0, &chart_options()).unwrap();
+    assert!(!output
+        .scene
+        .nodes
+        .iter()
+        .any(|node| { matches!(node, SceneNode::Line(line) if line.color == Rgb::BLACK) }));
+    assert!(output.scene.nodes.iter().any(|node| {
+        matches!(node, SceneNode::Rect(frame) if frame.stroke == Some(Rgb::new(217, 217, 217)))
+    }));
 }
 
 #[test]
