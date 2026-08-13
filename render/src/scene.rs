@@ -564,7 +564,10 @@ impl GlyphRunNode {
             }
         }
         for (cluster, visible) in self.clusters.iter().zip(visible.iter_mut()) {
-            if retained[overlapping_groups(cluster)].iter().any(|value| *value) {
+            if retained[overlapping_groups(cluster)]
+                .iter()
+                .any(|value| *value)
+            {
                 *visible = true;
             }
         }

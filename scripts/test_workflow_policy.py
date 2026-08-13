@@ -1996,6 +1996,91 @@ steps:
             text,
         )
 
+    def test_render_hardening_requires_poppler_semantics_before_printing(
+        self,
+    ) -> None:
+        original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        semantic_selector = (
+            "pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_"
+            "without_changing_paint"
+        )
+        semantic_gate = (
+            "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+            f"            --lib {semantic_selector} \\\n"
+            "            -- --exact --list \\\n"
+            f"            | grep -Fqx '{semantic_selector}: test'\n"
+            "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+            f"            --lib {semantic_selector} \\\n"
+            "            -- --exact\n"
+        )
+        printing_selector = (
+            "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text"
+        )
+        printing_gate = (
+            "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+            f"            --test printing {printing_selector} \\\n"
+            "            -- --exact --list \\\n"
+            f"            | grep -Fqx '{printing_selector}: test'\n"
+            "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+            f"            --test printing {printing_selector} \\\n"
+            "            -- --exact\n"
+        )
+        focused_error = "pinned Poppler exact-test gate"
+        mutations = {
+            "poppler_optional": (
+                original.replace(
+                    '      RXLS_REQUIRE_POPPLER: "1"\n',
+                    '      RXLS_REQUIRE_POPPLER: "0"\n',
+                    1,
+                ),
+                "must fail closed on the pinned Poppler tools",
+            ),
+            "semantic_selector_deleted": (
+                original.replace(semantic_selector, "unreviewed_semantic_test"),
+                focused_error,
+            ),
+            "semantic_discovery_relaxed": (
+                original.replace(
+                    f"            | grep -Fqx '{semantic_selector}: test'\n",
+                    "            | true\n",
+                    1,
+                ),
+                focused_error,
+            ),
+            "semantic_execution_relaxed": (
+                original.replace(
+                    f"            --lib {semantic_selector} \\\n"
+                    "            -- --exact\n",
+                    f"            --lib {semantic_selector} \\\n"
+                    "            --\n",
+                    1,
+                ),
+                focused_error,
+            ),
+            "semantic_runs_after_printing": (
+                original.replace(
+                    semantic_gate + printing_gate,
+                    printing_gate + semantic_gate,
+                    1,
+                ),
+                focused_error,
+            ),
+            "printing_selector_deleted": (
+                original.replace(printing_selector, "unreviewed_printing_test"),
+                focused_error,
+            ),
+        }
+        for name, (workflow, expected_error) in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_hardening_workflow(
+                    Path("render-hardening.yml"), workflow
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in errors),
+                    errors,
+                )
+
     def test_render_hardening_rejects_mutable_apt_and_path_bearing_evidence(
         self,
     ) -> None:
@@ -2709,6 +2794,63 @@ steps:
     def test_render_package_release_rejects_unsafe_publication_paths(self) -> None:
         original = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
+            "verify_job_continue_on_error": original.replace(
+                "    timeout-minutes: 30\n    permissions:\n",
+                "    timeout-minutes: 30\n"
+                "    continue-on-error: true\n"
+                "    permissions:\n",
+                1,
+            ),
+            "identity_step_continue_on_error": original.replace(
+                "      - name: Validate event and package identity\n"
+                "        id: package\n",
+                "      - name: Validate event and package identity\n"
+                "        continue-on-error: true\n"
+                "        id: package\n",
+                1,
+            ),
+            "publish_job_continue_on_error": original.replace(
+                "    timeout-minutes: 15\n    environment: npm-render-worker\n",
+                "    timeout-minutes: 15\n"
+                "    continue-on-error: true\n"
+                "    environment: npm-render-worker\n",
+                1,
+            ),
+            "identity_disables_errexit": original.replace(
+                "      - name: Validate event and package identity\n"
+                "        id: package\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                "      - name: Validate event and package identity\n"
+                "        id: package\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                "          set +e\n",
+                1,
+            ),
+            "hosted_ci_gate_fail_open": original.replace(
+                "          require_successful_run ci.yml .github/workflows/ci.yml push CI\n",
+                "          require_successful_run ci.yml .github/workflows/ci.yml push CI || true\n",
+                1,
+            ),
+            "identity_checks_fail_open": original.replace(
+                'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"',
+                'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls" || true',
+            ).replace(
+                'test "$GITHUB_REF_TYPE" = "tag"',
+                'test "$GITHUB_REF_TYPE" = "tag" || true',
+            ).replace(
+                'test "$GITHUB_REF_NAME" = "render-v$version"',
+                'test "$GITHUB_REF_NAME" = "render-v$version" || true',
+            ).replace(
+                'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+                'test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || true',
+            ).replace(
+                'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+                'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA" || true',
+            ),
             "tag": original.replace(
                 'test "$GITHUB_REF_NAME" = "render-v$version"', "true"
             ),
@@ -2889,6 +3031,168 @@ steps:
                 '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n',
                 '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
                 '            echo \'Path("target/render-package/browser-prerequisite.json")\'\n',
+                1,
+            ),
+            "manual_prefix_independent_event_guard": original.replace(
+                "          python3 scripts/render_supply_chain.py sbom \\\n",
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                "            python3 scripts/render_supply_chain.py sbom \\\n",
+                1,
+            ).replace(
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                "          fi\n"
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                1,
+            ),
+            "manual_suffix_independent_event_guard": original.replace(
+                "          fi\n"
+                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                "          fi\n"
+                '          if [[ "${{ github.event_name }}" == "push" ]]; then\n'
+                "            npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                1,
+            ).replace(
+                "          NODE\n"
+                "      - name: Upload verified package candidate\n",
+                "          NODE\n"
+                "          fi\n"
+                "      - name: Upload verified package candidate\n",
+                1,
+            ),
+            "manual_downstream_inside_event_guard": original.replace(
+                "          fi\n"
+                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                1,
+            ).replace(
+                "          NODE\n"
+                "      - name: Upload verified package candidate\n",
+                "          NODE\n"
+                "          fi\n"
+                "      - name: Upload verified package candidate\n",
+                1,
+            ),
+            "manual_sbom_inside_event_guard": original.replace(
+                "          python3 scripts/render_supply_chain.py sbom \\\n",
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                "            python3 scripts/render_supply_chain.py sbom \\\n",
+                1,
+            ).replace(
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                1,
+            ),
+            "manual_browser_read_outside_event_guard": original.replace(
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                "            true\n"
+                "          fi\n"
+                '          ARCHIVE="$archive" python3 - <<\'PY\'\n',
+                1,
+            ).replace(
+                "          PY\n"
+                "          else\n"
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
+                "            echo \"workflow_dispatch verified the locally rebuilt package without publication prerequisites\"\n"
+                "          fi\n",
+                "          PY\n"
+                '          if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then\n'
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
+                "            echo \"workflow_dispatch verified the locally rebuilt package without publication prerequisites\"\n"
+                "          fi\n",
+                1,
+            ),
+            "manual_policy_shell_guard": original.replace(
+                "      - name: Enforce workflow and package policy\n"
+                "        run: |\n"
+                '          test "$(node --version)" = "v$NODE_VERSION"\n',
+                "      - name: Enforce workflow and package policy\n"
+                "        run: |\n"
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+                '            test "$(node --version)" = "v$NODE_VERSION"\n',
+                1,
+            ).replace(
+                "          npm --prefix bindings/render-wasm test\n"
+                "      - name: Build the exact worker/WASM package\n",
+                "          npm --prefix bindings/render-wasm test\n"
+                "          fi\n"
+                "      - name: Build the exact worker/WASM package\n",
+                1,
+            ),
+            "manual_build_shell_guard": original.replace(
+                "      - name: Build the exact worker/WASM package\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n",
+                "      - name: Build the exact worker/WASM package\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n',
+                1,
+            ).replace(
+                "          npm --prefix bindings/render-wasm run build:wasm\n"
+                "      - name: Pack, inspect, dry-run, and consume\n",
+                "          npm --prefix bindings/render-wasm run build:wasm\n"
+                "          fi\n"
+                "      - name: Pack, inspect, dry-run, and consume\n",
+                1,
+            ),
+            "extra_manual_trigger": original.replace(
+                "  workflow_dispatch:\n"
+                "  push:\n",
+                "  workflow_dispatch:\n"
+                "  schedule:\n"
+                '    - cron: "0 0 * * *"\n'
+                "  push:\n",
+                1,
+            ),
+            "verify_job_tag_only": original.replace(
+                "  verify:\n"
+                "    name: Verify immutable npm artifact\n",
+                "  verify:\n"
+                "    name: Verify immutable npm artifact\n"
+                "    if: github.event_name == 'push'\n",
+                1,
+            ),
+            "nested_policy_skips_dispatch": original.replace(
+                "      - name: Audit nested Rust advisories, licenses, and sources\n"
+                "        uses: EmbarkStudios/cargo-deny-action@",
+                "      - name: Audit nested Rust advisories, licenses, and sources\n"
+                "        if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+                "        uses: EmbarkStudios/cargo-deny-action@",
+                1,
+            ),
+            "nested_policy_continue_on_error": original.replace(
+                "      - name: Audit nested Rust advisories, licenses, and sources\n"
+                "        uses: EmbarkStudios/cargo-deny-action@"
+                "3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1\n"
+                "        with:\n",
+                "      - name: Audit nested Rust advisories, licenses, and sources\n"
+                "        uses: EmbarkStudios/cargo-deny-action@"
+                "3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1\n"
+                "        continue-on-error: true\n"
+                "        with:\n",
+                1,
+            ),
+            "publish_guard_relocated_to_policy": original.replace(
+                "  publish:\n"
+                "    name: Publish protected tag to npm\n"
+                "    if: github.event_name == 'push'\n",
+                "  publish:\n"
+                "    name: Publish protected tag to npm\n"
+                "    if: always()\n",
+                1,
+            ).replace(
+                "      - name: Enforce workflow and package policy\n"
+                "        run: |\n",
+                "      - name: Enforce workflow and package policy\n"
+                "        if: github.event_name == 'push'\n"
+                "        run: |\n",
                 1,
             ),
             "dispatch_publish": original.replace(

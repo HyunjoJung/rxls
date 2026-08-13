@@ -2901,11 +2901,9 @@ fn parse_xlsb_drawing_refs(xml: &str) -> Vec<XlsbDrawingRef> {
             Ok(Event::Text(text)) if field.is_some() => {
                 field_text.push_str(&drawing_text(&text));
             }
-            Ok(Event::Text(text)) if desc_depth > 0 => {
-                if desc_text.len() < MAX_XLSB_DRAWING_TEXT {
-                    desc_text.push_str(&drawing_text(&text));
-                    truncate_drawing_text(&mut desc_text);
-                }
+            Ok(Event::Text(text)) if desc_depth > 0 && desc_text.len() < MAX_XLSB_DRAWING_TEXT => {
+                desc_text.push_str(&drawing_text(&text));
+                truncate_drawing_text(&mut desc_text);
             }
             Ok(Event::GeneralRef(reference)) if field.is_some() => {
                 append_drawing_ref(&mut field_text, &reference);

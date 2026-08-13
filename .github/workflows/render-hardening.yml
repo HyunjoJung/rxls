@@ -141,6 +141,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --manifest-path render/Cargo.toml \
+            --lib pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \
+            -- --exact --list \
+            | grep -Fqx 'pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint: test'
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --lib pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \
+            -- --exact
+          cargo test --locked --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
             -- --exact --list \
             | grep -Fqx 'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'

@@ -57,9 +57,17 @@ def fixture_identity(lock: dict) -> dict:
         "libcairo2:amd64",
         bootstrap["libcairo2:amd64"],
     )
-    cairo_libraries = [package_fact("libc.so.6"), cairo_library]
+    libc_library = package_fact(
+        "libc.so.6",
+        "libc6:amd64",
+        bootstrap["libc6-dev:amd64"],
+    )
+    cairo_libraries = [libc_library, cairo_library]
     cairo_libraries.sort(key=lambda row: row["name"])
-    poppler_libraries = [package_fact("libc.so.6"), package_fact("libpoppler.so.1")]
+    poppler_libraries = [
+        libc_library,
+        package_fact("libpoppler.so.1"),
+    ]
     poppler_libraries.sort(key=lambda row: row["name"])
     executables = []
     for name in lock["poppler"]["executables"]:
@@ -184,6 +192,11 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         mutations.append(candidate)
         candidate = json.loads(json.dumps(lock))
         candidate["ubuntu_apt"]["bootstrap_packages"][0]["version"] = "mutable"
+        mutations.append(candidate)
+        candidate = json.loads(json.dumps(lock))
+        candidate["ubuntu_apt"]["bootstrap_packages"][0]["version"] = (
+            "2.39-0ubuntu8.6"
+        )
         mutations.append(candidate)
         for candidate in mutations:
             with self.subTest(candidate=candidate["ubuntu_apt"]):
@@ -358,9 +371,18 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         self.assertEqual(
             MODULE.apt_specs(lock, "bootstrap"),
             [
+                "libc6-dev:amd64=2.39-0ubuntu8.7",
                 "libcairo2:amd64=1.18.0-3build1",
                 "poppler-utils=24.02.0-1ubuntu9.9",
             ],
+        )
+        self.assertIn(
+            "libc6-dev:amd64=2.39-0ubuntu8.7",
+            MODULE.apt_specs(lock, "poppler"),
+        )
+        self.assertNotIn(
+            "libcairo2:amd64=1.18.0-3build1",
+            MODULE.apt_specs(lock, "poppler"),
         )
         lock["expected_identity"] = None
         with self.assertRaisesRegex(

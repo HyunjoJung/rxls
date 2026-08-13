@@ -103,8 +103,7 @@ const CALC_CELL_VERTICAL_MARGIN_TWIPS: i128 = 20;
 /// cell XF. Other imported formats retain Calc's ordinary 20-twip default.
 const CALC_BIFF_CELL_VERTICAL_MARGIN_TWIPS: i128 = 40;
 const CALC_CELL_VERTICAL_MARGIN: Fixed = Fixed::from_raw(
-    ((CALC_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128
-        + TWIPS_PER_CSS_PIXEL / 2)
+    ((CALC_CELL_VERTICAL_MARGIN_TWIPS * FIXED_UNITS_PER_PIXEL as i128 + TWIPS_PER_CSS_PIXEL / 2)
         / TWIPS_PER_CSS_PIXEL) as i64,
 );
 const CALC_BIFF_CELL_VERTICAL_MARGIN: Fixed = Fixed::from_raw(
@@ -4781,11 +4780,41 @@ fn calc_edit_engine_semantic_groups(
             Ok(GlyphSemanticGroup {
                 source_start: u64::try_from(pair[0])
                     .map_err(|_| RenderError::CoordinateOverflow)?,
-                source_end: u64::try_from(pair[1])
-                    .map_err(|_| RenderError::CoordinateOverflow)?,
+                source_end: u64::try_from(pair[1]).map_err(|_| RenderError::CoordinateOverflow)?,
             })
         })
         .collect()
+}
+
+/// Preserve the logical paragraph that Calc exports for clipped ODS wrapping.
+///
+/// A fixed-height, non-rotated wrapped ODS cell is painted as a clipped
+/// EditEngine paragraph. Calc's PDF keeps the complete paragraph in its text
+/// semantics when any laid-out line remains visible, even when later lines
+/// fall below the row clip. One bounded full-cell group reproduces that
+/// contract without changing outline clipping; ordinary and rotated cells
+/// retain their script-run grouping.
+fn glyph_semantic_groups(
+    region: &Region,
+    lines: &[PreparedLine],
+    block_height: Fixed,
+) -> Result<Vec<GlyphSemanticGroup>, RenderError> {
+    let retains_complete_ods_paragraph = region.ods_fixed_height_row
+        && lines.len() > 1
+        && block_height > region.rect.height
+        && region
+            .style
+            .as_ref()
+            .and_then(|style| style.align.as_ref())
+            .is_some_and(|alignment| alignment.wrap && alignment.rotation == 0);
+    if retains_complete_ods_paragraph {
+        return Ok(vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: u64::try_from(region.text.len())
+                .map_err(|_| RenderError::CoordinateOverflow)?,
+        }]);
+    }
+    calc_edit_engine_semantic_groups(&region.text, lines)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -13096,11 +13125,8 @@ fn build_glyph_run(
         // Calc preserves the beginning of implicitly aligned wrapped ODS text
         // in a fixed-height row. Its generic bottom default would otherwise
         // translate the beginning above the clip and retain only the tail.
-        let top_bounds = calc_cell_text_layout_bounds(
-            region.rect,
-            TextBaseline::Top,
-            region.vertical_margin,
-        )?;
+        let top_bounds =
+            calc_cell_text_layout_bounds(region.rect, TextBaseline::Top, region.vertical_margin)?;
         vertical_block_top(top_bounds, block_height, TextBaseline::Top)?
     } else {
         vertical_block_top(layout_bounds, block_height, style.baseline)?
@@ -13190,7 +13216,7 @@ fn build_glyph_run(
         commands,
         clusters,
         cluster_metrics,
-        semantic_groups: calc_edit_engine_semantic_groups(&region.text, &prepared.lines)?,
+        semantic_groups: glyph_semantic_groups(region, &prepared.lines, block_height)?,
         paints,
         decorations,
         color: style.color,
@@ -15820,18 +15846,11 @@ mod tests {
         let bottom =
             calc_cell_text_layout_bounds(rect, TextBaseline::Bottom, CALC_CELL_VERTICAL_MARGIN)
                 .unwrap();
-        let top = calc_cell_text_layout_bounds(
-            rect,
-            TextBaseline::Top,
-            CALC_CELL_VERTICAL_MARGIN,
-        )
-        .unwrap();
-        let middle = calc_cell_text_layout_bounds(
-            rect,
-            TextBaseline::Middle,
-            CALC_CELL_VERTICAL_MARGIN,
-        )
-        .unwrap();
+        let top = calc_cell_text_layout_bounds(rect, TextBaseline::Top, CALC_CELL_VERTICAL_MARGIN)
+            .unwrap();
+        let middle =
+            calc_cell_text_layout_bounds(rect, TextBaseline::Middle, CALC_CELL_VERTICAL_MARGIN)
+                .unwrap();
         assert_eq!(
             vertical_block_top(bottom, block, TextBaseline::Bottom).unwrap(),
             Fixed::from_pixels(28)
@@ -20569,6 +20588,23 @@ mod tests {
         )
         .unwrap();
 
+        for text in [
+            "implicit one two three four five six seven",
+            "top one two three four five six seven",
+            "middle one two three four five six seven",
+            "bottom one two three four five six seven",
+        ] {
+            let run = glyph_run(&build.scene, text);
+            assert_eq!(
+                run.semantic_groups,
+                [GlyphSemanticGroup {
+                    source_start: 0,
+                    source_end: u64::try_from(text.len()).unwrap(),
+                }],
+                "fixed-height ODS wrapping must retain Calc's complete logical paragraph"
+            );
+        }
+
         let span = |text: &str| {
             let run = glyph_run(&build.scene, text);
             let minimum = run
@@ -20602,6 +20638,39 @@ mod tests {
         assert!(middle_max > bottom(middle_clip));
         assert!(bottom_min < bottom_clip.y);
         assert!(bottom_max <= bottom(bottom_clip));
+    }
+
+    #[test]
+    fn ods_fixed_height_multiline_text_that_fits_does_not_expand_semantics() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.45in"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="0.75in" style:use-optimal-row-height="false"/></style:style><style:style style:name="ce" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="top"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Fits"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce" office:value-type="string"><text:p>tall one two</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 0, 0)),
+        )
+        .unwrap();
+        let run = glyph_run(&build.scene, "tall one two");
+        assert!(
+            run.cluster_metrics
+                .windows(2)
+                .any(|pair| pair[0].baseline_y != pair[1].baseline_y),
+            "the fixed-height control must actually wrap onto multiple lines"
+        );
+        assert!(
+            run.semantic_groups.is_empty(),
+            "a multiline paragraph that fits its fixed row must retain ordinary clip semantics"
+        );
+        let clip_bottom = run
+            .clip_bounds
+            .y
+            .checked_add(run.clip_bounds.height)
+            .unwrap();
+        assert!(run.cluster_metrics.iter().all(|metrics| {
+            metrics.baseline_y.checked_sub(metrics.ascent).unwrap() >= run.clip_bounds.y
+                && metrics.baseline_y.checked_sub(metrics.descent).unwrap() <= clip_bottom
+        }));
     }
 
     #[test]
@@ -20669,6 +20738,10 @@ mod tests {
 
         let build = build_scene(&workbook, 0, &options).unwrap();
         let run = glyph_run(&build.scene, "automatic one two three four five six seven");
+        assert!(
+            run.semantic_groups.is_empty(),
+            "an expanded ODS row must use ordinary per-cluster visibility"
+        );
         let clip_bottom = run
             .clip_bounds
             .y

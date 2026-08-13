@@ -4027,7 +4027,7 @@ mod tests {
     use crate::print::{build_print_document, PrintOptions};
     use crate::scene::{
         BackendCommandRangeTrace, BackendNodeTrace, ClipGroupNode, GlyphCluster, GlyphPaint,
-        ImageNode, LineNode, PathCommand, PathNode, RectNode, TextStyle,
+        GlyphSemanticGroup, ImageNode, LineNode, PathCommand, PathNode, RectNode, TextStyle,
     };
     use crate::svg::render_scene_svg_with_trace;
     use zip::write::SimpleFileOptions;
@@ -7493,10 +7493,7 @@ mod tests {
             ..artifact.clip_bounds
         };
         let bounds = glyph_bounds(&reference.commands).expect("font-pack glyph bounds");
-        let reference_right = reference_clip
-            .x
-            .checked_add(reference_clip.width)
-            .unwrap();
+        let reference_right = reference_clip.x.checked_add(reference_clip.width).unwrap();
         assert!(bounds.max_x < reference_right);
         let reference_pdf = render_print_document_pdf(&document_with_nodes(
             "semantic-paint-reference",
@@ -7529,8 +7526,67 @@ mod tests {
     }
 
     #[test]
+    fn clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint() {
+        let text = "VISIBLE HIDDEN";
+        let mut grouped = font_pack_glyph_run(text);
+        grouped.clip_bounds.width = Fixed::from_pixels(180);
+        let clip_bottom = grouped
+            .clip_bounds
+            .y
+            .checked_add(grouped.clip_bounds.height)
+            .unwrap();
+        let visible_source_end = u64::try_from("VISIBLE".len()).unwrap();
+        for (cluster, metrics) in grouped
+            .clusters
+            .iter()
+            .zip(grouped.cluster_metrics.iter_mut())
+        {
+            if cluster.source_start >= visible_source_end {
+                metrics.baseline_y = clip_bottom;
+            }
+        }
+        grouped.semantic_groups = vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: u64::try_from(text.len()).unwrap(),
+        }];
+        assert!(grouped.metadata_is_valid());
+
+        let mut ordinary = grouped.clone();
+        ordinary.semantic_groups.clear();
+        let ordinary_pdf = render_print_document_pdf(&document_with_nodes(
+            "ordinary-clipped-paragraph",
+            vec![SceneNode::GlyphRun(ordinary)],
+        ))
+        .unwrap();
+        let grouped_pdf = render_print_document_pdf(&document_with_nodes(
+            "grouped-clipped-paragraph",
+            vec![SceneNode::GlyphRun(grouped)],
+        ))
+        .unwrap();
+
+        if let (Some(ordinary_text), Some(grouped_text)) =
+            (poppler_text(&ordinary_pdf), poppler_text(&grouped_pdf))
+        {
+            assert!(ordinary_text.contains("VISIBLE"), "{ordinary_text:?}");
+            assert!(!ordinary_text.contains("HIDDEN"), "{ordinary_text:?}");
+            assert!(grouped_text.contains(text), "{grouped_text:?}");
+        }
+        if let (Some(ordinary_raster), Some(grouped_raster)) = (
+            poppler_raster(&ordinary_pdf, "ordinary-clipped-paragraph"),
+            poppler_raster(&grouped_pdf, "grouped-clipped-paragraph"),
+        ) {
+            assert_eq!(ordinary_raster.data(), grouped_raster.data());
+        }
+    }
+
+    #[test]
     fn nested_disjoint_clip_suppresses_font_pack_glyph_semantics() {
-        let glyph = font_pack_glyph_run("HIDDENFONT");
+        let mut glyph = font_pack_glyph_run("HIDDENFONT");
+        glyph.semantic_groups = vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: u64::try_from(glyph.text.len()).unwrap(),
+        }];
+        assert!(glyph.metadata_is_valid());
         let bounds = glyph_bounds(&glyph.commands).expect("font-pack glyph bounds");
         let hidden_x = bounds
             .max_x

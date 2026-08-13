@@ -92,6 +92,7 @@ fuzz_target!(|data: &[u8]| {
                 commands,
                 clusters: Vec::new(),
                 cluster_metrics: Vec::new(),
+                semantic_groups: Vec::new(),
                 paints: Vec::new(),
                 decorations: vec![LineNode {
                     x1: Fixed::ZERO,

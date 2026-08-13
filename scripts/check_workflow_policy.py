@@ -144,7 +144,10 @@ ORACLE_RENDER_WORKFLOW_SHA256 = (
     "52b3f6c7f2fd24590042400d01c978236e5da65424b821d8eaa95a4e29255040"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "227ec48eaafd9dc4896fce146557872b8eee19d49eaa872c62d39c8c5454834b"
+    "3655cfa89a37f652c1144937789ffbc18b8f663eb5cb01eea624ecbaf31d587e"
+)
+RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
+    "61a161d35ccf0d00839e0f78342750ef6d137c7e9f4cdae1d037768e12430211"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -372,6 +375,21 @@ def _single_yaml_block(
         errors.append(f"{path}: expected exactly one active {label}")
         return ""
     return blocks[0]
+
+
+def _yaml_mapping_entries_at_indent(
+    text: str, indent: int
+) -> list[tuple[str, str]]:
+    """Return active mapping entries at one exact indentation level."""
+
+    entries: list[tuple[str, str]] = []
+    for line in _without_commented_lines(text).splitlines():
+        if not line.strip() or len(line) - len(line.lstrip(" ")) != indent:
+            continue
+        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
+        if entry is not None:
+            entries.append(entry)
+    return entries
 
 
 def _normalized_active_commands(text: str) -> list[str]:
@@ -3712,6 +3730,10 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     pdf_runners = re.findall(r"^\s{4}runs-on:\s*(\S+)\s*$", pdf_job, re.MULTILINE)
     if pdf_runners != ["ubuntu-24.04"]:
         errors.append(f"{path}: PDF hardening must use only ubuntu-24.04")
+    if pdf_job.count('      RXLS_REQUIRE_POPPLER: "1"') != 1:
+        errors.append(
+            f"{path}: PDF hardening tests must fail closed on the pinned Poppler tools"
+        )
     if 'python-version: "3.13.14"' not in pdf_job:
         errors.append(
             f"{path}: PDF hardening must match the render-oracle Python identity"
@@ -3833,6 +3855,16 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "        run: |\n"
         "          set -euo pipefail\n"
         "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \\\n"
+        "            -- --exact --list \\\n"
+        "            | grep -Fqx "
+        "'pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint: test'\n"
+        "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
+        "            --lib "
+        "pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \\\n"
+        "            -- --exact\n"
+        "          cargo test --locked --manifest-path render/Cargo.toml \\\n"
         "            --test printing "
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
         "            -- --exact --list \\\n"
@@ -3845,8 +3877,8 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     )
     if pdf_exact_test_gate != expected_pdf_exact_test_gate:
         errors.append(
-            f"{path}: deterministic PDF exact-test gate must prove one discovered "
-            "test before executing the reviewed selector"
+            f"{path}: pinned Poppler exact-test gate must discover and execute the "
+            "ODS semantic regression before the preserved printing regression"
         )
 
     image_job = _single_yaml_block(
@@ -4438,8 +4470,25 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
 def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     """Require a verification-only dispatch and protected, exact-tag npm publish."""
 
-    text = _without_commented_lines(text)
     errors: list[str] = []
+    _audit_exact_workflow_sha256(
+        path,
+        text,
+        RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256,
+        errors,
+    )
+    text = _without_commented_lines(text)
+    if re.search(r"^\s+continue-on-error\s*:", text, re.MULTILINE):
+        errors.append(
+            f"{path}: render package verification and publication must fail closed"
+        )
+    trigger_names, trigger_errors = _workflow_trigger_names(text)
+    errors.extend(f"{path}: {error}" for error in trigger_errors)
+    if not trigger_errors and trigger_names != {"push", "workflow_dispatch"}:
+        errors.append(
+            f"{path}: render package release must have only push and "
+            "workflow_dispatch triggers"
+        )
     required = {
         'tags:\n      - "render-v*"': "must use the render-package-only tag namespace",
         "workflow_dispatch:": "must provide a verification-only manual dry run",
@@ -4838,6 +4887,73 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     verify_job = _single_yaml_block(
         path, active, "verify:", 2, "render package verify job", errors
     )
+    deny_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Audit nested Rust advisories, licenses, and sources",
+        6,
+        "nested Rust advisory and license audit step",
+        errors,
+    )
+    deny_entries = [
+        (name, _yaml_unquote_scalar(value))
+        for name, value, _, _ in _step_mapping_entries(6, deny_step.splitlines())
+    ]
+    expected_deny_entries = [
+        ("name", "Audit nested Rust advisories, licenses, and sources"),
+        (
+            "uses",
+            "EmbarkStudios/cargo-deny-action@"
+            "3c6349835b2b7b196a839186cb8b78e02f7b5f25",
+        ),
+        ("with", ""),
+    ]
+    deny_with_entries = [
+        (name, _yaml_unquote_scalar(value))
+        for name, value in _yaml_mapping_entries_at_indent(deny_step, 10)
+    ]
+    expected_deny_with_entries = [
+        ("rust-version", "1.85.0"),
+        ("command", "check"),
+        ("manifest-path", "bindings/render-wasm/Cargo.toml"),
+        ("arguments", "--config deny.toml --locked --all-features"),
+    ]
+    if (
+        deny_entries != expected_deny_entries
+        or deny_with_entries != expected_deny_with_entries
+    ):
+        errors.append(
+            f"{path}: nested advisory and license audit must use only the exact "
+            "reviewed action and inputs"
+        )
+    if any(
+        name == "if" for name, _ in _yaml_mapping_entries_at_indent(verify_job, 4)
+    ):
+        errors.append(
+            f"{path}: verification must run for both tag pushes and manual dispatches"
+        )
+    verify_step_conditions = [
+        value
+        for name, value in _yaml_mapping_entries_at_indent(verify_job, 8)
+        if name == "if"
+    ]
+    if verify_step_conditions != ["github.event_name == 'push'"]:
+        errors.append(
+            f"{path}: only the hosted prerequisite step may be conditional "
+            "during verification"
+        )
+    publish_job = _single_yaml_block(
+        path, active, "publish:", 2, "render package publish job", errors
+    )
+    publish_conditions = [
+        value
+        for name, value in _yaml_mapping_entries_at_indent(publish_job, 4)
+        if name == "if"
+    ]
+    if publish_conditions != ["github.event_name == 'push'"]:
+        errors.append(
+            f"{path}: npm publication must have exactly one exact tag-push job guard"
+        )
     prerequisite_step = _single_yaml_block(
         path,
         verify_job,
@@ -4846,13 +4962,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "hosted prerequisite evidence step",
         errors,
     )
-    prerequisite_top_keys = []
-    for line in prerequisite_step.splitlines()[1:]:
-        if len(line) - len(line.lstrip(" ")) != 8:
-            continue
-        entry = _yaml_mapping_entry(_strip_yaml_inline_comment(line.lstrip(" ")))
-        if entry is not None:
-            prerequisite_top_keys.append(entry[0])
+    prerequisite_top_keys = [
+        name for name, _ in _yaml_mapping_entries_at_indent(prerequisite_step, 8)
+    ]
     if prerequisite_top_keys != ["if", "env", "shell", "run"]:
         errors.append(
             f"{path}: hosted prerequisite step must use only exact if, env, shell, and run fields"
@@ -4971,6 +5083,46 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: browser run, artifact, verifier, and oracle gates must retain exact order"
         )
+    policy_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Enforce workflow and package policy",
+        6,
+        "render package policy and test step",
+        errors,
+    )
+    policy_top_keys = [
+        name for name, _ in _yaml_mapping_entries_at_indent(policy_step, 8)
+    ]
+    if policy_top_keys != ["run"]:
+        errors.append(
+            f"{path}: local workflow policy and tests must be an unconditional step"
+        )
+    expected_policy_commands = (
+        'test "$(node --version)" = "v$NODE_VERSION"',
+        'test "$(npm --version)" = "$NPM_VERSION"',
+        "python3 scripts/check_workflow_policy.py",
+        "python3 scripts/test_workflow_policy.py",
+        "python3 scripts/test_check_render_browser_release_evidence.py",
+        "python3 scripts/test_check_render_package.py",
+        "python3 scripts/test_check_npm_registry_evidence.py",
+        "python3 scripts/test_render_supply_chain.py",
+        "python3 scripts/test_check_render_oracle_release_evidence.py",
+        "python3 scripts/render_supply_chain.py notice --manifest-path "
+        "bindings/render-wasm/Cargo.toml --check "
+        "bindings/render-wasm/THIRD_PARTY_NOTICES.txt",
+        "cargo fmt --manifest-path bindings/render-wasm/Cargo.toml -- --check",
+        "cargo clippy --manifest-path bindings/render-wasm/Cargo.toml "
+        "--all-targets --locked -- -D warnings",
+        "cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked",
+        "npm --prefix bindings/render-wasm test",
+    )
+    policy_commands = _normalized_active_commands(policy_step)
+    if policy_commands[2:] != list(expected_policy_commands):
+        errors.append(
+            f"{path}: local policy, focused tests, and package tests must be the "
+            "exact reviewed command sequence"
+        )
     pack_step = _single_yaml_block(
         path,
         verify_job,
@@ -4979,29 +5131,115 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "render package pack and dry-run step",
         errors,
     )
+    pack_top_keys = [
+        name for name, _ in _yaml_mapping_entries_at_indent(pack_step, 8)
+    ]
+    if pack_top_keys != ["shell", "run"]:
+        errors.append(
+            f"{path}: local pack, dry-run, and consumer verification must be one "
+            "unconditional step"
+        )
     push_guard = 'if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then'
     dispatch_guard = 'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"'
-    if pack_step.count(push_guard) != 1:
+    if pack_step.count(push_guard) != 1 or pack_step.count(dispatch_guard) != 1:
         errors.append(
-            f"{path}: package-to-browser binding must use exactly one tag push guard"
+            f"{path}: package verification must contain exactly one tag-push "
+            "browser guard and one fail-closed dispatch guard"
         )
-    if pack_step.count(dispatch_guard) != 1:
-        errors.append(
-            f"{path}: manual package verification must fail closed on the exact dispatch event"
-        )
-    pack_order = (
-        push_guard,
-        'Path("target/render-package/browser-prerequisite.json")',
-        "browser-proven package differs from release candidate",
-        dispatch_guard,
-        "npm publish --dry-run --ignore-scripts --access public",
+    tag_branch_open = (
+        '          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then\n'
+        '            ARCHIVE="$archive" python3 - <<\'PY\''
     )
-    pack_positions = [pack_step.find(value) for value in pack_order]
-    if any(index < 0 for index in pack_positions) or pack_positions != sorted(
-        pack_positions
+    tag_branch_close = (
+        "          PY\n"
+        "          else\n"
+        '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
+        "            echo \"workflow_dispatch verified the locally rebuilt package "
+        "without publication prerequisites\"\n"
+        "          fi\n"
+    )
+    if pack_step.count(tag_branch_open) != 1 or pack_step.count(tag_branch_close) != 1:
+        errors.append(
+            f"{path}: browser receipt must use one exact push branch with a "
+            "fail-closed dispatch alternative"
+        )
+    tag_start = pack_step.find(tag_branch_open)
+    tag_close_start = pack_step.find(tag_branch_close, max(tag_start, 0))
+    tag_end = (
+        tag_close_start + len(tag_branch_close) if tag_close_start >= 0 else -1
+    )
+    if tag_start < 0 or tag_close_start < tag_start:
+        pack_prefix = ""
+        tag_branch = ""
+        pack_suffix = ""
+    else:
+        pack_prefix = pack_step[:tag_start]
+        tag_branch = pack_step[tag_start:tag_end]
+        pack_suffix = pack_step[tag_end:]
+    if any(
+        marker in section
+        for section in (pack_prefix, pack_suffix)
+        for marker in ("GITHUB_EVENT_NAME", "github.event_name")
     ):
         errors.append(
-            f"{path}: tag-only browser binding and dispatch dry run must retain exact order"
+            f"{path}: event-selective logic in package verification must be "
+            "confined to the authenticated browser-receipt branch"
+        )
+
+    prefix_order = (
+        "python3 scripts/render_supply_chain.py sbom",
+        "cmp --silent \\",
+        '--check "$output/render-worker-sbom.cdx.json"',
+        'sha256sum "$output/render-worker-sbom.cdx.json"',
+        "npm pack --json --pack-destination",
+        "python3 scripts/check_render_package.py",
+    )
+    prefix_positions = [pack_prefix.find(value) for value in prefix_order]
+    if (
+        any(index < 0 for index in prefix_positions)
+        or prefix_positions != sorted(prefix_positions)
+        or pack_step.count("python3 scripts/render_supply_chain.py sbom") != 3
+        or pack_prefix.count("python3 scripts/render_supply_chain.py sbom") != 3
+        or pack_prefix.count("python3 scripts/check_render_package.py") != 1
+        or pack_prefix.count("npm pack --json --pack-destination") != 1
+    ):
+        errors.append(
+            f"{path}: dispatch must run deterministic SBOM, package, and archive "
+            "validation before the tag-only browser binding"
+        )
+    browser_receipt = 'Path("target/render-package/browser-prerequisite.json")'
+    browser_mismatch = "browser-proven package differs from release candidate"
+    if (
+        pack_step.count(browser_receipt) != 1
+        or pack_step.count(browser_mismatch) != 1
+        or browser_receipt not in tag_branch
+        or browser_mismatch not in tag_branch
+        or "oracle-prerequisite.json" in pack_step
+    ):
+        errors.append(
+            f"{path}: only tag pushes may read and bind hosted browser prerequisites "
+            "during local package verification"
+        )
+    suffix_order = (
+        "npm publish --dry-run --ignore-scripts --access public",
+        'sha256sum "$archive" > "$archive.sha256"',
+        'consumer="$RUNNER_TEMP/render-worker-consumer"',
+        'rm -rf "$consumer"',
+        'mkdir -p "$consumer"',
+        'cd "$consumer"',
+        "npm init --yes >/dev/null",
+        'npm install --ignore-scripts "$GITHUB_WORKSPACE/$archive"',
+        "node --input-type=module - <<'NODE'",
+    )
+    suffix_positions = [pack_suffix.find(value) for value in suffix_order]
+    if (
+        any(index < 0 for index in suffix_positions)
+        or suffix_positions != sorted(suffix_positions)
+        or any(pack_step.count(value) != 1 for value in suffix_order)
+    ):
+        errors.append(
+            f"{path}: dry-run, checksum, and clean installed consumer must run "
+            "after the event-specific browser branch"
         )
     build_step = _single_yaml_block(
         path,
@@ -5011,6 +5249,31 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "render package wasm-bindgen build step",
         errors,
     )
+    build_top_keys = [
+        name for name, _ in _yaml_mapping_entries_at_indent(build_step, 8)
+    ]
+    if build_top_keys != ["shell", "run"]:
+        errors.append(f"{path}: exact worker/WASM build must be unconditional")
+    if "GITHUB_EVENT_NAME" in build_step or "github.event_name" in build_step:
+        errors.append(
+            f"{path}: exact worker/WASM build must not use event-selective shell guards"
+        )
+    verify_order = (
+        "- name: Validate event and package identity",
+        "- name: Require exact-SHA hosted gates and reviewed full oracle evidence",
+        "- name: Enforce workflow and package policy",
+        "- name: Build the exact worker/WASM package",
+        "- name: Pack, inspect, dry-run, and consume",
+        "- name: Upload verified package candidate",
+    )
+    verify_positions = [verify_job.find(value) for value in verify_order]
+    if any(index < 0 for index in verify_positions) or verify_positions != sorted(
+        verify_positions
+    ):
+        errors.append(
+            f"{path}: identity, tag-only prerequisites, local gates, build, pack, "
+            "and upload must retain exact order"
+        )
     errors.extend(
         _audit_exact_wasm_bindgen_install(
             path,

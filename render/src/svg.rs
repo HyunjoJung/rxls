@@ -481,12 +481,14 @@ fn visible_glyph_label_in_clip(
         let nominal_baseline_visible = node.rotation_degrees != 0
             || !semantic_clip_is_cell_clip
             || node.cluster_metrics.is_empty()
-            || node.cluster_metrics.get(cluster_index).is_some_and(|metrics| {
-                metrics.baseline_y.raw() >= clip.1 && metrics.baseline_y.raw() < clip.3
-            });
-        cluster_visible.push(
-            nominal_baseline_visible && glyph_commands_intersect_clip(commands, clip),
-        );
+            || node
+                .cluster_metrics
+                .get(cluster_index)
+                .is_some_and(|metrics| {
+                    metrics.baseline_y.raw() >= clip.1 && metrics.baseline_y.raw() < clip.3
+                });
+        cluster_visible
+            .push(nominal_baseline_visible && glyph_commands_intersect_clip(commands, clip));
     }
     node.expand_semantic_visibility(&mut cluster_visible);
     let mut ranges = Vec::new();
@@ -960,9 +962,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::scene::{
-        GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphSemanticGroup,
-    };
+    use crate::scene::{GlyphCluster, GlyphClusterMetrics, GlyphPaint, GlyphSemanticGroup};
 
     fn rectangle_commands(left: i64, right: i64) -> Vec<PathCommand> {
         vec![
@@ -1161,6 +1161,68 @@ mod tests {
 
         assert!(node.metadata_is_valid());
         assert_eq!(visible_glyph_label(&node).unwrap(), "中文 ");
+    }
+
+    #[test]
+    fn glyph_visible_label_retains_a_complete_clipped_ods_paragraph_group() {
+        let mut commands = rectangle_commands(0, 3);
+        commands.extend(rectangle_commands(4, 10));
+        let mut node = glyph_node(
+            "top bottom",
+            0,
+            10,
+            commands,
+            vec![
+                GlyphCluster {
+                    source_start: 0,
+                    source_end: 3,
+                    command_start: 0,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 3,
+                    source_end: 4,
+                    command_start: 5,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 4,
+                    source_end: 10,
+                    command_start: 5,
+                    command_end: 10,
+                },
+            ],
+        );
+        node.cluster_metrics = vec![
+            GlyphClusterMetrics {
+                origin_x: Fixed::ZERO,
+                advance_x: Fixed::from_raw(3),
+                baseline_y: Fixed::from_raw(5),
+                ascent: Fixed::from_raw(5),
+                descent: Fixed::from_raw(-1),
+            },
+            GlyphClusterMetrics {
+                origin_x: Fixed::from_raw(3),
+                advance_x: Fixed::from_raw(1),
+                baseline_y: Fixed::from_raw(5),
+                ascent: Fixed::from_raw(5),
+                descent: Fixed::from_raw(-1),
+            },
+            GlyphClusterMetrics {
+                origin_x: Fixed::from_raw(4),
+                advance_x: Fixed::from_raw(6),
+                baseline_y: Fixed::from_raw(10),
+                ascent: Fixed::from_raw(5),
+                descent: Fixed::from_raw(-1),
+            },
+        ];
+        node.semantic_groups = vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: 10,
+        }];
+
+        assert!(node.metadata_is_valid());
+        assert_eq!(visible_glyph_label(&node).unwrap(), "top bottom");
     }
 
     #[test]

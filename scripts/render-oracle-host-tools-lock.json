@@ -858,6 +858,10 @@
     "architecture": "amd64",
     "bootstrap_packages": [
       {
+        "name": "libc6-dev:amd64",
+        "version": "2.39-0ubuntu8.7"
+      },
+      {
         "name": "libcairo2:amd64",
         "version": "1.18.0-3build1"
       },

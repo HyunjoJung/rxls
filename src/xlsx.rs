@@ -8321,30 +8321,30 @@ pub(crate) fn parse_chart_with_theme(
                         ChartUnsupportedReason::UnsupportedPlotSemantics,
                     ),
                 },
-                name if chart_plot_option_supported(kind, name, &e).is_some() => {
-                    if chart_plot_option_supported(kind, name, &e) != Some(true) {
+                name if chart_plot_option_supported(kind, name, &e) == Some(false) => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                    if name == b"bubble3D" {
                         add_chart_unsupported(
                             &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                            ChartUnsupportedReason::ThreeDimensional,
                         );
-                        if name == b"bubble3D" {
-                            add_chart_unsupported(
-                                &mut unsupported_reasons,
-                                ChartUnsupportedReason::ThreeDimensional,
-                            );
-                        }
                     }
                 }
-                b"style" if chart_depth == 0 && current_series.is_none() => {
-                    if !matches!(
-                        unique_attr(&e, b"val"),
-                        Ok(Some(value)) if value == "2"
-                    ) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedChartStyle,
-                        );
-                    }
+                b"style"
+                    if chart_depth == 0
+                        && current_series.is_none()
+                        && !matches!(
+                            unique_attr(&e, b"val"),
+                            Ok(Some(value)) if value == "2"
+                        ) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedChartStyle,
+                    );
                 }
                 b"catAx" | b"dateAx" | b"valAx" => {
                     axis_context = axis_semantics
@@ -8379,28 +8379,26 @@ pub(crate) fn parse_chart_with_theme(
                     legend = true;
                     in_legend = true;
                 }
-                b"legendPos" => {
+                b"legendPos"
                     if !matches!(
                         unique_attr(&e, b"val"),
                         Ok(Some(value)) if value == "r"
-                    ) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedLegend,
-                        );
-                    }
+                    ) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedLegend,
+                    );
                 }
                 b"legendEntry" => add_chart_unsupported(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::UnsupportedLegend,
                 ),
-                b"overlay" => {
-                    if parse_chart_boolean_element(&e) != Ok(false) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedLegend,
-                        );
-                    }
+                b"overlay" if parse_chart_boolean_element(&e) != Ok(false) => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedLegend,
+                    );
                 }
                 b"manualLayout" => add_chart_unsupported(
                     &mut unsupported_reasons,
@@ -8702,16 +8700,19 @@ pub(crate) fn parse_chart_with_theme(
                         );
                     }
                 }
-                b"prstDash" if series_line_depth > 0 => {
-                    if !chart_text_attributes_are_subset(&e, &[b"val"])
-                        || !matches!(unique_attr(&e, b"val"), Ok(Some(value)) if value == "solid")
-                    {
-                        if let Some(series) = current_series.as_mut() {
-                            add_chart_series_style_loss(
-                                &mut series.style,
-                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
-                            );
-                        }
+                b"prstDash"
+                    if series_line_depth > 0
+                        && (!chart_text_attributes_are_subset(&e, &[b"val"])
+                            || !matches!(
+                                unique_attr(&e, b"val"),
+                                Ok(Some(value)) if value == "solid"
+                            )) =>
+                {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
                     }
                 }
                 b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"
@@ -8779,16 +8780,15 @@ pub(crate) fn parse_chart_with_theme(
                         && marker_depth == 0
                         && trendline_depth == 0
                         && error_bars_depth == 0
-                        && series_cache_depth == 0 =>
+                        && series_cache_depth == 0
+                        && current_series.as_mut().is_some_and(|series| {
+                            !retain_chart_series_position(series, local(e.name().as_ref()), &e)
+                        }) =>
                 {
-                    if current_series.as_mut().is_some_and(|series| {
-                        !retain_chart_series_position(series, local(e.name().as_ref()), &e)
-                    }) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedPlotSemantics,
-                        );
-                    }
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
                 }
                 b"tx" if current_series.is_some() => series_field = Some(ChartSeriesField::Name),
                 b"cat" | b"xVal" if current_series.is_some() => {
@@ -8895,54 +8895,52 @@ pub(crate) fn parse_chart_with_theme(
                         ChartUnsupportedReason::UnsupportedPlotSemantics,
                     ),
                 },
-                name if chart_plot_option_supported(kind, name, &e).is_some() => {
-                    if chart_plot_option_supported(kind, name, &e) != Some(true) {
+                name if chart_plot_option_supported(kind, name, &e) == Some(false) => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
+                    if name == b"bubble3D" {
                         add_chart_unsupported(
                             &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedPlotSemantics,
+                            ChartUnsupportedReason::ThreeDimensional,
                         );
-                        if name == b"bubble3D" {
-                            add_chart_unsupported(
-                                &mut unsupported_reasons,
-                                ChartUnsupportedReason::ThreeDimensional,
-                            );
-                        }
                     }
                 }
-                b"style" if chart_depth == 0 && current_series.is_none() => {
-                    if !matches!(
-                        unique_attr(&e, b"val"),
-                        Ok(Some(value)) if value == "2"
-                    ) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedChartStyle,
-                        );
-                    }
+                b"style"
+                    if chart_depth == 0
+                        && current_series.is_none()
+                        && !matches!(
+                            unique_attr(&e, b"val"),
+                            Ok(Some(value)) if value == "2"
+                        ) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedChartStyle,
+                    );
                 }
                 b"legend" => legend = true,
-                b"legendPos" => {
+                b"legendPos"
                     if !matches!(
                         unique_attr(&e, b"val"),
                         Ok(Some(value)) if value == "r"
-                    ) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedLegend,
-                        );
-                    }
+                    ) =>
+                {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedLegend,
+                    );
                 }
                 b"legendEntry" => add_chart_unsupported(
                     &mut unsupported_reasons,
                     ChartUnsupportedReason::UnsupportedLegend,
                 ),
-                b"overlay" => {
-                    if parse_chart_boolean_element(&e) != Ok(false) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedLegend,
-                        );
-                    }
+                b"overlay" if parse_chart_boolean_element(&e) != Ok(false) => {
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedLegend,
+                    );
                 }
                 b"manualLayout" => add_chart_unsupported(
                     &mut unsupported_reasons,
@@ -8986,16 +8984,15 @@ pub(crate) fn parse_chart_with_theme(
                         && marker_depth == 0
                         && trendline_depth == 0
                         && error_bars_depth == 0
-                        && series_cache_depth == 0 =>
+                        && series_cache_depth == 0
+                        && current_series.as_mut().is_some_and(|series| {
+                            !retain_chart_series_position(series, local(e.name().as_ref()), &e)
+                        }) =>
                 {
-                    if current_series.as_mut().is_some_and(|series| {
-                        !retain_chart_series_position(series, local(e.name().as_ref()), &e)
-                    }) {
-                        add_chart_unsupported(
-                            &mut unsupported_reasons,
-                            ChartUnsupportedReason::UnsupportedPlotSemantics,
-                        );
-                    }
+                    add_chart_unsupported(
+                        &mut unsupported_reasons,
+                        ChartUnsupportedReason::UnsupportedPlotSemantics,
+                    );
                 }
                 b"symbol" if marker_depth > 0 => {
                     if let Some(series) = current_series.as_mut() {
@@ -9187,16 +9184,19 @@ pub(crate) fn parse_chart_with_theme(
                         );
                     }
                 }
-                b"prstDash" if series_line_depth > 0 => {
-                    if !chart_text_attributes_are_subset(&e, &[b"val"])
-                        || !matches!(unique_attr(&e, b"val"), Ok(Some(value)) if value == "solid")
-                    {
-                        if let Some(series) = current_series.as_mut() {
-                            add_chart_series_style_loss(
-                                &mut series.style,
-                                ChartSeriesStyleLossKind::UnsupportedLinePaint,
-                            );
-                        }
+                b"prstDash"
+                    if series_line_depth > 0
+                        && (!chart_text_attributes_are_subset(&e, &[b"val"])
+                            || !matches!(
+                                unique_attr(&e, b"val"),
+                                Ok(Some(value)) if value == "solid"
+                            )) =>
+                {
+                    if let Some(series) = current_series.as_mut() {
+                        add_chart_series_style_loss(
+                            &mut series.style,
+                            ChartSeriesStyleLossKind::UnsupportedLinePaint,
+                        );
                     }
                 }
                 b"alpha" | b"alphaMod" | b"alphaOff" | b"blue" | b"blueMod" | b"blueOff"

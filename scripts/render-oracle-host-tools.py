@@ -391,7 +391,7 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
     except ValueError as error:
         raise HostToolError("lock_ubuntu_snapshot") from error
     bootstrap_packages = ubuntu_apt["bootstrap_packages"]
-    if not isinstance(bootstrap_packages, list) or len(bootstrap_packages) != 2:
+    if not isinstance(bootstrap_packages, list) or len(bootstrap_packages) != 3:
         raise HostToolError("lock_ubuntu_bootstrap_packages")
     bootstrap_pairs: list[tuple[str, str]] = []
     for item in bootstrap_packages:
@@ -406,7 +406,7 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
         ):
             raise HostToolError("lock_ubuntu_bootstrap_package")
         bootstrap_pairs.append((name, version))
-    if bootstrap_pairs != sorted(bootstrap_pairs) or len(set(bootstrap_pairs)) != 2:
+    if bootstrap_pairs != sorted(bootstrap_pairs) or len(set(bootstrap_pairs)) != 3:
         raise HostToolError("lock_ubuntu_bootstrap_packages")
     python = exact_keys(
         row["python"],
@@ -454,7 +454,7 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
     expected = row["expected_identity"]
     if expected is not None:
         validate_identity(expected, row)
-        expected_bootstrap_pairs = {
+        expected_runtime_pairs = {
             (
                 expected["cairo"]["library"]["package_name"],
                 expected["cairo"]["library"]["package_version"],
@@ -463,6 +463,17 @@ def validate_lock(document: object, requirements_payload: bytes) -> dict[str, An
                 (item["package_name"], item["package_version"])
                 for item in expected["poppler"]["executables"]
             },
+        }
+        libc_versions = {
+            item["package_version"]
+            for item in expected["poppler"]["native_libraries"]
+            if item["package_name"] == "libc6:amd64"
+        }
+        if len(libc_versions) != 1:
+            raise HostToolError("lock_ubuntu_bootstrap_identity")
+        expected_bootstrap_pairs = {
+            *expected_runtime_pairs,
+            ("libc6-dev:amd64", next(iter(libc_versions))),
         }
         if set(bootstrap_pairs) != expected_bootstrap_pairs:
             raise HostToolError("lock_ubuntu_bootstrap_identity")
@@ -835,7 +846,11 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
         sources.extend(expected["cairo"]["native_libraries"])
     elif scope != "poppler":
         raise HostToolError("scope")
-    packages: dict[str, str] = {}
+    packages = {
+        item["name"]: item["version"]
+        for item in lock["ubuntu_apt"]["bootstrap_packages"]
+        if item["name"] == "libc6-dev:amd64"
+    }
     for row in sources:
         name = row["package_name"]
         version = row["package_version"]
