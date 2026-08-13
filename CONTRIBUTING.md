@@ -31,6 +31,14 @@ Install the pinned registry-compatibility checker with
 `wasm32-unknown-unknown` Rust target is installed, then run the full local gate
 (all must pass clean):
 
+On macOS, put rustup's cargo proxy before any Homebrew Rust installation so
+`cargo +1.85.0`, `cargo +nightly`, and the API checker use the pinned toolchain:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo +1.85.0 -V
+```
+
 ```sh
 python3 scripts/public_hygiene_audit.py
 cargo fmt --all -- --check
