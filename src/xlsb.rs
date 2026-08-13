@@ -3276,6 +3276,7 @@ fn read_sheet_drawings(
                 sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
                 sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
                 sidecar.chart_category_axis_visible = parsed.category_axis_visible;
+                sidecar.chart_category_axis_shifted = parsed.category_axis_shifted;
                 sidecar.chart_value_axis_visible = parsed.value_axis_visible;
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;

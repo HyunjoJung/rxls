@@ -544,10 +544,16 @@ impl GlyphRunNode {
 
     /// Expand physical cluster visibility to complete retained semantic groups.
     pub(crate) fn expand_semantic_visibility(&self, visible: &mut [bool]) {
-        debug_assert_eq!(visible.len(), self.clusters.len());
-        if self.semantic_groups.is_empty() {
+        // Legacy caller-authored runs may intentionally omit clusters while
+        // still carrying a complete semantic partition. There is no physical
+        // cluster to expand in that representation; backends handle its
+        // single fallback glyph separately. Avoid indexing a visibility
+        // vector whose length is the fallback-glyph count rather than the
+        // cluster count.
+        if self.semantic_groups.is_empty() || self.clusters.is_empty() {
             return;
         }
+        debug_assert_eq!(visible.len(), self.clusters.len());
         let overlapping_groups = |cluster: &GlyphCluster| {
             let start = self
                 .semantic_groups
@@ -1070,5 +1076,41 @@ mod tests {
             !node.metadata_is_valid(),
             "font identities cannot remain without shaped glyphs"
         );
+    }
+
+    #[test]
+    fn semantic_visibility_ignores_unclustered_legacy_fallback_glyph() {
+        let node = GlyphRunNode {
+            text: "fallback".to_string(),
+            clip_bounds: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(10),
+            },
+            commands: Vec::new(),
+            clusters: Vec::new(),
+            cluster_metrics: Vec::new(),
+            semantic_groups: vec![GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 8,
+            }],
+            paints: Vec::new(),
+            decorations: Vec::new(),
+            color: Rgb::BLACK,
+            rotation_degrees: 0,
+            pivot_x: Fixed::ZERO,
+            pivot_y: Fixed::ZERO,
+            hyperlink: None,
+            glyphs: Vec::new(),
+            font_faces: Vec::new(),
+        };
+        assert!(node.metadata_is_valid());
+
+        // PDF's legacy fallback path has one registered glyph even though the
+        // scene node has no physical clusters. This must remain a no-op.
+        let mut visible = vec![true];
+        node.expand_semantic_visibility(&mut visible);
+        assert_eq!(visible, vec![true]);
     }
 }

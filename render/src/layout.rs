@@ -8547,6 +8547,9 @@ fn try_push_chart(
     let category_axis_visible = metadata
         .and_then(|metadata| metadata.chart_category_axis_visible)
         .unwrap_or(true);
+    let category_axis_shifted = metadata
+        .and_then(|metadata| metadata.chart_category_axis_shifted)
+        .unwrap_or(false);
     let value_axis_visible = metadata
         .and_then(|metadata| metadata.chart_value_axis_visible)
         .unwrap_or(true);
@@ -8923,7 +8926,17 @@ fn try_push_chart(
     let frame_fill = match metadata.map_or(ChartFrameFill::Automatic, |metadata| {
         metadata.chart_frame_fill
     }) {
-        ChartFrameFill::Automatic => Some(Rgb::WHITE),
+        ChartFrameFill::Automatic => {
+            // Imported OOXML chart spaces with no c:spPr paint are
+            // transparent in Calc. Authored charts retain the historical
+            // white compatibility default; an explicit unsupported paint
+            // also keeps that fallback so it is not mistaken for noFill.
+            let imported_implicit_no_fill = metadata.is_some_and(|metadata| {
+                metadata.chart_default_latin_font_family.is_some()
+                    && metadata.chart_frame_style_losses.is_empty()
+            });
+            (!imported_implicit_no_fill).then_some(Rgb::WHITE)
+        }
         ChartFrameFill::NoFill => None,
         ChartFrameFill::Solid(color) => {
             let [red, green, blue] = color.as_rgb();
@@ -8955,6 +8968,7 @@ fn try_push_chart(
             x_data_bounds,
             &series,
             category_axis_visible,
+            category_axis_shifted,
             value_axis_visible,
             category_major_gridlines,
             value_major_gridlines,
@@ -9028,6 +9042,7 @@ fn try_push_chart(
                     plot,
                     &series,
                     bounds,
+                    category_axis_shifted,
                     palette,
                     chart.data_labels,
                     &mut labels,
@@ -9078,6 +9093,7 @@ fn try_push_chart(
                     plot,
                     &series,
                     bounds,
+                    category_axis_shifted,
                     palette,
                     chart.data_labels,
                     &mut labels,
@@ -10134,6 +10150,16 @@ fn chart_category_label_is_retained(index: usize, count: usize, stride: usize) -
     index < count && (index % stride.max(1) == 0 || index + 1 == count)
 }
 
+fn chart_category_ratio(index: usize, count: usize, shifted: bool) -> f64 {
+    if shifted {
+        (index as f64 + 0.5) / count.max(1) as f64
+    } else if count == 1 {
+        0.5
+    } else {
+        index as f64 / (count - 1) as f64
+    }
+}
+
 fn chart_category_label_stride(count: usize) -> usize {
     if count <= MAX_CHART_CATEGORY_LABELS {
         1
@@ -10235,6 +10261,7 @@ fn push_cartesian_chart_axes(
     x_data_bounds: Option<(f64, f64)>,
     series: &[ResolvedChartSeries],
     category_axis_visible: bool,
+    category_axis_shifted: bool,
     value_axis_visible: bool,
     category_major_gridlines: bool,
     value_major_gridlines: bool,
@@ -10473,13 +10500,11 @@ fn push_cartesian_chart_axes(
                 height: extents.height,
             }
         } else {
-            let ratio = if chart_kind == ChartKind::Bar {
-                (index as f64 + 0.5) / categories.len() as f64
-            } else if categories.len() == 1 {
-                0.5
-            } else {
-                index as f64 / (categories.len() - 1) as f64
-            };
+            let ratio = chart_category_ratio(
+                index,
+                categories.len(),
+                category_axis_shifted || chart_kind == ChartKind::Bar,
+            );
             let x = chart_x(plot, ratio)?;
             if category_major_gridlines {
                 push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
@@ -10541,6 +10566,7 @@ fn push_line_chart(
     plot: Rect,
     series: &[ResolvedChartSeries],
     bounds: (f64, f64),
+    category_axis_shifted: bool,
     palette: &[Color],
     data_labels: bool,
     labels: &mut Vec<ChartLabel>,
@@ -10555,11 +10581,7 @@ fn push_line_chart(
         });
         let mut previous = None;
         for (index, value) in series.values.iter().enumerate() {
-            let ratio = if series.values.len() == 1 {
-                0.5
-            } else {
-                index as f64 / (series.values.len() - 1) as f64
-            };
+            let ratio = chart_category_ratio(index, series.values.len(), category_axis_shifted);
             let x = chart_x(plot, ratio)?;
             let y = chart_y(plot, *value, bounds)?;
             if series.style.line_visible {
@@ -10843,6 +10865,7 @@ fn push_area_chart(
     plot: Rect,
     series: &[ResolvedChartSeries],
     bounds: (f64, f64),
+    category_axis_shifted: bool,
     palette: &[Color],
     data_labels: bool,
     labels: &mut Vec<ChartLabel>,
@@ -10853,11 +10876,12 @@ fn push_area_chart(
     // Draw later series first so the first (primary) series remains visible,
     // matching the foreground ordering used by common office renderers.
     for (series_index, series) in series.iter().enumerate().rev() {
-        let (first_ratio, last_ratio) = if series.values.len() == 1 {
-            (0.5, 0.5)
-        } else {
-            (0.0, 1.0)
-        };
+        let first_ratio = chart_category_ratio(0, series.values.len(), category_axis_shifted);
+        let last_ratio = chart_category_ratio(
+            series.values.len().saturating_sub(1),
+            series.values.len(),
+            category_axis_shifted,
+        );
         let first_x = chart_x(plot, first_ratio)?;
         let last_x = chart_x(plot, last_ratio)?;
         let mut commands = Vec::with_capacity(series.values.len().saturating_add(3));
@@ -10866,11 +10890,7 @@ fn push_area_chart(
             y: baseline,
         });
         for (index, value) in series.values.iter().enumerate() {
-            let ratio = if series.values.len() == 1 {
-                0.5
-            } else {
-                index as f64 / (series.values.len() - 1) as f64
-            };
+            let ratio = chart_category_ratio(index, series.values.len(), category_axis_shifted);
             let x = chart_x(plot, ratio)?;
             let y = chart_y(plot, *value, bounds)?;
             commands.push(PathCommand::LineTo { x, y });
@@ -23504,6 +23524,7 @@ mod tests {
             plot,
             &series,
             (0.0, 2.0),
+            false,
             &[],
             false,
             &mut Vec::new(),
@@ -23550,6 +23571,7 @@ mod tests {
             plot,
             &series,
             (0.0, 2.0),
+            false,
             &[],
             false,
             &mut Vec::new(),
@@ -23565,6 +23587,21 @@ mod tests {
                         && path.stroke_width == Fixed::from_pixels(2)
             )
         }));
+    }
+
+    #[test]
+    fn shifted_category_positions_use_band_centers_and_legacy_positions_keep_endpoints() {
+        let shifted = (0..4)
+            .map(|index| chart_category_ratio(index, 4, true))
+            .collect::<Vec<_>>();
+        assert_eq!(shifted, [0.125, 0.375, 0.625, 0.875]);
+
+        let legacy = (0..4)
+            .map(|index| chart_category_ratio(index, 4, false))
+            .collect::<Vec<_>>();
+        assert_eq!(legacy, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]);
+        assert_eq!(chart_category_ratio(0, 1, true), 0.5);
+        assert_eq!(chart_category_ratio(0, 1, false), 0.5);
     }
 
     #[test]

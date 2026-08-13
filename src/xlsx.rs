@@ -5065,6 +5065,7 @@ fn read_sheet_drawings(
                 sidecar.chart_category_major_gridlines = Some(parsed.category_major_gridlines);
                 sidecar.chart_value_major_gridlines = Some(parsed.value_major_gridlines);
                 sidecar.chart_category_axis_visible = parsed.category_axis_visible;
+                sidecar.chart_category_axis_shifted = parsed.category_axis_shifted;
                 sidecar.chart_value_axis_visible = parsed.value_axis_visible;
                 sidecar.chart_unsupported_reasons = parsed.unsupported_reasons;
                 sidecar.chart_bar_direction = parsed.bar_direction;
@@ -5121,6 +5122,7 @@ pub(crate) struct ParsedChart {
     pub(crate) category_major_gridlines: bool,
     pub(crate) value_major_gridlines: bool,
     pub(crate) category_axis_visible: Option<bool>,
+    pub(crate) category_axis_shifted: Option<bool>,
     pub(crate) value_axis_visible: Option<bool>,
     pub(crate) limit_exceeded: bool,
     pub(crate) unsupported_reasons: Vec<ChartUnsupportedReason>,
@@ -7579,6 +7581,7 @@ struct RawChartAxis {
     label_alignment_seen: bool,
     label_offset_seen: bool,
     cross_between_seen: bool,
+    cross_between_shifted: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -7596,6 +7599,7 @@ struct ChartAxisSemantics {
     value_major_gridlines: bool,
     category_position: Option<RawChartAxisPosition>,
     value_position: Option<RawChartAxisPosition>,
+    category_axis_shifted: Option<bool>,
     invalid_visibility: bool,
     unsupported_topology: bool,
     unsupported_presentation: bool,
@@ -7722,11 +7726,21 @@ fn parse_chart_axis_semantics(xml: &str) -> ChartAxisSemantics {
                 if axis.cross_between_seen
                     || axis.kind != RawChartAxisKind::Value
                     || !chart_text_attributes_are_subset(element, &[b"val"])
-                    || !matches!(value(), Ok(Some(ref value)) if value == "between")
                 {
                     axis.unsupported_presentation = true;
                 }
                 axis.cross_between_seen = true;
+                match value() {
+                    Ok(Some(value)) if value == "between" => {
+                        axis.cross_between_shifted = Some(true);
+                    }
+                    Ok(Some(value)) if value == "midCat" => {
+                        axis.cross_between_shifted = Some(false);
+                    }
+                    Ok(Some(_)) | Ok(None) | Err(()) => {
+                        axis.unsupported_presentation = true;
+                    }
+                }
             }
             b"majorTickMark" | b"minorTickMark" => match value() {
                 Ok(Some(value)) if value == "none" => {}
@@ -7826,6 +7840,7 @@ fn parse_chart_axis_semantics(xml: &str) -> ChartAxisSemantics {
                             label_alignment_seen: false,
                             label_offset_seen: false,
                             cross_between_seen: false,
+                            cross_between_shifted: None,
                         },
                         false,
                     ));
@@ -7909,6 +7924,7 @@ fn parse_chart_axis_semantics(xml: &str) -> ChartAxisSemantics {
                             label_alignment_seen: false,
                             label_offset_seen: false,
                             cross_between_seen: false,
+                            cross_between_shifted: None,
                         });
                     }
                     malformed = true;
@@ -8117,11 +8133,21 @@ fn parse_chart_axis_semantics(xml: &str) -> ChartAxisSemantics {
                     semantics.value_visible = Some(axis.visible);
                     semantics.value_major_gridlines |= axis.major_gridlines;
                     semantics.value_position = axis.position;
+                    if axis.cross_between_shifted.is_some() {
+                        semantics.category_axis_shifted = axis.cross_between_shifted;
+                    }
                 }
             }
             role
         })
         .collect();
+    if semantics.category_axis_shifted.is_none() {
+        semantics.category_axis_shifted = match plot_kind {
+            Some(ChartKind::Bar | ChartKind::Line) => Some(true),
+            Some(ChartKind::Area | ChartKind::Radar) => Some(false),
+            _ => None,
+        };
+    }
     semantics
 }
 
@@ -9532,6 +9558,7 @@ pub(crate) fn parse_chart_with_theme(
         category_major_gridlines,
         value_major_gridlines,
         category_axis_visible: axis_semantics.category_visible,
+        category_axis_shifted: axis_semantics.category_axis_shifted,
         value_axis_visible: axis_semantics.value_visible,
         limit_exceeded,
         unsupported_reasons,
@@ -13980,8 +14007,10 @@ mod tests {
             assert!(!semantics.unsupported_presentation, "{expected_kind:?}");
             assert_eq!(semantics.category_visible, Some(true));
             assert_eq!(semantics.value_visible, Some(true));
+            assert_eq!(semantics.category_axis_shifted, Some(true));
             let parsed = parsed_chart(&xml);
             assert_eq!(parsed.chart.kind, expected_kind);
+            assert_eq!(parsed.category_axis_shifted, Some(true));
             assert!(
                 parsed.unsupported_reasons.is_empty(),
                 "{expected_kind:?}: {:?}",
@@ -13994,6 +14023,28 @@ mod tests {
         );
         assert_eq!(pie.chart.kind, ChartKind::Pie);
         assert!(pie.unsupported_reasons.is_empty());
+    }
+
+    #[test]
+    fn chart_category_shifted_position_replays_cross_between_and_calc_defaults() {
+        let axes = r#"<catAx><axId val="1"/><axPos val="b"/><crossAx val="2"/></catAx><valAx><axId val="2"/><axPos val="l"/><crossAx val="1"/>"#;
+        let base = |cross_between: &str| {
+            format!(
+                "<chartSpace><chart><plotArea><lineChart><axId val=\"1\"/><axId val=\"2\"/></lineChart>{axes}{cross_between}</valAx></plotArea></chart></chartSpace>"
+            )
+        };
+
+        let between = parse_chart_axis_semantics(&base("<crossBetween val=\"between\"/>"));
+        assert!(!between.unsupported_presentation);
+        assert_eq!(between.category_axis_shifted, Some(true));
+
+        let mid_cat = parse_chart_axis_semantics(&base("<crossBetween val=\"midCat\"/>"));
+        assert!(!mid_cat.unsupported_presentation);
+        assert_eq!(mid_cat.category_axis_shifted, Some(false));
+
+        let omitted = parse_chart_axis_semantics(&base(""));
+        assert!(!omitted.unsupported_presentation);
+        assert_eq!(omitted.category_axis_shifted, Some(true));
     }
 
     #[test]
@@ -14047,7 +14098,7 @@ mod tests {
             (r#"lblOffset val="100""#, r#"lblOffset val="101""#),
             (
                 r#"crossBetween val="between""#,
-                r#"crossBetween val="midCat""#,
+                r#"crossBetween val="unsupported""#,
             ),
         ] {
             let xml = generated_defaults.replacen(supported, unsupported, 1);

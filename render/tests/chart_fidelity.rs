@@ -203,6 +203,30 @@ fn imported_missing_theme_chart_labels_use_calc_latin_point_defaults() {
 }
 
 #[test]
+fn imported_implicit_chart_space_fill_is_transparent() {
+    let workbook = line_chart_workbook("");
+    let metadata = workbook.sheets[0]
+        .drawing_metadata()
+        .iter()
+        .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+        .expect("chart sidecar");
+    assert_eq!(metadata.chart_frame_fill, ChartFrameFill::Automatic);
+    assert!(metadata.chart_default_latin_font_family.is_some());
+    assert!(metadata.chart_frame_style_losses.is_empty());
+
+    let output = render_sheet_svg(&workbook, 0, &chart_options()).unwrap();
+    assert!(output.scene.nodes.iter().any(|node| {
+        matches!(
+            node,
+            SceneNode::Rect(frame)
+                if frame.fill.is_none()
+                    && frame.stroke == Some(Rgb::new(127, 127, 127))
+                    && frame.stroke_width == Fixed::from_pixels(1)
+        )
+    }));
+}
+
+#[test]
 fn imported_line_chart_renders_categories_nice_axis_and_circle_markers() {
     let workbook = line_chart_workbook(
         r#"<c:marker><c:symbol val="circle"/><c:size val="5"/></c:marker>
@@ -325,6 +349,66 @@ fn imported_line_chart_renders_categories_nice_axis_and_circle_markers() {
             actual: 8,
         })
     );
+}
+
+#[test]
+fn imported_line_chart_cross_between_moves_series_into_category_bands() {
+    let style = r#"<c:spPr><a:ln w="38100"><a:solidFill><a:srgbClr val="336699"/></a:solidFill></a:ln></c:spPr>"#;
+    let between = line_chart_workbook_with_metadata(
+        style,
+        "",
+        r#"<c:crossBetween val="between"/>"#,
+        "",
+    );
+    let mid_cat = line_chart_workbook_with_metadata(
+        style,
+        "",
+        r#"<c:crossBetween val="midCat"/>"#,
+        "",
+    );
+    assert_eq!(
+        between.sheets[0]
+            .drawing_metadata()
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("between chart sidecar")
+            .chart_category_axis_shifted,
+        Some(true)
+    );
+    assert_eq!(
+        mid_cat.sheets[0]
+            .drawing_metadata()
+            .iter()
+            .find(|metadata| metadata.kind == DrawingObjectKind::Chart)
+            .expect("midCat chart sidecar")
+            .chart_category_axis_shifted,
+        Some(false)
+    );
+
+    let x_positions = |workbook: &Workbook| {
+        let output = render_sheet_svg(workbook, 0, &chart_options()).unwrap();
+        let mut positions = output
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Line(line) if line.color == Rgb::new(0x33, 0x66, 0x99) => {
+                    Some([line.x1.raw(), line.x2.raw()])
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    };
+    let shifted = x_positions(&between);
+    let endpoints = x_positions(&mid_cat);
+    assert_eq!(shifted.len(), 4);
+    assert_eq!(endpoints.len(), 4);
+    assert!(shifted[0] > endpoints[0]);
+    assert!(shifted[3] < endpoints[3]);
 }
 
 #[test]

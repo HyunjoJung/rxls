@@ -5736,6 +5736,12 @@ pub struct DrawingMetadata {
     /// `None` preserves authored-chart, non-chart, and legacy-reader behavior;
     /// retained OOXML charts use `Some(false)` for a deleted axis.
     pub chart_category_axis_visible: Option<bool>,
+    /// Whether imported category positions are shifted into category bands.
+    ///
+    /// OOXML `crossBetween="between"` and Calc's omitted default for line and
+    /// column charts retain `Some(true)`. `midCat` retains `Some(false)`;
+    /// `None` preserves authored-chart and legacy-reader endpoint behavior.
+    pub chart_category_axis_shifted: Option<bool>,
     /// Whether the semantic value axis is visible for an imported chart.
     ///
     /// `None` preserves authored-chart, non-chart, and legacy-reader behavior;
