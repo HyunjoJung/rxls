@@ -56,6 +56,11 @@ const BIFF_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_pixels(17);
 /// This remains the conservative fallback when the workbook's Normal font
 /// cannot be resolved exactly from a verified pack.
 const OOXML_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(19_351);
+/// Calc keeps cell-anchored drawing endpoints on the imported OOXML standard
+/// row track (12.8 pt) even when the worksheet's text layout later chooses a
+/// taller automatic row.  Drawing anchors therefore need a separate, stable
+/// track model instead of borrowing the cell paint height.
+const CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(17_476);
 /// LibreOffice 26.2.3.2
 /// `sc/source/core/data/column2.cxx::lcl_GetAttribHeight` derives an automatic
 /// row from 118% of the pattern font's integer-twip height, then adds the two
@@ -7369,6 +7374,7 @@ fn push_drawing_placeholders(
     warnings: &mut Warnings,
 ) -> Result<(), RenderError> {
     let metadata_index = DrawingMetadataIndex::new(sheet);
+    let drawing_row_slots = calc_drawing_row_slots(sheet, row_slots);
     let mut placeholders = Vec::<DrawingPlaceholder>::new();
     let mut ordinal = 0_u64;
     for (index, image) in sheet.images().iter().enumerate() {
@@ -7378,7 +7384,7 @@ fn push_drawing_placeholders(
             image.from.1.saturating_add(4),
         ));
         match drawing_rect(
-            row_slots,
+            &drawing_row_slots,
             col_slots,
             cell_viewport,
             sheet_viewport,
@@ -7425,7 +7431,7 @@ fn push_drawing_placeholders(
     for (index, chart) in sheet.charts().iter().enumerate() {
         let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
         match drawing_rect(
-            row_slots,
+            &drawing_row_slots,
             col_slots,
             cell_viewport,
             sheet_viewport,
@@ -7480,7 +7486,7 @@ fn push_drawing_placeholders(
         };
         let to = metadata.to_cell.unwrap_or(from);
         match drawing_rect(
-            row_slots,
+            &drawing_row_slots,
             col_slots,
             cell_viewport,
             sheet_viewport,
@@ -12031,6 +12037,33 @@ fn row_or_column_boundary_row(slots: &[AxisSlot<u32>], index: u32, total: Fixed)
         .iter()
         .find(|slot| slot.index >= index)
         .map_or(total, |slot| slot.offset)
+}
+
+fn calc_drawing_row_slots(sheet: &Sheet, slots: &[AxisSlot<u32>]) -> Vec<AxisSlot<u32>> {
+    if sheet.implicit_ooxml_row_height_source()
+        != Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+        || sheet.default_row_height().is_some()
+    {
+        return slots.to_vec();
+    }
+    let mut offset = slots.first().map_or(Fixed::ZERO, |slot| slot.offset);
+    slots
+        .iter()
+        .map(|slot| {
+            let size = if sheet.row_heights().contains_key(&slot.index) {
+                slot.size
+            } else {
+                CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT
+            };
+            let current = MeasuredAxisSlot {
+                index: slot.index,
+                offset,
+                size,
+            };
+            offset = Fixed::from_raw(offset.raw().saturating_add(size.raw()));
+            current
+        })
+        .collect()
 }
 
 fn row_or_column_boundary_col(slots: &[AxisSlot<u16>], index: u16, total: Fixed) -> Fixed {
@@ -20003,6 +20036,40 @@ mod tests {
                 "{kind:?} anchor did not retain the exact implicit-row rectangle"
             );
         }
+    }
+
+    #[test]
+    fn imported_ooxml_drawing_anchors_use_calc_standard_row_tracks() {
+        let mut workbook = imported_xlsx("<styleSheet/>", "<worksheet><sheetData/></worksheet>");
+        workbook.sheets[0]
+            .add_image(Image::new([137, 80, 78, 71], ImageFmt::Png, (0, 0)).with_to((4, 4)));
+        assert!(workbook.sheets[0].has_implicit_ooxml_row_height());
+        let build = build_scene(
+            &workbook,
+            0,
+            &RenderOptions {
+                gridlines: false,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let frame = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Rect(RectNode {
+                    rect,
+                    fill: Some(color),
+                    ..
+                }) if *color == Rgb::new(242, 242, 242) => Some(*rect),
+                _ => None,
+            })
+            .expect("imported image placeholder frame");
+        assert_eq!(
+            frame.height,
+            Fixed::from_raw(CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT.raw() * 4)
+        );
     }
 
     #[test]
