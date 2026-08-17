@@ -941,12 +941,25 @@ LIBC_FAMILY_UNPINNED_PACKAGES = frozenset(
 
 def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     if scope == "bootstrap":
-        return [
+        top_level = [
             item["name"]
             if item["name"] in BOOTSTRAP_UNPINNED_PACKAGES
             else f"{item['name']}={item['version']}"
             for item in lock["ubuntu_apt"]["bootstrap_packages"]
         ]
+        if lock["expected_identity"] is None:
+            # First bootstrap: nothing is attested yet, so only the snapshot
+            # pinned top-level tools can be named and the capture defines the
+            # baseline.
+            return top_level
+        # Re-bootstrap against an existing attestation.  Installing only the
+        # top-level tools would leave every transitive library at whatever the
+        # runner image happens to carry, while verification compares the full
+        # attested closure — so any distribution security bump to a dependency
+        # fails the run for a reason unrelated to the oracle.  Requesting the
+        # attested closure makes the captured identity comparable by
+        # construction instead of exempting libraries one at a time.
+        return sorted(set(top_level) | set(apt_specs(lock, "all")))
     expected = lock["expected_identity"]
     if expected is None:
         raise HostToolError("host_identity_pin_required")

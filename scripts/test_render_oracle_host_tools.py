@@ -432,8 +432,25 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         # package's exact `libc6 (= version)` dependency. libc6-dev affects
         # neither rendering nor measurement, so it resolves freely while every
         # package that does affect the oracle stays exactly pinned.
+        # Re-bootstrapping against an existing attestation installs the whole
+        # attested closure, so the captured identity is comparable by
+        # construction rather than by exempting drifted libraries one at a time.
+        attested = MODULE.apt_specs(lock, "bootstrap")
+        self.assertEqual(attested, sorted(set(attested)))
+        for spec in (
+            "libcairo2:amd64=1.18.0-3build1",
+            "poppler-utils=24.02.0-1ubuntu9.9",
+            "libssl3t64:amd64=3.0.13-0ubuntu3.11",
+            "libkrb5-3:amd64=1.20.1-6ubuntu2.6",
+        ):
+            self.assertIn(spec, attested)
+        self.assertEqual(set(attested), set(attested) | set(MODULE.apt_specs(lock, "all")))
+        # A first bootstrap has nothing attested, so only the snapshot-pinned
+        # top-level tools can be named.
+        unpinned = json.loads(json.dumps(lock))
+        unpinned["expected_identity"] = None
         self.assertEqual(
-            MODULE.apt_specs(lock, "bootstrap"),
+            MODULE.apt_specs(unpinned, "bootstrap"),
             [
                 "libc6-dev:amd64",
                 "libcairo2:amd64=1.18.0-3build1",
