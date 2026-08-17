@@ -508,11 +508,12 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         # neither rendering nor measurement, so it resolves freely while every
         # package that does affect the oracle stays exactly pinned.
         # A first bootstrap has nothing attested, so only the snapshot-pinned
-        # top-level tools can be named. This is the shipped state while the
-        # oracle identity is being re-established.
-        self.assertIsNone(lock["expected_identity"])
+        # top-level tools can be named — that is the only set derivable before
+        # an attestation exists.
+        unpinned = json.loads(json.dumps(lock))
+        unpinned["expected_identity"] = None
         self.assertEqual(
-            MODULE.apt_specs(lock, "bootstrap"),
+            MODULE.apt_specs(unpinned, "bootstrap"),
             [
                 "libc6-dev:amd64",
                 "libcairo2:amd64=1.18.0-3build1",
@@ -523,7 +524,8 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         # attested closure, so the captured identity is comparable by
         # construction rather than by exempting drifted libraries one at a time.
         pinned = json.loads(json.dumps(lock))
-        pinned["expected_identity"] = fixture_identity(lock)
+        if pinned["expected_identity"] is None:
+            pinned["expected_identity"] = fixture_identity(lock)
         attested = MODULE.apt_specs(pinned, "bootstrap")
         self.assertEqual(attested, sorted(set(attested)))
         self.assertTrue(set(attested) >= set(MODULE.apt_specs(pinned, "all")))
