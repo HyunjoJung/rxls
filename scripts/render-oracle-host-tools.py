@@ -829,10 +829,28 @@ def validate_scoped_identity(
     raise HostToolError("scope")
 
 
+#: Build-support packages whose version is recorded for provenance but not
+#: pinned during bootstrap.
+#:
+#: The bootstrap scope deliberately installs a minimal set and does not pin
+#: ``libc6`` itself, so pinning ``libc6-dev`` to the snapshot's version fails
+#: whenever the runner image already carries a newer ``libc6``: the dev package
+#: has an exact ``libc6 (= <version>)`` dependency.  That is a dated drift, not
+#: a fidelity property — glibc 2.39-0ubuntu8.8 published 2026-07-27, after the
+#: pinned 20260718 snapshot, and runner images picked it up.  ``libc6-dev``
+#: contributes nothing to rendering or measurement, so it resolves freely while
+#: every package that does affect the oracle stays exactly pinned.  The
+#: ``poppler`` and ``all`` scopes are unaffected because they pin ``libc6``
+#: alongside it and are therefore self-consistent.
+BOOTSTRAP_UNPINNED_PACKAGES = frozenset({"libc6-dev:amd64"})
+
+
 def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     if scope == "bootstrap":
         return [
-            f"{item['name']}={item['version']}"
+            item["name"]
+            if item["name"] in BOOTSTRAP_UNPINNED_PACKAGES
+            else f"{item['name']}={item['version']}"
             for item in lock["ubuntu_apt"]["bootstrap_packages"]
         ]
     expected = lock["expected_identity"]

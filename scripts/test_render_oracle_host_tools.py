@@ -368,13 +368,32 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
     def test_apt_specs_are_sorted_exact_versions_and_require_a_pin(self) -> None:
         lock, _ = MODULE.load_lock()
+        # The bootstrap scope does not pin libc6, so pinning libc6-dev would
+        # fail against any runner image carrying a newer libc6 through the dev
+        # package's exact `libc6 (= version)` dependency. libc6-dev affects
+        # neither rendering nor measurement, so it resolves freely while every
+        # package that does affect the oracle stays exactly pinned.
         self.assertEqual(
             MODULE.apt_specs(lock, "bootstrap"),
             [
-                "libc6-dev:amd64=2.39-0ubuntu8.7",
+                "libc6-dev:amd64",
                 "libcairo2:amd64=1.18.0-3build1",
                 "poppler-utils=24.02.0-1ubuntu9.9",
             ],
+        )
+        # The provenance version stays recorded in the lock even though the
+        # bootstrap install no longer pins it.
+        self.assertEqual(
+            [
+                item["version"]
+                for item in lock["ubuntu_apt"]["bootstrap_packages"]
+                if item["name"] == "libc6-dev:amd64"
+            ],
+            ["2.39-0ubuntu8.7"],
+        )
+        # Only libc6-dev is exempt; nothing else may lose its pin.
+        self.assertEqual(
+            MODULE.BOOTSTRAP_UNPINNED_PACKAGES, frozenset({"libc6-dev:amd64"})
         )
         self.assertIn(
             "libc6-dev:amd64=2.39-0ubuntu8.7",
