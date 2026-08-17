@@ -13250,20 +13250,14 @@ fn build_glyph_run(
         .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
         .collect::<Result<Vec<_>, _>>()?;
     let block_height = sum_fixed(line_heights.iter().copied())?;
-    let top = if region.ods_fixed_height_row
-        && block_height > region.rect.height
-        && alignment.is_some_and(|alignment| {
-            alignment.wrap && alignment.vertical.is_none() && alignment.rotation == 0
-        }) {
-        // Calc preserves the beginning of implicitly aligned wrapped ODS text
-        // in a fixed-height row. Its generic bottom default would otherwise
-        // translate the beginning above the clip and retain only the tail.
-        let top_bounds =
-            calc_cell_text_layout_bounds(region.rect, TextBaseline::Top, region.vertical_margin)?;
-        vertical_block_top(top_bounds, block_height, TextBaseline::Top)?
-    } else {
-        vertical_block_top(layout_bounds, block_height, style.baseline)?
-    };
+    // An implicitly aligned wrapped ODS cell gets no special positioning: Calc
+    // resolves the absent alignment to its ordinary bottom default and lets the
+    // beginning translate above the row clip, exactly as an explicit bottom
+    // alignment does. Measured against the pinned oracle on a fixed-height row,
+    // the first words of an implicitly aligned cell and of an explicitly
+    // bottom-aligned cell are both pushed off the top, while an explicitly
+    // top-aligned cell keeps its first word at the row top.
+    let top = vertical_block_top(layout_bounds, block_height, style.baseline)?;
 
     let mut commands = Vec::new();
     let mut clusters = Vec::new();
@@ -20829,7 +20823,7 @@ mod tests {
     }
 
     #[test]
-    fn ods_fixed_height_wrapped_text_keeps_implicit_start_and_explicit_alignment_controls() {
+    fn ods_fixed_height_wrapped_text_resolves_implicit_alignment_to_calc_bottom() {
         let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="0.45in"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="0.25in" style:use-optimal-row-height="false"/></style:style><style:style style:name="ce-default" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap"/></style:style><style:style style:name="ce-top" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="top"/></style:style><style:style style:name="ce-middle" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="middle"/></style:style><style:style style:name="ce-bottom" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap" style:vertical-align="bottom"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Clip"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-default" office:value-type="string"><text:p>implicit one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-top" office:value-type="string"><text:p>top one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-middle" office:value-type="string"><text:p>middle one two three four five six seven</text:p></table:table-cell></table:table-row><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce-bottom" office:value-type="string"><text:p>bottom one two three four five six seven</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
         let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
         let workbook = ods_workbook(content, styles);
@@ -20882,14 +20876,26 @@ mod tests {
             span("bottom one two three four five six seven");
         let bottom = |clip: Rect| clip.y.checked_add(clip.height).unwrap();
 
-        assert!(implicit_min >= implicit_clip.y);
-        assert!(implicit_max > bottom(implicit_clip));
+        // Only an explicit top alignment keeps the beginning inside the row.
         assert!(top_min >= top_clip.y);
         assert!(top_max > bottom(top_clip));
         assert!(middle_min < middle_clip.y);
         assert!(middle_max > bottom(middle_clip));
         assert!(bottom_min < bottom_clip.y);
         assert!(bottom_max <= bottom(bottom_clip));
+        // An absent alignment resolves to Calc's bottom default, so it must
+        // translate identically to the explicit bottom cell rather than
+        // behaving like the top one. Verified against the pinned oracle: the
+        // first word of an implicitly aligned fixed-height wrapped cell and of
+        // an explicitly bottom-aligned one are both pushed above the row, while
+        // the explicitly top-aligned cell retains its first word.
+        assert!(implicit_min < implicit_clip.y);
+        assert!(implicit_max <= bottom(implicit_clip));
+        assert_eq!(
+            implicit_min.raw() - implicit_clip.y.raw(),
+            bottom_min.raw() - bottom_clip.y.raw(),
+            "implicit alignment must translate exactly like explicit bottom"
+        );
     }
 
     #[test]
