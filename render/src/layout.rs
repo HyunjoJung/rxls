@@ -5713,7 +5713,7 @@ fn apply_numeric_overflow(
                     scale_ratio(style.size, 13, 20)?
                 }
             };
-            let padding = outlined_horizontal_padding(pack, request, font_size, region, options)?;
+            let padding = outlined_horizontal_padding(pack, request, font_size, region)?;
             let available = inner_width(region.rect.width, padding)?;
             let direction = if sheet_right_to_left {
                 BaseDirection::RightToLeft
@@ -13373,7 +13373,7 @@ fn prepare_styled_text(
     let direction = text_base_direction(&region.text, sheet_right_to_left);
     let primary_size = styled_font_size(&styles[0], 1, 1)?;
     let horizontal_padding =
-        outlined_horizontal_padding(pack, styles[0].request(), primary_size, region, options)?;
+        outlined_horizontal_padding(pack, styles[0].request(), primary_size, region)?;
     let available_width = inner_width(region.rect.width, horizontal_padding)?;
     let calc_wrap_space = match region.line_layout_policy {
         CellLineLayoutPolicy::Native => None,
@@ -13756,9 +13756,14 @@ fn outlined_horizontal_padding(
     request: FontRequest<'_>,
     font_size: Fixed,
     region: &Region,
-    options: &RenderOptions,
 ) -> Result<Fixed, RenderError> {
-    let base = options.horizontal_padding.max(Fixed::ZERO);
+    // `ATTR_MARGIN` is one attribute covering all four cell edges, so Calc
+    // insets text horizontally by the same value it uses vertically: 20 twips
+    // ordinarily and the BIFF importer's 40 for an imported BIFF default. The
+    // backend-neutral `horizontal_padding` option is a coarser 3 px, which
+    // narrows the wrapping width by 2.5 pt against Calc and breaks lines Calc
+    // keeps whole.
+    let base = region.vertical_margin.max(Fixed::ZERO);
     let indent = region
         .style
         .as_ref()
@@ -20820,6 +20825,35 @@ mod tests {
         let build = build_scene(&workbook, 0, &options).unwrap();
         assert_eq!(build.scene.width, Fixed::from_pixels(18));
         assert_eq!(build.scene.height.raw(), 74_140);
+    }
+
+    #[test]
+    fn outlined_cell_text_is_inset_by_calc_attr_margin_not_the_generic_padding() {
+        // `ATTR_MARGIN` is one attribute for all four cell edges, so the
+        // horizontal inset must equal the vertical one. The generic 3 px
+        // `horizontal_padding` is 2.25 pt per side against Calc's 1 pt, which
+        // narrows the wrapping width by 2.5 pt and breaks lines Calc keeps.
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="2in"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Inset"><table:table-column table:style-name="co"/><table:table-row><table:table-cell office:value-type="string"><text:p>inset</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 0, 0)),
+        )
+        .unwrap();
+        let run = glyph_run(&build.scene, "inset");
+        let start = run.cluster_metrics[0].origin_x;
+        assert_eq!(
+            start.raw() - run.clip_bounds.x.raw(),
+            CALC_CELL_VERTICAL_MARGIN.raw(),
+            "a left-aligned outlined cell must start one ATTR_MARGIN in, matching the vertical inset"
+        );
+        assert_ne!(
+            CALC_CELL_VERTICAL_MARGIN.raw(),
+            Fixed::from_pixels(3).raw(),
+            "the Calc margin must not silently equal the generic padding, or this test proves nothing"
+        );
     }
 
     #[test]
