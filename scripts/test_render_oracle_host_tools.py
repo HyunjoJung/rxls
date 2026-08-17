@@ -181,6 +181,11 @@ class RenderOracleHostToolsTests(unittest.TestCase):
 
     def test_lock_rejects_mutable_or_mismatched_ubuntu_acquisition(self) -> None:
         lock, _ = MODULE.load_lock()
+        # The shipped lock is unpinned while the oracle identity is being
+        # re-established, and the bootstrap/identity cross-check only runs
+        # against a pinned lock. Pin one explicitly so the rejection this test
+        # exists to prove is actually exercised.
+        lock["expected_identity"] = fixture_identity(lock)
         requirements = MODULE.REQUIREMENTS.read_bytes()
         mutations = []
         for snapshot in ("latest", "20261340T250000Z"):
@@ -493,31 +498,30 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         # package's exact `libc6 (= version)` dependency. libc6-dev affects
         # neither rendering nor measurement, so it resolves freely while every
         # package that does affect the oracle stays exactly pinned.
-        # Re-bootstrapping against an existing attestation installs the whole
-        # attested closure, so the captured identity is comparable by
-        # construction rather than by exempting drifted libraries one at a time.
-        attested = MODULE.apt_specs(lock, "bootstrap")
-        self.assertEqual(attested, sorted(set(attested)))
-        for spec in (
-            "libcairo2:amd64=1.18.0-3build1",
-            "poppler-utils=24.02.0-1ubuntu9.9",
-            "libssl3t64:amd64=3.0.13-0ubuntu3.11",
-            "libkrb5-3:amd64=1.20.1-6ubuntu2.6",
-        ):
-            self.assertIn(spec, attested)
-        self.assertEqual(set(attested), set(attested) | set(MODULE.apt_specs(lock, "all")))
         # A first bootstrap has nothing attested, so only the snapshot-pinned
-        # top-level tools can be named.
-        unpinned = json.loads(json.dumps(lock))
-        unpinned["expected_identity"] = None
+        # top-level tools can be named. This is the shipped state while the
+        # oracle identity is being re-established.
+        self.assertIsNone(lock["expected_identity"])
         self.assertEqual(
-            MODULE.apt_specs(unpinned, "bootstrap"),
+            MODULE.apt_specs(lock, "bootstrap"),
             [
                 "libc6-dev:amd64",
                 "libcairo2:amd64=1.18.0-3build1",
                 "poppler-utils=24.02.0-1ubuntu9.9",
             ],
         )
+        # Re-bootstrapping against an existing attestation installs the whole
+        # attested closure, so the captured identity is comparable by
+        # construction rather than by exempting drifted libraries one at a time.
+        pinned = json.loads(json.dumps(lock))
+        pinned["expected_identity"] = fixture_identity(lock)
+        attested = MODULE.apt_specs(pinned, "bootstrap")
+        self.assertEqual(attested, sorted(set(attested)))
+        self.assertTrue(set(attested) >= set(MODULE.apt_specs(pinned, "all")))
+        self.assertIn("libcairo2:amd64=1.18.0-3build1", attested)
+        self.assertIn("poppler-utils=24.02.0-1ubuntu9.9", attested)
+        self.assertGreater(len(attested), 3, "the closure must exceed the top-level tools")
+        lock = pinned
         # The provenance version stays recorded in the lock even though the
         # bootstrap install no longer pins it.
         self.assertEqual(
