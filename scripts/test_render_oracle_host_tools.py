@@ -127,7 +127,12 @@ class RenderOracleHostToolsTests(unittest.TestCase):
     def test_checked_in_lock_has_exact_python_and_hashed_full_closure(self) -> None:
         lock, _ = MODULE.load_lock()
         self.assertEqual(lock["schema"], "rxls.render-oracle-host-tools-lock.v2")
-        self.assertEqual(lock["ubuntu_apt"]["snapshot"], "20260718T000000Z")
+        # The snapshot advances when the attested toolchain does, so assert its
+        # shape — an immutable timestamped snapshot — rather than a literal that
+        # has to be edited in lockstep with the lock it is meant to guard.
+        self.assertIsNotNone(
+            MODULE.UBUNTU_SNAPSHOT_RE.fullmatch(lock["ubuntu_apt"]["snapshot"])
+        )
         self.assertEqual(lock["python"]["version"], "3.13.14")
         self.assertEqual(lock["python"]["implementation"], "cpython")
         if lock["expected_identity"] is not None:
@@ -210,16 +215,20 @@ class RenderOracleHostToolsTests(unittest.TestCase):
 
     def test_apt_sources_are_exact_snapshot_only(self) -> None:
         lock, _ = MODULE.load_lock()
+        snapshot = lock["ubuntu_apt"]["snapshot"]
         self.assertEqual(
             MODULE.apt_sources(lock),
-            """Types: deb
-URIs: https://snapshot.ubuntu.com/ubuntu/20260718T000000Z
+            f"""Types: deb
+URIs: https://snapshot.ubuntu.com/ubuntu/{snapshot}
 Suites: noble noble-updates noble-security
 Components: main universe
 Architectures: amd64
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 """,
         )
+        # Whatever the snapshot is, it must be an immutable pinned one.
+        self.assertIsNotNone(MODULE.UBUNTU_SNAPSHOT_RE.fullmatch(snapshot))
+        self.assertNotIn("latest", MODULE.apt_sources(lock))
         self.assertNotIn("archive.ubuntu.com", MODULE.apt_sources(lock))
         self.assertNotIn("security.ubuntu.com", MODULE.apt_sources(lock))
 
