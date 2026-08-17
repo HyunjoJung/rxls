@@ -832,6 +832,59 @@ def scoped_identity(identity: dict[str, Any], scope: str) -> dict[str, Any]:
 IDENTITY_PROVENANCE_ONLY_PACKAGES = frozenset({"libc6:amd64"})
 
 
+def identity_mismatch_report(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> list[str]:
+    """Name the entries that differ, without emitting their digests.
+
+    A bare ``host_identity_mismatch`` cannot be acted on: the operator cannot
+    tell an incidental distribution bump apart from a real change to a tool that
+    decides output.  This reports which section and which named entry moved, and
+    for packaged entries the two package versions, so drift can be classified
+    without exporting file digests into the log.
+    """
+
+    lines: list[str] = []
+    for section in sorted(set(expected) | set(actual)):
+        before, after = expected.get(section), actual.get(section)
+        if before == after:
+            continue
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            lines.append(f"{section}: section present on one side only")
+            continue
+        for field in sorted(set(before) | set(after)):
+            left, right = before.get(field), after.get(field)
+            if left == right:
+                continue
+            if isinstance(left, list) and isinstance(right, list):
+                index = {row.get("name"): row for row in left if isinstance(row, dict)}
+                other = {row.get("name"): row for row in right if isinstance(row, dict)}
+                for name in sorted(set(index) | set(other)):
+                    a, b = index.get(name), other.get(name)
+                    if a == b:
+                        continue
+                    if a is None or b is None:
+                        side = "expected" if b is None else "observed"
+                        lines.append(f"{section}.{field}: {name} only in {side}")
+                        continue
+                    a_version = a.get("package_version") or a.get("provider_version")
+                    b_version = b.get("package_version") or b.get("provider_version")
+                    if a_version != b_version:
+                        lines.append(
+                            f"{section}.{field}: {name} "
+                            f"{a.get('package_name') or a.get('provider')} "
+                            f"{a_version} -> {b_version}"
+                        )
+                    else:
+                        lines.append(
+                            f"{section}.{field}: {name} content changed at "
+                            f"the same package version {a_version}"
+                        )
+            else:
+                lines.append(f"{section}.{field}: differs")
+    return lines
+
+
 def identity_for_comparison(identity: dict[str, Any]) -> dict[str, Any]:
     """Return `identity` with provenance-only native libraries removed."""
 
@@ -1004,6 +1057,10 @@ def verify_host(
     if expected is None and not bootstrap_identities:
         raise HostToolError("host_identity_pin_required")
     if status == "mismatch":
+        for line in identity_mismatch_report(
+            identity_for_comparison(expected), identity_for_comparison(actual)
+        ):
+            print(f"host_identity_mismatch: {line}", file=sys.stderr)
         raise HostToolError("host_identity_mismatch")
     return document
 

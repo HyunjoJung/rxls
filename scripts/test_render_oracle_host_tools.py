@@ -274,6 +274,65 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             pinned = MODULE.pin_from_evidence(lock_path, evidence_path)
             self.assertEqual(pinned["expected_identity"], identity)
 
+    def test_identity_mismatch_names_the_drifted_entry_without_digests(self) -> None:
+        # A bare error code cannot be acted on: it does not distinguish an
+        # incidental distribution bump from a real change to a tool that decides
+        # output. The report must name the entry and both package versions, and
+        # must never echo a file digest into the log.
+        lock, _ = MODULE.load_lock()
+        expected = fixture_identity(lock)
+        actual = json.loads(json.dumps(expected))
+        moved = next(
+            row
+            for row in actual["poppler"]["native_libraries"]
+            if row["package_name"] not in MODULE.IDENTITY_PROVENANCE_ONLY_PACKAGES
+        )
+        original_version = moved["package_version"]
+        moved["package_version"] = "9.9.9-9ubuntu9"
+        moved["sha256"] = digest("drifted")
+        lines = MODULE.identity_mismatch_report(
+            MODULE.identity_for_comparison(expected),
+            MODULE.identity_for_comparison(actual),
+        )
+        self.assertTrue(lines)
+        joined = "\n".join(lines)
+        self.assertIn(moved["name"], joined)
+        self.assertIn(original_version, joined)
+        self.assertIn("9.9.9-9ubuntu9", joined)
+        self.assertNotIn(moved["sha256"], joined)
+        self.assertNotIn(digest("drifted"), joined)
+
+        # A same-version content change is reported distinctly, because that is
+        # the case that must never be waved through as a distribution bump.
+        same = json.loads(json.dumps(expected))
+        target = next(
+            row
+            for row in same["poppler"]["native_libraries"]
+            if row["package_name"] not in MODULE.IDENTITY_PROVENANCE_ONLY_PACKAGES
+        )
+        target["sha256"] = digest("tampered")
+        report = "\n".join(
+            MODULE.identity_mismatch_report(
+                MODULE.identity_for_comparison(expected),
+                MODULE.identity_for_comparison(same),
+            )
+        )
+        self.assertIn("content changed at the same package version", report)
+        self.assertNotIn(digest("tampered"), report)
+
+        # A library excluded from the identity requirement produces no report.
+        exempt = json.loads(json.dumps(expected))
+        for row in exempt["poppler"]["native_libraries"]:
+            if row["package_name"] in MODULE.IDENTITY_PROVENANCE_ONLY_PACKAGES:
+                row["sha256"] = digest("libc-moved")
+        self.assertEqual(
+            MODULE.identity_mismatch_report(
+                MODULE.identity_for_comparison(expected),
+                MODULE.identity_for_comparison(exempt),
+            ),
+            [],
+        )
+
     def test_pinned_mismatch_fails_even_in_bootstrap_mode_and_uploads_actual(self) -> None:
         lock, _ = MODULE.load_lock()
         identity = fixture_identity(lock)
