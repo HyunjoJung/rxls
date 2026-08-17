@@ -333,6 +333,67 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             [],
         )
 
+    def test_provenance_exemption_covers_the_provider_spelling(self) -> None:
+        # Packaged rows name their source in `package_name`; the Python section
+        # uses `provider`. Honouring only one spelling leaves the C runtime
+        # compared under the other, which is exactly how a glibc security bump
+        # kept failing the hosted bootstrap after the exemption was added.
+        exempt = sorted(MODULE.IDENTITY_PROVENANCE_ONLY_PACKAGES)[0]
+
+        def section(version: str, sha: str) -> dict:
+            return {
+                "packaged": {
+                    "native_libraries": [
+                        {
+                            "bytes": 1,
+                            "name": "libc.so.6",
+                            "package_name": exempt,
+                            "package_version": version,
+                            "sha256": sha,
+                        },
+                        {
+                            "bytes": 2,
+                            "name": "libfreetype.so.6",
+                            "package_name": "libfreetype6:amd64",
+                            "package_version": "2.13.2-1",
+                            "sha256": digest("freetype"),
+                        },
+                    ]
+                },
+                "provided": {
+                    "native_libraries": [
+                        {
+                            "bytes": 3,
+                            "name": "libm.so.6",
+                            "provider": exempt,
+                            "provider_version": version,
+                            "sha256": sha,
+                        }
+                    ]
+                },
+            }
+
+        before = section("2.39-0ubuntu8.7", digest("glibc-8.7"))
+        after = section("2.39-0ubuntu8.8", digest("glibc-8.8"))
+        self.assertEqual(
+            MODULE.identity_mismatch_report(
+                MODULE.identity_for_comparison(before),
+                MODULE.identity_for_comparison(after),
+            ),
+            [],
+            "the C runtime must be exempt under both spellings",
+        )
+
+        # A library that is not exempt still fails closed under either spelling.
+        moved = json.loads(json.dumps(after))
+        moved["packaged"]["native_libraries"][1]["package_version"] = "2.13.3-1"
+        self.assertTrue(
+            MODULE.identity_mismatch_report(
+                MODULE.identity_for_comparison(before),
+                MODULE.identity_for_comparison(moved),
+            )
+        )
+
     def test_pinned_mismatch_fails_even_in_bootstrap_mode_and_uploads_actual(self) -> None:
         lock, _ = MODULE.load_lock()
         identity = fixture_identity(lock)

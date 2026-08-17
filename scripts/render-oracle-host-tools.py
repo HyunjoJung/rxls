@@ -893,13 +893,19 @@ def identity_for_comparison(identity: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict) or "native_libraries" not in value:
             pruned[section] = value
             continue
+        # Packaged entries name their source package in `package_name`, while
+        # the Python section records it in `provider`, so both spellings are
+        # honoured — otherwise the C runtime stays compared under one schema
+        # after being exempted under the other.
         libraries = [
             row
             for row in value["native_libraries"]
-            if row.get("package_name") not in IDENTITY_PROVENANCE_ONLY_PACKAGES
+            if (row.get("package_name") or row.get("provider"))
+            not in IDENTITY_PROVENANCE_ONLY_PACKAGES
         ]
-        if not libraries:
-            raise HostToolError("identity_native_libraries")
+        # A section may consist only of exempt libraries.  That leaves nothing
+        # to compare here while every other field in the section — executable,
+        # version, distributions — is still compared, so it is not an error.
         pruned[section] = {**value, "native_libraries": libraries}
     return pruned
 
