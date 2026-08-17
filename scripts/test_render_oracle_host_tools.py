@@ -395,13 +395,29 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         self.assertEqual(
             MODULE.BOOTSTRAP_UNPINNED_PACKAGES, frozenset({"libc6-dev:amd64"})
         )
-        self.assertIn(
-            "libc6-dev:amd64=2.39-0ubuntu8.7",
-            MODULE.apt_specs(lock, "poppler"),
+        # The libc6 family is requested by name only: libc6-dev and
+        # libc-dev-bin each depend on an exact libc6 version, so pinning any of
+        # them downgrades the runner's C runtime, and none of the three is part
+        # of the identity requirement.
+        poppler_specs = MODULE.apt_specs(lock, "poppler")
+        for package in sorted(MODULE.LIBC_FAMILY_UNPINNED_PACKAGES):
+            self.assertIn(package, poppler_specs)
+        self.assertFalse(
+            [
+                spec
+                for spec in poppler_specs
+                if spec.split("=", 1)[0] in MODULE.LIBC_FAMILY_UNPINNED_PACKAGES
+                and "=" in spec
+            ],
+            "no libc family package may carry a version pin",
         )
-        self.assertIn(
-            "libc-dev-bin=2.39-0ubuntu8.7",
-            MODULE.apt_specs(lock, "poppler"),
+        # Everything else keeps an exact pin.
+        self.assertTrue(
+            all(
+                "=" in spec
+                for spec in poppler_specs
+                if spec not in MODULE.LIBC_FAMILY_UNPINNED_PACKAGES
+            )
         )
         self.assertNotIn(
             "libcairo2:amd64=1.18.0-3build1",
@@ -417,12 +433,15 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         self.assertEqual(specs, sorted(specs))
         self.assertIn("fixture-package=1.2.3-1ubuntu1", specs)
         self.assertIn("poppler-utils=24.02.0-1ubuntu9.9", specs)
-        self.assertTrue(
-            all(
-                MODULE.DEBIAN_VERSION_RE.fullmatch(row.split("=", 1)[1])
-                for row in specs
-            )
-        )
+        # Every spec is either an exactly pinned `name=version` or one of the
+        # C runtime family requested by bare name.
+        for row in specs:
+            if row in MODULE.LIBC_FAMILY_UNPINNED_PACKAGES:
+                continue
+            name, separator, version = row.partition("=")
+            self.assertEqual(separator, "=", row)
+            self.assertIsNotNone(MODULE.DEBIAN_PACKAGE_RE.fullmatch(name), row)
+            self.assertIsNotNone(MODULE.DEBIAN_VERSION_RE.fullmatch(version), row)
 
     def test_apt_specs_reject_conflicting_or_shell_like_package_values(self) -> None:
         lock, _ = MODULE.load_lock()

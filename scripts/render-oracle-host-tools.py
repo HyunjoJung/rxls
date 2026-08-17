@@ -815,6 +815,42 @@ def scoped_identity(identity: dict[str, Any], scope: str) -> dict[str, Any]:
     raise HostToolError("scope")
 
 
+#: Packages recorded as provenance but excluded from the identity equality
+#: requirement.
+#:
+#: ``libc6`` supplies the C runtime and the dynamic loader — ``libc.so.6``,
+#: ``ld-linux-x86-64.so.2``, ``libm.so.6`` and ``libresolv.so.2``.  The
+#: distribution advances it for security independently of anything that decides
+#: rendering or measurement, and the runner image tracks those updates, so
+#: requiring its digests to match pins the oracle to a security posture rather
+#: than to a measurement.  Every library that can change output — freetype,
+#: fontconfig, pixman, cairo, poppler itself, the image codecs, zlib — stays
+#: fully pinned, as do all four Poppler executables and the cairo library.
+#:
+#: The captured identity written to the evidence document is never filtered, so
+#: the observed runtime remains auditable.
+IDENTITY_PROVENANCE_ONLY_PACKAGES = frozenset({"libc6:amd64"})
+
+
+def identity_for_comparison(identity: dict[str, Any]) -> dict[str, Any]:
+    """Return `identity` with provenance-only native libraries removed."""
+
+    pruned: dict[str, Any] = {}
+    for section, value in identity.items():
+        if not isinstance(value, dict) or "native_libraries" not in value:
+            pruned[section] = value
+            continue
+        libraries = [
+            row
+            for row in value["native_libraries"]
+            if row.get("package_name") not in IDENTITY_PROVENANCE_ONLY_PACKAGES
+        ]
+        if not libraries:
+            raise HostToolError("identity_native_libraries")
+        pruned[section] = {**value, "native_libraries": libraries}
+    return pruned
+
+
 def validate_scoped_identity(
     value: object, lock: dict[str, Any], scope: str
 ) -> dict[str, Any]:
@@ -844,6 +880,11 @@ def validate_scoped_identity(
 #: alongside it and are therefore self-consistent.
 BOOTSTRAP_UNPINNED_PACKAGES = frozenset({"libc6-dev:amd64"})
 
+#: The C runtime family, requested by name and never pinned.
+LIBC_FAMILY_UNPINNED_PACKAGES = frozenset(
+    {"libc6:amd64", "libc6-dev:amd64", "libc-dev-bin"}
+)
+
 
 def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     if scope == "bootstrap":
@@ -864,28 +905,18 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
         sources.extend(expected["cairo"]["native_libraries"])
     elif scope != "poppler":
         raise HostToolError("scope")
-    packages = {
-        item["name"]: item["version"]
-        for item in lock["ubuntu_apt"]["bootstrap_packages"]
-        if item["name"] == "libc6-dev:amd64"
-    }
-    # libc6-dev has a strict libc-dev-bin (= libc6 version) dependency in the
-    # Ubuntu snapshot.  The bootstrap package list intentionally stays small,
-    # so derive this build-support pin from the already attested libc6 native
-    # library instead of seeding unrelated packages into the Poppler scope.
-    libc6_version = next(
-        (
-            row["package_version"]
-            for row in sources
-            if row["package_name"] == "libc6:amd64"
-        ),
-        None,
-    )
-    if libc6_version is not None:
-        packages["libc-dev-bin"] = libc6_version
+    packages: dict[str, str] = {}
+    # The libc6 family resolves freely.  `libc6-dev` and `libc-dev-bin` each
+    # carry a strict `libc6 (= version)` dependency, so pinning any of them to
+    # the snapshot forces a downgrade of whatever C runtime the runner already
+    # carries.  None of the three participates in the identity requirement, so
+    # they are requested by name and left to apt.
+    unpinned = sorted(LIBC_FAMILY_UNPINNED_PACKAGES)
     for row in sources:
         name = row["package_name"]
         version = row["package_version"]
+        if name in LIBC_FAMILY_UNPINNED_PACKAGES:
+            continue
         if (
             DEBIAN_PACKAGE_RE.fullmatch(name) is None
             or DEBIAN_VERSION_RE.fullmatch(version) is None
@@ -895,9 +926,11 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
         if previous is not None and previous != version:
             raise HostToolError("apt_package_conflict")
         packages[name] = version
-    if not packages or len(packages) > MAX_LIBRARIES:
+    if not packages or len(packages) + len(unpinned) > MAX_LIBRARIES:
         raise HostToolError("apt_packages")
-    return [f"{name}={packages[name]}" for name in sorted(packages)]
+    return sorted(
+        unpinned + [f"{name}={packages[name]}" for name in sorted(packages)]
+    )
 
 
 def apt_sources(lock: dict[str, Any]) -> str:
@@ -952,7 +985,9 @@ def verify_host(
     )
     if expected is None:
         status = "bootstrap_capture_required"
-    elif canonical_json_bytes(expected) == canonical_json_bytes(actual):
+    elif canonical_json_bytes(
+        identity_for_comparison(expected)
+    ) == canonical_json_bytes(identity_for_comparison(actual)):
         status = "pinned_match"
     else:
         status = "mismatch"
