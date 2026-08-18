@@ -984,20 +984,6 @@ jobs:
           for name in ("build.json", "host-tools.json"):
               shutil.copyfile(root / name, upload_root / name)
           PY
-      - name: Emit the reviewable pinned oracle image lock
-        if: ${{ env.RXLS_IDENTITY_BOOTSTRAP == '1' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/run-render-oracle-container.py pin-image \
-            --build-evidence target/render-oracle-hosted/build.json \
-            --github-run-id "$GITHUB_RUN_ID" \
-            --github-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --github-job-id "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" --jq '.jobs[0].id')" \
-            --github-artifact-id "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[0].id')" \
-            --output-lock target/render-oracle-upload/lock.pinned.json
       - name: Verify and minimize aggregate-only hosted evidence
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' && env.RXLS_ORACLE_CAMPAIGN != 'ooxml-row-diagnostic' }}
         env:
