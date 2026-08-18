@@ -507,12 +507,14 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
         # package's exact `libc6 (= version)` dependency. libc6-dev affects
         # neither rendering nor measurement, so it resolves freely while every
         # package that does affect the oracle stays exactly pinned.
+        # The shipped lock carries the reviewed oracle identity.
+        self.assertIsNotNone(lock["expected_identity"])
         # A first bootstrap has nothing attested, so only the snapshot-pinned
-        # top-level tools can be named. This is the shipped state while the
-        # oracle identity is being re-established.
-        self.assertIsNone(lock["expected_identity"])
+        # top-level tools can be named.
+        unpinned = json.loads(json.dumps(lock))
+        unpinned["expected_identity"] = None
         self.assertEqual(
-            MODULE.apt_specs(lock, "bootstrap"),
+            MODULE.apt_specs(unpinned, "bootstrap"),
             [
                 "libc6-dev:amd64",
                 "libcairo2:amd64=1.18.0-3build1",
