@@ -1,0 +1,79 @@
+name: Render Oracle Pin
+
+# Emit the reviewable pinned oracle image lock from a completed hosted
+# bootstrap run.
+#
+# This cannot live inside the bootstrap workflow itself. `pin-image`
+# authenticates the run, job, and uploaded artifact through the GitHub API, and
+# the artifact only exists once the bootstrap run has finished uploading it, so
+# a step inside that same run would be asked to verify something that does not
+# exist yet.
+#
+# The emitted lock is an artifact for review, never a commit: adopting it stays
+# a maintainer action after two same-SHA observations agree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_run_id:
+        description: Run id of the completed identity-bootstrap Render Oracle run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: render-oracle-pin-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  emit-pinned-lock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact reviewed revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve and authenticate the bootstrap receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_RUN_ID: ${{ inputs.bootstrap_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BOOTSTRAP_RUN_ID" in
+            ''|*[!0-9]*) echo "bootstrap run id must be numeric" >&2; exit 2 ;;
+          esac
+          RUN_JSON="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BOOTSTRAP_RUN_ID")"
+          RUN_ATTEMPT="$(printf '%s' "$RUN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_attempt"])')"
+          SOURCE_SHA="$(printf '%s' "$RUN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["head_sha"])')"
+          # The lock is only meaningful for the revision it was observed at.
+          test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          JOB_ID="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BOOTSTRAP_RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '.jobs[0].id')"
+          ARTIFACT_ID="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BOOTSTRAP_RUN_ID/artifacts" \
+            --jq '.artifacts[0].id')"
+          mkdir -p target/render-oracle-pin
+          gh run download "$BOOTSTRAP_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --dir target/render-oracle-pin/evidence
+          BUILD_EVIDENCE="$(find target/render-oracle-pin/evidence -name build.json -type f | head -1)"
+          test -n "$BUILD_EVIDENCE"
+          python3 scripts/run-render-oracle-container.py pin-image \
+            --build-evidence "$BUILD_EVIDENCE" \
+            --github-run-id "$BOOTSTRAP_RUN_ID" \
+            --github-run-attempt "$RUN_ATTEMPT" \
+            --github-job-id "$JOB_ID" \
+            --github-artifact-id "$ARTIFACT_ID" \
+            --output-lock target/render-oracle-pin/lock.pinned.json
+      - name: Upload the reviewable pinned lock only
+        if: ${{ success() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-oracle-pinned-lock-${{ inputs.bootstrap_run_id }}-${{ github.run_id }}
+          path: target/render-oracle-pin/lock.pinned.json
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 30
