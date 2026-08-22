@@ -1,0 +1,427 @@
+name: render-hardening
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/render-hardening.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "render/**"
+      - "scripts/check_workflow_policy.py"
+      - "scripts/fetch-render-fonts.py"
+      - "scripts/render-fonts-lock.json"
+      - "scripts/render-oracle-host-requirements.txt"
+      - "scripts/render-oracle-host-tools-lock.json"
+      - "scripts/render-oracle-host-tools.py"
+      - "scripts/render-oracle-container/**"
+      - "scripts/render-performance-gates.py"
+      - "scripts/run-render-oracle-container.py"
+      - "scripts/test_render_oracle_container.py"
+      - "scripts/test_render_oracle_host_tools.py"
+      - "scripts/test_render_fuzz_assets.py"
+      - "scripts/test_render_performance_gates.py"
+      - "scripts/test_workflow_policy.py"
+      - "src/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  RENDER_MSRV: "1.85.0"
+  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
+  CARGO_FUZZ_VERSION: "0.13.2"
+
+jobs:
+  pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RXLS_REQUIRE_POPPLER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.14"
+      - name: Enforce hosted workflow policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
+      - name: Capture an unpinned host identity and fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_IDENTITY="$(
+            python3 -c 'import json; print(json.dumps(json.load(open("scripts/render-oracle-host-tools-lock.json"))["expected_identity"], separators=(",", ":")))'
+          )"
+          if [[ "$EXPECTED_IDENTITY" != "null" ]]; then
+            exit 0
+          fi
+          APT_ROOT="$PWD/target/render-oracle-apt"
+          mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          python3 scripts/render-oracle-host-tools.py apt-sources \
+            > "$APT_ROOT/ubuntu.sources"
+          APT_OPTIONS=(
+            -o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=-"
+            -o "Dir::State::lists=$APT_ROOT/lists"
+            -o "Dir::Cache::archives=$APT_ROOT/cache/archives"
+            -o "Acquire::Retries=3"
+          )
+          SYSTEM_PACKAGE_TEXT="$(
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope bootstrap
+          )"
+          mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+          [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install \
+            --yes \
+            --no-install-recommends \
+            --allow-downgrades \
+            "${SYSTEM_PACKAGES[@]}"
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --force-reinstall \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement scripts/render-oracle-host-requirements.txt
+          mkdir -p target
+          python3 scripts/render-oracle-host-tools.py verify \
+            --scope all \
+            --bootstrap-identities \
+            --output target/poppler-identity.json
+          echo "Review and pin the uploaded host identity before this gate can pass." >&2
+          exit 1
+      - name: Verify the pinned Poppler PDF gate and complete native closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          APT_ROOT="$PWD/target/render-oracle-apt"
+          mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          python3 scripts/render-oracle-host-tools.py apt-sources \
+            > "$APT_ROOT/ubuntu.sources"
+          APT_OPTIONS=(
+            -o "Dir::Etc::sourcelist=$APT_ROOT/ubuntu.sources"
+            -o "Dir::Etc::sourceparts=-"
+            -o "Dir::State::lists=$APT_ROOT/lists"
+            -o "Dir::Cache::archives=$APT_ROOT/cache/archives"
+            -o "Acquire::Retries=3"
+          )
+          python3 scripts/test_render_oracle_host_tools.py
+          SYSTEM_PACKAGE_TEXT="$(
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler
+          )"
+          mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
+          [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install \
+            --yes \
+            --no-install-recommends \
+            --allow-downgrades \
+            "${SYSTEM_PACKAGES[@]}"
+          python3 scripts/render-oracle-host-tools.py verify \
+            --scope poppler \
+            --output target/poppler-identity.json
+      - name: Reopen deterministic PDFs and extract Latin, Korean, and RTL text
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --lib pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \
+            -- --exact --list \
+            | grep -Fqx 'pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint: test'
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --lib pdf::tests::clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint \
+            -- --exact
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact --list \
+            | grep -Fqx 'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'
+          cargo test --locked --manifest-path render/Cargo.toml \
+            --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
+            -- --exact
+      - name: Upload verified Poppler identity
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-pdf-poppler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/poppler-identity.json
+          if-no-files-found: error
+          retention-days: 14
+
+  oracle-image:
+    name: locked LibreOffice oracle image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up the pinned Buildx client
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          name: rxls-oracle-client
+          version: v0.35.0
+          driver: docker-container
+          platforms: linux/amd64
+          driver-opts: |
+            image=docker.io/moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+            provenance-add-gha=false
+          buildkitd-flags: --oci-worker-snapshotter=native
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Build and verify the locked oracle image
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          LIVE_WRAPPER_SHA256="$(sha256sum scripts/run-render-oracle-container.py | awk '{print $1}')"
+          LOCK_WRAPPER_SHA256="$(
+            python3 -c 'import json; print(json.load(open("scripts/render-oracle-container/lock.json"))["wrapper"]["sha256"])'
+          )"
+          test "$LIVE_WRAPPER_SHA256" = "$LOCK_WRAPPER_SHA256"
+          mkdir -p target
+          EXPECTED_IMAGE_ID="$(
+            python3 -c 'import json; print(json.dumps(json.load(open("scripts/render-oracle-container/lock.json"))["built_image"]["expected_id"], separators=(",", ":")))'
+          )"
+          BOOTSTRAP_ARGS=()
+          if [[ "$EXPECTED_IMAGE_ID" == "null" ]]; then
+            BOOTSTRAP_ARGS+=(--bootstrap-identities)
+          fi
+          python3 scripts/run-render-oracle-container.py verify-lock \
+            "${BOOTSTRAP_ARGS[@]}"
+          build_oracle_image() {
+            python3 scripts/run-render-oracle-container.py build \
+              --engine docker \
+              --image rxls-render-oracle:lo-26.2.3 \
+              --execute \
+              "${BOOTSTRAP_ARGS[@]}" \
+              > target/render-oracle-image-build.json
+          }
+          retryable_oracle_download_failure() {
+            local build_log="$1"
+            grep --fixed-strings --quiet \
+              'https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz' \
+              "$build_log" &&
+              {
+                grep --extended-regexp --quiet \
+                  'curl: \((5|6|7|18|28|35|52|55|56|92)\)' \
+                  "$build_log" ||
+                  grep --extended-regexp --quiet \
+                    'curl: \(22\) The requested URL returned error: (408|429|500|502|503|504)([^0-9]|$)' \
+                    "$build_log"
+              }
+          }
+          build_status=1
+          for build_attempt in 1 2 3; do
+            build_log=target/render-oracle-image-build.stderr
+            rm -f target/render-oracle-image-build.json "$build_log"
+            if build_oracle_image 2> "$build_log"; then
+              cat "$build_log" >&2
+              build_status=0
+              break
+            else
+              build_status=$?
+              cat "$build_log" >&2
+            fi
+            if ! retryable_oracle_download_failure "$build_log"; then
+              exit "$build_status"
+            fi
+            if [[ "$build_attempt" -lt 3 ]]; then
+              retry_delay_seconds=$((build_attempt * 5))
+              printf \
+                'Locked oracle image build attempt %s/3 failed; retrying after %s seconds.\n' \
+                "$build_attempt" "$retry_delay_seconds" >&2
+              sleep "$retry_delay_seconds"
+            fi
+          done
+          rm -f "$build_log"
+          if [[ "$build_status" -ne 0 ]]; then
+            exit "$build_status"
+          fi
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          lock = json.loads(pathlib.Path("scripts/render-oracle-container/lock.json").read_text())
+          evidence = json.loads(pathlib.Path("target/render-oracle-image-build.json").read_text())
+          expected_source = os.environ["EXPECTED_SOURCE_SHA"]
+          live_wrapper_sha256 = hashlib.sha256(
+              pathlib.Path("scripts/run-render-oracle-container.py").read_bytes()
+          ).hexdigest()
+          expected = lock["built_image"]["expected_id"]
+          expected_manifest = lock["built_image"]["expected_manifest_digest"]
+          reproducibility = evidence["reproducibility"]
+          assert evidence["schema"] == "rxls.render-oracle-container-build.v3", evidence
+          assert evidence["source_commit"] == expected_source, evidence
+          assert evidence["wrapper_sha256"] == live_wrapper_sha256 == lock["wrapper"]["sha256"], evidence
+          assert reproducibility["status"] == "matched", reproducibility
+          assert reproducibility["build_count"] == 2, reproducibility
+          assert reproducibility["export_destination"] == "stdout", reproducibility
+          assert reproducibility["export_tar"] is True, reproducibility
+          assert reproducibility["export_media_type"] == "application/vnd.docker.distribution.manifest.v2+json", reproducibility
+          assert len(reproducibility["identities"]) == 2, reproducibility
+          assert reproducibility["identities"][0] == reproducibility["identities"][1], reproducibility
+          assert reproducibility["config_ids"] == [evidence["built_image_id"]] * 2, reproducibility
+          assert len(reproducibility["identity_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["identity_sha256"])) == 1, reproducibility
+          assert reproducibility["manifest_digests"] == [evidence["built_manifest_digest"]] * 2, reproducibility
+          assert reproducibility["descriptor_digests"] == reproducibility["manifest_digests"], reproducibility
+          assert len(reproducibility["descriptor_media_types"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_media_types"])) == 1, reproducibility
+          assert len(reproducibility["descriptor_sizes"]) == 2, reproducibility
+          assert len(set(reproducibility["descriptor_sizes"])) == 1, reproducibility
+          assert len(reproducibility["rootfs_diff_ids_sha256"]) == 2, reproducibility
+          assert len(set(reproducibility["rootfs_diff_ids_sha256"])) == 1, reproducibility
+          assert evidence["built_manifest_digest"] == reproducibility["manifest_digests"][0], evidence
+          if expected is None:
+              assert expected_manifest is None, lock
+              assert evidence["image_identity_status"] == "bootstrap_capture_required", evidence
+              assert evidence["expected_image_id"] is None, evidence
+              assert evidence["expected_manifest_digest"] is None, evidence
+              print("Review and pin the uploaded oracle image identity before this gate can pass.", file=sys.stderr)
+              raise SystemExit(1)
+          assert evidence["image_identity_status"] == "pinned_match", evidence
+          assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence
+          assert evidence["expected_manifest_digest"] == expected_manifest == evidence["built_manifest_digest"], evidence
+          PY
+      - name: Upload oracle image identity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-oracle-image-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-oracle-image-build.json
+          if-no-files-found: error
+          retention-days: 14
+
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Test the performance gate
+        run: |
+          python3 -m unittest \
+            scripts/test_render_fuzz_assets.py \
+            scripts/test_fetch_render_fonts.py \
+            scripts/test_render_performance_gates.py
+      - name: Acquire and verify the pinned OFL performance font pack
+        run: |
+          python3 scripts/fetch-render-fonts.py --acquire
+          python3 scripts/fetch-render-fonts.py --verify
+      - name: Test the generated workload driver at MSRV
+        run: cargo test --locked --manifest-path render/perf/Cargo.toml
+      - name: Build the generated workload driver
+        run: cargo build --locked --release --manifest-path render/perf/Cargo.toml
+      - name: Enforce renderer wall, RSS, page, command, and output caps
+        run: |
+          python3 scripts/render-performance-gates.py \
+            --driver render/perf/target/release/rxls-render-perf \
+            --font-pack-manifest local/render-fonts/pack/manifest.json \
+            --repeat 2 \
+            --output target/render-performance-evidence.json
+      - name: Upload renderer performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/render-performance-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '10' || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY_VERSION }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Build renderer fuzz targets
+        working-directory: render
+        run: cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build
+      - name: Replay deterministic renderer seeds
+        working-directory: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../target/render-fuzz
+          for target in snapshot_construction pagination svg_emission chart_range_resolution image_headers backend_command_replay; do
+            for seed in "fuzz/seeds/$target"/*; do
+              cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run "$target" "$seed" -- \
+                -runs=1 -seed=1 -timeout=10 -rss_limit_mb=2048 \
+                2>&1 | tee -a ../target/render-fuzz/replay.log
+            done
+          done
+      - name: Run bounded renderer fuzz campaigns
+        working-directory: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../target/render-fuzz/corpus
+          for target in snapshot_construction pagination svg_emission chart_range_resolution image_headers backend_command_replay; do
+            cp -R "fuzz/seeds/$target" "../target/render-fuzz/corpus/$target"
+            cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run "$target" "../target/render-fuzz/corpus/$target" -- \
+              -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 \
+              2>&1 | tee "../target/render-fuzz/$target.log"
+          done
+      - name: Upload renderer fuzz diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/render-fuzz/*.log
+            render/fuzz/artifacts/**
+          if-no-files-found: warn
+          retention-days: 14

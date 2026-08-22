@@ -1,0 +1,96 @@
+{
+  "license": "generated-test-inputs",
+  "schema": "rxls.render-fuzz-seeds.v1",
+  "targets": [
+    {
+      "seeds": [
+        {
+          "bytes": 37,
+          "name": "basic-grid",
+          "sha256": "6c0557b088df03ad8ae2054c414deb0b695dccb7ea8a21fb3ca415bd5074056a"
+        },
+        {
+          "bytes": 37,
+          "name": "hostile-xml",
+          "sha256": "27bb312424f68bc337871f61cc88524e70a231cd3dccef3874975ebc75181355"
+        }
+      ],
+      "target": "snapshot_construction"
+    },
+    {
+      "seeds": [
+        {
+          "bytes": 48,
+          "name": "fit-repeat",
+          "sha256": "a5e91eef471f90d6c240fbe6712113d35d8f806b95c97b1bc17fc0a474da9b88"
+        },
+        {
+          "bytes": 45,
+          "name": "invalid-geometry",
+          "sha256": "3eb6a82065c4f266b362ce73b0e02eeee87b4e99343fbf2b87adc3c7dabfbf78"
+        }
+      ],
+      "target": "pagination"
+    },
+    {
+      "seeds": [
+        {
+          "bytes": 34,
+          "name": "escaped-text",
+          "sha256": "1637647407013372c279f62c6e3be275d1cfc1d60eddbd3e3085085750fe9fe5"
+        },
+        {
+          "bytes": 45,
+          "name": "extreme-fixed",
+          "sha256": "34463f8dbea79ecffbb305cdfae3e7f038db89f0a65fbd0b7095ffab2eb7035f"
+        }
+      ],
+      "target": "svg_emission"
+    },
+    {
+      "seeds": [
+        {
+          "bytes": 48,
+          "name": "full-grid",
+          "sha256": "7dfe3cb16142ae8d71dd0397fb139e10ba764e55371ce4e4b514ee709ec964ea"
+        },
+        {
+          "bytes": 56,
+          "name": "malformed-a1",
+          "sha256": "c7fcf05d11bd95cefc75b9beac971e98392f72c4837661ee5852619d7f40aeb7"
+        }
+      ],
+      "target": "chart_range_resolution"
+    },
+    {
+      "seeds": [
+        {
+          "bytes": 34,
+          "name": "jpeg-bomb",
+          "sha256": "5ce260ee76586952b20a547d2a9f5d028e7eca27dc3d30a8a443bea6074dab6d"
+        },
+        {
+          "bytes": 38,
+          "name": "png-bomb",
+          "sha256": "544bee488f5c96df4a1163df9360ef73b96e61b830d2da8bb4dd20a4d3d84a9d"
+        }
+      ],
+      "target": "image_headers"
+    },
+    {
+      "seeds": [
+        {
+          "bytes": 46,
+          "name": "output-limits",
+          "sha256": "40582e9f2011e657aa55972630a31e4304d472e854c27aad068541fd8948d976"
+        },
+        {
+          "bytes": 38,
+          "name": "path-state",
+          "sha256": "ea3e2b9d12d5599a6f3d91fa6709bf5f57ddcdb68a53beef8e61fb9c90225f15"
+        }
+      ],
+      "target": "backend_command_replay"
+    }
+  ]
+}

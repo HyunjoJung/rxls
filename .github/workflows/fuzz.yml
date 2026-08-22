@@ -1,0 +1,137 @@
+name: fuzz
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Run the ordinary fuzz campaign or the branch-local Render Oracle workflow
+        required: true
+        default: fuzz
+        type: choice
+        options:
+          - fuzz
+          - render-oracle
+      campaign:
+        description: Render Oracle campaign (ignored for ordinary fuzz runs)
+        required: true
+        default: pilot
+        type: choice
+        options:
+          - pilot
+          - full
+          - ooxml-row-diagnostic
+      baseline_mode:
+        description: Verify a tracked baseline or bootstrap a hosted full candidate
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - candidate
+      bootstrap_identities:
+        description: Capture initially-null Render Oracle identities without parity
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
+  CARGO_FUZZ_VERSION: "0.13.2"
+
+jobs:
+  fuzz:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'fuzz' }}
+    runs-on: ubuntu-latest
+    env:
+      # PRs receive a bounded smoke gate; scheduled/manual runs retain the
+      # longer pre-existing campaign duration.
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '20' || '120' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY_VERSION }}
+      - name: Enforce hosted workflow policy
+        run: python3 scripts/check_workflow_policy.py
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Materialize deterministic fuzz seeds
+        run: |
+          python3 scripts/fuzz_seeds.py materialize \
+            --corpus-root target/fuzz-seeds \
+            --report target/fuzz-seed-manifest.json
+      - name: Build fuzz targets
+        id: build
+        shell: bash
+        run: |
+          mkdir -p target
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build 2>&1 | tee target/fuzz-build.log
+      - name: Replay deterministic fuzz seeds
+        id: replay
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          python3 scripts/fuzz_seeds.py replay \
+            --corpus-root target/fuzz-seeds \
+            --toolchain "$FUZZ_NIGHTLY_VERSION" \
+            --cargo-fuzz-version "$CARGO_FUZZ_VERSION" \
+            --report target/fuzz-seed-replay.json
+      - name: Fuzz the reader
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run parse target/fuzz-seeds/parse -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-parse.log
+      - name: Fuzz the authoring path
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run author target/fuzz-seeds/author -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-author.log
+      - name: Fuzz package-preserving edits
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run edit target/fuzz-seeds/edit -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-edit.log
+      - name: Fuzz formula decompilation and evaluation
+        if: ${{ always() && steps.replay.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run formula target/fuzz-seeds/formula -- -seed=1 -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 2>&1 | tee target/fuzz-formula.log
+      - name: Upload fuzz diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/fuzz-*.log
+            target/fuzz-*.json
+            fuzz/artifacts/**
+          if-no-files-found: warn
+          retention-days: 14
+
+  render-oracle:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'render-oracle' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/render-oracle.yml
+    with:
+      baseline_mode: ${{ inputs.baseline_mode }}
+      bootstrap_identities: ${{ inputs.bootstrap_identities }}
+      campaign: ${{ inputs.campaign }}
+      source_sha: ${{ github.sha }}

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rxls-wasm demo</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; }
+      pre { background: #f4f4f4; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>rxls-wasm diagnostic report</h1>
+    <label>Spreadsheet <input id="file" type="file" accept=".xls,.xlsx,.xlsm,.xlsb,.ods" /></label>
+    <p id="status">Choose a spreadsheet to inspect locally.</p>
+    <p id="actions">
+      <button id="show-report" type="button" disabled>Report</button>
+      <button id="show-text" type="button" disabled>Text</button>
+      <button id="show-csv" type="button" disabled>CSV</button>
+      <button id="show-html" type="button" disabled>HTML</button>
+    </p>
+    <pre id="output" aria-live="polite"></pre>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,991 @@
+name: Render package release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "render-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-package-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  verify:
+    name: Verify immutable npm artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Audit nested Rust advisories, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.85.0"
+          command: check
+          manifest-path: bindings/render-wasm/Cargo.toml
+          arguments: --config deny.toml --locked --all-features
+      - name: Validate event and package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          version=$(node -p 'require("./bindings/render-wasm/package.json").version')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "render-v$version"
+            git fetch origin main --no-tags
+            test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          else
+            echo "workflow_dispatch is verification-only; npm publish will not run"
+          fi
+      - name: Require exact-SHA hosted gates and reviewed full oracle evidence
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_successful_run() {
+            local workflow="$1"
+            local expected_path="$2"
+            local expected_event="$3"
+            local label="$4"
+            local selected=""
+            local selected_attempt=""
+            local run_id
+            local record
+            local head_sha
+            local event
+            local conclusion
+            local status
+            local run_path
+            local run_attempt
+            mapfile -t run_ids < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$workflow" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            for run_id in "${run_ids[@]}"; do
+              record=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+                --jq '[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv')
+              IFS=$'\t' read -r head_sha event conclusion status run_path run_attempt <<< "$record"
+              [[ "$head_sha" == "$GITHUB_SHA" \
+                && "$event" == "$expected_event" \
+                && "$conclusion" == "success" \
+                && "$status" == "completed" \
+                && "$run_path" == "$expected_path" \
+                && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || continue
+              selected="$run_id"
+              selected_attempt="$run_attempt"
+              break
+            done
+            test -n "$selected" || {
+              echo "$label has no successful $expected_event run for exact SHA $GITHUB_SHA" >&2
+              return 1
+            }
+            SELECTED_RUN_ID="$selected"
+            SELECTED_RUN_ATTEMPT="$selected_attempt"
+            echo "$label exact-SHA gate passed in run $selected"
+          }
+
+          SELECTED_RUN_ID=""
+          SELECTED_RUN_ATTEMPT=""
+          require_successful_run ci.yml .github/workflows/ci.yml push CI
+          require_successful_run codeql.yml .github/workflows/codeql.yml push CodeQL
+          require_successful_run \
+            render-hardening.yml \
+            .github/workflows/render-hardening.yml \
+            workflow_dispatch \
+            render-hardening
+          require_successful_run \
+            render-browser.yml \
+            .github/workflows/render-browser.yml \
+            push \
+            render-browser
+          browser_run_id="$SELECTED_RUN_ID"
+          browser_run_attempt="$SELECTED_RUN_ATTEMPT"
+
+          mkdir -p target/render-package
+          browser_artifact_name="render-browser-${GITHUB_SHA}-${browser_run_id}-${browser_run_attempt}"
+          mapfile -t browser_artifacts < <(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$browser_run_id/artifacts" \
+            --jq '.artifacts[] | [.id, .name, .expired, .size_in_bytes, .digest] | @tsv')
+          matching_browser_artifacts=()
+          for artifact_row in "${browser_artifacts[@]}"; do
+            IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+              <<< "$artifact_row"
+            [[ "$name" == "$browser_artifact_name" ]] || continue
+            matching_browser_artifacts+=("$artifact_row")
+          done
+          test "${#matching_browser_artifacts[@]}" = "1"
+          IFS=$'\t' read -r browser_artifact_id name expired size_bytes digest \
+            <<< "${matching_browser_artifacts[0]}"
+          [[ "$browser_artifact_id" =~ ^[1-9][0-9]*$ \
+            && "$expired" == "false" \
+            && "$size_bytes" =~ ^[1-9][0-9]*$ \
+            && "$size_bytes" -le 1048576 \
+            && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          python3 scripts/check_render_browser_release_evidence.py download \
+            --repository "$GITHUB_REPOSITORY" \
+            --artifact-id "$browser_artifact_id" \
+            --artifact-name "$browser_artifact_name" \
+            --artifact-size-bytes "$size_bytes" \
+            --artifact-digest "$digest" \
+            --head-sha "$GITHUB_SHA" \
+            --platform linux \
+            --workflow-run-id "$browser_run_id" \
+            --workflow-run-attempt "$browser_run_attempt" \
+            --output target/render-package/browser-prerequisite.json
+          echo "Render Browser evidence passed in run $browser_run_id"
+
+          selected_oracle=""
+          oracle_run_ids=()
+          for oracle_workflow in fuzz.yml render-oracle.yml; do
+            mapfile -t workflow_run_ids < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$oracle_workflow" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            oracle_run_ids+=("${workflow_run_ids[@]}")
+          done
+          for run_id in "${oracle_run_ids[@]}"; do
+            record=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '[.head_sha, .event, .conclusion, .status, .path, .run_attempt] | @tsv')
+            IFS=$'\t' read -r head_sha event conclusion status run_path run_attempt <<< "$record"
+            [[ "$head_sha" == "$GITHUB_SHA" \
+              && "$event" == "workflow_dispatch" \
+              && "$conclusion" == "success" \
+              && "$status" == "completed" \
+              && ( "$run_path" == ".github/workflows/fuzz.yml" \
+                || "$run_path" == ".github/workflows/render-oracle.yml" ) \
+              && "$run_attempt" =~ ^[1-9][0-9]*$ ]] || continue
+            artifact_name="render-oracle-${GITHUB_SHA}-${run_id}-${run_attempt}-full-verify"
+
+            mapfile -t artifact_rows < <(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '.artifacts[] | [.id, .name, .expired, .size_in_bytes, .digest] | @tsv')
+            matching_artifacts=()
+            for artifact_row in "${artifact_rows[@]}"; do
+              IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+                <<< "$artifact_row"
+              [[ "$name" == "$artifact_name" ]] || continue
+              matching_artifacts+=("$artifact_row")
+            done
+            [[ "${#matching_artifacts[@]}" == "1" ]] || continue
+            IFS=$'\t' read -r artifact_id name expired size_bytes digest \
+              <<< "${matching_artifacts[0]}"
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ \
+              && "$expired" == "false" \
+              && "$size_bytes" =~ ^[1-9][0-9]*$ \
+              && "$size_bytes" -le 67108864 \
+              && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+
+            if python3 scripts/check_render_oracle_release_evidence.py \
+              --download-repository "$GITHUB_REPOSITORY" \
+              --github-artifact-id "$artifact_id" \
+              --artifact-name "$artifact_name" \
+              --artifact-size-bytes "$size_bytes" \
+              --baseline-mode verify \
+              --campaign full \
+              --head-sha "$GITHUB_SHA" \
+              --reviewed-baseline scripts/render-parity-baseline-full.json \
+              --workflow-run-id "$run_id" \
+              --workflow-run-attempt "$run_attempt" \
+              --artifact-digest "$digest" \
+              --write-report target/render-package/oracle-prerequisite.json; then
+              selected_oracle="$run_id"
+              break
+            fi
+          done
+          test -n "$selected_oracle" || {
+            echo "Render Oracle has no valid reviewed full run for exact SHA $GITHUB_SHA" >&2
+            exit 1
+          }
+          echo "Render Oracle full evidence passed in run $selected_oracle"
+      - name: Enforce workflow and package policy
+        run: |
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
+          python3 scripts/test_check_render_browser_release_evidence.py
+          python3 scripts/test_check_render_package.py
+          python3 scripts/test_check_npm_registry_evidence.py
+          python3 scripts/test_render_supply_chain.py
+          python3 scripts/test_check_render_oracle_release_evidence.py
+          python3 scripts/render_supply_chain.py notice \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --check bindings/render-wasm/THIRD_PARTY_NOTICES.txt
+          cargo fmt --manifest-path bindings/render-wasm/Cargo.toml -- --check
+          cargo clippy --manifest-path bindings/render-wasm/Cargo.toml \
+            --all-targets --locked -- -D warnings
+          cargo test --manifest-path bindings/render-wasm/Cargo.toml --locked
+          npm --prefix bindings/render-wasm test
+      - name: Build the exact worker/WASM package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          npm --prefix bindings/render-wasm run build:wasm
+      - name: Pack, inspect, dry-run, and consume
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          output=target/render-package
+          archive="$output/rxls-render-worker-$version.tgz"
+          mkdir -p "$output"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --output "$output/render-worker-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --output "$RUNNER_TEMP/render-worker-sbom.cdx.json"
+          cmp --silent \
+            "$output/render-worker-sbom.cdx.json" \
+            "$RUNNER_TEMP/render-worker-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --manifest-path bindings/render-wasm/Cargo.toml \
+            --check "$output/render-worker-sbom.cdx.json"
+          sha256sum "$output/render-worker-sbom.cdx.json" \
+            > "$output/render-worker-sbom.cdx.json.sha256"
+          npm pack --json --pack-destination "$output" ./bindings/render-wasm \
+            | tee "$output/npm-pack.json"
+          python3 scripts/check_render_package.py bindings/render-wasm \
+            --archive "$archive" \
+            --git-rev "$GITHUB_SHA" \
+            --write-report "$output/package-report.json"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            ARCHIVE="$archive" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          expected_pending_boundary = {
+              "inputBytes": 33554432,
+              "queuedRequests": 4,
+              "pendingResourceBytes": 134217728,
+              "overflowBytes": 1,
+              "overflowOutcome": {
+                  "synchronous": True,
+                  "code": "limit_exceeded",
+                  "resource": "pendingResourceBytes",
+              },
+              "rejectedRequests": 4,
+              "rejectionCode": "client_closed",
+              "dispatchedRequests": 0,
+              "transportTerminated": True,
+          }
+
+          def positive_int(value, maximum):
+              return type(value) is int and 0 < value <= maximum
+
+          def valid_browser_proofs(browser):
+              pending = browser.get("pending_boundary")
+              pending_payload = (
+                  json.dumps(pending, indent=2, sort_keys=True) + "\n"
+              ).encode("utf-8")
+              if (
+                  browser.get("behavior_schema")
+                  != "rxls.render-browser-behavior.v2"
+                  or pending != expected_pending_boundary
+                  or browser.get("pending_boundary_sha256")
+                  != hashlib.sha256(pending_payload).hexdigest()
+              ):
+                  return False
+              mode_proofs = browser.get("mode_proofs")
+              if not isinstance(mode_proofs, dict) or set(mode_proofs) != {
+                  "installed",
+                  "source",
+              }:
+                  return False
+              for mode in ("installed", "source"):
+                  proof = mode_proofs.get(mode)
+                  if not isinstance(proof, dict) or set(proof) != {
+                      "network_proof",
+                      "process_tree_baseline_bytes",
+                      "process_tree_peak_bytes",
+                      "rss_boundary",
+                  }:
+                      return False
+                  network = proof.get("network_proof")
+                  if (
+                      not isinstance(network, dict)
+                      or set(network)
+                      != {
+                          "csp_sha256",
+                          "pre_navigation",
+                          "request_count",
+                          "route_sha256",
+                          "worker_count",
+                      }
+                      or network.get("pre_navigation") is not True
+                      or network.get("worker_count") != 2
+                      or network.get("request_count") != 19
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("route_sha256", "")
+                      )
+                      is None
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("csp_sha256", "")
+                      )
+                      is None
+                  ):
+                      return False
+                  rss = proof.get("rss_boundary")
+                  if not isinstance(rss, dict) or set(rss) != {
+                      "baseline_bytes",
+                      "duration_ms",
+                      "growth_bytes",
+                      "interval_ms",
+                      "max_gap_ms",
+                      "minimum_growth_bytes",
+                      "peak_bytes",
+                      "process_peak_bound",
+                      "required_samples",
+                      "sample_count",
+                  }:
+                      return False
+                  baseline = rss.get("baseline_bytes")
+                  duration = rss.get("duration_ms")
+                  growth = rss.get("growth_bytes")
+                  interval = rss.get("interval_ms")
+                  max_gap = rss.get("max_gap_ms")
+                  minimum_growth = rss.get("minimum_growth_bytes")
+                  peak = rss.get("peak_bytes")
+                  required = rss.get("required_samples")
+                  samples = rss.get("sample_count")
+                  process_baseline = proof.get("process_tree_baseline_bytes")
+                  process_peak = proof.get("process_tree_peak_bytes")
+                  if (
+                      rss.get("process_peak_bound") is not True
+                      or not positive_int(interval, 25)
+                      or interval != 10
+                      or not positive_int(required, 5)
+                      or required != 5
+                      or not positive_int(samples, 256)
+                      or samples < required
+                      or not positive_int(duration, 2000)
+                      or not positive_int(max_gap, 100)
+                      or not max_gap <= duration <= max_gap * (samples - 1)
+                      or not positive_int(minimum_growth, (1 << 63) - 1)
+                      or minimum_growth != 100663296
+                      or not positive_int(baseline, (1 << 63) - 1)
+                      or not positive_int(growth, (1 << 63) - 1)
+                      or not positive_int(peak, (1 << 63) - 1)
+                      or not positive_int(process_baseline, (1 << 63) - 1)
+                      or not positive_int(process_peak, (1 << 63) - 1)
+                      or baseline != process_baseline
+                      or peak < baseline
+                      or growth != peak - baseline
+                      or growth < minimum_growth
+                      or peak > process_peak
+                  ):
+                      return False
+              source_network = mode_proofs["source"]["network_proof"]
+              installed_network = mode_proofs["installed"]["network_proof"]
+              if (
+                  source_network["route_sha256"]
+                  == installed_network["route_sha256"]
+                  or source_network["csp_sha256"]
+                  == installed_network["csp_sha256"]
+              ):
+                  return False
+              return True
+
+          archive = Path(os.environ["ARCHIVE"]).read_bytes()
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          browser = json.loads(
+              Path("target/render-package/browser-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          package = browser.get("package", {})
+          if (
+              browser.get("schema")
+              != "rxls.render-browser-release-prerequisites.v5"
+              or browser.get("passed") is not True
+              or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not valid_browser_proofs(browser)
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("behavior_sha256", ""),
+              )
+              is None
+              or package.get("name") != packed.get("name")
+              or package.get("version") != packed.get("version")
+              or package.get("archive_bytes") != len(archive)
+              or not archive
+              or package.get("archive_sha256")
+              != hashlib.sha256(archive).hexdigest()
+              or package.get("entry_count") != packed.get("entryCount")
+              or package.get("unpacked_bytes") != packed.get("unpackedSize")
+              or package.get("integrity") != packed.get("integrity")
+              or package.get("shasum") != packed.get("shasum")
+          ):
+              raise SystemExit(
+                  "browser-proven package differs from release candidate"
+              )
+          PY
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            echo "workflow_dispatch verified the locally rebuilt package without publication prerequisites"
+          fi
+          npm publish --dry-run --ignore-scripts --access public "$archive" \
+            2>&1 | tee "$output/npm-publish-dry-run.txt"
+          sha256sum "$archive" > "$archive.sha256"
+          consumer="$RUNNER_TEMP/render-worker-consumer"
+          rm -rf "$consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$GITHUB_WORKSPACE/$archive"
+          node --input-type=module - <<'NODE'
+          const root = await import("@rxls/render-worker");
+          const protocol = await import("@rxls/render-worker/protocol");
+          const runtime = await import("@rxls/render-worker/worker-runtime");
+          if (typeof root.RenderWorkerClient !== "function" ||
+              protocol.PROTOCOL !== "rxls.render-worker.v1" ||
+              typeof runtime.RenderWorkerRuntime !== "function") {
+            process.exit(1);
+          }
+          NODE
+      - name: Upload verified package candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-worker-${{ github.sha }}
+          path: target/render-package/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  publish:
+    name: Publish protected tag to npm
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-render-worker
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: render-worker-${{ github.sha }}
+          path: target/render-package
+          digest-mismatch: error
+      - name: Reverify the immutable candidate
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          version=$(node -p 'require("./bindings/render-wasm/package.json").version')
+          test "$GITHUB_REF_NAME" = "render-v$version"
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          archive="target/render-package/rxls-render-worker-$version.tgz"
+          sha256sum --check "$archive.sha256"
+          sha256sum --check \
+            target/render-package/render-worker-sbom.cdx.json.sha256
+          python3 scripts/check_render_package.py bindings/render-wasm \
+            --archive "$archive" \
+            --archive-only \
+            --git-rev "$GITHUB_SHA"
+          ARCHIVE="$archive" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          expected_pending_boundary = {
+              "inputBytes": 33554432,
+              "queuedRequests": 4,
+              "pendingResourceBytes": 134217728,
+              "overflowBytes": 1,
+              "overflowOutcome": {
+                  "synchronous": True,
+                  "code": "limit_exceeded",
+                  "resource": "pendingResourceBytes",
+              },
+              "rejectedRequests": 4,
+              "rejectionCode": "client_closed",
+              "dispatchedRequests": 0,
+              "transportTerminated": True,
+          }
+
+          def positive_int(value, maximum):
+              return type(value) is int and 0 < value <= maximum
+
+          def valid_browser_proofs(browser):
+              pending = browser.get("pending_boundary")
+              pending_payload = (
+                  json.dumps(pending, indent=2, sort_keys=True) + "\n"
+              ).encode("utf-8")
+              if (
+                  browser.get("behavior_schema")
+                  != "rxls.render-browser-behavior.v2"
+                  or pending != expected_pending_boundary
+                  or browser.get("pending_boundary_sha256")
+                  != hashlib.sha256(pending_payload).hexdigest()
+              ):
+                  return False
+              mode_proofs = browser.get("mode_proofs")
+              if not isinstance(mode_proofs, dict) or set(mode_proofs) != {
+                  "installed",
+                  "source",
+              }:
+                  return False
+              for mode in ("installed", "source"):
+                  proof = mode_proofs.get(mode)
+                  if not isinstance(proof, dict) or set(proof) != {
+                      "network_proof",
+                      "process_tree_baseline_bytes",
+                      "process_tree_peak_bytes",
+                      "rss_boundary",
+                  }:
+                      return False
+                  network = proof.get("network_proof")
+                  if (
+                      not isinstance(network, dict)
+                      or set(network)
+                      != {
+                          "csp_sha256",
+                          "pre_navigation",
+                          "request_count",
+                          "route_sha256",
+                          "worker_count",
+                      }
+                      or network.get("pre_navigation") is not True
+                      or network.get("worker_count") != 2
+                      or network.get("request_count") != 19
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("route_sha256", "")
+                      )
+                      is None
+                      or re.fullmatch(
+                          r"[0-9a-f]{64}", network.get("csp_sha256", "")
+                      )
+                      is None
+                  ):
+                      return False
+                  rss = proof.get("rss_boundary")
+                  if not isinstance(rss, dict) or set(rss) != {
+                      "baseline_bytes",
+                      "duration_ms",
+                      "growth_bytes",
+                      "interval_ms",
+                      "max_gap_ms",
+                      "minimum_growth_bytes",
+                      "peak_bytes",
+                      "process_peak_bound",
+                      "required_samples",
+                      "sample_count",
+                  }:
+                      return False
+                  baseline = rss.get("baseline_bytes")
+                  duration = rss.get("duration_ms")
+                  growth = rss.get("growth_bytes")
+                  interval = rss.get("interval_ms")
+                  max_gap = rss.get("max_gap_ms")
+                  minimum_growth = rss.get("minimum_growth_bytes")
+                  peak = rss.get("peak_bytes")
+                  required = rss.get("required_samples")
+                  samples = rss.get("sample_count")
+                  process_baseline = proof.get("process_tree_baseline_bytes")
+                  process_peak = proof.get("process_tree_peak_bytes")
+                  if (
+                      rss.get("process_peak_bound") is not True
+                      or not positive_int(interval, 25)
+                      or interval != 10
+                      or not positive_int(required, 5)
+                      or required != 5
+                      or not positive_int(samples, 256)
+                      or samples < required
+                      or not positive_int(duration, 2000)
+                      or not positive_int(max_gap, 100)
+                      or not max_gap <= duration <= max_gap * (samples - 1)
+                      or not positive_int(minimum_growth, (1 << 63) - 1)
+                      or minimum_growth != 100663296
+                      or not positive_int(baseline, (1 << 63) - 1)
+                      or not positive_int(growth, (1 << 63) - 1)
+                      or not positive_int(peak, (1 << 63) - 1)
+                      or not positive_int(process_baseline, (1 << 63) - 1)
+                      or not positive_int(process_peak, (1 << 63) - 1)
+                      or baseline != process_baseline
+                      or peak < baseline
+                      or growth != peak - baseline
+                      or growth < minimum_growth
+                      or peak > process_peak
+                  ):
+                      return False
+              source_network = mode_proofs["source"]["network_proof"]
+              installed_network = mode_proofs["installed"]["network_proof"]
+              if (
+                  source_network["route_sha256"]
+                  == installed_network["route_sha256"]
+                  or source_network["csp_sha256"]
+                  == installed_network["csp_sha256"]
+              ):
+                  return False
+              return True
+
+          report = json.loads(
+              Path("target/render-package/package-report.json").read_text(encoding="utf-8")
+          )
+          archive = Path(os.environ["ARCHIVE"])
+          archive_payload = archive.read_bytes()
+          if report.get("schema") != "rxls.render-worker-package.v1":
+              raise SystemExit("unexpected package-report schema")
+          if report.get("passed") is not True or report.get("git_rev") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("package report is not bound to this exact commit")
+          if report.get("archive", {}).get("sha256") != hashlib.sha256(archive_payload).hexdigest():
+              raise SystemExit("package report archive digest differs")
+          notice = report.get("third_party_notice", {})
+          notice_file = report.get("files", {}).get("THIRD_PARTY_NOTICES.txt", {})
+          if (
+              not isinstance(notice.get("packages"), int)
+              or notice["packages"] < 1
+              or not isinstance(notice.get("legal_texts"), int)
+              or notice["legal_texts"] < 1
+              or notice.get("sha256") != notice_file.get("sha256")
+          ):
+              raise SystemExit("package report lacks exact third-party notice evidence")
+          prerequisites = json.loads(
+              Path("target/render-package/oracle-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          if (
+              prerequisites.get("schema")
+              != "rxls.render-worker-release-prerequisites.v1"
+              or prerequisites.get("passed") is not True
+              or prerequisites.get("head_sha") != os.environ["GITHUB_SHA"]
+              or prerequisites.get("campaign") != "full"
+              or prerequisites.get("baseline_mode") != "verify"
+              or prerequisites.get("full_cases") != 800
+              or prerequisites.get("ratchets") != 2
+              or not isinstance(prerequisites.get("workflow_run_id"), int)
+              or prerequisites["workflow_run_id"] < 1
+              or not isinstance(prerequisites.get("workflow_run_attempt"), int)
+              or prerequisites["workflow_run_attempt"] < 1
+              or not isinstance(prerequisites.get("artifact_id"), int)
+              or prerequisites["artifact_id"] < 1
+              or not isinstance(prerequisites.get("artifact_size_bytes"), int)
+              or not 1 <= prerequisites["artifact_size_bytes"] <= 67108864
+              or prerequisites.get("artifact_repository") != "HyunjoJung/rxls"
+              or prerequisites.get("artifact_name")
+              != (
+                  f"render-oracle-{os.environ['GITHUB_SHA']}-"
+                  f"{prerequisites['workflow_run_id']}-"
+                  f"{prerequisites['workflow_run_attempt']}-full-verify"
+              )
+              or re.fullmatch(
+                  r"sha256:[0-9a-f]{64}",
+                  prerequisites.get("artifact_digest", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  prerequisites.get("reviewed_baseline_sha256", ""),
+              )
+              is None
+          ):
+              raise SystemExit("full Render Oracle prerequisite evidence differs")
+          browser = json.loads(
+              Path("target/render-package/browser-prerequisite.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          browser_package = browser.get("package", {})
+          if (
+              browser.get("schema")
+              != "rxls.render-browser-release-prerequisites.v5"
+              or browser.get("passed") is not True
+              or browser.get("head_sha") != os.environ["GITHUB_SHA"]
+              or not valid_browser_proofs(browser)
+              or not isinstance(browser.get("workflow_run_id"), int)
+              or browser["workflow_run_id"] < 1
+              or not isinstance(browser.get("workflow_run_attempt"), int)
+              or browser["workflow_run_attempt"] < 1
+              or not isinstance(browser.get("artifact_id"), int)
+              or browser["artifact_id"] < 1
+              or not isinstance(browser.get("artifact_size_bytes"), int)
+              or not 1 <= browser["artifact_size_bytes"] <= 1048576
+              or browser.get("artifact_repository") != "HyunjoJung/rxls"
+              or browser.get("artifact_name")
+              != (
+                  f"render-browser-{os.environ['GITHUB_SHA']}-"
+                  f"{browser['workflow_run_id']}-"
+                  f"{browser['workflow_run_attempt']}"
+              )
+              or re.fullmatch(
+                  r"sha256:[0-9a-f]{64}",
+                  browser.get("artifact_digest", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("browser_evidence_sha256", ""),
+              )
+              is None
+              or re.fullmatch(
+                  r"[0-9a-f]{64}",
+                  browser.get("behavior_sha256", ""),
+              )
+              is None
+              or browser_package.get("name") != packed.get("name")
+              or browser_package.get("version") != packed.get("version")
+              or browser_package.get("archive_bytes") != len(archive_payload)
+              or browser_package.get("archive_sha256")
+              != hashlib.sha256(archive_payload).hexdigest()
+              or browser_package.get("entry_count") != packed.get("entryCount")
+              or browser_package.get("unpacked_bytes")
+              != packed.get("unpackedSize")
+              or browser_package.get("integrity") != packed.get("integrity")
+              or browser_package.get("shasum") != packed.get("shasum")
+          ):
+              raise SystemExit("Render Browser prerequisite evidence differs")
+          PY
+      - name: Detect an identical immutable registry release
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          spec="@rxls/render-worker@$version"
+          registry="target/render-package/registry-preflight.json"
+          error_log="target/render-package/registry-preflight.stderr"
+          if npm view "$spec" \
+            version dist.integrity repository.url dist.attestations --json \
+            > "$registry" 2> "$error_log"; then
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/render-package/registry-preflight.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
+          if (
+              registry.get("version") != os.environ["VERSION"]
+              or registry.get("dist.integrity") != packed.get("integrity")
+              or registry.get("repository.url")
+              != "git+https://github.com/HyunjoJung/rxls.git"
+              or not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit(
+                  "existing immutable registry version differs from the verified candidate"
+              )
+          PY
+            rm -f "$error_log"
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' "$error_log"; then
+              cat "$error_log" >&2
+              exit "$status"
+            fi
+            rm -f "$error_log"
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("target/render-package/registry-preflight.json").write_text(
+              json.dumps(
+                  {"status": "absent", "version": os.environ["VERSION"]},
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish exact package with provenance
+        if: steps.registry.outputs.already_published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${{ steps.package.outputs.version }}"
+          npm publish \
+            "target/render-package/rxls-render-worker-$version.tgz" \
+            --ignore-scripts --access public
+      - name: Verify the registry distribution and installed consumer
+        env:
+          ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          invocation_policy="current-run"
+          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
+            invocation_policy="existing-release"
+          elif [[ "$ALREADY_PUBLISHED" != "false" ]]; then
+            echo "registry preflight did not produce a valid publication state" >&2
+            exit 1
+          fi
+          version="${{ steps.package.outputs.version }}"
+          spec="@rxls/render-worker@$version"
+          for attempt in {1..12}; do
+            if npm view "$spec" \
+              version dist.integrity repository.url dist.attestations --json \
+              > target/render-package/registry.json; then
+              break
+            fi
+            test "$attempt" -lt 12
+            sleep 5
+          done
+          VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/render-package/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/render-package/registry.json").read_text(encoding="utf-8")
+          )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
+          if registry.get("version") != os.environ["VERSION"]:
+              raise SystemExit("registry version differs")
+          if registry.get("dist.integrity") != packed.get("integrity"):
+              raise SystemExit("registry integrity differs from the verified candidate")
+          if registry.get("repository.url") != "git+https://github.com/HyunjoJung/rxls.git":
+              raise SystemExit("registry repository metadata differs")
+          if (
+              not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("registry provenance attestation is missing or invalid")
+          PY
+          consumer="$RUNNER_TEMP/render-worker-registry-consumer"
+          rm -rf "$consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$spec"
+          npm audit signatures --json --include-attestations \
+            > "$GITHUB_WORKSPACE/target/render-package/registry-signatures.json"
+          python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py" \
+            --audit "$GITHUB_WORKSPACE/target/render-package/registry-signatures.json" \
+            --pack "$GITHUB_WORKSPACE/target/render-package/npm-pack.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow .github/workflows/render-package-release.yml \
+            --git-sha "$GITHUB_SHA" \
+            --git-ref "$GITHUB_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --invocation-policy "$invocation_policy"
+          node --input-type=module -e \
+            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v1") process.exit(1)'
+      - name: Upload registry evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: render-worker-registry-${{ github.sha }}
+          path: |
+            target/render-package/registry-preflight.json
+            target/render-package/registry.json
+            target/render-package/registry-signatures.json
+          if-no-files-found: warn
+          retention-days: 30
