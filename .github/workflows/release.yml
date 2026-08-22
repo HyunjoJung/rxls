@@ -1,0 +1,1032 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      baseline_run_id:
+        description: "Prior clean verification run ID to compare against"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: core-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_SEMVER_CHECKS_VERSION: "0.49.0"
+  RUSTFLAGS: "-D warnings"
+  RELEASE_RUST_VERSION: "1.96.1"
+  FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
+  CARGO_FUZZ_VERSION: "0.13.2"
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+            echo "Cargo.toml contains an invalid release version" >&2
+            exit 1
+          }
+          test "$(git rev-parse --is-shallow-repository)" = "false" || {
+            echo "release identity requires complete Git history" >&2
+            exit 1
+          }
+          test "$(git rev-list --count HEAD)" = "1" || {
+            echo "release source must contain exactly one public commit" >&2
+            exit 1
+          }
+          test "$(git rev-list --max-parents=0 --count HEAD)" = "1" || {
+            echo "release source must contain exactly one parentless root" >&2
+            exit 1
+          }
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA" || {
+            echo "release verification must target the exact origin/main head" >&2
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || {
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+              exit 1
+            }
+          else
+            echo "workflow_dispatch is verification-only; no publish will run"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RELEASE_RUST_VERSION }}
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+      - name: Dependency security, license, and source release gate
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.85.0"
+          command: check
+          arguments: --locked --all-features
+      - name: Validate native/WASM release identity
+        run: python3 scripts/check_release_identity.py
+      - name: Install locked wasm-bindgen and browser runtimes
+        shell: bash
+        run: |
+          version=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked
+          npm install --prefix target/playwright --no-save --ignore-scripts playwright@1.54.1
+          npm exec --prefix target/playwright -- playwright install --with-deps chromium
+      - name: Install public reference readers and render-harness libraries
+        run: |
+          python3 -m pip install \
+            "CairoSVG==2.9.0" \
+            "numpy==2.4.4" \
+            "openpyxl==3.1.5" \
+            "Pillow==12.3.0" \
+            "pyxlsb==1.0.10" \
+            "xlrd==2.0.2"
+      - name: Install LibreOffice Calc smoke consumer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libreoffice-calc
+
+      - name: Run canonical release gate
+        env:
+          RXLS_REQUIRE_OPENPYXL: "1"
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          set -o pipefail
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/public_hygiene_audit.py
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+          cargo test --all-targets --no-default-features --locked
+          cargo test --doc --all-features --locked
+          cargo doc --no-deps --all-features --locked
+          python3 scripts/check_public_api.py
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --all-features
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --default-features
+          cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --only-explicit-features
+          bash scripts/build-wasm-package.sh
+          cargo run --bin rxls --all-features --locked -- diagnose tests/fixtures/xlsx/reader-structural.xlsx > target/wasm-native-report.json
+          node bindings/wasm/tests/node-smoke.cjs target/wasm-package target/wasm-native-report.json \
+            | tee target/wasm-node-smoke.json
+          node bindings/wasm/tests/browser-smoke.mjs target/wasm-package target/wasm-native-report.json \
+            | tee target/wasm-browser-smoke.json
+          python3 -m unittest discover -s scripts -p "test_*.py"
+          cargo package --locked
+          python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
+          python3 scripts/check_cargo_publish_dry_run.py run \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --output target/package/release-cargo-publish-dry-run.json
+          cargo build --release --all-features --locked
+          cargo build --release --example edit_save_benchmark --all-features --locked
+          soffice --version | tee target/release-libreoffice-version.txt
+          python3 scripts/measure-performance.py \
+            --bin target/release/rxls \
+            --operation diagnose \
+            --case small=tests/fixtures/xlsx/reader-structural.xlsx \
+            --repeat 3 --max-seconds 1 --max-rss-mib 128 \
+            --output target/release-performance-small.json
+          python3 scripts/generate-performance-fixture.py \
+            --output target/performance/medium.xlsx --payload-mib 16
+          python3 scripts/measure-performance.py \
+            --bin target/release/rxls \
+            --operation diagnose \
+            --case medium=target/performance/medium.xlsx \
+            --repeat 3 --max-seconds 5 --max-rss-mib 512 \
+            --output target/release-performance-medium.json
+          python3 scripts/measure-performance.py \
+            --bin target/release/examples/edit_save_benchmark \
+            --operation edit-save \
+            --case medium-edit=target/performance/medium.xlsx \
+            --repeat 3 --max-seconds 10 --max-rss-mib 768 \
+            --output target/release-performance-edit.json
+          cargo run --example author_report --all-features --locked -- target/libreoffice-source.xlsx
+          cargo run --example api_journeys --all-features --locked -- target/api-journeys-edited.xlsx
+          rm -rf target/libreoffice-smoke
+          mkdir -p target/libreoffice-smoke
+          soffice -env:UserInstallation=file:///tmp/rxls-libreoffice \
+            --headless --convert-to xlsx --outdir target/libreoffice-smoke \
+            target/libreoffice-source.xlsx target/api-journeys-edited.xlsx \
+            2>&1 | tee target/release-libreoffice-xlsx-smoke.txt
+          test -s target/libreoffice-smoke/libreoffice-source.xlsx
+          test -s target/libreoffice-smoke/api-journeys-edited.xlsx
+          cargo run --bin rxls --all-features --locked -- \
+            diagnose target/libreoffice-smoke/libreoffice-source.xlsx \
+            > target/release-libreoffice-smoke.json
+          cargo run --bin rxls --all-features --locked -- \
+            diagnose target/libreoffice-smoke/api-journeys-edited.xlsx \
+            > target/release-libreoffice-edit-smoke.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          reports = [
+              Path("target/release-libreoffice-smoke.json"),
+              Path("target/release-libreoffice-edit-smoke.json"),
+          ]
+          for report in reports:
+              warnings = json.loads(report.read_text(encoding="utf-8")).get("warnings")
+              if warnings != []:
+                  raise SystemExit(f"{report}: expected an empty warnings array, got {warnings!r}")
+          PY
+
+      - name: Run full pinned public-corpus gate
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/fetch-public-corpus.py
+          cargo build --all-features --example extract --locked
+          cargo run --bin rxls --all-features --locked -- corpus-report local/public-corpus/manifest.json | tee target/release-corpus-report.txt
+          python3 scripts/measure-performance.py \
+            --bin target/release/rxls \
+            --operation diagnose \
+            --case largest-corpus=local/public-corpus/apache-poi/test-data/spreadsheet/ex45698-22488.xls \
+            --repeat 3 --max-seconds 30 --max-rss-mib 1024 \
+            --output target/release-performance-largest.json
+
+          python3 scripts/xls-xlrd-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-worst 20 --show-skips 200 | tee target/release-xls-parity-full.txt
+          grep -E "^(provenance:|manifest:|files:|rxls vs)" target/release-xls-parity-full.txt > target/release-xls-parity-summary.txt
+
+          python3 scripts/xlsx-openpyxl-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-worst 20 --show-skips 200 | tee target/release-ooxml-parity-full.txt
+          grep -E "^(provenance:|manifest:|files:|rxls vs)" target/release-ooxml-parity-full.txt > target/release-ooxml-parity-summary.txt
+
+          python3 scripts/xlsb-pyxlsb-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --expected-values tests/oracles/xlsb-visible-values.json --corpus-report target/release-corpus-report.txt --min 0.99 --show-skips 200 | tee target/release-xlsb-parity-full.txt
+          grep -E "^(provenance:|manifest:|files:|rxls vs)" target/release-xlsb-parity-full.txt > target/release-xlsb-parity-summary.txt
+
+          python3 scripts/ods-odfpy-parity.py --manifest local/public-corpus/manifest.json --bin target/debug/examples/extract --corpus-report target/release-corpus-report.txt --min 0.99 --show-skips 200 | tee target/release-ods-parity-full.txt
+          grep -E "^(provenance:|manifest:|files:|rxls vs)" target/release-ods-parity-full.txt > target/release-ods-parity-summary.txt
+
+          python3 scripts/verify_public_baseline.py \
+            --corpus-report target/release-corpus-report.txt \
+            --xls target/release-xls-parity-full.txt \
+            --ooxml target/release-ooxml-parity-full.txt \
+            --xlsb target/release-xlsb-parity-full.txt \
+            --ods target/release-ods-parity-full.txt \
+            --readme README.md
+
+      - name: Smoke package-edited XLSM through LibreOffice
+        shell: bash
+        run: |
+          set -euo pipefail
+          xlsm_source=$(python3 - <<'PY'
+          from scripts.public_corpus_manifest import manifest_files
+          from scripts.verify_libreoffice_xlsm import inspect_package
+
+          files = manifest_files("local/public-corpus/manifest.json", {".xlsm"})
+          for path in files:
+              try:
+                  inspect_package(path)
+              except ValueError:
+                  continue
+              print(path)
+              break
+          else:
+              raise SystemExit("pinned corpus contains no macro-enabled XLSM input")
+          PY
+          )
+          target/release/examples/edit_save_benchmark \
+            "$xlsm_source" target/libreoffice-package-edited.xlsm
+          rm -rf target/libreoffice-xlsm-smoke
+          mkdir -p target/libreoffice-xlsm-smoke
+          soffice -env:UserInstallation=file:///tmp/rxls-libreoffice-xlsm \
+            --headless --convert-to 'xlsm:Calc MS Excel 2007 VBA XML' \
+            --outdir target/libreoffice-xlsm-smoke \
+            target/libreoffice-package-edited.xlsm \
+            2>&1 | tee target/release-libreoffice-xlsm-smoke.txt
+          test -s target/libreoffice-xlsm-smoke/libreoffice-package-edited.xlsm
+          cargo run --bin rxls --all-features --locked -- \
+            diagnose target/libreoffice-xlsm-smoke/libreoffice-package-edited.xlsm \
+            > target/release-libreoffice-xlsm-edit-smoke.json
+          python3 scripts/verify_libreoffice_xlsm.py \
+            "$xlsm_source" \
+            target/libreoffice-package-edited.xlsm \
+            target/libreoffice-xlsm-smoke/libreoffice-package-edited.xlsm \
+            target/release-libreoffice-xlsm-edit-smoke.json \
+            --version-file target/release-libreoffice-version.txt \
+            --output target/release-libreoffice-xlsm-preservation.json
+          python3 scripts/sanitize_release_logs.py \
+            target/release-libreoffice-xlsx-smoke.txt \
+            target/release-libreoffice-xlsm-smoke.txt
+
+      - name: Generate focused formula, evaluation, and edit evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --quiet --all-features --locked --lib ptg::tests -- --nocapture 2>&1 | tee target/release-formula-evidence.txt
+          cargo test --quiet --all-features --locked --lib eval::tests -- --nocapture 2>&1 | tee target/release-evaluation-evidence.txt
+          cargo test --quiet --all-features --locked --lib spreadsheet::tests -- --nocapture 2>&1 | tee target/release-edit-unit-evidence.txt
+          cargo test --quiet --all-features --locked --test integration editable -- --nocapture 2>&1 | tee target/release-edit-integration-evidence.txt
+
+      - name: Run release fuzz campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$FUZZ_NIGHTLY_VERSION" --profile minimal
+          cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+          python3 scripts/record_toolchain_versions.py \
+            --release-rust "$RELEASE_RUST_VERSION" \
+            --fuzz-nightly "$FUZZ_NIGHTLY_VERSION" \
+            --cargo-fuzz "$CARGO_FUZZ_VERSION" \
+            --output target/release-toolchain-versions.json
+          python3 scripts/fuzz_seeds.py materialize \
+            --corpus-root target/fuzz-seeds \
+            --report target/fuzz-seed-manifest.json
+          cargo +"$FUZZ_NIGHTLY_VERSION" fuzz build 2>&1 | tee target/fuzz-build.log
+          python3 scripts/fuzz_seeds.py replay \
+            --corpus-root target/fuzz-seeds \
+            --toolchain "$FUZZ_NIGHTLY_VERSION" \
+            --cargo-fuzz-version "$CARGO_FUZZ_VERSION" \
+            --report target/fuzz-seed-replay.json
+          for target_name in parse author edit formula; do
+            cargo +"$FUZZ_NIGHTLY_VERSION" fuzz run "$target_name" \
+              "target/fuzz-seeds/$target_name" -- \
+              -seed=1 -max_total_time=120 -timeout=10 -rss_limit_mb=2048 \
+              2>&1 | tee "target/fuzz-$target_name.log"
+          done
+          python3 scripts/sanitize_release_logs.py target/fuzz-*.log
+
+      - name: Upload release diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-${{ steps.release.outputs.version }}-diagnostics-${{ github.run_attempt }}
+          path: |
+            target/release-*.txt
+            target/fuzz-*.log
+            target/fuzz-*.json
+            target/release-toolchain-versions.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Smoke exact packaged crate distribution
+        run: |
+          python3 scripts/smoke_crate_distribution.py \
+            --crate target/package/rxls-0.1.3.crate \
+            --write-report target/release-crate-distribution-smoke.json
+
+      - name: Generate release evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 scripts/public_hygiene_audit.py --json > target/release-public-hygiene-source.json
+          python3 scripts/generate-sbom.py \
+            --manifest-path Cargo.toml \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --output target/rxls-sbom.cdx.json
+          mkdir -p dist
+          version="${{ steps.release.outputs.version }}"
+          mkdir -p target/wasm-dist
+          archive=$(npm pack ./target/wasm-package --pack-destination target/wasm-dist --silent)
+          [[ "$archive" == "rxls-wasm-${version}.tgz" ]] || {
+            echo "unexpected npm archive name: $archive" >&2
+            exit 1
+          }
+          python3 scripts/check_wasm_package.py target/wasm-package \
+            --archive "target/wasm-dist/$archive" \
+            --write-report target/wasm-package/wasm-size-report.json
+          cp "target/package/rxls-${version}.crate" dist/
+          cp "target/wasm-dist/$archive" dist/
+          cp target/wasm-package/wasm-size-report.json dist/
+          cp target/wasm-native-report.json target/wasm-node-smoke.json target/wasm-browser-smoke.json dist/
+          cp target/release-corpus-report.txt target/release-*-parity-full.txt target/release-*-parity-summary.txt dist/
+          cp target/release-*-evidence.txt dist/
+          cp target/fuzz-*.log dist/
+          cp target/fuzz-seed-manifest.json target/fuzz-seed-replay.json dist/
+          cp target/release-toolchain-versions.json dist/
+          cp target/release-crate-distribution-smoke.json dist/
+          cp target/package/release-cargo-publish-dry-run.json dist/
+          cp tests/oracles/public-corpus-baseline.json tests/oracles/public-corpus-expectations.json dist/
+          cp target/release-public-hygiene-source.json dist/public-hygiene-source.json
+          cp target/rxls-sbom.cdx.json dist/
+          cp target/release-performance-*.json dist/
+          cp target/release-libreoffice-*.json dist/
+          cp target/release-libreoffice-version.txt \
+            target/release-libreoffice-xlsx-smoke.txt \
+            target/release-libreoffice-xlsm-smoke.txt dist/
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
+          (cd dist && sha256sum "rxls-${version}.crate" > "rxls-${version}.crate.sha256")
+          (cd dist && sha256sum "rxls-wasm-${version}.tgz" > "rxls-wasm-${version}.tgz.sha256")
+          python3 scripts/public_hygiene_audit.py --json dist > dist/public-hygiene.json
+          python3 scripts/release_manifest.py \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA" \
+            --hygiene-report dist/public-hygiene.json \
+            --output dist/rxls-release-manifest.json \
+            "dist/rxls-${version}.crate" \
+            "dist/rxls-${version}.crate.sha256" \
+            "dist/rxls-wasm-${version}.tgz" \
+            "dist/rxls-wasm-${version}.tgz.sha256" \
+            dist/wasm-size-report.json \
+            dist/wasm-native-report.json \
+            dist/wasm-node-smoke.json \
+            dist/wasm-browser-smoke.json \
+            dist/rxls-sbom.cdx.json \
+            dist/release-performance-small.json \
+            dist/release-performance-medium.json \
+            dist/release-performance-edit.json \
+            dist/release-performance-largest.json \
+            dist/release-libreoffice-smoke.json \
+            dist/release-libreoffice-edit-smoke.json \
+            dist/release-libreoffice-xlsm-edit-smoke.json \
+            dist/release-libreoffice-xlsm-preservation.json \
+            dist/release-libreoffice-version.txt \
+            dist/release-libreoffice-xlsx-smoke.txt \
+            dist/release-libreoffice-xlsm-smoke.txt \
+            dist/public-hygiene-source.json \
+            dist/public-corpus-baseline.json \
+            dist/public-corpus-expectations.json \
+            dist/release-corpus-report.txt \
+            dist/release-xls-parity-full.txt \
+            dist/release-xls-parity-summary.txt \
+            dist/release-ooxml-parity-full.txt \
+            dist/release-ooxml-parity-summary.txt \
+            dist/release-xlsb-parity-full.txt \
+            dist/release-xlsb-parity-summary.txt \
+            dist/release-ods-parity-full.txt \
+            dist/release-ods-parity-summary.txt \
+            dist/release-formula-evidence.txt \
+            dist/release-evaluation-evidence.txt \
+            dist/release-edit-unit-evidence.txt \
+            dist/release-edit-integration-evidence.txt \
+            dist/fuzz-build.log \
+            dist/fuzz-parse.log \
+            dist/fuzz-author.log \
+            dist/fuzz-edit.log \
+            dist/fuzz-formula.log \
+            dist/fuzz-seed-manifest.json \
+            dist/fuzz-seed-replay.json \
+            dist/release-toolchain-versions.json \
+            dist/release-crate-distribution-smoke.json \
+            dist/release-cargo-publish-dry-run.json
+          python3 scripts/release_manifest.py \
+            --verify-bundle dist \
+            --expected-files 48 \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA"
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-${{ steps.release.outputs.version }}-release-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Compare clean release candidates
+        if: github.event_name == 'workflow_dispatch' && inputs.baseline_run_id != ''
+        env:
+          BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          baseline_run_id="$BASELINE_RUN_ID"
+          [[ "$baseline_run_id" =~ ^[0-9]+$ ]] || {
+            echo "baseline_run_id must be a numeric GitHub Actions run ID" >&2
+            exit 1
+          }
+          baseline_sha=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$baseline_run_id" --jq .head_sha)
+          baseline_event=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$baseline_run_id" --jq .event)
+          baseline_conclusion=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$baseline_run_id" --jq .conclusion)
+          baseline_path=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$baseline_run_id" --jq .path)
+          baseline_run_attempt=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$baseline_run_id" --jq .run_attempt)
+          [[ "$baseline_sha" == "$GITHUB_SHA" ]] || {
+            echo "baseline run $baseline_run_id targets $baseline_sha, not $GITHUB_SHA" >&2
+            exit 1
+          }
+          [[ "$baseline_event" == "workflow_dispatch" && \
+            "$baseline_conclusion" == "success" && \
+            "$baseline_path" == ".github/workflows/release.yml" ]] || {
+            echo "baseline must be a successful verification-only Release workflow run" >&2
+            exit 1
+          }
+          [[ "$baseline_run_attempt" =~ ^[1-9][0-9]*$ ]] || {
+            echo "baseline run has an invalid attempt number" >&2
+            exit 1
+          }
+          mkdir -p target/baseline-release target/reproducibility
+          gh run download "$baseline_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "rxls-${version}-release-${baseline_run_attempt}" \
+            --dir target/baseline-release
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt target/baseline-release/release-cargo-publish-dry-run.json
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
+          python3 scripts/compare_release_bundles.py \
+            target/baseline-release dist \
+            --output target/reproducibility/rxls-release-reproducibility.json
+          VERSION="$version" BASELINE_RUN_ID="$baseline_run_id" \
+            BASELINE_RUN_ATTEMPT="$baseline_run_attempt" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          comparison_path = Path("target/reproducibility/rxls-release-reproducibility.json")
+          comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+          expected_sha = os.environ["GITHUB_SHA"].lower()
+          expected_version = os.environ["VERSION"]
+          if comparison.get("passed") is not True:
+              raise SystemExit("two-candidate comparison did not pass")
+          if comparison.get("git_rev") != expected_sha:
+              raise SystemExit("comparison is not bound to the candidate commit")
+          if comparison.get("version") != expected_version:
+              raise SystemExit("comparison is not bound to the release version")
+          comparison_bytes = comparison_path.read_bytes()
+          manifest_path = Path("dist/rxls-release-manifest.json")
+          manifest_bytes = manifest_path.read_bytes()
+          candidate_manifest_path = Path(
+              "target/reproducibility/rxls-release-candidate-manifest.json"
+          )
+          candidate_manifest_path.write_bytes(manifest_bytes)
+          attestation = {
+              "schema": "rxls.release-candidate-attestation.v1",
+              "version": expected_version,
+              "git_rev": expected_sha,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "baseline_run_id": int(os.environ["BASELINE_RUN_ID"]),
+              "baseline_run_attempt": int(os.environ["BASELINE_RUN_ATTEMPT"]),
+              "comparison_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "comparison_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "comparison": {
+                  "name": comparison_path.name,
+                  "bytes": len(comparison_bytes),
+                  "sha256": hashlib.sha256(comparison_bytes).hexdigest(),
+              },
+              "release_manifest": {
+                  "name": candidate_manifest_path.name,
+                  "bytes": len(manifest_bytes),
+                  "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+              },
+          }
+          Path("target/reproducibility/rxls-release-candidate-attestation.json").write_text(
+              json.dumps(attestation, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload reproducibility comparison
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.baseline_run_id != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-${{ steps.release.outputs.version }}-reproducibility-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/reproducibility/rxls-release-reproducibility.json
+            target/reproducibility/rxls-release-candidate-attestation.json
+            target/reproducibility/rxls-release-candidate-manifest.json
+          if-no-files-found: error
+
+      - name: Require successful exact-SHA CI and CodeQL runs
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_successful_push() {
+            local workflow_file="$1"
+            local expected_path="$2"
+            local label="$3"
+            local selected=""
+            mapfile -t runs < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$workflow_file" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId,conclusion,event,headSha \
+              --jq '.[] | [.databaseId, .headSha, .conclusion, .event] | @tsv')
+            for row in "${runs[@]}"; do
+              IFS=$'\t' read -r run_id head_sha conclusion event <<< "$row"
+              [[ "$head_sha" == "$GITHUB_SHA" && \
+                "$conclusion" == "success" && "$event" == "push" ]] || continue
+              run_path=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .path)
+              [[ "$run_path" == "$expected_path" ]] || continue
+              selected="$run_id"
+              break
+            done
+            [[ -n "$selected" ]] || {
+              echo "$label has no successful push run for exact SHA $GITHUB_SHA" >&2
+              exit 1
+            }
+            echo "$label exact-SHA gate passed in run $selected"
+          }
+          require_successful_push ci.yml .github/workflows/ci.yml CI
+          require_successful_push codeql.yml .github/workflows/codeql.yml CodeQL
+
+      - name: Require exact-SHA two-candidate publication attestation
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          prefix="rxls-${version}-reproducibility-${GITHUB_SHA}-"
+          mkdir -p target/publication-attestation
+          mapfile -t candidate_runs < <(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release.yml \
+            --event workflow_dispatch \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 100 \
+            --json databaseId,conclusion,event,headSha \
+            --jq '.[] | select(.headSha == env.GITHUB_SHA and .event == "workflow_dispatch" and .conclusion == "success") | .databaseId')
+          [[ ${#candidate_runs[@]} -gt 0 ]] || {
+            echo "no successful comparison run exists for tag SHA $GITHUB_SHA" >&2
+            exit 1
+          }
+
+          selected_run=""
+          selected_attempt=""
+          selected_baseline=""
+          selected_baseline_attempt=""
+          for run_id in "${candidate_runs[@]}"; do
+            mapfile -t artifacts < <(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq ".artifacts[] | select(.expired == false and (.name | startswith(\"$prefix\"))) | .name")
+            for artifact in "${artifacts[@]}"; do
+              rm -rf target/publication-attestation/*
+              gh run download "$run_id" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name "$artifact" \
+                --dir target/publication-attestation
+              if RUN_ID="$run_id" VERSION="$version" ARTIFACT_NAME="$artifact" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("target/publication-attestation")
+          comparison_path = root / "rxls-release-reproducibility.json"
+          attestation_path = root / "rxls-release-candidate-attestation.json"
+          candidate_manifest_path = root / "rxls-release-candidate-manifest.json"
+          comparison_bytes = comparison_path.read_bytes()
+          candidate_manifest_bytes = candidate_manifest_path.read_bytes()
+          comparison = json.loads(comparison_bytes)
+          attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+          expected_sha = os.environ["GITHUB_SHA"].lower()
+          expected_version = os.environ["VERSION"]
+          if comparison.get("schema") != "rxls.release-reproducibility.v1":
+              raise SystemExit("unexpected comparison schema")
+          if comparison.get("passed") is not True or comparison.get("errors") != []:
+              raise SystemExit("comparison evidence did not pass cleanly")
+          if comparison.get("git_rev") != expected_sha or comparison.get("version") != expected_version:
+              raise SystemExit("comparison evidence targets a different release")
+          if attestation.get("schema") != "rxls.release-candidate-attestation.v1":
+              raise SystemExit("unexpected candidate attestation schema")
+          if attestation.get("git_rev") != expected_sha or attestation.get("version") != expected_version:
+              raise SystemExit("candidate attestation targets a different release")
+          if attestation.get("repository") != os.environ["GITHUB_REPOSITORY"]:
+              raise SystemExit("candidate attestation targets a different repository")
+          if attestation.get("comparison_run_id") != int(os.environ["RUN_ID"]):
+              raise SystemExit("candidate attestation is detached from its immutable artifact run")
+          comparison_run_attempt = attestation.get("comparison_run_attempt")
+          if type(comparison_run_attempt) is not int or comparison_run_attempt < 1:
+              raise SystemExit("candidate attestation has an invalid comparison attempt")
+          expected_artifact = (
+              f"rxls-{expected_version}-reproducibility-{expected_sha}-"
+              f"{comparison_run_attempt}"
+          )
+          if os.environ["ARTIFACT_NAME"] != expected_artifact:
+              raise SystemExit("candidate attestation is detached from its attempt artifact")
+          baseline_run_id = attestation.get("baseline_run_id")
+          if type(baseline_run_id) is not int or baseline_run_id == int(os.environ["RUN_ID"]):
+              raise SystemExit("candidate attestation does not identify a distinct baseline run")
+          baseline_run_attempt = attestation.get("baseline_run_attempt")
+          if type(baseline_run_attempt) is not int or baseline_run_attempt < 1:
+              raise SystemExit("candidate attestation has an invalid baseline attempt")
+          record = attestation.get("comparison")
+          if not isinstance(record, dict):
+              raise SystemExit("candidate attestation has no comparison record")
+          if record.get("name") != comparison_path.name or record.get("bytes") != len(comparison_bytes):
+              raise SystemExit("candidate attestation comparison metadata is invalid")
+          if record.get("sha256") != hashlib.sha256(comparison_bytes).hexdigest():
+              raise SystemExit("candidate attestation comparison digest is invalid")
+          manifest_record = attestation.get("release_manifest")
+          if not isinstance(manifest_record, dict):
+              raise SystemExit("candidate attestation has no release-manifest record")
+          if manifest_record.get("name") != candidate_manifest_path.name:
+              raise SystemExit("candidate attestation release-manifest name is invalid")
+          if manifest_record.get("bytes") != len(candidate_manifest_bytes):
+              raise SystemExit("candidate attestation release-manifest size is invalid")
+          manifest_digest = manifest_record.get("sha256")
+          if manifest_digest != hashlib.sha256(candidate_manifest_bytes).hexdigest():
+              raise SystemExit("candidate attestation release-manifest digest is invalid")
+          Path("target/publication-attestation/baseline-run-id").write_text(
+              str(baseline_run_id), encoding="utf-8"
+          )
+          Path("target/publication-attestation/baseline-run-attempt").write_text(
+              str(baseline_run_attempt), encoding="utf-8"
+          )
+          Path("target/publication-attestation/comparison-run-attempt").write_text(
+              str(comparison_run_attempt), encoding="utf-8"
+          )
+          PY
+              then
+                selected_attempt=$(cat target/publication-attestation/comparison-run-attempt)
+                current_attempt=$(gh api \
+                  "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .run_attempt)
+                [[ "$current_attempt" == "$selected_attempt" ]] || continue
+                selected_run="$run_id"
+                selected_baseline=$(cat target/publication-attestation/baseline-run-id)
+                selected_baseline_attempt=$(cat target/publication-attestation/baseline-run-attempt)
+                break 2
+              fi
+            done
+          done
+          [[ -n "$selected_run" && -n "$selected_attempt" && \
+            -n "$selected_baseline" && -n "$selected_baseline_attempt" ]] || {
+            echo "no valid immutable two-candidate attestation exists for $GITHUB_SHA" >&2
+            exit 1
+          }
+          baseline_sha=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$selected_baseline" --jq .head_sha)
+          baseline_event=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$selected_baseline" --jq .event)
+          baseline_conclusion=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$selected_baseline" --jq .conclusion)
+          baseline_path=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$selected_baseline" --jq .path)
+          baseline_attempt=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$selected_baseline" --jq .run_attempt)
+          [[ "$baseline_sha" == "$GITHUB_SHA" && \
+            "$baseline_event" == "workflow_dispatch" && \
+            "$baseline_conclusion" == "success" && \
+            "$baseline_path" == ".github/workflows/release.yml" && \
+            "$baseline_attempt" == "$selected_baseline_attempt" ]] || {
+            echo "attested baseline run is not a successful exact-SHA verification run" >&2
+            exit 1
+          }
+          rm -rf target/attested-candidate-release
+          mkdir -p target/attested-candidate-release
+          gh run download "$selected_run" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "rxls-${version}-release-${selected_attempt}" \
+            --dir target/attested-candidate-release
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt target/attested-candidate-release/release-cargo-publish-dry-run.json
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
+          VERSION="$version" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          attestation = json.loads(
+              Path("target/publication-attestation/rxls-release-candidate-attestation.json")
+              .read_text(encoding="utf-8")
+          )
+          manifest_path = Path(
+              "target/attested-candidate-release/rxls-release-manifest.json"
+          )
+          manifest_bytes = manifest_path.read_bytes()
+          candidate_manifest_bytes = Path(
+              "target/publication-attestation/rxls-release-candidate-manifest.json"
+          ).read_bytes()
+          if candidate_manifest_bytes != manifest_bytes:
+              raise SystemExit("attested candidate manifest copy differs from release artifact")
+          record = attestation["release_manifest"]
+          if record.get("bytes") != len(manifest_bytes):
+              raise SystemExit("attested candidate release-manifest size differs")
+          if record.get("sha256") != hashlib.sha256(manifest_bytes).hexdigest():
+              raise SystemExit("attested candidate release-manifest digest differs")
+          manifest = json.loads(manifest_bytes)
+          if manifest.get("version") != os.environ["VERSION"]:
+              raise SystemExit("attested candidate release-manifest version differs")
+          if manifest.get("git_rev") != os.environ["GITHUB_SHA"].lower():
+              raise SystemExit("attested candidate release-manifest revision differs")
+          PY
+          python3 scripts/release_manifest.py \
+            --verify-bundle target/attested-candidate-release \
+            --expected-files 48 \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA"
+          python3 scripts/compare_release_bundles.py \
+            target/attested-candidate-release dist \
+            --output target/publication-attestation/rxls-tag-release-comparison.json
+          echo "publication authorized by candidate runs $selected_baseline and $selected_run; tag bundle matches the attested candidate"
+
+      - name: Bind publication provenance into release manifest
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          cp target/publication-attestation/rxls-release-candidate-manifest.json dist/
+          cp target/publication-attestation/rxls-release-reproducibility.json dist/
+          cp target/publication-attestation/rxls-release-candidate-attestation.json dist/
+          cp target/publication-attestation/rxls-tag-release-comparison.json dist/
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt dist/release-cargo-publish-dry-run.json
+          python3 scripts/public_hygiene_audit.py --json dist \
+            > target/release-public-hygiene-publication.json
+          cp target/release-public-hygiene-publication.json dist/public-hygiene.json
+          mapfile -t artifacts < <(find dist -maxdepth 1 -type f \
+            ! -name rxls-release-manifest.json \
+            ! -name public-hygiene.json -print | LC_ALL=C sort)
+          [[ ${#artifacts[@]} -eq 50 ]] || {
+            echo "publication manifest input count differs from the 0.1.3 contract" >&2
+            exit 1
+          }
+          python3 scripts/release_manifest.py \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA" \
+            --hygiene-report dist/public-hygiene.json \
+            --output dist/rxls-release-manifest.json \
+            "${artifacts[@]}"
+          python3 scripts/release_manifest.py \
+            --verify-bundle dist \
+            --expected-files 52 \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA"
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          version="${{ steps.release.outputs.version }}"
+          url="https://crates.io/api/v1/crates/rxls/${version}"
+          local_checksum=$(sha256sum "dist/rxls-${version}.crate" | cut -d ' ' -f 1)
+          status=$(curl --retry 3 --retry-all-errors -sS -o /tmp/crates-response.json \
+            -w "%{http_code}" -A "rxls-release-ci (GitHub Actions)" "$url")
+          case "$status" in
+            200)
+              echo "rxls ${version} is already published; skipping"
+              ;;
+            404)
+              cargo publish --locked --registry crates-io
+              ;;
+            *)
+              echo "crates.io version check failed with HTTP $status" >&2
+              cat /tmp/crates-response.json >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$status" == "404" ]]; then
+            for attempt in $(seq 1 12); do
+              sleep 5
+              status=$(curl --retry 3 --retry-all-errors -sS \
+                -o /tmp/crates-response.json -w "%{http_code}" \
+                -A "rxls-release-ci (GitHub Actions)" "$url")
+              [[ "$status" == "200" ]] && break
+              [[ "$status" == "404" ]] || {
+                echo "crates.io checksum lookup failed with HTTP $status" >&2
+                exit 1
+              }
+            done
+          fi
+          [[ "$status" == "200" ]] || {
+            echo "published version did not appear in the crates.io API" >&2
+            exit 1
+          }
+          remote_checksum=$(python3 -c "import json; print(json.load(open('/tmp/crates-response.json', encoding='utf-8'))['version']['checksum'])")
+          [[ "$remote_checksum" == "$local_checksum" ]] || {
+            echo "crates.io checksum does not match release evidence" >&2
+            echo "local=$local_checksum remote=$remote_checksum" >&2
+            exit 1
+          }
+
+      - name: Smoke published crates.io distribution
+        id: registry_distribution_smoke
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          passed=false
+          for attempt in $(seq 1 12); do
+            if python3 scripts/smoke_crate_distribution.py \
+              --registry-version 0.1.3 \
+              --write-report target/release-crates-io-distribution-smoke.json; then
+              passed=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$passed" == "true" ]]
+
+      - name: Upload published crates.io distribution evidence
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-0.1.3-crates-io-smoke-${{ github.run_attempt }}
+          path: target/release-crates-io-distribution-smoke.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Create or update GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          python3 scripts/reconcile_github_release.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$tag" \
+            --target-commitish "$GITHUB_SHA" \
+            --dist dist \
+            --expected-files 52 \
+            --token-env GH_TOKEN
+
+      - name: Verify published crate, WASM, docs, assets, and checksums
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release.outputs.version }}"
+          tag="$GITHUB_REF_NAME"
+          smoke=$(mktemp -d)
+          trap 'rm -rf "$smoke"' EXIT
+          mkdir -p "$smoke/project/src" "$smoke/cargo-home" "$smoke/assets"
+          cat > "$smoke/project/Cargo.toml" <<EOF
+          [package]
+          name = "rxls-published-smoke"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          rxls = "=$version"
+          EOF
+          cat > "$smoke/project/src/main.rs" <<'EOF'
+          use rxls::{Cell, Workbook};
+
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let mut authored = Workbook::new();
+              authored.add_sheet("Smoke").write(0, 0, "published");
+              let bytes = authored.to_xlsx_checked()?;
+              let reopened = Workbook::open(&bytes)?;
+              assert_eq!(
+                  reopened.sheets[0].cell(0, 0),
+                  Some(&Cell::Text("published".into()))
+              );
+              Ok(())
+          }
+          EOF
+
+          smoke_passed=false
+          for attempt in $(seq 1 18); do
+            if CARGO_HOME="$smoke/cargo-home" cargo run --quiet \
+              --manifest-path "$smoke/project/Cargo.toml"; then
+              smoke_passed=true
+              break
+            fi
+            sleep 10
+          done
+          [[ "$smoke_passed" == "true" ]] || {
+            echo "published-crate smoke did not pass after registry propagation window" >&2
+            exit 1
+          }
+
+          docs_ready=false
+          for attempt in $(seq 1 30); do
+            status=$(curl --retry 3 --retry-all-errors -sS -o /dev/null \
+              -w "%{http_code}" "https://docs.rs/rxls/$version/rxls/")
+            if [[ "$status" == "200" ]]; then
+              docs_ready=true
+              break
+            fi
+            sleep 20
+          done
+          [[ "$docs_ready" == "true" ]] || {
+            echo "docs.rs did not publish rxls $version within the verification window" >&2
+            exit 1
+          }
+
+          gh release download "$tag" --dir "$smoke/assets"
+          python3 scripts/check_cargo_publish_dry_run.py verify \
+            --manifest Cargo.toml \
+            --git-sha "$GITHUB_SHA" \
+            --receipt "$smoke/assets/release-cargo-publish-dry-run.json"
+          python3 scripts/release_manifest.py \
+            --verify-bundle "$smoke/assets" \
+            --expected-files 52 \
+            --version "$version" \
+            --git-rev "$GITHUB_SHA"
+          (cd "$smoke/assets" && sha256sum --check ./*.sha256)
+
+          mkdir -p "$smoke/wasm-consumer"
+          (
+            cd "$smoke/wasm-consumer"
+            npm init --yes >/dev/null
+            npm install --ignore-scripts --no-audit --no-fund \
+              "$smoke/assets/rxls-wasm-$version.tgz"
+            RXLS_SMOKE_FIXTURE="$GITHUB_WORKSPACE/tests/fixtures/xlsx/reader-structural.xlsx" \
+              node <<'JS'
+          "use strict";
+
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const { extractText, maxInputBytes, reportJson } = require("rxls-wasm");
+
+          assert.equal(maxInputBytes(), 32 * 1024 * 1024);
+          const bytes = fs.readFileSync(process.env.RXLS_SMOKE_FIXTURE);
+          assert.match(extractText(bytes), /item\tamount\tok/);
+          const report = JSON.parse(reportJson(bytes));
+          assert.equal(report.schema_version, 2);
+          assert.equal(report.format, "xlsx");
+          assert.ok(report.stats.sheets > 0);
+          JS
+            node "$GITHUB_WORKSPACE/bindings/wasm/tests/browser-smoke.mjs" \
+              "$smoke/wasm-consumer/node_modules/rxls-wasm" \
+              "$GITHUB_WORKSPACE/target/wasm-native-report.json"
+          )

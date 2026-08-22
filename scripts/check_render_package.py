@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Validate the publishable @rxls/render-worker npm artifact."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sys
+import tarfile
+import tomllib
+
+
+PACKAGE_NAME = "@rxls/render-worker"
+CRATE_NAME = "rxls-render-wasm"
+REPOSITORY_URL = "git+https://github.com/HyunjoJung/rxls.git"
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024
+MAX_UNPACKED_BYTES = 5 * 1024 * 1024
+MAX_WASM_BYTES = 4 * 1024 * 1024
+MAX_JAVASCRIPT_BYTES = 128 * 1024
+MAX_NOTICE_BYTES = 512 * 1024
+NOTICE_NAME = "THIRD_PARTY_NOTICES.txt"
+EXPECTED_FILES = frozenset(
+    {
+        "LICENSE",
+        "README.md",
+        NOTICE_NAME,
+        "js/client.mjs",
+        "js/protocol.mjs",
+        "js/worker-runtime.mjs",
+        "js/worker.mjs",
+        "package.json",
+        "pkg/rxls_render_wasm.d.ts",
+        "pkg/rxls_render_wasm.js",
+        "pkg/rxls_render_wasm_bg.wasm",
+        "pkg/rxls_render_wasm_bg.wasm.d.ts",
+    }
+)
+EXPECTED_EXPORTS = {
+    ".": "./js/client.mjs",
+    "./protocol": "./js/protocol.mjs",
+    "./worker-runtime": "./js/worker-runtime.mjs",
+    "./worker": "./js/worker.mjs",
+}
+SEMVER_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_json(path: Path, errors: list[str], label: str) -> dict:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        errors.append(f"invalid {label}: {error}")
+        return {}
+    if not isinstance(document, dict):
+        errors.append(f"{label} must contain a JSON object")
+        return {}
+    return document
+
+
+def _metadata_errors(metadata: dict, crate_version: str | None) -> list[str]:
+    errors: list[str] = []
+    version = metadata.get("version")
+    if metadata.get("name") != PACKAGE_NAME:
+        errors.append(f"package name must be {PACKAGE_NAME}")
+    if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
+        errors.append("package version must be valid SemVer")
+    if crate_version is not None and version != crate_version:
+        errors.append("npm and render-WASM crate versions must match")
+    if metadata.get("private") is True:
+        errors.append("package must remain publishable")
+    if metadata.get("type") != "module":
+        errors.append("package must remain an ES module")
+    if metadata.get("license") != "MIT":
+        errors.append("package license must be MIT")
+    if metadata.get("repository") != {
+        "type": "git",
+        "url": REPOSITORY_URL,
+        "directory": "bindings/render-wasm",
+    }:
+        errors.append("package repository metadata must identify its public source directory")
+    if metadata.get("publishConfig") != {"access": "public", "provenance": True}:
+        errors.append("package must require public access and npm provenance")
+    if metadata.get("files") != [
+        "js/",
+        "pkg/",
+        "README.md",
+        "LICENSE",
+        NOTICE_NAME,
+    ]:
+        errors.append(
+            "package files must list exactly the worker, WASM, README, and legal assets"
+        )
+    if metadata.get("exports") != EXPECTED_EXPORTS:
+        errors.append("package exports must expose only the bounded worker API")
+    if metadata.get("engines") != {"node": ">=20"}:
+        errors.append("package Node floor must remain explicit")
+    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
+        if metadata.get(field) not in (None, {}):
+            errors.append(f"package must remain free of {field}")
+    return errors
+
+
+def _safe_archive_name(name: str) -> str | None:
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        return None
+    if path.parts[0] != "package" or len(path.parts) < 2:
+        return None
+    return PurePosixPath(*path.parts[1:]).as_posix()
+
+
+def _notice_errors(payload: bytes) -> tuple[list[str], dict[str, object] | None]:
+    errors: list[str] = []
+    if len(payload) > MAX_NOTICE_BYTES:
+        errors.append(
+            f"packed third-party notice is {len(payload)} bytes; budget is "
+            f"{MAX_NOTICE_BYTES}"
+        )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        return [f"packed third-party notice must be UTF-8: {error}"], None
+    if not text.startswith("RXLS RENDER WORKER THIRD-PARTY NOTICES\n"):
+        errors.append("packed third-party notice has an invalid title")
+    for required in (
+        "Generated by scripts/render_supply_chain.py. Do not edit manually.",
+        "- Manifest: bindings/render-wasm/Cargo.toml",
+        "- Target: wasm32-unknown-unknown",
+        "- Dependency edges: Cargo normal edges for the production target",
+    ):
+        if required not in text:
+            errors.append(f"packed third-party notice is missing: {required}")
+    if "file://" in text or re.search(r"/(?:Users|home)/[^/\s]+/", text):
+        errors.append("packed third-party notice contains a host path")
+
+    lock_match = re.search(r"^- Cargo lock SHA-256: ([0-9a-f]{64})$", text, re.MULTILINE)
+    package_count_match = re.search(
+        r"^- Third-party packages: ([1-9][0-9]*)$", text, re.MULTILINE
+    )
+    legal_count_match = re.search(
+        r"^- Unique legal texts: ([1-9][0-9]*)$", text, re.MULTILINE
+    )
+    if lock_match is None:
+        errors.append("packed third-party notice lacks a locked Cargo SHA-256")
+    if package_count_match is None:
+        errors.append("packed third-party notice lacks a positive package count")
+    if legal_count_match is None:
+        errors.append("packed third-party notice lacks a positive legal-text count")
+
+    package_ids = re.findall(
+        r"^PACKAGE: ([A-Za-z0-9_.-]+) ([^\s]+)$", text, re.MULTILINE
+    )
+    legal_digests = re.findall(
+        r"^LEGAL TEXT SHA-256: ([0-9a-f]{64})$", text, re.MULTILINE
+    )
+    referenced_digests = re.findall(
+        r"^- [A-Za-z0-9_.+/-]+: ([0-9a-f]{64})$", text, re.MULTILINE
+    )
+    if len(set(package_ids)) != len(package_ids):
+        errors.append("packed third-party notice repeats a package identity")
+    if len(set(legal_digests)) != len(legal_digests):
+        errors.append("packed third-party notice repeats a legal text identity")
+    if package_count_match is not None and int(package_count_match.group(1)) != len(
+        package_ids
+    ):
+        errors.append("packed third-party notice package count differs from its index")
+    if legal_count_match is not None and int(legal_count_match.group(1)) != len(
+        legal_digests
+    ):
+        errors.append("packed third-party notice legal-text count differs from its index")
+    for label in (
+        "Cargo source:",
+        "Declared license expression:",
+        "Registry archive SHA-256:",
+        "Legal files:",
+    ):
+        if text.count(label) != len(package_ids):
+            errors.append(f"packed third-party notice has an incomplete {label} index")
+    if set(referenced_digests) != set(legal_digests):
+        errors.append("packed third-party notice legal-file references are incomplete")
+    if text.count("----- BEGIN LEGAL TEXT -----") != len(legal_digests) or text.count(
+        "----- END LEGAL TEXT -----"
+    ) != len(legal_digests):
+        errors.append("packed third-party notice legal-text framing is incomplete")
+
+    summary: dict[str, object] | None = None
+    if lock_match is not None and package_count_match is not None and legal_count_match is not None:
+        summary = {
+            "cargo_lock_sha256": lock_match.group(1),
+            "packages": int(package_count_match.group(1)),
+            "legal_texts": int(legal_count_match.group(1)),
+            "sha256": _sha256_bytes(payload),
+        }
+    return errors, summary
+
+
+def validate(
+    package_root: Path,
+    archive: Path,
+    *,
+    git_rev: str | None = None,
+    compare_source_files: bool = True,
+) -> tuple[list[str], dict]:
+    errors: list[str] = []
+    package_root = package_root.resolve()
+    archive = archive.resolve()
+
+    crate_version: str | None = None
+    manifest_path = package_root / "Cargo.toml"
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        errors.append(f"invalid render-WASM Cargo.toml: {error}")
+    else:
+        package = manifest.get("package", {})
+        if package.get("name") != CRATE_NAME:
+            errors.append(f"render-WASM crate name must be {CRATE_NAME}")
+        version = package.get("version")
+        if isinstance(version, str):
+            crate_version = version
+        else:
+            errors.append("render-WASM crate version must be a string")
+        if package.get("publish") is not False:
+            errors.append("the implementation crate must remain excluded from crates.io")
+
+    source_metadata = _read_json(package_root / "package.json", errors, "package.json")
+    errors.extend(_metadata_errors(source_metadata, crate_version))
+    repository_license = package_root.parents[1] / "LICENSE"
+    package_license = package_root / "LICENSE"
+    if repository_license.is_file() and (
+        not package_license.is_file()
+        or package_license.read_bytes() != repository_license.read_bytes()
+    ):
+        errors.append("packed license must match the repository MIT license")
+
+    archive_record: dict[str, object] | None = None
+    files: dict[str, dict[str, object]] = {}
+    archive_metadata: dict = {}
+    notice_summary: dict[str, object] | None = None
+    if not archive.is_file():
+        errors.append(f"missing npm archive: {archive}")
+    else:
+        archive_bytes = archive.stat().st_size
+        archive_record = {
+            "name": archive.name,
+            "bytes": archive_bytes,
+            "sha256": _sha256(archive),
+        }
+        if archive_bytes > MAX_ARCHIVE_BYTES:
+            errors.append(
+                f"npm archive is {archive_bytes} bytes; budget is {MAX_ARCHIVE_BYTES}"
+            )
+        try:
+            with tarfile.open(archive, "r:gz") as package:
+                seen: set[str] = set()
+                total_unpacked = 0
+                for member in package.getmembers():
+                    if member.isdir():
+                        continue
+                    relative = _safe_archive_name(member.name)
+                    if relative is None:
+                        errors.append(f"npm archive contains an unsafe member: {member.name}")
+                        continue
+                    if not member.isfile():
+                        errors.append(f"npm archive contains a non-file member: {relative}")
+                        continue
+                    if relative in seen:
+                        errors.append(f"npm archive repeats file: {relative}")
+                        continue
+                    seen.add(relative)
+                    total_unpacked += member.size
+                    extracted = package.extractfile(member)
+                    if extracted is None:
+                        errors.append(f"npm archive file cannot be read: {relative}")
+                        continue
+                    data = extracted.read(MAX_UNPACKED_BYTES + 1)
+                    if len(data) != member.size:
+                        errors.append(f"npm archive file size differs: {relative}")
+                        continue
+                    files[relative] = {
+                        "bytes": len(data),
+                        "sha256": _sha256_bytes(data),
+                    }
+                    if compare_source_files:
+                        source_path = package_root / relative
+                        if not source_path.is_file():
+                            errors.append(f"missing packed source file: {relative}")
+                        elif source_path.read_bytes() != data:
+                            errors.append(f"packed file differs from source: {relative}")
+                    if relative == "package.json":
+                        try:
+                            archive_metadata = json.loads(data.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                            errors.append(f"invalid packed package.json: {error}")
+                    if relative == NOTICE_NAME:
+                        notice_errors, notice_summary = _notice_errors(data)
+                        errors.extend(notice_errors)
+                    if relative.endswith(".wasm"):
+                        if not data.startswith(b"\0asm"):
+                            errors.append(f"packed WebAssembly magic is invalid: {relative}")
+                        if len(data) > MAX_WASM_BYTES:
+                            errors.append(
+                                f"packed WebAssembly is {len(data)} bytes; budget is "
+                                f"{MAX_WASM_BYTES}"
+                            )
+                    if relative.endswith((".mjs", ".js")) and len(data) > MAX_JAVASCRIPT_BYTES:
+                        errors.append(
+                            f"packed JavaScript is {len(data)} bytes; budget is "
+                            f"{MAX_JAVASCRIPT_BYTES}: {relative}"
+                        )
+                if total_unpacked > MAX_UNPACKED_BYTES:
+                    errors.append(
+                        f"npm archive expands to {total_unpacked} bytes; budget is "
+                        f"{MAX_UNPACKED_BYTES}"
+                    )
+                for relative in sorted(EXPECTED_FILES - seen):
+                    errors.append(f"npm archive is missing file: {relative}")
+                for relative in sorted(seen - EXPECTED_FILES):
+                    errors.append(f"npm archive contains unexpected file: {relative}")
+        except (OSError, tarfile.TarError) as error:
+            errors.append(f"invalid npm archive: {error}")
+
+    if archive_metadata:
+        errors.extend(_metadata_errors(archive_metadata, crate_version))
+        if archive_metadata != source_metadata:
+            errors.append("packed package metadata differs from the reviewed source metadata")
+        version = archive_metadata.get("version")
+        expected_name = f"rxls-render-worker-{version}.tgz"
+        if archive.name != expected_name:
+            errors.append(f"npm archive name must be {expected_name}")
+
+    if git_rev is not None and re.fullmatch(r"[0-9a-f]{40}", git_rev) is None:
+        errors.append("git revision must be a lowercase 40-character SHA")
+
+    report = {
+        "schema": "rxls.render-worker-package.v1",
+        "package": {
+            "name": source_metadata.get("name"),
+            "version": source_metadata.get("version"),
+        },
+        "git_rev": git_rev,
+        "budgets": {
+            "archive_bytes": MAX_ARCHIVE_BYTES,
+            "unpacked_bytes": MAX_UNPACKED_BYTES,
+            "wasm_bytes": MAX_WASM_BYTES,
+            "javascript_bytes_per_file": MAX_JAVASCRIPT_BYTES,
+            "third_party_notice_bytes": MAX_NOTICE_BYTES,
+        },
+        "third_party_notice": notice_summary,
+        "files": dict(sorted(files.items())),
+        "archive": archive_record,
+        "passed": not errors,
+    }
+    return errors, report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("package_root", type=Path)
+    parser.add_argument("--archive", required=True, type=Path)
+    parser.add_argument("--git-rev")
+    parser.add_argument("--archive-only", action="store_true")
+    parser.add_argument("--write-report", type=Path)
+    args = parser.parse_args()
+
+    errors, report = validate(
+        args.package_root,
+        args.archive,
+        git_rev=args.git_rev,
+        compare_source_files=not args.archive_only,
+    )
+    if args.write_report is not None:
+        args.write_report.parent.mkdir(parents=True, exist_ok=True)
+        args.write_report.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    if errors:
+        for error in errors:
+            print(f"render package: {error}", file=sys.stderr)
+        return 1
+    print(
+        "render package: "
+        f"name={report['package']['name']} version={report['package']['version']} "
+        f"files={len(report['files'])} budgets=ok"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
