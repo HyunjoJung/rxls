@@ -1,0 +1,15 @@
+# OSS-Fuzz project config for `rxls` (submission-ready).
+#
+# rxls is a native-Rust Microsoft Excel reader (.xls / .xlsx / .xlsb) + .xlsx
+# author. It parses untrusted binary/zip input in-process, so it is a natural
+# fuzz target. Live submission to https://github.com/google/oss-fuzz is gated on
+# eligibility (real-world usage); this directory mirrors the expected layout so
+# submission is one PR away. See build.sh / Dockerfile.
+homepage: "https://github.com/HyunjoJung/rxls"
+language: rust
+main_repo: "https://github.com/HyunjoJung/rxls"
+primary_contact: "j96263732@gmail.com"
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer

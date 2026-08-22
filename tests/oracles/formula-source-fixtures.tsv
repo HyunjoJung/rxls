@@ -1,0 +1,11 @@
+# dialect	rgce_hex	rgb_extra_hex	base_row	base_col	expected_source	provenance
+biff5	17036f6c64	-	0	0	"old"	BIFF5 legacy PtgStr layout
+biff8	2400000000	-	0	0	$A$1	MS-XLS PtgRef absolute row and column
+biff8	2400000080	-	4	0	$A1	MS-XLS RgceLoc stores coordinates with a relative row marker
+biff8	2400000040	-	0	2	A$1	MS-XLS RgceLoc stores coordinates with a relative column marker
+biff8	2cffffffff	-	5	2	B5	MS-XLS PtgRefN RgceLocRel signed relative offsets
+biff8	1e0500211800	-	0	0	ABS(5)	MS-XLS Ftab id 24
+biff8	1e050019100000	-	0	0	SUM(5)	MS-XLS PtgAttrSum
+biff8	2000000000000000	01000001000000000000f03f010000000000000040	0	0	{1,2}	MS-XLS PtgArray and PtgExtraArray
+biff12	24040000000200	-	0	0	$C$5	MS-XLSB PtgRef widened row
+biff12	212200	-	0	0	TRUE()	MS-XLSB Ftab id 34

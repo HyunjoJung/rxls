@@ -1,0 +1,35 @@
+[graph]
+all-features = true
+
+[advisories]
+# These notices report maintenance status, not a vulnerability, and provide no
+# safe upgrade. Keep the exact IDs visible while the rendering stack retains
+# rustybuzz/ttf-parser for deterministic shaping and font inspection.
+ignore = [
+  "RUSTSEC-2026-0192",
+  "RUSTSEC-2026-0206",
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
