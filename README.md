@@ -1,6 +1,7 @@
 # rxls
 
-[Korean README](README.ko.md)
+[![English](https://img.shields.io/badge/Language-English-1D5FBF.svg)](README.md)
+[![Korean](https://img.shields.io/badge/Language-%ED%95%9C%EA%B5%AD%EC%96%B4-0F766E.svg)](README.ko.md)
 
 **A native Rust spreadsheet toolkit.** Reads `.xls`, `.xlsx`, `.xlsb`, and `.ods`
 into one typed cell model, writes styled `.xlsx`, and edits `.xlsx`/`.xlsm` in

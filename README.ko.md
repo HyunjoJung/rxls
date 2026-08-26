@@ -1,6 +1,7 @@
 # rxls
 
-[English README](README.md)
+[![English](https://img.shields.io/badge/Language-English-1D5FBF.svg)](README.md)
+[![한국어](https://img.shields.io/badge/Language-%ED%95%9C%EA%B5%AD%EC%96%B4-0F766E.svg)](README.ko.md)
 
 **네이티브 Rust 스프레드시트 툴킷.** `.xls`, `.xlsx`, `.xlsb`, `.ods`를 하나의
 typed cell 모델로 읽고, 서식이 적용된 `.xlsx`를 생성하며, 패키지의 나머지
