@@ -44,7 +44,7 @@ fn main() {
     sheet.write_url(2, 0, "https://example.com/reports/2026-07", "7월 운영 현황");
     sheet.write(2, 1, "데이터팀");
     sheet.write_styled(2, 2, 150_000_000.0, &won);
-    sheet.write_styled(2, 3, Cell::date(46_000.0), &date);
+    sheet.write_styled(2, 3, Cell::date(46_234.0), &date); // 2026-07-31
     sheet.write(2, 4, "검토 완료");
 
     // Layout: column widths, frozen header, autofilter over the table.
