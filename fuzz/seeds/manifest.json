@@ -46,7 +46,7 @@
     {
       "id": "reader-xls-biff8",
       "name": "reader-basic.xls",
-      "sha256": "85c305746d22d202744b7c26e5a0218f739a152dbe3f4fa8e909c095d9915dda",
+      "sha256": "cc34ecc31ee34c2d88ffdf12bf9ac7ed43480767c183da25cd17f3d1a45f9cd6",
       "source": "tests/fixtures/xls/reader-basic.xls"
     },
     {
