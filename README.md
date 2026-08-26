@@ -1,5 +1,7 @@
 # rxls
 
+[Korean README](README.ko.md)
+
 **A native Rust spreadsheet toolkit.** Reads `.xls`, `.xlsx`, `.xlsb`, and `.ods`
 into one typed cell model, writes styled `.xlsx`, and edits `.xlsx`/`.xlsm` in
 place without disturbing the rest of the package.
@@ -45,11 +47,11 @@ bound to one exact revision.
 
 ## Demo and architecture
 
-[![rxls 2026 OSS contest demo](.github/assets/rxls-demo-thumbnail.png)](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.mp4)
+[![rxls 2026 OSS contest demo](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/_z8tUe4a1Ho)
 
-The [2:49 exact-release demo](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.mp4)
+The [2:49 exact-release demo](https://youtu.be/_z8tUe4a1Ho)
 runs the real `rxls` CLI against a BIFF5/cp949 workbook, opens all four formats
-through the common model, generates a styled Korean-language operations report, and
+through the common model, generates a styled operations report, and
 reopens that report with `openpyxl 3.1.5`. Reader commands use the exact `v0.1.3`
 CLI at [`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814);
 the tracked report driver calls the library from that same checkout.
@@ -94,14 +96,14 @@ formats when their Cargo features are enabled (`features = ["full"]`).
 use rxls::{Cell, CellStyle, HAlign, Workbook};
 
 let mut wb = Workbook::new();
-let sheet = wb.add_sheet("운영보고서");
+let sheet = wb.add_sheet("Operations Report");
 
 let header = CellStyle::new().bold().fill([0xDD, 0xEB, 0xF7]).align(HAlign::Center).wrap();
-sheet.write_styled(0, 0, "항목", &header);
-sheet.write_styled(0, 1, "금액", &header);
+sheet.write_styled(0, 0, "Item", &header);
+sheet.write_styled(0, 1, "Amount", &header);
 
-sheet.write_url(1, 0, "https://example.com/reports/2026-07", "7월 운영 현황");
-sheet.write_styled(1, 1, 150_000_000.0, &CellStyle::new().num_fmt("₩#,##0"));
+sheet.write_url(1, 0, "https://example.com/reports/2026-07", "July operations");
+sheet.write_styled(1, 1, 150_000_000.0, &CellStyle::new().num_fmt("$#,##0"));
 
 sheet.set_col_width(0, 42.0);
 sheet.freeze_panes(1, 0);
