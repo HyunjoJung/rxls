@@ -47,7 +47,7 @@ bound to one exact revision.
 
 ## Demo and architecture
 
-[![rxls 2026 OSS contest demo](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/_z8tUe4a1Ho)
+[![rxls 2026 OSS contest demo](.github/assets/rxls-demo-thumbnail-en.png)](https://youtu.be/_z8tUe4a1Ho)
 
 The [2:49 exact-release demo](https://youtu.be/_z8tUe4a1Ho)
 runs the real `rxls` CLI against a BIFF5/cp949 workbook, opens all four formats
@@ -61,7 +61,7 @@ the tracked report driver calls the library from that same checkout.
 [independent decode/audio/privacy QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.json) ·
 [media release](https://github.com/HyunjoJung/rxls/releases/tag/oss-contest-2026-demo)
 
-![rxls architecture: untrusted bytes through bounded format parsers into one typed model and public surfaces](.github/assets/rxls-architecture.png)
+![rxls architecture: untrusted bytes through bounded format parsers into one typed model and public surfaces](.github/assets/rxls-architecture-en.png)
 
 The contest media release is deliberately separate from the immutable
 `v0.1.3` 52-asset release-evidence bundle.
