@@ -5927,7 +5927,7 @@ mod tests {
         }
         hlink.extend_from_slice(&wstr("rId2"));
         hlink.extend_from_slice(&wstr(""));
-        hlink.extend_from_slice(&wstr("Open bid"));
+        hlink.extend_from_slice(&wstr("Open report"));
         hlink.extend_from_slice(&wstr(""));
         let sheet = rec(0x01EE, &hlink);
 
@@ -7081,7 +7081,7 @@ mod tests {
         let wb_bin = rec(BRT_BUNDLE_SH, &wb_bin);
 
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.bin"/></Relationships>"#;
-        let core = r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"><dc:title>Binary Report</dc:title><dc:subject>Procurement</dc:subject><dc:creator>rxls xlsb</dc:creator><cp:keywords>bid,binary</cp:keywords><dc:description>XLSB public metadata</dc:description><cp:lastModifiedBy>reviewer</cp:lastModifiedBy><dcterms:created>2026-06-24T01:02:03Z</dcterms:created></cp:coreProperties>"#;
+        let core = r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"><dc:title>Binary Report</dc:title><dc:subject>Operations</dc:subject><dc:creator>rxls xlsb</dc:creator><cp:keywords>ops,binary</cp:keywords><dc:description>XLSB public metadata</dc:description><cp:lastModifiedBy>reviewer</cp:lastModifiedBy><dcterms:created>2026-06-24T01:02:03Z</dcterms:created></cp:coreProperties>"#;
         let app = r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Excel</Application><Company>ACME XLSB</Company></Properties>"#;
 
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -7100,9 +7100,9 @@ mod tests {
         let wb = Workbook::open(&zw.finish().unwrap().into_inner()).unwrap();
         let metadata = wb.metadata();
         assert_eq!(metadata.properties.title.as_deref(), Some("Binary Report"));
-        assert_eq!(metadata.properties.subject.as_deref(), Some("Procurement"));
+        assert_eq!(metadata.properties.subject.as_deref(), Some("Operations"));
         assert_eq!(metadata.properties.creator.as_deref(), Some("rxls xlsb"));
-        assert_eq!(metadata.properties.keywords.as_deref(), Some("bid,binary"));
+        assert_eq!(metadata.properties.keywords.as_deref(), Some("ops,binary"));
         assert_eq!(
             metadata.properties.description.as_deref(),
             Some("XLSB public metadata")

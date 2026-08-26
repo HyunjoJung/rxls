@@ -14704,7 +14704,7 @@ mod tests {
             ),
             (
                 "docProps/core.xml",
-                r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"><dc:title>Quarterly Report</dc:title><dc:subject>Procurement</dc:subject><dc:creator>rxls reader</dc:creator><cp:keywords>bid,report</cp:keywords><dc:description>Public bid report</dc:description><cp:lastModifiedBy>reviewer</cp:lastModifiedBy><dcterms:created>2024-01-02T03:04:05Z</dcterms:created></cp:coreProperties>"#,
+                r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"><dc:title>Quarterly Report</dc:title><dc:subject>Operations</dc:subject><dc:creator>rxls reader</dc:creator><cp:keywords>ops,report</cp:keywords><dc:description>Quarterly operations report</dc:description><cp:lastModifiedBy>reviewer</cp:lastModifiedBy><dcterms:created>2024-01-02T03:04:05Z</dcterms:created></cp:coreProperties>"#,
             ),
             (
                 "docProps/app.xml",
@@ -14720,12 +14720,12 @@ mod tests {
         let wb = Workbook::open(&bytes).unwrap();
 
         assert_eq!(wb.properties.title.as_deref(), Some("Quarterly Report"));
-        assert_eq!(wb.properties.subject.as_deref(), Some("Procurement"));
+        assert_eq!(wb.properties.subject.as_deref(), Some("Operations"));
         assert_eq!(wb.properties.creator.as_deref(), Some("rxls reader"));
-        assert_eq!(wb.properties.keywords.as_deref(), Some("bid,report"));
+        assert_eq!(wb.properties.keywords.as_deref(), Some("ops,report"));
         assert_eq!(
             wb.properties.description.as_deref(),
-            Some("Public bid report")
+            Some("Quarterly operations report")
         );
         assert_eq!(wb.properties.last_modified_by.as_deref(), Some("reviewer"));
         assert_eq!(

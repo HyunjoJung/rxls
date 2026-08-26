@@ -1616,7 +1616,7 @@ fn committed_xls_fixture_exposes_legacy_reader_surface() {
     assert_eq!(sheet.cell(0, 1), Some(&Cell::Text("amount".into())));
     assert_eq!(sheet.cell(1, 0), Some(&Cell::Text("road".into())));
     assert_eq!(sheet.cell(1, 1), Some(&Cell::Number(42.0)));
-    assert_eq!(sheet.cell(2, 0), Some(&Cell::Text("입찰공고".into())));
+    assert_eq!(sheet.cell(2, 0), Some(&Cell::Text("업무보고".into())));
     assert_eq!(sheet.cell(2, 1), Some(&Cell::Date(45366.0)));
     assert_eq!(sheet.formatted(2, 1), Some("2024-03-15"));
     assert_eq!(sheet.merged_ranges(), &[(3, 0, 3, 2)]);
@@ -4621,7 +4621,7 @@ fn authoring_handles_empty_sheet_and_long_unicode() {
 
     let mut wb = Workbook::new();
     wb.add_sheet("빈"); // empty sheet — no cells
-    let long = "조달청".repeat(400); // 1200 chars
+    let long = "데이터".repeat(400); // 1200 chars
     wb.add_sheet("긴글").write(0, 0, long.as_str());
 
     let reread = Workbook::open(&wb.to_xlsx()).expect("reopen");
@@ -4900,7 +4900,7 @@ fn doc_properties_authoring_helpers_accept_owned_text() {
     wb.set_properties(
         DocProperties::new()
             .with_title(String::from("Owned Report"))
-            .with_subject(String::from("Procurement"))
+            .with_subject(String::from("Operations"))
             .with_creator(String::from("rxls author"))
             .with_keywords(String::from("owned,metadata"))
             .with_description(String::from("Owned workbook description"))
@@ -4910,7 +4910,7 @@ fn doc_properties_authoring_helpers_accept_owned_text() {
     );
 
     assert_eq!(wb.properties.title.as_deref(), Some("Owned Report"));
-    assert_eq!(wb.properties.subject.as_deref(), Some("Procurement"));
+    assert_eq!(wb.properties.subject.as_deref(), Some("Operations"));
     assert_eq!(wb.properties.creator.as_deref(), Some("rxls author"));
     assert_eq!(wb.properties.keywords.as_deref(), Some("owned,metadata"));
     assert_eq!(
@@ -4930,7 +4930,7 @@ fn doc_properties_authoring_helpers_accept_owned_text() {
     let back = Workbook::open(&bytes).expect("reopen metadata helper workbook");
     let properties = back.metadata().properties;
     assert_eq!(properties.title.as_deref(), Some("Owned Report"));
-    assert_eq!(properties.subject.as_deref(), Some("Procurement"));
+    assert_eq!(properties.subject.as_deref(), Some("Operations"));
     assert_eq!(properties.creator.as_deref(), Some("rxls author"));
     assert_eq!(properties.keywords.as_deref(), Some("owned,metadata"));
     assert_eq!(
@@ -6804,7 +6804,7 @@ fn range_deserializer_can_select_later_header_row() {
     let mut wb = Workbook::new();
     {
         let s = wb.add_sheet("Data");
-        s.write(0, 0, "Bid export");
+        s.write(0, 0, "Monthly export");
         s.write(1, 0, "generated metadata");
         s.write(2, 1, "price");
         s.write(2, 2, "name");

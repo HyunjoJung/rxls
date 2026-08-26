@@ -49,10 +49,10 @@ bound to one exact revision.
 
 The [2:49 exact-release demo](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.mp4)
 runs the real `rxls` CLI against a BIFF5/cp949 workbook, opens all four formats
-through the common model, generates a styled Korean procurement report, and
-reopens that report with `openpyxl 3.1.5`. Every command is executed from
-[`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814),
-the exact `v0.1.3` source.
+through the common model, generates a styled Korean-language operations report, and
+reopens that report with `openpyxl 3.1.5`. Reader commands use the exact `v0.1.3`
+CLI at [`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814);
+the tracked report driver calls the library from that same checkout.
 
 [Korean captions](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.ko.srt) ·
 [build receipt](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.json) ·
@@ -94,13 +94,13 @@ formats when their Cargo features are enabled (`features = ["full"]`).
 use rxls::{Cell, CellStyle, HAlign, Workbook};
 
 let mut wb = Workbook::new();
-let sheet = wb.add_sheet("입찰공고");
+let sheet = wb.add_sheet("운영보고서");
 
 let header = CellStyle::new().bold().fill([0xDD, 0xEB, 0xF7]).align(HAlign::Center).wrap();
-sheet.write_styled(0, 0, "공고명", &header);
-sheet.write_styled(0, 1, "추정가격", &header);
+sheet.write_styled(0, 0, "항목", &header);
+sheet.write_styled(0, 1, "금액", &header);
 
-sheet.write_url(1, 0, "https://www.g2b.go.kr/...", "뉴미디어 콘텐츠 제작");
+sheet.write_url(1, 0, "https://example.com/reports/2026-07", "7월 운영 현황");
 sheet.write_styled(1, 1, 150_000_000.0, &CellStyle::new().num_fmt("₩#,##0"));
 
 sheet.set_col_width(0, 42.0);

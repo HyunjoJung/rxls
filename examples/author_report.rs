@@ -1,4 +1,4 @@
-//! Build a styled bid-comparison `.xlsx` report (an end-to-end authoring scenario) and
+//! Build a styled monthly operations `.xlsx` report (an end-to-end authoring scenario) and
 //! write it to the given path. Exercises the authoring API end to end.
 //!
 //! ```text
@@ -13,7 +13,7 @@ fn main() {
         .unwrap_or_else(|| "report.xlsx".to_string());
 
     let mut wb = Workbook::new();
-    let sheet = wb.add_sheet("입찰공고");
+    let sheet = wb.add_sheet("운영보고서");
 
     // Merged, colored title row.
     let title = CellStyle::new()
@@ -22,7 +22,7 @@ fn main() {
         .color([255, 255, 255])
         .fill([0x2F, 0x54, 0x96])
         .align(HAlign::Center);
-    sheet.write_styled(0, 0, "나라장터 입찰공고 비교", &title);
+    sheet.write_styled(0, 0, "월간 운영 보고서", &title);
     sheet.merge(0, 0, 0, 4);
 
     // Shaded, bold, wrapped header row.
@@ -31,26 +31,21 @@ fn main() {
         .fill([0xDD, 0xEB, 0xF7])
         .align(HAlign::Center)
         .wrap();
-    for (c, h) in ["공고명", "기관", "추정가격", "마감일시", "자격"]
+    for (c, h) in ["항목", "담당팀", "금액", "기준일", "상태"]
         .iter()
         .enumerate()
     {
         sheet.write_styled(1, c as u16, *h, &hdr);
     }
 
-    // Data row: hyperlinked 공고명, ₩ amount, date.
+    // Data row: hyperlinked item, KRW amount, and date.
     let won = CellStyle::new().num_fmt("₩#,##0");
     let date = CellStyle::new().num_fmt("yyyy-mm-dd");
-    sheet.write_url(
-        2,
-        0,
-        "https://www.g2b.go.kr/co/cobs/0001",
-        "26~27시즌 KT농구단 뉴미디어 콘텐츠 제작",
-    );
-    sheet.write(2, 1, "케이티스포츠");
+    sheet.write_url(2, 0, "https://example.com/reports/2026-07", "7월 운영 현황");
+    sheet.write(2, 1, "데이터팀");
     sheet.write_styled(2, 2, 150_000_000.0, &won);
     sheet.write_styled(2, 3, Cell::date(46_000.0), &date);
-    sheet.write(2, 4, "제한경쟁");
+    sheet.write(2, 4, "검토 완료");
 
     // Layout: column widths, frozen header, autofilter over the table.
     sheet.set_col_width(0, 42.0);

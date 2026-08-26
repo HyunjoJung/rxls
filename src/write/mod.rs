@@ -2033,7 +2033,7 @@ mod tests {
     #[test]
     fn authors_a_styled_report() {
         let mut wb = Workbook::new();
-        let sheet = wb.add_sheet("입찰");
+        let sheet = wb.add_sheet("보고서");
         sheet.write_styled(
             0,
             0,
@@ -2084,7 +2084,7 @@ mod tests {
     #[test]
     fn authoring_is_ooxml_conformant() {
         let mut wb = Workbook::new();
-        let sheet = wb.add_sheet("입찰: 비교/표*[2026]"); // illegal chars → sanitized
+        let sheet = wb.add_sheet("보고서: 월간/표*[2026]"); // illegal chars → sanitized
         let hdr = CellStyle::new()
             .bold()
             .italic()
@@ -2190,10 +2190,10 @@ mod tests {
         s.write_styled(
             0,
             0,
-            "공고명",
+            "항목",
             &CellStyle::new().bold().fill([0xDD, 0xEB, 0xF7]),
         );
-        s.write_url(1, 0, "https://www.g2b.go.kr/x", "콘텐츠 제작");
+        s.write_url(1, 0, "https://example.com/reports/monthly", "월간 현황");
         s.write_styled(1, 1, 150_000_000.0, &CellStyle::new().num_fmt("₩#,##0"));
         s.write(1, 2, Cell::Date(46_000.0));
         s.merge(2, 0, 2, 2);
@@ -3047,18 +3047,18 @@ print('READ_DV_OK')
     fn table_opens_in_openpyxl() {
         let mut wb = Workbook::new();
         let s = wb.add_sheet("t");
-        for (c, h) in ["공고명", "기관", "가격"].iter().enumerate() {
+        for (c, h) in ["항목", "담당팀", "금액"].iter().enumerate() {
             s.write(0, c as u16, *h);
         }
         for r in 1..4u32 {
-            s.write(r, 0, format!("공고{r}"));
-            s.write(r, 1, "조달청");
+            s.write(r, 0, format!("항목{r}"));
+            s.write(r, 1, "데이터팀");
             s.write(r, 2, f64::from(r) * 1000.0);
         }
         s.add_table(crate::Table {
             range: (0, 0, 3, 2),
             name: "Sales".into(),
-            columns: vec!["공고명".into(), "기관".into(), "가격".into()],
+            columns: vec!["항목".into(), "담당팀".into(), "금액".into()],
             style: None,
         });
         s.set_table_header_format(
@@ -3135,7 +3135,7 @@ print('READ_DV_OK')
         let mut wb = Workbook::new();
         let s = wb.add_sheet("c");
         s.write(0, 0, "셀");
-        s.add_comment(0, 0, "검토 필요", Some("조달청"));
+        s.add_comment(0, 0, "검토 필요", Some("검토자"));
         let bytes = wb.to_xlsx();
         let script = "import sys\nfrom openpyxl import load_workbook\nwb=load_workbook(sys.argv[1])\nws=wb.active\nc=ws['A1'].comment\nassert c is not None, 'no comment on A1'\nassert '검토 필요' in c.text, repr(c.text)\nprint('COMMENT_OK')\n";
         assert_opens_in_openpyxl(&bytes, script, "COMMENT_OK");

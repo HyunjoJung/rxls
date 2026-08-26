@@ -276,7 +276,7 @@ def biff_note(row: int, col: int, object_id: int, author: str) -> bytes:
 
 
 def generate_xls() -> None:
-    strings = ["item", "amount", "road", "입찰공고", "secret"]
+    strings = ["item", "amount", "road", "업무보고", "secret"]
 
     xf_plain = bytes(20)
     xf_date = bytearray(20)

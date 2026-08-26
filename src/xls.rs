@@ -4936,9 +4936,9 @@ mod tests {
             ],
             &[
                 (2, TestPropertyValue::Lpstr("Legacy Report")),
-                (3, TestPropertyValue::Lpstr("Procurement")),
+                (3, TestPropertyValue::Lpstr("Operations")),
                 (4, TestPropertyValue::Lpstr("rxls reader")),
-                (5, TestPropertyValue::Lpstr("bid,legacy")),
+                (5, TestPropertyValue::Lpstr("ops,legacy")),
                 (6, TestPropertyValue::Lpstr("XLS public metadata")),
                 (8, TestPropertyValue::Lpstr("reviewer")),
                 (12, TestPropertyValue::Filetime(0x01DD_0375_1176_3780)),
@@ -4964,9 +4964,9 @@ mod tests {
         let metadata = wb.metadata();
 
         assert_eq!(metadata.properties.title.as_deref(), Some("Legacy Report"));
-        assert_eq!(metadata.properties.subject.as_deref(), Some("Procurement"));
+        assert_eq!(metadata.properties.subject.as_deref(), Some("Operations"));
         assert_eq!(metadata.properties.creator.as_deref(), Some("rxls reader"));
-        assert_eq!(metadata.properties.keywords.as_deref(), Some("bid,legacy"));
+        assert_eq!(metadata.properties.keywords.as_deref(), Some("ops,legacy"));
         assert_eq!(
             metadata.properties.description.as_deref(),
             Some("XLS public metadata")
@@ -5076,8 +5076,8 @@ mod tests {
         cont.extend_from_slice(b"WORLD");
         stream.extend_from_slice(&rec(CONTINUE, &cont));
 
-        // Uncompressed LABEL at (1,0): cch=4 ("입찰공고") split 2 / 2 chars.
-        let kr: Vec<u16> = "입찰공고".encode_utf16().collect();
+        // Uncompressed LABEL at (1,0): cch=4 ("업무보고") split 2 / 2 chars.
+        let kr: Vec<u16> = "업무보고".encode_utf16().collect();
         let mut lbl2 = vec![1, 0, 0, 0, 0, 0];
         lbl2.extend_from_slice(&(kr.len() as u16).to_le_bytes());
         lbl2.push(0x01); // grbit uncompressed (UTF-16LE)
@@ -5099,7 +5099,7 @@ mod tests {
             "compressed split truncated: {text:?}"
         );
         assert!(
-            text.contains("입찰공고"),
+            text.contains("업무보고"),
             "uncompressed split truncated: {text:?}"
         );
     }
@@ -5142,7 +5142,7 @@ mod tests {
         let mut s_bof = vec![0x00, 0x06, 0x10, 0x00];
         s_bof.extend_from_slice(&[0u8; 12]);
         stream.extend_from_slice(&rec(BOF, &s_bof));
-        let url = "https://example.com/bid";
+        let url = "https://example.com/report";
         let mut hlink = Vec::new();
         for v in [0u16, 1, 1, 1] {
             hlink.extend_from_slice(&v.to_le_bytes());
@@ -7111,7 +7111,7 @@ mod tests {
             // 949 is Windows Korean/UHC (a superset of KS X 1001).
             (949, EUC_KR, "내역서", "뷁 테스트"),
             // 51949 is the BIFF declaration used for EUC-KR.
-            (51949, EUC_KR, "한국어", "조달청 입찰공고"),
+            (51949, EUC_KR, "한국어", "월간 업무보고"),
             (932, SHIFT_JIS, "集計", "日本語テスト"),
             (1252, WINDOWS_1252, "Résumé", "Café € – naïve"),
         ];

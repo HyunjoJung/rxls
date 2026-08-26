@@ -6878,19 +6878,19 @@ mod tests {
     #[test]
     fn ods_doc_properties_surface_through_workbook_metadata() {
         let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"><office:body><office:spreadsheet><table:table table:name="Meta"/></office:spreadsheet></office:body></office:document-content>"#;
-        let meta = r#"<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"><office:meta><dc:title>ODS Report</dc:title><dc:subject>Procurement</dc:subject><meta:initial-creator>rxls ods</meta:initial-creator><dc:creator>reviewer</dc:creator><meta:keyword>bid</meta:keyword><meta:keyword>ods</meta:keyword><dc:description>ODS public metadata</dc:description><meta:creation-date>2026-06-24T02:03:04Z</meta:creation-date><meta:user-defined meta:name="Company">ACME ODS</meta:user-defined></office:meta></office:document-meta>"#;
+        let meta = r#"<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"><office:meta><dc:title>ODS Report</dc:title><dc:subject>Operations</dc:subject><meta:initial-creator>rxls ods</meta:initial-creator><dc:creator>reviewer</dc:creator><meta:keyword>ops</meta:keyword><meta:keyword>ods</meta:keyword><dc:description>ODS public metadata</dc:description><meta:creation-date>2026-06-24T02:03:04Z</meta:creation-date><meta:user-defined meta:name="Company">ACME ODS</meta:user-defined></office:meta></office:document-meta>"#;
 
         let wb = Workbook::open(&ods_bytes_with_meta(content, meta)).unwrap();
         let metadata = wb.metadata();
 
         assert_eq!(metadata.properties.title.as_deref(), Some("ODS Report"));
-        assert_eq!(metadata.properties.subject.as_deref(), Some("Procurement"));
+        assert_eq!(metadata.properties.subject.as_deref(), Some("Operations"));
         assert_eq!(metadata.properties.creator.as_deref(), Some("rxls ods"));
         assert_eq!(
             metadata.properties.last_modified_by.as_deref(),
             Some("reviewer")
         );
-        assert_eq!(metadata.properties.keywords.as_deref(), Some("bid,ods"));
+        assert_eq!(metadata.properties.keywords.as_deref(), Some("ops,ods"));
         assert_eq!(
             metadata.properties.description.as_deref(),
             Some("ODS public metadata")
