@@ -43,41 +43,9 @@
     "snapshotter": "native"
   },
   "built_image": {
-    "bootstrap_receipt": {
-      "artifact": {
-        "digest": "sha256:caaf92bce2174b509251f49dbb3664e6f132a743b01c22de465b98aad297ed7a",
-        "id": 9306849946,
-        "name": "render-oracle-image-275bd906a53b30920642d62b3ce39fac8a91681a-32086102162-1",
-        "size_in_bytes": 1752
-      },
-      "evidence": {
-        "bytes": 6945,
-        "member": "render-oracle-image-build.json",
-        "sha256": "03ed264eaeb71fcb9d0871a1332873ade6f030a2f005ebbb7cc74c42e6dc832b"
-      },
-      "job": {
-        "conclusion": "failure",
-        "id": 95558849778,
-        "name": "locked LibreOffice oracle image",
-        "run_attempt": 1,
-        "run_id": 32086102162
-      },
-      "repository": {
-        "full_name": "HyunjoJung/rxls",
-        "id": 1297467060
-      },
-      "run": {
-        "conclusion": "failure",
-        "event": "pull_request",
-        "head_sha": "275bd906a53b30920642d62b3ce39fac8a91681a",
-        "id": 32086102162,
-        "run_attempt": 1,
-        "workflow": ".github/workflows/render-hardening.yml"
-      },
-      "schema": "rxls.render-oracle-bootstrap-receipt.v1"
-    },
-    "expected_id": "sha256:1b777cfdea902cdd2cd40d3141f218c1cf01dbf4682d5533b3eb842f7289456c",
-    "expected_manifest_digest": "sha256:01264ea47261bf796b97b67ee204216121e30ab619d9db38cf82d2319d96c196",
+    "bootstrap_receipt": null,
+    "expected_id": null,
+    "expected_manifest_digest": null,
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
@@ -88,9 +56,9 @@
   },
   "files": [
     {
-      "bytes": 6445,
+      "bytes": 6954,
       "path": "Containerfile",
-      "sha256": "36f36e95e27acb21c28e4bb766b60dd364fb8bc8f3cd5d31be0502284e26e380"
+      "sha256": "625beac0eb87e5095dc3bc65dbca5876bb34ac2c1217168bf4835ceaf712cfbb"
     },
     {
       "bytes": 6189,
@@ -106,8 +74,9 @@
   "libreoffice": {
     "artifact": {
       "bytes": 216816909,
+      "fallback_url": "https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz",
       "sha256": "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5",
-      "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+      "url": "https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
     },
     "platform": "linux/x86_64",
     "version": "26.2.3.2"
@@ -125,8 +94,8 @@
   },
   "schema": "rxls.render-oracle-container-lock.v3",
   "wrapper": {
-    "bytes": 128247,
+    "bytes": 128581,
     "path": "scripts/run-render-oracle-container.py",
-    "sha256": "82ba4f250ee12e17675816b12c6566f9a5a2e3835637a640bdc4c125c71373eb"
+    "sha256": "ce79762f5b6484aa232b4065045ebe19b057bd48fe9868f40d8603e320e6adc2"
   }
 }

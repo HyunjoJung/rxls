@@ -223,11 +223,14 @@ jobs:
           retryable_oracle_download_failure() {
             local build_log="$1"
             grep --fixed-strings --quiet \
+              'https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz' \
+              "$build_log" &&
+              grep --fixed-strings --quiet \
               'https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz' \
               "$build_log" &&
               {
                 grep --extended-regexp --quiet \
-                  'curl: \((5|6|7|18|28|35|52|55|56|92)\)' \
+                  'curl: \((5|6|7|16|18|28|35|52|55|56|92)\)' \
                   "$build_log" ||
                   grep --extended-regexp --quiet \
                     'curl: \(22\) The requested URL returned error: (408|429|500|502|503|504)([^0-9]|$)' \

@@ -1043,13 +1043,36 @@ class RenderOracleContainerTests(unittest.TestCase):
         containerfile = (CONTAINER_DIR / "Containerfile").read_text()
         base = lock["base_image"]
         artifact = lock["libreoffice"]["artifact"]
+        self.assertEqual(
+            (artifact["url"], artifact["fallback_url"]),
+            MODULE.LIBREOFFICE_ARTIFACT_URLS,
+        )
+        for key in ("url", "fallback_url"):
+            mutated = json.loads(json.dumps(lock))
+            mutated["libreoffice"]["artifact"][key] += "?unreviewed=1"
+            with self.subTest(key=key), self.assertRaisesRegex(
+                MODULE.OracleContainerError,
+                "lock_artifact_url",
+            ):
+                MODULE.validate_lock(mutated)
         self.assertIn(
             f"FROM --platform=linux/amd64 {base['reference']}",
             containerfile,
         )
         self.assertIn(artifact["url"], containerfile)
+        self.assertIn(artifact["fallback_url"], containerfile)
         self.assertIn(str(artifact["bytes"]), containerfile)
         self.assertIn(artifact["sha256"], containerfile)
+        self.assertEqual(containerfile.count("--http1.1"), 1)
+        self.assertEqual(containerfile.count("--retry 4"), 1)
+        self.assertEqual(containerfile.count("--retry-all-errors"), 1)
+        self.assertEqual(containerfile.count("--retry-delay 2"), 1)
+        self.assertEqual(containerfile.count("--connect-timeout 30"), 1)
+        self.assertIn(
+            'for download_url in "${primary_url}" "${fallback_url}"',
+            containerfile,
+        )
+        self.assertIn("test \"${downloaded}\" = '1'", containerfile)
         self.assertIn(lock["debian_snapshot"]["timestamp"], containerfile)
         for dependency in (
             "libcairo2=1.16.0-7",
