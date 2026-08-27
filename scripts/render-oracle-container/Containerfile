@@ -43,9 +43,21 @@ RUN set -eux; \
       libx11-xcb1=2:1.8.4-2+deb12u2 \
       libxinerama1=2:1.1.4-3; \
     archive=/tmp/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz; \
-    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-      --output "${archive}" \
-      'https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
+    primary_url='https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
+    fallback_url='https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
+    downloaded=0; \
+    for download_url in "${primary_url}" "${fallback_url}"; do \
+      rm -f "${archive}"; \
+      if curl --fail --location --http1.1 \
+          --retry 4 --retry-all-errors --retry-delay 2 \
+          --connect-timeout 30 \
+          --proto '=https' --proto-redir '=https' --tlsv1.2 \
+          --output "${archive}" "${download_url}"; then \
+        downloaded=1; \
+        break; \
+      fi; \
+    done; \
+    test "${downloaded}" = '1'; \
     test "$(wc -c < "${archive}")" = '216816909'; \
     printf '%s  %s\n' \
       '18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5' \

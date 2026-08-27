@@ -865,7 +865,7 @@ steps:
             "stale_output": ("rm -f target/", "test -e target/"),
             "discard_status": ("build_status=$?", "build_status=1"),
             "retry_every_curl_failure": (
-                r"curl: \((5|6|7|18|28|35|52|55|56|92)\)",
+                r"curl: \((5|6|7|16|18|28|35|52|55|56|92)\)",
                 r"curl: \([0-9]+\)",
             ),
             "retry_not_found": (
@@ -941,6 +941,7 @@ steps:
         scenarios = {
             "integrity": (2, ["1"]),
             "transient": (0, ["1", "2"]),
+            "http2": (0, ["1", "2"]),
             "exhausted": (2, ["1", "2", "3"]),
         }
         mock_function = textwrap.dedent(
@@ -959,14 +960,25 @@ steps:
                 transient)
                   if [[ "$mock_attempt" -eq 1 ]]; then
                     printf '%s\\n' \
-                      "$MOCK_ORACLE_URL" \
+                      "$MOCK_ORACLE_PRIMARY_URL" \
+                      "$MOCK_ORACLE_FALLBACK_URL" \
                       'curl: (18) transfer closed with bytes remaining to read' >&2
+                    return 2
+                  fi
+                  ;;
+                http2)
+                  if [[ "$mock_attempt" -eq 1 ]]; then
+                    printf '%s\\n' \
+                      "$MOCK_ORACLE_PRIMARY_URL" \
+                      "$MOCK_ORACLE_FALLBACK_URL" \
+                      'curl: (16) Error in the HTTP2 framing layer' >&2
                     return 2
                   fi
                   ;;
                 exhausted)
                   printf '%s\\n' \
-                    "$MOCK_ORACLE_URL" \
+                    "$MOCK_ORACLE_PRIMARY_URL" \
+                    "$MOCK_ORACLE_FALLBACK_URL" \
                     'curl: (22) The requested URL returned error: 500' >&2
                   return 2
                   ;;
@@ -975,7 +987,11 @@ steps:
             }
             """
         )
-        oracle_url = (
+        primary_url = (
+            "https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/"
+            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+        )
+        fallback_url = (
             "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
             "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
         )
@@ -1018,7 +1034,8 @@ steps:
                             {
                                 "MOCK_ATTEMPTS_FILE": str(attempts_path),
                                 "MOCK_MODE": scenario,
-                                "MOCK_ORACLE_URL": oracle_url,
+                                "MOCK_ORACLE_PRIMARY_URL": primary_url,
+                                "MOCK_ORACLE_FALLBACK_URL": fallback_url,
                             }
                         )
                         result = subprocess.run(

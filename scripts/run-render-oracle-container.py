@@ -123,6 +123,12 @@ BUILDKIT_SNAPSHOTTER = "native"
 BUILDKIT_DEFAULT_COMPATIBILITY_VERSION = 30
 BUILDKIT_COMPATIBILITY_SOURCE = "pinned-buildkit-default"
 REPRODUCIBILITY_BUILD_COUNT = 2
+LIBREOFFICE_ARTIFACT_URLS = (
+    "https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/"
+    "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz",
+    "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
+    "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz",
+)
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"
 )
@@ -871,16 +877,21 @@ def validate_lock(document: object) -> dict[str, Any]:
     if libreoffice.get("platform") != "linux/x86_64":
         raise OracleContainerError("lock_libreoffice_platform")
     artifact = libreoffice.get("artifact")
-    if not isinstance(artifact, dict):
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "bytes",
+        "fallback_url",
+        "sha256",
+        "url",
+    }:
         raise OracleContainerError("lock_artifact")
     if artifact.get("sha256") != LIBREOFFICE_ARTIFACT_SHA256:
         raise OracleContainerError("lock_artifact_sha256")
     if artifact.get("bytes") != 216_816_909:
         raise OracleContainerError("lock_artifact_bytes")
-    if artifact.get("url") != (
-        "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
-        "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
-    ):
+    if (
+        artifact.get("url"),
+        artifact.get("fallback_url"),
+    ) != LIBREOFFICE_ARTIFACT_URLS:
         raise OracleContainerError("lock_artifact_url")
 
     files = document.get("files")
