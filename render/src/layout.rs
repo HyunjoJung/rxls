@@ -10684,10 +10684,10 @@ fn chart_category_data_plot(
         return Ok(plot);
     }
     // Calc keeps the category axis and value-axis bounds at the diagram edge,
-    // but reserves one frame-padding interval on either side for shifted
-    // category bands.  Keep that inset on labels and series while leaving
-    // value ticks/gridlines on the full plot rectangle.
-    let inset = Fixed::from_pixels(8);
+    // but places shifted category bands three pixels inside that rectangle.
+    // Keep that inset on labels and series while leaving value ticks and
+    // gridlines on the full plot rectangle.
+    let inset = Fixed::from_pixels(3);
     let double_inset = Fixed::from_raw(
         inset
             .raw()
@@ -24734,7 +24734,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_category_data_plot_keeps_calc_frame_padding() {
+    fn shifted_category_data_plot_keeps_calc_band_inset() {
         let plot = Rect {
             x: Fixed::from_pixels(10),
             y: Fixed::from_pixels(20),
@@ -24742,9 +24742,9 @@ mod tests {
             height: Fixed::from_pixels(40),
         };
         let shifted = chart_category_data_plot(plot, true, false).unwrap();
-        assert_eq!(shifted.x, Fixed::from_pixels(18));
+        assert_eq!(shifted.x, Fixed::from_pixels(13));
         assert_eq!(shifted.y, plot.y);
-        assert_eq!(shifted.width, Fixed::from_pixels(84));
+        assert_eq!(shifted.width, Fixed::from_pixels(94));
         assert_eq!(shifted.height, plot.height);
         assert_eq!(chart_category_data_plot(plot, false, false).unwrap(), plot);
         assert_eq!(chart_category_data_plot(plot, true, true).unwrap(), plot);

@@ -25,9 +25,6 @@ impl CellLineLayoutPolicy {
         }
     }
 
-    fn suppresses_overflowing_ascii_space(self) -> bool {
-        matches!(self, Self::CalcEditEngine)
-    }
 }
 
 /// A wrapped source line and the end of the source that contributes advance.
@@ -140,8 +137,10 @@ pub(crate) fn wrap_text_lines(
         }
         state.bump_segment()?;
         if opportunity == BreakOpportunity::Allowed
-            && policy == CellLineLayoutPolicy::CalcEditEngine
-            && is_internal_hangul_break(text, end)
+            && ((policy == CellLineLayoutPolicy::Native
+                && is_internal_ascii_hyphen_break(text, end))
+                || (policy == CellLineLayoutPolicy::CalcEditEngine
+                    && is_internal_hangul_break(text, end)))
         {
             continue;
         }
@@ -194,6 +193,15 @@ fn is_internal_hangul_break(text: &str, boundary: usize) -> bool {
             .is_some_and(is_calc_hangul)
 }
 
+fn is_internal_ascii_hyphen_break(text: &str, boundary: usize) -> bool {
+    if boundary == 0 || boundary >= text.len() || !text.is_char_boundary(boundary) {
+        return false;
+    }
+    let before = text.get(..boundary).and_then(|value| value.chars().next_back());
+    let after = text.get(boundary..).and_then(|value| value.chars().next());
+    before == Some('-') && after.is_some_and(char::is_alphanumeric)
+}
+
 fn is_calc_hangul(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -237,16 +245,12 @@ impl RangeWrapState {
             return Ok(());
         }
 
-        let suppressed_space = if policy.suppresses_overflowing_ascii_space() {
-            self.first_overflowing_trailing_ascii_space(
-                text,
-                atom.clone(),
-                available_width,
-                measure,
-            )?
-        } else {
-            None
-        };
+        let suppressed_space = self.first_overflowing_trailing_ascii_space(
+            text,
+            atom.clone(),
+            available_width,
+            measure,
+        )?;
         if let Some((space_start, space_end)) = suppressed_space {
             self.append(atom.start..space_end, space_start)?;
             self.finish_line(space_end)?;
@@ -263,7 +267,7 @@ impl RangeWrapState {
         }
 
         if self.current.is_some() {
-            self.finish_automatic_line(text, policy, atom.start)?;
+            self.finish_automatic_line(text, atom.start)?;
         }
         if policy.fits(width, available_width) {
             self.append(atom.clone(), atom.end)?;
@@ -336,8 +340,7 @@ impl RangeWrapState {
                 .current_width
                 .checked_add(width)
                 .ok_or(RenderError::CoordinateOverflow)?;
-            if policy.suppresses_overflowing_ascii_space()
-                && grapheme.end == grapheme.start + 1
+            if grapheme.end == grapheme.start + 1
                 && text.as_bytes().get(grapheme.start) == Some(&b' ')
                 && !policy.fits(combined, available_width)
             {
@@ -346,7 +349,7 @@ impl RangeWrapState {
                 continue;
             }
             if self.current.is_some() && !policy.fits(combined, available_width) {
-                self.finish_automatic_line(text, policy, grapheme.start)?;
+                self.finish_automatic_line(text, grapheme.start)?;
             }
             self.append(grapheme.clone(), grapheme.end)?;
             self.current_width = self
@@ -354,7 +357,7 @@ impl RangeWrapState {
                 .checked_add(width)
                 .ok_or(RenderError::CoordinateOverflow)?;
             if !policy.fits(self.current_width, available_width) {
-                self.finish_automatic_line(text, policy, grapheme.end)?;
+                self.finish_automatic_line(text, grapheme.end)?;
             }
         }
         Ok(())
@@ -412,17 +415,14 @@ impl RangeWrapState {
     fn finish_automatic_line(
         &mut self,
         text: &str,
-        policy: CellLineLayoutPolicy,
         empty_at: usize,
     ) -> Result<(), RenderError> {
-        if policy.suppresses_overflowing_ascii_space() {
-            if let Some(current) = self.current.as_mut() {
-                if current.advance_end == current.source.end
-                    && current.source.end > current.source.start
-                    && text.as_bytes().get(current.source.end - 1) == Some(&b' ')
-                {
-                    current.advance_end -= 1;
-                }
+        if let Some(current) = self.current.as_mut() {
+            if current.advance_end == current.source.end
+                && current.source.end > current.source.start
+                && text.as_bytes().get(current.source.end - 1) == Some(&b' ')
+            {
+                current.advance_end -= 1;
             }
         }
         self.finish_line(empty_at)
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn calc_retains_an_overflowing_ascii_space_without_its_advance() {
+    fn automatic_wrap_retains_an_overflowing_ascii_space_without_its_advance() {
         let text = "ab cd";
         let native = wrap_text_lines(
             text,
@@ -600,7 +600,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(native[0].source, 0..3);
-        assert_eq!(native[0].advance_end, 3);
+        assert_eq!(native[0].advance_end, 2);
         assert_eq!(calc[0].source, 0..3);
         assert_eq!(calc[0].advance_end, 2);
         assert_eq!(calc[1].source, 3..5);
@@ -691,6 +691,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["가나다", "라마바", "사"]
         );
+    }
+
+    #[test]
+    fn native_wrapping_keeps_internal_ascii_hyphenated_words_together() {
+        let text = "ab project-authored text";
+        let lines = wrap_text_lines(
+            text,
+            true,
+            CellLineLayoutPolicy::Native,
+            Fixed::from_pixels(17),
+            10,
+            100,
+            monospace_range(text),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| text.get(line.source.clone()).unwrap())
+                .collect::<Vec<_>>(),
+            ["ab ", "project-authored ", "text"]
+        );
+        assert_eq!(lines[1].advance_end, "ab project-authored".len());
     }
 
     #[test]

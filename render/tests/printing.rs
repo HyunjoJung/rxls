@@ -2483,7 +2483,7 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         fitted.pages[0].scene.background,
         whole_scene.scene.background
     );
-    assert!(has_print_gridline(&fitted.pages[0].scene.nodes));
+    assert!(!has_print_gridline(&fitted.pages[0].scene.nodes));
     assert!(has_view_gridline(&whole_scene.scene.nodes));
     assert_eq!(fitted.report.logical_pages, 1);
     assert_eq!(fitted.report.scale_permille, 1_000);
@@ -2550,12 +2550,12 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         retained.pages[0].scene.background,
         with_gridlines.scene.background
     );
-    assert!(has_print_gridline(&retained.pages[0].scene.nodes));
+    assert!(!has_print_gridline(&retained.pages[0].scene.nodes));
     assert!(has_view_gridline(&with_gridlines.scene.nodes));
 }
 
 #[test]
-fn single_page_gridlines_preserve_source_print_intent_for_all_formats() {
+fn single_page_gridlines_are_suppressed_for_all_source_formats() {
     fn has_view_gridline(nodes: &[SceneNode]) -> bool {
         nodes.iter().any(|node| match node {
             SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
@@ -2620,9 +2620,10 @@ fn single_page_gridlines_preserve_source_print_intent_for_all_formats() {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &enabled).unwrap();
-        assert!(
-            print_gridline_count(&document.pages[0].scene.nodes) > 0,
-            "{label} SinglePageSheets must preserve source print gridlines"
+        assert_eq!(
+            print_gridline_count(&document.pages[0].scene.nodes),
+            0,
+            "{label} SinglePageSheets must suppress source print gridlines"
         );
 
         let mut disabled = enabled;

@@ -79,10 +79,9 @@ pub struct PrintOptions {
     /// Omit logical page slots whose body contains no cell, format-only blank,
     /// or merge. Scale selection still sees the complete print area.
     pub omit_sparse_pages: bool,
-    /// Ignore authored pagination and emit the selected visible sheet scene at
-    /// 100% on one content-sized page. Calc's `SinglePageSheets` export still
-    /// honors authored print-gridline intent; worksheet-view-only gridlines do
-    /// not opt a sheet into printed gridlines.
+    /// Ignore authored print-page settings and emit the selected visible sheet
+    /// scene at 100% on one content-sized page. Like Calc's `SinglePageSheets`
+    /// PDF export, this mode suppresses worksheet and authored print gridlines.
     pub single_page_sheets: bool,
     /// Pagination and backend resource ceilings.
     pub limits: PrintLimits,
@@ -1057,14 +1056,10 @@ fn prepare_single_page_sheet_document(
     enforce_print_limit(LimitKind::Pages, options.limits.max_pages, 1)?;
 
     let mut render_options = options.render.clone();
-    let source_print_gridlines = sheet
-        .print_metadata()
-        .print_gridlines()
-        .unwrap_or_else(|| sheet.print_gridlines());
-    // SinglePageSheets replaces pagination, not the source's print-gridline
-    // intent. Keep an explicit caller opt-out authoritative while preventing
-    // worksheet-view gridlines alone from leaking into print output.
-    render_options.gridlines &= source_print_gridlines;
+    // Calc's SinglePageSheets export suppresses the worksheet grid regardless
+    // of sheet-view and authored print-gridline flags. A caller opt-out remains
+    // authoritative because this path never turns gridlines back on.
+    render_options.gridlines = false;
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
     let build = build_single_page_sheet_scene_for_print(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
@@ -4948,7 +4943,7 @@ mod tests {
     }
 
     #[test]
-    fn single_page_sheets_preserve_authored_print_gridline_intent() {
+    fn single_page_sheets_suppress_gridlines_like_calc() {
         fn print_gridline_count(nodes: &[SceneNode]) -> usize {
             nodes
                 .iter()
@@ -4991,7 +4986,7 @@ mod tests {
         };
         let document = build_print_document(&workbook, 0, &single_page).unwrap();
         assert!(single_page.render.gridlines);
-        assert!(print_gridline_count(&document.pages[0].scene.nodes) > 2);
+        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
 
         let mut single_page_disabled = single_page.clone();
         single_page_disabled.render.gridlines = false;
