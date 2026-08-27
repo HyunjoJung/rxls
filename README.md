@@ -4,8 +4,8 @@
 [![Korean](https://img.shields.io/badge/Language-%ED%95%9C%EA%B5%AD%EC%96%B4-0F766E.svg)](README.ko.md)
 
 **A native Rust spreadsheet toolkit.** Reads `.xls`, `.xlsx`, `.xlsb`, and `.ods`
-into one typed cell model, writes styled `.xlsx`, and edits `.xlsx`/`.xlsm` in
-place without disturbing the rest of the package.
+into a single typed cell model, writes styled `.xlsx`, and edits `.xlsx`/`.xlsm`
+in place while leaving the rest of the package untouched.
 
 [![Crates.io](https://img.shields.io/crates/v/rxls.svg)](https://crates.io/crates/rxls)
 [![Docs.rs](https://docs.rs/rxls/badge.svg)](https://docs.rs/rxls)
@@ -13,10 +13,10 @@ place without disturbing the rest of the package.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
 
-No JVM, no Apache POI, no Office automation, no subprocess — the core library
-calls none of them. It is built for document pipelines that must accept legacy
-Korean cp949 workbooks and untrusted uploads without turning malformed input
-into a panic.
+The core library requires no JVM or Apache POI, performs no Office automation,
+and spawns no subprocesses. It is built for document pipelines that must accept
+legacy Korean cp949 workbooks and untrusted uploads without panicking on
+malformed input.
 
 ```sh
 cargo add rxls@0.1.3 --features full
@@ -32,8 +32,9 @@ cargo add rxls@0.1.3 --features full
 | `.xlsb` | ✓ | — | — | 18/18 vs `pyxlsb` |
 | `.ods` | ✓ | — | — | 14/14 vs bounded ODF XML |
 
-Also included: a deterministic formula-evaluation MVP, CSV/HTML/Markdown export,
-machine-readable workbook diagnostics, a CLI, and a standalone WASM adapter.
+`rxls` also includes a deterministic formula-evaluation MVP,
+CSV/HTML/Markdown export, machine-readable workbook diagnostics, a CLI, and a
+standalone WASM adapter.
 
 ### At a glance
 
@@ -53,11 +54,11 @@ bound to one exact revision.
 | [![rxls 0.1.3 English live demo](.github/assets/rxls-demo-thumbnail-en.png)](https://youtu.be/Z7tNhqMdCVU) | [![rxls 0.1.3 Korean live demo](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/IzmFd_ARh1A) |
 | [Watch the 2:53 English demo](https://youtu.be/Z7tNhqMdCVU) | [Watch the 2:54 Korean demo](https://youtu.be/IzmFd_ARh1A) |
 
-Both exact-release demos run the real `rxls` CLI against a BIFF5/cp949
-workbook, open all four formats through the common model, generate a styled
+Both exact-release demos run the real `rxls` CLI against a BIFF5/cp949 workbook
+and open all four formats through the common model. They generate a styled
 six-row XLSX report, inspect its native table, filter, cached `SUM` formula,
-validation, and chart in Excel 16, and reopen it with `openpyxl 3.1.5`. Reader
-commands use the exact `v0.1.3` CLI at
+data validation, and chart in Excel 16, then reopen it with `openpyxl 3.1.5`.
+Reader commands use the exact `v0.1.3` CLI at
 [`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814);
 the tracked report drivers call the library from that same checkout.
 
@@ -237,11 +238,11 @@ fall back to Windows-1252, malformed byte sequences become U+FFFD, and
 `Workbook::open_with_codepage` can override a missing or incorrect declaration.
 BIFF8 strings are Unicode and do not use this fallback.
 
-Modern **`.xlsx`** (OOXML) is read too (default `xlsx` feature): `Workbook::open`
-auto-detects OLE2 `.xls` vs ZIP `.xlsx` and produces the same typed cells and
-text. `xlsx` cell data, shared strings, and number formats (for dates) are
-parsed via `zip` + `quick-xml`; `default-features = false` drops both deps for
-an `.xls`-only build.
+The default `xlsx` feature also reads modern **`.xlsx`** (OOXML) files:
+`Workbook::open` auto-detects OLE2 `.xls` vs ZIP `.xlsx` and produces the same
+typed cells and text. `xlsx` cell data, shared strings, and number formats (for
+dates) are parsed via `zip` + `quick-xml`; `default-features = false` drops both
+deps for an `.xls`-only build.
 
 **Failure is typed, never a panic.** Unsupported password-protected workbooks
 (`FILEPASS`) are reported as `Error::Encrypted` rather than emitting ciphertext.
@@ -249,10 +250,10 @@ Legacy XOR (Method 1) workbooks using Excel's default `VelvetSweatshop` password
 are deobfuscated. Every read is bounds-checked; malformed structures are either
 handled by an explicit bounded recovery path or return an `Error`. After a
 successful read, `Workbook::parse_provenance` distinguishes the format's primary
-container path from rxls's bounded tolerant CFB directory walk and exposes
-stable typed recovery codes. Recovery is an audit signal, not a guarantee that
-the original container was valid or complete, and it never bypasses the existing
-strict edit/save safeguards.
+container path from rxls's bounded, tolerant CFB directory walk and exposes
+stable typed recovery codes. Recovery is an audit signal: it does not guarantee
+that the original container was valid or complete, and it never bypasses the
+existing strict edit/save safeguards.
 
 Parsing, export, editing, and WASM paths enforce bounded input, allocation, and
 output limits. Release gates enforce absolute performance ceilings and same-SHA
@@ -264,9 +265,9 @@ manifest.
 
 ### Reading
 
-Targets plain-text extraction for search/indexing. Date/time serials and
-percentages are rendered through the retained format metadata. Excel custom
-formats support positive/negative/zero/text sections, conditions and colors,
+For search and indexing, readers support plain-text extraction. Date/time
+serials and percentages are rendered through the retained format metadata.
+Excel custom formats support positive/negative/zero/text sections, conditions and colors,
 locale/currency markers, grouping and scaling, fractions, scientific notation,
 date/time and elapsed tokens, literals, escapes, and text placeholders. ODS
 continues to prefer its source display paragraph, with typed-value fallbacks
@@ -281,8 +282,8 @@ substitution remain explicit boundaries.
 
 ### Editing existing files
 
-Package-preserving and `.xlsx`/`.xlsm`-only. `Spreadsheet` supports atomic
-batches; cell/formula and range edits; document, name, sheet, layout, pane, and
+Editing is package-preserving and limited to `.xlsx`/`.xlsm`. `Spreadsheet`
+supports atomic batches; cell/formula and range edits; document, name, sheet, layout, pane, and
 print-area metadata; sheet add/rename/delete; merges; legacy notes; hyperlinks;
 exact-range validations; and safe bottom-row resizing of existing tables.
 Untouched declared parts round-trip byte-for-byte, including retained VBA
@@ -313,7 +314,7 @@ Pivot tables, threaded comments, and macros are out of scope.
 ### Export, diagnostics, and WASM
 
 A worksheet can be exported directly to **CSV**, **HTML**, or **Markdown**
-(`Sheet`/`Workbook::to_csv`/`to_html`/`to_markdown`), and a whole workbook can be
+(`Sheet`/`Workbook::to_csv`/`to_html`/`to_markdown`). A whole workbook can be
 summarized as machine-readable JSON via `WorkbookReport` — sheet/cell/formula
 counts, document properties, and a feature inventory — surfaced on the CLI as
 `rxls diagnose <file>` (and `rxls csv <file>` for direct CSV export).
