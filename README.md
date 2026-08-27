@@ -48,18 +48,25 @@ bound to one exact revision.
 
 ## Demo and architecture
 
-[![rxls 2026 OSS contest demo](.github/assets/rxls-demo-thumbnail-en.png)](https://youtu.be/_z8tUe4a1Ho)
+| English demo | Korean demo |
+|---|---|
+| [![rxls 0.1.3 English live demo](.github/assets/rxls-demo-thumbnail-en.png)](https://youtu.be/Z7tNhqMdCVU) | [![rxls 0.1.3 Korean live demo](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/IzmFd_ARh1A) |
+| [Watch the 2:53 English demo](https://youtu.be/Z7tNhqMdCVU) | [Watch the 2:54 Korean demo](https://youtu.be/IzmFd_ARh1A) |
 
-The [2:49 exact-release demo](https://youtu.be/_z8tUe4a1Ho)
-runs the real `rxls` CLI against a BIFF5/cp949 workbook, opens all four formats
-through the common model, generates a styled operations report, and
-reopens that report with `openpyxl 3.1.5`. Reader commands use the exact `v0.1.3`
-CLI at [`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814);
-the tracked report driver calls the library from that same checkout.
+Both exact-release demos run the real `rxls` CLI against a BIFF5/cp949
+workbook, open all four formats through the common model, generate a styled
+six-row XLSX report, inspect its native table, filter, cached `SUM` formula,
+validation, and chart in Excel 16, and reopen it with `openpyxl 3.1.5`. Reader
+commands use the exact `v0.1.3` CLI at
+[`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814);
+the tracked report drivers call the library from that same checkout.
 
+[English captions](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.en-US.srt) ·
 [Korean captions](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.ko.srt) ·
-[build receipt](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.json) ·
-[independent decode/audio/privacy QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.json) ·
+[English build receipt](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.en-US.json) ·
+[Korean build receipt](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.json) ·
+[English QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.en-US.json) ·
+[Korean QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.json) ·
 [media release](https://github.com/HyunjoJung/rxls/releases/tag/oss-contest-2026-demo)
 
 ![rxls architecture: untrusted bytes through bounded format parsers into one typed model and public surfaces](.github/assets/rxls-architecture-en.png)

@@ -52,17 +52,25 @@ revision에 연결된 [52개 asset 릴리스 증거 묶음](https://github.com/H
 
 ## 데모와 아키텍처
 
-[![rxls 2026 오픈소스 개발자대회 시연영상](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/_z8tUe4a1Ho)
+| 한국어 시연 | English demo |
+|---|---|
+| [![rxls 0.1.3 한국어 실제 시연](.github/assets/rxls-demo-thumbnail.png)](https://youtu.be/IzmFd_ARh1A) | [![rxls 0.1.3 English live demo](.github/assets/rxls-demo-thumbnail-en.png)](https://youtu.be/Z7tNhqMdCVU) |
+| [2분 54초 한국어 시연 보기](https://youtu.be/IzmFd_ARh1A) | [Watch the 2:53 English demo](https://youtu.be/Z7tNhqMdCVU) |
 
-[2분 49초 시연영상](https://youtu.be/_z8tUe4a1Ho)은 실제 `rxls` CLI로
-BIFF5/cp949 통합문서를 읽고, 네 형식을 공통 모델로 열고, 서식이 적용된 운영
-보고서를 만든 뒤 `openpyxl 3.1.5`로 다시 검증합니다. reader 명령은 정확한
-`v0.1.3` CLI인 [`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814)를
+두 영상은 모두 정확한 공개 릴리스를 사용합니다. 실제 `rxls` CLI로
+BIFF5/cp949 통합문서를 읽고, 네 형식을 공통 모델로 열고, 6개 행과 서식이
+적용된 XLSX 보고서를 생성합니다. 이어 Excel 16에서 표, 필터, 캐시된 `SUM`
+수식, 데이터 검증, 차트를 직접 확인하고 `openpyxl 3.1.5`로 다시 검증합니다.
+reader 명령은 정확한 `v0.1.3` CLI인
+[`e1390e5`](https://github.com/HyunjoJung/rxls/commit/e1390e5aa349fbf933c39bccda400a4a2ee1d814)를
 사용하며, 추적된 report driver도 같은 checkout의 library를 호출합니다.
 
-[한국어 자막 파일](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.ko.srt) ·
-[빌드 영수증](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.json) ·
-[독립 decode/audio/privacy QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.json) ·
+[한국어 자막](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.ko.srt) ·
+[영어 자막](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/rxls-2026-oss-contest-demo.en-US.srt) ·
+[한국어 빌드 영수증](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.json) ·
+[영어 빌드 영수증](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-verification.en-US.json) ·
+[한국어 QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.json) ·
+[영어 QA](https://github.com/HyunjoJung/rxls/releases/download/oss-contest-2026-demo/video-qa.en-US.json) ·
 [미디어 릴리스](https://github.com/HyunjoJung/rxls/releases/tag/oss-contest-2026-demo)
 
 ![rxls 아키텍처: 신뢰할 수 없는 bytes를 bounded format parser와 하나의 typed model을 거쳐 public surface로 전달](.github/assets/rxls-architecture.png)
