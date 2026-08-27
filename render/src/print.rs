@@ -79,9 +79,10 @@ pub struct PrintOptions {
     /// Omit logical page slots whose body contains no cell, format-only blank,
     /// or merge. Scale selection still sees the complete print area.
     pub omit_sparse_pages: bool,
-    /// Ignore authored print-page settings and emit the selected visible sheet
-    /// scene at 100% on one content-sized page. Like Calc's `SinglePageSheets`
-    /// PDF export, this mode suppresses worksheet and authored print gridlines.
+    /// Ignore authored pagination and emit the selected visible sheet scene at
+    /// 100% on one content-sized page. Calc's `SinglePageSheets` export still
+    /// honors authored print-gridline intent; worksheet-view-only gridlines do
+    /// not opt a sheet into printed gridlines.
     pub single_page_sheets: bool,
     /// Pagination and backend resource ceilings.
     pub limits: PrintLimits,
@@ -1056,10 +1057,14 @@ fn prepare_single_page_sheet_document(
     enforce_print_limit(LimitKind::Pages, options.limits.max_pages, 1)?;
 
     let mut render_options = options.render.clone();
-    // Calc's SinglePageSheets export suppresses the worksheet grid regardless
-    // of sheet-view and authored print-gridline flags. A caller opt-out remains
-    // authoritative because this path never turns gridlines back on.
-    render_options.gridlines = false;
+    let source_print_gridlines = sheet
+        .print_metadata()
+        .print_gridlines()
+        .unwrap_or_else(|| sheet.print_gridlines());
+    // SinglePageSheets replaces pagination, not the source's print-gridline
+    // intent. Keep an explicit caller opt-out authoritative while preventing
+    // worksheet-view gridlines alone from leaking into print output.
+    render_options.gridlines &= source_print_gridlines;
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
     let build = build_single_page_sheet_scene_for_print(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
@@ -2476,26 +2481,41 @@ fn append_headings(
     scale_permille: u16,
     limits: &PrintLimits,
 ) -> Result<(), RenderError> {
-    let scaled_heading_width = scale_fixed(heading_width, scale_permille)?;
     let scaled_heading_height = scale_fixed(heading_height, scale_permille)?;
     let right_to_left = sheet.sheet_view().right_to_left;
+    let cell_width = repeated_width
+        .checked_add(slot.columns.size)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let total_width = heading_width
+        .checked_add(cell_width)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let expected_right = grid_x
+        .checked_add(scale_fixed(total_width, scale_permille)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
     let row_heading_x = if right_to_left {
-        let scaled_body_width = scale_fixed(slot.columns.size, scale_permille)?;
-        let scaled_repeated_width = scale_fixed(repeated_width, scale_permille)?;
         grid_x
-            .checked_add(scaled_body_width)
-            .and_then(|value| value.checked_add(scaled_repeated_width))
+            .checked_add(scale_fixed(cell_width, scale_permille)?)
             .ok_or(RenderError::CoordinateOverflow)?
     } else {
         grid_x
     };
+    let row_heading_right = if right_to_left {
+        expected_right
+    } else {
+        grid_x
+            .checked_add(scale_fixed(heading_width, scale_permille)?)
+            .ok_or(RenderError::CoordinateOverflow)?
+    };
+    let row_heading_width = row_heading_right
+        .checked_sub(row_heading_x)
+        .ok_or(RenderError::CoordinateOverflow)?;
     append_heading_cell(
         output,
         "",
         Rect {
             x: row_heading_x,
             y: grid_y,
-            width: scaled_heading_width,
+            width: row_heading_width,
             height: scaled_heading_height,
         },
         options,
@@ -2511,13 +2531,14 @@ fn append_headings(
     } else {
         Vec::new()
     };
-    let mut x = if right_to_left {
-        grid_x
+    let mut unscaled_x = if right_to_left {
+        Fixed::ZERO
     } else {
-        grid_x
-            .checked_add(scaled_heading_width)
-            .ok_or(RenderError::CoordinateOverflow)?
+        heading_width
     };
+    let mut x = grid_x
+        .checked_add(scale_fixed(unscaled_x, scale_permille)?)
+        .ok_or(RenderError::CoordinateOverflow)?;
     let visual_columns = if right_to_left {
         body_columns
             .iter()
@@ -2531,72 +2552,66 @@ fn append_headings(
             .collect::<Vec<_>>()
     };
     for axis in visual_columns {
-        let width = scale_fixed(axis.size, scale_permille)?;
+        unscaled_x = unscaled_x
+            .checked_add(axis.size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let next_x = grid_x
+            .checked_add(scale_fixed(unscaled_x, scale_permille)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
         append_heading_cell(
             output,
             &column_label(axis.index),
             Rect {
                 x,
                 y: grid_y,
-                width,
+                width: next_x
+                    .checked_sub(x)
+                    .ok_or(RenderError::CoordinateOverflow)?,
                 height: scaled_heading_height,
             },
             options,
             limits,
         )?;
-        x = x
-            .checked_add(width)
-            .ok_or(RenderError::CoordinateOverflow)?;
+        x = next_x;
     }
+    let mut unscaled_y = heading_height;
     let mut y = grid_y
-        .checked_add(scaled_heading_height)
+        .checked_add(scale_fixed(unscaled_y, scale_permille)?)
         .ok_or(RenderError::CoordinateOverflow)?;
     for axis in title_rows.iter().chain(&body_rows) {
-        let height = scale_fixed(axis.size, scale_permille)?;
+        unscaled_y = unscaled_y
+            .checked_add(axis.size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let next_y = grid_y
+            .checked_add(scale_fixed(unscaled_y, scale_permille)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
         append_heading_cell(
             output,
             &(u64::from(axis.index) + 1).to_string(),
             Rect {
                 x: row_heading_x,
                 y,
-                width: scaled_heading_width,
-                height,
+                width: row_heading_width,
+                height: next_y
+                    .checked_sub(y)
+                    .ok_or(RenderError::CoordinateOverflow)?,
             },
             options,
             limits,
         )?;
-        y = y
-            .checked_add(height)
-            .ok_or(RenderError::CoordinateOverflow)?;
+        y = next_y;
     }
-    let expected_width = scale_fixed(
-        heading_width
-            .checked_add(repeated_width)
-            .and_then(|value| value.checked_add(slot.columns.size))
-            .ok_or(RenderError::CoordinateOverflow)?,
-        scale_permille,
-    )?;
-    let expected_height = scale_fixed(
-        heading_height
-            .checked_add(repeated_height)
-            .and_then(|value| value.checked_add(slot.rows.size))
-            .ok_or(RenderError::CoordinateOverflow)?,
-        scale_permille,
-    )?;
-    debug_assert!(
-        x.raw()
-            <= grid_x
-                .raw()
-                .saturating_add(expected_width.raw())
-                .saturating_add(2)
-    );
-    debug_assert!(
-        y.raw()
-            <= grid_y
-                .raw()
-                .saturating_add(expected_height.raw())
-                .saturating_add(2)
-    );
+    let expected_bottom = grid_y
+        .checked_add(scale_fixed(
+            heading_height
+                .checked_add(repeated_height)
+                .and_then(|value| value.checked_add(slot.rows.size))
+                .ok_or(RenderError::CoordinateOverflow)?,
+            scale_permille,
+        )?)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    debug_assert_eq!(x.max(row_heading_right), expected_right);
+    debug_assert_eq!(y, expected_bottom);
     Ok(())
 }
 
@@ -4933,7 +4948,7 @@ mod tests {
     }
 
     #[test]
-    fn single_page_sheets_suppress_gridlines_like_calc() {
+    fn single_page_sheets_preserve_authored_print_gridline_intent() {
         fn print_gridline_count(nodes: &[SceneNode]) -> usize {
             nodes
                 .iter()
@@ -4976,7 +4991,7 @@ mod tests {
         };
         let document = build_print_document(&workbook, 0, &single_page).unwrap();
         assert!(single_page.render.gridlines);
-        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
+        assert!(print_gridline_count(&document.pages[0].scene.nodes) > 2);
 
         let mut single_page_disabled = single_page.clone();
         single_page_disabled.render.gridlines = false;

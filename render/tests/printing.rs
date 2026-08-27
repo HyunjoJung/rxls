@@ -2483,7 +2483,7 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         fitted.pages[0].scene.background,
         whole_scene.scene.background
     );
-    assert!(!has_print_gridline(&fitted.pages[0].scene.nodes));
+    assert!(has_print_gridline(&fitted.pages[0].scene.nodes));
     assert!(has_view_gridline(&whole_scene.scene.nodes));
     assert_eq!(fitted.report.logical_pages, 1);
     assert_eq!(fitted.report.scale_permille, 1_000);
@@ -2550,12 +2550,12 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         retained.pages[0].scene.background,
         with_gridlines.scene.background
     );
-    assert!(!has_print_gridline(&retained.pages[0].scene.nodes));
+    assert!(has_print_gridline(&retained.pages[0].scene.nodes));
     assert!(has_view_gridline(&with_gridlines.scene.nodes));
 }
 
 #[test]
-fn single_page_gridlines_are_suppressed_for_all_source_formats() {
+fn single_page_gridlines_preserve_source_print_intent_for_all_formats() {
     fn has_view_gridline(nodes: &[SceneNode]) -> bool {
         nodes.iter().any(|node| match node {
             SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
@@ -2620,10 +2620,9 @@ fn single_page_gridlines_are_suppressed_for_all_source_formats() {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &enabled).unwrap();
-        assert_eq!(
-            print_gridline_count(&document.pages[0].scene.nodes),
-            0,
-            "{label} SinglePageSheets must suppress source print gridlines"
+        assert!(
+            print_gridline_count(&document.pages[0].scene.nodes) > 0,
+            "{label} SinglePageSheets must preserve source print gridlines"
         );
 
         let mut disabled = enabled;
@@ -2633,6 +2632,112 @@ fn single_page_gridlines_are_suppressed_for_all_source_formats() {
             print_gridline_count(&document.pages[0].scene.nodes),
             0,
             "{label} caller opt-out must still suppress gridlines"
+        );
+    }
+}
+
+#[test]
+fn fractional_scaled_headings_share_exact_edges_with_the_print_block() {
+    let heading_fill = Rgb::new(242, 242, 242);
+
+    for right_to_left in [false, true] {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("fractional headings");
+        sheet.set_right_to_left(right_to_left);
+        sheet.set_print_headings();
+        for row in 0..8 {
+            sheet.set_row_height(row, 15.1 + (row % 3) as f32 * 0.2);
+            for column in 0..6 {
+                if row == 0 {
+                    sheet.set_col_width(column, 8.1 + (column % 3) as f32 * 0.2);
+                }
+                sheet.write(row, column, format!("{row}:{column}"));
+            }
+        }
+        sheet.set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 7, 5))
+                .with_repeat_rows(0, 0)
+                .with_repeat_cols(0, 0)
+                .with_scale(85),
+        );
+
+        let document = build_print_document(
+            &workbook,
+            0,
+            &PrintOptions {
+                omit_sparse_pages: false,
+                ..PrintOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.report.scale_permille, 850);
+
+        let page = &document.pages[0];
+        let heading_rects = page
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Rect(rect) if rect.fill == Some(heading_fill) => Some(rect.rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let corner = heading_rects[0];
+        let column_rects = heading_rects
+            .iter()
+            .copied()
+            .skip(1)
+            .filter(|rect| rect.y == corner.y)
+            .collect::<Vec<_>>();
+        let row_rects = heading_rects
+            .iter()
+            .copied()
+            .skip(1)
+            .filter(|rect| rect.y != corner.y)
+            .collect::<Vec<_>>();
+        let content = page
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::ClipGroup(group) => Some(group),
+                _ => None,
+            })
+            .unwrap();
+        let block = content
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::ClipGroup(group) => Some(group.clip),
+                _ => None,
+            })
+            .unwrap();
+
+        let column_left = column_rects.iter().map(|rect| rect.x).min().unwrap();
+        let column_right = column_rects
+            .iter()
+            .map(|rect| rect.x.raw() + rect.width.raw())
+            .max()
+            .unwrap();
+        let row_top = row_rects.iter().map(|rect| rect.y).min().unwrap();
+        let row_bottom = row_rects
+            .iter()
+            .map(|rect| rect.y.raw() + rect.height.raw())
+            .max()
+            .unwrap();
+        assert_eq!(column_left, block.x, "RTL={right_to_left}");
+        assert_eq!(
+            column_right,
+            block.x.raw() + block.width.raw(),
+            "RTL={right_to_left}"
+        );
+        assert_eq!(row_top, block.y, "RTL={right_to_left}");
+        assert_eq!(
+            row_bottom,
+            block.y.raw() + block.height.raw(),
+            "RTL={right_to_left}"
         );
     }
 }
