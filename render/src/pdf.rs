@@ -258,6 +258,118 @@ struct PdfEmbeddedFace {
     to_unicode: BTreeMap<u16, String>,
 }
 
+#[derive(Debug, Default)]
+struct PdfEmbeddedLineAdjustment {
+    correction_x: Fixed,
+    previous_text_face: Option<(usize, Fixed)>,
+}
+
+fn embedded_advance_in_scene_units(face: &PdfEmbeddedFace, cid: u16, size: Fixed) -> Option<Fixed> {
+    let advance = i64::from(*face.face.advances.get(usize::from(cid))?);
+    let upem = i64::from(face.face.units_per_em.max(1));
+    let pdf_units = advance.checked_mul(1_000)?.checked_add(upem / 2)? / upem;
+    let raw = size.raw().checked_mul(pdf_units)?.checked_div(1_000)?;
+    Some(Fixed::from_raw(raw))
+}
+
+/// Keep neutral spaces in a left-to-right fallback run on the preceding face.
+///
+/// Calc assigns a trailing U+0020 to the preceding CJK fallback face. The
+/// shaper may instead assign it to the primary Latin face; preserving absolute
+/// glyph origins then accumulates that face's wider PDF `/W` advance. Besides
+/// moving later words, the difference can cross Poppler's overlapping-line
+/// threshold. Re-home only plain, horizontal LTR spaces for which the retained
+/// fallback face has an unambiguous U+0020, and carry the exact PDF-width delta
+/// into later placements on the same baseline.
+fn normalize_ltr_contextual_spaces(
+    node: &GlyphRunNode,
+    embedded: &[PdfEmbeddedFace],
+    per_cluster: &mut [Vec<PdfEmbeddedGlyph>],
+) -> Option<()> {
+    if node.rotation_degrees.rem_euclid(360) != 0
+        || per_cluster.len() != node.clusters.len()
+        || node
+            .clusters
+            .windows(2)
+            .any(|pair| pair[0].source_start > pair[1].source_start)
+    {
+        return Some(());
+    }
+
+    // Validate horizontal paint order before mutating the plan. RTL and other
+    // non-monotonic runs retain their scene-authored absolute placements.
+    let mut last_x_by_baseline = BTreeMap::<Fixed, Fixed>::new();
+    for placements in per_cluster
+        .iter()
+        .filter(|placements| !placements.is_empty())
+    {
+        let baseline = placements[0].origin_y;
+        if placements.iter().any(|placed| placed.origin_y != baseline)
+            || placements
+                .windows(2)
+                .any(|pair| pair[0].origin_x > pair[1].origin_x)
+        {
+            return Some(());
+        }
+        if last_x_by_baseline
+            .get(&baseline)
+            .is_some_and(|last_x| *last_x > placements[0].origin_x)
+        {
+            return Some(());
+        }
+        last_x_by_baseline.insert(baseline, placements.last()?.origin_x);
+    }
+
+    let mut lines = BTreeMap::<Fixed, PdfEmbeddedLineAdjustment>::new();
+    for (cluster, placements) in node.clusters.iter().zip(per_cluster.iter_mut()) {
+        let Some(first) = placements.first() else {
+            continue;
+        };
+        let baseline = first.origin_y;
+        let line = lines.entry(baseline).or_default();
+        for placed in placements.iter_mut() {
+            placed.origin_x = placed.origin_x.checked_add(line.correction_x)?;
+        }
+
+        let start = usize::try_from(cluster.source_start).ok()?;
+        let end = usize::try_from(cluster.source_end).ok()?;
+        let text = node.text.get(start..end)?;
+        if text == " " && placements.len() == 1 {
+            let placed = &mut placements[0];
+            let Some((previous_font, previous_size)) = line.previous_text_face else {
+                continue;
+            };
+            if previous_font == placed.font_index || previous_size != placed.size {
+                continue;
+            }
+            let Some(replacement_cid) = embedded
+                .get(previous_font)
+                .and_then(|face| face.semantic_space_cid)
+            else {
+                continue;
+            };
+            let old_advance = embedded_advance_in_scene_units(
+                embedded.get(placed.font_index)?,
+                placed.cid,
+                placed.size,
+            )?;
+            let new_advance = embedded_advance_in_scene_units(
+                embedded.get(previous_font)?,
+                replacement_cid,
+                placed.size,
+            )?;
+            let delta = new_advance.checked_sub(old_advance)?;
+            placed.font_index = previous_font;
+            placed.cid = replacement_cid;
+            line.correction_x = line.correction_x.checked_add(delta)?;
+        } else if !text.chars().all(char::is_whitespace) {
+            let placed = placements.last()?;
+            line.previous_text_face = Some((placed.font_index, placed.size));
+        }
+    }
+    Some(())
+}
+
 #[derive(Debug)]
 struct PdfFontRegistry<'a> {
     subsets: Vec<PdfFontSubset>,
@@ -384,6 +496,7 @@ impl<'a> PdfFontRegistry<'a> {
                 size: glyph.size,
             });
         }
+        normalize_ltr_contextual_spaces(node, &self.embedded, &mut per_cluster)?;
 
         // Record what each code stands for while cluster text is still in hand.
         // Stage the additions first so a run can fall back to Type 3 without
@@ -4515,6 +4628,120 @@ mod tests {
         };
 
         assert_eq!(embedded_widths_array(&face), "[0 [0 334]]");
+    }
+
+    fn contextual_space_fixture() -> (
+        GlyphRunNode,
+        Vec<PdfEmbeddedFace>,
+        Vec<Vec<PdfEmbeddedGlyph>>,
+    ) {
+        let face = |digest: &str, space_advance: u16| PdfEmbeddedFace {
+            digest: digest.to_string(),
+            face: EmbeddedFace {
+                program: Vec::new(),
+                kind: FontProgramKind::TrueType,
+                gids: vec![0, 1, 2],
+                advances: vec![0, space_advance, 920],
+                units_per_em: 1_000,
+                pdf_ascent: 800,
+                pdf_descent: -200,
+                bbox: (0, -200, 1_000, 800),
+                cap_height: 700,
+                italic_angle: 0.0,
+                monospaced: false,
+            },
+            semantic_space_cid: Some(1),
+            to_unicode: BTreeMap::new(),
+        };
+        let embedded = vec![face("cjk", 224), face("latin", 226)];
+        let text = "한 한 0";
+        let mut node = positioned_outline(text, 0, 0, 40, 12);
+        node.clusters = [(0, 3), (3, 4), (4, 7), (7, 8), (8, 9)]
+            .into_iter()
+            .map(|(source_start, source_end)| GlyphCluster {
+                source_start,
+                source_end,
+                command_start: 0,
+                command_end: 0,
+            })
+            .collect();
+
+        let size = Fixed::from_raw(15_000);
+        let baseline = Fixed::from_raw(30_000);
+        let placement = |font_index, cid, origin_x| {
+            vec![PdfEmbeddedGlyph {
+                font_index,
+                cid,
+                origin_x: Fixed::from_raw(origin_x),
+                origin_y: baseline,
+                size,
+            }]
+        };
+        let original = vec![
+            placement(0, 2, 0),
+            placement(1, 1, 5_000),
+            placement(0, 2, 10_000),
+            placement(1, 1, 15_000),
+            placement(1, 2, 20_000),
+        ];
+        (node, embedded, original)
+    }
+
+    fn embedded_plan_snapshot(plan: &[Vec<PdfEmbeddedGlyph>]) -> Vec<(usize, u16, i64)> {
+        plan.iter()
+            .map(|cluster| {
+                let glyph = cluster[0];
+                (glyph.font_index, glyph.cid, glyph.origin_x.raw())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ltr_fallback_spaces_carry_the_preceding_face_width_delta() {
+        let (node, embedded, original) = contextual_space_fixture();
+        let mut adjusted = original.clone();
+        assert_eq!(
+            normalize_ltr_contextual_spaces(&node, &embedded, &mut adjusted),
+            Some(())
+        );
+        assert_eq!(
+            embedded_plan_snapshot(&adjusted),
+            [
+                (0, 2, 0),
+                (0, 1, 5_000),
+                (0, 2, 9_970),
+                (0, 1, 14_970),
+                (1, 2, 19_940),
+            ],
+            "each 226-to-224 PDF space removes 30 fixed units at this size"
+        );
+    }
+
+    #[test]
+    fn contextual_space_normalization_preserves_rotated_and_reverse_runs() {
+        let (mut node, embedded, original) = contextual_space_fixture();
+        node.rotation_degrees = 90;
+        let mut rotated = original.clone();
+        assert_eq!(
+            normalize_ltr_contextual_spaces(&node, &embedded, &mut rotated),
+            Some(())
+        );
+        assert_eq!(
+            embedded_plan_snapshot(&rotated),
+            embedded_plan_snapshot(&original)
+        );
+
+        node.rotation_degrees = 0;
+        let mut reverse = original.clone();
+        for (index, cluster) in reverse.iter_mut().enumerate() {
+            cluster[0].origin_x = Fixed::from_raw(20_000 - index as i64 * 5_000);
+        }
+        let expected = embedded_plan_snapshot(&reverse);
+        assert_eq!(
+            normalize_ltr_contextual_spaces(&node, &embedded, &mut reverse),
+            Some(())
+        );
+        assert_eq!(embedded_plan_snapshot(&reverse), expected);
     }
 
     #[test]
