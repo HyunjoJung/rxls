@@ -14,7 +14,9 @@ import tomllib
 SCHEMA = "rxls.core-package-gate.v1"
 MAX_ARCHIVE_BYTES = 1 << 20
 MAX_UNPACKED_BYTES = 5 << 20
-MAX_FILES = 160
+# Parser domains are intentionally split into private source modules. Keep a
+# bounded file-count budget while the byte limits enforce distribution size.
+MAX_FILES = 192
 ALLOWED_DEPENDENCIES = {
     "cfb",
     "chrono",
