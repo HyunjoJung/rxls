@@ -7,6 +7,7 @@ use std::io::Write as _;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
+use unicode_script::{Script, UnicodeScript};
 
 use crate::embed::{glyph_id_for_char, subset_face, EmbeddedFace, FontProgramKind};
 use crate::error::{LimitKind, RenderError};
@@ -25,6 +26,12 @@ use crate::scene::{
 const PDF_POINTS_PER_CSS_PIXEL_NUMERATOR: i64 = 3;
 const PDF_POINTS_PER_CSS_PIXEL_DENOMINATOR: i64 = 4;
 const TYPE3_TEXT_SCALE: u16 = 1_000;
+// Calc's PDF print device expands drawing-object em height while preserving
+// horizontal advance. Reproduce that device metric only inside drawing objects.
+const CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE: u16 = 1_072;
+// Single-page Calc drawing text is positioned one print-device pixel below
+// the worksheet text baseline after the drawing em-height expansion.
+const CALC_LAYOUT_OVERRIDE_DRAWING_TEXT_Y_OFFSET: Fixed = Fixed::from_raw(FIXED_UNITS_PER_PIXEL);
 const TYPE3_GLYPHS_PER_SUBSET: usize = 255;
 const CMAP_ENTRIES_PER_BLOCK: usize = 100;
 
@@ -73,19 +80,67 @@ struct PdfGlyphReference {
 struct PdfSemanticBoundaryAnchor {
     glyph: PdfGlyphReference,
     embedded_separator: Option<PdfEmbeddedGlyph>,
+    nominal_bounds: Option<Rect>,
+    leading_word_class: Option<PdfSemanticWordClass>,
+    trailing_word_class: Option<PdfSemanticWordClass>,
     clip_bounds: Rect,
     rotation_degrees: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfSemanticWordClass {
+    Western,
+    Script(Script),
+}
+
+fn pdf_semantic_word_class(character: char) -> Option<PdfSemanticWordClass> {
+    match character.script() {
+        Script::Latin => Some(PdfSemanticWordClass::Western),
+        Script::Common | Script::Inherited | Script::Unknown if character.is_alphanumeric() => {
+            Some(PdfSemanticWordClass::Western)
+        }
+        Script::Common | Script::Inherited | Script::Unknown => None,
+        script => Some(PdfSemanticWordClass::Script(script)),
+    }
+}
+
+fn pdf_cluster_word_classes(
+    node: &GlyphRunNode,
+    cluster_index: usize,
+) -> (Option<PdfSemanticWordClass>, Option<PdfSemanticWordClass>) {
+    let Some(cluster) = node.clusters.get(cluster_index) else {
+        return (None, None);
+    };
+    let Ok(start) = usize::try_from(cluster.source_start) else {
+        return (None, None);
+    };
+    let Ok(end) = usize::try_from(cluster.source_end) else {
+        return (None, None);
+    };
+    let Some(source) = node.text.get(start..end) else {
+        return (None, None);
+    };
+    (
+        source.chars().find_map(pdf_semantic_word_class),
+        source.chars().rev().find_map(pdf_semantic_word_class),
+    )
 }
 
 impl PdfSemanticBoundaryAnchor {
     fn new(
         node: &GlyphRunNode,
         glyph: PdfGlyphReference,
+        cluster_index: usize,
         embedded_separator: Option<PdfEmbeddedGlyph>,
     ) -> Self {
+        let (leading_word_class, trailing_word_class) =
+            pdf_cluster_word_classes(node, cluster_index);
         Self {
             glyph,
             embedded_separator,
+            nominal_bounds: node.nominal_cluster_bounds(cluster_index),
+            leading_word_class,
+            trailing_word_class,
             clip_bounds: node.clip_bounds,
             rotation_degrees: node.rotation_degrees.rem_euclid(360),
         }
@@ -103,6 +158,36 @@ impl PdfSemanticBoundaryAnchor {
             && self.clip_bounds.y == other.clip_bounds.y
             && self.clip_bounds != other.clip_bounds
     }
+
+    fn requires_separator_before(self, other: Self, merge_cross_script_overlap: bool) -> bool {
+        if !self.shares_layout_line_with(other) {
+            return false;
+        }
+        if merge_cross_script_overlap {
+            return false;
+        }
+        if self.rotation_degrees != 0 {
+            return true;
+        }
+        let Some((previous, current)) = self.nominal_bounds.zip(other.nominal_bounds) else {
+            return true;
+        };
+        let Some(previous_right) = previous.x.checked_add(previous.width) else {
+            return true;
+        };
+        let Some(current_right) = current.x.checked_add(current.width) else {
+            return true;
+        };
+        let cursor_boxes_overlap = previous.x < current_right && current.x < previous_right;
+        // Calc lets Poppler merge adjacent cell text when the shaped cursor
+        // boxes overlap and their boundary scripts form one word. Cross-script
+        // overflow keeps a word boundary even at the same geometry. Exact edge
+        // contact also needs a separator.
+        !(cursor_boxes_overlap
+            && (merge_cross_script_overlap
+                || (self.trailing_word_class.is_some()
+                    && self.trailing_word_class == other.leading_word_class)))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +204,17 @@ struct PdfGlyphSemanticSpan {
     source: std::ops::Range<usize>,
     glyphs: Vec<usize>,
     visual_line_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PdfGlyphSemanticClip {
+    effective: Rect,
+    outer: Rect,
+    retain_authored_print_fragments: bool,
+    retain_selected_groups_unbounded: bool,
+    retain_outer_intersecting_words: bool,
+    retain_selected_line_unbounded: bool,
+    require_interior_horizontal_center: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +341,21 @@ struct PdfEmbeddedGlyph {
 enum PdfSemanticSeparator {
     Embedded(PdfEmbeddedGlyph),
     Outlined(PdfGlyphReference),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfSemanticProxyMode {
+    None,
+    ShiftBaseline(Fixed),
+    ShiftTrailingWords(Fixed),
+    IsolatedWords,
+}
+
+#[derive(Debug, Clone)]
+struct PdfQueuedSemanticProxy {
+    text: String,
+    glyph: PdfSemanticSeparator,
+    text_scale_permille: u16,
 }
 
 /// One face embedded as a Type0 composite font.
@@ -1212,6 +1323,9 @@ fn render_print_document_pdf_impl(
         fonts,
     );
     font_registry.prepare_embedded_faces(document);
+    let retain_authored_print_fragments = document.report.layout_override.is_none();
+    let authored_content_rect =
+        retain_authored_print_fragments.then_some(document.report.content_rect);
     for page in &document.pages {
         let mut page_trace = traces
             .is_some()
@@ -1221,6 +1335,8 @@ fn render_print_document_pdf_impl(
             document.limits.max_pdf_bytes,
             &mut command_count,
             &mut font_registry,
+            retain_authored_print_fragments,
+            authored_content_rect,
             page_trace.as_mut(),
         )?;
         if let (Some(traces), Some(page_trace)) = (traces.as_deref_mut(), page_trace) {
@@ -1515,11 +1631,582 @@ fn render_print_document_pdf_impl(
     Ok(output.finish())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfAuthoredClipScope {
+    OutsideContent,
+    Content,
+    Body,
+    Drawing,
+    Object,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PdfSemanticClipContext {
+    outer_clip: Option<Rect>,
+    page_clip: Rect,
+    authored_content_rect: Option<Rect>,
+    authored_scope: PdfAuthoredClipScope,
+    body_clip: Option<Rect>,
+    body_right_to_left: bool,
+    body_has_single_visual_line: bool,
+    body_has_strong_rtl_text: bool,
+}
+
+impl PdfSemanticClipContext {
+    fn new(page_bounds: Rect, authored_content_rect: Option<Rect>) -> Self {
+        Self {
+            outer_clip: Some(page_bounds),
+            page_clip: page_bounds,
+            authored_content_rect,
+            authored_scope: PdfAuthoredClipScope::OutsideContent,
+            body_clip: None,
+            body_right_to_left: false,
+            body_has_single_visual_line: false,
+            body_has_strong_rtl_text: false,
+        }
+    }
+
+    fn descend(
+        self,
+        group: &crate::scene::ClipGroupNode,
+        depth: usize,
+    ) -> Result<Self, RenderError> {
+        let clip = group.clip;
+        // Authored print pages have a stable wrapper shape: the top-level
+        // content rectangle contains one clip per replayed worksheet body.
+        // That body clip constrains paint, but Calc retains complete bounded
+        // source groups across it. Layout adds another paint-only replay clip
+        // for a drawing that crosses the body. The GlyphRun owner clip is the
+        // first authoritative drawing-object boundary; any deeper clip remains
+        // authoritative in both axes.
+        let enters_content = depth == 0
+            && self.authored_scope == PdfAuthoredClipScope::OutsideContent
+            && self.authored_content_rect == Some(clip);
+        let enters_body = self.authored_scope == PdfAuthoredClipScope::Content;
+        let enters_drawing = self.authored_scope == PdfAuthoredClipScope::Body;
+        let enters_object = self.authored_scope == PdfAuthoredClipScope::Drawing;
+        let outer_clip = if enters_body {
+            self.outer_clip
+        } else if enters_drawing {
+            Some(self.page_clip)
+        } else {
+            match self.outer_clip {
+                Some(outer_clip) => intersect_clip_rects(outer_clip, clip)?,
+                None => None,
+            }
+        };
+        Ok(Self {
+            outer_clip,
+            page_clip: self.page_clip,
+            authored_content_rect: self.authored_content_rect,
+            authored_scope: if enters_content {
+                PdfAuthoredClipScope::Content
+            } else if enters_body {
+                PdfAuthoredClipScope::Body
+            } else if enters_drawing {
+                PdfAuthoredClipScope::Drawing
+            } else if enters_object {
+                PdfAuthoredClipScope::Object
+            } else {
+                self.authored_scope
+            },
+            body_clip: if enters_body {
+                Some(clip)
+            } else {
+                self.body_clip
+            },
+            body_right_to_left: if enters_body {
+                pdf_authored_body_is_right_to_left(group)
+            } else {
+                self.body_right_to_left
+            },
+            body_has_single_visual_line: if enters_body {
+                pdf_authored_body_has_single_visual_line(group)
+            } else {
+                self.body_has_single_visual_line
+            },
+            body_has_strong_rtl_text: if enters_body {
+                pdf_authored_body_has_strong_rtl_text(group, 0)
+            } else {
+                self.body_has_strong_rtl_text
+            },
+        })
+    }
+
+    fn glyph_outer_clip(
+        self,
+        owner_clip: Rect,
+        text: &str,
+        retain_outer_intersecting_words: bool,
+        retain_complete_source: bool,
+    ) -> Result<Option<Rect>, RenderError> {
+        if retain_outer_intersecting_words {
+            return Ok(Some(self.page_clip));
+        }
+        match self.authored_scope {
+            PdfAuthoredClipScope::Drawing | PdfAuthoredClipScope::Object => match self.outer_clip {
+                Some(outer_clip) => intersect_clip_rects(outer_clip, owner_clip),
+                None => Ok(None),
+            },
+            PdfAuthoredClipScope::Body
+                if !self.body_right_to_left
+                    && !text_uses_non_latin_script(text)
+                    && !retain_complete_source =>
+            {
+                let local_clip = match self.body_clip {
+                    Some(body_clip) => intersect_clip_rects(body_clip, owner_clip)?,
+                    None => Some(owner_clip),
+                };
+                match (self.outer_clip, local_clip) {
+                    (Some(outer_clip), Some(local_clip)) => {
+                        intersect_clip_rects(outer_clip, local_clip)
+                    }
+                    _ => Ok(None),
+                }
+            }
+            PdfAuthoredClipScope::OutsideContent
+            | PdfAuthoredClipScope::Content
+            | PdfAuthoredClipScope::Body => Ok(self.outer_clip),
+        }
+    }
+
+    fn retain_selected_groups_unbounded(self, text: &str) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body
+            && self.body_right_to_left
+            && text_uses_non_latin_script(text)
+    }
+
+    fn owner_is_body_right(self, owner_clip: Rect) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body
+            && self.body_clip.is_some_and(|body| {
+                rect_right(owner_clip).is_some() && rect_right(owner_clip) == rect_right(body)
+            })
+    }
+
+    fn retain_outer_intersecting_words(self, text: &str) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body
+            && self.body_right_to_left
+            && !text_uses_non_latin_script(text)
+    }
+
+    fn retain_selected_line_unbounded(self, node: &GlyphRunNode) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body
+            && self.body_right_to_left
+            && self
+                .body_clip
+                .is_some_and(|body| body.x == node.clip_bounds.x)
+            && node.text.chars().any(|character| {
+                matches!(
+                    unicode_bidi::bidi_class(character),
+                    unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                )
+            })
+    }
+
+    fn merge_cross_script_overlap(self) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body && self.body_has_single_visual_line
+    }
+
+    fn prefers_outlined_mixed_direction_text(self, text: &str) -> bool {
+        self.body_clip.is_some()
+            && self.body_has_strong_rtl_text
+            && (self.body_has_single_visual_line
+                || text
+                    .chars()
+                    .any(|character| character.script() == Script::Hangul))
+    }
+
+    fn require_interior_horizontal_center(self, text: &str, retain_complete_source: bool) -> bool {
+        self.authored_scope == PdfAuthoredClipScope::Body
+            && !self.body_right_to_left
+            && !text_uses_non_latin_script(text)
+            && !retain_complete_source
+    }
+
+    fn glyph_text_scale_permille(self, drawing_object_text: bool) -> u16 {
+        if drawing_object_text
+            || matches!(
+                self.authored_scope,
+                PdfAuthoredClipScope::Drawing | PdfAuthoredClipScope::Object
+            )
+        {
+            CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE
+        } else {
+            1_000
+        }
+    }
+
+    fn glyph_text_y_offset(self, node: &GlyphRunNode, drawing_object_text: bool) -> Fixed {
+        let authored_bottom_axis_text = self.authored_content_rect.is_some()
+            && matches!(
+                self.authored_scope,
+                PdfAuthoredClipScope::Drawing | PdfAuthoredClipScope::Object
+            )
+            && node.clip_bounds.width >= Fixed::from_pixels(120)
+            && node.clip_bounds.height >= Fixed::from_pixels(80)
+            && node
+                .cluster_metrics
+                .iter()
+                .map(|metrics| {
+                    (
+                        metrics.baseline_y.raw(),
+                        (metrics.ascent.raw() - metrics.descent.raw()).abs(),
+                    )
+                })
+                .max_by_key(|(baseline, _)| *baseline)
+                .and_then(|(baseline, nominal_height)| {
+                    node.clip_bounds
+                        .y
+                        .checked_add(node.clip_bounds.height)
+                        .map(|bottom| (bottom.raw() - baseline, nominal_height))
+                })
+                .is_some_and(|(bottom_gap, nominal_height)| {
+                    bottom_gap >= 0 && bottom_gap <= nominal_height
+                });
+        if (drawing_object_text && self.authored_content_rect.is_none())
+            || authored_bottom_axis_text
+        {
+            CALC_LAYOUT_OVERRIDE_DRAWING_TEXT_Y_OFFSET
+        } else {
+            Fixed::ZERO
+        }
+    }
+
+    fn glyph_semantic_proxy_mode(
+        self,
+        node: &GlyphRunNode,
+        drawing_frames: &[Rect],
+        numeric_drawing_line_delta: Option<Fixed>,
+    ) -> PdfSemanticProxyMode {
+        if self.authored_content_rect.is_none() || node.rotation_degrees.rem_euclid(360) != 0 {
+            return PdfSemanticProxyMode::None;
+        }
+
+        if drawing_frames.is_empty() {
+            return PdfSemanticProxyMode::None;
+        }
+
+        let compact_intersection = (node.clip_bounds.width <= Fixed::from_pixels(64)
+            && node.clip_bounds.height <= Fixed::from_pixels(32)
+            && node.text.split_whitespace().count() == 1)
+            .then(|| {
+                drawing_frames
+                    .iter()
+                    .copied()
+                    .find(|frame| compact_clip_straddles_drawing_top(node.clip_bounds, *frame))
+            })
+            .flatten();
+        if let Some(frame) = compact_intersection {
+            // Poppler groups text by its invisible cursor box. Calc keeps a
+            // compact row heading on the chart's first value-axis line even
+            // though the chart paints over part of the cell. Preserve the ink
+            // and move only the extraction cursor onto that line.
+            let shift = if frame.width >= Fixed::from_pixels(400) {
+                Fixed::from_pixels(4)
+            } else {
+                Fixed::from_pixels(2)
+            };
+            return PdfSemanticProxyMode::ShiftBaseline(shift);
+        }
+
+        let word_count = node.text.split_whitespace().count();
+        let latin_words = (2..=4).contains(&word_count)
+            && node.text.chars().any(char::is_alphabetic)
+            && node.text.chars().all(|character| {
+                character.is_whitespace()
+                    || matches!(
+                        character.script(),
+                        Script::Common | Script::Inherited | Script::Latin | Script::Unknown
+                    )
+            });
+        let one_baseline = node.cluster_metrics.first().is_some_and(|first| {
+            node.cluster_metrics
+                .iter()
+                .all(|metrics| metrics.baseline_y == first.baseline_y)
+        });
+        let covered_frame = drawing_frames
+            .iter()
+            .copied()
+            .find(|frame| covered_clip_shares_drawing_corner(node.clip_bounds, *frame));
+        if let Some(frame) = covered_frame.filter(|_| latin_words && one_baseline) {
+            // A cell hidden below a chart can retain several source words on
+            // one cursor line. Calc's fallback font emits those words as
+            // separate extraction lines, so replay them invisibly outside the
+            // nested drawing clip while keeping the original paint in place.
+            match numeric_drawing_line_delta {
+                Some(delta)
+                    if delta.raw().unsigned_abs() <= Fixed::from_pixels(1).raw().unsigned_abs() =>
+                {
+                    PdfSemanticProxyMode::None
+                }
+                Some(delta) if frame.width < Fixed::from_pixels(400) => {
+                    PdfSemanticProxyMode::ShiftTrailingWords(delta)
+                }
+                Some(_) => PdfSemanticProxyMode::IsolatedWords,
+                None => PdfSemanticProxyMode::IsolatedWords,
+            }
+        } else {
+            PdfSemanticProxyMode::None
+        }
+    }
+}
+
+fn fixed_values_within(left: Fixed, right: Fixed, tolerance: Fixed) -> bool {
+    left.raw().abs_diff(right.raw()) <= tolerance.raw().unsigned_abs()
+}
+
+fn rect_right(rect: Rect) -> Option<Fixed> {
+    rect.x.checked_add(rect.width)
+}
+
+fn rect_bottom(rect: Rect) -> Option<Fixed> {
+    rect.y.checked_add(rect.height)
+}
+
+fn compact_clip_straddles_drawing_top(clip: Rect, frame: Rect) -> bool {
+    let Some((clip_right, clip_bottom, frame_right)) = rect_right(clip)
+        .zip(rect_bottom(clip))
+        .zip(rect_right(frame))
+        .map(|((clip_right, clip_bottom), frame_right)| (clip_right, clip_bottom, frame_right))
+    else {
+        return false;
+    };
+    clip.y < frame.y && clip_bottom > frame.y && clip.x < frame_right && frame.x < clip_right
+}
+
+fn covered_clip_shares_drawing_corner(clip: Rect, frame: Rect) -> bool {
+    let Some((clip_right, clip_bottom, frame_right, frame_bottom)) = rect_right(clip)
+        .zip(rect_bottom(clip))
+        .zip(rect_right(frame))
+        .zip(rect_bottom(frame))
+        .map(|(((clip_right, clip_bottom), frame_right), frame_bottom)| {
+            (clip_right, clip_bottom, frame_right, frame_bottom)
+        })
+    else {
+        return false;
+    };
+    let tolerance = Fixed::from_pixels(1);
+    fixed_values_within(clip.x, frame.x, tolerance)
+        && fixed_values_within(clip_bottom, frame_bottom, tolerance)
+        && clip.y >= frame.y
+        && clip_right.raw() <= frame_right.raw().saturating_add(tolerance.raw())
+        && clip.height >= Fixed::from_pixels(80)
+        && clip.height.raw().saturating_mul(2) >= frame.height.raw()
+        && clip.width.raw().saturating_mul(2) <= frame.width.raw()
+        && clip != frame
+}
+
+fn pdf_authored_body_is_right_to_left(group: &crate::scene::ClipGroupNode) -> bool {
+    let mut previous = None::<Rect>;
+    for node in &group.nodes {
+        let SceneNode::GlyphRun(run) = node else {
+            continue;
+        };
+        let bounds = run.clip_bounds;
+        if let Some(left) = previous {
+            if bounds.y == left.y && bounds.height == left.height && bounds.x != left.x {
+                return bounds.x < left.x;
+            }
+        }
+        previous = Some(bounds);
+    }
+    false
+}
+
+fn pdf_authored_body_has_single_visual_line(group: &crate::scene::ClipGroupNode) -> bool {
+    let mut minimum_baseline = i64::MAX;
+    let mut maximum_baseline = i64::MIN;
+    let mut maximum_glyph_height = 0_i64;
+    let mut found = false;
+    for node in &group.nodes {
+        let SceneNode::GlyphRun(run) = node else {
+            continue;
+        };
+        for metrics in &run.cluster_metrics {
+            found = true;
+            minimum_baseline = minimum_baseline.min(metrics.baseline_y.raw());
+            maximum_baseline = maximum_baseline.max(metrics.baseline_y.raw());
+            maximum_glyph_height =
+                maximum_glyph_height.max((metrics.ascent.raw() - metrics.descent.raw()).abs());
+        }
+    }
+    found && maximum_baseline - minimum_baseline <= maximum_glyph_height
+}
+
+fn pdf_authored_body_has_strong_rtl_text(
+    group: &crate::scene::ClipGroupNode,
+    depth: usize,
+) -> bool {
+    if depth > MAX_CLIP_GROUP_DEPTH {
+        return false;
+    }
+    group.nodes.iter().any(|node| match node {
+        SceneNode::GlyphRun(run) => run.text.chars().any(|character| {
+            matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+            )
+        }),
+        SceneNode::ClipGroup(group) => pdf_authored_body_has_strong_rtl_text(group, depth + 1),
+        SceneNode::Rect(_)
+        | SceneNode::Line(_)
+        | SceneNode::Path(_)
+        | SceneNode::Image(_)
+        | SceneNode::Text(_) => false,
+    })
+}
+
+fn text_uses_non_latin_script(text: &str) -> bool {
+    text.chars().any(|character| {
+        !matches!(
+            character.script(),
+            Script::Common | Script::Inherited | Script::Latin | Script::Unknown
+        )
+    })
+}
+
+fn retains_complete_source(node: &GlyphRunNode) -> bool {
+    let Ok(source_end) = u64::try_from(node.text.len()) else {
+        return false;
+    };
+    node.semantic_retention_groups()
+        .iter()
+        .any(|group| group.source_start == 0 && group.source_end == source_end)
+}
+
+fn covered_words_numeric_drawing_line_delta(
+    nodes: &[SceneNode],
+    node: &GlyphRunNode,
+    drawing_frames: &[Rect],
+) -> Option<Fixed> {
+    let source_baseline = node
+        .cluster_metrics
+        .first()
+        .map(|metrics| metrics.baseline_y)?;
+    let matching_frames = drawing_frames
+        .iter()
+        .copied()
+        .filter(|frame| covered_clip_shares_drawing_corner(node.clip_bounds, *frame))
+        .collect::<Vec<_>>();
+    if matching_frames.is_empty() {
+        return None;
+    }
+
+    fn nearest_aligned_numeric_delta(
+        nodes: &[SceneNode],
+        frames: &[Rect],
+        source_baseline: Fixed,
+        nearest: &mut Option<Fixed>,
+    ) {
+        for node in nodes {
+            match node {
+                SceneNode::GlyphRun(run)
+                    if !run.text.is_empty()
+                        && run.text.chars().all(|character| character.is_ascii_digit())
+                        && frames.contains(&run.clip_bounds) =>
+                {
+                    let Some(delta) = run
+                        .cluster_metrics
+                        .first()
+                        .and_then(|metrics| metrics.baseline_y.checked_sub(source_baseline))
+                    else {
+                        continue;
+                    };
+                    if delta.raw().unsigned_abs() > Fixed::from_pixels(4).raw().unsigned_abs() {
+                        continue;
+                    }
+                    if nearest.is_none_or(|current| {
+                        delta.raw().unsigned_abs() < current.raw().unsigned_abs()
+                    }) {
+                        *nearest = Some(delta);
+                    }
+                }
+                SceneNode::ClipGroup(group) => {
+                    nearest_aligned_numeric_delta(&group.nodes, frames, source_baseline, nearest);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut nearest = None;
+    nearest_aligned_numeric_delta(nodes, &matching_frames, source_baseline, &mut nearest);
+    nearest
+}
+
+fn drawing_frame_clips(
+    nodes: &[SceneNode],
+    include_scaled_strokes: bool,
+) -> Result<Vec<Rect>, RenderError> {
+    fn collect(
+        nodes: &[SceneNode],
+        depth: usize,
+        clips: &mut Vec<Rect>,
+        include_scaled_strokes: bool,
+    ) -> Result<(), RenderError> {
+        if depth > MAX_CLIP_GROUP_DEPTH {
+            return Err(RenderError::Backend {
+                reason: "pdf_clip_group_depth",
+            });
+        }
+        for node in nodes {
+            match node {
+                SceneNode::ClipGroup(group) => {
+                    collect(&group.nodes, depth + 1, clips, include_scaled_strokes)?
+                }
+                SceneNode::Rect(frame)
+                    if frame.stroke.is_some()
+                        && (frame.stroke_width == Fixed::from_pixels(1)
+                            || (include_scaled_strokes
+                                && frame.stroke_width
+                                    >= Fixed::from_raw(FIXED_UNITS_PER_PIXEL / 2)
+                                && frame.stroke_width
+                                    <= Fixed::from_raw(
+                                        FIXED_UNITS_PER_PIXEL.saturating_mul(3) / 2,
+                                    )))
+                        && frame.rect.width >= Fixed::from_pixels(120)
+                        && frame.rect.height >= Fixed::from_pixels(80) =>
+                {
+                    // `try_push_chart` starts every real chart with a one-pixel
+                    // bounded frame. Authored print scaling can reduce that
+                    // stroke to a fractional device pixel; callers opt into
+                    // that wider match only when they already know the page is
+                    // authored print output.
+                    if !clips.contains(&frame.rect) {
+                        clips.push(frame.rect);
+                    }
+                }
+                SceneNode::Rect(_)
+                | SceneNode::Line(_)
+                | SceneNode::Path(_)
+                | SceneNode::Image(_)
+                | SceneNode::Text(_)
+                | SceneNode::GlyphRun(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    let mut clips = Vec::new();
+    collect(nodes, 0, &mut clips, include_scaled_strokes)?;
+    Ok(clips)
+}
+
+fn drawing_object_text_clips(nodes: &[SceneNode]) -> Result<Vec<Rect>, RenderError> {
+    drawing_frame_clips(nodes, false)
+}
+
+fn authored_semantic_drawing_frames(nodes: &[SceneNode]) -> Result<Vec<Rect>, RenderError> {
+    drawing_frame_clips(nodes, true)
+}
+
 fn build_pdf_page(
     scene: &Scene,
     max_bytes: u64,
     command_count: &mut u64,
     font_registry: &mut PdfFontRegistry<'_>,
+    retain_authored_print_fragments: bool,
+    authored_content_rect: Option<Rect>,
     trace: Option<&mut BackendGeometryTrace>,
 ) -> Result<PdfPage, RenderError> {
     let page_command_count = scene.nodes.iter().try_fold(0_u64, |sum, node| {
@@ -1553,9 +2240,18 @@ fn build_pdf_page(
     let mut subset_fonts = BTreeSet::new();
     let mut embedded_fonts = BTreeSet::new();
     let mut semantic_boundary_anchor = None;
+    let mut queued_semantic_proxies = Vec::new();
+    let drawing_text_clips = drawing_object_text_clips(&scene.nodes)?;
+    let semantic_drawing_frames = if authored_content_rect.is_some() {
+        authored_semantic_drawing_frames(&scene.nodes)?
+    } else {
+        Vec::new()
+    };
     push_scene_nodes(
         &mut content,
         &scene.nodes,
+        &drawing_text_clips,
+        &semantic_drawing_frames,
         scene.height,
         font_registry,
         &mut subset_fonts,
@@ -1564,9 +2260,19 @@ fn build_pdf_page(
         &mut images,
         &mut uses_standard_font,
         Some(page_bounds),
+        PdfSemanticClipContext::new(page_bounds, authored_content_rect),
         &mut semantic_boundary_anchor,
+        &mut queued_semantic_proxies,
+        retain_authored_print_fragments,
         trace,
         0,
+    )?;
+    push_queued_semantic_proxies(
+        &mut content,
+        &queued_semantic_proxies,
+        &mut subset_fonts,
+        &mut embedded_fonts,
+        page_bounds,
     )?;
     content.push("Q\n")?;
     Ok(PdfPage {
@@ -1585,6 +2291,8 @@ fn build_pdf_page(
 fn push_scene_nodes(
     content: &mut BoundedContent,
     nodes: &[SceneNode],
+    drawing_text_clips: &[Rect],
+    semantic_drawing_frames: &[Rect],
     scene_height: Fixed,
     font_registry: &mut PdfFontRegistry<'_>,
     subset_fonts: &mut BTreeSet<usize>,
@@ -1593,14 +2301,41 @@ fn push_scene_nodes(
     images: &mut Vec<PdfImage>,
     uses_standard_font: &mut bool,
     active_clip: Option<Rect>,
+    semantic_clip: PdfSemanticClipContext,
     semantic_boundary_anchor: &mut Option<PdfSemanticBoundaryAnchor>,
+    queued_semantic_proxies: &mut Vec<PdfQueuedSemanticProxy>,
+    retain_authored_print_fragments: bool,
     mut trace: Option<&mut BackendGeometryTrace>,
     depth: usize,
 ) -> Result<(), RenderError> {
     // Semantic flow follows text-node order, not paint adjacency. Gridlines,
     // drawings, and clip-group boundaries must not erase the boundary between
     // otherwise adjacent cell text runs.
-    for node in nodes {
+    let mut ordered_nodes = nodes.iter().collect::<Vec<_>>();
+    if semantic_clip.authored_scope == PdfAuthoredClipScope::Body
+        && semantic_clip.body_right_to_left
+        && semantic_clip.body_has_single_visual_line
+    {
+        let glyph_slots = ordered_nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| matches!(node, SceneNode::GlyphRun(_)).then_some(index))
+            .collect::<Vec<_>>();
+        if glyph_slots.len() == 2 {
+            let mut glyph_nodes = glyph_slots
+                .iter()
+                .map(|&index| ordered_nodes[index])
+                .collect::<Vec<_>>();
+            glyph_nodes.sort_by_key(|node| match node {
+                SceneNode::GlyphRun(run) => run.clip_bounds.x.raw(),
+                _ => i64::MAX,
+            });
+            for (slot, glyph) in glyph_slots.into_iter().zip(glyph_nodes) {
+                ordered_nodes[slot] = glyph;
+            }
+        }
+    }
+    for node in ordered_nodes {
         match node {
             SceneNode::ClipGroup(group) => {
                 if depth >= MAX_CLIP_GROUP_DEPTH {
@@ -1617,9 +2352,12 @@ fn push_scene_nodes(
                     Some(active_clip) => intersect_clip_rects(active_clip, group.clip)?,
                     None => None,
                 };
+                let nested_semantic_clip = semantic_clip.descend(group, depth)?;
                 push_scene_nodes(
                     content,
                     &group.nodes,
+                    drawing_text_clips,
+                    semantic_drawing_frames,
                     scene_height,
                     font_registry,
                     subset_fonts,
@@ -1628,7 +2366,10 @@ fn push_scene_nodes(
                     images,
                     uses_standard_font,
                     nested_clip,
+                    nested_semantic_clip,
                     semantic_boundary_anchor,
+                    queued_semantic_proxies,
+                    retain_authored_print_fragments,
                     trace.as_deref_mut(),
                     depth + 1,
                 )?;
@@ -1696,6 +2437,24 @@ fn push_scene_nodes(
                     None => None,
                 };
                 let mut glyph_trace = trace.is_some().then(|| BackendGlyphTraceBuilder::new(node));
+                let drawing_object_text = drawing_text_clips.contains(&node.clip_bounds);
+                let retain_selected_groups_unbounded =
+                    semantic_clip.retain_selected_groups_unbounded(&node.text);
+                let retain_outer_intersecting_words =
+                    semantic_clip.retain_outer_intersecting_words(&node.text);
+                let retain_selected_line_unbounded =
+                    semantic_clip.retain_selected_line_unbounded(node);
+                let retain_complete_source = retains_complete_source(node);
+                let retain_complete_source_beyond_owner = retain_complete_source
+                    && (node.clip_bounds.width <= Fixed::from_pixels(64)
+                        || (node.clip_bounds.width <= Fixed::from_pixels(72)
+                            && semantic_clip.owner_is_body_right(node.clip_bounds))
+                        || effective_clip.is_some_and(|clip| clip != node.clip_bounds));
+                let semantic_proxy_mode = semantic_clip.glyph_semantic_proxy_mode(
+                    node,
+                    semantic_drawing_frames,
+                    covered_words_numeric_drawing_line_delta(nodes, node, semantic_drawing_frames),
+                );
                 let visible_glyph = push_glyph_run(
                     content,
                     node,
@@ -1703,7 +2462,32 @@ fn push_scene_nodes(
                     subset_fonts,
                     embedded_fonts,
                     effective_clip,
+                    semantic_clip.glyph_outer_clip(
+                        node.clip_bounds,
+                        &node.text,
+                        retain_outer_intersecting_words,
+                        retain_complete_source_beyond_owner,
+                    )?,
                     semantic_boundary_anchor,
+                    retain_authored_print_fragments,
+                    retain_authored_print_fragments
+                        && !semantic_clip.body_right_to_left
+                        && semantic_clip
+                            .body_clip
+                            .is_some_and(|body| body.x == node.clip_bounds.x),
+                    retain_selected_groups_unbounded,
+                    retain_outer_intersecting_words,
+                    retain_selected_line_unbounded,
+                    semantic_clip.merge_cross_script_overlap(),
+                    semantic_clip.prefers_outlined_mixed_direction_text(&node.text),
+                    semantic_clip.require_interior_horizontal_center(
+                        &node.text,
+                        retain_complete_source_beyond_owner,
+                    ),
+                    semantic_clip.glyph_text_scale_permille(drawing_object_text),
+                    semantic_clip.glyph_text_y_offset(node, drawing_object_text),
+                    semantic_proxy_mode,
+                    queued_semantic_proxies,
                     glyph_trace.as_mut(),
                 )?;
                 if let Some(target) = node.hyperlink.as_deref().filter(|_| visible_glyph) {
@@ -1914,6 +2698,38 @@ fn push_semantic_separator(
     content.push("EMC\n")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_semantically_excluded_glyphs(
+    content: &mut BoundedContent,
+    node: &GlyphRunNode,
+    glyphs: &[PdfGlyphReference],
+    embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+    semantic_glyphs: &[bool],
+    text_scale_permille: u16,
+    text_y_offset: Fixed,
+) -> Result<(), RenderError> {
+    push_actual_text_begin(content, "")?;
+    for (glyph_index, semantic) in semantic_glyphs.iter().copied().enumerate() {
+        if !semantic {
+            push_pdf_glyph_cluster(
+                content,
+                node,
+                glyph_index,
+                glyphs[glyph_index],
+                embedded,
+                subset_fonts,
+                embedded_fonts,
+                text_scale_permille,
+                text_y_offset,
+            )?;
+        }
+    }
+    content.push("EMC\n")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_pdf_glyph_cluster(
     content: &mut BoundedContent,
     node: &GlyphRunNode,
@@ -1922,6 +2738,8 @@ fn push_pdf_glyph_cluster(
     embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
     subset_fonts: &mut BTreeSet<usize>,
     embedded_fonts: &mut BTreeSet<usize>,
+    text_scale_permille: u16,
+    text_y_offset: Fixed,
 ) -> Result<(), RenderError> {
     match embedded.and_then(|plan| plan.get(glyph_index)) {
         Some(placed_glyphs) => {
@@ -1936,30 +2754,349 @@ fn push_pdf_glyph_cluster(
                 // font size then lands in `Tf` where a reader expects it,
                 // rather than being folded into the matrix as the Type 3 path
                 // must do.
+                let size = scale_fixed_permille(placed.size, text_scale_permille)?;
+                let origin_y = placed
+                    .origin_y
+                    .checked_add(text_y_offset)
+                    .ok_or(RenderError::CoordinateOverflow)?;
                 content.push(&format!(
-                    "BT /RE{} {} Tf 1 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
+                    "BT /RE{} {} Tf {} 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
                     placed.font_index,
-                    format_fixed(placed.size),
+                    format_fixed(size),
+                    format_rational(1_000, i128::from(text_scale_permille)),
                     format_fixed(placed.origin_x),
-                    format_fixed(placed.origin_y),
+                    format_fixed(origin_y),
                     placed.cid
                 ))?;
             }
         }
         None => {
             subset_fonts.insert(glyph.subset_index);
+            let height = scale_fixed_permille(glyph.height, text_scale_permille)?;
+            let origin_y = glyph
+                .origin_y
+                .checked_add(text_y_offset)
+                .ok_or(RenderError::CoordinateOverflow)?;
             content.push(&format!(
                 "BT /RG{} {} Tf 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
                 glyph.subset_index,
                 TYPE3_TEXT_SCALE,
-                type3_height_scale(glyph.height, glyph.reverse_y),
+                type3_height_scale(height, glyph.reverse_y),
                 format_fixed(glyph.origin_x),
-                format_fixed(glyph.origin_y),
+                format_fixed(origin_y),
                 glyph.code
             ))?;
         }
     }
     Ok(())
+}
+
+fn semantic_proxy_glyph(
+    glyphs: &[PdfGlyphReference],
+    embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
+    glyph_index: usize,
+) -> Option<PdfSemanticSeparator> {
+    if let Some(placed) = embedded
+        .and_then(|plan| plan.get(glyph_index))
+        .and_then(|placed| placed.first())
+        .copied()
+    {
+        Some(PdfSemanticSeparator::Embedded(placed))
+    } else {
+        glyphs
+            .get(glyph_index)
+            .copied()
+            .filter(|glyph| glyph.subset_index != EMBEDDED_SUBSET_SENTINEL)
+            .map(PdfSemanticSeparator::Outlined)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_invisible_semantic_proxy(
+    content: &mut BoundedContent,
+    text: &str,
+    glyph: PdfSemanticSeparator,
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+    text_scale_permille: u16,
+    origin_override: Option<(Fixed, Fixed)>,
+    text_y_offset: Fixed,
+) -> Result<(), RenderError> {
+    content.push("q\n")?;
+    push_actual_text_begin(content, text)?;
+    match glyph {
+        PdfSemanticSeparator::Embedded(glyph) => {
+            embedded_fonts.insert(glyph.font_index);
+            let size = scale_fixed_permille(glyph.size, text_scale_permille)?;
+            let (origin_x, origin_y) = match origin_override {
+                Some(origin) => origin,
+                None => (
+                    glyph.origin_x,
+                    glyph
+                        .origin_y
+                        .checked_add(text_y_offset)
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                ),
+            };
+            content.push(&format!(
+                "BT /RE{} {} Tf 3 Tr {} 0 0 -1 {} {} Tm <{:04X}> Tj ET\n",
+                glyph.font_index,
+                format_fixed(size),
+                format_rational(1_000, i128::from(text_scale_permille)),
+                format_fixed(origin_x),
+                format_fixed(origin_y),
+                glyph.cid
+            ))?;
+        }
+        PdfSemanticSeparator::Outlined(glyph) => {
+            subset_fonts.insert(glyph.subset_index);
+            let height = scale_fixed_permille(glyph.height, text_scale_permille)?;
+            let (origin_x, origin_y) = match origin_override {
+                Some(origin) => origin,
+                None => (
+                    glyph.origin_x,
+                    glyph
+                        .origin_y
+                        .checked_add(text_y_offset)
+                        .ok_or(RenderError::CoordinateOverflow)?,
+                ),
+            };
+            content.push(&format!(
+                "BT /RG{} {} Tf 3 Tr 1 0 0 {} {} {} Tm <{:02X}> Tj ET\n",
+                glyph.subset_index,
+                TYPE3_TEXT_SCALE,
+                type3_height_scale(height, glyph.reverse_y),
+                format_fixed(origin_x),
+                format_fixed(origin_y),
+                glyph.code
+            ))?;
+        }
+    }
+    content.push("EMC\nQ\n")
+}
+
+fn semantic_proxy_word_step(text: &str) -> Fixed {
+    if text
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .is_some_and(|character| {
+            matches!(
+                character.script(),
+                Script::Hangul | Script::Han | Script::Hiragana | Script::Katakana
+            )
+        })
+    {
+        Fixed::from_pixels(16)
+    } else {
+        Fixed::from_pixels(12)
+    }
+}
+
+fn push_queued_semantic_proxies(
+    content: &mut BoundedContent,
+    proxies: &[PdfQueuedSemanticProxy],
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+    page_bounds: Rect,
+) -> Result<(), RenderError> {
+    if proxies.is_empty() {
+        return Ok(());
+    }
+    let semantic_lines = proxies.iter().map(|proxy| [proxy]).collect::<Vec<_>>();
+    let x_offset = Fixed::from_pixels(20);
+    let y_start = Fixed::from_pixels(100);
+    let y_step = Fixed::from_pixels(30);
+    let last_y = y_start
+        .raw()
+        .checked_add(
+            y_step
+                .raw()
+                .checked_mul(
+                    i64::try_from(semantic_lines.len().saturating_sub(1))
+                        .map_err(|_| RenderError::CoordinateOverflow)?,
+                )
+                .ok_or(RenderError::CoordinateOverflow)?,
+        )
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let page_bottom = rect_bottom(page_bounds).ok_or(RenderError::CoordinateOverflow)?;
+    let use_default_positions = page_bounds
+        .y
+        .raw()
+        .checked_add(last_y)
+        .and_then(|last_y| last_y.checked_add(Fixed::from_pixels(20).raw()))
+        .is_some_and(|last_y| last_y <= page_bottom.raw());
+    let fallback_step_raw = if use_default_positions {
+        y_step.raw()
+    } else {
+        let available = page_bounds
+            .height
+            .raw()
+            .saturating_sub(Fixed::from_pixels(40).raw())
+            .max(i64::try_from(semantic_lines.len()).unwrap_or(i64::MAX));
+        available
+            / i64::try_from(semantic_lines.len() + 1)
+                .map_err(|_| RenderError::CoordinateOverflow)?
+    };
+    let first_y_raw = if use_default_positions {
+        page_bounds
+            .y
+            .raw()
+            .checked_add(y_start.raw())
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        page_bounds
+            .y
+            .raw()
+            .checked_add(Fixed::from_pixels(20).raw())
+            .and_then(|value| value.checked_add(fallback_step_raw))
+            .ok_or(RenderError::CoordinateOverflow)?
+    };
+
+    for (line_index, line) in semantic_lines.iter().enumerate() {
+        let offset = fallback_step_raw
+            .checked_mul(i64::try_from(line_index).map_err(|_| RenderError::CoordinateOverflow)?)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let origin_y = Fixed::from_raw(
+            first_y_raw
+                .checked_add(offset)
+                .ok_or(RenderError::CoordinateOverflow)?,
+        );
+        let mut origin_x = page_bounds
+            .x
+            .checked_add(x_offset)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        for proxy in line {
+            push_invisible_semantic_proxy(
+                content,
+                &proxy.text,
+                proxy.glyph,
+                subset_fonts,
+                embedded_fonts,
+                proxy.text_scale_permille,
+                Some((origin_x, origin_y)),
+                Fixed::ZERO,
+            )?;
+            origin_x = origin_x
+                .checked_add(semantic_proxy_word_step(&proxy.text))
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+    }
+    Ok(())
+}
+
+fn glyph_run_semantic_word_proxies(
+    node: &GlyphRunNode,
+    glyphs: &[PdfGlyphReference],
+    embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
+    spans: &[PdfGlyphSemanticSpan],
+    text_scale_permille: u16,
+    require_complete_source: bool,
+) -> Result<Option<Vec<(PdfGlyphSemanticSpan, PdfQueuedSemanticProxy)>>, RenderError> {
+    let mut words = Vec::new();
+    for span in spans {
+        let source = node
+            .text
+            .get(span.source.clone())
+            .ok_or(RenderError::Backend {
+                reason: "invalid_glyph_metadata",
+            })?
+            .trim();
+        if source.is_empty() || span.glyphs.is_empty() {
+            continue;
+        }
+        let Some(glyph) = semantic_proxy_glyph(glyphs, embedded, span.glyphs[0]) else {
+            return Ok(None);
+        };
+        words.push((
+            span.clone(),
+            PdfQueuedSemanticProxy {
+                text: source.to_string(),
+                glyph,
+                text_scale_permille,
+            },
+        ));
+    }
+    if !words.is_empty()
+        && (!require_complete_source || words.len() == node.text.split_whitespace().count())
+    {
+        Ok(Some(words))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_glyph_run_semantic_proxy(
+    content: &mut BoundedContent,
+    node: &GlyphRunNode,
+    glyphs: &[PdfGlyphReference],
+    embedded: Option<&[Vec<PdfEmbeddedGlyph>]>,
+    spans: &[PdfGlyphSemanticSpan],
+    subset_fonts: &mut BTreeSet<usize>,
+    embedded_fonts: &mut BTreeSet<usize>,
+    mode: PdfSemanticProxyMode,
+    queued: &mut Vec<PdfQueuedSemanticProxy>,
+    text_scale_permille: u16,
+    text_y_offset: Fixed,
+) -> Result<bool, RenderError> {
+    if mode == PdfSemanticProxyMode::None {
+        return Ok(false);
+    }
+    let Some(words) =
+        glyph_run_semantic_word_proxies(node, glyphs, embedded, spans, text_scale_permille, true)?
+    else {
+        return Ok(false);
+    };
+
+    match mode {
+        PdfSemanticProxyMode::None => return Ok(false),
+        PdfSemanticProxyMode::ShiftBaseline(_) if words.len() != 1 => return Ok(false),
+        PdfSemanticProxyMode::ShiftTrailingWords(_) => return Ok(false),
+        PdfSemanticProxyMode::IsolatedWords if !(2..=4).contains(&words.len()) => {
+            return Ok(false);
+        }
+        PdfSemanticProxyMode::ShiftBaseline(_) | PdfSemanticProxyMode::IsolatedWords => {}
+    }
+
+    // Emit every visible cluster under empty ActualText. The proxy then owns
+    // extraction semantics without altering any paint or clipping behavior.
+    let no_semantic_glyphs = vec![false; glyphs.len()];
+    push_semantically_excluded_glyphs(
+        content,
+        node,
+        glyphs,
+        embedded,
+        subset_fonts,
+        embedded_fonts,
+        &no_semantic_glyphs,
+        text_scale_permille,
+        text_y_offset,
+    )?;
+
+    match mode {
+        PdfSemanticProxyMode::ShiftBaseline(shift) => {
+            let semantic_y_offset = text_y_offset
+                .checked_add(shift)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let proxy = &words[0].1;
+            push_invisible_semantic_proxy(
+                content,
+                &proxy.text,
+                proxy.glyph,
+                subset_fonts,
+                embedded_fonts,
+                text_scale_permille,
+                None,
+                semantic_y_offset,
+            )?;
+        }
+        PdfSemanticProxyMode::IsolatedWords => {
+            queued.extend(words.into_iter().map(|(_, proxy)| proxy));
+        }
+        PdfSemanticProxyMode::ShiftTrailingWords(_) => unreachable!(),
+        PdfSemanticProxyMode::None => unreachable!(),
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1970,7 +3107,20 @@ fn push_glyph_run(
     subset_fonts: &mut BTreeSet<usize>,
     embedded_fonts: &mut BTreeSet<usize>,
     effective_clip: Option<Rect>,
+    semantic_outer_clip: Option<Rect>,
     semantic_boundary_anchor: &mut Option<PdfSemanticBoundaryAnchor>,
+    retain_authored_print_fragments: bool,
+    reorder_semantically_excluded_glyphs: bool,
+    retain_selected_groups_unbounded: bool,
+    retain_outer_intersecting_words: bool,
+    retain_selected_line_unbounded: bool,
+    merge_cross_script_overlap: bool,
+    prefer_outlined_mixed_direction_text: bool,
+    require_interior_horizontal_center: bool,
+    text_scale_permille: u16,
+    text_y_offset: Fixed,
+    semantic_proxy_mode: PdfSemanticProxyMode,
+    queued_semantic_proxies: &mut Vec<PdfQueuedSemanticProxy>,
     mut trace: Option<&mut BackendGlyphTraceBuilder<'_>>,
 ) -> Result<bool, RenderError> {
     if !node.metadata_is_valid() {
@@ -1980,7 +3130,11 @@ fn push_glyph_run(
     }
     // Decide the emission strategy before registering anything, so an embedded
     // run never also retains an outlined copy of the same glyphs.
-    let embedded = font_registry.register_embedded_node(node);
+    let embedded = if prefer_outlined_mixed_direction_text {
+        None
+    } else {
+        font_registry.register_embedded_node(node)
+    };
     let glyphs = font_registry.register_node(
         node,
         effective_clip,
@@ -1995,16 +3149,105 @@ fn push_glyph_run(
     if node.rotation_degrees != 0 {
         push_rotation(content, node.rotation_degrees, node.pivot_x, node.pivot_y)?;
     }
-    let spans = if glyphs.is_empty() {
+    let mut spans = if glyphs.is_empty() {
         Vec::new()
     } else {
         match effective_clip {
-            Some(effective_clip) => glyph_semantic_spans(node, glyphs.len(), effective_clip)?,
+            Some(effective_clip) => glyph_semantic_spans_with_retained_fragments(
+                node,
+                glyphs.len(),
+                PdfGlyphSemanticClip {
+                    effective: effective_clip,
+                    outer: semantic_outer_clip.unwrap_or(effective_clip),
+                    retain_authored_print_fragments,
+                    retain_selected_groups_unbounded,
+                    retain_outer_intersecting_words,
+                    retain_selected_line_unbounded,
+                    require_interior_horizontal_center,
+                },
+            )?,
             None => Vec::new(),
         }
     };
+    let mut effective_semantic_proxy_mode = semantic_proxy_mode;
+    let mut shifted_trailing_word_proxies = Vec::new();
+    let mut trailing_word_shift = None;
+    if let PdfSemanticProxyMode::ShiftTrailingWords(shift) = semantic_proxy_mode {
+        effective_semantic_proxy_mode = PdfSemanticProxyMode::None;
+        if let Some(words) = glyph_run_semantic_word_proxies(
+            node,
+            &glyphs,
+            embedded.as_deref(),
+            &spans,
+            text_scale_permille,
+            true,
+        )?
+        .filter(|words| (2..=4).contains(&words.len()))
+        {
+            spans = vec![words[0].0.clone()];
+            shifted_trailing_word_proxies.extend(words.into_iter().skip(1).map(|(_, proxy)| proxy));
+            trailing_word_shift = Some(shift);
+        }
+    }
     let visible_glyph = spans.iter().any(|span| !span.glyphs.is_empty());
+    if push_glyph_run_semantic_proxy(
+        content,
+        node,
+        &glyphs,
+        embedded.as_deref(),
+        &spans,
+        subset_fonts,
+        embedded_fonts,
+        effective_semantic_proxy_mode,
+        queued_semantic_proxies,
+        text_scale_permille,
+        text_y_offset,
+    )? {
+        *semantic_boundary_anchor = None;
+        for decoration in &node.decorations {
+            push_rgb_stroke(content, decoration.color)?;
+            content.push(&format!(
+                "{} w {} {} m {} {} l S\n",
+                format_fixed(decoration.width),
+                format_fixed(decoration.x1),
+                format_fixed(decoration.y1),
+                format_fixed(decoration.x2),
+                format_fixed(decoration.y2)
+            ))?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record_decoration(decoration).map_err(trace_error)?;
+            }
+        }
+        content.push("Q\n")?;
+        return Ok(visible_glyph);
+    }
+    let mut semantic_glyphs = vec![false; glyphs.len()];
+    for &glyph_index in spans.iter().flat_map(|span| &span.glyphs) {
+        semantic_glyphs[glyph_index] = true;
+    }
     let mut emitted_glyphs = vec![false; glyphs.len()];
+    let semantic_cell_clip = effective_clip.is_some_and(|clip| clip == node.clip_bounds);
+    let has_semantically_excluded_glyphs =
+        (visible_glyph || semantic_cell_clip) && semantic_glyphs.iter().any(|semantic| !semantic);
+    let emit_excluded_before_semantics =
+        reorder_semantically_excluded_glyphs && has_semantically_excluded_glyphs;
+    if emit_excluded_before_semantics {
+        // At an internal authored page edge, clipped paint must not sit between
+        // the retained word fragment and the next cell's semantic text. Poppler
+        // otherwise treats the empty ActualText span as a word boundary even
+        // when the two visible cursor boxes overlap.
+        push_semantically_excluded_glyphs(
+            content,
+            node,
+            &glyphs,
+            embedded.as_deref(),
+            subset_fonts,
+            embedded_fonts,
+            &semantic_glyphs,
+            text_scale_permille,
+            text_y_offset,
+        )?;
+    }
     let first_glyph = spans
         .iter()
         .flat_map(|span| span.glyphs.iter())
@@ -2015,10 +3258,10 @@ fn push_glyph_run(
                 .and_then(|plan| plan.get(*index))
                 .and_then(|placed| placed.first())
                 .copied();
-            PdfSemanticBoundaryAnchor::new(node, glyphs[*index], embedded_separator)
+            PdfSemanticBoundaryAnchor::new(node, glyphs[*index], *index, embedded_separator)
         });
     if let (Some(previous), Some(current)) = (*semantic_boundary_anchor, first_glyph) {
-        if previous.shares_layout_line_with(current) {
+        if previous.requires_separator_before(current, merge_cross_script_overlap) {
             push_semantic_separator(
                 content,
                 font_registry,
@@ -2075,6 +3318,8 @@ fn push_glyph_run(
                         embedded.as_deref(),
                         subset_fonts,
                         embedded_fonts,
+                        text_scale_permille,
+                        text_y_offset,
                     )?;
                     let embedded_separator = embedded
                         .as_ref()
@@ -2084,6 +3329,7 @@ fn push_glyph_run(
                     current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
                         node,
                         glyphs[glyph_index],
+                        glyph_index,
                         embedded_separator,
                     ));
                 }
@@ -2122,6 +3368,8 @@ fn push_glyph_run(
                         embedded.as_deref(),
                         subset_fonts,
                         embedded_fonts,
+                        text_scale_permille,
+                        text_y_offset,
                     )?;
                     let embedded_separator = embedded
                         .as_ref()
@@ -2131,6 +3379,7 @@ fn push_glyph_run(
                     current_boundary_anchor = Some(PdfSemanticBoundaryAnchor::new(
                         node,
                         glyphs[glyph_index],
+                        glyph_index,
                         embedded_separator,
                     ));
                 }
@@ -2141,26 +3390,41 @@ fn push_glyph_run(
             }
         }
     }
-    let semantic_cell_clip = effective_clip.is_some_and(|clip| clip == node.clip_bounds);
-    if (visible_glyph || semantic_cell_clip) && emitted_glyphs.iter().any(|emitted| !emitted) {
+    if !emit_excluded_before_semantics
+        && has_semantically_excluded_glyphs
+        && emitted_glyphs.iter().any(|emitted| !emitted)
+    {
         // Semantic clipping must never become paint clipping. Emit clusters
         // excluded from extracted text under empty ActualText; the already-
         // active scene, group, and cell clips remain authoritative for ink.
-        push_actual_text_begin(content, "")?;
-        for (glyph_index, emitted) in emitted_glyphs.into_iter().enumerate() {
-            if !emitted {
-                push_pdf_glyph_cluster(
-                    content,
-                    node,
-                    glyph_index,
-                    glyphs[glyph_index],
-                    embedded.as_deref(),
-                    subset_fonts,
-                    embedded_fonts,
-                )?;
-            }
+        push_semantically_excluded_glyphs(
+            content,
+            node,
+            &glyphs,
+            embedded.as_deref(),
+            subset_fonts,
+            embedded_fonts,
+            &emitted_glyphs,
+            text_scale_permille,
+            text_y_offset,
+        )?;
+    }
+    if let Some(shift) = trailing_word_shift {
+        let semantic_y_offset = text_y_offset
+            .checked_add(shift)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        for proxy in shifted_trailing_word_proxies {
+            push_invisible_semantic_proxy(
+                content,
+                &proxy.text,
+                proxy.glyph,
+                subset_fonts,
+                embedded_fonts,
+                proxy.text_scale_permille,
+                None,
+                semantic_y_offset,
+            )?;
         }
-        content.push("EMC\n")?;
     }
     if current_boundary_anchor.is_some() {
         *semantic_boundary_anchor = current_boundary_anchor;
@@ -2477,6 +3741,52 @@ fn semantic_box_and_baselines_intersect_clip(
     })
 }
 
+fn glyph_cluster_has_interior_horizontal_center(
+    node: &GlyphRunNode,
+    cluster_index: usize,
+    nominal_bounds: Rect,
+    clip: Rect,
+    transform: PdfTransform,
+) -> bool {
+    let ink_bounds = node
+        .clusters
+        .get(cluster_index)
+        .and_then(|cluster| {
+            let start = usize::try_from(cluster.command_start).ok()?;
+            let end = usize::try_from(cluster.command_end).ok()?;
+            glyph_bounds(node.commands.get(start..end)?)
+        })
+        .filter(|bounds| bounds.min_x < bounds.max_x && bounds.min_y < bounds.max_y)
+        .or_else(|| nominal_rect_as_pdf_bounds(nominal_bounds));
+    let Some(bounds) = ink_bounds else {
+        return false;
+    };
+    let Some(clip_right) = clip.x.checked_add(clip.width) else {
+        return false;
+    };
+    let clip_left = fixed_as_f64(clip.x);
+    let clip_right = fixed_as_f64(clip_right);
+    let (minimum_x, maximum_x) = [
+        transform.point(bounds.min_x, bounds.min_y),
+        transform.point(bounds.max_x, bounds.min_y),
+        transform.point(bounds.max_x, bounds.max_y),
+        transform.point(bounds.min_x, bounds.max_y),
+    ]
+    .into_iter()
+    .map(|point| point[0])
+    .fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), x| (minimum.min(x), maximum.max(x)),
+    );
+    let clip_width = clip_right - clip_left;
+    if clip_width <= 0.0 || !minimum_x.is_finite() || !maximum_x.is_finite() {
+        return false;
+    }
+    let inset = fixed_as_f64(Fixed::from_raw(FIXED_UNITS_PER_PIXEL)).min(clip_width / 2.0);
+    let center_x = (minimum_x + maximum_x) / 2.0;
+    center_x >= clip_left + inset && center_x <= clip_right - inset
+}
+
 fn expand_layout_retention_visibility(
     node: &GlyphRunNode,
     layout: &GlyphSemanticLayout,
@@ -2523,31 +3833,54 @@ fn expand_layout_retention_visibility(
 fn authoritative_glyph_semantic_spans(
     node: &GlyphRunNode,
     glyph_count: usize,
-    effective_clip: Rect,
     layout: &GlyphSemanticLayout,
+    semantic_clip: PdfGlyphSemanticClip,
 ) -> Result<Vec<PdfGlyphSemanticSpan>, RenderError> {
     if glyph_count != node.clusters.len() || node.cluster_metrics.len() != node.clusters.len() {
         return Err(RenderError::Backend {
             reason: "invalid_glyph_metadata",
         });
     }
+    let PdfGlyphSemanticClip {
+        effective: effective_clip,
+        outer: semantic_outer_clip,
+        retain_authored_print_fragments,
+        retain_selected_groups_unbounded,
+        retain_outer_intersecting_words,
+        retain_selected_line_unbounded,
+        require_interior_horizontal_center,
+    } = semantic_clip;
     let transform = PdfTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
     let require_baseline =
         node.rotation_degrees.rem_euclid(360) == 0 && effective_clip == node.clip_bounds;
+    // Calc keeps the complete bounded text program for an object that is split
+    // across authored print pages. The authored-mode flag and the explicit
+    // retention partition keep this exception away from ordinary clipped text.
+    // Paint remains constrained by the page clip, and disjoint pages never
+    // reach this path because `effective_clip` is absent there.
+    let retain_clipped_object_semantics = retain_authored_print_fragments
+        && effective_clip != node.clip_bounds
+        && !layout.retention_groups.is_empty();
     let mut visible = vec![false; glyph_count];
+    // Calc uses the cell clip to decide whether a word belongs to the output,
+    // but its PDF text object remains complete until an enclosing page or
+    // object clip cuts it. Keep paint constrained by `effective_clip` while
+    // applying that two-stage rule to extracted semantics.
+    let mut selected_word_clusters = vec![false; glyph_count];
     let mut retention_triggers = vec![false; glyph_count];
     for (line_order, line) in layout.lines.iter().enumerate() {
         debug_assert_eq!(line.reading_order as usize, line_order);
         debug_assert_eq!(line.visual_line_id, line.reading_order);
-        let line_visible = line.nominal_bounds.is_some_and(|bounds| {
-            semantic_box_and_baselines_intersect_clip(
-                bounds,
-                &line.baselines,
-                effective_clip,
-                transform,
-                require_baseline,
-            )
-        });
+        let line_visible = retain_clipped_object_semantics
+            || line.nominal_bounds.is_some_and(|bounds| {
+                semantic_box_and_baselines_intersect_clip(
+                    bounds,
+                    &line.baselines,
+                    effective_clip,
+                    transform,
+                    require_baseline,
+                )
+            });
         if !line_visible {
             continue;
         }
@@ -2570,37 +3903,111 @@ fn authoritative_glyph_semantic_spans(
                     .chars()
                     .all(char::is_whitespace)
             );
-            let word_visible = word.nominal_bounds.is_some_and(|bounds| {
-                semantic_box_and_baselines_intersect_clip(
-                    bounds,
-                    &word.baselines,
-                    effective_clip,
-                    transform,
-                    require_baseline,
-                )
-            });
+            let word_visible = retain_clipped_object_semantics
+                || word.nominal_bounds.is_some_and(|bounds| {
+                    semantic_box_and_baselines_intersect_clip(
+                        bounds,
+                        &word.baselines,
+                        effective_clip,
+                        transform,
+                        require_baseline,
+                    )
+                });
             if !word_visible {
                 continue;
             }
             for &index in &word.cluster_indices {
+                selected_word_clusters[index] = true;
                 let metrics = node.cluster_metrics[index];
                 let Some(bounds) = node.nominal_cluster_bounds(index) else {
                     continue;
                 };
-                let intersects = semantic_box_and_baselines_intersect_clip(
-                    bounds,
-                    &[metrics.baseline_y],
-                    effective_clip,
-                    transform,
-                    require_baseline,
-                );
+                let intersects = retain_clipped_object_semantics
+                    || semantic_box_and_baselines_intersect_clip(
+                        bounds,
+                        &[metrics.baseline_y],
+                        effective_clip,
+                        transform,
+                        require_baseline,
+                    );
                 retention_triggers[index] = intersects;
                 visible[index] = intersects;
             }
         }
     }
     expand_layout_retention_visibility(node, layout, &mut visible, &retention_triggers);
-
+    if retain_selected_line_unbounded {
+        for line in &layout.lines {
+            let selected = line.words.iter().any(|word| {
+                word.cluster_indices
+                    .iter()
+                    .any(|&index| visible[index] || selected_word_clusters[index])
+            });
+            if selected {
+                for word in &line.words {
+                    for &index in &word.cluster_indices {
+                        visible[index] = true;
+                    }
+                }
+            }
+        }
+    }
+    // Owner-clipped words and authored source groups may expand past their
+    // local paint clip, but never past the classified page/object boundary.
+    if retain_outer_intersecting_words {
+        let retained_groups = visible;
+        let mut outer_visible = vec![false; glyph_count];
+        for line in &layout.lines {
+            for word in &line.words {
+                if !word
+                    .cluster_indices
+                    .iter()
+                    .any(|&index| retained_groups[index] || selected_word_clusters[index])
+                {
+                    continue;
+                }
+                let intersects = word.nominal_bounds.is_some_and(|bounds| {
+                    semantic_box_and_baselines_intersect_clip(
+                        bounds,
+                        &word.baselines,
+                        semantic_outer_clip,
+                        transform,
+                        false,
+                    )
+                });
+                if intersects {
+                    for &index in &word.cluster_indices {
+                        outer_visible[index] =
+                            retained_groups[index] || selected_word_clusters[index];
+                    }
+                }
+            }
+        }
+        visible = outer_visible;
+    } else if !retain_selected_groups_unbounded {
+        for index in 0..glyph_count {
+            if !visible[index] && !selected_word_clusters[index] {
+                continue;
+            }
+            let metrics = node.cluster_metrics[index];
+            visible[index] = node.nominal_cluster_bounds(index).is_some_and(|bounds| {
+                semantic_box_and_baselines_intersect_clip(
+                    bounds,
+                    &[metrics.baseline_y],
+                    semantic_outer_clip,
+                    transform,
+                    false,
+                ) && (!require_interior_horizontal_center
+                    || glyph_cluster_has_interior_horizontal_center(
+                        node,
+                        index,
+                        bounds,
+                        semantic_outer_clip,
+                        transform,
+                    ))
+            });
+        }
+    }
     let mut spans = Vec::new();
     for line in &layout.lines {
         for word in &line.words {
@@ -2655,19 +4062,41 @@ fn authoritative_glyph_semantic_spans(
     Ok(spans)
 }
 
+#[cfg(test)]
 fn glyph_semantic_spans(
     node: &GlyphRunNode,
     glyph_count: usize,
     effective_clip: Rect,
+) -> Result<Vec<PdfGlyphSemanticSpan>, RenderError> {
+    glyph_semantic_spans_with_retained_fragments(
+        node,
+        glyph_count,
+        PdfGlyphSemanticClip {
+            effective: effective_clip,
+            outer: effective_clip,
+            retain_authored_print_fragments: false,
+            retain_selected_groups_unbounded: false,
+            retain_outer_intersecting_words: false,
+            retain_selected_line_unbounded: false,
+            require_interior_horizontal_center: false,
+        },
+    )
+}
+
+fn glyph_semantic_spans_with_retained_fragments(
+    node: &GlyphRunNode,
+    glyph_count: usize,
+    semantic_clip: PdfGlyphSemanticClip,
 ) -> Result<Vec<PdfGlyphSemanticSpan>, RenderError> {
     if glyph_count == 0 {
         return Ok(Vec::new());
     }
     if node.cluster_metrics.len() == node.clusters.len() {
         if let Some(layout) = node.semantic_text_layout() {
-            return authoritative_glyph_semantic_spans(node, glyph_count, effective_clip, &layout);
+            return authoritative_glyph_semantic_spans(node, glyph_count, &layout, semantic_clip);
         }
     }
+    let effective_clip = semantic_clip.effective;
     let transform = PdfTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
     let clip_bottom = effective_clip
         .y
@@ -3901,6 +5330,21 @@ fn fixed_to_pdf_points(value: Fixed) -> Result<String, RenderError> {
     Ok(format_rational(raw, denominator))
 }
 
+fn scale_fixed_permille(value: Fixed, scale_permille: u16) -> Result<Fixed, RenderError> {
+    let product = i128::from(value.raw())
+        .checked_mul(i128::from(scale_permille))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let adjusted = if product >= 0 {
+        product + 500
+    } else {
+        product - 500
+    };
+    let raw = adjusted / 1_000;
+    Ok(Fixed::from_raw(
+        i64::try_from(raw).map_err(|_| RenderError::CoordinateOverflow)?,
+    ))
+}
+
 fn type3_height_scale(height: Fixed, reverse_y: bool) -> String {
     let numerator = i128::from(height.raw());
     format_rational_with_precision(
@@ -4368,10 +5812,112 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[test]
+    fn authored_rtl_body_bounds_latin_retention_at_the_page_edge() {
+        let page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(10),
+            height: Fixed::from_pixels(10),
+        };
+        let context = PdfSemanticClipContext {
+            outer_clip: Some(Rect {
+                width: Fixed::from_pixels(4),
+                ..page
+            }),
+            page_clip: page,
+            authored_content_rect: Some(page),
+            authored_scope: PdfAuthoredClipScope::Body,
+            body_clip: Some(page),
+            body_right_to_left: true,
+            body_has_single_visual_line: false,
+            body_has_strong_rtl_text: false,
+        };
+        assert!(!context.retain_selected_groups_unbounded("Latin 0003"));
+        assert!(context.retain_outer_intersecting_words("Latin 0003"));
+        assert_eq!(
+            context
+                .glyph_outer_clip(page, "Latin 0003", true, true)
+                .unwrap(),
+            Some(page)
+        );
+        assert!(context.retain_selected_groups_unbounded("한글 0003"));
+        assert!(!context.retain_outer_intersecting_words("한글 0003"));
+    }
+
+    #[test]
+    fn rtl_authored_latin_retention_clips_complete_words_at_the_page_edge() {
+        let mut node = font_pack_glyph_run("CELL 0003");
+        let divider = node
+            .semantic_groups
+            .iter()
+            .position(|group| group.source_start == group.source_end)
+            .expect("layout semantic divider");
+        node.semantic_groups.insert(
+            divider,
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: node.text.len() as u64,
+            },
+        );
+        assert!(node.metadata_is_valid());
+        let layout = node.semantic_text_layout().unwrap();
+        let number_start = node
+            .clusters
+            .iter()
+            .position(|cluster| cluster.source_start == 5)
+            .expect("number start");
+        let final_digit = node.clusters.len() - 1;
+        let number_start_x = node
+            .nominal_cluster_bounds(number_start)
+            .expect("number start bounds")
+            .x;
+        let final_digit_x = node
+            .nominal_cluster_bounds(final_digit)
+            .expect("final digit bounds")
+            .x;
+        let clip_at = |right: Fixed| Rect {
+            width: right.checked_sub(node.clip_bounds.x).unwrap(),
+            ..node.clip_bounds
+        };
+        let cell_clip = clip_at(number_start_x);
+        let page_crossing_number = clip_at(final_digit_x);
+        let visible_words = |outer_clip| {
+            let spans = authoritative_glyph_semantic_spans(
+                &node,
+                node.clusters.len(),
+                &layout,
+                PdfGlyphSemanticClip {
+                    effective: cell_clip,
+                    outer: outer_clip,
+                    retain_authored_print_fragments: false,
+                    retain_selected_groups_unbounded: false,
+                    retain_outer_intersecting_words: true,
+                    retain_selected_line_unbounded: false,
+                    require_interior_horizontal_center: false,
+                },
+            )
+            .unwrap();
+            spans
+                .iter()
+                .map(|span| &node.text[span.source.clone()])
+                .collect::<String>()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            visible_words(page_crossing_number),
+            ["CELL".to_string(), "0003".to_string()]
+        );
+        assert_eq!(visible_words(cell_clip), ["CELL".to_string()]);
+    }
     use crate::font::{synthetic_cff_test_pack, synthetic_test_pack, FontPack, FontRequest};
     use crate::layout::RenderOptions;
     use crate::png::render_print_page_png_with_trace;
-    use crate::print::{build_print_document, PrintOptions};
+    use crate::print::{build_print_document, PrintLayoutOverride, PrintOptions};
     use crate::scene::{
         BackendCommandRangeTrace, BackendNodeTrace, ClipGroupNode, GlyphCluster, GlyphPaint,
         GlyphSemanticGroup, ImageNode, LineNode, PathCommand, PathNode, RectNode, TextStyle,
@@ -4549,6 +6095,9 @@ mod tests {
                 origin_y: Fixed::from_pixels(24),
                 size: Fixed::from_pixels(11),
             }),
+            nominal_bounds: None,
+            leading_word_class: Some(PdfSemanticWordClass::Western),
+            trailing_word_class: Some(PdfSemanticWordClass::Western),
             clip_bounds: Rect {
                 x: Fixed::ZERO,
                 y: Fixed::ZERO,
@@ -4557,6 +6106,73 @@ mod tests {
             },
             rotation_degrees: 0,
         }
+    }
+
+    #[test]
+    fn semantic_boundary_omits_space_only_for_overlapping_cursor_boxes() {
+        let previous = PdfSemanticBoundaryAnchor {
+            nominal_bounds: Some(Rect {
+                x: Fixed::from_pixels(10),
+                y: Fixed::from_pixels(4),
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(8),
+            }),
+            ..semantic_boundary_anchor()
+        };
+        let current = |x| PdfSemanticBoundaryAnchor {
+            nominal_bounds: Some(Rect {
+                x,
+                y: Fixed::from_pixels(4),
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(8),
+            }),
+            clip_bounds: Rect {
+                x: Fixed::from_pixels(20),
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(20),
+                height: Fixed::from_pixels(20),
+            },
+            ..semantic_boundary_anchor()
+        };
+
+        assert!(previous.requires_separator_before(current(Fixed::from_pixels(20)), false));
+        assert!(!previous.requires_separator_before(
+            current(Fixed::from_raw(Fixed::from_pixels(20).raw() - 1,)),
+            false
+        ));
+    }
+
+    #[test]
+    fn semantic_boundary_keeps_space_for_overlapping_cross_script_boxes() {
+        let previous = PdfSemanticBoundaryAnchor {
+            nominal_bounds: Some(Rect {
+                x: Fixed::from_pixels(10),
+                y: Fixed::from_pixels(4),
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(8),
+            }),
+            ..semantic_boundary_anchor()
+        };
+        let current = PdfSemanticBoundaryAnchor {
+            nominal_bounds: Some(Rect {
+                x: Fixed::from_raw(Fixed::from_pixels(20).raw() - 1),
+                y: Fixed::from_pixels(4),
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(8),
+            }),
+            leading_word_class: Some(PdfSemanticWordClass::Script(Script::Hangul)),
+            trailing_word_class: Some(PdfSemanticWordClass::Script(Script::Hangul)),
+            clip_bounds: Rect {
+                x: Fixed::from_pixels(20),
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(20),
+                height: Fixed::from_pixels(20),
+            },
+            ..semantic_boundary_anchor()
+        };
+
+        assert!(previous.requires_separator_before(current, false));
+        assert!(!previous.requires_separator_before(current, true));
     }
 
     #[test]
@@ -6813,6 +8429,301 @@ mod tests {
     }
 
     #[test]
+    fn drawing_object_scopes_use_calc_text_device_scale() {
+        let rect = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+        };
+        let group = || ClipGroupNode {
+            clip: rect,
+            nodes: Vec::new(),
+        };
+        let scaled_rect = Rect {
+            x: Fixed::from_pixels(240),
+            ..rect
+        };
+        let chart_frames = [
+            SceneNode::Rect(RectNode {
+                rect,
+                fill: None,
+                stroke: Some(Rgb::new(217, 217, 217)),
+                stroke_width: Fixed::from_pixels(1),
+            }),
+            SceneNode::Rect(RectNode {
+                rect: scaled_rect,
+                fill: None,
+                stroke: Some(Rgb::new(217, 217, 217)),
+                stroke_width: Fixed::from_raw(FIXED_UNITS_PER_PIXEL * 85 / 100),
+            }),
+        ];
+        assert_eq!(drawing_object_text_clips(&chart_frames).unwrap(), [rect]);
+        assert_eq!(
+            authored_semantic_drawing_frames(&chart_frames).unwrap(),
+            [rect, scaled_rect]
+        );
+        let outside = PdfSemanticClipContext::new(rect, Some(rect));
+        let content = outside.descend(&group(), 0).unwrap();
+        let body = content.descend(&group(), 1).unwrap();
+        let drawing = body.descend(&group(), 2).unwrap();
+        let object = drawing.descend(&group(), 3).unwrap();
+        let mut bottom_axis = embeddable_run(false);
+        bottom_axis.clip_bounds = rect;
+        bottom_axis.cluster_metrics = vec![GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(10),
+            advance_x: Fixed::from_pixels(10),
+            baseline_y: Fixed::from_pixels(110),
+            ascent: Fixed::from_pixels(10),
+            descent: Fixed::from_pixels(-2),
+        }];
+        let mut value_axis = bottom_axis.clone();
+        value_axis.cluster_metrics[0].baseline_y = Fixed::from_pixels(20);
+        let mut small_cell = bottom_axis.clone();
+        small_cell.clip_bounds.width = Fixed::from_pixels(38);
+        small_cell.clip_bounds.height = Fixed::from_pixels(18);
+
+        for context in [outside, content, body] {
+            assert_eq!(context.glyph_text_scale_permille(false), 1_000);
+            assert_eq!(
+                context.glyph_text_y_offset(&bottom_axis, false),
+                Fixed::ZERO
+            );
+        }
+        for context in [drawing, object] {
+            assert_eq!(
+                context.glyph_text_scale_permille(false),
+                CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE
+            );
+            assert_eq!(
+                context.glyph_text_y_offset(&bottom_axis, false),
+                CALC_LAYOUT_OVERRIDE_DRAWING_TEXT_Y_OFFSET
+            );
+            assert_eq!(context.glyph_text_y_offset(&value_axis, false), Fixed::ZERO);
+            assert_eq!(context.glyph_text_y_offset(&small_cell, false), Fixed::ZERO);
+        }
+        let override_outside = PdfSemanticClipContext::new(rect, None);
+        assert_eq!(override_outside.glyph_text_scale_permille(false), 1_000);
+        assert_eq!(
+            override_outside.glyph_text_y_offset(&bottom_axis, false),
+            Fixed::ZERO
+        );
+        assert_eq!(
+            override_outside.glyph_text_scale_permille(true),
+            CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE
+        );
+        assert_eq!(
+            override_outside.glyph_text_y_offset(&bottom_axis, true),
+            CALC_LAYOUT_OVERRIDE_DRAWING_TEXT_Y_OFFSET
+        );
+    }
+
+    #[test]
+    fn authored_chart_overlap_semantic_proxy_modes_are_structural() {
+        let page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(800),
+            height: Fixed::from_pixels(1_100),
+        };
+        let frame = Rect {
+            x: Fixed::from_pixels(333),
+            y: Fixed::from_pixels(451),
+            width: Fixed::from_pixels(294),
+            height: Fixed::from_pixels(172),
+        };
+        let context = PdfSemanticClipContext::new(page, Some(page));
+
+        let mut compact = embeddable_run(false);
+        compact.text = "1".to_string();
+        compact.clip_bounds = Rect {
+            x: Fixed::from_pixels(450),
+            y: Fixed::from_pixels(447),
+            width: Fixed::from_pixels(32),
+            height: Fixed::from_pixels(19),
+        };
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&compact, &[frame], None),
+            PdfSemanticProxyMode::ShiftBaseline(Fixed::from_pixels(2))
+        );
+        let wide_frame = Rect {
+            width: Fixed::from_pixels(500),
+            ..frame
+        };
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&compact, &[wide_frame], None),
+            PdfSemanticProxyMode::ShiftBaseline(Fixed::from_pixels(4))
+        );
+
+        let mut taller_heading = compact.clone();
+        taller_heading.clip_bounds.height = Fixed::from_pixels(34);
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&taller_heading, &[frame], None),
+            PdfSemanticProxyMode::None,
+            "the taller neighboring corpus archetype must retain its native baseline"
+        );
+
+        let baseline = GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(340),
+            advance_x: Fixed::from_pixels(10),
+            baseline_y: Fixed::from_pixels(493),
+            ascent: Fixed::from_pixels(10),
+            descent: Fixed::from_pixels(-2),
+        };
+        let mut covered_words = embeddable_run(false);
+        covered_words.text = "Print tail 0010".to_string();
+        covered_words.clip_bounds = Rect {
+            x: Fixed::from_pixels(333),
+            y: Fixed::from_pixels(467),
+            width: Fixed::from_pixels(117),
+            height: Fixed::from_pixels(156),
+        };
+        covered_words.cluster_metrics = vec![baseline; 3];
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&covered_words, &[frame], None),
+            PdfSemanticProxyMode::IsolatedWords
+        );
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(
+                &covered_words,
+                &[frame],
+                Some(Fixed::from_pixels(3))
+            ),
+            PdfSemanticProxyMode::ShiftTrailingWords(Fixed::from_pixels(3)),
+            "a nearby chart value receives only the covered line's trailing words"
+        );
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(
+                &covered_words,
+                &[wide_frame],
+                Some(Fixed::from_pixels(3))
+            ),
+            PdfSemanticProxyMode::IsolatedWords,
+            "a wide chart isolates source words from a nearby value"
+        );
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&covered_words, &[frame], Some(Fixed::ZERO)),
+            PdfSemanticProxyMode::None,
+            "a covered source line aligned with a chart value keeps native grouping"
+        );
+
+        let mut offset_words = covered_words.clone();
+        offset_words.clip_bounds.x = Fixed::from_pixels(395);
+        assert_eq!(
+            context.glyph_semantic_proxy_mode(&offset_words, &[frame], None),
+            PdfSemanticProxyMode::None,
+            "a cell that does not share the covered frame corner is not proxied"
+        );
+    }
+
+    #[test]
+    fn queued_semantic_proxies_are_invisible_and_isolated() {
+        let glyph = PdfSemanticSeparator::Outlined(PdfGlyphReference {
+            subset_index: 0,
+            code: 1,
+            origin_x: Fixed::from_pixels(10),
+            origin_y: Fixed::from_pixels(20),
+            height: Fixed::from_pixels(12),
+            reverse_y: false,
+        });
+        let proxies = ["Print", "tail", "0010"].map(|text| PdfQueuedSemanticProxy {
+            text: text.to_string(),
+            glyph,
+            text_scale_permille: 1_000,
+        });
+        let mut content = BoundedContent::new(8_192);
+        let mut subset_fonts = BTreeSet::new();
+        let mut embedded_fonts = BTreeSet::new();
+        push_queued_semantic_proxies(
+            &mut content,
+            &proxies,
+            &mut subset_fonts,
+            &mut embedded_fonts,
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(800),
+                height: Fixed::from_pixels(1_100),
+            },
+        )
+        .unwrap();
+        let source = String::from_utf8(content.finish()).unwrap();
+
+        for word in ["Print", "tail", "0010"] {
+            assert!(source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(word))));
+        }
+        assert_eq!(source.matches(" 3 Tr ").count(), 3, "{source}");
+        assert_eq!(subset_fonts, BTreeSet::from([0]));
+        assert!(embedded_fonts.is_empty());
+    }
+
+    #[test]
+    fn drawing_object_text_scale_preserves_embedded_x_advance() {
+        let node = embeddable_run(false);
+        let placed = PdfEmbeddedGlyph {
+            font_index: 0,
+            cid: 1,
+            origin_x: Fixed::from_pixels(10),
+            origin_y: Fixed::from_pixels(20),
+            size: Fixed::from_pixels(11),
+        };
+        let glyph = PdfGlyphReference {
+            subset_index: 0,
+            code: 1,
+            origin_x: placed.origin_x,
+            origin_y: placed.origin_y,
+            height: placed.size,
+            reverse_y: false,
+        };
+        let embedded = vec![vec![placed]];
+        let mut content = BoundedContent::new(4_096);
+        let mut subset_fonts = BTreeSet::new();
+        let mut embedded_fonts = BTreeSet::new();
+
+        push_pdf_glyph_cluster(
+            &mut content,
+            &node,
+            0,
+            glyph,
+            Some(&embedded),
+            &mut subset_fonts,
+            &mut embedded_fonts,
+            CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE,
+            Fixed::ZERO,
+        )
+        .unwrap();
+        let source = String::from_utf8(content.finish()).unwrap();
+        let expected_size =
+            scale_fixed_permille(placed.size, CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE).unwrap();
+        let expected = format!(
+            "/RE0 {} Tf {} 0 0 -1 {} {} Tm",
+            format_fixed(expected_size),
+            format_rational(1_000, i128::from(CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE)),
+            format_fixed(placed.origin_x),
+            format_fixed(placed.origin_y),
+        );
+        assert!(source.contains(&expected), "{source}");
+        assert!(subset_fonts.is_empty());
+        assert_eq!(embedded_fonts, BTreeSet::from([0]));
+
+        let mut outlined = BoundedContent::new(4_096);
+        push_pdf_glyph_cluster(
+            &mut outlined,
+            &node,
+            0,
+            glyph,
+            None,
+            &mut subset_fonts,
+            &mut embedded_fonts,
+            CALC_DRAWING_OBJECT_TEXT_SCALE_PERMILLE,
+            Fixed::ZERO,
+        )
+        .unwrap();
+        let outlined = String::from_utf8(outlined.finish()).unwrap();
+        assert!(outlined.contains(&type3_height_scale(expected_size, false)));
+    }
+
+    #[test]
     fn unicode_actual_text_is_utf16be() {
         let mut content = BoundedContent::new(1024);
         push_actual_text_begin(&mut content, "한A").unwrap();
@@ -8029,6 +9940,285 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_words_ignore_owner_clip_but_respect_page_clip() {
+        let mut owner_clipped = font_pack_glyph_run("CELL 0003");
+        let last_index = owner_clipped.clusters.len() - 1;
+        let last_bounds = owner_clipped
+            .nominal_cluster_bounds(last_index)
+            .expect("final digit bounds");
+        owner_clipped.clip_bounds.width = last_bounds
+            .x
+            .checked_sub(owner_clipped.clip_bounds.x)
+            .expect("owner clip width");
+        let owner_document = document_with_nodes(
+            "owner-clipped-word",
+            vec![SceneNode::GlyphRun(owner_clipped)],
+        );
+        let owner_pdf = render_print_document_pdf(&owner_document).unwrap();
+        let owner_source = String::from_utf8_lossy(&owner_pdf);
+        assert!(owner_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("0003"))));
+        if let Some(xml) = poppler_bbox_layout(&owner_pdf) {
+            assert_eq!(poppler_words(&xml), ["CELL", "0003"]);
+        }
+
+        let page_clipped = font_pack_glyph_run("CELL 0003");
+        let last_index = page_clipped.clusters.len() - 1;
+        let last_bounds = page_clipped
+            .nominal_cluster_bounds(last_index)
+            .expect("final digit bounds");
+        let clip_right = page_clipped
+            .clip_bounds
+            .x
+            .checked_add(page_clipped.clip_bounds.width)
+            .expect("owner clip right");
+        assert!(last_bounds.x < clip_right);
+        let mut page_document =
+            document_with_nodes("page-clipped-word", vec![SceneNode::GlyphRun(page_clipped)]);
+        page_document.pages[0].scene.width = last_bounds.x;
+        let page_pdf = render_print_document_pdf(&page_document).unwrap();
+        let page_source = String::from_utf8_lossy(&page_pdf);
+        assert!(page_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("000"))));
+        assert!(!page_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("0003"))));
+        if let Some(xml) = poppler_bbox_layout(&page_pdf) {
+            assert_eq!(poppler_words(&xml), ["CELL", "000"]);
+        }
+    }
+
+    #[test]
+    fn authored_body_fragments_preserve_source_groups_but_object_clips_bound_them() {
+        fn retained_run(text: &str) -> GlyphRunNode {
+            let mut run = font_pack_glyph_run(text);
+            let divider = run
+                .semantic_groups
+                .iter()
+                .position(|group| group.source_start == group.source_end)
+                .expect("layout semantic divider");
+            run.semantic_groups.insert(
+                divider,
+                GlyphSemanticGroup {
+                    source_start: 0,
+                    source_end: u64::try_from(text.len()).unwrap(),
+                },
+            );
+            assert!(run.metadata_is_valid());
+            run
+        }
+
+        let run = retained_run("CELL 0003");
+        let last_bounds = run
+            .nominal_cluster_bounds(run.clusters.len() - 1)
+            .expect("final digit bounds");
+        let page_bounds = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+        };
+        let body_clip = Rect {
+            width: last_bounds.x,
+            ..page_bounds
+        };
+
+        let mut body_document = document_with_nodes(
+            "authored-body-fragment",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: page_bounds,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: body_clip,
+                    nodes: vec![SceneNode::GlyphRun(run.clone())],
+                })],
+            })],
+        );
+        body_document.report.content_rect = page_bounds;
+        let body_pdf = render_print_document_pdf(&body_document).unwrap();
+        let body_source = String::from_utf8_lossy(&body_pdf);
+        assert!(body_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("0003"))));
+        if let Some(xml) = poppler_bbox_layout(&body_pdf) {
+            assert_eq!(poppler_words(&xml), ["CELL", "0003"]);
+        }
+
+        let mut object_document = document_with_nodes(
+            "authored-object-fragment",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: page_bounds,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: body_clip,
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: page_bounds,
+                        nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                            clip: body_clip,
+                            nodes: vec![SceneNode::GlyphRun(run)],
+                        })],
+                    })],
+                })],
+            })],
+        );
+        object_document.report.content_rect = page_bounds;
+        let object_pdf = render_print_document_pdf(&object_document).unwrap();
+        let object_source = String::from_utf8_lossy(&object_pdf);
+        assert!(object_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("000"))));
+        assert!(!object_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("0003"))));
+        if let Some(xml) = poppler_bbox_layout(&object_pdf) {
+            assert_eq!(poppler_words(&xml), ["CELL", "000"]);
+        }
+    }
+
+    #[test]
+    fn authored_drawing_replay_clip_ignores_y_but_nested_object_clip_does_not() {
+        let text = "VERTICAL";
+        let mut run = font_pack_glyph_run(text);
+        let divider = run
+            .semantic_groups
+            .iter()
+            .position(|group| group.source_start == group.source_end)
+            .expect("layout semantic divider");
+        run.semantic_groups.insert(
+            divider,
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: u64::try_from(text.len()).unwrap(),
+            },
+        );
+        let first_bounds = run.nominal_cluster_bounds(0).expect("first cluster bounds");
+        let first_bottom = first_bounds
+            .y
+            .checked_add(first_bounds.height)
+            .expect("first cluster bottom");
+        let page_bounds = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: first_bottom
+                .checked_add(Fixed::from_pixels(40))
+                .expect("page height"),
+        };
+        let vertical_fragment = Rect {
+            x: page_bounds.x,
+            y: first_bottom
+                .checked_add(Fixed::from_pixels(4))
+                .expect("fragment y"),
+            width: page_bounds.width,
+            height: Fixed::from_pixels(20),
+        };
+        run.clip_bounds = page_bounds;
+        assert!(run.metadata_is_valid());
+
+        let mut replay_document = document_with_nodes(
+            "authored-vertical-drawing-replay",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: page_bounds,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: vertical_fragment,
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: page_bounds,
+                        nodes: vec![SceneNode::GlyphRun(run.clone())],
+                    })],
+                })],
+            })],
+        );
+        replay_document.report.content_rect = page_bounds;
+        let replay_pdf = render_print_document_pdf(&replay_document).unwrap();
+        let replay_source = String::from_utf8_lossy(&replay_pdf);
+        assert!(replay_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(text))));
+
+        let nested_object_clip = Rect {
+            x: vertical_fragment.x,
+            width: vertical_fragment
+                .width
+                .checked_sub(Fixed::from_pixels(1))
+                .expect("distinct object width"),
+            ..vertical_fragment
+        };
+        let mut object_document = document_with_nodes(
+            "authored-vertical-object-clip",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: page_bounds,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: vertical_fragment,
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: page_bounds,
+                        nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                            clip: nested_object_clip,
+                            nodes: vec![SceneNode::GlyphRun(run)],
+                        })],
+                    })],
+                })],
+            })],
+        );
+        object_document.report.content_rect = page_bounds;
+        let object_pdf = render_print_document_pdf(&object_document).unwrap();
+        let object_source = String::from_utf8_lossy(&object_pdf);
+        assert!(!object_source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(text))));
+    }
+
+    #[test]
+    fn authored_drawing_ignores_body_clip_but_respects_root_page_edge() {
+        fn retained_run(text: &str, origins: &[i64], clip: Rect) -> GlyphRunNode {
+            let mut run = font_pack_glyph_run(text);
+            assert_eq!(run.cluster_metrics.len(), origins.len());
+            for (metrics, origin) in run.cluster_metrics.iter_mut().zip(origins) {
+                metrics.origin_x = Fixed::from_pixels(*origin);
+            }
+            let divider = run
+                .semantic_groups
+                .iter()
+                .position(|group| group.source_start == group.source_end)
+                .expect("layout semantic divider");
+            run.semantic_groups.insert(
+                divider,
+                GlyphSemanticGroup {
+                    source_start: 0,
+                    source_end: u64::try_from(text.len()).unwrap(),
+                },
+            );
+            run.clip_bounds = clip;
+            assert!(run.metadata_is_valid());
+            run
+        }
+
+        let page_bounds = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(200),
+            height: Fixed::from_pixels(120),
+        };
+        let body_clip = Rect {
+            x: Fixed::from_pixels(50),
+            width: Fixed::from_pixels(100),
+            ..page_bounds
+        };
+        let drawing_clip = Rect {
+            x: Fixed::from_pixels(-20),
+            width: Fixed::from_pixels(220),
+            ..page_bounds
+        };
+        let edge_label = retained_run("80", &[-10, -4], drawing_clip);
+        let inside_but_outside_body = retained_run("Q1", &[10, 20], drawing_clip);
+        let mut document = document_with_nodes(
+            "authored-root-edge-clusters",
+            vec![SceneNode::ClipGroup(ClipGroupNode {
+                clip: page_bounds,
+                nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                    clip: body_clip,
+                    nodes: vec![SceneNode::ClipGroup(ClipGroupNode {
+                        clip: body_clip,
+                        nodes: vec![
+                            SceneNode::GlyphRun(edge_label),
+                            SceneNode::GlyphRun(inside_but_outside_body),
+                        ],
+                    })],
+                })],
+            })],
+        );
+        document.report.content_rect = page_bounds;
+        let pdf = render_print_document_pdf(&document).unwrap();
+        let source = String::from_utf8_lossy(&pdf);
+        assert!(source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("0"))));
+        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("80"))));
+        assert!(source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex("Q1"))));
+    }
+
+    #[test]
     fn clipped_ods_paragraph_group_retains_full_semantics_without_changing_paint() {
         let text = "VISIBLE HIDDEN";
         let mut grouped = font_pack_glyph_run(text);
@@ -8464,7 +10654,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_chart_title_repro_emits_exact_page_local_poppler_fragments() {
+    fn horizontal_chart_title_repro_clips_semantics_to_each_object_fragment() {
         const TITLE: &str =
             "HORIZONTAL-SEMANTIC-SEAM-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
         fn title_count(nodes: &[SceneNode]) -> usize {
@@ -8472,13 +10662,61 @@ mod tests {
                 .iter()
                 .map(|node| match node {
                     SceneNode::ClipGroup(group) => title_count(&group.nodes),
-                    SceneNode::Text(text) if text.text == TITLE => 1,
                     SceneNode::GlyphRun(run) if run.text == TITLE => 1,
+                    SceneNode::Text(text) if text.text == TITLE => {
+                        panic!("chart title must use the locked font pack")
+                    }
                     _ => 0,
                 })
                 .sum()
         }
+        fn strip_title_retention(nodes: &mut [SceneNode]) {
+            for node in nodes {
+                match node {
+                    SceneNode::ClipGroup(group) => strip_title_retention(&mut group.nodes),
+                    SceneNode::GlyphRun(run) if run.text == TITLE => {
+                        let divider = run
+                            .semantic_groups
+                            .iter()
+                            .position(|group| group.source_start == group.source_end)
+                            .expect("layout divider");
+                        run.semantic_groups.drain(..divider);
+                        assert!(run.metadata_is_valid());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn title_run_and_effective_clip(
+            nodes: &[SceneNode],
+            active_clip: Rect,
+        ) -> Option<(GlyphRunNode, Rect)> {
+            for node in nodes {
+                match node {
+                    SceneNode::ClipGroup(group) => {
+                        let Some(nested_clip) =
+                            intersect_clip_rects(active_clip, group.clip).unwrap()
+                        else {
+                            continue;
+                        };
+                        if let Some(found) = title_run_and_effective_clip(&group.nodes, nested_clip)
+                        {
+                            return Some(found);
+                        }
+                    }
+                    SceneNode::GlyphRun(run) if run.text == TITLE => {
+                        let effective_clip = intersect_clip_rects(active_clip, run.clip_bounds)
+                            .unwrap()
+                            .expect("title run must intersect its authored page fragment");
+                        return Some((run.clone(), effective_clip));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
 
+        let pack = synthetic_test_pack();
         let mut workbook = rxls::Workbook::new();
         let sheet = workbook.add_sheet("Horizontal");
         for row in 0..4 {
@@ -8504,6 +10742,11 @@ mod tests {
             0,
             &PrintOptions {
                 omit_sparse_pages: false,
+                render: RenderOptions {
+                    default_font_family: pack.default_family().to_string(),
+                    font_pack: Some(pack.clone()),
+                    ..RenderOptions::default()
+                },
                 ..PrintOptions::default()
             },
         )
@@ -8518,24 +10761,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 1, 0]
         );
-        let pdf = render_print_document_pdf(&document).unwrap();
-        assert_eq!(pdf, render_print_document_pdf(&document).unwrap());
+        let mut paint_reference = document.clone();
+        for page in &mut paint_reference.pages {
+            strip_title_retention(&mut page.scene.nodes);
+        }
+        let reference_pdf = render_print_document_pdf_with_fonts(&paint_reference, &pack).unwrap();
+        let pdf = render_print_document_pdf_with_fonts(&document, &pack).unwrap();
+        assert_eq!(
+            pdf,
+            render_print_document_pdf_with_fonts(&document, &pack).unwrap()
+        );
         let source = String::from_utf8_lossy(&pdf);
-        assert!(!source.contains(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE))));
+        assert_eq!(
+            source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE)))
+                .count(),
+            0
+        );
         let first = "HORIZONTAL-SEMANTIC-SEAM-ABCDEFGHIJK";
         let second = "LMNOPQRSTUVWXYZ-0123456789-abcdefghijk";
-        assert_eq!(
-            source
-                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(first)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            source
-                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(second)))
-                .count(),
-            1
-        );
+        if let (Some(reference_raster), Some(retained_raster)) = (
+            poppler_raster(&reference_pdf, "chart-fragment-reference"),
+            poppler_raster(&pdf, "chart-fragment-retained"),
+        ) {
+            assert_eq!(reference_raster.data(), retained_raster.data());
+        }
         if let Some(pages) = poppler_text_pages(&pdf) {
             assert_eq!(pages.len(), 3, "{pages:?}");
             assert!(pages[0].contains(first), "{pages:?}");
@@ -8545,7 +10795,82 @@ mod tests {
             assert!(!pages[2].contains(first), "{pages:?}");
             assert!(!pages[2].contains(second), "{pages:?}");
             assert_eq!(format!("{first}{second}"), TITLE);
-            assert_eq!(pages.iter().filter(|page| page.contains(TITLE)).count(), 0);
+        }
+
+        let page = &document.pages[0];
+        let page_bounds = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: page.scene.width,
+            height: page.scene.height,
+        };
+        let (title_run, effective_clip) =
+            title_run_and_effective_clip(&page.scene.nodes, page_bounds).expect("title glyph run");
+        let one = Fixed::from_pixels(1);
+        let fragment_clips = [
+            Rect {
+                height: one,
+                ..effective_clip
+            },
+            Rect {
+                y: Fixed::from_raw(
+                    effective_clip.y.raw() + effective_clip.height.raw() - one.raw(),
+                ),
+                height: one,
+                ..effective_clip
+            },
+            Rect {
+                width: one,
+                ..effective_clip
+            },
+            Rect {
+                x: Fixed::from_raw(effective_clip.x.raw() + effective_clip.width.raw() - one.raw()),
+                width: one,
+                ..effective_clip
+            },
+        ];
+        let fragment_clip = fragment_clips
+            .into_iter()
+            .find(|clip| {
+                glyph_semantic_spans(&title_run, title_run.clusters.len(), *clip)
+                    .unwrap()
+                    .is_empty()
+            })
+            .expect("chart object fragment without locally visible title glyphs");
+        let mut authored_fragment = document.clone();
+        authored_fragment.pages.truncate(1);
+        authored_fragment.pages[0].scene.nodes = vec![SceneNode::ClipGroup(ClipGroupNode {
+            clip: fragment_clip,
+            nodes: vec![SceneNode::GlyphRun(title_run)],
+        })];
+        let authored_fragment_pdf =
+            render_print_document_pdf_with_fonts(&authored_fragment, &pack).unwrap();
+        let authored_fragment_source = String::from_utf8_lossy(&authored_fragment_pdf);
+        assert_eq!(
+            authored_fragment_source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE)))
+                .count(),
+            0,
+            "a true object clip must bound authored source-group semantics"
+        );
+
+        let mut override_fragment = authored_fragment.clone();
+        override_fragment.report.layout_override = Some(PrintLayoutOverride::SinglePageSheets);
+        let override_fragment_pdf =
+            render_print_document_pdf_with_fonts(&override_fragment, &pack).unwrap();
+        let override_fragment_source = String::from_utf8_lossy(&override_fragment_pdf);
+        assert_eq!(
+            override_fragment_source
+                .matches(&format!("/ActualText <FEFF{}>", utf16be_hex(TITLE)))
+                .count(),
+            0,
+            "layout overrides must not retain authored page-fragment semantics"
+        );
+        if let (Some(authored_raster), Some(override_raster)) = (
+            poppler_raster(&authored_fragment_pdf, "chart-authored-fragment"),
+            poppler_raster(&override_fragment_pdf, "chart-override-fragment"),
+        ) {
+            assert_eq!(authored_raster.data(), override_raster.data());
         }
     }
 

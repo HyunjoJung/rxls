@@ -338,6 +338,21 @@ fn synthetic_print_metadata_xlsx() -> Vec<u8> {
     ])
 }
 
+fn calc_print_typography_xlsx(scale: u16) -> Vec<u8> {
+    let workbook = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Typography" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    let relationships = r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    let styles = r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Noto Sans CJK KR"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+    let worksheet = format!(
+        r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>body</t></is></c></row></sheetData><printOptions headings="1"/><pageSetup paperSize="1" scale="{scale}"/><headerFooter scaleWithDoc="1" alignWithMargins="1"><oddHeader>&amp;LHEADER</oddHeader><oddFooter>&amp;RFOOTER</oddFooter></headerFooter></worksheet>"#
+    );
+    zip_text_parts(&[
+        ("xl/workbook.xml", workbook),
+        ("xl/_rels/workbook.xml.rels", relationships),
+        ("xl/styles.xml", styles),
+        ("xl/worksheets/sheet1.xml", &worksheet),
+    ])
+}
+
 fn synthetic_fit_breaks_xlsx(
     print_area: &str,
     fit_to_page: Option<bool>,
@@ -1719,7 +1734,7 @@ fn xlsx_sidecar_drives_multi_area_break_order_headers_and_override_isolation() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(first_header.style.size.raw(), 12 * 1_024);
+    assert_eq!(first_header.style.size.raw(), 15_019);
     assert_eq!(
         first_header.bounds.x.raw(),
         document.report.content_rect.x.raw() + document.report.content_rect.width.raw() / 3
@@ -2426,12 +2441,19 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
             _ => false,
         })
     }
-    fn has_print_gridline(nodes: &[SceneNode]) -> bool {
-        nodes.iter().any(|node| match node {
-            SceneNode::Line(line) => line.color == Rgb::BLACK && line.width == Fixed::from_raw(137),
-            SceneNode::ClipGroup(group) => has_print_gridline(&group.nodes),
-            _ => false,
-        })
+    fn print_gridline_count(nodes: &[SceneNode]) -> usize {
+        nodes
+            .iter()
+            .map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.width == Fixed::from_raw(137) =>
+                {
+                    1
+                }
+                SceneNode::ClipGroup(group) => print_gridline_count(&group.nodes),
+                _ => 0,
+            })
+            .sum()
     }
 
     let mut workbook = Workbook::new();
@@ -2483,7 +2505,11 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         fitted.pages[0].scene.background,
         whole_scene.scene.background
     );
-    assert!(!has_print_gridline(&fitted.pages[0].scene.nodes));
+    assert_eq!(
+        print_gridline_count(&fitted.pages[0].scene.nodes),
+        9,
+        "hidden terminal axes split one retained Calc frame segment"
+    );
     assert!(has_view_gridline(&whole_scene.scene.nodes));
     assert_eq!(fitted.report.logical_pages, 1);
     assert_eq!(fitted.report.scale_permille, 1_000);
@@ -2550,12 +2576,16 @@ fn single_page_override_uses_the_visible_content_scene_and_ignores_page_setup() 
         retained.pages[0].scene.background,
         with_gridlines.scene.background
     );
-    assert!(!has_print_gridline(&retained.pages[0].scene.nodes));
+    assert_eq!(
+        print_gridline_count(&retained.pages[0].scene.nodes),
+        9,
+        "hidden terminal axes split one retained Calc frame segment"
+    );
     assert!(has_view_gridline(&with_gridlines.scene.nodes));
 }
 
 #[test]
-fn single_page_gridlines_are_suppressed_for_all_source_formats() {
+fn single_page_projects_calc_grid_for_all_source_formats() {
     fn has_view_gridline(nodes: &[SceneNode]) -> bool {
         nodes.iter().any(|node| match node {
             SceneNode::Line(line) => line.color == Rgb::GRIDLINE,
@@ -2563,17 +2593,21 @@ fn single_page_gridlines_are_suppressed_for_all_source_formats() {
             _ => false,
         })
     }
-    fn print_gridline_count(nodes: &[SceneNode]) -> usize {
+    fn print_gridlines(nodes: &[SceneNode]) -> Vec<&rxls_render::LineNode> {
         nodes
             .iter()
-            .map(|node| match node {
+            .flat_map(|node| match node {
                 SceneNode::Line(line) => {
-                    usize::from(line.color == Rgb::BLACK && line.width == Fixed::from_raw(137))
+                    if line.color == Rgb::BLACK && line.width == Fixed::from_raw(137) {
+                        vec![line]
+                    } else {
+                        Vec::new()
+                    }
                 }
-                SceneNode::ClipGroup(group) => print_gridline_count(&group.nodes),
-                _ => 0,
+                SceneNode::ClipGroup(group) => print_gridlines(&group.nodes),
+                _ => Vec::new(),
             })
-            .sum()
+            .collect()
     }
 
     let mut sources = [
@@ -2620,19 +2654,86 @@ fn single_page_gridlines_are_suppressed_for_all_source_formats() {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &enabled).unwrap();
-        assert_eq!(
-            print_gridline_count(&document.pages[0].scene.nodes),
-            0,
-            "{label} SinglePageSheets must suppress source print gridlines"
+        let fragments = print_gridlines(&document.pages[0].scene.nodes);
+        let vertical = fragments
+            .iter()
+            .filter(|line| line.x1 == line.x2)
+            .collect::<Vec<_>>();
+        let horizontal = fragments
+            .iter()
+            .filter(|line| line.y1 == line.y2)
+            .collect::<Vec<_>>();
+        assert!(
+            !vertical.is_empty() && !horizontal.is_empty(),
+            "{label} SinglePageSheets must retain both grid axes"
         );
+        assert_eq!(fragments.len(), vertical.len() + horizontal.len());
+        assert!(horizontal.iter().any(|line| line.y1 == Fixed::from_raw(39)));
 
         let mut disabled = enabled;
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
         assert_eq!(
-            print_gridline_count(&document.pages[0].scene.nodes),
+            print_gridlines(&document.pages[0].scene.nodes).len(),
             0,
-            "{label} caller opt-out must still suppress gridlines"
+            "{label} caller opt-out must also suppress the outline"
+        );
+    }
+}
+
+#[test]
+fn single_page_projects_ltr_rows_and_keeps_the_calc_rtl_frame() {
+    fn print_gridlines(nodes: &[SceneNode]) -> Vec<rxls_render::LineNode> {
+        nodes
+            .iter()
+            .flat_map(|node| match node {
+                SceneNode::Line(line)
+                    if line.color == Rgb::BLACK && line.width == Fixed::from_raw(137) =>
+                {
+                    vec![line.clone()]
+                }
+                SceneNode::ClipGroup(group) => print_gridlines(&group.nodes),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    for right_to_left in [false, true] {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("four-row fragments");
+        sheet.set_right_to_left(right_to_left);
+        sheet.set_print_gridlines();
+        for row in 0..12 {
+            sheet.set_row_height(row, 15.0);
+            sheet.write(row, 0, format!("row {row}"));
+        }
+
+        let options = PrintOptions {
+            single_page_sheets: true,
+            ..PrintOptions::default()
+        };
+        let document = build_print_document(&workbook, 0, &options).unwrap();
+        let lines = print_gridlines(&document.pages[0].scene.nodes);
+        let internal_horizontal = lines
+            .iter()
+            .filter(|line| line.y1 == line.y2 && line.y1 != Fixed::from_raw(39))
+            .collect::<Vec<_>>();
+        let vertical = lines.iter().filter(|line| line.x1 == line.x2).count();
+
+        assert_eq!(vertical, 1, "RTL={right_to_left}");
+        if right_to_left {
+            assert!(internal_horizontal.is_empty());
+            assert_eq!(lines.len(), 2);
+        } else {
+            assert_eq!(internal_horizontal.len(), 3);
+            assert_eq!(internal_horizontal[0].y1, Fixed::from_raw(71_657));
+            assert_eq!(lines.len(), 5);
+        }
+
+        let prepared = prepare_print_document(&workbook, 0, &options).unwrap();
+        assert_eq!(
+            build_print_page(&workbook, &prepared, 0).unwrap(),
+            document.pages[0]
         );
     }
 }
@@ -2686,6 +2787,12 @@ fn fractional_scaled_headings_share_exact_edges_with_the_print_block() {
             })
             .collect::<Vec<_>>();
         let corner = heading_rects[0];
+        assert_eq!(corner.width, Fixed::from_raw(33_075), "RTL={right_to_left}");
+        assert_eq!(
+            corner.height,
+            Fixed::from_raw(14_797),
+            "RTL={right_to_left}"
+        );
         let column_rects = heading_rects
             .iter()
             .copied()
@@ -2739,6 +2846,78 @@ fn fractional_scaled_headings_share_exact_edges_with_the_print_block() {
             row_bottom,
             block.y.raw() + block.height.raw(),
             "RTL={right_to_left}"
+        );
+    }
+}
+
+#[test]
+fn calc_running_text_and_heading_typography_scale_independently() {
+    for (scale, running_size, heading_size, line_height, padding, heading_padding) in [
+        (
+            100_u16, 15_019_i64, 13_653_i64, 16_384_i64, 4_096_i64, 2_048_i64,
+        ),
+        (85, 12_766, 11_605, 13_926, 3_482, 1_741),
+    ] {
+        let workbook = Workbook::open(&calc_print_typography_xlsx(scale)).unwrap();
+        let document = build_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.report.scale_permille, scale * 10);
+
+        let text_nodes = document.pages[0]
+            .scene
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let header = text_nodes
+            .iter()
+            .copied()
+            .find(|text| text.text == "HEADER")
+            .unwrap();
+        let footer = text_nodes
+            .iter()
+            .copied()
+            .find(|text| text.text == "FOOTER")
+            .unwrap();
+        let column_heading = text_nodes
+            .iter()
+            .copied()
+            .find(|text| text.text == "A")
+            .unwrap();
+        let row_heading = text_nodes
+            .iter()
+            .copied()
+            .find(|text| text.text == "1")
+            .unwrap();
+
+        for running in [header, footer] {
+            assert_eq!(running.style.family, "Noto Sans CJK KR");
+            assert_eq!(running.style.size, Fixed::from_raw(running_size));
+            assert_eq!(running.style.baseline, rxls_render::TextBaseline::Middle);
+            assert_eq!(running.bounds.height, Fixed::from_raw(line_height));
+            assert_eq!(running.horizontal_padding, Fixed::from_raw(padding));
+        }
+        assert_eq!(header.bounds.y, Fixed::from_raw(29_491));
+        assert_eq!(
+            footer.bounds.y,
+            Fixed::from_raw(document.report.paper.height.raw() - 29_491 - line_height)
+        );
+
+        for heading in [column_heading, row_heading] {
+            assert_eq!(heading.style.family, "Liberation Sans");
+            assert_eq!(heading.style.size, Fixed::from_raw(heading_size));
+            assert_eq!(heading.style.baseline, rxls_render::TextBaseline::Middle);
+            assert_eq!(heading.horizontal_padding, Fixed::from_raw(heading_padding));
+        }
+        assert_eq!(column_heading.bounds.y, document.report.content_rect.y);
+        assert_eq!(
+            row_heading.bounds.y,
+            Fixed::from_raw(
+                document.report.content_rect.y.raw() + if scale == 100 { 17_408 } else { 14_797 },
+            )
         );
     }
 }

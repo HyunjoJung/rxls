@@ -130,7 +130,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
     "cfc561662aad1b88ce6bcfc1387c7ebe5622025d25a7621125a0a1bc7b4d0bdc",
-    "00913cd52200ecd2863b8463b8a705917883b2eed1a3005bb1dafaf156a9659b",
+    "fc38b091078736b27ab95d43d5ceb8a91477e68a7a6e0b8c0261817882c68dec",
     "940f6c80f0324bc5969d03134a1d1e5448c7c8c9f455cb5979a23a81cc9b2ce0",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
     "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
@@ -147,7 +147,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "009b1bfc1e452bb94be95488837419c8ee7143db7ffcbb993b9562bcbd489cc1"
+    "dba690b0defabe7bdb4f651fa38c6ece0b0d4ece6f49919e6fe7d71046f2f6a9"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "ac477662896b26fef0fb4bfe292efcb2ff1cce2f09fb76e03b43da42143ec152"
@@ -3492,6 +3492,19 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
     }
     for snippet, message in required.items():
         if snippet not in active:
+            errors.append(f"{path}: {message}")
+    path_guard_definitions = {
+        "artifact_extension = re.compile(": (
+            "must define the artifact-extension guard independently in both "
+            "evidence sanitizers"
+        ),
+        'traversal = re.compile(r"(?:^|[\\\\/])\\.\\.(?:$|[\\\\/])")': (
+            "must define the traversal guard independently in both evidence "
+            "sanitizers"
+        ),
+    }
+    for snippet, message in path_guard_definitions.items():
+        if active.count(snippet) != 2:
             errors.append(f"{path}: {message}")
     if re.search(r"python-version:\s*[\"']?3\.13[\"']?\s*$", text, re.MULTILINE):
         errors.append(f"{path}: mutable Python minor selectors are forbidden")

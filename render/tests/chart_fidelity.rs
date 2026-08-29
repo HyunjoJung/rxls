@@ -451,6 +451,30 @@ fn imported_line_chart_cross_between_moves_series_into_category_bands() {
             _ => None,
         })
         .expect("imported chart vertical axis");
+    let category_label = |label: &str| {
+        between_output
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::Text(text) if text.text == label && text.clip_bounds == frame => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("imported chart category label")
+    };
+    let first_label = category_label("Q1");
+    let last_label = category_label("Q4");
+    let label_center_x =
+        |label: &rxls_render::TextNode| label.bounds.x.raw() + label.bounds.width.raw() / 2;
+    assert!(label_center_x(first_label) < shifted[0]);
+    assert!(label_center_x(last_label) > shifted[3]);
+    assert_eq!(
+        first_label.bounds.y.raw() - horizontal_axis.y1.raw(),
+        Fixed::from_pixels(8).raw(),
+        "Calc places shifted category labels below the full plot edge"
+    );
     assert_eq!(
         Fixed::from_raw(frame.x.raw() + frame.width.raw() - horizontal_axis.x2.raw()),
         Fixed::from_pixels(8),

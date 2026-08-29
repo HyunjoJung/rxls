@@ -13,6 +13,8 @@ use crate::scene::Fixed;
 pub(crate) enum CellLineLayoutPolicy {
     /// Preserve rxls's existing exact-fit behavior.
     Native,
+    /// Preserve native fitting while honoring ODF's internal hyphen breaks.
+    OdsNative,
     /// Match Calc EditEngine's strict fit boundary and trailing-space handling.
     CalcEditEngine,
 }
@@ -20,11 +22,10 @@ pub(crate) enum CellLineLayoutPolicy {
 impl CellLineLayoutPolicy {
     fn fits(self, width: Fixed, available_width: Fixed) -> bool {
         match self {
-            Self::Native => width <= available_width,
+            Self::Native | Self::OdsNative => width <= available_width,
             Self::CalcEditEngine => width < available_width,
         }
     }
-
 }
 
 /// A wrapped source line and the end of the source that contributes advance.
@@ -161,7 +162,9 @@ pub(crate) fn wrap_text_lines(
         start = end;
         if opportunity == BreakOpportunity::Mandatory {
             match policy {
-                CellLineLayoutPolicy::Native => state.finish_line(atom_end)?,
+                CellLineLayoutPolicy::Native | CellLineLayoutPolicy::OdsNative => {
+                    state.finish_line(atom_end)?
+                }
                 CellLineLayoutPolicy::CalcEditEngine => {
                     state.finish_mandatory_line(atom_end)?;
                 }
@@ -197,7 +200,9 @@ fn is_internal_ascii_hyphen_break(text: &str, boundary: usize) -> bool {
     if boundary == 0 || boundary >= text.len() || !text.is_char_boundary(boundary) {
         return false;
     }
-    let before = text.get(..boundary).and_then(|value| value.chars().next_back());
+    let before = text
+        .get(..boundary)
+        .and_then(|value| value.chars().next_back());
     let after = text.get(boundary..).and_then(|value| value.chars().next());
     before == Some('-') && after.is_some_and(char::is_alphanumeric)
 }
@@ -412,11 +417,7 @@ impl RangeWrapState {
         Ok(())
     }
 
-    fn finish_automatic_line(
-        &mut self,
-        text: &str,
-        empty_at: usize,
-    ) -> Result<(), RenderError> {
+    fn finish_automatic_line(&mut self, text: &str, empty_at: usize) -> Result<(), RenderError> {
         if let Some(current) = self.current.as_mut() {
             if current.advance_end == current.source.end
                 && current.source.end > current.source.start
@@ -715,6 +716,23 @@ mod tests {
             ["ab ", "project-authored ", "text"]
         );
         assert_eq!(lines[1].advance_end, "ab project-authored".len());
+
+        let ods = wrap_text_lines(
+            text,
+            true,
+            CellLineLayoutPolicy::OdsNative,
+            Fixed::from_pixels(17),
+            10,
+            100,
+            monospace_range(text),
+        )
+        .unwrap();
+        assert_eq!(
+            ods.iter()
+                .map(|line| text.get(line.source.clone()).unwrap())
+                .collect::<Vec<_>>(),
+            ["ab project-", "authored text"]
+        );
     }
 
     #[test]

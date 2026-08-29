@@ -7,8 +7,202 @@ use crate::scene::{
     GlyphRunNode, GlyphSemanticLayout, ImageNode, LineNode, PathCommand, PathNode, Rect, RectNode,
     Rgb, Scene, SceneNode, TextAnchor, TextBaseline, TextNode, FIXED_UNITS_PER_PIXEL,
 };
+use unicode_script::{Script, UnicodeScript};
 
 const MAX_CLIP_GROUP_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SvgAuthoredClipScope {
+    OutsideContent,
+    Content,
+    Body,
+    Drawing,
+    Object,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SvgSemanticClipContext {
+    outer_clip: Option<Rect>,
+    page_clip: Rect,
+    authored_scope: SvgAuthoredClipScope,
+    body_clip: Option<Rect>,
+    body_right_to_left: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SvgGlyphSemanticClip {
+    effective: Option<Rect>,
+    outer: Option<Rect>,
+    retain_selected_groups_unbounded: bool,
+    retain_selected_line_unbounded: bool,
+    retain_outer_intersecting_words: bool,
+    require_interior_horizontal_center: bool,
+    use_nominal_horizontal_center: bool,
+}
+
+impl SvgSemanticClipContext {
+    fn new(page_bounds: Rect) -> Self {
+        Self {
+            outer_clip: Some(page_bounds),
+            page_clip: page_bounds,
+            authored_scope: SvgAuthoredClipScope::OutsideContent,
+            body_clip: None,
+            body_right_to_left: false,
+        }
+    }
+
+    fn descend(self, group: &crate::scene::ClipGroupNode) -> Result<Self, RenderError> {
+        let clip = group.clip;
+        let enters_content = self.authored_scope == SvgAuthoredClipScope::OutsideContent
+            && is_authored_content_wrapper(group);
+        let enters_body = self.authored_scope == SvgAuthoredClipScope::Content;
+        let enters_drawing = self.authored_scope == SvgAuthoredClipScope::Body;
+        let enters_object = self.authored_scope == SvgAuthoredClipScope::Drawing;
+        let outer_clip = if enters_body {
+            // Worksheet cells may retain complete source groups across the
+            // replay viewport, so this clip remains paint-only.
+            self.outer_clip
+        } else if enters_drawing {
+            // Calc clips a replayed drawing's text program to the physical
+            // page and its own object, not to worksheet content margins.
+            Some(self.page_clip)
+        } else {
+            match self.outer_clip {
+                Some(outer_clip) => intersect_rects(outer_clip, clip)?,
+                None => None,
+            }
+        };
+        Ok(Self {
+            outer_clip,
+            page_clip: self.page_clip,
+            authored_scope: if enters_content {
+                SvgAuthoredClipScope::Content
+            } else if enters_body {
+                SvgAuthoredClipScope::Body
+            } else if enters_drawing {
+                SvgAuthoredClipScope::Drawing
+            } else if enters_object {
+                SvgAuthoredClipScope::Object
+            } else {
+                self.authored_scope
+            },
+            body_clip: if enters_body {
+                Some(clip)
+            } else {
+                self.body_clip
+            },
+            body_right_to_left: if enters_body {
+                authored_body_is_right_to_left(group)
+            } else {
+                self.body_right_to_left
+            },
+        })
+    }
+
+    fn glyph_clips(self, node: &GlyphRunNode) -> Result<SvgGlyphSemanticClip, RenderError> {
+        let owner_clip = node.clip_bounds;
+        let effective_clip = match self.outer_clip {
+            Some(outer_clip) => intersect_rects(outer_clip, owner_clip)?,
+            None => None,
+        };
+        // A mirrored worksheet does not make an embedded Latin run RTL. Calc
+        // retains non-Latin source groups wholesale, but clips Latin groups at
+        // the physical page edge one complete intersecting word at a time.
+        let uses_non_latin_script = text_uses_non_latin_script(&node.text);
+        let retain_selected_groups_unbounded = self.authored_scope == SvgAuthoredClipScope::Body
+            && self.body_right_to_left
+            && uses_non_latin_script;
+        let retain_selected_line_unbounded = retain_selected_groups_unbounded
+            && node.semantic_retention_groups().len() > 1
+            && node.semantic_line_records().is_some()
+            && node.text.chars().any(|character| {
+                matches!(
+                    unicode_bidi::bidi_class(character),
+                    unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL
+                )
+            });
+        let retain_outer_intersecting_words = self.authored_scope == SvgAuthoredClipScope::Body
+            && self.body_right_to_left
+            && !uses_non_latin_script;
+        let owner_at_body_right = self.body_clip.is_some_and(|body| {
+            rect_right(owner_clip).is_some() && rect_right(owner_clip) == rect_right(body)
+        });
+        let broaden_body_semantics = self.authored_scope == SvgAuthoredClipScope::Body
+            && (self.body_right_to_left
+                || text_uses_non_latin_script(&node.text)
+                || owner_at_body_right);
+        let outer_clip = if self.authored_scope == SvgAuthoredClipScope::Body
+            && !self.body_right_to_left
+            && !uses_non_latin_script
+            && !retains_complete_source(node)
+        {
+            effective_clip
+        } else if retain_outer_intersecting_words {
+            Some(self.page_clip)
+        } else {
+            match self.authored_scope {
+                SvgAuthoredClipScope::Body if broaden_body_semantics => self.outer_clip,
+                SvgAuthoredClipScope::Body
+                | SvgAuthoredClipScope::Drawing
+                | SvgAuthoredClipScope::Object => effective_clip,
+                SvgAuthoredClipScope::OutsideContent | SvgAuthoredClipScope::Content => {
+                    self.outer_clip
+                }
+            }
+        };
+        Ok(SvgGlyphSemanticClip {
+            effective: effective_clip,
+            outer: outer_clip,
+            retain_selected_groups_unbounded,
+            retain_selected_line_unbounded,
+            retain_outer_intersecting_words,
+            require_interior_horizontal_center: self.authored_scope == SvgAuthoredClipScope::Body
+                && !self.body_right_to_left
+                && !uses_non_latin_script
+                && (!retains_complete_source(node) || owner_clip.width > Fixed::from_pixels(64)),
+            use_nominal_horizontal_center: owner_at_body_right,
+        })
+    }
+}
+
+fn rect_right(rect: Rect) -> Option<Fixed> {
+    rect.x.checked_add(rect.width)
+}
+
+fn text_uses_non_latin_script(text: &str) -> bool {
+    text.chars().any(|character| {
+        !matches!(
+            character.script(),
+            Script::Common | Script::Inherited | Script::Latin | Script::Unknown
+        )
+    })
+}
+
+fn retains_complete_source(node: &GlyphRunNode) -> bool {
+    let Ok(source_end) = u64::try_from(node.text.len()) else {
+        return false;
+    };
+    node.semantic_retention_groups()
+        .iter()
+        .any(|group| group.source_start == 0 && group.source_end == source_end)
+}
+
+fn authored_body_is_right_to_left(group: &crate::scene::ClipGroupNode) -> bool {
+    let mut previous = None::<Rect>;
+    for node in &group.nodes {
+        let SceneNode::GlyphRun(run) = node else {
+            continue;
+        };
+        let bounds = run.clip_bounds;
+        if let Some(left) = previous {
+            if bounds.y == left.y && bounds.height == left.height && bounds.x != left.x {
+                return bounds.x < left.x;
+            }
+        }
+        previous = Some(bounds);
+    }
+    false
+}
 
 /// Serialize a backend-neutral scene as deterministic SVG.
 pub fn render_scene_svg(scene: &Scene, max_output_bytes: u64) -> Result<String, RenderError> {
@@ -62,6 +256,12 @@ fn render_scene_svg_impl(
     push_rgb(&mut out, scene.background)?;
     out.push("\"/>\n")?;
 
+    let page_bounds = Rect {
+        x: Fixed::ZERO,
+        y: Fixed::ZERO,
+        width: scene.width,
+        height: scene.height,
+    };
     let mut clip_index = 0_usize;
     push_scene_nodes(
         &mut out,
@@ -69,15 +269,41 @@ fn render_scene_svg_impl(
         &mut clip_index,
         trace,
         0,
-        Some(Rect {
-            x: Fixed::ZERO,
-            y: Fixed::ZERO,
-            width: scene.width,
-            height: scene.height,
-        }),
+        Some(page_bounds),
+        SvgSemanticClipContext::new(page_bounds),
     )?;
     out.push("</svg>\n")?;
     Ok(out.finish())
+}
+
+fn is_authored_content_wrapper(group: &crate::scene::ClipGroupNode) -> bool {
+    !group.nodes.is_empty()
+        && group
+            .nodes
+            .iter()
+            .all(|node| matches!(node, SceneNode::ClipGroup(_)))
+        && group.nodes.iter().any(authored_body_replay)
+}
+
+fn authored_body_replay(node: &SceneNode) -> bool {
+    let SceneNode::ClipGroup(group) = node else {
+        return false;
+    };
+    contains_retained_layout_semantics(&group.nodes)
+}
+
+fn contains_retained_layout_semantics(nodes: &[SceneNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        SceneNode::ClipGroup(group) => contains_retained_layout_semantics(&group.nodes),
+        SceneNode::GlyphRun(run) => {
+            run.semantic_line_records().is_some() && !run.semantic_retention_groups().is_empty()
+        }
+        SceneNode::Rect(_)
+        | SceneNode::Line(_)
+        | SceneNode::Path(_)
+        | SceneNode::Image(_)
+        | SceneNode::Text(_) => false,
+    })
 }
 
 fn collect_clip_bounds(
@@ -111,6 +337,7 @@ fn push_scene_nodes(
     mut trace: Option<&mut BackendGeometryTrace>,
     depth: usize,
     active_clip: Option<Rect>,
+    semantic_clip: SvgSemanticClipContext,
 ) -> Result<(), RenderError> {
     for node in nodes {
         match node {
@@ -134,6 +361,7 @@ fn push_scene_nodes(
                     Some(active_clip) => intersect_rects(active_clip, group.clip)?,
                     None => None,
                 };
+                let nested_semantic_clip = semantic_clip.descend(group)?;
                 push_scene_nodes(
                     out,
                     &group.nodes,
@@ -141,6 +369,7 @@ fn push_scene_nodes(
                     trace.as_deref_mut(),
                     depth + 1,
                     effective_group_clip,
+                    nested_semantic_clip,
                 )?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::ClipEnd);
@@ -184,12 +413,9 @@ fn push_scene_nodes(
                     .ok_or(RenderError::CoordinateOverflow)?;
             }
             SceneNode::GlyphRun(glyphs) => {
-                let effective_clip = match active_clip {
-                    Some(active_clip) => intersect_rects(active_clip, glyphs.clip_bounds)?,
-                    None => None,
-                };
+                let glyph_clip = semantic_clip.glyph_clips(glyphs)?;
                 let glyph_trace =
-                    push_glyph_run(out, glyphs, *clip_index, trace.is_some(), effective_clip)?;
+                    push_glyph_run(out, glyphs, *clip_index, trace.is_some(), glyph_clip)?;
                 if let (Some(trace), Some(glyph_trace)) = (trace.as_deref_mut(), glyph_trace) {
                     trace.push(BackendNodeTrace::Glyph(glyph_trace));
                 }
@@ -350,7 +576,7 @@ fn push_glyph_run(
     node: &GlyphRunNode,
     clip_index: usize,
     tracing: bool,
-    effective_clip: Option<Rect>,
+    semantic_clip: SvgGlyphSemanticClip,
 ) -> Result<Option<BackendGlyphTrace>, RenderError> {
     if !node.metadata_is_valid() {
         return Err(RenderError::Backend {
@@ -368,7 +594,7 @@ fn push_glyph_run(
                 .map_err(trace_error)?;
         }
     }
-    let visible_label = visible_glyph_label_in_clip(node, effective_clip)?;
+    let visible_label = visible_glyph_label_in_clip(node, semantic_clip)?;
     out.push("<g role=\"text\" aria-label=\"")?;
     push_xml_escaped(out, &node.text, true)?;
     out.push("\" data-rxls-visible-label=\"")?;
@@ -433,7 +659,18 @@ fn push_glyph_run(
 
 #[cfg(test)]
 fn visible_glyph_label(node: &GlyphRunNode) -> Result<String, RenderError> {
-    visible_glyph_label_in_clip(node, Some(node.clip_bounds))
+    visible_glyph_label_in_clip(
+        node,
+        SvgGlyphSemanticClip {
+            effective: Some(node.clip_bounds),
+            outer: Some(node.clip_bounds),
+            retain_selected_groups_unbounded: false,
+            retain_selected_line_unbounded: false,
+            retain_outer_intersecting_words: false,
+            require_interior_horizontal_center: false,
+            use_nominal_horizontal_center: false,
+        },
+    )
 }
 
 /// Return the logical source text whose nominal layout remains visible through
@@ -442,11 +679,14 @@ fn visible_glyph_label(node: &GlyphRunNode) -> Result<String, RenderError> {
 /// source visibility from outline ink.
 fn visible_glyph_label_in_clip(
     node: &GlyphRunNode,
-    effective_clip: Option<Rect>,
+    semantic_clip: SvgGlyphSemanticClip,
 ) -> Result<String, RenderError> {
-    let Some(effective_clip) = effective_clip else {
+    let Some(effective_clip) = semantic_clip.effective else {
         return Ok(String::new());
     };
+    if semantic_clip.outer.is_none() {
+        return Ok(String::new());
+    }
     let clip_right = effective_clip
         .x
         .raw()
@@ -468,15 +708,11 @@ fn visible_glyph_label_in_clip(
     }
 
     let semantic_layout = node.semantic_text_layout();
-    let mut retention_triggers = None;
-    let mut cluster_visible = match semantic_layout
+    let (mut cluster_visible, authoritative_layout) = match semantic_layout
         .as_ref()
-        .and_then(|layout| nominal_layout_cluster_visibility(node, layout, effective_clip))
+        .and_then(|layout| nominal_layout_cluster_visibility(node, layout, semantic_clip))
     {
-        Some((visible, triggers)) => {
-            retention_triggers = Some(triggers);
-            visible
-        }
+        Some(visible) => (visible, true),
         None => {
             let mut visible = Vec::with_capacity(node.clusters.len());
             for (cluster_index, cluster) in node.clusters.iter().enumerate() {
@@ -505,12 +741,10 @@ fn visible_glyph_label_in_clip(
                     nominal_baseline_visible && glyph_commands_intersect_clip(commands, clip),
                 );
             }
-            visible
+            (visible, false)
         }
     };
-    if let Some(triggers) = retention_triggers {
-        node.expand_semantic_visibility_from(&mut cluster_visible, &triggers);
-    } else {
+    if !authoritative_layout {
         node.expand_semantic_visibility(&mut cluster_visible);
     }
     let mut ranges = Vec::new();
@@ -606,40 +840,207 @@ fn fixed_as_f64(value: Fixed) -> f64 {
 fn nominal_layout_cluster_visibility(
     node: &GlyphRunNode,
     layout: &GlyphSemanticLayout,
-    clip: Rect,
-) -> Option<(Vec<bool>, Vec<bool>)> {
+    semantic_clip: SvgGlyphSemanticClip,
+) -> Option<Vec<bool>> {
     if node.cluster_metrics.len() != node.clusters.len() {
         return None;
     }
+    let effective_clip = semantic_clip.effective?;
+    let semantic_outer_clip = semantic_clip.outer?;
+    let retain_selected_groups_unbounded = semantic_clip.retain_selected_groups_unbounded;
+    let retain_selected_line_unbounded = semantic_clip.retain_selected_line_unbounded;
+    let retain_outer_intersecting_words = semantic_clip.retain_outer_intersecting_words;
+    let require_interior_horizontal_center = semantic_clip.require_interior_horizontal_center;
+    let use_nominal_horizontal_center = semantic_clip.use_nominal_horizontal_center;
     let transform =
         SvgSemanticTransform::rotation(node.rotation_degrees, node.pivot_x, node.pivot_y);
+    let require_baseline =
+        node.rotation_degrees.rem_euclid(360) == 0 && effective_clip == node.clip_bounds;
     let mut visible = vec![false; node.clusters.len()];
+    let mut selected_word_clusters = vec![false; node.clusters.len()];
     let mut retention_triggers = vec![false; node.clusters.len()];
     for line in &layout.lines {
-        for &index in &line.cluster_indices {
-            let metrics = *node.cluster_metrics.get(index)?;
-            let bounds = node.nominal_cluster_bounds(index)?;
-            let intersects = transformed_rect_intersects_clip(bounds, clip, transform)
-                && (node.rotation_degrees.rem_euclid(360) != 0
-                    || clip != node.clip_bounds
-                    || transformed_baseline_intersects_clip(metrics, clip, transform));
-            retention_triggers[index] = intersects;
-            visible[index] = intersects;
+        let line_visible = line.nominal_bounds.is_some_and(|bounds| {
+            semantic_box_and_baselines_intersect_clip(
+                bounds,
+                &line.baselines,
+                effective_clip,
+                transform,
+                require_baseline,
+            )
+        });
+        if !line_visible {
+            continue;
+        }
+        for word in &line.words {
+            let word_visible = word.nominal_bounds.is_some_and(|bounds| {
+                semantic_box_and_baselines_intersect_clip(
+                    bounds,
+                    &word.baselines,
+                    effective_clip,
+                    transform,
+                    require_baseline,
+                )
+            });
+            if !word_visible {
+                continue;
+            }
+            for &index in &word.cluster_indices {
+                selected_word_clusters[index] = true;
+                let metrics = *node.cluster_metrics.get(index)?;
+                let bounds = node.nominal_cluster_bounds(index)?;
+                let intersects = semantic_cluster_is_visible(
+                    node,
+                    index,
+                    bounds,
+                    &[metrics.baseline_y],
+                    effective_clip,
+                    transform,
+                    require_baseline,
+                    require_interior_horizontal_center,
+                    use_nominal_horizontal_center,
+                );
+                retention_triggers[index] = intersects;
+                visible[index] = intersects;
+            }
         }
     }
-    Some((visible, retention_triggers))
+    node.expand_semantic_visibility_from(&mut visible, &retention_triggers);
+    if retain_selected_line_unbounded {
+        for line in &layout.lines {
+            let selected = line.words.iter().any(|word| {
+                word.cluster_indices
+                    .iter()
+                    .any(|&index| visible[index] || selected_word_clusters[index])
+            });
+            if selected {
+                for word in &line.words {
+                    for &index in &word.cluster_indices {
+                        visible[index] = true;
+                    }
+                }
+            }
+        }
+    }
+    if !retain_selected_groups_unbounded && !retain_outer_intersecting_words {
+        for (index, cluster_visible) in visible.iter_mut().enumerate() {
+            if !*cluster_visible {
+                continue;
+            }
+            let cluster = *node.clusters.get(index)?;
+            let start = usize::try_from(cluster.source_start).ok()?;
+            let end = usize::try_from(cluster.source_end).ok()?;
+            *cluster_visible = layout
+                .lines
+                .iter()
+                .any(|line| line.source.start <= start && end <= line.source.end);
+        }
+    }
+    if retain_selected_groups_unbounded {
+        return Some(visible);
+    }
+    if retain_outer_intersecting_words {
+        let retained_groups = visible;
+        let mut outer_visible = vec![false; node.clusters.len()];
+        for line in &layout.lines {
+            for word in &line.words {
+                if !word
+                    .cluster_indices
+                    .iter()
+                    .any(|&index| retained_groups[index] || selected_word_clusters[index])
+                {
+                    continue;
+                }
+                let intersects = word.nominal_bounds.is_some_and(|bounds| {
+                    semantic_box_and_baselines_intersect_clip(
+                        bounds,
+                        &word.baselines,
+                        semantic_outer_clip,
+                        transform,
+                        false,
+                    )
+                });
+                if intersects {
+                    for &index in &word.cluster_indices {
+                        outer_visible[index] =
+                            retained_groups[index] || selected_word_clusters[index];
+                    }
+                }
+            }
+        }
+        return Some(outer_visible);
+    }
+    for index in 0..node.clusters.len() {
+        if !visible[index] && !selected_word_clusters[index] {
+            continue;
+        }
+        let metrics = *node.cluster_metrics.get(index)?;
+        visible[index] = node.nominal_cluster_bounds(index).is_some_and(|bounds| {
+            semantic_cluster_is_visible(
+                node,
+                index,
+                bounds,
+                &[metrics.baseline_y],
+                semantic_outer_clip,
+                transform,
+                false,
+                require_interior_horizontal_center,
+                use_nominal_horizontal_center,
+            )
+        });
+    }
+    Some(visible)
 }
 
-fn transformed_baseline_intersects_clip(
-    metrics: crate::scene::GlyphClusterMetrics,
+#[allow(clippy::too_many_arguments)]
+fn semantic_cluster_is_visible(
+    node: &GlyphRunNode,
+    cluster_index: usize,
+    bounds: Rect,
+    baselines: &[Fixed],
+    clip: Rect,
+    transform: SvgSemanticTransform,
+    require_baseline: bool,
+    require_interior_horizontal_center: bool,
+    use_nominal_horizontal_center: bool,
+) -> bool {
+    semantic_box_and_baselines_intersect_clip(bounds, baselines, clip, transform, require_baseline)
+        && (!require_interior_horizontal_center
+            || glyph_cluster_has_interior_horizontal_center(
+                node,
+                cluster_index,
+                bounds,
+                clip,
+                transform,
+                use_nominal_horizontal_center,
+            ))
+}
+
+fn semantic_box_and_baselines_intersect_clip(
+    bounds: Rect,
+    baselines: &[Fixed],
+    clip: Rect,
+    transform: SvgSemanticTransform,
+    require_baseline: bool,
+) -> bool {
+    transformed_rect_intersects_clip(bounds, clip, transform)
+        && (!require_baseline
+            || baselines.iter().copied().any(|baseline| {
+                transformed_baseline_intersects_clip_value(baseline, bounds, clip, transform)
+            }))
+}
+
+fn transformed_baseline_intersects_clip_value(
+    baseline_y: Fixed,
+    bounds: Rect,
     clip: Rect,
     transform: SvgSemanticTransform,
 ) -> bool {
-    let Some(advance_end) = metrics.origin_x.checked_add(metrics.advance_x) else {
+    let Some(bounds_right) = bounds.x.checked_add(bounds.width) else {
         return false;
     };
-    let left = Fixed::from_raw(metrics.origin_x.raw().min(advance_end.raw()));
-    let right = Fixed::from_raw(metrics.origin_x.raw().max(advance_end.raw()));
+    let left = Fixed::from_raw(bounds.x.raw().min(bounds_right.raw()));
+    let right = Fixed::from_raw(bounds.x.raw().max(bounds_right.raw()));
     let width = right
         .checked_sub(left)
         .map(|width| width.max(Fixed::from_raw(1)))
@@ -647,7 +1048,7 @@ fn transformed_baseline_intersects_clip(
     transformed_rect_intersects_clip(
         Rect {
             x: left,
-            y: metrics.baseline_y,
+            y: baseline_y,
             width,
             height: Fixed::from_raw(1),
         },
@@ -693,6 +1094,68 @@ fn transformed_rect_intersects_clip(
         [fixed_as_f64(clip.x), fixed_as_f64(clip_bottom)],
     ];
     semantic_quadrilaterals_overlap(&transformed, &clip)
+}
+
+fn glyph_cluster_has_interior_horizontal_center(
+    node: &GlyphRunNode,
+    cluster_index: usize,
+    nominal_bounds: Rect,
+    clip: Rect,
+    transform: SvgSemanticTransform,
+    use_nominal_bounds: bool,
+) -> bool {
+    let ink_bounds = (!use_nominal_bounds)
+        .then(|| {
+            node.clusters
+                .get(cluster_index)
+                .and_then(|cluster| {
+                    let start = usize::try_from(cluster.command_start).ok()?;
+                    let end = usize::try_from(cluster.command_end).ok()?;
+                    glyph_command_bounds(node.commands.get(start..end)?)
+                })
+                .and_then(|(min_x, min_y, max_x, max_y)| {
+                    let width = Fixed::from_raw(max_x).checked_sub(Fixed::from_raw(min_x))?;
+                    let height = Fixed::from_raw(max_y).checked_sub(Fixed::from_raw(min_y))?;
+                    (width > Fixed::ZERO && height > Fixed::ZERO).then_some(Rect {
+                        x: Fixed::from_raw(min_x),
+                        y: Fixed::from_raw(min_y),
+                        width,
+                        height,
+                    })
+                })
+        })
+        .flatten();
+    let rect = ink_bounds.unwrap_or(nominal_bounds);
+    let Some(rect_right) = rect.x.checked_add(rect.width) else {
+        return false;
+    };
+    let Some(rect_bottom) = rect.y.checked_add(rect.height) else {
+        return false;
+    };
+    let Some(clip_right) = clip.x.checked_add(clip.width) else {
+        return false;
+    };
+    let clip_left = fixed_as_f64(clip.x);
+    let clip_right = fixed_as_f64(clip_right);
+    let (minimum_x, maximum_x) = [
+        transform.point(rect.x, rect.y),
+        transform.point(rect_right, rect.y),
+        transform.point(rect_right, rect_bottom),
+        transform.point(rect.x, rect_bottom),
+    ]
+    .into_iter()
+    .map(|point| point[0])
+    .fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), x| (minimum.min(x), maximum.max(x)),
+    );
+    let clip_width = clip_right - clip_left;
+    if clip_width <= 0.0 || !minimum_x.is_finite() || !maximum_x.is_finite() {
+        return false;
+    }
+    let inset = fixed_as_f64(Fixed::from_raw(FIXED_UNITS_PER_PIXEL)).min(clip_width / 2.0);
+    let center_x = (minimum_x + maximum_x) / 2.0;
+    center_x >= clip_left + inset && center_x <= clip_right - inset
 }
 
 fn semantic_quadrilaterals_overlap(left: &[[f64; 2]; 4], right: &[[f64; 2]; 4]) -> bool {
@@ -771,7 +1234,7 @@ fn intersect_rects(left: Rect, right: Rect) -> Result<Option<Rect>, RenderError>
     }))
 }
 
-fn glyph_commands_intersect_clip(commands: &[PathCommand], clip: (i64, i64, i64, i64)) -> bool {
+fn glyph_command_bounds(commands: &[PathCommand]) -> Option<(i64, i64, i64, i64)> {
     let mut current: Option<(i64, i64)> = None;
     let mut contour_start: Option<(i64, i64)> = None;
     let mut bounds: Option<(i64, i64, i64, i64)> = None;
@@ -838,7 +1301,11 @@ fn glyph_commands_intersect_clip(commands: &[PathCommand], clip: (i64, i64, i64,
             }
         }
     }
-    bounds.is_some_and(|(min_x, min_y, max_x, max_y)| {
+    bounds
+}
+
+fn glyph_commands_intersect_clip(commands: &[PathCommand], clip: (i64, i64, i64, i64)) -> bool {
+    glyph_command_bounds(commands).is_some_and(|(min_x, min_y, max_x, max_y)| {
         max_x > clip.0 && min_x < clip.2 && max_y > clip.1 && min_y < clip.3
     })
 }
@@ -1210,6 +1677,73 @@ mod tests {
         }
     }
 
+    fn authoritative_word_node(retain_complete_source: bool) -> GlyphRunNode {
+        let pixel = FIXED_UNITS_PER_PIXEL;
+        let mut commands = rectangle_commands(0, 4 * pixel);
+        commands.extend(rectangle_commands(5 * pixel, 8 * pixel));
+        commands.extend(rectangle_commands(8 * pixel, 9 * pixel));
+        let mut node = glyph_node(
+            "CELL 0003",
+            0,
+            8 * pixel,
+            commands,
+            vec![
+                GlyphCluster {
+                    source_start: 0,
+                    source_end: 4,
+                    command_start: 0,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 4,
+                    source_end: 5,
+                    command_start: 5,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 5,
+                    source_end: 8,
+                    command_start: 5,
+                    command_end: 10,
+                },
+                GlyphCluster {
+                    source_start: 8,
+                    source_end: 9,
+                    command_start: 10,
+                    command_end: 15,
+                },
+            ],
+        );
+        node.clip_bounds.height = Fixed::from_pixels(10);
+        let metrics = |origin_x, advance_x| GlyphClusterMetrics {
+            origin_x: Fixed::from_raw(origin_x * pixel),
+            advance_x: Fixed::from_raw(advance_x * pixel),
+            baseline_y: Fixed::from_raw(8 * pixel),
+            ascent: Fixed::from_raw(7 * pixel),
+            descent: Fixed::from_raw(-2 * pixel),
+        };
+        node.cluster_metrics = vec![metrics(0, 4), metrics(4, 1), metrics(5, 3), metrics(8, 1)];
+        node.semantic_groups = Vec::with_capacity(3);
+        if retain_complete_source {
+            node.semantic_groups.push(GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 9,
+            });
+        }
+        node.semantic_groups.extend([
+            GlyphSemanticGroup {
+                source_start: 9,
+                source_end: 9,
+            },
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 9,
+            },
+        ]);
+        assert!(node.metadata_is_valid());
+        node
+    }
+
     #[test]
     fn rgba_images_are_self_contained_accessible_and_rotated() {
         let scene = Scene {
@@ -1577,6 +2111,368 @@ mod tests {
             }],
         );
         assert_eq!(visible_glyph_label(&outside).unwrap(), "");
+    }
+
+    #[test]
+    fn authoritative_word_ignores_owner_clip_but_respects_page_clip() {
+        let node = authoritative_word_node(false);
+
+        let scene = |width| Scene {
+            title: "owner and page clips".to_string(),
+            width: Fixed::from_pixels(width),
+            height: Fixed::from_pixels(10),
+            background: Rgb::WHITE,
+            nodes: vec![SceneNode::GlyphRun(node.clone())],
+        };
+        let owner_clipped = render_scene_svg(&scene(10), 1 << 20).unwrap();
+        assert!(owner_clipped.contains("data-rxls-visible-label=\"CELL 0003\""));
+        assert!(owner_clipped.contains("aria-label=\"CELL 0003\""));
+
+        let page_clipped = render_scene_svg(&scene(8), 1 << 20).unwrap();
+        assert!(page_clipped.contains("data-rxls-visible-label=\"CELL 000\""));
+        assert!(!page_clipped.contains("data-rxls-visible-label=\"CELL 0003\""));
+        assert!(page_clipped.contains("aria-label=\"CELL 0003\""));
+    }
+
+    #[test]
+    fn authored_group_expansion_stops_at_the_prepared_line_source() {
+        let mut node = authoritative_word_node(true);
+        node.semantic_groups
+            .last_mut()
+            .expect("prepared line")
+            .source_end = 8;
+        assert!(node.metadata_is_valid());
+        let page = Rect {
+            width: Fixed::from_pixels(10),
+            ..node.clip_bounds
+        };
+        let ordinary = SvgGlyphSemanticClip {
+            effective: Some(node.clip_bounds),
+            outer: Some(page),
+            retain_selected_groups_unbounded: false,
+            retain_selected_line_unbounded: false,
+            retain_outer_intersecting_words: false,
+            require_interior_horizontal_center: false,
+            use_nominal_horizontal_center: false,
+        };
+
+        assert_eq!(
+            visible_glyph_label_in_clip(&node, ordinary).unwrap(),
+            "CELL 000"
+        );
+        assert_eq!(
+            visible_glyph_label_in_clip(
+                &node,
+                SvgGlyphSemanticClip {
+                    retain_selected_groups_unbounded: true,
+                    ..ordinary
+                },
+            )
+            .unwrap(),
+            "CELL 0003"
+        );
+    }
+
+    #[test]
+    fn authored_split_groups_expand_to_the_selected_prepared_line() {
+        let mut node = authoritative_word_node(false);
+        node.semantic_groups = vec![
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 5,
+            },
+            GlyphSemanticGroup {
+                source_start: 5,
+                source_end: 9,
+            },
+            GlyphSemanticGroup {
+                source_start: 9,
+                source_end: 9,
+            },
+            GlyphSemanticGroup {
+                source_start: 0,
+                source_end: 9,
+            },
+        ];
+        assert!(node.metadata_is_valid());
+        let narrow = Rect {
+            width: Fixed::from_pixels(4),
+            ..node.clip_bounds
+        };
+        let clip = SvgGlyphSemanticClip {
+            effective: Some(narrow),
+            outer: Some(narrow),
+            retain_selected_groups_unbounded: true,
+            retain_selected_line_unbounded: true,
+            retain_outer_intersecting_words: false,
+            require_interior_horizontal_center: false,
+            use_nominal_horizontal_center: false,
+        };
+
+        assert_eq!(
+            visible_glyph_label_in_clip(&node, clip).unwrap(),
+            "CELL 0003"
+        );
+    }
+
+    #[test]
+    fn authored_body_and_drawing_clips_follow_axis_specific_semantics() {
+        fn rect(x: i64, y: i64, width: i64, height: i64) -> Rect {
+            Rect {
+                x: Fixed::from_pixels(x),
+                y: Fixed::from_pixels(y),
+                width: Fixed::from_pixels(width),
+                height: Fixed::from_pixels(height),
+            }
+        }
+
+        fn scene(
+            content_clip: Rect,
+            body_clip: Rect,
+            drawing_clip: Option<Rect>,
+            object_clip: Option<Rect>,
+            authored: bool,
+            multiple_bodies: bool,
+        ) -> Scene {
+            let page_bounds = Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(10),
+                height: Fixed::from_pixels(10),
+            };
+            let mut run = authoritative_word_node(authored);
+            if drawing_clip.is_some() {
+                run.clip_bounds = page_bounds;
+            }
+            let mut body_nodes = vec![SceneNode::GlyphRun(run)];
+            if let Some(clip) = object_clip {
+                body_nodes = vec![SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip,
+                    nodes: body_nodes,
+                })];
+            }
+            if let Some(clip) = drawing_clip {
+                body_nodes = vec![SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip,
+                    nodes: body_nodes,
+                })];
+            }
+            let mut bodies = vec![SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                clip: body_clip,
+                nodes: body_nodes,
+            })];
+            if multiple_bodies {
+                bodies.push(SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip: rect(0, 8, 10, 2),
+                    nodes: vec![SceneNode::Rect(RectNode {
+                        rect: rect(0, 8, 1, 1),
+                        fill: Some(Rgb::WHITE),
+                        stroke: None,
+                        stroke_width: Fixed::ZERO,
+                    })],
+                }));
+            }
+            Scene {
+                title: "authored semantic clips".to_string(),
+                width: page_bounds.width,
+                height: page_bounds.height,
+                background: Rgb::WHITE,
+                nodes: vec![SceneNode::ClipGroup(crate::scene::ClipGroupNode {
+                    clip: content_clip,
+                    nodes: bodies,
+                })],
+            }
+        }
+
+        let page = rect(0, 0, 10, 10);
+        let body_fragment = render_scene_svg(
+            &scene(page, rect(0, 0, 8, 10), None, None, true, false),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(body_fragment.contains("data-rxls-visible-label=\"CELL 0003\""));
+        assert!(body_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let interior_owner_fragment =
+            render_scene_svg(&scene(page, page, None, None, true, false), 1 << 20).unwrap();
+        assert!(interior_owner_fragment.contains("data-rxls-visible-label=\"CELL 000\""));
+        assert!(interior_owner_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let content_fragment = render_scene_svg(
+            &scene(
+                rect(0, 0, 8, 10),
+                rect(0, 0, 8, 10),
+                None,
+                None,
+                true,
+                false,
+            ),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(content_fragment.contains("data-rxls-visible-label=\"CELL 000\""));
+        assert!(content_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let vertical_drawing_fragment = render_scene_svg(
+            &scene(
+                page,
+                rect(0, 0, 10, 4),
+                Some(rect(0, 0, 10, 4)),
+                None,
+                true,
+                true,
+            ),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(vertical_drawing_fragment.contains("data-rxls-visible-label=\"CELL 0003\""));
+        assert!(vertical_drawing_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let horizontal_drawing_fragment = render_scene_svg(
+            &scene(
+                page,
+                rect(0, 0, 8, 10),
+                Some(rect(0, 0, 8, 10)),
+                None,
+                true,
+                true,
+            ),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(horizontal_drawing_fragment.contains("data-rxls-visible-label=\"CELL 0003\""));
+        assert!(horizontal_drawing_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let object_fragment = render_scene_svg(
+            &scene(page, page, Some(page), Some(rect(0, 0, 8, 10)), true, true),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(object_fragment.contains("data-rxls-visible-label=\"CELL 000\""));
+        assert!(object_fragment.contains("aria-label=\"CELL 0003\""));
+
+        let ordinary_nested_clip = render_scene_svg(
+            &scene(page, rect(0, 0, 8, 10), None, None, false, false),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(ordinary_nested_clip.contains("data-rxls-visible-label=\"CELL 000\""));
+        assert!(ordinary_nested_clip.contains("aria-label=\"CELL 0003\""));
+    }
+
+    #[test]
+    fn authored_rtl_body_bounds_latin_retention_at_the_page_edge() {
+        let page = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(8),
+            height: Fixed::from_pixels(10),
+        };
+        let context = SvgSemanticClipContext {
+            outer_clip: Some(Rect {
+                width: Fixed::from_pixels(4),
+                ..page
+            }),
+            page_clip: page,
+            authored_scope: SvgAuthoredClipScope::Body,
+            body_clip: Some(Rect {
+                width: Fixed::from_pixels(4),
+                ..page
+            }),
+            body_right_to_left: true,
+        };
+        let latin = authoritative_word_node(true);
+        let latin_clip = context.glyph_clips(&latin).unwrap();
+        assert!(!latin_clip.retain_selected_groups_unbounded);
+        assert!(!latin_clip.retain_selected_line_unbounded);
+        assert!(latin_clip.retain_outer_intersecting_words);
+        assert_eq!(
+            visible_glyph_label_in_clip(&latin, latin_clip).unwrap(),
+            "CELL 0003"
+        );
+
+        let narrow_page = Rect {
+            width: Fixed::from_pixels(4),
+            ..page
+        };
+        let narrow_context = SvgSemanticClipContext {
+            outer_clip: Some(narrow_page),
+            page_clip: narrow_page,
+            body_clip: Some(narrow_page),
+            ..context
+        };
+        assert_eq!(
+            visible_glyph_label_in_clip(&latin, narrow_context.glyph_clips(&latin).unwrap())
+                .unwrap(),
+            "CELL"
+        );
+
+        let mut non_latin = latin;
+        non_latin.text = "한글 0003".to_string();
+        let non_latin_clip = context.glyph_clips(&non_latin).unwrap();
+        assert!(non_latin_clip.retain_selected_groups_unbounded);
+        assert!(
+            !non_latin_clip.retain_selected_line_unbounded,
+            "a single retained group does not need prepared-line expansion"
+        );
+        assert!(!non_latin_clip.retain_outer_intersecting_words);
+    }
+
+    #[test]
+    fn glyph_semantic_boundary_uses_interior_ink_center() {
+        let pixel = FIXED_UNITS_PER_PIXEL;
+        let mut commands = rectangle_commands(9 * pixel + 2 * pixel / 5, 10 * pixel);
+        commands.extend(rectangle_commands(8 * pixel, 9 * pixel));
+        let node = glyph_node(
+            "ab",
+            0,
+            10 * pixel,
+            commands,
+            vec![
+                GlyphCluster {
+                    source_start: 0,
+                    source_end: 1,
+                    command_start: 0,
+                    command_end: 5,
+                },
+                GlyphCluster {
+                    source_start: 1,
+                    source_end: 2,
+                    command_start: 5,
+                    command_end: 10,
+                },
+            ],
+        );
+        let clip = Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(10),
+            height: Fixed::from_pixels(10),
+        };
+        let transform = SvgSemanticTransform::rotation(0, Fixed::ZERO, Fixed::ZERO);
+        let nominal_bounds = Rect {
+            x: Fixed::from_pixels(8),
+            y: Fixed::ZERO,
+            width: Fixed::from_pixels(1),
+            height: Fixed::from_pixels(1),
+        };
+
+        assert!(!glyph_cluster_has_interior_horizontal_center(
+            &node,
+            0,
+            nominal_bounds,
+            clip,
+            transform,
+            false,
+        ));
+        assert!(glyph_cluster_has_interior_horizontal_center(
+            &node,
+            1,
+            nominal_bounds,
+            clip,
+            transform,
+            false,
+        ));
     }
 
     #[test]

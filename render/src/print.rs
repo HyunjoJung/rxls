@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rxls::{PageSetup, PrintLossKind, PrintPageOrder, Sheet, Workbook};
+use rxls::{OoxmlImplicitRowHeight, PageSetup, PrintLossKind, PrintPageOrder, Sheet, Workbook};
 use sha2::{Digest, Sha256};
 
 use crate::error::{LimitKind, RenderError};
@@ -17,7 +17,8 @@ use crate::layout::{
     prepared_drawing_geometry_extent, render_single_page_used_scene_range, render_used_print_range,
     CellCoordinate, MeasuredAxisSlot, RenderLimits, RenderOptions, RenderRange, RenderReport,
     RenderSelection, SheetGeometryOverride, SparseDisplayCellIndex, WarningCode,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW, PRINT_GRIDLINE_WIDTH,
+    CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    PRINT_GRIDLINE_WIDTH,
 };
 use crate::scene::{
     ClipGroupNode, Fixed, GlyphSemanticGroup, PathCommand, Rect, RectNode, Rgb, Scene, SceneNode,
@@ -27,9 +28,14 @@ use crate::scene::{
 const DEFAULT_LEFT_RIGHT_INCHES: f64 = 0.7;
 const DEFAULT_TOP_BOTTOM_INCHES: f64 = 0.75;
 const DEFAULT_HEADER_FOOTER_INCHES: f64 = 0.3;
-const ROW_HEADING_WIDTH: Fixed = Fixed::from_pixels(32);
-const COLUMN_HEADING_HEIGHT: Fixed = Fixed::from_pixels(20);
-const HEADER_FOOTER_FONT_SIZE: Fixed = Fixed::from_pixels(12);
+const ROW_HEADING_WIDTH: Fixed = Fixed::from_pixels(38);
+const COLUMN_HEADING_HEIGHT: Fixed = Fixed::from_pixels(17);
+const HEADER_FOOTER_FONT_SIZE: Fixed = Fixed::from_raw(15_019);
+const HEADER_FOOTER_LINE_HEIGHT: Fixed = Fixed::from_pixels(16);
+const HEADER_FOOTER_HORIZONTAL_PADDING: Fixed = Fixed::from_pixels(4);
+const HEADING_FONT_FAMILY: &str = "Liberation Sans";
+const HEADING_FONT_SIZE: Fixed = Fixed::from_raw(13_653);
+const HEADING_HORIZONTAL_PADDING: Fixed = Fixed::from_pixels(2);
 const SINGLE_PAGE_CUSTOM_PAPER_CODE: u16 = 0;
 const MIN_PRINT_SCALE_PERMILLE: u16 = 100;
 const MAX_PRINT_SCALE_PERMILLE: u16 = 4_000;
@@ -81,7 +87,9 @@ pub struct PrintOptions {
     pub omit_sparse_pages: bool,
     /// Ignore authored print-page settings and emit the selected visible sheet
     /// scene at 100% on one content-sized page. Like Calc's `SinglePageSheets`
-    /// PDF export, this mode suppresses worksheet and authored print gridlines.
+    /// PDF export, this mode suppresses most of the cell gridline mesh. When
+    /// source print gridlines are enabled, Calc's top/leading outline and the
+    /// first LTR four-row block boundary remain.
     pub single_page_sheets: bool,
     /// Pagination and backend resource ceilings.
     pub limits: PrintLimits,
@@ -752,7 +760,7 @@ fn prepare_print_area(
     let (drawing_extents, has_absolute_drawings) =
         prepared_drawing_geometry_extent(sheet, &render_ranges, &source_options)?;
     let mut measurement_ranges = render_ranges.clone();
-    for extent in drawing_extents {
+    for extent in &drawing_extents {
         measurement_ranges.push(RenderRange::new(
             extent.first_row,
             extent.first_col,
@@ -797,6 +805,7 @@ fn prepare_print_area(
         merge_measured_axis(&mut row_sizes, &rows);
         merge_measured_axis(&mut column_sizes, &columns);
     }
+    apply_calc_xlsx_trailing_blank_print_rows(sheet, &render_ranges, &mut row_sizes);
     let measured_rows = measured_axis_slots(row_sizes)?;
     let measured_columns = measured_axis_slots(column_sizes)?;
     let mut source = build_sheet_scene_with_geometry_for_print(
@@ -1056,10 +1065,13 @@ fn prepare_single_page_sheet_document(
     enforce_print_limit(LimitKind::Pages, options.limits.max_pages, 1)?;
 
     let mut render_options = options.render.clone();
-    // Calc's SinglePageSheets export suppresses the worksheet grid regardless
-    // of sheet-view and authored print-gridline flags. A caller opt-out remains
-    // authoritative because this path never turns gridlines back on.
-    render_options.gridlines = false;
+    // Calc's DrawToDev path projects the worksheet grid through a distinct
+    // metafile axis. Layout owns that source-native transform so merged cells,
+    // text overflow, hidden tracks, RTL reflection, and drawing order remain
+    // part of one scene construction contract.
+    let source_gridlines =
+        effective_print_behavior(sheet, &sheet.page_setup().cloned().unwrap_or_default()).gridlines;
+    render_options.gridlines &= source_gridlines;
     let tracks_used_extent = matches!(render_options.selection, RenderSelection::Used);
     let build = build_single_page_sheet_scene_for_print(sheet, sheet_index, &render_options)?;
     let scene = build.scene;
@@ -1969,11 +1981,13 @@ fn build_page_scene(
         .checked_add(y_center)
         .ok_or(RenderError::CoordinateOverflow)?;
     let mut nodes = Vec::new();
+    let mut body_nodes = Vec::new();
+    let mut heading_nodes = Vec::new();
     let right_to_left = sheet.sheet_view().right_to_left;
 
     if behavior.headings {
         append_headings(
-            &mut nodes,
+            &mut heading_nodes,
             sheet,
             source_options,
             measured_rows,
@@ -1991,7 +2005,6 @@ fn build_page_scene(
             limits,
         )?;
     }
-    let content_start = nodes.len();
 
     let body_x = if right_to_left {
         grid_x
@@ -2031,7 +2044,7 @@ fn build_page_scene(
     if let Some(range) = contiguous_page_range {
         let x = if right_to_left { grid_x } else { repeat_x };
         append_block(
-            &mut nodes,
+            &mut body_nodes,
             sheet,
             sheet_index,
             source_options,
@@ -2053,7 +2066,7 @@ fn build_page_scene(
         )?;
     } else if slot.rows.size.raw() > 0 && slot.columns.size.raw() > 0 {
         append_block(
-            &mut nodes,
+            &mut body_nodes,
             sheet,
             sheet_index,
             source_options,
@@ -2163,13 +2176,15 @@ fn build_page_scene(
         }
     }
 
-    if nodes.len() > content_start {
-        let content_nodes = nodes.split_off(content_start);
+    nodes.extend(body_nodes);
+    if !nodes.is_empty() {
+        let content_nodes = std::mem::take(&mut nodes);
         nodes.push(SceneNode::ClipGroup(ClipGroupNode {
             clip: content_rect,
             nodes: content_nodes,
         }));
     }
+    nodes.extend(heading_nodes);
 
     let running_x = if behavior.header_footer.align_with_margins {
         content_rect.x
@@ -2356,6 +2371,31 @@ fn append_block(
     let Some(clip) = intersect_rect(block_clip, content_rect)? else {
         return Ok(());
     };
+    let right_to_left = sheet.sheet_view().right_to_left;
+    let internal_trailing_edge =
+        sheet
+            .visual_dimensions()
+            .is_some_and(|(_, visual_first_col, _, visual_last_col)| {
+                if right_to_left {
+                    range.first_col > visual_first_col
+                } else {
+                    range.last_col < visual_last_col
+                }
+            });
+    let semantic_trailing_edge = if internal_trailing_edge {
+        Some(if right_to_left {
+            (clip.x, true)
+        } else {
+            (
+                clip.x
+                    .checked_add(clip.width)
+                    .ok_or(RenderError::CoordinateOverflow)?,
+                false,
+            )
+        })
+    } else {
+        None
+    };
     let mut options = base_options.clone();
     options.selection = RenderSelection::Range(range);
     let scene = media_budget.build_sheet_scene(
@@ -2367,8 +2407,9 @@ fn append_block(
     )?;
     let mut nodes = Vec::with_capacity(scene.nodes.len());
     for node in scene.nodes {
-        let mut transformed = transform_node(node, x, y, scale_permille)?;
-        retain_authored_print_semantics(&mut transformed, 0)?;
+        let transformed = transform_node(node, x, y, scale_permille)?;
+        let mut transformed = align_authored_print_glyph_run(transformed)?;
+        retain_authored_print_semantics(&mut transformed, semantic_trailing_edge, 0)?;
         nodes.push(transformed);
     }
     if nodes.is_empty() {
@@ -2383,7 +2424,27 @@ fn append_block(
     Ok(())
 }
 
-fn retain_authored_print_semantics(node: &mut SceneNode, depth: u16) -> Result<(), RenderError> {
+fn align_authored_print_glyph_run(node: SceneNode) -> Result<SceneNode, RenderError> {
+    let SceneNode::GlyphRun(run) = node else {
+        return Ok(node);
+    };
+    let clip_bounds = run.clip_bounds;
+    // Calc snaps shaped worksheet and heading text slightly above uniformly
+    // scaled layout geometry on its print device. Call sites intentionally
+    // exclude drawing and running text, which retain their own placement.
+    let offset = Fixed::from_raw(-(FIXED_UNITS_PER_PIXEL * 2 / 5));
+    let mut shifted = transform_node(SceneNode::GlyphRun(run), Fixed::ZERO, offset, 1_000)?;
+    if let SceneNode::GlyphRun(run) = &mut shifted {
+        run.clip_bounds = clip_bounds;
+    }
+    Ok(shifted)
+}
+
+fn retain_authored_print_semantics(
+    node: &mut SceneNode,
+    semantic_trailing_edge: Option<(Fixed, bool)>,
+    depth: u16,
+) -> Result<(), RenderError> {
     if depth > 64 {
         return Err(RenderError::Backend {
             reason: "scene_nesting_too_deep",
@@ -2392,15 +2453,30 @@ fn retain_authored_print_semantics(node: &mut SceneNode, depth: u16) -> Result<(
     match node {
         SceneNode::ClipGroup(group) => {
             for node in &mut group.nodes {
-                retain_authored_print_semantics(node, depth.saturating_add(1))?;
+                retain_authored_print_semantics(
+                    node,
+                    semantic_trailing_edge,
+                    depth.saturating_add(1),
+                )?;
             }
         }
         SceneNode::GlyphRun(run) if !run.text.is_empty() && !run.clusters.is_empty() => {
+            let touches_internal_trailing_edge = depth == 0
+                && semantic_trailing_edge.is_some_and(|(edge, edge_is_left)| {
+                    if edge_is_left {
+                        run.clip_bounds.x == edge
+                    } else {
+                        run.clip_bounds.x.checked_add(run.clip_bounds.width) == Some(edge)
+                    }
+                });
             let divider_index = run
                 .semantic_groups
                 .iter()
                 .position(|group| group.source_start == group.source_end);
-            if divider_index == Some(0) && run.semantic_groups.len() == 2 {
+            if !touches_internal_trailing_edge
+                && divider_index == Some(0)
+                && run.semantic_groups.len() == 2
+            {
                 run.semantic_groups.insert(
                     0,
                     GlyphSemanticGroup {
@@ -2513,6 +2589,7 @@ fn append_headings(
             width: row_heading_width,
             height: scaled_heading_height,
         },
+        scale_permille,
         options,
         limits,
     )?;
@@ -2564,6 +2641,7 @@ fn append_headings(
                     .ok_or(RenderError::CoordinateOverflow)?,
                 height: scaled_heading_height,
             },
+            scale_permille,
             options,
             limits,
         )?;
@@ -2591,6 +2669,7 @@ fn append_headings(
                     .checked_sub(y)
                     .ok_or(RenderError::CoordinateOverflow)?,
             },
+            scale_permille,
             options,
             limits,
         )?;
@@ -2614,6 +2693,7 @@ fn append_heading_cell(
     output: &mut Vec<SceneNode>,
     text: &str,
     rect: Rect,
+    scale_permille: u16,
     options: &RenderOptions,
     limits: &PrintLimits,
 ) -> Result<(), RenderError> {
@@ -2624,13 +2704,15 @@ fn append_heading_cell(
         stroke_width: Fixed::from_pixels(1),
     }));
     if !text.is_empty() {
-        output.push(build_auxiliary_text_node(
+        let font_size = scale_fixed(HEADING_FONT_SIZE, scale_permille)?;
+        let padding = scale_fixed(HEADING_HORIZONTAL_PADDING, scale_permille)?;
+        let heading = build_auxiliary_text_node(
             text.to_string(),
             rect,
-            Fixed::from_pixels(2),
+            padding,
             TextStyle {
-                family: options.default_font_family.clone(),
-                size: HEADER_FOOTER_FONT_SIZE,
+                family: HEADING_FONT_FAMILY.to_string(),
+                size: font_size,
                 color: Rgb::BLACK,
                 bold: false,
                 italic: false,
@@ -2641,7 +2723,8 @@ fn append_heading_cell(
                 rotation_degrees: 0,
             },
             options,
-        )?);
+        )?;
+        output.push(align_authored_print_glyph_run(heading)?);
     }
     enforce_print_limit(
         LimitKind::PageSceneNodes,
@@ -2671,12 +2754,19 @@ fn append_running_text(
     };
     let sections = expand_running_text(source, &sheet.name, page_number, total_pages, warnings);
     let third = Fixed::from_raw(page_width.raw() / 3);
-    let height = scale_fixed(Fixed::from_pixels(16), text_scale_permille)?;
-    let padding = scale_fixed(Fixed::from_pixels(4), text_scale_permille)?;
+    let height = scale_fixed(HEADER_FOOTER_LINE_HEIGHT, text_scale_permille)?;
+    let padding = scale_fixed(HEADER_FOOTER_HORIZONTAL_PADDING, text_scale_permille)?;
     let font_size = scale_fixed(HEADER_FOOTER_FONT_SIZE, text_scale_permille)?;
+    let font_family = sheet
+        .default_cell_style()
+        .and_then(|style| style.font.as_ref())
+        .and_then(|font| font.name.as_deref())
+        .filter(|family| !family.trim().is_empty())
+        .unwrap_or(&options.default_font_family)
+        .to_string();
     let y = if bottom_aligned {
         base_y
-            .checked_add(Fixed::from_pixels(16))
+            .checked_add(HEADER_FOOTER_LINE_HEIGHT)
             .and_then(|value| value.checked_sub(height))
             .ok_or(RenderError::CoordinateOverflow)?
     } else {
@@ -2707,7 +2797,7 @@ fn append_running_text(
             bounds,
             padding,
             TextStyle {
-                family: options.default_font_family.clone(),
+                family: font_family.clone(),
                 size: font_size,
                 color: Rgb::BLACK,
                 bold: false,
@@ -3654,6 +3744,44 @@ where
             .entry(slot.index)
             .and_modify(|size| *size = (*size).max(slot.size))
             .or_insert(slot.size);
+    }
+}
+
+fn apply_calc_xlsx_trailing_blank_print_rows(
+    sheet: &Sheet,
+    render_ranges: &[RenderRange],
+    row_sizes: &mut BTreeMap<u32, Fixed>,
+) {
+    if sheet.implicit_ooxml_row_height_source()
+        != Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+        || sheet.default_row_height().is_some()
+    {
+        return;
+    }
+
+    let visual_last_row = sheet
+        .visual_dimensions()
+        .map(|(_, _, last_row, _)| last_row);
+    for (&row, size) in row_sizes.iter_mut() {
+        let is_trailing_blank = visual_last_row.is_none_or(|last_row| row > last_row);
+        let is_relevant_chart_row = sheet.charts().iter().any(|chart| {
+            let anchor_intersects_print = chart.from.0 <= chart.to.0
+                && chart.from.1 <= chart.to.1
+                && render_ranges.iter().any(|range| {
+                    chart.from.0 <= range.last_row
+                        && chart.to.0 >= range.first_row
+                        && chart.from.1 <= range.last_col
+                        && chart.to.1 >= range.first_col
+                });
+            anchor_intersects_print && chart.from.0 <= row && row < chart.to.0
+        });
+        if is_trailing_blank
+            && !is_relevant_chart_row
+            && !sheet.row_heights().contains_key(&row)
+            && !sheet.row_styles().contains_key(&row)
+        {
+            *size = CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT;
+        }
     }
 }
 
@@ -4918,6 +5046,101 @@ mod tests {
     }
 
     #[test]
+    fn authored_print_aligns_direct_sheet_and_heading_glyph_runs() {
+        let pack = crate::font::synthetic_test_pack();
+        let options = RenderOptions {
+            font_pack: Some(pack.clone()),
+            default_font_family: pack.default_family().to_string(),
+            gridlines: false,
+            ..RenderOptions::default()
+        };
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("aligned-cell").write(0, 0, "AB");
+        let build = build_sheet_scene(&workbook.sheets[0], 0, &options).unwrap();
+        let original = build
+            .scene
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                SceneNode::GlyphRun(run) => Some(run.clone()),
+                _ => None,
+            })
+            .expect("layout-produced glyph run");
+        let offset = Fixed::from_raw(-(FIXED_UNITS_PER_PIXEL * 2 / 5));
+        let mut expected = match transform_node(
+            SceneNode::GlyphRun(original.clone()),
+            Fixed::ZERO,
+            offset,
+            1_000,
+        )
+        .unwrap()
+        {
+            SceneNode::GlyphRun(run) => run,
+            _ => unreachable!(),
+        };
+        expected.clip_bounds = original.clip_bounds;
+
+        let aligned =
+            align_authored_print_glyph_run(SceneNode::GlyphRun(original.clone())).unwrap();
+        assert_eq!(aligned, SceneNode::GlyphRun(expected));
+
+        let nested = SceneNode::ClipGroup(ClipGroupNode {
+            clip: original.clip_bounds,
+            nodes: vec![SceneNode::GlyphRun(original)],
+        });
+        assert_eq!(
+            align_authored_print_glyph_run(nested.clone()).unwrap(),
+            nested
+        );
+
+        let heading_rect = Rect {
+            x: Fixed::from_pixels(20),
+            y: Fixed::from_pixels(30),
+            width: Fixed::from_pixels(38),
+            height: Fixed::from_pixels(17),
+        };
+        let mut heading_nodes = Vec::new();
+        append_heading_cell(
+            &mut heading_nodes,
+            "9",
+            heading_rect,
+            1_000,
+            &options,
+            &PrintLimits::default(),
+        )
+        .unwrap();
+        let SceneNode::GlyphRun(heading) = &heading_nodes[1] else {
+            panic!("font-backed heading must be shaped");
+        };
+        let unaligned = build_auxiliary_text_node(
+            "9".to_string(),
+            heading_rect,
+            HEADING_HORIZONTAL_PADDING,
+            TextStyle {
+                family: HEADING_FONT_FAMILY.to_string(),
+                size: HEADING_FONT_SIZE,
+                color: Rgb::BLACK,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                anchor: TextAnchor::Middle,
+                baseline: TextBaseline::Middle,
+                rotation_degrees: 0,
+            },
+            &options,
+        )
+        .unwrap();
+        let SceneNode::GlyphRun(unaligned) = unaligned else {
+            panic!("font-backed heading must be shaped");
+        };
+        assert_eq!(heading.clip_bounds, heading_rect);
+        for (before, after) in unaligned.glyphs.iter().zip(&heading.glyphs) {
+            assert_eq!(after.origin_y, before.origin_y.checked_add(offset).unwrap());
+        }
+    }
+
+    #[test]
     fn ordered_pages_pdf_and_png_share_one_scene_deterministically() {
         let document = multipage_document();
         assert!(document.pages.len() >= 4);
@@ -4943,24 +5166,27 @@ mod tests {
     }
 
     #[test]
-    fn single_page_sheets_suppress_gridlines_like_calc() {
-        fn print_gridline_count(nodes: &[SceneNode]) -> usize {
+    fn single_page_sheets_retain_the_calc_grid_fragments() {
+        fn print_gridlines(nodes: &[SceneNode]) -> Vec<&crate::scene::LineNode> {
             nodes
                 .iter()
-                .map(|node| match node {
-                    SceneNode::Line(line) => {
-                        usize::from(line.color == Rgb::BLACK && line.width == PRINT_GRIDLINE_WIDTH)
+                .flat_map(|node| match node {
+                    SceneNode::Line(line)
+                        if line.color == Rgb::BLACK && line.width == PRINT_GRIDLINE_WIDTH =>
+                    {
+                        vec![line]
                     }
-                    SceneNode::ClipGroup(group) => print_gridline_count(&group.nodes),
-                    _ => 0,
+                    SceneNode::ClipGroup(group) => print_gridlines(&group.nodes),
+                    _ => Vec::new(),
                 })
-                .sum()
+                .collect()
         }
 
         let mut workbook = Workbook::new();
         let sheet = workbook.add_sheet("gridlines");
         sheet.write(0, 0, "A");
         sheet.write(1, 1, "B");
+        sheet.write(9, 9, "C");
         sheet.set_print_gridlines();
         assert!(sheet.print_gridlines());
         assert!(sheet.print_metadata().print_gridlines().unwrap_or(false));
@@ -4973,12 +5199,12 @@ mod tests {
             ..PrintOptions::default()
         };
         let document = build_print_document(&workbook, 0, &authored).unwrap();
-        assert!(print_gridline_count(&document.pages[0].scene.nodes) > 2);
+        assert!(print_gridlines(&document.pages[0].scene.nodes).len() > 2);
 
         let mut disabled = authored.clone();
         disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &disabled).unwrap();
-        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
+        assert!(print_gridlines(&document.pages[0].scene.nodes).is_empty());
 
         let single_page = PrintOptions {
             single_page_sheets: true,
@@ -4986,19 +5212,39 @@ mod tests {
         };
         let document = build_print_document(&workbook, 0, &single_page).unwrap();
         assert!(single_page.render.gridlines);
-        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
+        let scene = &document.pages[0].scene;
+        let grid = print_gridlines(&scene.nodes);
+        assert_eq!(grid.len(), 6);
 
         let mut single_page_disabled = single_page.clone();
         single_page_disabled.render.gridlines = false;
         let document = build_print_document(&workbook, 0, &single_page_disabled).unwrap();
-        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
+        assert!(print_gridlines(&document.pages[0].scene.nodes).is_empty());
 
         let mut source_disabled = Workbook::new();
         let sheet = source_disabled.add_sheet("source-disabled");
         sheet.write(0, 0, "A");
         sheet.write(1, 1, "B");
+        sheet.write(9, 9, "C");
         let document = build_print_document(&source_disabled, 0, &single_page).unwrap();
-        assert_eq!(print_gridline_count(&document.pages[0].scene.nodes), 0);
+        assert!(print_gridlines(&document.pages[0].scene.nodes).is_empty());
+
+        workbook.sheets[0].set_right_to_left(true);
+        let document = build_print_document(&workbook, 0, &single_page).unwrap();
+        let scene = &document.pages[0].scene;
+        let grid = print_gridlines(&scene.nodes);
+        let vertical = grid
+            .iter()
+            .filter(|line| line.x1 == line.x2)
+            .map(|line| line.x1)
+            .collect::<BTreeSet<_>>();
+        let horizontal = grid
+            .iter()
+            .filter(|line| line.y1 == line.y2)
+            .map(|line| line.y1)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(vertical.len(), 1, "RTL must retain the leading page frame");
+        assert_eq!(horizontal.len(), 1, "RTL must retain the top page frame");
     }
 
     #[test]
@@ -5105,6 +5351,66 @@ mod tests {
                 .map(|row| (row, Fixed::from_pixels(20)))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn imported_xlsx_trailing_blank_print_rows_use_calc_standard_tracks() {
+        let bytes = zip_parts(&[
+            (
+                "xl/workbook.xml",
+                br#"<workbook><sheets><sheet name="Rows" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
+            ),
+        ]);
+        let mut workbook = Workbook::open(&bytes).unwrap();
+        workbook.sheets[0].set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 3, 0))
+                .with_scale(100),
+        );
+        workbook.sheets[0].set_row_height(3, 15.0);
+
+        let scaled = prepare_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        let PreparedPrintState::Paginated { areas, .. } = &scaled.state else {
+            panic!("expected paginated state");
+        };
+        assert_eq!(
+            areas[0].measured_rows[1].size,
+            CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT
+        );
+
+        workbook.sheets[0].set_page_setup(
+            PageSetup::new()
+                .with_print_area((0, 0, 3, 0))
+                .with_fit_to_pages(1, 1),
+        );
+        let prepared = prepare_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        let PreparedPrintState::Paginated { areas, .. } = &prepared.state else {
+            panic!("expected paginated state");
+        };
+        let rows = &areas[0].measured_rows;
+        assert_eq!(rows.len(), 4);
+        assert_ne!(rows[0].size, CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT);
+        assert_eq!(rows[1].size, CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT);
+        assert_eq!(rows[2].size, CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT);
+        assert_eq!(rows[3].size, Fixed::from_pixels(20));
+
+        workbook.sheets[0].add_chart(Chart::new(ChartKind::Line, (1, 0), (3, 1)));
+        let prepared = prepare_print_document(&workbook, 0, &PrintOptions::default()).unwrap();
+        let PreparedPrintState::Paginated { areas, .. } = &prepared.state else {
+            panic!("expected paginated state");
+        };
+        let rows = &areas[0].measured_rows;
+        assert_ne!(rows[1].size, CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT);
+        assert_ne!(rows[2].size, CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT);
+        assert_eq!(rows[3].size, Fixed::from_pixels(20));
     }
 
     #[test]

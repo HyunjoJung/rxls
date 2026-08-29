@@ -1002,6 +1002,12 @@ jobs:
           import re
           import shutil
 
+          artifact_extension = re.compile(
+              r"\.(?:xls|xlsx|xlsb|xlsm|ods|fods|pdf|png|svg)\Z",
+              re.IGNORECASE,
+          )
+          traversal = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
+
           def load(path):
               return json.loads(path.read_text(encoding="utf-8"))
 

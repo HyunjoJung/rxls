@@ -60,7 +60,7 @@ const OOXML_APPLICATION_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(19_351);
 /// row track (12.8 pt) even when the worksheet's text layout later chooses a
 /// taller automatic row.  Drawing anchors therefore need a separate, stable
 /// track model instead of borrowing the cell paint height.
-const CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(17_476);
+pub(crate) const CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT: Fixed = Fixed::from_raw(17_476);
 /// LibreOffice 26.2.3.2
 /// `sc/source/core/data/column2.cxx::lcl_GetAttribHeight` derives an automatic
 /// row from 118% of the pattern font's integer-twip height, then adds the two
@@ -1223,6 +1223,7 @@ fn build_auxiliary_text_node_with_clip_and_kerning(
         rect: bounds,
         is_merged: false,
         line_layout_policy: CellLineLayoutPolicy::Native,
+        line_placement_policy: CalcLinePlacementPolicy::Native,
         calc_wrap_space: None,
         style: None,
         conditional: ConditionalPaint::default(),
@@ -1249,6 +1250,7 @@ fn build_auxiliary_text_node_with_clip_and_kerning(
         &style,
         false,
         kerning,
+        false,
         &auxiliary_options,
         &mut statistics,
         &mut warnings,
@@ -1281,12 +1283,42 @@ struct CalcLineLayoutEvidence {
     wrap_space_available: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcImportProvenance {
+    Ods,
+    Biff,
+    Xlsb,
+    Xlsx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcLinePlacementPolicy {
+    Native,
+    #[cfg(test)]
+    RequestedFace,
+    Imported(CalcImportProvenance),
+}
+
+impl CalcLinePlacementPolicy {
+    fn uses_placement_ascent(self) -> bool {
+        self != Self::Native
+    }
+
+    fn uses_placement_line_height(self) -> bool {
+        !matches!(
+            self,
+            Self::Native | Self::Imported(CalcImportProvenance::Biff)
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Region {
     source: CellCoordinate,
     rect: Rect,
     is_merged: bool,
     line_layout_policy: CellLineLayoutPolicy,
+    line_placement_policy: CalcLinePlacementPolicy,
     calc_wrap_space: Option<CalcWrapSpace>,
     style: Option<CellStyle>,
     conditional: ConditionalPaint,
@@ -1760,6 +1792,8 @@ fn build_sheet_scene_inner(
     let mut x = axis_slots_end(&col_slots)?;
     let mut drawing_row_slots = None;
     let mut drawing_col_slots = None;
+    let mut metafile_grid_row_slots = None;
+    let mut metafile_grid_col_slots = None;
     if let Some(source_native_twips) = source_native_twips.as_ref() {
         debug_assert_eq!(endpoint_policy, AxisEndpointPolicy::SourceNative);
         debug_assert!(geometry.is_none());
@@ -1767,9 +1801,29 @@ fn build_sheet_scene_inner(
         y = calc_inclusive_rectangle_extent(y).ok_or(RenderError::CoordinateOverflow)?;
         drawing_row_slots = Some(row_slots.clone());
         drawing_col_slots = Some(col_slots.clone());
+        if gridline_policy == GridlinePolicy::CalcSinglePagePrint {
+            let mut grid_rows = row_slots.clone();
+            let mut grid_columns = col_slots.clone();
+            apply_calc_single_page_metafile_grid_axis_fit(
+                &mut grid_rows,
+                &source_native_twips.rows,
+            )?;
+            apply_calc_single_page_metafile_grid_axis_fit(
+                &mut grid_columns,
+                &source_native_twips.columns,
+            )?;
+            metafile_grid_row_slots = Some(grid_rows);
+            metafile_grid_col_slots = Some(grid_columns);
+        }
         apply_calc_single_page_axis_fit(&mut row_slots, &source_native_twips.rows, y, options)?;
         apply_calc_single_page_axis_fit(&mut col_slots, &source_native_twips.columns, x, options)?;
     }
+    let rtl_fit_slack = if source_native_twips.is_some() {
+        x.checked_sub(axis_slots_end(&col_slots)?)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        Fixed::ZERO
+    };
     let viewport_rows = drawing_row_slots.as_deref().unwrap_or(&row_slots);
     let viewport = drawing_layout_viewport(
         sheet,
@@ -1792,13 +1846,35 @@ fn build_sheet_scene_inner(
     if let Some(slots) = drawing_row_slots.as_mut() {
         offset_axis_slots(slots, viewport.cell.y)?;
     }
+    if let Some(slots) = metafile_grid_col_slots.as_mut() {
+        offset_axis_slots(slots, viewport.cell.x)?;
+    }
+    if let Some(slots) = metafile_grid_row_slots.as_mut() {
+        offset_axis_slots(slots, viewport.cell.y)?;
+    }
     let canvas_width = viewport.sheet.width.max(Fixed::from_pixels(1));
     let canvas_height = viewport.sheet.height.max(Fixed::from_pixels(1));
     enforce_dimension(canvas_width, options)?;
     enforce_dimension(canvas_height, options)?;
     let sheet_right_to_left = sheet.sheet_view().right_to_left;
-    let reflected_col_slots = visual_column_slots(&col_slots, canvas_width, sheet_right_to_left)?;
+    let reflection_width = if sheet_right_to_left {
+        canvas_width
+            .checked_sub(rtl_fit_slack)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        canvas_width
+    };
+    let reflected_col_slots =
+        visual_column_slots(&col_slots, reflection_width, sheet_right_to_left)?;
     let visual_col_slots = reflected_col_slots.as_deref().unwrap_or(&col_slots);
+    let reflected_metafile_grid_col_slots = if let Some(slots) = &metafile_grid_col_slots {
+        visual_column_slots(slots, reflection_width, sheet_right_to_left)?
+    } else {
+        None
+    };
+    let visual_metafile_grid_col_slots = reflected_metafile_grid_col_slots
+        .as_deref()
+        .or(metafile_grid_col_slots.as_deref());
 
     let mut merge_cover = BTreeMap::<CellCoordinate, usize>::new();
     let mut merge_layouts = Vec::<MergeLayout>::new();
@@ -2017,17 +2093,26 @@ fn build_sheet_scene_inner(
                         None
                     }
                 });
+            let is_plain_text =
+                display_cell.is_some_and(|cell| matches!(cell.value, Cell::Text(_)));
             let line_layout_policy = cell_line_layout_policy(
                 sheet,
                 source,
                 style.as_ref(),
                 rich_text.as_deref(),
                 CalcLineLayoutEvidence {
-                    is_plain_text: display_cell
-                        .is_some_and(|cell| matches!(cell.value, Cell::Text(_))),
+                    is_plain_text,
                     has_adjustable_row,
                     wrap_space_available: calc_line_layout_available && calc_wrap_space.is_some(),
                 },
+                options,
+            );
+            let line_placement_policy = calc_line_placement_policy(
+                sheet,
+                source,
+                style.as_ref(),
+                rich_text.as_deref(),
+                is_plain_text,
                 options,
             );
             regions.push(Region {
@@ -2035,6 +2120,7 @@ fn build_sheet_scene_inner(
                 rect,
                 is_merged,
                 line_layout_policy,
+                line_placement_policy,
                 calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
                     .then_some(calc_wrap_space)
                     .flatten(),
@@ -2116,8 +2202,38 @@ fn build_sheet_scene_inner(
         &suppresses_gridlines,
         show_gridlines,
         gridline_policy,
+        EdgeCompositionMode::Combined,
         options,
     )?;
+    let calc_metafile_grid_composed_edges = (gridline_policy
+        == GridlinePolicy::CalcSinglePagePrint)
+        .then(|| {
+            compose_edges(
+                &regions,
+                &suppresses_gridlines,
+                show_gridlines,
+                gridline_policy,
+                EdgeCompositionMode::CalcMetafileGrid,
+                options,
+            )
+        })
+        .transpose()?;
+    let metafile_grid_edges = match (
+        metafile_grid_row_slots.as_deref(),
+        visual_metafile_grid_col_slots,
+    ) {
+        (Some(grid_rows), Some(grid_columns)) => Some(remap_calc_metafile_grid_edges(
+            calc_metafile_grid_composed_edges
+                .as_deref()
+                .unwrap_or(&composed_edges),
+            &row_slots,
+            visual_col_slots,
+            grid_rows,
+            grid_columns,
+        )?),
+        (None, None) => None,
+        _ => return Err(RenderError::CoordinateOverflow),
+    };
     let scene_bounds = Rect {
         x: Fixed::ZERO,
         y: Fixed::ZERO,
@@ -2172,6 +2288,7 @@ fn build_sheet_scene_inner(
                 &style,
                 sheet_right_to_left,
                 CALC_WORKSHEET_KERNING,
+                gridline_policy == GridlinePolicy::CalcSinglePagePrint,
                 options,
                 &mut typography_stats,
                 &mut warnings,
@@ -2200,16 +2317,18 @@ fn build_sheet_scene_inner(
     if show_gridlines && gridline_policy != GridlinePolicy::WorksheetView {
         // Calc paints print gridlines above cell content and borders but below
         // anchored drawing objects such as images and charts.
-        push_composed_edges(
-            &mut nodes,
-            &composed_edges,
-            EdgeClaimKind::Gridline,
-            gridline_policy,
-            viewport.cell,
-            scene_bounds,
-            sheet_right_to_left,
-            options,
-        )?;
+        if gridline_policy != GridlinePolicy::CalcSinglePagePrint || !sheet_right_to_left {
+            push_composed_edges(
+                &mut nodes,
+                metafile_grid_edges.as_deref().unwrap_or(&composed_edges),
+                EdgeClaimKind::Gridline,
+                gridline_policy,
+                viewport.cell,
+                scene_bounds,
+                sheet_right_to_left,
+                options,
+            )?;
+        }
         push_print_gridline_leading_frame(
             &mut nodes,
             viewport.cell,
@@ -2229,6 +2348,7 @@ fn build_sheet_scene_inner(
         canvas_width,
         canvas_height,
         sheet_right_to_left,
+        gridline_policy == GridlinePolicy::CalcSinglePagePrint,
         &mut text_bytes,
         &mut glyphs,
         &mut typography_stats,
@@ -3462,12 +3582,21 @@ fn round_positive_mul_div(value: i128, multiplier: i128, divisor: i128) -> Optio
         .checked_div(divisor)
 }
 
-/// Convert a cumulative Calc position from integer twips to 1/100 mm.
+/// Convert a Calc distance or cumulative position from integer twips to 1/100 mm.
 ///
 /// Calc's SinglePageSheets path sums raw track widths/heights before converting
 /// each rectangle endpoint with ordinary half-up `twip -> mm100` conversion.
 fn calc_twips_position_to_hmm(twips: i128) -> Option<i128> {
     round_positive_mul_div(twips, 127, 72)
+}
+
+/// Convert one positive Calc track to integer 1/100-mm units. DrawToDev
+/// truncates each track before adding it to the metafile device position.
+fn calc_twips_track_to_hmm(twips: i128) -> Option<i128> {
+    if twips <= 0 {
+        return None;
+    }
+    twips.checked_mul(127)?.checked_div(72)
 }
 
 fn calc_hmm_to_fixed_raw(hmm: i128) -> Option<i128> {
@@ -3480,6 +3609,18 @@ fn calc_hmm_to_fixed_raw(hmm: i128) -> Option<i128> {
 
 fn calc_hmm_to_fixed(hmm: i128) -> Option<Fixed> {
     let raw = calc_hmm_to_fixed_raw(hmm)?;
+    i64::try_from(raw).ok().map(Fixed::from_raw)
+}
+
+/// Convert Calc's integer 1/100-mm track coordinates as emitted by the
+/// `DrawToDev` metafile grid path. The metafile device applies 84/635 CSS
+/// pixels per mm100.
+fn calc_metafile_grid_hmm_to_fixed(hmm: i128) -> Option<Fixed> {
+    let raw = round_positive_mul_div(
+        hmm,
+        84_i128.checked_mul(i128::from(FIXED_UNITS_PER_PIXEL))?,
+        635,
+    )?;
     i64::try_from(raw).ok().map(Fixed::from_raw)
 }
 
@@ -3851,6 +3992,55 @@ fn apply_calc_single_page_axis_fit<I: Copy>(
     page_extent: Fixed,
     options: &RenderOptions,
 ) -> Result<(), RenderError> {
+    apply_calc_single_page_axis_projection(
+        slots,
+        source_twips,
+        page_extent,
+        calc_hmm_to_fixed,
+        Some(options),
+    )
+}
+
+/// Project source-native tracks through Calc's metafile grid scale. DrawToDev
+/// converts each track independently to integer 1/100-mm units before adding
+/// it to the device position; rounding a cumulative twip endpoint instead
+/// shifts later gridlines. Unlike the cell axis, these coordinates are not fit
+/// back into the page rectangle.
+fn apply_calc_single_page_metafile_grid_axis_fit<I: Copy>(
+    slots: &mut [MeasuredAxisSlot<I>],
+    source_twips: &[i128],
+) -> Result<(), RenderError> {
+    if slots.len() != source_twips.len() || source_twips.iter().any(|twips| *twips <= 0) {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    let mut cumulative_hmm = 0_i128;
+    let mut previous_boundary = Fixed::ZERO;
+    for (slot, twips) in slots.iter_mut().zip(source_twips) {
+        let track_hmm = calc_twips_track_to_hmm(*twips)
+            .filter(|hmm| *hmm > 0)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        cumulative_hmm = cumulative_hmm
+            .checked_add(track_hmm)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let boundary = calc_metafile_grid_hmm_to_fixed(cumulative_hmm)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        slot.offset = previous_boundary;
+        slot.size = boundary
+            .checked_sub(previous_boundary)
+            .filter(|size| *size > Fixed::ZERO)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        previous_boundary = boundary;
+    }
+    Ok(())
+}
+
+fn apply_calc_single_page_axis_projection<I: Copy>(
+    slots: &mut [MeasuredAxisSlot<I>],
+    source_twips: &[i128],
+    page_extent: Fixed,
+    project_hmm: fn(i128) -> Option<Fixed>,
+    output_options: Option<&RenderOptions>,
+) -> Result<(), RenderError> {
     if slots.len() != source_twips.len() || source_twips.iter().any(|twips| *twips <= 0) {
         return Err(RenderError::CoordinateOverflow);
     }
@@ -3880,13 +4070,15 @@ fn apply_calc_single_page_axis_fit<I: Copy>(
         cumulative_hmm = cumulative_hmm
             .checked_add(track_hmm)
             .ok_or(RenderError::CoordinateOverflow)?;
-        let boundary = calc_hmm_to_fixed(cumulative_hmm).ok_or(RenderError::CoordinateOverflow)?;
+        let boundary = project_hmm(cumulative_hmm).ok_or(RenderError::CoordinateOverflow)?;
         slot.offset = previous_boundary;
         slot.size = boundary
             .checked_sub(previous_boundary)
             .ok_or(RenderError::CoordinateOverflow)?;
         previous_boundary = boundary;
-        enforce_dimension(boundary, options)?;
+        if let Some(options) = output_options {
+            enforce_dimension(boundary, options)?;
+        }
     }
     Ok(())
 }
@@ -4560,6 +4752,7 @@ fn resolve_conditional_layout_cells(
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::Native,
+            line_placement_policy: CalcLinePlacementPolicy::Native,
             calc_wrap_space: None,
             style: style_snapshot
                 .owned_style(source)
@@ -4652,9 +4845,82 @@ fn cell_line_layout_policy(
     };
     if verified().is_some() {
         CellLineLayoutPolicy::CalcEditEngine
+    } else if matches!(
+        sheet.imported_default_row_axis_measure(),
+        Some(ImportedAxisMeasure::MillimeterHundredths(_))
+    ) {
+        CellLineLayoutPolicy::OdsNative
     } else {
         CellLineLayoutPolicy::Native
     }
+}
+
+fn calc_import_provenance(sheet: &Sheet) -> Option<CalcImportProvenance> {
+    match sheet.implicit_ooxml_row_height_source() {
+        Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+            return Some(CalcImportProvenance::Xlsx);
+        }
+        Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => {
+            return Some(CalcImportProvenance::Xlsb);
+        }
+        Some(OoxmlImplicitRowHeight::None) | None => {}
+    }
+    if sheet.biff_uses_application_default_row_height()
+        || matches!(
+            sheet.imported_default_row_axis_measure(),
+            Some(ImportedAxisMeasure::Twips(_))
+        )
+    {
+        return Some(CalcImportProvenance::Biff);
+    }
+    matches!(
+        sheet.imported_default_row_axis_measure(),
+        Some(ImportedAxisMeasure::MillimeterHundredths(_))
+    )
+    .then_some(CalcImportProvenance::Ods)
+}
+
+fn calc_line_placement_policy(
+    sheet: &Sheet,
+    source: CellCoordinate,
+    style: Option<&CellStyle>,
+    rich_text: Option<&[rxls::TextRun]>,
+    is_plain_text: bool,
+    options: &RenderOptions,
+) -> CalcLinePlacementPolicy {
+    let verified = || {
+        if !is_plain_text || rich_text.is_some() || has_conditional_text_layout_overlay(sheet) {
+            return None;
+        }
+        let provenance = calc_import_provenance(sheet)?;
+        let style = style?;
+        let font = style.font.as_ref()?;
+        if font.size_pt.is_none() || font.script != FormatScript::None {
+            return None;
+        }
+        if style.align.as_ref().is_some_and(|alignment| {
+            alignment.rotation != 0 || alignment.shrink_to_fit || alignment.indent != 0
+        }) {
+            return None;
+        }
+        let resolution = options.font_pack.as_ref()?.resolve(FontRequest {
+            family: font.name.as_deref()?,
+            weight: if font.bold { 700 } else { 400 },
+            italic: font.italic,
+        });
+        if !(resolution.exact_family || resolution.declared_alias) || !resolution.exact_style {
+            return None;
+        }
+        if matches!(
+            provenance,
+            CalcImportProvenance::Xlsx | CalcImportProvenance::Xlsb
+        ) && verified_calc_cell_font_size_pt(sheet, source, style, options).is_none()
+        {
+            return None;
+        }
+        Some(CalcLinePlacementPolicy::Imported(provenance))
+    };
+    verified().unwrap_or(CalcLinePlacementPolicy::Native)
 }
 
 fn calc_ooxml_implicit_row_height(sheet: &Sheet, options: &RenderOptions) -> Option<Fixed> {
@@ -4686,7 +4952,7 @@ fn calc_ooxml_row_height_from_points(points: u16) -> Option<Fixed> {
         .map(Fixed::from_raw)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum CalcScriptClass {
     Western,
     Asian,
@@ -4891,13 +5157,9 @@ fn calc_edit_engine_semantic_groups(
 
 /// Preserve Calc retention groups and append authoritative visual-line records.
 ///
-/// A fixed-height, non-rotated wrapped ODS cell is painted as a clipped
-/// EditEngine paragraph. Calc's PDF keeps the complete paragraph in its text
-/// semantics when any laid-out line remains visible, even when later lines
-/// fall below the row clip. Retention groups remain a complete source
-/// partition before a zero-length divider. The prepared visual lines follow
-/// that divider in reading order, so SVG and PDF never have to recover line
-/// boundaries from outline visibility or baseline heuristics.
+/// A fixed-height, non-rotated wrapped ODS cell retains the prepared source
+/// prefix as one semantic group. A trailing group completes the source
+/// partition without making text beyond Calc's printer cutoff visible.
 fn glyph_semantic_groups(
     region: &Region,
     lines: &[PreparedLine],
@@ -4905,7 +5167,7 @@ fn glyph_semantic_groups(
     sheet_right_to_left: bool,
 ) -> Result<Vec<GlyphSemanticGroup>, RenderError> {
     let alignment = region.style.as_ref().and_then(|style| style.align.as_ref());
-    let retains_complete_ods_paragraph = region.ods_fixed_height_row
+    let retains_clipped_ods_prefix = region.ods_fixed_height_row
         && lines.len() > 1
         && block_height > region.rect.height
         && alignment.is_some_and(|alignment| alignment.wrap && alignment.rotation == 0);
@@ -4934,7 +5196,22 @@ fn glyph_semantic_groups(
         && single_visual_line
         && non_rotated
         && ((!right_to_left && region.fixed_height_row) || (right_to_left && !sheet_right_to_left));
-    let mut records = if retains_complete_ods_paragraph || retains_complete_mixed_script_cell {
+    let mut records = if retains_clipped_ods_prefix {
+        let prefix_end = lines.last().map(|line| line.source.end).unwrap_or_default();
+        let text_len = region.text.len();
+        let mut groups = vec![GlyphSemanticGroup {
+            source_start: 0,
+            source_end: u64::try_from(prefix_end).map_err(|_| RenderError::CoordinateOverflow)?,
+        }];
+        if prefix_end < text_len {
+            groups.push(GlyphSemanticGroup {
+                source_start: u64::try_from(prefix_end)
+                    .map_err(|_| RenderError::CoordinateOverflow)?,
+                source_end: u64::try_from(text_len).map_err(|_| RenderError::CoordinateOverflow)?,
+            });
+        }
+        groups
+    } else if retains_complete_mixed_script_cell {
         vec![GlyphSemanticGroup {
             source_start: 0,
             source_end: u64::try_from(region.text.len())
@@ -5165,6 +5442,66 @@ fn expand_draw_strings_cutoff_to_cluster_boundary(
     }
 }
 
+fn expand_draw_strings_cutoff_to_visible_cluster(
+    record: &mut GlyphSemanticGroup,
+    clusters: &[GlyphCluster],
+    cluster_metrics: &[GlyphClusterMetrics],
+    clip_bounds: Rect,
+    base_margin: Fixed,
+    anchor: TextAnchor,
+    calc_single_page_layout: bool,
+) -> Result<(), RenderError> {
+    if calc_single_page_layout {
+        return Ok(());
+    }
+    let inset = base_margin
+        .max(Fixed::ZERO)
+        .checked_add(Fixed::from_pixels(1))
+        .ok_or(RenderError::CoordinateOverflow)?;
+    match anchor {
+        TextAnchor::Start => {
+            let visible_end = clip_bounds
+                .x
+                .checked_add(clip_bounds.width)
+                .and_then(|right| right.checked_sub(inset))
+                .ok_or(RenderError::CoordinateOverflow)?;
+            if let Some((cluster, _)) =
+                clusters
+                    .iter()
+                    .zip(cluster_metrics)
+                    .find(|(cluster, metrics)| {
+                        cluster.source_start == record.source_end && metrics.origin_x < visible_end
+                    })
+            {
+                record.source_end = cluster.source_end;
+            }
+        }
+        TextAnchor::End => {
+            let visible_start = clip_bounds
+                .x
+                .checked_add(inset)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            if let Some((cluster, _)) =
+                clusters
+                    .iter()
+                    .zip(cluster_metrics)
+                    .rev()
+                    .find(|(cluster, metrics)| {
+                        let trailing = metrics
+                            .origin_x
+                            .checked_add(metrics.advance_x)
+                            .unwrap_or(metrics.origin_x);
+                        cluster.source_end == record.source_start && trailing > visible_start
+                    })
+            {
+                record.source_start = cluster.source_start;
+            }
+        }
+        TextAnchor::Middle => {}
+    }
+    Ok(())
+}
+
 fn calc_draw_strings_edit_character(character: char) -> bool {
     matches!(
         character,
@@ -5198,12 +5535,14 @@ fn utf16_suffix_byte_len(text: &str, units: usize) -> usize {
 struct CalcScriptClassSummary {
     first: Option<CalcScriptClass>,
     mixed: bool,
+    has_western: bool,
     has_asian: bool,
     has_complex: bool,
 }
 
 impl CalcScriptClassSummary {
     fn record(&mut self, script: CalcScriptClass) {
+        self.has_western |= script == CalcScriptClass::Western;
         self.has_asian |= script == CalcScriptClass::Asian;
         self.has_complex |= script == CalcScriptClass::Complex;
         if self.first.is_some_and(|first| first != script) {
@@ -5214,6 +5553,7 @@ impl CalcScriptClassSummary {
     }
 
     fn merge(&mut self, other: Self) {
+        self.has_western |= other.has_western;
         self.has_asian |= other.has_asian;
         self.has_complex |= other.has_complex;
         self.mixed |= other.mixed;
@@ -5221,6 +5561,14 @@ impl CalcScriptClassSummary {
             self.record(script);
         }
     }
+}
+
+fn calc_script_class_summary(text: &str) -> CalcScriptClassSummary {
+    let mut summary = CalcScriptClassSummary::default();
+    for script in text.chars().filter_map(calc_script_class) {
+        summary.record(script);
+    }
+    summary
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5251,8 +5599,7 @@ fn calc_script_class_summary_bounded(
 ) -> Result<CalcScriptClassSummary, RenderError> {
     let base_work = stats.text_work;
     let mut scanned = 0_u64;
-    let mut summary = CalcScriptClassSummary::default();
-    for character in text.chars() {
+    for _ in text.chars() {
         scanned = scanned
             .checked_add(1)
             .ok_or(RenderError::CoordinateOverflow)?;
@@ -5260,14 +5607,11 @@ fn calc_script_class_summary_bounded(
             .checked_add(scanned)
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce(LimitKind::TextRuns, options.limits.max_text_runs, actual)?;
-        if let Some(script) = calc_script_class(character) {
-            summary.record(script);
-        }
     }
     stats.text_work = base_work
         .checked_add(scanned)
         .ok_or(RenderError::CoordinateOverflow)?;
-    Ok(summary)
+    Ok(calc_script_class_summary(text))
 }
 
 fn is_explicit_bidi_control(class: BidiClass) -> bool {
@@ -5828,6 +6172,14 @@ fn expand_automatic_row_heights(
                     options,
                 )
             };
+            let line_placement_policy = calc_line_placement_policy(
+                sheet,
+                source,
+                style.as_ref(),
+                rich_text.as_deref(),
+                matches!(cell.value, Cell::Text(_)),
+                options,
+            );
             let region = Region {
                 source,
                 rect: Rect {
@@ -5838,6 +6190,7 @@ fn expand_automatic_row_heights(
                 },
                 is_merged,
                 line_layout_policy,
+                line_placement_policy,
                 calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
                     .then_some(calc_wrap_space)
                     .flatten(),
@@ -7747,6 +8100,7 @@ fn push_drawing_placeholders(
     scene_width: Fixed,
     scene_height: Fixed,
     right_to_left: bool,
+    calc_single_page_layout: bool,
     text_bytes: &mut u64,
     glyphs: &mut u64,
     typography_stats: &mut TypographyStats,
@@ -7755,6 +8109,14 @@ fn push_drawing_placeholders(
 ) -> Result<(), RenderError> {
     let metadata_index = DrawingMetadataIndex::new(sheet);
     let drawing_row_slots = calc_drawing_row_slots(sheet, row_slots);
+    // Calc keeps imported OOXML images on its drawing-row axis during print
+    // replay. Charts and shapes continue to use the prepared cell-row axis.
+    let prepared_image_row_slots =
+        geometry.map(|geometry| calc_drawing_row_slots(sheet, geometry.rows));
+    let image_geometry = match (geometry, prepared_image_row_slots.as_deref()) {
+        (Some(geometry), Some(rows)) => Some(SheetGeometryOverride::new(rows, geometry.columns)),
+        _ => None,
+    };
     let mut placeholders = Vec::<DrawingPlaceholder>::new();
     let mut ordinal = 0_u64;
     for (index, image) in sheet.images().iter().enumerate() {
@@ -7774,7 +8136,7 @@ fn push_drawing_placeholders(
             to,
             metadata,
             right_to_left,
-            geometry,
+            image_geometry,
         )? {
             DrawingPlacement::Placed(rect) => placeholders.push(DrawingPlaceholder {
                 kind: DrawingPlaceholderKind::Image(index),
@@ -7971,11 +8333,12 @@ fn push_drawing_placeholders(
             }
             DrawingPlaceholderKind::Chart(index, kind) => {
                 let metadata = metadata_index.get(DrawingObjectKind::Chart, index);
-                if !try_push_chart(
+                if !try_push_chart_with_layout(
                     &mut object_nodes,
                     placeholder.rect,
                     &sheet.charts()[index],
                     metadata,
+                    calc_single_page_layout,
                     sheet,
                     &mut chart_points,
                     text_bytes,
@@ -8549,6 +8912,13 @@ pub(crate) fn cell_drawings_intersect_prepared_range(
         .copied()
         .filter(|slot| slot.index >= range.first_row && slot.index <= range.last_row)
         .collect::<Vec<_>>();
+    let image_geometry_rows = calc_drawing_row_slots(sheet, geometry.rows);
+    let image_row_slots = image_geometry_rows
+        .iter()
+        .copied()
+        .filter(|slot| slot.index >= range.first_row && slot.index <= range.last_row)
+        .collect::<Vec<_>>();
+    let image_geometry = SheetGeometryOverride::new(&image_geometry_rows, geometry.columns);
     let col_slots = geometry
         .columns
         .iter()
@@ -8578,7 +8948,7 @@ pub(crate) fn cell_drawings_intersect_prepared_range(
         ));
         if matches!(
             drawing_rect(
-                &row_slots,
+                &image_row_slots,
                 &col_slots,
                 viewport,
                 viewport,
@@ -8588,7 +8958,7 @@ pub(crate) fn cell_drawings_intersect_prepared_range(
                 to,
                 metadata,
                 right_to_left,
-                Some(geometry),
+                Some(image_geometry),
             )?,
             DrawingPlacement::Placed(_)
         ) {
@@ -8719,12 +9089,46 @@ fn rectangles_intersect(left: Rect, right: Rect) -> bool {
         && left_bottom > i128::from(right.y.raw())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn try_push_chart(
     nodes: &mut Vec<SceneNode>,
     rect: Rect,
     chart: &Chart,
     metadata: Option<&DrawingMetadata>,
+    sheet: &Sheet,
+    chart_points: &mut u64,
+    text_bytes: &mut u64,
+    glyphs: &mut u64,
+    typography_stats: &mut TypographyStats,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+    warning_cell: CellCoordinate,
+) -> Result<bool, RenderError> {
+    try_push_chart_with_layout(
+        nodes,
+        rect,
+        chart,
+        metadata,
+        false,
+        sheet,
+        chart_points,
+        text_bytes,
+        glyphs,
+        typography_stats,
+        options,
+        warnings,
+        warning_cell,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_push_chart_with_layout(
+    nodes: &mut Vec<SceneNode>,
+    rect: Rect,
+    chart: &Chart,
+    metadata: Option<&DrawingMetadata>,
+    calc_single_page_layout: bool,
     sheet: &Sheet,
     chart_points: &mut u64,
     text_bytes: &mut u64,
@@ -8970,11 +9374,15 @@ fn try_push_chart(
         )
     };
     let cartesian_axis = if cartesian {
-        let Some(axis) = chart_nice_value_axis(
-            &series,
-            matches!(chart.kind, ChartKind::Bar | ChartKind::Area)
-                || (metadata.is_some() && chart.kind == ChartKind::Line),
-        ) else {
+        let axis = if metadata.is_some() && chart.kind == ChartKind::Line {
+            chart_calc_imported_line_value_axis(&series)
+        } else {
+            chart_nice_value_axis(
+                &series,
+                matches!(chart.kind, ChartKind::Bar | ChartKind::Area),
+            )
+        };
+        let Some(axis) = axis else {
             *chart_points = initial_points;
             return Ok(false);
         };
@@ -9163,8 +9571,35 @@ fn try_push_chart(
         .transpose()?;
     let legend_extents = legend_metrics.rotated(text_styles.legend.rotation_degrees(0))?;
 
-    let frame_padding = Fixed::from_pixels(8);
     let text_gap = Fixed::from_pixels(4);
+    let imported_chart_frame =
+        metadata.is_some_and(|metadata| metadata.chart_default_latin_font_family.is_some());
+    let frame_padding =
+        chart_frame_padding(rect.width, imported_chart_frame && calc_single_page_layout)?;
+    let calc_default_line_plot = metadata.is_some_and(|metadata| {
+        metadata.chart_series_styles.len() == chart.series.len()
+            && metadata.chart_series_styles.iter().all(|style| {
+                style.marker == ChartMarkerSymbol::Circle && style.marker_size == Some(5)
+            })
+    }) && chart.kind == ChartKind::Line
+        && category_axis_shifted
+        && category_axis_visible
+        && value_axis_visible
+        && chart_title.is_none()
+        && x_axis_title.is_none()
+        && y_axis_title.is_none()
+        && legend_entries.is_empty()
+        && !chart.data_labels;
+    // Calc's imported circle-marker line profile leaves a small asymmetric
+    // vertical inset around the plot, independent of the axis-label bands.
+    // SinglePageSheets retains the authored inset for compact chart frames,
+    // but switches to its tighter replay profile once the frame exceeds five
+    // CSS inches. The distinction also keeps chart labels from being merged
+    // with worksheet text on adjacent baselines.
+    let compact_calc_single_page_line_plot =
+        calc_single_page_layout && rect.width <= Fixed::from_pixels(480);
+    let calc_authored_line_plot_spacing =
+        !calc_single_page_layout || compact_calc_single_page_line_plot;
     let horizontal_overhang = Fixed::from_raw(horizontal_axis_extents.width.raw() / 2);
     let vertical_axis_space = if vertical_axis_extents.width > Fixed::ZERO {
         vertical_axis_extents
@@ -9209,8 +9644,18 @@ fn try_push_chart(
     } else {
         vertical_axis_overhang
     };
+    let calc_top_plot_spacing = if calc_default_line_plot {
+        Fixed::from_pixels(if calc_authored_line_plot_spacing {
+            7
+        } else {
+            4
+        })
+    } else {
+        Fixed::ZERO
+    };
     let top_gutter = title_band
         .checked_add(top_axis_overhang)
+        .and_then(|value| value.checked_add(calc_top_plot_spacing))
         .ok_or(RenderError::CoordinateOverflow)?;
     let horizontal_axis_space = if horizontal_axis_extents.height > Fixed::ZERO {
         horizontal_axis_extents
@@ -9227,8 +9672,18 @@ fn try_push_chart(
             .ok_or(RenderError::CoordinateOverflow)
     })?;
     let bottom_text_space = sum_fixed([horizontal_axis_space, x_axis_title_space])?;
+    let calc_bottom_plot_spacing = if calc_default_line_plot {
+        Fixed::from_pixels(if calc_authored_line_plot_spacing {
+            4
+        } else {
+            1
+        })
+    } else {
+        Fixed::ZERO
+    };
     let bottom_gutter = frame_padding
         .checked_add(bottom_text_space.max(vertical_axis_overhang))
+        .and_then(|value| value.checked_add(calc_bottom_plot_spacing))
         .ok_or(RenderError::CoordinateOverflow)?;
 
     let legend_layout = if legend_entries.is_empty() {
@@ -9339,8 +9794,6 @@ fn try_push_chart(
             .checked_sub(top)
             .ok_or(RenderError::CoordinateOverflow)?,
     };
-    let imported_chart_frame =
-        metadata.is_some_and(|metadata| metadata.chart_default_latin_font_family.is_some());
     let frame_fill = match metadata.map_or(ChartFrameFill::Automatic, |metadata| {
         metadata.chart_frame_fill
     }) {
@@ -9804,6 +10257,23 @@ fn try_push_chart(
         )?;
     }
     Ok(true)
+}
+
+fn chart_frame_padding(
+    width: Fixed,
+    imported_calc_single_page_chart: bool,
+) -> Result<Fixed, RenderError> {
+    if !imported_calc_single_page_chart {
+        return Ok(Fixed::from_pixels(8));
+    }
+
+    // Calc's SinglePageSheets replay places imported axis-label ink at roughly
+    // two percent of the chart width. Our logical text bounds precede that ink
+    // by half of the standard four-pixel chart text gap.
+    Fixed::from_raw(width.raw() / 50)
+        .checked_sub(Fixed::from_pixels(2))
+        .map(|padding| padding.max(Fixed::ZERO))
+        .ok_or(RenderError::CoordinateOverflow)
 }
 
 struct ResolvedChartSeries {
@@ -10307,12 +10777,15 @@ fn measure_chart_text_with_style(
             &shaped,
             std::slice::from_ref(&style),
             CellLineLayoutPolicy::Native,
+            CalcLinePlacementPolicy::Native,
+            text,
             1,
             1,
+            options,
         )?;
         (
             width,
-            line_height_from_metrics(metrics, CellLineLayoutPolicy::Native)?,
+            line_height_from_metrics(metrics, CalcLinePlacementPolicy::Native)?,
         )
     } else {
         // Preserve deterministic, backend-neutral geometry for callers that
@@ -10406,7 +10879,14 @@ fn nice_chart_step(value: f64) -> Option<f64> {
     (step.is_finite() && step > 0.0).then_some(step)
 }
 
-fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> Option<NiceChartAxis> {
+fn chart_nice_axis_with_target(
+    values: impl Iterator<Item = f64>,
+    force_zero: bool,
+    target_intervals: f64,
+) -> Option<NiceChartAxis> {
+    if !target_intervals.is_finite() || target_intervals <= 0.0 {
+        return None;
+    }
     let mut raw_minimum = f64::INFINITY;
     let mut raw_maximum = f64::NEG_INFINITY;
     for value in values {
@@ -10447,7 +10927,7 @@ fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> Optio
     if !span.is_finite() || span <= 0.0 {
         return None;
     }
-    let step_input = span / CHART_AXIS_TARGET_INTERVALS;
+    let step_input = span / target_intervals;
     let major = nice_chart_step(if step_input > 0.0 { step_input } else { span })?;
     let padding = span * 0.05;
     if !padding.is_finite() {
@@ -10523,6 +11003,10 @@ fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> Optio
     })
 }
 
+fn chart_nice_axis(values: impl Iterator<Item = f64>, force_zero: bool) -> Option<NiceChartAxis> {
+    chart_nice_axis_with_target(values, force_zero, CHART_AXIS_TARGET_INTERVALS)
+}
+
 fn chart_nice_value_axis(
     series: &[ResolvedChartSeries],
     force_zero: bool,
@@ -10532,6 +11016,20 @@ fn chart_nice_value_axis(
             .iter()
             .flat_map(|series| series.values.iter().copied()),
         force_zero,
+    )
+}
+
+fn chart_calc_imported_line_value_axis(series: &[ResolvedChartSeries]) -> Option<NiceChartAxis> {
+    // Calc changes a positive imported line chart from ten-unit to
+    // twenty-unit ticks immediately above 85. Using 8.5 target intervals
+    // reproduces the verified 85/86 boundary without changing authored,
+    // bar, area, scatter, or bubble axes.
+    chart_nice_axis_with_target(
+        series
+            .iter()
+            .flat_map(|series| series.values.iter().copied()),
+        true,
+        8.5,
     )
 }
 
@@ -10684,9 +11182,7 @@ fn chart_category_data_plot(
         return Ok(plot);
     }
     // Calc keeps the category axis and value-axis bounds at the diagram edge,
-    // but places shifted category bands three pixels inside that rectangle.
-    // Keep that inset on labels and series while leaving value ticks and
-    // gridlines on the full plot rectangle.
+    // but places shifted series bands three pixels inside that rectangle.
     let inset = Fixed::from_pixels(3);
     let double_inset = Fixed::from_raw(
         inset
@@ -10739,6 +11235,11 @@ fn push_cartesian_chart_axes(
     warning_cell: CellCoordinate,
 ) -> Result<(), RenderError> {
     let category_plot = chart_category_data_plot(plot, category_axis_shifted, horizontal_bar)?;
+    let category_label_plot = if category_axis_shifted && !horizontal_bar {
+        plot
+    } else {
+        category_plot
+    };
     let plot_right = plot
         .x
         .checked_add(plot.width)
@@ -10749,6 +11250,11 @@ fn push_cartesian_chart_axes(
         .ok_or(RenderError::CoordinateOverflow)?;
     let grid = Rgb::new(217, 217, 217);
     let text_gap = Fixed::from_pixels(4);
+    let category_label_gap = if category_axis_shifted && !horizontal_bar {
+        Fixed::from_pixels(8)
+    } else {
+        text_gap
+    };
     if value_axis_visible {
         for value in &axis.ticks {
             let label = chart_axis_number(*value, axis.major);
@@ -10970,7 +11476,7 @@ fn push_cartesian_chart_axes(
                 categories.len(),
                 category_axis_shifted || chart_kind == ChartKind::Bar,
             );
-            let x = chart_x(category_plot, ratio)?;
+            let x = chart_x(category_label_plot, ratio)?;
             if category_major_gridlines {
                 push_placeholder_line(nodes, x, plot.y, x, plot_bottom, grid, options)?;
             }
@@ -10978,7 +11484,7 @@ fn push_cartesian_chart_axes(
                 x: x.checked_sub(Fixed::from_raw(extents.width.raw() / 2))
                     .ok_or(RenderError::CoordinateOverflow)?,
                 y: plot_bottom
-                    .checked_add(text_gap)
+                    .checked_add(category_label_gap)
                     .ok_or(RenderError::CoordinateOverflow)?,
                 width: extents.width,
                 height: extents.height,
@@ -13267,6 +13773,7 @@ struct PreparedText {
     styles: Vec<ResolvedRunStyle>,
     lines: Vec<PreparedLine>,
     line_layout_policy: CellLineLayoutPolicy,
+    line_placement_policy: CalcLinePlacementPolicy,
     horizontal_padding: Fixed,
     available_width: Fixed,
     max_width: Fixed,
@@ -13307,11 +13814,11 @@ fn measure_automatic_cell_height(
         }
     }
     match prepared.line_layout_policy {
-        CellLineLayoutPolicy::Native => sum_fixed(
+        CellLineLayoutPolicy::Native | CellLineLayoutPolicy::OdsNative => sum_fixed(
             prepared
                 .lines
                 .iter()
-                .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
+                .map(|line| line_height_from_metrics(line.metrics, prepared.line_placement_policy))
                 .collect::<Result<Vec<_>, _>>()?,
         )?
         .checked_add(Fixed::from_pixels(AUTO_ROW_VERTICAL_PADDING_PIXELS))
@@ -13422,6 +13929,48 @@ fn calc_verified_complex_role_face(
     Ok(Some(resolution.id))
 }
 
+fn apply_calc_complex_role_shaping_style(
+    pack: &FontPack,
+    region: &Region,
+    styles: &mut [ResolvedRunStyle],
+    options: &RenderOptions,
+) -> Result<(), RenderError> {
+    if region.rich_text.is_some()
+        || !matches!(
+            region.line_placement_policy,
+            CalcLinePlacementPolicy::Imported(
+                CalcImportProvenance::Biff
+                    | CalcImportProvenance::Xlsb
+                    | CalcImportProvenance::Xlsx
+            )
+        )
+    {
+        return Ok(());
+    }
+    let summary = calc_script_class_summary(&region.text);
+    if !calc_edit_engine_uses_only_complex_role(&region.text, summary, options)? {
+        return Ok(());
+    }
+    let style = styles.first_mut().ok_or(RenderError::Typography {
+        reason: "missing_text_style",
+    })?;
+    let requested = pack.resolve(style.request());
+    if !(requested.exact_family || requested.declared_alias) || !requested.exact_style {
+        return Ok(());
+    }
+    let Some(complex_role) = calc_verified_complex_role_face(pack, style, requested.id)? else {
+        return Ok(());
+    };
+    if complex_role != requested.id {
+        // Calc assigns the complete RTL embedding, including Western digits,
+        // to the COMPLEX font role. The verified pack owns the deterministic
+        // Tahoma alias; script fallback still selects an Arabic face for the
+        // Arabic glyphs while neutral digits remain on this role face.
+        style.family = CALC_CTL_LOGICAL_FAMILY.to_string();
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedAsianFace {
     None,
@@ -13497,17 +14046,20 @@ fn account_shaping(
 
 fn line_height_from_metrics(
     metrics: CombinedLineMetrics,
-    policy: CellLineLayoutPolicy,
+    policy: CalcLinePlacementPolicy,
 ) -> Result<Fixed, RenderError> {
-    let physical = metrics
-        .ascent
-        .checked_sub(metrics.descent)
-        .ok_or(RenderError::CoordinateOverflow)?;
-    let height = match policy {
-        CellLineLayoutPolicy::Native => physical
+    let height = if policy.uses_placement_line_height() {
+        metrics
+            .placement_ascent
+            .checked_sub(metrics.placement_descent)
+            .ok_or(RenderError::CoordinateOverflow)?
+    } else {
+        metrics
+            .ascent
+            .checked_sub(metrics.descent)
+            .ok_or(RenderError::CoordinateOverflow)?
             .checked_add(metrics.line_gap)
-            .ok_or(RenderError::CoordinateOverflow)?,
-        CellLineLayoutPolicy::CalcEditEngine => physical,
+            .ok_or(RenderError::CoordinateOverflow)?
     };
     Ok(height.max(Fixed::from_raw(1)))
 }
@@ -13567,6 +14119,7 @@ fn build_glyph_run(
     style: &TextStyle,
     sheet_right_to_left: bool,
     kerning: bool,
+    calc_single_page_layout: bool,
     options: &RenderOptions,
     stats: &mut TypographyStats,
     warnings: &mut Warnings,
@@ -13617,17 +14170,44 @@ fn build_glyph_run(
                 &line.shaped,
                 &prepared.styles,
                 prepared.line_layout_policy,
+                prepared.line_placement_policy,
+                region.text.get(line.source.start..line.advance_end).ok_or(
+                    RenderError::Typography {
+                        reason: "invalid_line_source_range",
+                    },
+                )?,
                 scale_numerator,
                 scale_denominator,
+                options,
             )?;
         }
     }
 
-    let line_heights = prepared
+    let mut line_heights = prepared
         .lines
         .iter()
-        .map(|line| line_height_from_metrics(line.metrics, prepared.line_layout_policy))
+        .map(|line| line_height_from_metrics(line.metrics, prepared.line_placement_policy))
         .collect::<Result<Vec<_>, _>>()?;
+    let full_block_height = sum_fixed(line_heights.iter().copied())?;
+    if region.ods_fixed_height_row
+        && full_block_height > region.rect.height
+        && alignment.is_some_and(|alignment| alignment.wrap && alignment.rotation == 0)
+    {
+        let mut covered_height = Fixed::ZERO;
+        let mut covered_lines = 0_usize;
+        while covered_lines < line_heights.len() && covered_height < region.rect.height {
+            covered_height = covered_height
+                .checked_add(line_heights[covered_lines])
+                .ok_or(RenderError::CoordinateOverflow)?;
+            covered_lines += 1;
+        }
+        // Calc's fixed-row printer keeps one leading line beyond the lines
+        // needed to cover the row. Bottom alignment can place that line above
+        // the clip while preserving the final visible line at the row edge.
+        let retained_lines = covered_lines.saturating_add(1).min(line_heights.len());
+        prepared.lines.truncate(retained_lines);
+        line_heights.truncate(retained_lines);
+    }
     let block_height = sum_fixed(line_heights.iter().copied())?;
     // An implicitly aligned wrapped ODS cell gets no special positioning: Calc
     // resolves the absent alignment to its ordinary bottom default and lets the
@@ -13647,8 +14227,13 @@ fn build_glyph_run(
     let mut font_faces = Vec::new();
     let mut line_top = top;
     for (line, line_height) in prepared.lines.iter().zip(line_heights) {
+        let placement_ascent = if prepared.line_placement_policy.uses_placement_ascent() {
+            line.metrics.placement_ascent
+        } else {
+            line.metrics.ascent
+        };
         let baseline = line_top
-            .checked_add(line.metrics.ascent)
+            .checked_add(placement_ascent)
             .ok_or(RenderError::CoordinateOverflow)?;
         let line_x = horizontal_line_start(
             layout_bounds,
@@ -13732,6 +14317,17 @@ fn build_glyph_run(
             &clusters,
             style.anchor,
         );
+        if style.bold {
+            expand_draw_strings_cutoff_to_visible_cluster(
+                &mut semantic_groups[1],
+                &clusters,
+                &cluster_metrics,
+                clip_bounds,
+                region.vertical_margin,
+                style.anchor,
+                calc_single_page_layout,
+            )?;
+        }
     }
     let node = GlyphRunNode {
         glyphs,
@@ -13767,14 +14363,15 @@ fn prepare_styled_text(
     options: &RenderOptions,
     stats: &mut TypographyStats,
 ) -> Result<PreparedText, RenderError> {
-    let (styles, spans) = resolve_rich_styles(region, base)?;
+    let (mut styles, spans) = resolve_rich_styles(region, base)?;
+    apply_calc_complex_role_shaping_style(pack, region, &mut styles, options)?;
     let direction = text_base_direction(&region.text, sheet_right_to_left);
     let primary_size = styled_font_size(&styles[0], 1, 1)?;
     let horizontal_padding =
         outlined_horizontal_padding(pack, styles[0].request(), primary_size, region)?;
     let available_width = inner_width(region.rect.width, horizontal_padding)?;
     let calc_wrap_space = match region.line_layout_policy {
-        CellLineLayoutPolicy::Native => None,
+        CellLineLayoutPolicy::Native | CellLineLayoutPolicy::OdsNative => None,
         CellLineLayoutPolicy::CalcEditEngine => {
             Some(region.calc_wrap_space.ok_or(RenderError::Typography {
                 reason: "missing_calc_wrap_space",
@@ -13840,6 +14437,13 @@ fn prepare_styled_text(
     let mut family_substituted = false;
     for line in wrapped_lines {
         let source = line.source;
+        let line_text =
+            region
+                .text
+                .get(source.start..line.advance_end)
+                .ok_or(RenderError::Typography {
+                    reason: "invalid_line_source_range",
+                })?;
         let shaped = shape_styled_range(
             pack,
             &region.text,
@@ -13852,7 +14456,17 @@ fn prepare_styled_text(
         )?;
         account_shaping(pack, &shaped, options, stats)?;
         let width = styled_shaped_width(pack, &shaped, &styles, 1, 1)?;
-        let metrics = styled_line_metrics(pack, &shaped, &styles, region.line_layout_policy, 1, 1)?;
+        let metrics = styled_line_metrics(
+            pack,
+            &shaped,
+            &styles,
+            region.line_layout_policy,
+            region.line_placement_policy,
+            line_text,
+            1,
+            1,
+            options,
+        )?;
         max_width = max_width.max(width);
         missing_glyphs = missing_glyphs.saturating_add(shaped.missing_glyphs as u64);
         family_substituted |= !shaped.requested_family_matched;
@@ -13877,6 +14491,7 @@ fn prepare_styled_text(
         styles,
         lines,
         line_layout_policy: region.line_layout_policy,
+        line_placement_policy: region.line_placement_policy,
         horizontal_padding,
         available_width,
         max_width,
@@ -14181,6 +14796,8 @@ struct CombinedLineMetrics {
     ascent: Fixed,
     descent: Fixed,
     line_gap: Fixed,
+    placement_ascent: Fixed,
+    placement_descent: Fixed,
     calc_ascent_pixels: i64,
     calc_descent_pixels: i64,
     calc_portion_height_mm100: u64,
@@ -14256,70 +14873,245 @@ fn single_face_line_metrics(
         ascent,
         descent,
         line_gap,
+        placement_ascent: ascent,
+        placement_descent: descent,
         calc_ascent_pixels,
         calc_descent_pixels,
         calc_portion_height_mm100,
     })
 }
 
-fn styled_line_metrics(
+fn combine_styled_line_metrics(
+    combined: &mut Option<CombinedLineMetrics>,
+    ink: CombinedLineMetrics,
+    placement: CombinedLineMetrics,
+) {
+    let candidate = CombinedLineMetrics {
+        ascent: ink.ascent,
+        descent: ink.descent,
+        line_gap: ink.line_gap,
+        placement_ascent: placement.ascent,
+        placement_descent: placement.descent,
+        calc_ascent_pixels: placement.calc_ascent_pixels,
+        calc_descent_pixels: placement.calc_descent_pixels,
+        calc_portion_height_mm100: placement.calc_portion_height_mm100,
+    };
+    match combined {
+        Some(combined) => {
+            combined.ascent = combined.ascent.max(candidate.ascent);
+            combined.descent = combined.descent.min(candidate.descent);
+            combined.line_gap = combined.line_gap.max(candidate.line_gap);
+            combined.placement_ascent = combined.placement_ascent.max(candidate.placement_ascent);
+            combined.placement_descent =
+                combined.placement_descent.min(candidate.placement_descent);
+            combined.calc_ascent_pixels = combined
+                .calc_ascent_pixels
+                .max(candidate.calc_ascent_pixels);
+            combined.calc_descent_pixels = combined
+                .calc_descent_pixels
+                .min(candidate.calc_descent_pixels);
+            combined.calc_portion_height_mm100 = combined
+                .calc_portion_height_mm100
+                .max(candidate.calc_portion_height_mm100);
+        }
+        None => *combined = Some(candidate),
+    }
+}
+
+fn replace_line_placement_metrics(
+    mut ink: CombinedLineMetrics,
+    placement: CombinedLineMetrics,
+) -> CombinedLineMetrics {
+    ink.placement_ascent = placement.ascent;
+    ink.placement_descent = placement.descent;
+    ink.calc_ascent_pixels = placement.calc_ascent_pixels;
+    ink.calc_descent_pixels = placement.calc_descent_pixels;
+    ink.calc_portion_height_mm100 = placement.calc_portion_height_mm100;
+    ink
+}
+
+fn calc_selected_asian_role_face(shaped: &ShapedText, line_text: &str) -> Option<FontId> {
+    let mut selected = None;
+    for run in &shaped.runs {
+        let source = line_text.get(run.source.clone())?;
+        if !calc_script_class_summary(source).has_asian {
+            continue;
+        }
+        if run.style_index != 0 || run.glyphs.iter().any(|glyph| glyph.glyph_id == 0) {
+            return None;
+        }
+        if selected.is_some_and(|font_id| font_id != run.font_id) {
+            return None;
+        }
+        selected = Some(run.font_id);
+    }
+    selected
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calc_imported_line_placement_metrics(
     pack: &FontPack,
     shaped: &ShapedText,
-    styles: &[ResolvedRunStyle],
-    policy: CellLineLayoutPolicy,
+    line_text: &str,
+    style: &ResolvedRunStyle,
+    provenance: CalcImportProvenance,
+    layout_policy: CellLineLayoutPolicy,
     scale_numerator: i64,
     scale_denominator: i64,
-) -> Result<CombinedLineMetrics, RenderError> {
-    let mut combined = CombinedLineMetrics {
-        ascent: Fixed::ZERO,
-        descent: Fixed::ZERO,
-        line_gap: Fixed::ZERO,
-        calc_ascent_pixels: 0,
-        calc_descent_pixels: 0,
-        calc_portion_height_mm100: 0,
-    };
-    let mut initialized = false;
-    let mut include = |font_id: FontId, style: &ResolvedRunStyle| -> Result<(), RenderError> {
+    options: &RenderOptions,
+) -> Result<Option<CombinedLineMetrics>, RenderError> {
+    let summary = calc_script_class_summary(line_text);
+    let only_complex = calc_edit_engine_uses_only_complex_role(line_text, summary, options)?;
+    let requested_font_id = pack.resolve(style.request()).id;
+    let mut roles = BTreeSet::new();
+    if only_complex {
+        roles.insert(CalcScriptClass::Complex);
+    } else {
+        if summary.has_western {
+            roles.insert(CalcScriptClass::Western);
+        }
+        if summary.has_asian {
+            roles.insert(CalcScriptClass::Asian);
+        }
+        if summary.has_complex {
+            roles.insert(CalcScriptClass::Complex);
+        }
+    }
+    if roles.is_empty() {
+        roles.insert(CalcScriptClass::Western);
+    }
+
+    let mut combined = None;
+    for role in roles {
+        let font_id = match role {
+            CalcScriptClass::Western => requested_font_id,
+            CalcScriptClass::Asian => {
+                calc_selected_asian_role_face(shaped, line_text).unwrap_or(requested_font_id)
+            }
+            CalcScriptClass::Complex => match provenance {
+                CalcImportProvenance::Ods => requested_font_id,
+                CalcImportProvenance::Biff
+                | CalcImportProvenance::Xlsb
+                | CalcImportProvenance::Xlsx => {
+                    let Some(font_id) =
+                        calc_verified_complex_role_face(pack, style, requested_font_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    font_id
+                }
+            },
+        };
         let metrics = single_face_line_metrics(
             pack,
             font_id,
             style,
-            policy,
+            layout_policy,
             scale_numerator,
             scale_denominator,
         )?;
-        if !initialized {
-            combined = metrics;
-            initialized = true;
-        } else {
-            combined.ascent = combined.ascent.max(metrics.ascent);
-            combined.descent = combined.descent.min(metrics.descent);
-            combined.line_gap = combined.line_gap.max(metrics.line_gap);
-            combined.calc_ascent_pixels =
-                combined.calc_ascent_pixels.max(metrics.calc_ascent_pixels);
-            combined.calc_descent_pixels = combined
-                .calc_descent_pixels
-                .min(metrics.calc_descent_pixels);
-            combined.calc_portion_height_mm100 = combined
-                .calc_portion_height_mm100
-                .max(metrics.calc_portion_height_mm100);
-        }
+        combine_styled_line_metrics(&mut combined, metrics, metrics);
+    }
+    Ok(combined)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn styled_line_metrics(
+    pack: &FontPack,
+    shaped: &ShapedText,
+    styles: &[ResolvedRunStyle],
+    layout_policy: CellLineLayoutPolicy,
+    placement_policy: CalcLinePlacementPolicy,
+    line_text: &str,
+    scale_numerator: i64,
+    scale_denominator: i64,
+    options: &RenderOptions,
+) -> Result<CombinedLineMetrics, RenderError> {
+    let mut ink = None;
+    let mut include_ink = |font_id: FontId, style: &ResolvedRunStyle| -> Result<(), RenderError> {
+        let metrics = single_face_line_metrics(
+            pack,
+            font_id,
+            style,
+            layout_policy,
+            scale_numerator,
+            scale_denominator,
+        )?;
+        combine_styled_line_metrics(&mut ink, metrics, metrics);
         Ok(())
     };
     if shaped.runs.is_empty() {
         let primary = styles.first().ok_or(RenderError::Typography {
             reason: "missing_text_style",
         })?;
-        include(pack.resolve(primary.request()).id, primary)?;
+        include_ink(pack.resolve(primary.request()).id, primary)?;
     } else {
         for run in &shaped.runs {
             let style = styles.get(run.style_index).ok_or(RenderError::Typography {
                 reason: "invalid_rich_style_index",
             })?;
-            include(run.font_id, style)?;
+            include_ink(run.font_id, style)?;
         }
     }
-    Ok(combined)
+    let ink = ink.ok_or(RenderError::Typography {
+        reason: "missing_line_metrics",
+    })?;
+    let placement = match placement_policy {
+        CalcLinePlacementPolicy::Native => return Ok(ink),
+        #[cfg(test)]
+        CalcLinePlacementPolicy::RequestedFace => {
+            let mut requested = None;
+            if shaped.runs.is_empty() {
+                let primary = styles.first().ok_or(RenderError::Typography {
+                    reason: "missing_text_style",
+                })?;
+                let metrics = single_face_line_metrics(
+                    pack,
+                    pack.resolve(primary.request()).id,
+                    primary,
+                    layout_policy,
+                    scale_numerator,
+                    scale_denominator,
+                )?;
+                combine_styled_line_metrics(&mut requested, metrics, metrics);
+            } else {
+                for run in &shaped.runs {
+                    let style = styles.get(run.style_index).ok_or(RenderError::Typography {
+                        reason: "invalid_rich_style_index",
+                    })?;
+                    let metrics = single_face_line_metrics(
+                        pack,
+                        pack.resolve(style.request()).id,
+                        style,
+                        layout_policy,
+                        scale_numerator,
+                        scale_denominator,
+                    )?;
+                    combine_styled_line_metrics(&mut requested, metrics, metrics);
+                }
+            }
+            requested
+        }
+        CalcLinePlacementPolicy::Imported(provenance) => {
+            let Some(style) = (styles.len() == 1).then(|| &styles[0]) else {
+                return Ok(ink);
+            };
+            calc_imported_line_placement_metrics(
+                pack,
+                shaped,
+                line_text,
+                style,
+                provenance,
+                layout_policy,
+                scale_numerator,
+                scale_denominator,
+                options,
+            )?
+        }
+    };
+    Ok(placement.map_or(ink, |placement| {
+        replace_line_placement_metrics(ink, placement)
+    }))
 }
 
 fn vertical_block_top(
@@ -15257,11 +16049,18 @@ enum EdgeClaimKind {
     Explicit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeCompositionMode {
+    Combined,
+    CalcMetafileGrid,
+}
+
 fn compose_edges(
     regions: &[Region],
     suppresses_gridlines: &[bool],
     show_gridlines: bool,
     gridline_policy: GridlinePolicy,
+    mode: EdgeCompositionMode,
     options: &RenderOptions,
 ) -> Result<Vec<(ComposedEdgeKey, EdgeClaim)>, RenderError> {
     #[derive(Debug, Clone, Copy)]
@@ -15333,6 +16132,7 @@ fn compose_edges(
                     .copied()
                     .unwrap_or(false),
                 show_gridlines,
+                mode,
             ) else {
                 continue;
             };
@@ -15410,6 +16210,81 @@ fn compose_edges(
     Ok(coalesce_composed_edges(composed))
 }
 
+fn calc_axis_boundary_remap<I: Copy + PartialEq>(
+    cell_slots: &[AxisSlot<I>],
+    grid_slots: &[AxisSlot<I>],
+) -> Result<BTreeMap<Fixed, Fixed>, RenderError> {
+    if cell_slots.len() != grid_slots.len() {
+        return Err(RenderError::CoordinateOverflow);
+    }
+    let mut boundaries = BTreeMap::new();
+    for (cell, grid) in cell_slots.iter().zip(grid_slots) {
+        if cell.index != grid.index {
+            return Err(RenderError::CoordinateOverflow);
+        }
+        let cell_end = cell
+            .offset
+            .checked_add(cell.size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        let grid_end = grid
+            .offset
+            .checked_add(grid.size)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        for (source, target) in [(cell.offset, grid.offset), (cell_end, grid_end)] {
+            if boundaries
+                .get(&source)
+                .is_some_and(|existing| *existing != target)
+            {
+                return Err(RenderError::CoordinateOverflow);
+            }
+            boundaries.insert(source, target);
+        }
+    }
+    Ok(boundaries)
+}
+
+/// Keep the compositor's logical edge decisions, but move Calc
+/// SinglePageSheets grid claims onto the separate `DrawToDev` metafile axis.
+/// Every endpoint remains a cell-track boundary, so merge, fill, overflow, and
+/// hidden-track suppression survive unchanged.
+fn remap_calc_metafile_grid_edges(
+    composed: &[(ComposedEdgeKey, EdgeClaim)],
+    cell_rows: &[AxisSlot<u32>],
+    cell_columns: &[AxisSlot<u16>],
+    grid_rows: &[AxisSlot<u32>],
+    grid_columns: &[AxisSlot<u16>],
+) -> Result<Vec<(ComposedEdgeKey, EdgeClaim)>, RenderError> {
+    let rows = calc_axis_boundary_remap(cell_rows, grid_rows)?;
+    let columns = calc_axis_boundary_remap(cell_columns, grid_columns)?;
+    composed
+        .iter()
+        .map(|&(mut key, claim)| {
+            if claim.kind == EdgeClaimKind::Gridline {
+                let (axis, spans) = match key.orientation {
+                    ComposedEdgeOrientation::Vertical => (&columns, &rows),
+                    ComposedEdgeOrientation::Horizontal => (&rows, &columns),
+                };
+                key.axis = axis
+                    .get(&key.axis)
+                    .copied()
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                key.start = spans
+                    .get(&key.start)
+                    .copied()
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                key.end = spans
+                    .get(&key.end)
+                    .copied()
+                    .ok_or(RenderError::CoordinateOverflow)?;
+                if key.start > key.end {
+                    std::mem::swap(&mut key.start, &mut key.end);
+                }
+            }
+            Ok((key, claim))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_composed_edges(
     nodes: &mut Vec<SceneNode>,
@@ -15437,28 +16312,36 @@ fn push_composed_edges(
         let key = if layer == EdgeClaimKind::Gridline
             && gridline_policy == GridlinePolicy::CalcSinglePagePrint
         {
-            let Some(clipped) = clip_composed_edge(key, scene_bounds)? else {
+            let Some(clipped) = clip_composed_edge(key, scene_bounds, PRINT_GRIDLINE_WIDTH)? else {
                 continue;
             };
             clipped
         } else {
             key
         };
+        if print_gridline {
+            push_node(
+                nodes,
+                SceneNode::Line(edge_line(
+                    key,
+                    Fixed::ZERO,
+                    Rgb::BLACK,
+                    PRINT_GRIDLINE_WIDTH,
+                )?),
+                options,
+            )?;
+            continue;
+        }
         if claim.style == BorderStyle::Double {
             push_double_edge(nodes, key, claim, options)?;
             continue;
         }
-        let (color, width) = if print_gridline {
-            (Rgb::BLACK, PRINT_GRIDLINE_WIDTH)
-        } else {
-            let Some(width) = border_width(claim.style) else {
-                continue;
-            };
-            (claim.color, width)
+        let Some(width) = border_width(claim.style) else {
+            continue;
         };
         push_node(
             nodes,
-            SceneNode::Line(edge_line(key, Fixed::ZERO, color, width)?),
+            SceneNode::Line(edge_line(key, Fixed::ZERO, claim.color, width)?),
             options,
         )?;
     }
@@ -15485,6 +16368,7 @@ fn is_print_gridline_leading_edge(
 fn clip_composed_edge(
     mut key: ComposedEdgeKey,
     clip: Rect,
+    stroke_width: Fixed,
 ) -> Result<Option<ComposedEdgeKey>, RenderError> {
     let right = clip
         .x
@@ -15494,16 +16378,37 @@ fn clip_composed_edge(
         .y
         .checked_add(clip.height)
         .ok_or(RenderError::CoordinateOverflow)?;
+    let axis_slop = Fixed::from_raw(
+        stroke_width
+            .raw()
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)?
+            / 2,
+    );
+    let left_axis_limit = clip
+        .x
+        .checked_sub(axis_slop)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let right_axis_limit = right
+        .checked_add(axis_slop)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let top_axis_limit = clip
+        .y
+        .checked_sub(axis_slop)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let bottom_axis_limit = bottom
+        .checked_add(axis_slop)
+        .ok_or(RenderError::CoordinateOverflow)?;
     match key.orientation {
         ComposedEdgeOrientation::Vertical => {
-            if key.axis < clip.x || key.axis > right {
+            if key.axis < left_axis_limit || key.axis > right_axis_limit {
                 return Ok(None);
             }
             key.start = std::cmp::max(key.start, clip.y);
             key.end = std::cmp::min(key.end, bottom);
         }
         ComposedEdgeOrientation::Horizontal => {
-            if key.axis < clip.y || key.axis > bottom {
+            if key.axis < top_axis_limit || key.axis > bottom_axis_limit {
                 return Ok(None);
             }
             key.start = std::cmp::max(key.start, clip.x);
@@ -15563,7 +16468,7 @@ fn push_print_gridline_leading_frame(
             end: right,
         },
     ] {
-        let Some(key) = clip_composed_edge(key, scene_bounds)? else {
+        let Some(key) = clip_composed_edge(key, scene_bounds, PRINT_GRIDLINE_WIDTH)? else {
             continue;
         };
         push_node(
@@ -15585,7 +16490,21 @@ fn region_edge_claim(
     side: CellEdge,
     suppresses_gridlines: bool,
     show_gridlines: bool,
+    mode: EdgeCompositionMode,
 ) -> Option<EdgeClaim> {
+    if mode == EdgeCompositionMode::CalcMetafileGrid {
+        return show_gridlines.then_some(EdgeClaim {
+            kind: if suppresses_gridlines {
+                EdgeClaimKind::GridlineSuppression
+            } else {
+                EdgeClaimKind::Gridline
+            },
+            style: BorderStyle::Thin,
+            color: Rgb::GRIDLINE,
+            owner: region.source,
+            side,
+        });
+    }
     let (style, color) = region
         .style
         .as_ref()
@@ -16229,6 +17148,33 @@ mod tests {
         panic!("fixed drawing outer frame")
     }
 
+    fn image_placeholder_rect(nodes: &[SceneNode]) -> Option<Rect> {
+        nodes.iter().find_map(|node| match node {
+            SceneNode::Rect(RectNode {
+                rect,
+                fill: Some(color),
+                ..
+            }) if *color == Rgb::new(242, 242, 242) => Some(*rect),
+            SceneNode::ClipGroup(group) => image_placeholder_rect(&group.nodes),
+            _ => None,
+        })
+    }
+
+    fn chart_outer_rect(nodes: &[SceneNode]) -> Option<Rect> {
+        nodes
+            .iter()
+            .filter_map(|node| match node {
+                SceneNode::Rect(RectNode {
+                    rect,
+                    stroke: Some(_),
+                    ..
+                }) => Some(*rect),
+                SceneNode::ClipGroup(group) => chart_outer_rect(&group.nodes),
+                _ => None,
+            })
+            .max_by_key(|rect| i128::from(rect.width.raw()) * i128::from(rect.height.raw()))
+    }
+
     fn shape_placeholder_rect(nodes: &[SceneNode]) -> Option<Rect> {
         nodes.iter().find_map(|node| match node {
             SceneNode::Rect(RectNode {
@@ -16651,18 +17597,352 @@ mod tests {
             ascent: Fixed::from_pixels(8),
             descent: Fixed::from_pixels(-2),
             line_gap: Fixed::from_pixels(3),
+            placement_ascent: Fixed::from_pixels(8),
+            placement_descent: Fixed::from_pixels(-2),
             calc_ascent_pixels: 8,
             calc_descent_pixels: -2,
             calc_portion_height_mm100: 265,
         };
         assert_eq!(
-            line_height_from_metrics(metrics, CellLineLayoutPolicy::Native).unwrap(),
+            line_height_from_metrics(metrics, CalcLinePlacementPolicy::Native).unwrap(),
             Fixed::from_pixels(13)
         );
         assert_eq!(
-            line_height_from_metrics(metrics, CellLineLayoutPolicy::CalcEditEngine).unwrap(),
+            line_height_from_metrics(metrics, CalcLinePlacementPolicy::RequestedFace).unwrap(),
             Fixed::from_pixels(10)
         );
+        assert_eq!(
+            line_height_from_metrics(
+                metrics,
+                CalcLinePlacementPolicy::Imported(CalcImportProvenance::Biff),
+            )
+            .unwrap(),
+            Fixed::from_pixels(13),
+            "BIFF keeps the selected fallback face's ink block height"
+        );
+        for provenance in [
+            CalcImportProvenance::Ods,
+            CalcImportProvenance::Xlsb,
+            CalcImportProvenance::Xlsx,
+        ] {
+            assert_eq!(
+                line_height_from_metrics(metrics, CalcLinePlacementPolicy::Imported(provenance),)
+                    .unwrap(),
+                Fixed::from_pixels(10),
+                "Calc package imports use the role face's block height"
+            );
+        }
+    }
+
+    #[test]
+    fn calc_placement_metrics_do_not_replace_fallback_ink_metrics() {
+        let fallback_ink = CombinedLineMetrics {
+            ascent: Fixed::from_pixels(14),
+            descent: Fixed::from_pixels(-8),
+            line_gap: Fixed::from_pixels(2),
+            placement_ascent: Fixed::from_pixels(14),
+            placement_descent: Fixed::from_pixels(-8),
+            calc_ascent_pixels: 14,
+            calc_descent_pixels: -8,
+            calc_portion_height_mm100: 582,
+        };
+        let requested_face = CombinedLineMetrics {
+            ascent: Fixed::from_pixels(10),
+            descent: Fixed::from_pixels(-3),
+            line_gap: Fixed::from_pixels(1),
+            placement_ascent: Fixed::from_pixels(10),
+            placement_descent: Fixed::from_pixels(-3),
+            calc_ascent_pixels: 10,
+            calc_descent_pixels: -3,
+            calc_portion_height_mm100: 344,
+        };
+        let mut combined = None;
+        combine_styled_line_metrics(&mut combined, fallback_ink, requested_face);
+        let combined = combined.unwrap();
+
+        assert_eq!(combined.ascent, fallback_ink.ascent);
+        assert_eq!(combined.descent, fallback_ink.descent);
+        assert_eq!(combined.line_gap, fallback_ink.line_gap);
+        assert_eq!(combined.placement_ascent, requested_face.ascent);
+        assert_eq!(combined.placement_descent, requested_face.descent);
+        assert_eq!(
+            line_height_from_metrics(combined, CalcLinePlacementPolicy::Native).unwrap(),
+            Fixed::from_pixels(24),
+            "Native layout must continue to use the selected fallback face"
+        );
+        assert_eq!(
+            line_height_from_metrics(combined, CalcLinePlacementPolicy::RequestedFace).unwrap(),
+            Fixed::from_pixels(13),
+            "Calc placement must use the requested face without rewriting ink metrics"
+        );
+        assert_eq!(combined.calc_ascent_pixels, 10);
+        assert_eq!(combined.calc_descent_pixels, -3);
+        assert_eq!(combined.calc_portion_height_mm100, 344);
+    }
+
+    #[test]
+    fn calc_mixed_arabic_cjk_uses_requested_face_for_line_placement() {
+        let pack = synthetic_test_pack();
+        let text = "한국어 العربية";
+        let style = ResolvedRunStyle {
+            family: "Wide Sans".to_string(),
+            size: points_to_fixed(11.0).unwrap(),
+            color: Rgb::BLACK,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            script: FormatScript::None,
+        };
+        let styles = vec![style.clone()];
+        let spans = vec![StyledSourceSpan {
+            source: 0..text.len(),
+            style_index: 0,
+        }];
+        let options = RenderOptions::default();
+        let shaped = shape_styled_range(
+            &pack,
+            text,
+            0..text.len(),
+            &spans,
+            &styles,
+            BaseDirection::Auto,
+            true,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            shaped
+                .runs
+                .iter()
+                .map(|run| run.font_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([FontId(0), FontId(1)]),
+            "the fixture must select the CJK face and an Arabic fallback face"
+        );
+
+        let requested = single_face_line_metrics(
+            &pack,
+            pack.resolve(style.request()).id,
+            &style,
+            CellLineLayoutPolicy::CalcEditEngine,
+            1,
+            1,
+        )
+        .unwrap();
+        let calc = styled_line_metrics(
+            &pack,
+            &shaped,
+            &styles,
+            CellLineLayoutPolicy::CalcEditEngine,
+            CalcLinePlacementPolicy::RequestedFace,
+            text,
+            1,
+            1,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(calc.placement_ascent, requested.ascent);
+        assert_eq!(calc.placement_descent, requested.descent);
+        assert_eq!(calc.calc_ascent_pixels, requested.calc_ascent_pixels);
+        assert_eq!(calc.calc_descent_pixels, requested.calc_descent_pixels);
+
+        let native = styled_line_metrics(
+            &pack,
+            &shaped,
+            &styles,
+            CellLineLayoutPolicy::Native,
+            CalcLinePlacementPolicy::Native,
+            text,
+            1,
+            1,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(native.placement_ascent, native.ascent);
+        assert_eq!(native.placement_descent, native.descent);
+    }
+
+    #[test]
+    fn calc_rich_superscript_keeps_its_explicit_requested_face_metrics() {
+        let pack = synthetic_test_pack();
+        let text = "한국어 العربية";
+        let arabic_start = "한국어 ".len();
+        let base = ResolvedRunStyle {
+            family: "Wide Sans".to_string(),
+            size: points_to_fixed(11.0).unwrap(),
+            color: Rgb::BLACK,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            script: FormatScript::None,
+        };
+        let superscript = ResolvedRunStyle {
+            family: "RTL Sans".to_string(),
+            size: points_to_fixed(18.0).unwrap(),
+            script: FormatScript::Superscript,
+            ..base.clone()
+        };
+        let styles = vec![base.clone(), superscript.clone()];
+        let spans = vec![
+            StyledSourceSpan {
+                source: 0..arabic_start,
+                style_index: 0,
+            },
+            StyledSourceSpan {
+                source: arabic_start..text.len(),
+                style_index: 1,
+            },
+        ];
+        let shaped = shape_styled_range(
+            &pack,
+            text,
+            0..text.len(),
+            &spans,
+            &styles,
+            BaseDirection::Auto,
+            true,
+            &RenderOptions::default(),
+        )
+        .unwrap();
+        let metrics = styled_line_metrics(
+            &pack,
+            &shaped,
+            &styles,
+            CellLineLayoutPolicy::CalcEditEngine,
+            CalcLinePlacementPolicy::RequestedFace,
+            text,
+            1,
+            1,
+            &RenderOptions::default(),
+        )
+        .unwrap();
+        let base_metrics = single_face_line_metrics(
+            &pack,
+            pack.resolve(base.request()).id,
+            &base,
+            CellLineLayoutPolicy::CalcEditEngine,
+            1,
+            1,
+        )
+        .unwrap();
+        let superscript_metrics = single_face_line_metrics(
+            &pack,
+            pack.resolve(superscript.request()).id,
+            &superscript,
+            CellLineLayoutPolicy::CalcEditEngine,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            metrics.placement_ascent,
+            base_metrics.ascent.max(superscript_metrics.ascent)
+        );
+        assert_eq!(
+            metrics.placement_descent,
+            base_metrics.descent.min(superscript_metrics.descent)
+        );
+    }
+
+    #[test]
+    fn calc_mixed_fallback_wrapping_steps_by_requested_face_height() {
+        let pack = synthetic_test_pack();
+        let mut options = outlined_options(RenderRange::new(0, 0, 0, 0));
+        options.font_pack = Some(pack.clone());
+        let text = "한국어 العربية 한국어 العربية 한국어 العربية";
+        let region = Region {
+            source: CellCoordinate { row: 0, col: 0 },
+            rect: Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(100),
+                height: Fixed::from_pixels(120),
+            },
+            is_merged: false,
+            line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            line_placement_policy: CalcLinePlacementPolicy::RequestedFace,
+            calc_wrap_space: Some(CalcWrapSpace {
+                paper_width_mm100: 2_000,
+            }),
+            style: Some(
+                CellStyle::new()
+                    .font_name("Wide Sans")
+                    .size(11)
+                    .wrap()
+                    .valign(VAlign::Top),
+            ),
+            conditional: ConditionalPaint::default(),
+            text: text.to_string(),
+            rich_text: None,
+            hyperlink: None,
+            numeric_default: false,
+            text_can_overflow: false,
+            fixed_height_row: false,
+            ods_fixed_height_row: false,
+            print_vertical_overflow: false,
+            vertical_margin: CALC_CELL_VERTICAL_MARGIN,
+        };
+        let style = text_style(&region, &options);
+        let mut statistics = TypographyStats::default();
+        let prepared = prepare_styled_text(
+            &pack,
+            &region,
+            &style,
+            false,
+            true,
+            &options,
+            &mut statistics,
+        )
+        .unwrap();
+        assert!(prepared.lines.len() > 1, "the fixture must wrap");
+        let requested = single_face_line_metrics(
+            &pack,
+            pack.resolve(prepared.styles[0].request()).id,
+            &prepared.styles[0],
+            CellLineLayoutPolicy::CalcEditEngine,
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(prepared.lines.iter().all(|line| {
+            line.metrics.placement_ascent == requested.ascent
+                && line.metrics.placement_descent == requested.descent
+        }));
+
+        let mut statistics = TypographyStats::default();
+        let run = build_glyph_run(
+            &pack,
+            &region,
+            region.rect,
+            region.rect,
+            None,
+            &style,
+            false,
+            true,
+            false,
+            &options,
+            &mut statistics,
+            &mut Warnings::default(),
+        )
+        .unwrap();
+        let baselines = run
+            .cluster_metrics
+            .iter()
+            .map(|metrics| metrics.baseline_y.raw())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(baselines.len(), prepared.lines.len());
+        let expected_step = requested
+            .ascent
+            .checked_sub(requested.descent)
+            .unwrap()
+            .raw();
+        assert!(baselines
+            .windows(2)
+            .all(|window| window[1] - window[0] == expected_step));
     }
 
     #[test]
@@ -16671,6 +17951,8 @@ mod tests {
             ascent: Fixed::from_raw(17_422),
             descent: Fixed::from_raw(-4_325),
             line_gap: Fixed::ZERO,
+            placement_ascent: Fixed::from_raw(17_422),
+            placement_descent: Fixed::from_raw(-4_325),
             calc_ascent_pixels: 17,
             calc_descent_pixels: -4,
             calc_portion_height_mm100: 556,
@@ -16688,6 +17970,8 @@ mod tests {
             ascent: Fixed::from_pixels(16),
             descent: Fixed::from_pixels(-4),
             line_gap: Fixed::ZERO,
+            placement_ascent: Fixed::from_pixels(16),
+            placement_descent: Fixed::from_pixels(-4),
             calc_ascent_pixels: 16,
             calc_descent_pixels: -4,
             calc_portion_height_mm100: 529,
@@ -16795,6 +18079,59 @@ mod tests {
                 "verified XLSX Arabic-plus-digits row for {family}"
             );
         }
+    }
+
+    #[test]
+    fn pinned_imported_mixed_rtl_digits_use_the_calc_complex_role_face() {
+        let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
+            return;
+        };
+        let pack = FontPack::load_manifest(manifest).expect("load pinned render font pack");
+        let text = "مرحبا بالعالم 0007";
+        let styles = r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="Carlito"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let workbook = imported_xlsx(
+            styles,
+            &format!(
+                r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Plain 0007</t></is></c></row></sheetData></worksheet>"#
+            ),
+        );
+        let options = RenderOptions {
+            selection: RenderSelection::Range(RenderRange::new(0, 0, 1, 0)),
+            gridlines: false,
+            default_font_family: "Carlito".to_string(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        };
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        let run = glyph_run(&build.scene, text);
+        let digit_start = text.find("0007").unwrap() as u64;
+        let digit_clusters = run
+            .clusters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cluster)| {
+                (cluster.source_start >= digit_start).then_some(index as u32)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!digit_clusters.is_empty());
+        let digit_faces = run
+            .glyphs
+            .iter()
+            .filter(|glyph| digit_clusters.contains(&glyph.cluster))
+            .map(|glyph| &run.font_faces[glyph.face as usize].family)
+            .collect::<Vec<_>>();
+        assert!(!digit_faces.is_empty());
+        assert!(
+            digit_faces
+                .iter()
+                .all(|family| family.as_str() == "Noto Sans Hebrew"),
+            "{digit_faces:?}"
+        );
+        let plain = glyph_run(&build.scene, "Plain 0007");
+        assert!(
+            plain.font_faces.iter().all(|face| face.family == "Carlito"),
+            "plain imported text must retain its Western role"
+        );
     }
 
     #[test]
@@ -17016,6 +18353,7 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            line_placement_policy: CalcLinePlacementPolicy::RequestedFace,
             calc_wrap_space: Some(CalcWrapSpace {
                 paper_width_mm100: 1,
             }),
@@ -17098,6 +18436,7 @@ mod tests {
             &base,
             false,
             true,
+            false,
             &options,
             &mut statistics,
             &mut Warnings::default(),
@@ -18435,6 +19774,7 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::CalcEditEngine,
+            line_placement_policy: CalcLinePlacementPolicy::RequestedFace,
             calc_wrap_space: calc_ooxml_wrap_space(sheet, [0], maximum_digit_width).unwrap(),
             style: Some(style.clone()),
             conditional: ConditionalPaint::default(),
@@ -18465,7 +19805,7 @@ mod tests {
             .lines
             .iter()
             .map(|line| {
-                line_height_from_metrics(line.metrics, CellLineLayoutPolicy::CalcEditEngine)
+                line_height_from_metrics(line.metrics, CalcLinePlacementPolicy::RequestedFace)
             })
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -18571,6 +19911,18 @@ mod tests {
             ),
             CellLineLayoutPolicy::Native
         );
+        assert_eq!(
+            calc_line_placement_policy(
+                explicit_sheet,
+                CellCoordinate { row: 0, col: 0 },
+                Some(&explicit_style),
+                None,
+                true,
+                &options,
+            ),
+            CalcLinePlacementPolicy::Imported(CalcImportProvenance::Xlsx),
+            "a fixed row keeps native wrapping but still replays Calc's imported role placement"
+        );
         let (explicit_rows, _) = measure_sheet_axes(explicit_sheet, range, &options).unwrap();
         assert_eq!(explicit_rows[0].size, points_to_fixed(42.0).unwrap());
         let explicit_scene = build_scene(&explicit, 0, &options).unwrap();
@@ -18581,13 +19933,15 @@ mod tests {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let native_step =
-            line_height_from_metrics(prepared.lines[0].metrics, CellLineLayoutPolicy::Native)
-                .unwrap();
+        let imported_step = line_height_from_metrics(
+            prepared.lines[0].metrics,
+            CalcLinePlacementPolicy::Imported(CalcImportProvenance::Xlsx),
+        )
+        .unwrap();
         assert!(explicit_baselines.len() >= 2);
         assert_eq!(
             explicit_baselines[1] - explicit_baselines[0],
-            native_step.raw()
+            imported_step.raw()
         );
 
         let huge_width = imported_xlsx(
@@ -18731,6 +20085,7 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::Native,
+            line_placement_policy: CalcLinePlacementPolicy::Native,
             calc_wrap_space: None,
             style: Some(style),
             conditional: ConditionalPaint::default(),
@@ -18757,6 +20112,7 @@ mod tests {
         .unwrap();
         let mut calc_region = native_region.clone();
         calc_region.line_layout_policy = CellLineLayoutPolicy::CalcEditEngine;
+        calc_region.line_placement_policy = CalcLinePlacementPolicy::RequestedFace;
         calc_region.calc_wrap_space = Some(calc_wrap_space);
         let mut calc_statistics = TypographyStats::default();
         let calc_height = measure_automatic_cell_height(
@@ -18802,7 +20158,7 @@ mod tests {
         for (window, line) in baselines.windows(2).zip(&prepared.lines) {
             assert_eq!(
                 window[1] - window[0],
-                line_height_from_metrics(line.metrics, CellLineLayoutPolicy::Native)
+                line_height_from_metrics(line.metrics, CalcLinePlacementPolicy::Native)
                     .unwrap()
                     .raw()
             );
@@ -19722,6 +21078,7 @@ mod tests {
             },
             is_merged: false,
             line_layout_policy: CellLineLayoutPolicy::Native,
+            line_placement_policy: CalcLinePlacementPolicy::Native,
             calc_wrap_space: None,
             style: Some(CellStyle::new().font_name("Legacy Sans").size(11)),
             conditional: ConditionalPaint::default(),
@@ -20405,6 +21762,101 @@ mod tests {
     }
 
     #[test]
+    fn prepared_print_geometry_uses_calc_rows_for_implicit_ooxml_images_only() {
+        let prepared_rect = |workbook: &Workbook, kind: DrawingObjectKind, tile: RenderRange| {
+            let sheet = &workbook.sheets[0];
+            let geometry_range = RenderRange::new(3, 2, 7, 5);
+            let geometry_options = outlined_options(geometry_range);
+            let (rows, columns) =
+                measure_sheet_axes(sheet, geometry_range, &geometry_options).unwrap();
+            let build = build_sheet_scene_with_geometry_for_print(
+                sheet,
+                0,
+                &RenderOptions {
+                    selection: RenderSelection::Range(tile),
+                    ..geometry_options
+                },
+                SheetGeometryOverride::new(&rows, &columns),
+            )
+            .unwrap();
+            match kind {
+                DrawingObjectKind::Image => image_placeholder_rect(&build.scene.nodes),
+                DrawingObjectKind::Chart => chart_outer_rect(&build.scene.nodes),
+                _ => unreachable!("fixture only creates images or charts"),
+            }
+            .expect("prepared drawing frame")
+        };
+
+        let implicit_image = imported_two_cell_drawing(DrawingObjectKind::Image, (0, 0));
+        let implicit_chart = imported_two_cell_drawing(DrawingObjectKind::Chart, (0, 0));
+        assert_eq!(
+            implicit_image.sheets[0].implicit_ooxml_row_height_source(),
+            Some(OoxmlImplicitRowHeight::XlsxApplicationDefault)
+        );
+        let full_tile = RenderRange::new(3, 2, 6, 4);
+        let image = prepared_rect(&implicit_image, DrawingObjectKind::Image, full_tile);
+        let chart = prepared_rect(&implicit_chart, DrawingObjectKind::Chart, full_tile);
+        assert_eq!(
+            image.height,
+            Fixed::from_raw(CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT.raw() * 4)
+        );
+        assert_eq!(
+            chart.height,
+            Fixed::from_raw(OOXML_APPLICATION_DEFAULT_ROW_HEIGHT.raw() * 4)
+        );
+
+        let explicit_worksheet = r#"<worksheet><sheetFormatPr defaultRowHeight="15"/><sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#;
+        let explicit_image = imported_two_cell_drawing_with_worksheet(
+            DrawingObjectKind::Image,
+            (0, 0),
+            explicit_worksheet,
+        );
+        let explicit_chart = imported_two_cell_drawing_with_worksheet(
+            DrawingObjectKind::Chart,
+            (0, 0),
+            explicit_worksheet,
+        );
+        assert_eq!(
+            explicit_image.sheets[0].implicit_ooxml_row_height_source(),
+            None
+        );
+        assert_eq!(
+            prepared_rect(&explicit_image, DrawingObjectKind::Image, full_tile).height,
+            prepared_rect(&explicit_chart, DrawingObjectKind::Chart, full_tile).height,
+            "explicit row geometry must remain shared by images and charts"
+        );
+    }
+
+    #[test]
+    fn prepared_print_image_continuation_uses_the_calc_row_tile_offset() {
+        let workbook = imported_two_cell_drawing(DrawingObjectKind::Image, (0, 0));
+        let sheet = &workbook.sheets[0];
+        let geometry_range = RenderRange::new(3, 2, 7, 5);
+        let geometry_options = outlined_options(geometry_range);
+        let (rows, columns) = measure_sheet_axes(sheet, geometry_range, &geometry_options).unwrap();
+        let continuation = build_sheet_scene_with_geometry_for_print(
+            sheet,
+            0,
+            &RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(5, 2, 6, 4)),
+                ..geometry_options
+            },
+            SheetGeometryOverride::new(&rows, &columns),
+        )
+        .unwrap();
+        let image = image_placeholder_rect(&continuation.scene.nodes)
+            .expect("continued image frame on the prepared print tile");
+        assert_eq!(
+            image.y,
+            Fixed::from_raw(-CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT.raw() * 2)
+        );
+        assert_eq!(
+            image.height,
+            Fixed::from_raw(CALC_OOXML_DRAWING_DEFAULT_ROW_HEIGHT.raw() * 4)
+        );
+    }
+
+    #[test]
     fn imported_xlsx_chart_anchors_follow_expanded_cell_rows() {
         let mut workbook = imported_two_cell_drawing(DrawingObjectKind::Chart, (0, 0));
         workbook.sheets[0].set_col_width(0, 8.0);
@@ -20622,7 +22074,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(print_grid.len(), 6);
+        assert_eq!(print_grid.len(), 2);
         assert!(!build
             .scene
             .nodes
@@ -20650,6 +22102,177 @@ mod tests {
                 && line.y1 == PRINT_GRIDLINE_FRAME_TOP_INSET
                 && line.y2 == PRINT_GRIDLINE_FRAME_TOP_INSET
         }));
+    }
+
+    #[test]
+    fn calc_metafile_grid_remap_preserves_composed_segment_gaps() {
+        fn slots<I: Copy>(indexes: &[I], size_pixels: i64) -> Vec<AxisSlot<I>> {
+            indexes
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(position, index)| AxisSlot {
+                    index,
+                    offset: Fixed::from_pixels(i64::try_from(position).unwrap() * size_pixels),
+                    size: Fixed::from_pixels(size_pixels),
+                })
+                .collect()
+        }
+
+        let cell_rows = slots(&[0_u32, 1, 2], 10);
+        let cell_columns = slots(&[0_u16, 1], 10);
+        let grid_rows = slots(&[0_u32, 1, 2], 40);
+        let grid_columns = slots(&[0_u16, 1], 40);
+        let grid_claim = EdgeClaim {
+            kind: EdgeClaimKind::Gridline,
+            style: BorderStyle::Thin,
+            color: Rgb::BLACK,
+            owner: CellCoordinate { row: 0, col: 0 },
+            side: CellEdge::Left,
+        };
+        let explicit_claim = EdgeClaim {
+            kind: EdgeClaimKind::Explicit,
+            ..grid_claim
+        };
+        let first = ComposedEdgeKey {
+            orientation: ComposedEdgeOrientation::Vertical,
+            axis: Fixed::from_pixels(10),
+            start: Fixed::ZERO,
+            end: Fixed::from_pixels(10),
+        };
+        let second = ComposedEdgeKey {
+            start: Fixed::from_pixels(20),
+            end: Fixed::from_pixels(30),
+            ..first
+        };
+        let explicit = ComposedEdgeKey {
+            orientation: ComposedEdgeOrientation::Horizontal,
+            axis: Fixed::from_pixels(10),
+            start: Fixed::ZERO,
+            end: Fixed::from_pixels(20),
+        };
+
+        let remapped = remap_calc_metafile_grid_edges(
+            &[
+                (first, grid_claim),
+                (second, grid_claim),
+                (explicit, explicit_claim),
+            ],
+            &cell_rows,
+            &cell_columns,
+            &grid_rows,
+            &grid_columns,
+        )
+        .unwrap();
+
+        assert_eq!(
+            remapped[0].0,
+            ComposedEdgeKey {
+                axis: Fixed::from_pixels(40),
+                end: Fixed::from_pixels(40),
+                ..first
+            }
+        );
+        assert_eq!(
+            remapped[1].0,
+            ComposedEdgeKey {
+                axis: Fixed::from_pixels(40),
+                start: Fixed::from_pixels(80),
+                end: Fixed::from_pixels(120),
+                ..second
+            }
+        );
+        assert_eq!(remapped[2].0, explicit);
+    }
+
+    #[test]
+    fn single_page_print_gridlines_precede_chart_and_image_paint() {
+        fn drawing_frame(scene: &Scene) -> (usize, Rect, Option<Rgb>, Option<Rgb>) {
+            scene
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| match node {
+                    SceneNode::Rect(node) if node.stroke.is_some() => {
+                        Some((index, node.rect, node.fill, node.stroke))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(_, rect, _, _)| {
+                    i128::from(rect.width.raw()) * i128::from(rect.height.raw())
+                })
+                .expect("drawing frame")
+        }
+
+        fn print_gridline_overlaps_rect(line: &LineNode, rect: Rect) -> bool {
+            let right = rect.x.checked_add(rect.width).unwrap();
+            let bottom = rect.y.checked_add(rect.height).unwrap();
+            if line.x1 == line.x2 {
+                let start = std::cmp::min(line.y1, line.y2);
+                let end = std::cmp::max(line.y1, line.y2);
+                line.x1 >= rect.x && line.x1 <= right && start < bottom && end > rect.y
+            } else if line.y1 == line.y2 {
+                let start = std::cmp::min(line.x1, line.x2);
+                let end = std::cmp::max(line.x1, line.x2);
+                line.y1 >= rect.y && line.y1 <= bottom && start < right && end > rect.x
+            } else {
+                false
+            }
+        }
+
+        for kind in [DrawingObjectKind::Chart, DrawingObjectKind::Image] {
+            let workbook = imported_two_cell_drawing(kind, (0, 0));
+            let options = RenderOptions {
+                selection: RenderSelection::Range(RenderRange::new(0, 0, 9, 6)),
+                ..RenderOptions::default()
+            };
+            let mut without_gridline_options = options.clone();
+            without_gridline_options.gridlines = false;
+            let without_gridlines = build_single_page_sheet_scene_for_print(
+                &workbook.sheets[0],
+                0,
+                &without_gridline_options,
+            )
+            .unwrap();
+            let with_gridlines =
+                build_single_page_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
+            let frame = drawing_frame(&with_gridlines.scene);
+            assert_eq!(
+                (frame.1, frame.2, frame.3),
+                {
+                    let without = drawing_frame(&without_gridlines.scene);
+                    (without.1, without.2, without.3)
+                },
+                "gridline layout must not mutate drawing paint for {kind:?}"
+            );
+            let rect = frame.1;
+            let print_gridlines = with_gridlines
+                .scene
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| match node {
+                    SceneNode::Line(line)
+                        if line.color == Rgb::BLACK && line.width == PRINT_GRIDLINE_WIDTH =>
+                    {
+                        Some((index, line))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert!(!print_gridlines.is_empty(), "{kind:?}");
+            assert!(
+                print_gridlines
+                    .iter()
+                    .any(|(_, line)| print_gridline_overlaps_rect(line, rect)),
+                "metafile grid must continue through the {kind:?} anchor {rect:?}"
+            );
+            assert!(
+                print_gridlines.iter().all(|(index, _)| *index < frame.0),
+                "the {kind:?} paint must be emitted after worksheet hairlines"
+            );
+        }
     }
 
     #[test]
@@ -20700,7 +22323,7 @@ mod tests {
             build_single_page_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
         let authored_gridlines = print_gridlines(&authored.scene);
         let single_page_gridlines = print_gridlines(&single_page.scene);
-        assert_eq!(single_page_gridlines.len(), 26);
+        assert_eq!(single_page_gridlines.len(), 8);
         assert_ne!(
             single_page_gridlines, authored_gridlines,
             "SinglePageSheets must retain the fitted cell axis and Calc page frame"
@@ -20709,7 +22332,11 @@ mod tests {
         workbook.sheets[0].set_right_to_left(true);
         let rtl =
             build_single_page_sheet_scene_for_print(&workbook.sheets[0], 0, &options).unwrap();
-        assert_eq!(print_gridlines(&rtl.scene).len(), 26);
+        assert_eq!(
+            print_gridlines(&rtl.scene).len(),
+            2,
+            "Calc's RTL metafile retains only the top and leading frame"
+        );
         assert_ne!(print_gridlines(&rtl.scene), authored_gridlines);
     }
 
@@ -21607,6 +23234,61 @@ mod tests {
         };
         expand_draw_strings_cutoff_to_cluster_boundary(&mut suffix, &clusters, TextAnchor::End);
         assert_eq!(suffix.source_start, 1);
+
+        let visible_cluster = [GlyphCluster {
+            source_start: 9,
+            source_end: 10,
+            command_start: 0,
+            command_end: 1,
+        }];
+        let metrics = [GlyphClusterMetrics {
+            origin_x: Fixed::from_pixels(67),
+            advance_x: Fixed::from_pixels(9),
+            baseline_y: Fixed::from_pixels(10),
+            ascent: Fixed::from_pixels(8),
+            descent: Fixed::from_pixels(-2),
+        }];
+        let mut proportional_prefix = GlyphSemanticGroup {
+            source_start: 0,
+            source_end: 9,
+        };
+        expand_draw_strings_cutoff_to_visible_cluster(
+            &mut proportional_prefix,
+            &visible_cluster,
+            &metrics,
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(70),
+                height: Fixed::from_pixels(20),
+            },
+            Fixed::from_pixels(1),
+            TextAnchor::Start,
+            false,
+        )
+        .unwrap();
+        assert_eq!(proportional_prefix.source_end, 10);
+
+        let mut single_page_prefix = GlyphSemanticGroup {
+            source_start: 0,
+            source_end: 9,
+        };
+        expand_draw_strings_cutoff_to_visible_cluster(
+            &mut single_page_prefix,
+            &visible_cluster,
+            &metrics,
+            Rect {
+                x: Fixed::ZERO,
+                y: Fixed::ZERO,
+                width: Fixed::from_pixels(70),
+                height: Fixed::from_pixels(20),
+            },
+            Fixed::from_pixels(1),
+            TextAnchor::Start,
+            true,
+        )
+        .unwrap();
+        assert_eq!(single_page_prefix.source_end, 9);
     }
 
     #[test]
@@ -21628,16 +23310,24 @@ mod tests {
             "bottom one two three four five six seven",
         ] {
             let run = glyph_run(&build.scene, text);
-            assert_eq!(
-                run.semantic_retention_groups(),
-                [GlyphSemanticGroup {
-                    source_start: 0,
-                    source_end: u64::try_from(text.len()).unwrap(),
-                }],
-                "fixed-height ODS wrapping must retain Calc's complete logical paragraph"
-            );
             let semantic_layout = run.semantic_text_layout().unwrap();
             assert!(semantic_layout.lines.len() > 1);
+            let prepared_end = semantic_layout.lines.last().unwrap().source.end;
+            assert!(prepared_end < text.len());
+            assert_eq!(
+                run.semantic_retention_groups(),
+                [
+                    GlyphSemanticGroup {
+                        source_start: 0,
+                        source_end: u64::try_from(prepared_end).unwrap(),
+                    },
+                    GlyphSemanticGroup {
+                        source_start: u64::try_from(prepared_end).unwrap(),
+                        source_end: u64::try_from(text.len()).unwrap(),
+                    },
+                ],
+                "fixed-height ODS wrapping must stop at Calc's prepared printer prefix"
+            );
             assert!(semantic_layout
                 .lines
                 .windows(2)
@@ -21669,7 +23359,9 @@ mod tests {
             span("bottom one two three four five six seven");
         let bottom = |clip: Rect| clip.y.checked_add(clip.height).unwrap();
 
-        // Only an explicit top alignment keeps the beginning inside the row.
+        // Top keeps its first baseline inside, middle centers the retained
+        // prefix across both row edges, and bottom shifts that prefix above
+        // the row while keeping its final baseline inside.
         assert!(top_min >= top_clip.y);
         assert!(top_max > bottom(top_clip));
         assert!(middle_min < middle_clip.y);
@@ -21688,6 +23380,54 @@ mod tests {
             implicit_min.raw() - implicit_clip.y.raw(),
             bottom_min.raw() - bottom_clip.y.raw(),
             "implicit alignment must translate exactly like explicit bottom"
+        );
+    }
+
+    #[test]
+    fn ods_fixed_height_printer_prefix_matches_narrow_hyphenated_paragraph() {
+        let text = "Wrapped project-authored text for ods-0022 seed 440022";
+        let content = format!(
+            r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:automatic-styles><style:style style:name="co" style:family="table-column"><style:table-column-properties style:column-width="64pt"/></style:style><style:style style:name="ro" style:family="table-row"><style:table-row-properties style:row-height="45pt" style:use-optimal-row-height="false"/></style:style><style:style style:name="ce" style:family="table-cell"><style:table-cell-properties fo:wrap-option="wrap"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="Clip"><table:table-column table:style-name="co"/><table:table-row table:style-name="ro"><table:table-cell table:style-name="ce" office:value-type="string"><text:p>{text}</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#
+        );
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"><office:styles><style:default-style style:family="table-cell"><style:text-properties style:font-name="Noto Sans CJK KR" style:font-name-asian="Noto Sans CJK KR" style:font-name-complex="Noto Sans CJK KR" fo:font-family="Noto Sans CJK KR" fo:font-size="11pt" style:font-size-asian="11pt" style:font-size-complex="11pt"/></style:default-style></office:styles></office:document-styles>"#;
+        let workbook = ods_workbook(&content, styles);
+        let build = build_scene(
+            &workbook,
+            0,
+            &outlined_options(RenderRange::new(0, 0, 0, 0)),
+        )
+        .unwrap();
+        let run = glyph_run(&build.scene, text);
+        let layout = run.semantic_text_layout().unwrap();
+        let lines = layout
+            .lines
+            .iter()
+            .map(|line| &text[line.source.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "Wrapped ",
+                "project-",
+                "authored ",
+                "text for ",
+                "ods-0022 "
+            ]
+        );
+        let prefix_end = "Wrapped project-authored text for ods-0022 ".len();
+        assert_eq!(layout.lines.last().unwrap().source.end, prefix_end);
+        assert_eq!(
+            run.semantic_retention_groups(),
+            [
+                GlyphSemanticGroup {
+                    source_start: 0,
+                    source_end: prefix_end as u64,
+                },
+                GlyphSemanticGroup {
+                    source_start: prefix_end as u64,
+                    source_end: text.len() as u64,
+                },
+            ]
         );
     }
 
@@ -21827,6 +23567,21 @@ mod tests {
         zip.start_file("styles.xml", options).unwrap();
         zip.write_all(styles.as_bytes()).unwrap();
         Workbook::open(&zip.finish().unwrap().into_inner()).expect("ODS workbook")
+    }
+
+    #[test]
+    fn single_page_ods_rtl_keeps_fit_slack_on_the_trailing_edge() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:automatic-styles><style:style style:name="rtl" style:family="table"><style:table-properties style:writing-mode="rl-tb"/></style:style><style:style style:name="column" style:family="table-column"><style:table-column-properties style:column-width="2.5cm"/></style:style><style:style style:name="row" style:family="table-row"><style:table-row-properties style:row-height="15pt" style:use-optimal-row-height="false"/></style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="RTL" table:style-name="rtl"><table:table-column table:style-name="column"/><table:table-row table:style-name="row"><table:table-cell office:value-type="string"><text:p>A</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:styles/></office:document-styles>"#;
+        let workbook = ods_workbook(content, styles);
+        let sheet = &workbook.sheets[0];
+        assert!(sheet.sheet_view().right_to_left);
+
+        let range = RenderRange::new(0, 0, 0, 0);
+        let scene = build_single_page_sheet_scene(sheet, 0, &outlined_options(range)).unwrap();
+        let run = glyph_run(&scene.scene, "A");
+        assert_eq!(run.clip_bounds.x, Fixed::ZERO);
+        assert!(run.clip_bounds.width < scene.scene.width);
     }
 
     #[test]
@@ -23319,11 +25074,14 @@ mod tests {
                 &shaped,
                 std::slice::from_ref(&style),
                 CellLineLayoutPolicy::Native,
+                CalcLinePlacementPolicy::Native,
+                "WWW",
                 1,
                 1,
+                &options,
             )
             .unwrap(),
-            CellLineLayoutPolicy::Native,
+            CalcLinePlacementPolicy::Native,
         )
         .unwrap()
         .checked_add(Fixed::from_pixels(4))
@@ -23651,7 +25409,7 @@ mod tests {
     fn imported_line_chart_value_axis_keeps_calc_zero_baseline() {
         let mut style = ChartSeriesStyle::default();
         style.marker = ChartMarkerSymbol::None;
-        let series = [ResolvedChartSeries {
+        let mut series = [ResolvedChartSeries {
             name: "Imported line".to_string(),
             values: vec![51.0, 64.0, 77.0, 90.0],
             x_values: None,
@@ -23665,10 +25423,20 @@ mod tests {
             style,
         }];
         let authored = chart_nice_value_axis(&series, false).unwrap();
-        let imported = chart_nice_value_axis(&series, true).unwrap();
+        let imported = chart_calc_imported_line_value_axis(&series).unwrap();
         assert_eq!((authored.minimum, authored.maximum), (45.0, 95.0));
         assert_eq!((imported.minimum, imported.maximum), (0.0, 100.0));
         assert_eq!(imported.ticks, vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0]);
+
+        for (maximum, expected_major, expected_maximum) in
+            [(81.0, 10.0, 90.0), (85.0, 10.0, 90.0), (86.0, 20.0, 100.0)]
+        {
+            series[0].values = vec![42.0, 55.0, 68.0, maximum];
+            let axis = chart_calc_imported_line_value_axis(&series).unwrap();
+            assert_eq!(axis.minimum, 0.0, "maximum={maximum}");
+            assert_eq!(axis.major, expected_major, "maximum={maximum}");
+            assert_eq!(axis.maximum, expected_maximum, "maximum={maximum}");
+        }
     }
 
     #[test]
@@ -24279,6 +26047,26 @@ mod tests {
     }
 
     #[test]
+    fn imported_calc_single_page_chart_padding_tracks_the_chart_width() {
+        assert_eq!(
+            chart_frame_padding(Fixed::from_pixels(346), true)
+                .unwrap()
+                .raw(),
+            5_038
+        );
+        assert_eq!(
+            chart_frame_padding(Fixed::from_pixels(671), true)
+                .unwrap()
+                .raw(),
+            11_694
+        );
+        assert_eq!(
+            chart_frame_padding(Fixed::from_pixels(671), false).unwrap(),
+            Fixed::from_pixels(8)
+        );
+    }
+
+    #[test]
     fn pinned_missing_theme_chart_roles_resolve_to_the_verified_arimo_alias() {
         let Some(manifest) = std::env::var_os("RXLS_TEST_FONT_PACK_MANIFEST") else {
             return;
@@ -24748,6 +26536,115 @@ mod tests {
         assert_eq!(shifted.height, plot.height);
         assert_eq!(chart_category_data_plot(plot, false, false).unwrap(), plot);
         assert_eq!(chart_category_data_plot(plot, true, true).unwrap(), plot);
+    }
+
+    #[test]
+    fn imported_default_line_chart_keeps_calc_vertical_plot_insets() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("line_plot_insets");
+        for (row, (category, value)) in [("Low", 0.0), ("High", 100.0)].into_iter().enumerate() {
+            sheet.write(row as u32, 0, category);
+            sheet.write_number(row as u32, 1, value);
+        }
+        let series = || {
+            Series::new("line_plot_insets!$B$1:$B$2").with_categories("line_plot_insets!$A$1:$A$2")
+        };
+        let default_chart = Chart::new(ChartKind::Line, (0, 0), (10, 8)).add_series(series());
+        let labeled_chart = Chart::new(ChartKind::Line, (0, 0), (10, 8))
+            .with_data_labels(true)
+            .add_series(series());
+        let mut metadata = DrawingMetadata::default();
+        metadata.chart_category_axis_shifted = Some(true);
+        metadata.chart_category_axis_visible = Some(true);
+        metadata.chart_value_axis_visible = Some(true);
+        metadata.chart_value_major_gridlines = Some(true);
+        let mut series_style = ChartSeriesStyle::default();
+        series_style.marker = ChartMarkerSymbol::Circle;
+        series_style.marker_size = Some(5);
+        metadata.chart_series_styles.push(series_style);
+        let rect = Rect {
+            x: Fixed::from_pixels(10),
+            y: Fixed::from_pixels(20),
+            width: Fixed::from_pixels(500),
+            height: Fixed::from_pixels(300),
+        };
+        let render = |chart: &Chart, rect: Rect, calc_single_page_layout: bool| {
+            let mut nodes = Vec::new();
+            assert!(try_push_chart_with_layout(
+                &mut nodes,
+                rect,
+                chart,
+                Some(&metadata),
+                calc_single_page_layout,
+                sheet,
+                &mut 0,
+                &mut 0,
+                &mut 0,
+                &mut TypographyStats::default(),
+                &RenderOptions::default(),
+                &mut Warnings::default(),
+                CellCoordinate { row: 0, col: 0 },
+            )
+            .unwrap());
+            nodes
+        };
+        let plot_bounds = |nodes: &[SceneNode]| {
+            let mut gridlines = nodes
+                .iter()
+                .filter_map(|node| match node {
+                    SceneNode::Line(line)
+                        if line.color == Rgb::new(217, 217, 217) && line.y1 == line.y2 =>
+                    {
+                        Some(line.y1)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            gridlines.sort_unstable_by_key(|y| y.raw());
+            (
+                *gridlines.first().expect("top value gridline"),
+                *gridlines.last().expect("bottom value gridline"),
+            )
+        };
+
+        let (default_top, default_bottom) = plot_bounds(&render(&default_chart, rect, false));
+        let (labeled_top, labeled_bottom) = plot_bounds(&render(&labeled_chart, rect, false));
+        assert_eq!(
+            default_top,
+            labeled_top.checked_add(Fixed::from_pixels(7)).unwrap()
+        );
+        assert_eq!(
+            default_bottom,
+            labeled_bottom.checked_sub(Fixed::from_pixels(4)).unwrap()
+        );
+
+        let (default_top, default_bottom) = plot_bounds(&render(&default_chart, rect, true));
+        let (labeled_top, labeled_bottom) = plot_bounds(&render(&labeled_chart, rect, true));
+        assert_eq!(
+            default_top,
+            labeled_top.checked_add(Fixed::from_pixels(4)).unwrap()
+        );
+        assert_eq!(
+            default_bottom,
+            labeled_bottom.checked_sub(Fixed::from_pixels(1)).unwrap()
+        );
+
+        let compact_rect = Rect {
+            width: Fixed::from_pixels(400),
+            ..rect
+        };
+        let (default_top, default_bottom) =
+            plot_bounds(&render(&default_chart, compact_rect, true));
+        let (labeled_top, labeled_bottom) =
+            plot_bounds(&render(&labeled_chart, compact_rect, true));
+        assert_eq!(
+            default_top,
+            labeled_top.checked_add(Fixed::from_pixels(7)).unwrap()
+        );
+        assert_eq!(
+            default_bottom,
+            labeled_bottom.checked_sub(Fixed::from_pixels(4)).unwrap()
+        );
     }
 
     #[test]
@@ -25818,7 +27715,7 @@ mod tests {
     #[test]
     fn calc_single_page_fit_adds_twip_padding_and_truncates_each_track() {
         let source_twips = [964_i128, 1_757, 1_247, 2_296, 765, 1_644];
-        let mut slots = source_twips
+        let slots = source_twips
             .iter()
             .enumerate()
             .map(|(index, _)| MeasuredAxisSlot {
@@ -25828,14 +27725,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let page_extent = calc_hmm_to_fixed(15_299).unwrap();
+        let mut cell_slots = slots.clone();
+        let mut grid_slots = slots;
 
         apply_calc_single_page_axis_fit(
-            &mut slots,
+            &mut cell_slots,
             &source_twips,
             page_extent,
             &RenderOptions::default(),
         )
         .unwrap();
+        apply_calc_single_page_metafile_grid_axis_fit(&mut grid_slots, &source_twips).unwrap();
 
         let to_hmm = |value: Fixed| {
             round_positive_mul_div(
@@ -25845,12 +27745,61 @@ mod tests {
             )
             .unwrap()
         };
-        let boundaries = slots
+        let boundaries = cell_slots
             .iter()
             .map(|slot| to_hmm(slot.offset.checked_add(slot.size).unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(boundaries, [1_696, 4_788, 6_982, 11_022, 12_368, 15_261]);
+        let grid_boundaries = grid_slots
+            .iter()
+            .map(|slot| slot.offset.checked_add(slot.size).unwrap().raw())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            grid_boundaries,
+            [230_279, 650_064, 947_937, 1_496_407, 1_679_141, 2_071_834],
+            "DrawToDev must truncate each native-twip track before 84/635 projection"
+        );
         assert_eq!(to_hmm(page_extent), 15_299);
         assert_eq!(15_299 - boundaries.last().copied().unwrap(), 38);
+    }
+
+    #[test]
+    fn calc_metafile_grid_truncates_tracks_before_accumulating_hmm() {
+        let source_twips = [343_i128, 343, 276, 276];
+        let mut slots = source_twips
+            .iter()
+            .enumerate()
+            .map(|(index, _)| MeasuredAxisSlot {
+                index: u32::try_from(index).unwrap(),
+                offset: Fixed::ZERO,
+                size: Fixed::from_pixels(1),
+            })
+            .collect::<Vec<_>>();
+
+        apply_calc_single_page_metafile_grid_axis_fit(&mut slots, &source_twips).unwrap();
+
+        let projected = slots
+            .iter()
+            .map(|slot| slot.offset.checked_add(slot.size).unwrap().raw())
+            .collect::<Vec<_>>();
+        assert_eq!(projected, [81_952, 163_905, 229_737, 295_570]);
+
+        let mut cumulative_twips = 0_i128;
+        let cumulative_endpoint_projection = source_twips
+            .iter()
+            .map(|twips| {
+                cumulative_twips += twips;
+                calc_metafile_grid_hmm_to_fixed(
+                    calc_twips_position_to_hmm(cumulative_twips).unwrap(),
+                )
+                .unwrap()
+                .raw()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cumulative_endpoint_projection,
+            [81_952, 163_905, 229_873, 295_841]
+        );
+        assert_ne!(projected, cumulative_endpoint_projection);
     }
 }

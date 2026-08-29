@@ -1546,6 +1546,16 @@ steps:
                 "item, key_path, allow_retention_policy",
                 1,
             ),
+            "artifact_guard_definition_missing": original.replace(
+                "          artifact_extension = re.compile(\n",
+                "          artifact_extension_missing = re.compile(\n",
+                1,
+            ),
+            "traversal_guard_definition_missing": original.replace(
+                '          traversal = re.compile(r"(?:^|[\\\\/])\\.\\.(?:$|[\\\\/])")\n',
+                "",
+                1,
+            ),
             "path_traversal_allowed": original.replace(
                 "                  assert traversal.search(value) is None\n",
                 "",
