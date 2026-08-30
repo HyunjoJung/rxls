@@ -1,0 +1,130 @@
+name: vscode-extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/vscode-extension.yml"
+      - "extensions/vscode/**"
+      - "tests/fixtures/**"
+      - "viewer/**"
+  pull_request:
+    paths:
+      - ".github/workflows/vscode-extension.yml"
+      - "extensions/vscode/**"
+      - "tests/fixtures/**"
+      - "viewer/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vscode-extension-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
+  VSCODE_VERSION: "1.134.0"
+
+jobs:
+  package:
+    name: Reproducible VSIX and clean install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install locked build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          npm ci --prefix viewer --ignore-scripts
+          npm ci --prefix extensions/vscode --ignore-scripts
+      - name: Test source and dependency policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix viewer test
+          npm --prefix extensions/vscode run check
+          npm --prefix extensions/vscode run test:unit
+          npm --prefix extensions/vscode audit --audit-level=high
+      - name: Build and verify reproducible VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix extensions/vscode run package:vsix
+          python3 extensions/vscode/scripts/verify_vsix.py \
+            extensions/vscode/target/rxls-spreadsheet-preview-0.1.0.vsix \
+            --renderer-root extensions/vscode/node_modules/@rxls/render-worker \
+            --checksum extensions/vscode/target/rxls-spreadsheet-preview-0.1.0.vsix.sha256
+      - name: Install packaged extension in a clean profile
+        shell: bash
+        env:
+          RXLS_VSCODE_VERSION: ${{ env.VSCODE_VERSION }}
+        run: npm --prefix extensions/vscode run test:install
+      - name: Upload verified VSIX and checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-vscode-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            extensions/vscode/target/rxls-spreadsheet-preview-0.1.0.vsix
+            extensions/vscode/target/rxls-spreadsheet-preview-0.1.0.vsix.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  e2e:
+    name: Five formats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install locked test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          npm ci --prefix viewer --ignore-scripts
+          npm ci --prefix extensions/vscode --ignore-scripts
+      - name: Exercise trusted and Restricted Mode previews on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RXLS_VSCODE_VERSION: ${{ env.VSCODE_VERSION }}
+        run: xvfb-run -a npm --prefix extensions/vscode run test:e2e
+      - name: Exercise trusted and Restricted Mode previews on desktop
+        if: runner.os != 'Linux'
+        env:
+          RXLS_VSCODE_VERSION: ${{ env.VSCODE_VERSION }}
+        run: npm --prefix extensions/vscode run test:e2e

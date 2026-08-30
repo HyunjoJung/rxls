@@ -43,6 +43,44 @@ body {
   letter-spacing: 0;
 }
 
+.host-only {
+  display: none !important;
+}
+
+body.host-vscode {
+  color-scheme: light dark;
+  --border: var(--vscode-panel-border, #d7dadd);
+  --border-strong: var(--vscode-contrastBorder, #b8bec4);
+  --canvas: var(--vscode-editor-background, #e9ecef);
+  --panel: var(--vscode-sideBar-background, #f8f9fa);
+  --surface: var(--vscode-editorWidget-background, #ffffff);
+  --text: var(--vscode-editor-foreground, #202326);
+  --muted: var(--vscode-descriptionForeground, #626970);
+  --focus: var(--vscode-focusBorder, #1769aa);
+}
+
+body.host-vscode .host-only {
+  display: inline-flex !important;
+}
+
+body.host-vscode .app-bar {
+  color: var(--vscode-titleBar-activeForeground, #f7faf8);
+  background: var(--vscode-titleBar-activeBackground, #202a24);
+  border-bottom-color: var(--vscode-titleBar-border, #111713);
+}
+
+body.host-vscode .sidebar-primary,
+body.host-vscode .edit-controls,
+body.host-vscode #save-document,
+body.host-vscode .empty-state .command-button,
+body.host-vscode .drop-overlay {
+  display: none !important;
+}
+
+body.host-vscode .sidebar {
+  background: var(--vscode-sideBar-background, var(--panel));
+}
+
 button,
 select,
 input,

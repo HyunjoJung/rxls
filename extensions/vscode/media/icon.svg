@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="32" fill="#202a24"/>
+  <rect x="24" y="24" width="94" height="208" rx="14" fill="#6ee7a0"/>
+  <text x="71" y="171" fill="#163321" font-family="Consolas, monospace" font-size="132" font-weight="800" text-anchor="middle">r</text>
+  <rect x="132" y="48" width="100" height="160" rx="9" fill="#ffffff"/>
+  <rect x="146" y="64" width="72" height="25" rx="3" fill="#176b3a"/>
+  <g fill="none" stroke="#b8c7bd" stroke-width="5">
+    <path d="M146 105h72M146 134h72M146 163h72M170 89v91M195 89v91"/>
+  </g>
+  <rect x="146" y="180" width="72" height="12" rx="3" fill="#6ee7a0"/>
+</svg>

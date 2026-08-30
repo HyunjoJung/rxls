@@ -49,6 +49,14 @@ const MAX_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_PNG_PIXELS = 16 * 1024 * 1024;
 const ZOOM_STEP = 0.15;
 const BLOCKED_SVG_ELEMENTS = "script, foreignObject, iframe, object, embed";
+const hostKind = document.querySelector('meta[name="rxls-host-kind"]')?.content ?? "browser";
+const hostResourceBase = document.querySelector('meta[name="rxls-resource-base"]')?.content;
+const vscodeHost =
+  hostKind === "vscode" && typeof globalThis.acquireVsCodeApi === "function"
+    ? globalThis.acquireVsCodeApi()
+    : null;
+
+document.body.classList.toggle("host-vscode", Boolean(vscodeHost));
 
 const icons = {
   ChevronDown,
@@ -84,6 +92,7 @@ const elements = Object.fromEntries(
   [
     "document-name",
     "document-detail",
+    "reload-document",
     "open-button",
     "empty-open-button",
     "file-input",
@@ -181,10 +190,14 @@ const state = {
   cellReadTarget: null,
   cellReadPending: false,
   cellEditPending: false,
-  dragDepth: 0
+  dragDepth: 0,
+  hostGeneration: 0,
+  hostWorker: null
 };
 
-const baseUrl = new URL(import.meta.env.BASE_URL, window.location.origin);
+const baseUrl = hostResourceBase
+  ? new URL(hostResourceBase)
+  : new URL(import.meta.env.BASE_URL, window.location.origin);
 const openRequests = createLatestRequestGate();
 const cellReads = createLatestRequestGate();
 let samples = [];
@@ -195,11 +208,20 @@ void initialize();
 
 async function initialize() {
   try {
-    const [runtime, sampleManifest] = await Promise.all([
-      import(/* @vite-ignore */ new URL("runtime/js/client.mjs", baseUrl).href),
-      fetchJson(new URL("samples/manifest.json", baseUrl))
-    ]);
+    const runtime = await import(
+      /* @vite-ignore */ new URL("runtime/js/client.mjs", baseUrl).href
+    );
     state.runtime = runtime;
+    if (vscodeHost) {
+      setBusy(false);
+      showEmpty();
+      elements["document-name"].textContent = "Spreadsheet preview";
+      elements["document-detail"].textContent = "Waiting for VS Code";
+      elements["status-message"].textContent = "Waiting for workbook";
+      postHostMessage({ type: "ready" });
+      return;
+    }
+    const sampleManifest = await fetchJson(new URL("samples/manifest.json", baseUrl));
     samples = sampleManifest.samples ?? [];
     populateSamples();
     if (samples.length > 0) {
@@ -216,6 +238,7 @@ async function initialize() {
 }
 
 function bindEvents() {
+  elements["reload-document"].addEventListener("click", requestHostReload);
   elements["open-button"].addEventListener("click", chooseFile);
   elements["empty-open-button"].addEventListener("click", chooseFile);
   elements["file-input"].addEventListener("change", (event) => {
@@ -243,7 +266,7 @@ function bindEvents() {
   elements["zoom-in"].addEventListener("click", () => setZoom(state.zoom + ZOOM_STEP));
   elements["fit-view"].addEventListener("click", fitToWidth);
   elements["save-document"].addEventListener("click", () => void saveWorkbookCopy());
-  elements["export-svg"].addEventListener("click", exportSvg);
+  elements["export-svg"].addEventListener("click", () => exportSvg());
   elements["export-png"].addEventListener("click", () => void exportPng());
   elements["dismiss-error"].addEventListener("click", dismissError);
   elements["sidebar-toggle"].addEventListener("click", toggleSidebar);
@@ -261,11 +284,15 @@ function bindEvents() {
     void submitPropertiesEdit(event)
   );
 
-  const viewport = elements["viewer-viewport"];
-  viewport.addEventListener("dragenter", onDragEnter);
-  viewport.addEventListener("dragover", onDragOver);
-  viewport.addEventListener("dragleave", onDragLeave);
-  viewport.addEventListener("drop", onDrop);
+  if (vscodeHost) {
+    window.addEventListener("message", onHostMessage);
+  } else {
+    const viewport = elements["viewer-viewport"];
+    viewport.addEventListener("dragenter", onDragEnter);
+    viewport.addEventListener("dragover", onDragOver);
+    viewport.addEventListener("dragleave", onDragLeave);
+    viewport.addEventListener("drop", onDrop);
+  }
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("beforeunload", (event) => {
     if (state.editState?.dirty) {
@@ -391,22 +418,24 @@ function failOpenRequest(request, error) {
 
 async function openWorkbook(bytes, file, request) {
   if (!isCurrentOpenRequest(request)) {
-    return;
+    return false;
   }
   let client = null;
   try {
     const workerUrl = new URL("runtime/js/worker.mjs", baseUrl);
-    client = new state.runtime.RenderWorkerClient(workerUrl);
+    const workerTarget = await createWorkerTarget(workerUrl);
+    client = new state.runtime.RenderWorkerClient(workerTarget);
     request.client = client;
     const documentId = `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const opened = await client.open(bytes, { documentId });
     if (!isCurrentOpenRequest(request)) {
       client.terminate();
-      return;
+      return false;
     }
 
     const previousClient = state.client;
     state.client = client;
+    state.hostWorker = workerTarget instanceof Worker ? workerTarget : null;
     state.documentId = documentId;
     state.workbook = opened.workbook;
     state.editState = opened.editState;
@@ -422,17 +451,182 @@ async function openWorkbook(bytes, file, request) {
       state.openRequest = null;
       closeSidebar();
     }
+    return true;
   } catch (error) {
     client?.terminate();
     if (state.client === client) {
       state.client = null;
+      state.hostWorker = null;
       state.documentId = null;
       state.workbook = null;
       state.editState = null;
       state.file = null;
     }
     failOpenRequest(request, error);
+    return false;
   }
+}
+
+async function createWorkerTarget(workerUrl) {
+  if (!vscodeHost) {
+    return workerUrl;
+  }
+  const workerBundleUrl = new URL("runtime/vscode-worker.js", baseUrl);
+  const wasmUrl = new URL("runtime/pkg/rxls_render_wasm_bg.wasm", baseUrl);
+  const [workerResponse, wasmResponse] = await Promise.all([
+    fetch(workerBundleUrl),
+    fetch(wasmUrl)
+  ]);
+  if (!workerResponse.ok || !wasmResponse.ok) {
+    throw new Error("The packaged VS Code renderer could not be loaded.");
+  }
+  const [workerBlob, wasmBytes] = await Promise.all([
+    workerResponse.blob(),
+    wasmResponse.arrayBuffer()
+  ]);
+  const bootstrapUrl = URL.createObjectURL(workerBlob);
+  const worker = new Worker(bootstrapUrl, { name: "rxls-render-worker" });
+  let released = false;
+  const releaseBootstrap = () => {
+    if (!released) {
+      released = true;
+      URL.revokeObjectURL(bootstrapUrl);
+    }
+  };
+  worker.addEventListener("message", releaseBootstrap, { once: true });
+  worker.addEventListener("error", releaseBootstrap, { once: true });
+  worker.addEventListener("error", () => handleHostedWorkerCrash(worker));
+  worker.postMessage(
+    {
+      protocol: "rxls.vscode.worker.bootstrap.v1",
+      wasm: wasmBytes
+    },
+    [wasmBytes]
+  );
+  return worker;
+}
+
+function handleHostedWorkerCrash(worker) {
+  if (state.hostWorker !== worker || state.openRequest) {
+    return;
+  }
+  state.client = null;
+  state.hostWorker = null;
+  setBusy(false);
+  const error = new Error("The isolated renderer stopped unexpectedly.");
+  error.code = "worker_crashed";
+  showError(error);
+}
+
+async function loadHostWorkbook(message) {
+  try {
+    if (!Number.isSafeInteger(message?.generation) || message.generation <= 0) {
+      throw new TypeError("The VS Code workbook generation is invalid.");
+    }
+    const name = String(message?.file?.name ?? "");
+    if (!acceptsWorkbook(name)) {
+      throw new TypeError("VS Code provided an unsupported workbook name.");
+    }
+    const bytes = hostMessageBytes(message.bytes);
+    if (bytes.byteLength > MAX_INPUT_BYTES) {
+      const error = new Error(
+        `The VS Code preview accepts files up to ${formatBytes(MAX_INPUT_BYTES)}.`
+      );
+      error.code = "limit_exceeded";
+      throw error;
+    }
+    state.hostGeneration = message.generation;
+    const request = beginOpenRequest(`Opening ${name}`);
+    const opened = await openWorkbook(
+      bytes,
+      {
+        name,
+        size: bytes.byteLength,
+        source: "VS Code",
+        sampleId: null
+      },
+      request
+    );
+    if (opened && state.hostGeneration === message.generation) {
+      postHostMessage({
+        type: "loaded",
+        generation: message.generation,
+        preview: viewerStateForTest()
+      });
+    }
+  } catch (error) {
+    setBusy(false);
+    if (!state.workbook) {
+      showEmpty();
+    }
+    showError(error);
+  }
+}
+
+function hostMessageBytes(value) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  throw new TypeError("VS Code did not provide binary workbook bytes.");
+}
+
+function onHostMessage(event) {
+  const message = event.data;
+  if (!message || typeof message !== "object") {
+    return;
+  }
+  switch (message.type) {
+    case "load":
+      void loadHostWorkbook(message);
+      break;
+    case "host-error": {
+      if (
+        Number.isSafeInteger(message.generation) &&
+        message.generation < state.hostGeneration
+      ) {
+        return;
+      }
+      if (Number.isSafeInteger(message.generation) && message.generation >= 0) {
+        state.hostGeneration = message.generation;
+      }
+      setBusy(false);
+      if (!state.workbook) {
+        showEmpty();
+      }
+      const error = new Error(String(message.message ?? "The workbook could not be loaded."));
+      error.code = String(message.code ?? "host_error");
+      showError(error, false);
+      break;
+    }
+    case "host-status":
+      elements["status-message"].textContent = String(message.message ?? "Ready");
+      break;
+    case "host-command":
+      if (message.command === "export-svg") {
+        exportSvg(message.requestId);
+      } else if (message.command === "export-png") {
+        void exportPng(message.requestId);
+      } else if (message.command === "test-crash-renderer" && state.hostWorker) {
+        state.hostWorker.postMessage({ protocol: "rxls.vscode.worker.crash-test.v1" });
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+function requestHostReload() {
+  if (!vscodeHost || state.busy) {
+    return;
+  }
+  postHostMessage({ type: "reload" });
+}
+
+function postHostMessage(message) {
+  vscodeHost?.postMessage(message);
 }
 
 async function selectSheet(index) {
@@ -652,13 +846,25 @@ function updatePageUi() {
 function updateEditUi() {
   const editState = state.editState;
   const editable = editState?.capability === "read-write";
-  const available = Boolean(state.workbook && editable && !state.busy);
-  const readOnly = Boolean(state.workbook && !editable);
+  const hostReadOnly = Boolean(state.workbook && vscodeHost);
+  const available = Boolean(state.workbook && editable && !state.busy && !vscodeHost);
+  const readOnly = Boolean(state.workbook && !editable && !hostReadOnly);
   const reason = readOnly ? editReasonLabel(editState?.reason) : null;
-  const status = editable ? (editState.dirty ? "Modified" : "Available") : "Read-only";
+  const status = hostReadOnly
+    ? "Read-only"
+    : editable
+      ? editState.dirty
+        ? "Modified"
+        : "Available"
+      : "Read-only";
   elements["meta-editing"].textContent = state.workbook ? status : "-";
-  elements["meta-editing"].title = reason ?? status;
-  elements["meta-editing"].classList.toggle("dirty", Boolean(editState?.dirty));
+  elements["meta-editing"].title = hostReadOnly
+    ? "VS Code previews do not modify source workbooks."
+    : (reason ?? status);
+  elements["meta-editing"].classList.toggle(
+    "dirty",
+    Boolean(editState?.dirty && !hostReadOnly)
+  );
   elements["editing-reason"].hidden = !reason;
   elements["editing-reason"].textContent = reason ?? "";
   elements["edit-cell"].disabled = !available;
@@ -678,7 +884,7 @@ function updateEditUi() {
       control.removeAttribute("aria-describedby");
     }
   }
-  if (editable) {
+  if (editable && !vscodeHost) {
     elements["edit-cell"].title = "Edit cell";
     elements["document-properties"].title = "Document properties";
     elements["save-document"].title = "Download preserved workbook";
@@ -992,7 +1198,8 @@ async function saveWorkbookCopy() {
 
 function canEditWorkbook() {
   return Boolean(
-    state.client &&
+    !vscodeHost &&
+      state.client &&
       state.workbook &&
       !state.busy &&
       state.editState?.capability === "read-write"
@@ -1083,28 +1290,45 @@ function showEmpty() {
   updateEditUi();
 }
 
-function showError(error) {
-  elements["error-message"].textContent = describeError(error);
+function showError(error, reportToHost = true) {
+  const message = describeError(error);
+  elements["error-message"].textContent = message;
   elements["error-banner"].hidden = false;
+  if (reportToHost) {
+    postHostMessage({
+      type: "preview-error",
+      generation: state.hostGeneration,
+      code: String(error?.code ?? error?.name ?? "error"),
+      message
+    });
+  }
 }
 
 function dismissError() {
   elements["error-banner"].hidden = true;
 }
 
-function exportSvg() {
+function exportSvg(requestId = null) {
   if (!state.svgText) {
     return;
   }
-  downloadBlob(
-    new Blob([state.svgText], { type: "image/svg+xml;charset=utf-8" }),
-    `${exportBaseName()}.svg`
-  );
+  const fileName = `${exportBaseName()}.svg`;
+  if (vscodeHost) {
+    postHostMessage({
+      type: "export",
+      requestId,
+      kind: "svg",
+      fileName,
+      bytes: new TextEncoder().encode(state.svgText)
+    });
+  } else {
+    downloadBlob(new Blob([state.svgText], { type: "image/svg+xml;charset=utf-8" }), fileName);
+  }
   elements["status-message"].textContent = "SVG exported";
   elements["export-menu"].removeAttribute("open");
 }
 
-async function exportPng() {
+async function exportPng(requestId = null) {
   if (!state.svgElement) {
     return;
   }
@@ -1134,7 +1358,18 @@ async function exportPng() {
           "image/png"
         );
       });
-      downloadBlob(png, `${exportBaseName()}.png`);
+      const fileName = `${exportBaseName()}.png`;
+      if (vscodeHost) {
+        postHostMessage({
+          type: "export",
+          requestId,
+          kind: "png",
+          fileName,
+          bytes: new Uint8Array(await png.arrayBuffer())
+        });
+      } else {
+        downloadBlob(png, fileName);
+      }
       elements["status-message"].textContent = "PNG exported";
     } finally {
       URL.revokeObjectURL(sourceUrl);
@@ -1210,6 +1445,9 @@ function onKeyDown(event) {
     return;
   }
   if (key === "o") {
+    if (vscodeHost) {
+      return;
+    }
     event.preventDefault();
     chooseFile();
     return;
@@ -1266,6 +1504,8 @@ async function fetchJson(url) {
 
 export function viewerStateForTest() {
   return {
+    host: hostKind,
+    hostGeneration: state.hostGeneration,
     fileName: state.file?.name ?? null,
     source: state.file?.source ?? null,
     format: state.file ? extensionOf(state.file.name) : null,

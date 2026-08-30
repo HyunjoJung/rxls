@@ -18,6 +18,7 @@ exclude = [
     ".env.*",
     ".github/",
     "bindings/",
+    "extensions/",
     "fuzz/",
     "oss-fuzz/",
     "render/",

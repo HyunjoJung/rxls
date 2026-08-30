@@ -184,6 +184,13 @@ XLSX, XLSM, XLSB, ODS 파일을 확인할 수 있습니다. 선택한 파일은 
 VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다. XLS, XLSB, ODS는
 명시적으로 읽기 전용입니다.
 
+소스 워크스페이스에서는 별도 버전으로 관리되는 읽기 전용
+[VS Code 사용자 편집기(English)](extensions/vscode/README.md)도 빌드합니다.
+같은 로컬 worker를 사용해 XLS, XLSX, XLSM, XLSB, ODS의 시트·페이지 보기,
+확대·축소, 파일 변경 시 재로드, SVG/PNG 내보내기를 제공합니다. 워크북 바이트는
+extension host와 webview worker 밖으로 나가지 않으며 telemetry나 외부 네트워크
+클라이언트가 없습니다.
+
 ### 시연 영상
 
 | 한국어 시연 | 영어 시연 |
@@ -205,7 +212,7 @@ VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다.
 
 | 문서 | 내용 |
 |---|---|
-| [Compatibility](docs/compatibility.md) | 형식, Cargo 기능, 메타데이터, 내보내기, CLI, WASM, 로컬 MCP 지원 범위 |
+| [Compatibility](docs/compatibility.md) | 형식, Cargo 기능, 메타데이터, 내보내기, CLI, WASM, MCP, VS Code 지원 범위 |
 | [Preservation and editing](docs/preservation.md) | XLSX/XLSM 편집 가능 여부, atomicity, 보존 파트, 명시적 비지원 범위 |
 | [Validation and reproducibility](docs/validation.md) | 공개 코퍼스, oracle, 릴리스 증거, 재현 명령 |
 | [Format internals](docs/format-internals.md) | BIFF, 코드페이지, OOXML/ODS 파싱, 입력 한도와 실패 동작 |
@@ -242,7 +249,8 @@ VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다.
   문서 속성, 기능 목록, parse provenance를 담은 `WorkbookReport` JSON을
   제공합니다.
 - **이식 가능한 인터페이스:** 네이티브 CLI, 분리된 Node/브라우저 WASM
-  어댑터, 로컬 stdio MCP 서버가 같은 코어 모델을 사용합니다. MCP 세션은
+  어댑터, 로컬 stdio MCP 서버, 읽기 전용 VS Code 미리보기가 같은 코어 모델을
+  사용합니다. MCP 세션은
   허용 경로 안에서만 동작하고 구조화 결과를 반환하며 XLSX/XLSM 패키지를
   보존합니다. 워크북 바이트는 프로토콜 메시지나 네트워크로 나가지 않습니다.
 
@@ -264,8 +272,8 @@ bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 [MCP 서버 가이드(English)](bindings/mcp/README.md)에 정리되어 있습니다.
 
 현재 게시된 코어 릴리스는 `0.1.3`입니다. 렌더러,
-`@rxls/render-worker`, 로컬 MCP 서버는 별도 게이트로 관리되는 워크스페이스
-인터페이스이며 게시된 코어 크레이트 계약에는 포함되지 않습니다.
+`@rxls/render-worker`, 로컬 MCP 서버, VS Code 미리보기는 별도 게이트로 관리되는
+워크스페이스 인터페이스이며 게시된 코어 크레이트 계약에는 포함되지 않습니다.
 
 ## 기여
 

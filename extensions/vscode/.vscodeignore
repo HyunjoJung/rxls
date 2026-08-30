@@ -1,0 +1,13 @@
+src/**
+scripts/**
+test-fixtures/**
+target/**
+node_modules/**
+tsconfig.json
+package-lock.json
+.vscodeignore
+media/viewer/**/*.map
+media/icon.svg
+dist/test/**
+**/.DS_Store
+**/Thumbs.db

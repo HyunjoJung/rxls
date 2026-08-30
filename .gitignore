@@ -25,3 +25,8 @@ fuzz/artifacts/
 /viewer/public/THIRD_PARTY_NOTICES.txt
 /viewer/public/runtime/
 /viewer/public/samples/
+/extensions/vscode/.vscode-test/
+/extensions/vscode/dist/
+/extensions/vscode/media/viewer/
+/extensions/vscode/node_modules/
+/extensions/vscode/target/
