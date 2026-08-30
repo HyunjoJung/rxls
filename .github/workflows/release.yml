@@ -229,7 +229,9 @@ jobs:
             --ooxml target/release-ooxml-parity-full.txt \
             --xlsb target/release-xlsb-parity-full.txt \
             --ods target/release-ods-parity-full.txt \
-            --readme README.md
+            --readme README.md \
+            --readme-ko README.ko.md \
+            --validation-doc docs/validation.md
 
       - name: Smoke package-edited XLSM through LibreOffice
         shell: bash

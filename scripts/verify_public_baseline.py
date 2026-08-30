@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify public-corpus reports and README claims against one checked-in baseline."""
+"""Verify public-corpus reports and public docs against one checked-in baseline."""
 
 from __future__ import annotations
 
@@ -13,8 +13,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE = ROOT / "tests" / "oracles" / "public-corpus-baseline.json"
 SCHEMA = "rxls.public-corpus-baseline.v1"
-README_START = "<!-- public-corpus-baseline:start -->"
-README_END = "<!-- public-corpus-baseline:end -->"
+VALIDATION_START = "<!-- public-corpus-baseline:start -->"
+VALIDATION_END = "<!-- public-corpus-baseline:end -->"
+README_EN_START = "<!-- public-corpus-summary:en:start -->"
+README_EN_END = "<!-- public-corpus-summary:en:end -->"
+README_KO_START = "<!-- public-corpus-summary:ko:start -->"
+README_KO_END = "<!-- public-corpus-summary:ko:end -->"
 ORACLE_READERS = {
     "xls": "xlrd",
     "ooxml": "openpyxl",
@@ -174,13 +178,13 @@ def verify_parity(text: str, kind: str, expected: dict) -> list[str]:
     return errors
 
 
-def readme_block(baseline: dict) -> str:
+def validation_block(baseline: dict) -> str:
     corpus = baseline["corpus"]
     parity = baseline["parity"]
     by_ext = corpus["by_ext"]
     return "\n".join(
         [
-            README_START,
+            VALIDATION_START,
             f"**Current public-corpus gate ({baseline['as_of']}).** The pinned fetch recipe selects {corpus['manifest_files']}",
             f"files from Apache POI and calamine at immutable upstream commits: {by_ext['.xls']['files']} `.xls`,",
             f"{by_ext['.xlsx']['files']} `.xlsx`, {by_ext['.xlsm']['files']} `.xlsm`, {by_ext['.xlsb']['files']} `.xlsb`, and {by_ext['.ods']['files']} `.ods`. `rxls corpus-report` opens",
@@ -194,19 +198,103 @@ def readme_block(baseline: dict) -> str:
             f"| `.xlsx`/`.xlsm` vs `openpyxl` | {parity['ooxml']['comparable']} | {parity['ooxml']['mean_percent']:.3f}% mean parity; {parity['ooxml']['at_least_99']}/{parity['ooxml']['comparable']} at least 99% |",
             f"| `.xlsb` vs `pyxlsb` plus committed residual oracles | {parity['xlsb']['comparable']} | {parity['xlsb']['mean_percent']:.3f}% mean parity |",
             f"| `.ods` vs bounded ODF XML visible-text oracle | {parity['ods']['comparable']} | {parity['ods']['mean_percent']:.3f}% mean recall |",
-            README_END,
+            VALIDATION_END,
         ]
     )
 
 
+def _shared_summary_mean(baseline: dict) -> float:
+    means = {
+        float(baseline["parity"][kind]["mean_percent"])
+        for kind in ("xls", "ooxml", "xlsb", "ods")
+    }
+    if len(means) != 1:
+        raise ValueError("compact public-corpus summary requires one shared mean")
+    return means.pop()
+
+
+def readme_en_block(baseline: dict) -> str:
+    corpus = baseline["corpus"]
+    parity = baseline["parity"]
+    mean = _shared_summary_mean(baseline)
+    return "\n".join(
+        [
+            README_EN_START,
+            f"**Public corpus ({baseline['as_of']}):** {corpus['manifest_files']} files, {corpus['opened']} opened, {corpus['expected_rejections']} expected rejections,",
+            f"{corpus['unexpected_failures']} unexpected failures, and {corpus['unexpected_accepts']} unexpected accepts. Visible-value checks reached",
+            f"{mean:.3f}% mean parity or recall across {parity['xls']['comparable']} comparable `.xls`, {parity['ooxml']['comparable']}",
+            f"`.xlsx`/`.xlsm`, {parity['xlsb']['comparable']} `.xlsb`, and {parity['ods']['comparable']} `.ods` files.",
+            README_EN_END,
+        ]
+    )
+
+
+def readme_ko_block(baseline: dict) -> str:
+    corpus = baseline["corpus"]
+    parity = baseline["parity"]
+    mean = _shared_summary_mean(baseline)
+    return "\n".join(
+        [
+            README_KO_START,
+            f"**공개 코퍼스({baseline['as_of']}):** {corpus['manifest_files']}개 파일 중 {corpus['opened']}개를 열었고 {corpus['expected_rejections']}개는 예상된",
+            f"거절이었습니다. 예상 밖 실패는 {corpus['unexpected_failures']}건, 예상 밖 수용은 {corpus['unexpected_accepts']}건입니다. 표시 값 검증은",
+            f"비교 가능한 `.xls` {parity['xls']['comparable']}개, `.xlsx`/`.xlsm` {parity['ooxml']['comparable']}개, `.xlsb` {parity['xlsb']['comparable']}개,",
+            f"`.ods` {parity['ods']['comparable']}개에서 평균 일치율 또는 재현율 {mean:.3f}%를 기록했습니다.",
+            README_KO_END,
+        ]
+    )
+
+
+def _verify_document_block(
+    text: str,
+    expected: str,
+    start_marker: str,
+    end_marker: str,
+    label: str,
+) -> list[str]:
+    start_count = text.count(start_marker)
+    end_count = text.count(end_marker)
+    if start_count != 1 or end_count != 1:
+        return [
+            f"{label} public-corpus markers must appear exactly once "
+            f"(start={start_count}, end={end_count})"
+        ]
+    start = text.find(start_marker)
+    end = text.find(end_marker)
+    if end < start:
+        return [f"{label} public-corpus markers are out of order"]
+    actual = text[start : end + len(end_marker)]
+    return [] if actual == expected else [f"{label} public-corpus block differs from baseline"]
+
+
+def verify_validation_document(text: str, baseline: dict) -> list[str]:
+    return _verify_document_block(
+        text,
+        validation_block(baseline),
+        VALIDATION_START,
+        VALIDATION_END,
+        "validation document",
+    )
+
+
 def verify_readme(text: str, baseline: dict) -> list[str]:
-    expected = readme_block(baseline)
-    start = text.find(README_START)
-    end = text.find(README_END, start + len(README_START)) if start >= 0 else -1
-    if start < 0 or end < 0:
-        return ["README public-corpus baseline markers are missing"]
-    actual = text[start : end + len(README_END)]
-    return [] if actual == expected else ["README public-corpus block differs from baseline"]
+    return _verify_document_block(
+        text,
+        readme_en_block(baseline),
+        README_EN_START,
+        README_EN_END,
+        "English README",
+    )
+
+
+def verify_readme_ko(text: str, baseline: dict) -> list[str]:
+    return _verify_document_block(
+        text,
+        readme_ko_block(baseline),
+        README_KO_START,
+        README_KO_END,
+        "Korean README",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,12 +306,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--xlsb", type=Path)
     parser.add_argument("--ods", type=Path)
     parser.add_argument("--readme", type=Path)
+    parser.add_argument("--readme-ko", type=Path)
+    parser.add_argument("--validation-doc", type=Path)
     parser.add_argument("--render-readme", action="store_true")
+    parser.add_argument("--render-readme-ko", action="store_true")
+    parser.add_argument("--render-validation-doc", action="store_true")
     args = parser.parse_args(argv)
     try:
         baseline = load_baseline(args.baseline)
         if args.render_readme:
-            print(readme_block(baseline))
+            print(readme_en_block(baseline))
+            return 0
+        if args.render_readme_ko:
+            print(readme_ko_block(baseline))
+            return 0
+        if args.render_validation_doc:
+            print(validation_block(baseline))
             return 0
 
         errors: list[str] = []
@@ -243,6 +341,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
         if args.readme:
             errors.extend(verify_readme(args.readme.read_text(encoding="utf-8"), baseline))
+        if args.readme_ko:
+            errors.extend(
+                verify_readme_ko(args.readme_ko.read_text(encoding="utf-8"), baseline)
+            )
+        if args.validation_doc:
+            errors.extend(
+                verify_validation_document(
+                    args.validation_doc.read_text(encoding="utf-8"), baseline
+                )
+            )
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"public baseline: {error}", file=sys.stderr)
         return 2
