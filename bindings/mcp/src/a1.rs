@@ -36,7 +36,7 @@ impl CellRange {
         let cols = usize::from(end.col - start.col + 1);
         if rows.saturating_mul(cols) > MAX_RANGE_CELLS {
             return Err(format!(
-                "RXLS_MCP_RANGE_TOO_LARGE: at most {MAX_RANGE_CELLS} cells may be read"
+                "RXLS_MCP_RANGE_TOO_LARGE: at most {MAX_RANGE_CELLS} cells may be processed"
             ));
         }
         Ok(Self { start, end })

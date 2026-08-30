@@ -41,6 +41,7 @@ With no `--root`, the current directory is the only allowed root.
 | `workbook_list_sessions` | List active sessions and retained byte totals |
 | `workbook_inspect` | Inspect format, sheets, provenance, and edit capability |
 | `workbook_read_range` | Read up to 10,000 cells as typed structured output |
+| `workbook_compare` | Compare typed and displayed values across up to 10,000 cells |
 | `workbook_export_sheet` | Export bounded CSV, Markdown, or HTML |
 | `workbook_set_cells` | Atomically set values or write formulas to up to 100 cells |
 | `workbook_save_copy` | Publish a new same-format XLSX/XLSM copy without overwrite |
@@ -51,6 +52,9 @@ With no `--root`, the current directory is the only allowed root.
 - Existing paths and allowed roots are canonicalized before comparison.
 - Workbook inputs are capped at 32 MiB; four sessions may retain 128 MiB total.
 - One JSON-RPC line and one structured tool result are each capped at 1 MiB.
+- Range comparisons inspect at most 10,000 cells and return at most 100 detailed
+  differences within a 512 KiB detail budget, plus complete count and explicit
+  count/size truncation status.
 - Workbook data is accepted by local path only, never as base64 in MCP JSON.
 - XLS, XLSB, and ODS sessions are read-only. XLSX/XLSM edits require rxls's
   lossless retained-package capability.

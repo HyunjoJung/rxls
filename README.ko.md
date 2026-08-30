@@ -260,7 +260,7 @@ cargo build --release --manifest-path bindings/mcp/Cargo.toml --locked
 bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 ```
 
-8개 도구, 클라이언트 설정, 파일시스템 경계, 자원 제한은
+9개 도구, 클라이언트 설정, 파일시스템 경계, 자원 제한은
 [MCP 서버 가이드(English)](bindings/mcp/README.md)에 정리되어 있습니다.
 
 현재 게시된 코어 릴리스는 `0.1.3`입니다. 렌더러,

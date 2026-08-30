@@ -19,13 +19,15 @@ use sha2::{Digest, Sha256};
 
 use crate::a1::{format_cell, parse_cell, CellAddress, CellRange};
 use crate::model::{
-    CellEdit, CellResult, CloseSessionResult, ExportFormat, ExportSheetParams, ExportSheetResult,
+    CellDifference, CellEdit, CellResult, CloseSessionResult, CompareWorkbooksParams,
+    CompareWorkbooksResult, ComparedCell, ExportFormat, ExportSheetParams, ExportSheetResult,
     InputValue, InspectWorkbookResult, ListSessionsResult, OpenWorkbookParams, OpenWorkbookResult,
     ParseProvenanceResult, ReadRangeParams, ReadRangeResult, SaveCopyParams, SaveCopyResult,
     SessionParams, SessionSummary, SetCellsParams, SetCellsResult, SheetSummary, TypedCell,
 };
 use crate::{
-    MAX_BATCH_EDITS, MAX_OUTPUT_BYTES, MAX_SESSIONS, MAX_SESSION_BYTES, MAX_WORKBOOK_BYTES,
+    MAX_BATCH_EDITS, MAX_COMPARE_DETAIL_BYTES, MAX_COMPARE_DIFFERENCES, MAX_OUTPUT_BYTES,
+    MAX_SESSIONS, MAX_SESSION_BYTES, MAX_WORKBOOK_BYTES,
 };
 
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -438,6 +440,91 @@ impl RxlsMcpServer {
         })
     }
 
+    /// Compare a bounded A1 range across two open workbook sessions.
+    #[tool(
+        description = "Compare typed and displayed values for at most 10,000 matching worksheet cells",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn workbook_compare(
+        &self,
+        Parameters(params): Parameters<CompareWorkbooksParams>,
+    ) -> Result<Json<CompareWorkbooksResult>, String> {
+        let range = CellRange::parse(&params.range)?;
+        let state = self.state()?;
+        let left_session = find_session(&state, &params.left_session_id)?;
+        let right_session = find_session(&state, &params.right_session_id)?;
+        let left_sheet = find_worksheet(left_session.spreadsheet.workbook(), &params.left_sheet)?;
+        let right_sheet =
+            find_worksheet(right_session.spreadsheet.workbook(), &params.right_sheet)?;
+
+        let mut difference_count = 0usize;
+        let mut returned_detail_bytes = 0usize;
+        let mut truncated_by_count = false;
+        let mut truncated_by_size = false;
+        let mut differences = Vec::new();
+        for row in range.start.row..=range.end.row {
+            for col in range.start.col..=range.end.col {
+                if left_sheet.cell(row, col) == right_sheet.cell(row, col)
+                    && left_sheet.formatted(row, col) == right_sheet.formatted(row, col)
+                {
+                    continue;
+                }
+                difference_count = difference_count.saturating_add(1);
+                if differences.len() >= MAX_COMPARE_DIFFERENCES {
+                    truncated_by_count = true;
+                    continue;
+                }
+                let difference = CellDifference {
+                    address: format_cell(CellAddress { row, col }),
+                    row: row + 1,
+                    column: col + 1,
+                    left: compared_cell(left_sheet, row, col),
+                    right: compared_cell(right_sheet, row, col),
+                };
+                let detail_bytes = serde_json::to_vec(&difference)
+                    .map_err(|_| {
+                        error(
+                            "RXLS_MCP_SERIALIZE_FAILED",
+                            "comparison detail could not be serialized",
+                        )
+                    })?
+                    .len();
+                if returned_detail_bytes.saturating_add(detail_bytes) > MAX_COMPARE_DETAIL_BYTES {
+                    truncated_by_size = true;
+                    continue;
+                }
+                returned_detail_bytes += detail_bytes;
+                differences.push(difference);
+            }
+        }
+        let returned_differences = differences.len();
+        checked_json(CompareWorkbooksResult {
+            left_session_id: left_session.id.clone(),
+            left_sha256: left_session.current_sha256.clone(),
+            left_sheet: left_sheet.name.clone(),
+            right_session_id: right_session.id.clone(),
+            right_sha256: right_session.current_sha256.clone(),
+            right_sheet: right_sheet.name.clone(),
+            range: params.range,
+            compared_cells: range.cell_count(),
+            identical: difference_count == 0,
+            difference_count,
+            returned_differences,
+            max_returned_differences: MAX_COMPARE_DIFFERENCES,
+            returned_detail_bytes,
+            max_detail_bytes: MAX_COMPARE_DETAIL_BYTES,
+            differences_truncated: returned_differences < difference_count,
+            truncated_by_count,
+            truncated_by_size,
+            differences,
+        })
+    }
+
     /// Export one worksheet as bounded deterministic text.
     #[tool(
         description = "Export one worksheet as bounded CSV, Markdown, or HTML",
@@ -647,7 +734,7 @@ impl RxlsMcpServer {
 }
 
 #[tool_handler(
-    instructions = "Open a workbook first. Use the returned session_id for bounded reads, exports, preservation-aware XLSX/XLSM edits, save-copy, and close. All paths remain below server-configured roots."
+    instructions = "Open a workbook first. Use returned session IDs for bounded reads, comparisons, exports, preservation-aware XLSX/XLSM edits, save-copy, and close. All paths remain below server-configured roots."
 )]
 impl ServerHandler for RxlsMcpServer {}
 
@@ -830,6 +917,13 @@ fn typed_cell(cell: &Cell) -> TypedCell {
             formula: formula.clone(),
             cached: Box::new(typed_cell(cached)),
         },
+    }
+}
+
+fn compared_cell(sheet: &Sheet, row: u32, col: u16) -> ComparedCell {
+    ComparedCell {
+        value: sheet.cell(row, col).map(typed_cell),
+        display: sheet.formatted(row, col).map(str::to_string),
     }
 }
 
@@ -1059,6 +1153,39 @@ mod tests {
         fs::write(path, bytes).expect("write sample workbook");
     }
 
+    fn write_number_column_xlsx(path: &Path, offset: f64, cells: usize) {
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for row in 0..cells {
+            sheet.write_number(
+                u32::try_from(row).expect("test row fits in u32"),
+                0,
+                row as f64 + offset,
+            );
+        }
+        let bytes = workbook
+            .to_xlsx_checked()
+            .expect("author comparison workbook");
+        fs::write(path, bytes).expect("write comparison workbook");
+    }
+
+    fn write_text_column_xlsx(path: &Path, prefix: &str, cells: usize) {
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        let suffix = "x".repeat(20_000);
+        for row in 0..cells {
+            sheet.write_string(
+                u32::try_from(row).expect("test row fits in u32"),
+                0,
+                format!("{prefix}-{row:04}-{suffix}"),
+            );
+        }
+        let bytes = workbook
+            .to_xlsx_checked()
+            .expect("author long-text workbook");
+        fs::write(path, bytes).expect("write long-text workbook");
+    }
+
     fn server_for(root: &TempDir) -> RxlsMcpServer {
         RxlsMcpServer::new(
             ServerConfig::new(vec![root.path().to_path_buf()]).expect("configure server root"),
@@ -1209,8 +1336,96 @@ mod tests {
             .starts_with("RXLS_MCP_EDIT_LIMIT:"));
     }
 
+    #[test]
+    fn compares_bounded_ranges_and_reports_truncation() {
+        let root = TempDir::new().unwrap();
+        let left_path = root.path().join("left.xlsx");
+        let right_path = root.path().join("right.xlsx");
+        write_number_column_xlsx(&left_path, 0.0, 101);
+        write_number_column_xlsx(&right_path, 1.0, 101);
+        let server = server_for(&root);
+        let left = open_sample(&server, &left_path);
+        let right = open_sample(&server, &right_path);
+
+        let compared = server
+            .workbook_compare(Parameters(CompareWorkbooksParams {
+                left_session_id: left.session.session_id.clone(),
+                left_sheet: "Data".to_string(),
+                right_session_id: right.session.session_id,
+                right_sheet: "Data".to_string(),
+                range: "A1:A101".to_string(),
+            }))
+            .expect("compare workbooks")
+            .0;
+        assert!(!compared.identical);
+        assert_eq!(compared.compared_cells, 101);
+        assert_eq!(compared.difference_count, 101);
+        assert_eq!(compared.returned_differences, MAX_COMPARE_DIFFERENCES);
+        assert_eq!(compared.max_returned_differences, MAX_COMPARE_DIFFERENCES);
+        assert!(compared.returned_detail_bytes <= compared.max_detail_bytes);
+        assert!(compared.differences_truncated);
+        assert!(compared.truncated_by_count);
+        assert!(!compared.truncated_by_size);
+        assert_eq!(compared.differences.first().unwrap().address, "A1");
+        assert_eq!(compared.differences.last().unwrap().address, "A100");
+        assert!(matches!(
+            compared.differences[0].left.value,
+            Some(TypedCell::Number { value: 0.0 })
+        ));
+        assert!(matches!(
+            compared.differences[0].right.value,
+            Some(TypedCell::Number { value: 1.0 })
+        ));
+
+        let identical = server
+            .workbook_compare(Parameters(CompareWorkbooksParams {
+                left_session_id: left.session.session_id.clone(),
+                left_sheet: "Data".to_string(),
+                right_session_id: left.session.session_id,
+                right_sheet: "Data".to_string(),
+                range: "A1:A101".to_string(),
+            }))
+            .expect("compare identical session")
+            .0;
+        assert!(identical.identical);
+        assert_eq!(identical.difference_count, 0);
+        assert!(identical.differences.is_empty());
+        assert!(!identical.differences_truncated);
+        assert!(!identical.truncated_by_count);
+        assert!(!identical.truncated_by_size);
+    }
+
+    #[test]
+    fn comparison_detail_bytes_remain_bounded_for_long_cells() {
+        let root = TempDir::new().unwrap();
+        let left_path = root.path().join("long-left.xlsx");
+        let right_path = root.path().join("long-right.xlsx");
+        write_text_column_xlsx(&left_path, "left", 20);
+        write_text_column_xlsx(&right_path, "right", 20);
+        let server = server_for(&root);
+        let left = open_sample(&server, &left_path);
+        let right = open_sample(&server, &right_path);
+
+        let compared = server
+            .workbook_compare(Parameters(CompareWorkbooksParams {
+                left_session_id: left.session.session_id,
+                left_sheet: "Data".to_string(),
+                right_session_id: right.session.session_id,
+                right_sheet: "Data".to_string(),
+                range: "A1:A20".to_string(),
+            }))
+            .expect("compare long cells")
+            .0;
+        assert_eq!(compared.difference_count, 20);
+        assert!(compared.returned_differences < compared.difference_count);
+        assert!(compared.returned_detail_bytes <= MAX_COMPARE_DETAIL_BYTES);
+        assert!(compared.differences_truncated);
+        assert!(!compared.truncated_by_count);
+        assert!(compared.truncated_by_size);
+    }
+
     #[tokio::test]
-    async fn exposes_eight_tools_and_structured_results_over_mcp() {
+    async fn exposes_nine_tools_and_structured_results_over_mcp() {
         let root = TempDir::new().unwrap();
         let source = root.path().join("protocol.xlsx");
         write_sample_xlsx(&source);
@@ -1237,6 +1452,7 @@ mod tests {
             names,
             BTreeSet::from([
                 "workbook_close",
+                "workbook_compare",
                 "workbook_export_sheet",
                 "workbook_inspect",
                 "workbook_list_sessions",
@@ -1253,6 +1469,7 @@ mod tests {
                 .is_some_and(|annotations| annotations.open_world_hint == Some(false))
         }));
         for name in [
+            "workbook_compare",
             "workbook_export_sheet",
             "workbook_inspect",
             "workbook_list_sessions",
@@ -1287,6 +1504,35 @@ mod tests {
                 .and_then(|value| value.get("format"))
                 .and_then(serde_json::Value::as_str),
             Some("xlsx")
+        );
+        let session_id = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .expect("open result session ID");
+        let arguments = json!({
+            "left_session_id": session_id,
+            "left_sheet": "Data",
+            "right_session_id": session_id,
+            "right_sheet": "Data",
+            "range": "A1:B2"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let compared = client
+            .call_tool(CallToolRequestParams::new("workbook_compare").with_arguments(arguments))
+            .await
+            .expect("call workbook_compare");
+        assert_ne!(compared.is_error, Some(true));
+        assert_eq!(
+            compared
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("identical"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
 
         client.cancel().await.expect("cancel client");
