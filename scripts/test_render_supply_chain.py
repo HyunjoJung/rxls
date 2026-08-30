@@ -42,6 +42,92 @@ class RenderSupplyChainTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
         self.assertTrue(run.call_args.kwargs["text"])
 
+    def test_mcp_profile_covers_supported_native_targets(self) -> None:
+        profile = self.supply.PROFILE_CONFIGS["mcp"]
+        self.assertEqual(profile["crate_name"], "rxls-mcp")
+        self.assertEqual(profile["manifest"], Path("bindings/mcp/Cargo.toml"))
+        self.assertEqual(
+            profile["target"],
+            (
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ),
+        )
+
+    def test_mcp_legal_overrides_are_exactly_pinned(self) -> None:
+        expected = {
+            "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+            "url": (
+                "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
+                "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+            ),
+            "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+        }
+        self.assertEqual(self.supply.LEGAL_URL_OVERRIDES[("rmcp", "3.1.4")], expected)
+        self.assertEqual(
+            self.supply.LEGAL_URL_OVERRIDES[("rmcp-macros", "3.1.4")], expected
+        )
+
+    def test_native_metadata_merge_unions_target_filtered_edges(self) -> None:
+        linux = {
+            "packages": [{"id": "root"}, {"id": "dep"}],
+            "workspace_members": ["root"],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": "root",
+                        "deps": [
+                            {
+                                "name": "dep",
+                                "pkg": "dep",
+                                "dep_kinds": [{"kind": None, "target": "cfg(unix)"}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        windows = {
+            "packages": [{"id": "root"}, {"id": "dep"}, {"id": "win"}],
+            "workspace_members": ["root"],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": "root",
+                        "deps": [
+                            {
+                                "name": "dep",
+                                "pkg": "dep",
+                                "dep_kinds": [{"kind": None, "target": "cfg(windows)"}],
+                            },
+                            {
+                                "name": "win",
+                                "pkg": "win",
+                                "dep_kinds": [{"kind": None, "target": "cfg(windows)"}],
+                            },
+                        ],
+                    }
+                ]
+            },
+        }
+
+        merged = self.supply._merge_metadata([linux, windows])
+        self.assertEqual(
+            [package["id"] for package in merged["packages"]],
+            ["dep", "root", "win"],
+        )
+        root = next(node for node in merged["resolve"]["nodes"] if node["id"] == "root")
+        self.assertEqual([dependency["pkg"] for dependency in root["deps"]], ["dep", "win"])
+        dep = next(dependency for dependency in root["deps"] if dependency["pkg"] == "dep")
+        self.assertEqual(
+            {kind["target"] for kind in dep["dep_kinds"]},
+            {"cfg(unix)", "cfg(windows)"},
+        )
+
     def _write_crate(
         self,
         path: Path,

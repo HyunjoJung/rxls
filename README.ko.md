@@ -45,7 +45,7 @@ cargo add rxls@0.1.3 --features full
 
 네 가지 형식을 모두 읽으려면 `features = ["full"]`을 사용합니다. XLS 리더는
 항상 포함되고 XLSX/XLSM은 기본 기능으로 활성화됩니다. 형식, 메타데이터,
-Cargo 기능, CLI, 내보내기, WASM의 정확한 범위는
+Cargo 기능, CLI, 내보내기, WASM, 로컬 MCP의 정확한 범위는
 [Compatibility 문서](docs/compatibility.md)에서 확인할 수 있습니다. (English)
 
 ### 공통 읽기 인터페이스
@@ -198,14 +198,14 @@ VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다.
 ![rxls 아키텍처: 신뢰할 수 없는 바이트가 처리 범위가 제한된 형식 파서와 하나의 타입 모델을 거쳐 공개 인터페이스로 전달됨](.github/assets/rxls-architecture.png)
 
 형식별 파싱 결과는 하나의 타입 통합문서 모델로 모입니다. 라이브러리, CLI,
-내보내기, 진단, 편집, WASM 인터페이스가 이 모델을 함께 사용합니다. 구현
+내보내기, 진단, 편집, WASM, 로컬 MCP 인터페이스가 이 모델을 함께 사용합니다. 구현
 경계는 [Format internals](docs/format-internals.md)를 참고하십시오. (English)
 
 ## 문서
 
 | 문서 | 내용 |
 |---|---|
-| [Compatibility](docs/compatibility.md) | 형식, Cargo 기능, 메타데이터, 내보내기, CLI, WASM 지원 범위 |
+| [Compatibility](docs/compatibility.md) | 형식, Cargo 기능, 메타데이터, 내보내기, CLI, WASM, 로컬 MCP 지원 범위 |
 | [Preservation and editing](docs/preservation.md) | XLSX/XLSM 편집 가능 여부, atomicity, 보존 파트, 명시적 비지원 범위 |
 | [Validation and reproducibility](docs/validation.md) | 공개 코퍼스, oracle, 릴리스 증거, 재현 명령 |
 | [Format internals](docs/format-internals.md) | BIFF, 코드페이지, OOXML/ODS 파싱, 입력 한도와 실패 동작 |
@@ -241,9 +241,10 @@ VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다.
 - **내보내기와 진단:** CSV, HTML, Markdown 출력과 함께 시트·셀·수식 수,
   문서 속성, 기능 목록, parse provenance를 담은 `WorkbookReport` JSON을
   제공합니다.
-- **이식 가능한 인터페이스:** 네이티브 CLI와 분리된 Node/브라우저 WASM
-  어댑터가 같은 코어 모델을 사용합니다. WASM은 구조화된 `RxlsError`와 동기
-  32 MiB 입력 제한을 둡니다.
+- **이식 가능한 인터페이스:** 네이티브 CLI, 분리된 Node/브라우저 WASM
+  어댑터, 로컬 stdio MCP 서버가 같은 코어 모델을 사용합니다. MCP 세션은
+  허용 경로 안에서만 동작하고 구조화 결과를 반환하며 XLSX/XLSM 패키지를
+  보존합니다. 워크북 바이트는 프로토콜 메시지나 네트워크로 나가지 않습니다.
 
 ```sh
 cargo install rxls --version =0.1.3 --locked
@@ -252,9 +253,19 @@ rxls diagnose book.xlsx
 rxls csv book.xlsx --sheet 0 --max-output-bytes 1048576
 ```
 
-현재 게시된 코어 릴리스는 `0.1.3`입니다. 저장소에는 실험적인 렌더러와
-`@rxls/render-worker` 소스도 있지만, 별도 게이트로 관리되며 게시된 코어
-크레이트 계약에는 포함되지 않습니다.
+소스 워크스페이스에는 아직 별도 배포하지 않은 로컬 MCP 서버도 있습니다.
+
+```sh
+cargo build --release --manifest-path bindings/mcp/Cargo.toml --locked
+bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
+```
+
+8개 도구, 클라이언트 설정, 파일시스템 경계, 자원 제한은
+[MCP 서버 가이드(English)](bindings/mcp/README.md)에 정리되어 있습니다.
+
+현재 게시된 코어 릴리스는 `0.1.3`입니다. 렌더러,
+`@rxls/render-worker`, 로컬 MCP 서버는 별도 게이트로 관리되는 워크스페이스
+인터페이스이며 게시된 코어 크레이트 계약에는 포함되지 않습니다.
 
 ## 기여
 

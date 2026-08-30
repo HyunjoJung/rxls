@@ -85,12 +85,19 @@ class WorkflowPolicyTests(unittest.TestCase):
                         self.policy.audit_semver_gate(workflow_path.name, workflow)
                     )
 
-    def test_ci_keeps_cli_ods_feature_surface_warning_clean(self) -> None:
+    def test_ci_keeps_feature_and_mcp_surfaces_warning_clean(self) -> None:
         original = CI_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
             self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, original), []
         )
         for command in self.policy.ADDITIONAL_FEATURE_CLIPPY_COMMANDS:
+            with self.subTest(command=command):
+                removed = original.replace(command, "", 1)
+                self.assertNotEqual(removed, original)
+                self.assertTrue(
+                    self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, removed)
+                )
+        for command in self.policy.MCP_CI_COMMANDS:
             with self.subTest(command=command):
                 removed = original.replace(command, "", 1)
                 self.assertNotEqual(removed, original)
@@ -3811,7 +3818,7 @@ steps:
             self.policy.audit_codeql_workflow(Path("codeql.yml"), text), []
         )
 
-    def test_codeql_rejects_dropped_root_renderer_or_render_wasm_build(self) -> None:
+    def test_codeql_rejects_dropped_root_renderer_render_wasm_or_mcp_build(self) -> None:
         original = CODEQL_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
             "main_push_path_filter": original.replace(
@@ -3831,6 +3838,10 @@ steps:
                 "cargo build --manifest-path bindings/render-wasm/Cargo.toml \\\n"
                 "            --all-targets --locked",
                 "cargo build --manifest-path bindings/render-wasm/Cargo.toml --locked",
+            ),
+            "mcp": original.replace(
+                "cargo build --manifest-path bindings/mcp/Cargo.toml --all-targets --locked",
+                "cargo build --manifest-path bindings/mcp/Cargo.toml --locked",
             ),
             "autobuild": original.replace(
                 "      - name: Build",

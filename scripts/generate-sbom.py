@@ -21,7 +21,13 @@ def cargo_metadata(manifest_path: Path) -> dict[str, object]:
         "--manifest-path",
         str(manifest_path),
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
     return json.loads(completed.stdout)
 
 

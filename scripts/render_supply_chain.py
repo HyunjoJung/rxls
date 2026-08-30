@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate locked, path-neutral WASM dependency evidence."""
+"""Generate locked, path-neutral Cargo dependency evidence."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tarfile
 import tomllib
+import urllib.error
+import urllib.request
 
 
 CRATE_NAME = "rxls-render-wasm"
@@ -27,11 +29,29 @@ PROFILE_CONFIGS = {
         "crate_name": CRATE_NAME,
         "manifest": DEFAULT_MANIFEST,
         "notice_title": NOTICE_TITLE,
+        "target": TARGET,
+        "target_label": TARGET,
     },
     "core-wasm": {
         "crate_name": "rxls-wasm",
         "manifest": Path("bindings/wasm/Cargo.toml"),
         "notice_title": "RXLS WASM THIRD-PARTY NOTICES",
+        "target": TARGET,
+        "target_label": TARGET,
+    },
+    "mcp": {
+        "crate_name": "rxls-mcp",
+        "manifest": Path("bindings/mcp/Cargo.toml"),
+        "notice_title": "RXLS MCP THIRD-PARTY NOTICES",
+        "target": (
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ),
+        "target_label": "Linux, macOS, and Windows (x86_64/aarch64)",
     },
 }
 LEGAL_FILE_PREFIXES = (
@@ -45,6 +65,27 @@ LEGAL_FILE_PREFIXES = (
 MAX_LEGAL_FILE_BYTES = 512 * 1024
 MAX_NOTICE_BYTES = 512 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+LEGAL_URL_OVERRIDES = {
+    # rmcp 3.1.4 declares Apache-2.0 but its crates.io archive omits the
+    # workspace-root legal file. Pin the exact upstream release commit and
+    # content hash so a registry packaging omission cannot drop the notice.
+    ("rmcp", "3.1.4"): {
+        "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+        "url": (
+            "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
+            "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+        ),
+        "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+    },
+    ("rmcp-macros", "3.1.4"): {
+        "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+        "url": (
+            "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
+            "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+        ),
+        "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+    },
+}
 
 
 class SupplyChainError(ValueError):
@@ -55,18 +96,18 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def cargo_metadata(manifest_path: Path) -> dict[str, object]:
+def _cargo_metadata_one(manifest_path: Path, target: str | None) -> dict[str, object]:
     command = [
         "cargo",
         "metadata",
         "--format-version",
         "1",
         "--locked",
-        "--filter-platform",
-        TARGET,
         "--manifest-path",
         str(manifest_path),
     ]
+    if target is not None:
+        command[4:4] = ["--filter-platform", target]
     completed = subprocess.run(
         command,
         check=True,
@@ -78,6 +119,60 @@ def cargo_metadata(manifest_path: Path) -> dict[str, object]:
     if not isinstance(document, dict):
         raise SupplyChainError("cargo metadata must contain an object")
     return document
+
+
+def _merge_metadata(documents: list[dict[str, object]]) -> dict[str, object]:
+    if not documents:
+        raise SupplyChainError("at least one cargo metadata document is required")
+    packages: dict[str, dict[str, object]] = {}
+    workspace_members: set[str] = set()
+    node_dependencies: dict[str, dict[str, dict[str, object]]] = {}
+    for document in documents:
+        for package in document.get("packages", []):
+            packages[str(package["id"])] = package
+        workspace_members.update(str(item) for item in document.get("workspace_members", []))
+        resolve = document.get("resolve")
+        if not isinstance(resolve, dict):
+            raise SupplyChainError("cargo metadata is missing its resolved dependency graph")
+        for node in resolve.get("nodes", []):
+            package_id = str(node["id"])
+            dependencies = node_dependencies.setdefault(package_id, {})
+            for dependency in node.get("deps", []):
+                dependency_id = str(dependency["pkg"])
+                existing = dependencies.get(dependency_id)
+                if existing is None:
+                    dependencies[dependency_id] = dependency
+                    continue
+                known = {
+                    json.dumps(kind, sort_keys=True)
+                    for kind in existing.get("dep_kinds", [])
+                }
+                for kind in dependency.get("dep_kinds", []):
+                    encoded = json.dumps(kind, sort_keys=True)
+                    if encoded not in known:
+                        existing.setdefault("dep_kinds", []).append(kind)
+                        known.add(encoded)
+    nodes = [
+        {"id": package_id, "deps": list(sorted(dependencies.values(), key=lambda item: str(item["pkg"])))}
+        for package_id, dependencies in sorted(node_dependencies.items())
+    ]
+    return {
+        "packages": list(sorted(packages.values(), key=lambda item: str(item["id"]))),
+        "workspace_members": sorted(workspace_members),
+        "resolve": {"nodes": nodes},
+    }
+
+
+def cargo_metadata(
+    manifest_path: Path,
+    *,
+    target: str | tuple[str, ...] | None = TARGET,
+) -> dict[str, object]:
+    if isinstance(target, tuple):
+        return _merge_metadata(
+            [_cargo_metadata_one(manifest_path, item) for item in target]
+        )
+    return _cargo_metadata_one(manifest_path, target)
 
 
 def cargo_lock(manifest_path: Path) -> tuple[dict[str, object], str]:
@@ -247,6 +342,30 @@ def _declared_license_path(package: dict[str, object]) -> str | None:
     return "/".join(parts)
 
 
+def _legal_url_override(package: dict[str, object]) -> tuple[str, bytes] | None:
+    identity = (str(package["name"]), str(package["version"]))
+    override = LEGAL_URL_OVERRIDES.get(identity)
+    if override is None:
+        return None
+    request = urllib.request.Request(
+        str(override["url"]),
+        headers={"User-Agent": "rxls-supply-chain-audit"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read(MAX_LEGAL_FILE_BYTES + 1)
+    if not payload or len(payload) > MAX_LEGAL_FILE_BYTES:
+        raise SupplyChainError(f"{_package_identity(package)} legal override is invalid")
+    if sha256_bytes(payload) != override["sha256"]:
+        raise SupplyChainError(
+            f"{_package_identity(package)} legal override differs from its pinned hash"
+        )
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SupplyChainError("legal override must be UTF-8") from error
+    return str(override["name"]), payload
+
+
 def _legal_files(
     package: dict[str, object], expected_checksum: str
 ) -> list[tuple[str, bytes]]:
@@ -295,6 +414,9 @@ def _legal_files(
                 candidates[relative] = member
 
             if not candidates:
+                override = _legal_url_override(package)
+                if override is not None:
+                    return [override]
                 raise SupplyChainError(
                     f"{identity} has no distributable legal file in its registry archive"
                 )
@@ -336,6 +458,7 @@ def render_notice(
     crate_name: str = CRATE_NAME,
     manifest_label: Path = DEFAULT_MANIFEST,
     notice_title: str = NOTICE_TITLE,
+    target_label: str = TARGET,
 ) -> tuple[str, dict[str, int]]:
     _, closure, _ = production_closure(metadata, crate_name=crate_name)
     third_party = sorted(
@@ -368,23 +491,34 @@ def render_notice(
         package_checksums[identity] = checksum
 
     separator = "=" * 79
+    if target_label == TARGET:
+        notice_scope = [
+            "The npm package has no npm runtime dependencies. This notice conservatively",
+            "covers every third-party crate reachable through normal Cargo edges used to",
+            "produce the WebAssembly artifact, including proc-macro support. Legal-file",
+            "text is identified and deduplicated by raw SHA-256. Embedded legal text is",
+            "normalized from CRLF or CR to LF for deterministic display; framing and",
+        ]
+    else:
+        notice_scope = [
+            "This notice conservatively covers every third-party crate reachable through",
+            "normal Cargo edges for supported native targets, including proc-macro support.",
+            "Legal-file text is identified and deduplicated by raw SHA-256. Embedded legal",
+            "text is normalized from CRLF or CR to LF for deterministic display; framing and",
+        ]
     lines = [
         notice_title,
         f"Generated by {GENERATOR}. Do not edit manually.",
         "",
         "Scope:",
         f"- Manifest: {manifest_label.as_posix()}",
-        f"- Target: {TARGET}",
+        f"- Target: {target_label}",
         "- Dependency edges: Cargo normal edges for the production target",
         f"- Cargo lock SHA-256: {lock_sha256}",
         f"- Third-party packages: {len(third_party)}",
         f"- Unique legal texts: {len(legal_payloads)}",
         "",
-        "The npm package has no npm runtime dependencies. This notice conservatively",
-        "covers every third-party crate reachable through normal Cargo edges used to",
-        "produce the WebAssembly artifact, including proc-macro support. Legal-file",
-        "text is identified and deduplicated by raw SHA-256. Embedded legal text is",
-        "normalized from CRLF or CR to LF for deterministic display; framing and",
+        *notice_scope,
         "line-break normalization are not part of the referenced legal-file bytes.",
         "",
     ]
@@ -406,6 +540,9 @@ def render_notice(
                 "Legal files:",
             ]
         )
+        override = LEGAL_URL_OVERRIDES.get(identity)
+        if override is not None:
+            lines.append(f"Pinned legal source: {override['url']}")
         for filename, digest in package_legal_files[identity]:
             lines.append(f"- {filename}: {digest}")
         lines.append("")
@@ -482,6 +619,7 @@ def make_sbom(
     lock_sha256: str,
     *,
     crate_name: str = CRATE_NAME,
+    target_label: str = TARGET,
 ) -> dict[str, object]:
     root_id, closure, adjacency = production_closure(metadata, crate_name=crate_name)
     lock_index = _lock_index(lock)
@@ -518,7 +656,7 @@ def make_sbom(
                 {"name": "rxls:dependency-edges", "value": "normal"},
                 {"name": "rxls:generator", "value": GENERATOR},
                 {"name": "rxls:locked", "value": "true"},
-                {"name": "rxls:target", "value": TARGET},
+                {"name": "rxls:target", "value": target_label},
             ],
         },
         "components": components,
@@ -532,8 +670,15 @@ def render_sbom(
     lock_sha256: str,
     *,
     crate_name: str = CRATE_NAME,
+    target_label: str = TARGET,
 ) -> tuple[str, dict[str, int]]:
-    document = make_sbom(metadata, lock, lock_sha256, crate_name=crate_name)
+    document = make_sbom(
+        metadata,
+        lock,
+        lock_sha256,
+        crate_name=crate_name,
+        target_label=target_label,
+    )
     rendered = json.dumps(document, indent=2, sort_keys=True) + "\n"
     if "file://" in rendered or re.search(r"/(?:Users|home)/[^/\s]+/", rendered):
         raise SupplyChainError("CycloneDX evidence contains a host path")
@@ -543,8 +688,12 @@ def render_sbom(
     }
 
 
-def _inputs(manifest_path: Path) -> tuple[dict[str, object], dict[str, object], str]:
-    metadata = cargo_metadata(manifest_path)
+def _inputs(
+    manifest_path: Path,
+    *,
+    target: str | tuple[str, ...] | None = TARGET,
+) -> tuple[dict[str, object], dict[str, object], str]:
+    metadata = cargo_metadata(manifest_path, target=target)
     lock, lock_sha256 = cargo_lock(manifest_path)
     return metadata, lock, lock_sha256
 
@@ -585,7 +734,11 @@ def main(argv: list[str] | None = None) -> int:
         profile = PROFILE_CONFIGS[args.profile]
         default_manifest = Path(profile["manifest"])
         manifest_path = args.manifest_path or default_manifest
-        metadata, lock, lock_sha256 = _inputs(manifest_path)
+        target = profile["target"]
+        metadata, lock, lock_sha256 = _inputs(
+            manifest_path,
+            target=target if isinstance(target, (str, tuple)) else None,
+        )
         if args.command == "notice":
             rendered, summary = render_notice(
                 metadata,
@@ -594,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
                 crate_name=str(profile["crate_name"]),
                 manifest_label=default_manifest,
                 notice_title=str(profile["notice_title"]),
+                target_label=str(profile["target_label"]),
             )
         else:
             rendered, summary = render_sbom(
@@ -601,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
                 lock,
                 lock_sha256,
                 crate_name=str(profile["crate_name"]),
+                target_label=str(profile["target_label"]),
             )
         _write_or_check(
             rendered,
@@ -616,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         UnicodeDecodeError,
         ValueError,
         subprocess.CalledProcessError,
+        urllib.error.URLError,
         json.JSONDecodeError,
         tomllib.TOMLDecodeError,
     ) as error:

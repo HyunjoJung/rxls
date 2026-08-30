@@ -96,7 +96,7 @@ Styles are interned into deduplicated OOXML resource tables. Writer features
 are checked by in-tree `openpyxl` gates. Pivot tables, threaded comments, macro
 creation, and authoring formats other than XLSX are outside the current scope.
 
-## Export, diagnostics, CLI, and WASM
+## Export, diagnostics, CLI, WASM, and MCP
 
 A sheet or workbook can be exported to CSV, HTML, or Markdown. CSV export has
 an explicit formula-text policy for callers that will open output in
@@ -114,9 +114,21 @@ and browser entry points, TypeScript declarations, structured `RxlsError`
 objects, and a synchronous 32 MiB input limit. It is built and distributed
 separately from the native CLI.
 
-The source workspace also contains an experimental renderer and
-`@rxls/render-worker`. They are not included in the published core crate and do
-not extend the read, write, edit, CLI, or core WASM compatibility claims.
+The isolated `bindings/mcp` crate exposes eight local stdio tools for opening,
+inspecting, reading, exporting, preservation-editing, save-copying, and closing
+workbook sessions. It accepts paths rather than workbook bytes, canonicalizes
+them below one or more configured roots, and opens no network listener. One
+workbook is capped at 32 MiB, four sessions at 128 MiB of current package bytes,
+one range at 10,000 cells, one edit batch at 100 cells, and each JSON-RPC line
+and structured result at 1 MiB. XLS, XLSB, and ODS are read-only; only retained
+XLSX/XLSM sessions with `EditCapability::ReadWrite` can mutate or save. The MCP
+crate is currently built from the source workspace and is not independently
+published.
+
+The source workspace also contains an experimental renderer,
+`@rxls/render-worker`, and the local MCP server. They are not included in the
+published core crate and do not extend the read, write, edit, CLI, or core WASM
+compatibility claims.
 The worker keeps retained workbook bytes inside its dedicated session. For
 editable XLSX/XLSM packages it exposes typed cell inspection, cell value or
 formula replacement, document-property replacement, undo/redo, and preserved

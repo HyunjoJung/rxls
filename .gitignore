@@ -4,6 +4,7 @@
 .env.*
 !.env.example
 bindings/wasm/target
+bindings/mcp/target
 render/target
 fuzz/target
 fuzz/Cargo.lock
