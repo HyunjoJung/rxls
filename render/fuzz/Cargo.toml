@@ -14,7 +14,7 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = "=1.4.2"
-libfuzzer-sys = "=0.4.10"
+libfuzzer-sys = "=0.4.13"
 
 [dependencies.rxls]
 path = "../.."
