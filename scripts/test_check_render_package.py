@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -36,12 +38,25 @@ class RenderPackageTests(unittest.TestCase):
             "version": "0.1.2",
             "type": "module",
             "description": "test package",
+            "author": {
+                "name": "Hyunjo Jung",
+                "url": "https://github.com/HyunjoJung",
+            },
             "license": "MIT",
             "repository": {
                 "type": "git",
                 "url": "git+https://github.com/HyunjoJung/rxls.git",
                 "directory": "bindings/render-wasm",
             },
+            "homepage": "https://hyunjojung.github.io/rxls/",
+            "keywords": [
+                "excel",
+                "spreadsheet",
+                "rust",
+                "wasm",
+                "worker",
+                "rendering",
+            ],
             "publishConfig": {"access": "public", "provenance": True},
             "files": [
                 "js/",
@@ -50,12 +65,8 @@ class RenderPackageTests(unittest.TestCase):
                 "LICENSE",
                 "THIRD_PARTY_NOTICES.txt",
             ],
-            "exports": {
-                ".": "./js/client.mjs",
-                "./protocol": "./js/protocol.mjs",
-                "./worker-runtime": "./js/worker-runtime.mjs",
-                "./worker": "./js/worker.mjs",
-            },
+            "types": "./js/client.d.mts",
+            "exports": self.checker.EXPECTED_EXPORTS,
             "scripts": {"test": "node --test"},
             "engines": {"node": ">=20"},
         }
@@ -63,16 +74,18 @@ class RenderPackageTests(unittest.TestCase):
             "LICENSE": b"MIT License\n",
             "README.md": b"# package\n",
             "THIRD_PARTY_NOTICES.txt": self._notice(),
-            "js/client.mjs": b"export class RenderWorkerClient {}\n",
-            "js/protocol.mjs": b"export const PROTOCOL = 'rxls.render-worker.v1';\n",
-            "js/worker-runtime.mjs": b"export class WorkerRuntime {}\n",
-            "js/worker.mjs": b"export {};\n",
             "package.json": (json.dumps(metadata, indent=2) + "\n").encode(),
             "pkg/rxls_render_wasm.d.ts": b"export function capabilities(): string;\n",
             "pkg/rxls_render_wasm.js": b"export function capabilities() {}\n",
             "pkg/rxls_render_wasm_bg.wasm": b"\0asm\x01\0\0\0",
             "pkg/rxls_render_wasm_bg.wasm.d.ts": b"export {};\n",
         }
+        source_root = ROOT / "bindings" / "render-wasm"
+        for relative in (
+            *self.checker.DECLARATION_MODULES.keys(),
+            *self.checker.DECLARATION_MODULES.values(),
+        ):
+            files[relative] = (source_root / relative).read_bytes()
         for relative, payload in files.items():
             path = package / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,10 +134,16 @@ publish = false
         *,
         extra: tuple[str, bytes] | None = None,
         symlink: bool = False,
+        directory: bool = False,
+        bomb: bool = False,
+        unsafe_bomb: bool = False,
+        omit: str | None = None,
     ) -> Path:
         archive = root / "rxls-render-worker-0.1.2.tgz"
         with tarfile.open(archive, "w:gz") as output:
             for relative in sorted(self.checker.EXPECTED_FILES):
+                if relative == omit:
+                    continue
                 output.add(package / relative, arcname=f"package/{relative}")
             if extra is not None:
                 name, payload = extra
@@ -136,24 +155,82 @@ publish = false
                 info.type = tarfile.SYMTYPE
                 info.linkname = "/etc/passwd"
                 output.addfile(info)
+            if directory:
+                info = tarfile.TarInfo("package/private/")
+                info.type = tarfile.DIRTYPE
+                output.addfile(info)
+            if bomb:
+                payload = b"\0" * (self.checker.MAX_UNPACKED_BYTES + 1)
+                info = tarfile.TarInfo("package/bomb.bin")
+                info.size = len(payload)
+                output.addfile(info, io.BytesIO(payload))
+            if unsafe_bomb:
+                payload = b"\0" * (self.checker.MAX_UNPACKED_BYTES + 1)
+                info = tarfile.TarInfo("package/../bomb.bin")
+                info.size = len(payload)
+                output.addfile(info, io.BytesIO(payload))
         return archive
+
+    def _receipt(self, root: Path, package: Path, archive: Path) -> Path:
+        payload = archive.read_bytes()
+        receipt = root / "npm-pack.json"
+        receipt.write_text(
+            json.dumps(
+                [
+                    {
+                        "name": "@rxls/render-worker",
+                        "version": "0.1.2",
+                        "filename": archive.name,
+                        "size": len(payload),
+                        "unpackedSize": sum(
+                            (package / relative).stat().st_size
+                            for relative in self.checker.EXPECTED_FILES
+                        ),
+                        "shasum": hashlib.sha1(payload).hexdigest(),
+                        "integrity": "sha512-"
+                        + base64.b64encode(hashlib.sha512(payload).digest()).decode(
+                            "ascii"
+                        ),
+                        "entryCount": len(self.checker.EXPECTED_FILES),
+                    }
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return receipt
 
     def test_accepts_exact_dependency_free_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = self._package(root)
             archive = self._archive(root, package)
+            receipt = self._receipt(root, package, archive)
 
             errors, report = self.checker.validate(
-                package, archive, git_rev="a" * 40
+                package, archive, git_rev="a" * 40, npm_pack=receipt
             )
+            receipt_sha256 = self.checker._sha256(receipt)
 
         self.assertEqual(errors, [])
         self.assertTrue(report["passed"])
         self.assertEqual(set(report["files"]), self.checker.EXPECTED_FILES)
         self.assertEqual(report["git_rev"], "a" * 40)
+        self.assertEqual(report["npm_pack"]["sha256"], receipt_sha256)
         self.assertEqual(report["third_party_notice"]["packages"], 1)
         self.assertEqual(report["third_party_notice"]["legal_texts"], 1)
+        self.assertEqual(
+            {
+                path
+                for path in report["files"]
+                if path.endswith(".d.mts")
+            },
+            set(self.checker.DECLARATION_MODULES.values()),
+        )
+        self.assertEqual(
+            report["budgets"]["declaration_bytes_per_file"],
+            self.checker.MAX_DECLARATION_BYTES,
+        )
 
     def test_rejects_version_and_repository_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -172,6 +249,88 @@ publish = false
         self.assertTrue(any("versions must match" in error for error in errors))
         self.assertTrue(any("public source directory" in error for error in errors))
 
+    def test_rejects_public_maintainer_and_discovery_metadata_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            metadata_path = package / "package.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["author"]["url"] = "https://example.invalid/maintainer"
+            metadata["homepage"] = "https://example.invalid/product"
+            metadata["keywords"] = ["spreadsheet"]
+            metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            archive = self._archive(root, package)
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("public maintainer" in error for error in errors))
+        self.assertTrue(any("public viewer" in error for error in errors))
+        self.assertTrue(any("public rendering role" in error for error in errors))
+
+    def test_rejects_missing_or_misordered_type_conditions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            metadata_path = package / "package.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.pop("types")
+            root_export = metadata["exports"]["."]
+            metadata["exports"]["."] = {
+                "import": root_export["import"],
+                "types": root_export["types"],
+                "default": root_export["default"],
+            }
+            metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            archive = self._archive(root, package)
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("root types" in error for error in errors))
+        self.assertTrue(any("conditions must order types" in error for error in errors))
+
+    def test_rejects_declaration_runtime_export_drift_and_any(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            client_types = package / "js" / "client.d.mts"
+            client_types.write_text(
+                client_types.read_text(encoding="utf-8").replace(
+                    "export declare class RenderWorkerClient",
+                    "export declare class MissingClient",
+                ),
+                encoding="utf-8",
+            )
+            worker_types = package / "js" / "worker.d.mts"
+            worker_types.write_text(
+                "export type Unsafe = any;\nexport {};\n",
+                encoding="utf-8",
+            )
+            archive = self._archive(root, package)
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("runtime declarations differ" in error for error in errors))
+        self.assertTrue(any("must not expose any" in error for error in errors))
+
+    def test_rejects_missing_packed_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            archive = self._archive(root, package, omit="js/protocol.d.mts")
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(
+            any("missing file: js/protocol.d.mts" in error for error in errors)
+        )
+        self.assertTrue(
+            any("missing declaration module: js/protocol.d.mts" in error for error in errors)
+        )
+
     def test_rejects_unexpected_and_non_file_archive_members(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -185,6 +344,46 @@ publish = false
         self.assertFalse(report["passed"])
         self.assertTrue(any("unexpected file: private.txt" in error for error in errors))
         self.assertTrue(any("non-file member: pkg/link" in error for error in errors))
+
+    def test_rejects_directory_header_and_compressed_expansion_bomb(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            archive = self._archive(root, package, directory=True, bomb=True)
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("non-file member: private" in error for error in errors))
+        self.assertTrue(any("expands to more than" in error for error in errors))
+
+    def test_rejects_unsafe_expansion_before_skipping_the_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            archive = self._archive(root, package, unsafe_bomb=True)
+
+            errors, report = self.checker.validate(package, archive)
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("expands to more than" in error for error in errors))
+
+    def test_rejects_stale_npm_pack_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._package(root)
+            archive = self._archive(root, package)
+            receipt = self._receipt(root, package, archive)
+            document = json.loads(receipt.read_text(encoding="utf-8"))
+            document[0]["integrity"] = "sha512-stale"
+            receipt.write_text(json.dumps(document) + "\n", encoding="utf-8")
+
+            errors, report = self.checker.validate(
+                package, archive, npm_pack=receipt
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("receipt differs: integrity" in error for error in errors))
 
     def test_rejects_invalid_wasm_and_git_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

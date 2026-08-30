@@ -44,26 +44,13 @@ class BrowserEvidenceTests(unittest.TestCase):
                         "version": "0.1.3",
                         "filename": self.archive.name,
                         "size": len(archive),
-                        "unpackedSize": 12,
+                        "unpackedSize": len(MODULE.EXPECTED_PACKAGE_FILES),
                         "shasum": hashlib.sha1(archive).hexdigest(),
                         "integrity": f"sha512-{integrity}",
-                        "entryCount": 12,
+                        "entryCount": len(MODULE.EXPECTED_PACKAGE_FILES),
                         "files": [
                             {"path": path, "size": 1}
-                            for path in (
-                                "LICENSE",
-                                "README.md",
-                                "THIRD_PARTY_NOTICES.txt",
-                                "js/client.mjs",
-                                "js/protocol.mjs",
-                                "js/worker-runtime.mjs",
-                                "js/worker.mjs",
-                                "package.json",
-                                "pkg/rxls_render_wasm.js",
-                                "pkg/rxls_render_wasm_bg.wasm",
-                                "pkg/rxls_render_wasm_bg.wasm.d.ts",
-                                "pkg/rxls_render_wasm.d.ts",
-                            )
+                            for path in sorted(MODULE.EXPECTED_PACKAGE_FILES)
                         ],
                     }
                 ],
@@ -306,7 +293,10 @@ class BrowserEvidenceTests(unittest.TestCase):
         summary = self._summary()
         self.assertEqual(summary["schema"], MODULE.SCHEMA)
         self.assertEqual(summary["head_sha"], HEAD_SHA)
-        self.assertEqual(summary["package"]["entry_count"], 12)
+        self.assertEqual(
+            summary["package"]["entry_count"],
+            len(MODULE.EXPECTED_PACKAGE_FILES),
+        )
         self.assertTrue(summary["behavior"]["source_installed_equal"])
         self.assertEqual(
             summary["modes"]["source"]["behavior_sha256"],

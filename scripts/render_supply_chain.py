@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Generate locked, path-neutral render-worker dependency evidence."""
+"""Generate locked, path-neutral WASM dependency evidence."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import tomllib
-from typing import Callable
 
 
 CRATE_NAME = "rxls-render-wasm"
@@ -20,6 +22,18 @@ DEFAULT_NOTICE = Path("bindings/render-wasm/THIRD_PARTY_NOTICES.txt")
 TARGET = "wasm32-unknown-unknown"
 GENERATOR = "scripts/render_supply_chain.py"
 NOTICE_TITLE = "RXLS RENDER WORKER THIRD-PARTY NOTICES"
+PROFILE_CONFIGS = {
+    "render-worker": {
+        "crate_name": CRATE_NAME,
+        "manifest": DEFAULT_MANIFEST,
+        "notice_title": NOTICE_TITLE,
+    },
+    "core-wasm": {
+        "crate_name": "rxls-wasm",
+        "manifest": Path("bindings/wasm/Cargo.toml"),
+        "notice_title": "RXLS WASM THIRD-PARTY NOTICES",
+    },
+}
 LEGAL_FILE_PREFIXES = (
     "license",
     "licence",
@@ -86,6 +100,8 @@ def _normal_dependencies(node: dict[str, object]) -> list[str]:
 
 def production_closure(
     metadata: dict[str, object],
+    *,
+    crate_name: str = CRATE_NAME,
 ) -> tuple[str, dict[str, dict[str, object]], dict[str, list[str]]]:
     packages = {
         str(package["id"]): package for package in metadata.get("packages", [])
@@ -94,10 +110,10 @@ def production_closure(
     roots = [
         item
         for item in workspace_members
-        if packages.get(item, {}).get("name") == CRATE_NAME
+        if packages.get(item, {}).get("name") == crate_name
     ]
     if len(roots) != 1:
-        raise SupplyChainError(f"expected exactly one {CRATE_NAME} workspace root")
+        raise SupplyChainError(f"expected exactly one {crate_name} workspace root")
     resolve = metadata.get("resolve")
     if not isinstance(resolve, dict):
         raise SupplyChainError("cargo metadata is missing its resolved dependency graph")
@@ -148,40 +164,160 @@ def _package_lock_entry(package: dict[str, object], index: dict) -> dict:
     return entry
 
 
-def _legal_files(package: dict[str, object]) -> list[tuple[str, bytes]]:
-    package_root = Path(str(package["manifest_path"])).resolve().parent
-    candidates: dict[str, Path] = {}
-    for candidate in package_root.iterdir():
-        lowered = candidate.name.lower()
-        if candidate.is_file() and lowered.startswith(LEGAL_FILE_PREFIXES):
-            candidates[candidate.name] = candidate
-    declared = package.get("license_file")
-    if declared:
-        candidate = Path(str(declared)).resolve()
+def _package_identity(package: dict[str, object]) -> str:
+    return f"{package['name']} {package['version']}"
+
+
+def _registry_archive_candidates(package: dict[str, object]) -> list[Path]:
+    archive_name = f"{package['name']}-{package['version']}.crate"
+    manifest = Path(str(package["manifest_path"]))
+    if not manifest.is_absolute():
+        manifest = Path(os.path.abspath(manifest))
+    package_root = manifest.parent
+    candidates: list[Path] = []
+
+    registry_id = package_root.parent
+    registry_src = registry_id.parent
+    registry_root = registry_src.parent
+    if registry_src.name == "src" and registry_root.name == "registry":
+        candidates.append(
+            registry_root / "cache" / registry_id.name / archive_name
+        )
+
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    cache_root = cargo_home / "registry" / "cache"
+    if cache_root.is_dir():
+        candidates.extend(cache_root.glob(f"*/{archive_name}"))
+
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        unique.setdefault(os.path.abspath(candidate), candidate)
+    return [unique[key] for key in sorted(unique)]
+
+
+def _verified_registry_archive(
+    package: dict[str, object], expected_checksum: str
+) -> bytes:
+    identity = _package_identity(package)
+    source = package.get("source")
+    if not isinstance(source, str) or not source.startswith("registry+"):
+        raise SupplyChainError(f"{identity} is not a Cargo registry dependency")
+    if SHA256_RE.fullmatch(expected_checksum) is None:
+        raise SupplyChainError(f"{identity} lacks a locked registry checksum")
+
+    found = False
+    unreadable = False
+    for candidate in _registry_archive_candidates(package):
+        if not candidate.is_file():
+            continue
+        found = True
         try:
-            relative = candidate.relative_to(package_root).as_posix()
+            payload = candidate.read_bytes()
+        except OSError:
+            unreadable = True
+            continue
+        if sha256_bytes(payload) == expected_checksum:
+            return payload
+    if unreadable:
+        raise SupplyChainError(f"{identity} registry archive cannot be read")
+    if found:
+        raise SupplyChainError(
+            f"{identity} registry archive checksum differs from Cargo.lock"
+        )
+    raise SupplyChainError(f"{identity} registry archive is missing")
+
+
+def _declared_license_path(package: dict[str, object]) -> str | None:
+    declared = package.get("license_file")
+    if not declared:
+        return None
+    manifest = Path(str(package["manifest_path"]))
+    if not manifest.is_absolute():
+        manifest = Path(os.path.abspath(manifest))
+    package_root = manifest.parent
+    candidate = Path(str(declared))
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.relative_to(package_root)
         except ValueError as error:
             raise SupplyChainError("crate license_file escapes its package root") from error
-        if not candidate.is_file():
-            raise SupplyChainError("crate license_file is missing")
-        candidates[relative] = candidate
-    if not candidates:
-        raise SupplyChainError(
-            f"{package['name']} {package['version']} has no distributable legal file"
-        )
-    result: list[tuple[str, bytes]] = []
-    for name, path in sorted(candidates.items()):
-        payload = path.read_bytes()
-        if not payload or len(payload) > MAX_LEGAL_FILE_BYTES:
-            raise SupplyChainError(
-                f"{package['name']} {package['version']} has an invalid legal file"
-            )
-        try:
-            payload.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise SupplyChainError("crate legal files must be UTF-8") from error
-        result.append((name, payload))
-    return result
+    parts = candidate.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise SupplyChainError("crate license_file is not a safe package path")
+    return "/".join(parts)
+
+
+def _legal_files(
+    package: dict[str, object], expected_checksum: str
+) -> list[tuple[str, bytes]]:
+    payload = _verified_registry_archive(package, expected_checksum)
+    identity = _package_identity(package)
+    archive_root = f"{package['name']}-{package['version']}"
+    declared = _declared_license_path(package)
+    candidates: dict[str, tarfile.TarInfo] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                raw_name = (
+                    member.name[:-1]
+                    if member.isdir() and member.name.endswith("/")
+                    else member.name
+                )
+                if (
+                    not raw_name
+                    or raw_name.startswith("/")
+                    or "\\" in raw_name
+                    or any(part in ("", ".", "..") for part in raw_name.split("/"))
+                ):
+                    raise SupplyChainError(f"{identity} has an unsafe archive member")
+                parts = raw_name.split("/")
+                if parts[0] != archive_root:
+                    raise SupplyChainError(
+                        f"{identity} archive member escapes its package root"
+                    )
+                relative = "/".join(parts[1:])
+                if not relative:
+                    continue
+                is_root_legal = (
+                    "/" not in relative
+                    and relative.lower().startswith(LEGAL_FILE_PREFIXES)
+                )
+                if not is_root_legal and relative != declared:
+                    continue
+                if not member.isfile():
+                    raise SupplyChainError(
+                        f"{identity} legal file is not a regular archive member"
+                    )
+                if relative in candidates:
+                    raise SupplyChainError(
+                        f"{identity} archive contains a duplicate legal file"
+                    )
+                candidates[relative] = member
+
+            if not candidates:
+                raise SupplyChainError(
+                    f"{identity} has no distributable legal file in its registry archive"
+                )
+            result: list[tuple[str, bytes]] = []
+            for name, member in sorted(candidates.items()):
+                if member.size <= 0 or member.size > MAX_LEGAL_FILE_BYTES:
+                    raise SupplyChainError(f"{identity} has an invalid legal file")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise SupplyChainError(f"{identity} legal file cannot be read")
+                legal_payload = stream.read(MAX_LEGAL_FILE_BYTES + 1)
+                if len(legal_payload) != member.size:
+                    raise SupplyChainError(f"{identity} has an invalid legal file")
+                try:
+                    legal_payload.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise SupplyChainError("crate legal files must be UTF-8") from error
+                result.append((name, legal_payload))
+            return result
+    except SupplyChainError:
+        raise
+    except (EOFError, OSError, tarfile.TarError) as error:
+        raise SupplyChainError(f"{identity} registry archive is invalid") from error
 
 
 def _package_sort_key(package: dict[str, object]) -> tuple[str, str, str]:
@@ -197,37 +333,47 @@ def render_notice(
     lock: dict[str, object],
     lock_sha256: str,
     *,
-    legal_file_loader: Callable[[dict[str, object]], list[tuple[str, bytes]]] = _legal_files,
+    crate_name: str = CRATE_NAME,
+    manifest_label: Path = DEFAULT_MANIFEST,
+    notice_title: str = NOTICE_TITLE,
 ) -> tuple[str, dict[str, int]]:
-    _, closure, _ = production_closure(metadata)
+    _, closure, _ = production_closure(metadata, crate_name=crate_name)
     third_party = sorted(
         (package for package in closure.values() if package.get("source") is not None),
         key=_package_sort_key,
     )
     if not third_party:
-        raise SupplyChainError("render-WASM production closure has no third-party packages")
+        raise SupplyChainError(f"{crate_name} production closure has no third-party packages")
     index = _lock_index(lock)
     package_legal_files: dict[tuple[str, str], list[tuple[str, str]]] = {}
     legal_payloads: dict[str, bytes] = {}
     legal_references: dict[str, list[str]] = {}
+    package_checksums: dict[tuple[str, str], str] = {}
     for package in third_party:
         identity = (str(package["name"]), str(package["version"]))
+        entry = _package_lock_entry(package, index)
+        checksum = entry.get("checksum")
+        if not isinstance(checksum, str) or SHA256_RE.fullmatch(checksum) is None:
+            raise SupplyChainError(
+                f"{package['name']} {package['version']} lacks a locked registry checksum"
+            )
         records: list[tuple[str, str]] = []
-        for filename, payload in legal_file_loader(package):
+        for filename, payload in _legal_files(package, checksum):
             digest = sha256_bytes(payload)
             legal_payloads.setdefault(digest, payload)
             reference = f"{identity[0]} {identity[1]}/{filename}"
             legal_references.setdefault(digest, []).append(reference)
             records.append((filename, digest))
         package_legal_files[identity] = records
+        package_checksums[identity] = checksum
 
     separator = "=" * 79
     lines = [
-        NOTICE_TITLE,
+        notice_title,
         f"Generated by {GENERATOR}. Do not edit manually.",
         "",
         "Scope:",
-        f"- Manifest: {DEFAULT_MANIFEST.as_posix()}",
+        f"- Manifest: {manifest_label.as_posix()}",
         f"- Target: {TARGET}",
         "- Dependency edges: Cargo normal edges for the production target",
         f"- Cargo lock SHA-256: {lock_sha256}",
@@ -243,18 +389,13 @@ def render_notice(
         "",
     ]
     for package in third_party:
-        entry = _package_lock_entry(package, index)
-        checksum = entry.get("checksum")
-        if not isinstance(checksum, str) or SHA256_RE.fullmatch(checksum) is None:
-            raise SupplyChainError(
-                f"{package['name']} {package['version']} lacks a locked registry checksum"
-            )
         license_expression = package.get("license")
         if not isinstance(license_expression, str) or not license_expression.strip():
             raise SupplyChainError(
                 f"{package['name']} {package['version']} lacks a license expression"
             )
         identity = (str(package["name"]), str(package["version"]))
+        checksum = package_checksums[identity]
         lines.extend(
             [
                 separator,
@@ -336,9 +477,13 @@ def _component(package: dict[str, object], lock_index: dict) -> dict[str, object
 
 
 def make_sbom(
-    metadata: dict[str, object], lock: dict[str, object], lock_sha256: str
+    metadata: dict[str, object],
+    lock: dict[str, object],
+    lock_sha256: str,
+    *,
+    crate_name: str = CRATE_NAME,
 ) -> dict[str, object]:
-    root_id, closure, adjacency = production_closure(metadata)
+    root_id, closure, adjacency = production_closure(metadata, crate_name=crate_name)
     lock_index = _lock_index(lock)
     root = closure[root_id]
     references = {package_ref(package) for package in closure.values()}
@@ -382,9 +527,13 @@ def make_sbom(
 
 
 def render_sbom(
-    metadata: dict[str, object], lock: dict[str, object], lock_sha256: str
+    metadata: dict[str, object],
+    lock: dict[str, object],
+    lock_sha256: str,
+    *,
+    crate_name: str = CRATE_NAME,
 ) -> tuple[str, dict[str, int]]:
-    document = make_sbom(metadata, lock, lock_sha256)
+    document = make_sbom(metadata, lock, lock_sha256, crate_name=crate_name)
     rendered = json.dumps(document, indent=2, sort_keys=True) + "\n"
     if "file://" in rendered or re.search(r"/(?:Users|home)/[^/\s]+/", rendered):
         raise SupplyChainError("CycloneDX evidence contains a host path")
@@ -422,17 +571,37 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("notice", "sbom"):
         child = subparsers.add_parser(command)
-        child.add_argument("--manifest-path", type=Path, default=DEFAULT_MANIFEST)
+        child.add_argument(
+            "--profile",
+            choices=sorted(PROFILE_CONFIGS),
+            default="render-worker",
+        )
+        child.add_argument("--manifest-path", type=Path)
         destination = child.add_mutually_exclusive_group(required=True)
         destination.add_argument("--output", type=Path)
         destination.add_argument("--check", type=Path)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        metadata, lock, lock_sha256 = _inputs(args.manifest_path)
+        profile = PROFILE_CONFIGS[args.profile]
+        default_manifest = Path(profile["manifest"])
+        manifest_path = args.manifest_path or default_manifest
+        metadata, lock, lock_sha256 = _inputs(manifest_path)
         if args.command == "notice":
-            rendered, summary = render_notice(metadata, lock, lock_sha256)
+            rendered, summary = render_notice(
+                metadata,
+                lock,
+                lock_sha256,
+                crate_name=str(profile["crate_name"]),
+                manifest_label=default_manifest,
+                notice_title=str(profile["notice_title"]),
+            )
         else:
-            rendered, summary = render_sbom(metadata, lock, lock_sha256)
+            rendered, summary = render_sbom(
+                metadata,
+                lock,
+                lock_sha256,
+                crate_name=str(profile["crate_name"]),
+            )
         _write_or_check(
             rendered,
             output=args.output,

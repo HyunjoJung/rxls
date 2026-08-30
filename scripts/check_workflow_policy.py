@@ -153,7 +153,10 @@ ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "ac477662896b26fef0fb4bfe292efcb2ff1cce2f09fb76e03b43da42143ec152"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "34c70e2545ac3356c8908acace66974b04ad37c61c3371244c6034e8e374f7e7"
+    "b8e4fe366df65893c6e46d89f9f5271d936c24ed9d58565b1748512847579745"
+)
+WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
+    "02b6d4b68f43dd18d1f2b1c16165332b19346ba27480feea03ecbedfcd2cf3c2"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -4423,6 +4426,50 @@ def audit_render_browser_workflow(path: Path, text: str) -> list[str]:
             errors.append(
                 f"{path}: {step_name[8:]} must retain its authenticated pipeline"
             )
+    pack_step = _single_yaml_block(
+        path,
+        worker_job,
+        "- name: Pack and consume the publishable artifact",
+        6,
+        "publishable browser package step",
+        errors,
+    )
+    pack_requirements = {
+        'version="$(node -p \'require("./package.json").version\')"': (
+            "browser package archive must derive its version from reviewed metadata"
+        ),
+        (
+            'archive="$GITHUB_WORKSPACE/target/render-browser-evidence/'
+            'rxls-render-worker-$version.tgz"'
+        ): "browser package archive path must remain version-neutral",
+        'python3 "$GITHUB_WORKSPACE/scripts/check_render_package.py" .': (
+            "browser package must use the shared full artifact contract checker"
+        ),
+        '--archive "$archive"': (
+            "browser package checker must inspect the exact consumed archive"
+        ),
+        "--npm-pack ../../target/render-browser-evidence/npm-pack.json": (
+            "browser package checker must bind the npm pack receipt"
+        ),
+        '--git-rev "$(git rev-parse HEAD)"': (
+            "browser package checker must bind the checked-out revision"
+        ),
+        (
+            "--write-report ../../target/render-browser-evidence/"
+            "package-report.json"
+        ): "browser package checker must emit a reviewable report",
+        '            "$archive"': (
+            "installed browser smoke must consume the checked dynamic archive"
+        ),
+        'sha256sum "$archive"': (
+            "browser package digest must cover the checked dynamic archive"
+        ),
+    }
+    for snippet, message in pack_requirements.items():
+        if snippet not in pack_step:
+            errors.append(f"{path}: {message}")
+    if re.search(r"rxls-render-worker-[0-9]+\.[0-9]+\.[0-9]+\.tgz", pack_step):
+        errors.append(f"{path}: browser package step must not pin a stale package version")
     final_source_step = _single_yaml_block(
         path,
         worker_job,
@@ -4642,6 +4689,12 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: render package verification and publication must fail closed"
         )
+    if re.search(
+        r"^\s*set\s+\+e\s*$|\|\|\s*(?:true|:)(?:\s|$)",
+        text,
+        re.MULTILINE,
+    ):
+        errors.append(f"{path}: release shell commands must not disable fail-closed mode")
     trigger_names, trigger_errors = _workflow_trigger_names(text)
     errors.extend(f"{path}: {error}" for error in trigger_errors)
     if not trigger_errors and trigger_names != {"push", "workflow_dispatch"}:
@@ -4775,14 +4828,23 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/check_render_package.py": (
             "must enforce the bounded package/archive contract"
         ),
-        "EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25": (
-            "must use the pinned nested advisory and license gate"
+        '--npm-pack "$output/npm-pack.json"': (
+            "candidate validation must bind npm's exact pack receipt"
         ),
-        "manifest-path: bindings/render-wasm/Cargo.toml": (
-            "cargo-deny must audit the nested render-WASM manifest"
+        "--npm-pack target/render-package/npm-pack.json": (
+            "transported candidate validation must rebind the pack receipt"
         ),
-        "arguments: --config deny.toml --locked --all-features": (
-            "cargo-deny must use the root policy and locked complete feature graph"
+        "Install checksum-verified cargo-deny": (
+            "must install the reviewed dependency-policy binary"
+        ),
+        'echo "$CARGO_DENY_SHA256  $archive" | sha256sum --check --strict': (
+            "must verify cargo-deny before execution"
+        ),
+        'test ! -L "$tool_root/cargo-deny"': (
+            "must reject a symbolic-link cargo-deny executable"
+        ),
+        "cargo-deny --manifest-path bindings/render-wasm/Cargo.toml \\": (
+            "cargo-deny must audit the locked nested render-WASM graph"
         ),
         "scripts/render_supply_chain.py notice": (
             "must verify the checked third-party notice against the locked closure"
@@ -4828,6 +4890,15 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "actions/download-artifact@": (
             "must transfer the verified candidate rather than rebuild it for publication"
         ),
+        "scripts/select_run_artifact.py": (
+            "must select an attempt-bound candidate for failed-job retries"
+        ),
+        '--current-attempt "$GITHUB_RUN_ATTEMPT"': (
+            "artifact selection must bind the current workflow attempt"
+        ),
+        'artifact-ids: ${{ steps.candidate.outputs.artifact_id }}': (
+            "must download the selected immutable artifact ID"
+        ),
         "digest-mismatch: error": "must fail closed on artifact transport drift",
         "if: github.event_name == 'push'": (
             "the publication job must not run for workflow_dispatch"
@@ -4841,9 +4912,6 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         "package-manager-cache: false": (
             "release jobs must not restore mutable package-manager caches"
-        ),
-        "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}": (
-            "the first-package bootstrap token must be scoped to the publish step"
         ),
         "npm publish \\": "must contain a real tag-only publication command",
         "id: registry": (
@@ -4869,6 +4937,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         'python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py"': (
             "must bind the verified DSSE payload to the exact release identity"
+        ),
+        '--archive "$GITHUB_WORKSPACE/target/render-package/rxls-render-worker-$version.tgz"': (
+            "npm evidence must hash the transferred candidate archive directly"
         ),
         "--workflow .github/workflows/render-package-release.yml": (
             "npm provenance must name the exact publishing workflow"
@@ -4898,10 +4969,13 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             errors.append(f"{path}: {message}")
 
     exact_main = 'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"'
-    if text.count(exact_main) != 2:
+    if text.count(exact_main) != 1:
         errors.append(
-            f"{path}: exact origin/main must be checked during candidate verification "
-            "and again immediately before npm publication"
+            f"{path}: exact origin/main must be checked once during candidate verification"
+        )
+    if text.count('git merge-base --is-ancestor "$GITHUB_SHA" origin/main') != 1:
+        errors.append(
+            f"{path}: publication retry must require the tag commit to remain in main"
         )
     if text.count('git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags') != 1:
         errors.append(
@@ -4914,6 +4988,10 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(f"{path}: npm publication must revalidate the hosted tag commit")
 
     exact_assignments = {
+        "CARGO_DENY_VERSION": "0.19.4",
+        "CARGO_DENY_SHA256": (
+            "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
+        ),
         "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,
         "NPM_VERSION": RENDER_PACKAGE_NPM_VERSION,
         "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
@@ -4927,8 +5005,9 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         if len(assignment.findall(text)) != 1:
             errors.append(f"{path}: expected exact {name}={value}")
 
-    if text.count("NODE_AUTH_TOKEN:") != 1 or text.count("secrets.NPM_TOKEN") != 1:
-        errors.append(f"{path}: npm bootstrap credentials must appear only on publish")
+    for forbidden in ("NODE_AUTH_TOKEN", "secrets.NPM_TOKEN", "_authToken"):
+        if forbidden in text:
+            errors.append(f"{path}: trusted npm publication must not expose {forbidden}")
     if text.count("if: github.event_name == 'push'") != 2:
         errors.append(
             f"{path}: only the hosted prerequisites and publish job may be tag-only"
@@ -4967,6 +5046,21 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     if text.count("check_npm_registry_evidence.py") != 2:
         errors.append(
             f"{path}: npm provenance validator and its focused tests must each run once"
+        )
+    if text.count("python3 scripts/check_render_package.py") != 2:
+        errors.append(
+            f"{path}: candidate and transported render packages must both be validated"
+        )
+    if text.count('--current-attempt "$GITHUB_RUN_ATTEMPT"') != 1:
+        errors.append(
+            f"{path}: render candidate selection must bind exactly one current attempt"
+        )
+    if (
+        text.count('--npm-pack "$output/npm-pack.json"') != 1
+        or text.count("--npm-pack target/render-package/npm-pack.json") != 1
+    ):
+        errors.append(
+            f"{path}: both render package checks must bind the exact npm pack receipt"
         )
     registry_verification_step = _single_yaml_block(
         path,
@@ -5039,13 +5133,21 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: expected exact-SHA CI, CodeQL, hardening, and browser gates"
         )
-    deny_index = text.find("EmbarkStudios/cargo-deny-action@")
+    deny_index = text.find("Install checksum-verified cargo-deny")
     build_index = text.find("npm --prefix bindings/render-wasm run build:wasm")
     if deny_index < 0 or build_index < 0 or deny_index > build_index:
         errors.append(f"{path}: nested dependency policy must run before building WASM")
     active = _without_commented_lines(text)
     verify_job = _single_yaml_block(
         path, active, "verify:", 2, "render package verify job", errors
+    )
+    deny_install_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Install checksum-verified cargo-deny",
+        6,
+        "checksum-verified cargo-deny install step",
+        errors,
     )
     deny_step = _single_yaml_block(
         path,
@@ -5055,37 +5157,20 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "nested Rust advisory and license audit step",
         errors,
     )
-    deny_entries = [
-        (name, _yaml_unquote_scalar(value))
-        for name, value, _, _ in _step_mapping_entries(6, deny_step.splitlines())
-    ]
-    expected_deny_entries = [
-        ("name", "Audit nested Rust advisories, licenses, and sources"),
-        (
-            "uses",
-            "EmbarkStudios/cargo-deny-action@"
-            "3c6349835b2b7b196a839186cb8b78e02f7b5f25",
-        ),
-        ("with", ""),
-    ]
-    deny_with_entries = [
-        (name, _yaml_unquote_scalar(value))
-        for name, value in _yaml_mapping_entries_at_indent(deny_step, 10)
-    ]
-    expected_deny_with_entries = [
-        ("rust-version", "1.85.0"),
-        ("command", "check"),
-        ("manifest-path", "bindings/render-wasm/Cargo.toml"),
-        ("arguments", "--config deny.toml --locked --all-features"),
-    ]
-    if (
-        deny_entries != expected_deny_entries
-        or deny_with_entries != expected_deny_with_entries
+    if "sha256sum --check --strict" not in deny_install_step or (
+        "cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+        not in deny_install_step
     ):
-        errors.append(
-            f"{path}: nested advisory and license audit must use only the exact "
-            "reviewed action and inputs"
-        )
+        errors.append(f"{path}: cargo-deny install must use the reviewed binary and digest")
+    if _normalized_active_commands(deny_step)[3:] != [
+        "set -euo pipefail",
+        'test "$(command -v cargo-deny)" = '
+        '"$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION/cargo-deny"',
+        'test "$(cargo-deny --version)" = "cargo-deny $CARGO_DENY_VERSION"',
+        "cargo-deny --manifest-path bindings/render-wasm/Cargo.toml "
+        "--locked --all-features check --config deny.toml",
+    ]:
+        errors.append(f"{path}: nested cargo-deny invocation drifted")
     if any(
         name == "if" for name, _ in _yaml_mapping_entries_at_indent(verify_job, 4)
     ):
@@ -5113,6 +5198,23 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     if publish_conditions != ["github.event_name == 'push'"]:
         errors.append(
             f"{path}: npm publication must have exactly one exact tag-push job guard"
+        )
+    reverify_step = _single_yaml_block(
+        path,
+        publish_job,
+        "- name: Reverify the immutable candidate",
+        6,
+        "render package transported-candidate verification step",
+        errors,
+    )
+    if (
+        reverify_step.count("python3 scripts/check_render_package.py") != 1
+        or reverify_step.count("--npm-pack target/render-package/npm-pack.json") != 1
+        or reverify_step.count("--archive-only") != 1
+    ):
+        errors.append(
+            f"{path}: transported render candidate must be checked once against "
+            "its npm receipt without rebuilding"
         )
     prerequisite_step = _single_yaml_block(
         path,
@@ -5361,6 +5463,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         or pack_step.count("python3 scripts/render_supply_chain.py sbom") != 3
         or pack_prefix.count("python3 scripts/render_supply_chain.py sbom") != 3
         or pack_prefix.count("python3 scripts/check_render_package.py") != 1
+        or pack_prefix.count('--npm-pack "$output/npm-pack.json"') != 1
         or pack_prefix.count("npm pack --json --pack-destination") != 1
     ):
         errors.append(
@@ -5419,6 +5522,8 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             f"{path}: exact worker/WASM build must not use event-selective shell guards"
         )
     verify_order = (
+        "- name: Install checksum-verified cargo-deny",
+        "- name: Audit nested Rust advisories, licenses, and sources",
         "- name: Validate event and package identity",
         "- name: Require exact-SHA hosted gates and reviewed full oracle evidence",
         "- name: Enforce workflow and package policy",
@@ -5444,6 +5549,440 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             "render package wasm-bindgen build step",
         )
     )
+    return errors
+
+
+def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
+    """Require a reproducible dispatch and protected exact-tag rxls-wasm publish."""
+
+    errors: list[str] = []
+    _audit_exact_workflow_sha256(
+        path,
+        text,
+        WASM_PACKAGE_RELEASE_WORKFLOW_SHA256,
+        errors,
+    )
+    active = _without_commented_lines(text)
+    if re.search(r"^\s+continue-on-error\s*:", active, re.MULTILINE):
+        errors.append(f"{path}: WASM package verification and publication must fail closed")
+    if re.search(
+        r"^\s*set\s+\+e\s*$|\|\|\s*(?:true|:)(?:\s|$)",
+        active,
+        re.MULTILINE,
+    ):
+        errors.append(f"{path}: release shell commands must not disable fail-closed mode")
+    trigger_names, trigger_errors = _workflow_trigger_names(active)
+    errors.extend(f"{path}: {error}" for error in trigger_errors)
+    if not trigger_errors and trigger_names != {"push", "workflow_dispatch"}:
+        errors.append(
+            f"{path}: WASM package release must have only push and "
+            "workflow_dispatch triggers"
+        )
+    if re.search(r"^\s*pull_request:\s*$", active, re.MULTILINE):
+        errors.append(f"{path}: pull requests must never enter npm publication")
+
+    required = {
+        'tags:\n      - "wasm-v*"': "must use the core-WASM-only tag namespace",
+        'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"': (
+            "manual verification must reject every unrecognized event"
+        ),
+        'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"': (
+            "must reject publication from repository forks"
+        ),
+        'test "$GITHUB_REF_NAME" = "wasm-v$version"': (
+            "must bind publication to the exact package version tag"
+        ),
+        'test "$(node -p \'require("./bindings/wasm/npm/package.json").name\')" = "rxls-wasm"': (
+            "must bind both release jobs to the exact npm package name"
+        ),
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"': (
+            "must require the candidate to equal the public main head"
+        ),
+        "require_successful_run ci.yml .github/workflows/ci.yml CI": (
+            "must require exact-SHA push CI"
+        ),
+        "require_successful_run codeql.yml .github/workflows/codeql.yml CodeQL": (
+            "must require exact-SHA push CodeQL"
+        ),
+        '&& "$event" == "push" \\': (
+            "hosted gates must accept only successful push runs"
+        ),
+        "Install checksum-verified cargo-deny": (
+            "must install the reviewed dependency-policy binary"
+        ),
+        'echo "$CARGO_DENY_SHA256  $archive" | sha256sum --check --strict': (
+            "must verify cargo-deny before execution"
+        ),
+        'test ! -L "$tool_root/cargo-deny"': (
+            "must reject a symbolic-link cargo-deny executable"
+        ),
+        "cargo-deny --manifest-path bindings/wasm/Cargo.toml \\": (
+            "nested dependency policy must audit the locked core WASM graph"
+        ),
+        "python3 scripts/test_workflow_policy.py": (
+            "must execute workflow policy mutation tests"
+        ),
+        "python3 scripts/render_supply_chain.py notice": (
+            "must regenerate and verify the complete legal notice"
+        ),
+        "--check bindings/wasm/THIRD_PARTY_NOTICES.txt": (
+            "must bind the packaged legal notice to the locked closure"
+        ),
+        'bash scripts/build-wasm-package.sh "$package"': (
+            "must build the exact staged npm package"
+        ),
+        "node bindings/wasm/tests/node-smoke.cjs": (
+            "must exercise clean Node and TypeScript consumers"
+        ),
+        "node bindings/wasm/tests/browser-smoke.mjs": (
+            "must exercise the real Chromium consumer"
+        ),
+        "npm pack --json --pack-destination": (
+            "must preserve npm's exact archive metadata"
+        ),
+        "python3 scripts/check_wasm_package.py": (
+            "must validate package contents, identity, and byte budgets"
+        ),
+        '--npm-pack "$output/npm-pack.json"': (
+            "candidate and transported archive checks must bind npm pack metadata"
+        ),
+        "python3 scripts/render_supply_chain.py sbom": (
+            "must produce the locked core-WASM CycloneDX graph"
+        ),
+        "cmp --silent \\": "must prove deterministic CycloneDX generation",
+        "npm publish --dry-run --ignore-scripts --access public": (
+            "must execute a registry publication dry run"
+        ),
+        "Verify evidence source remained exact and clean": (
+            "must recheck the source after candidate construction"
+        ),
+        "actions/download-artifact@": (
+            "must transfer the verified candidate instead of rebuilding it"
+        ),
+        "scripts/select_run_artifact.py": (
+            "must select an attempt-bound candidate for failed-job retries"
+        ),
+        '--current-attempt "$GITHUB_RUN_ATTEMPT"': (
+            "artifact selection must bind the current workflow attempt"
+        ),
+        'artifact-ids: ${{ steps.candidate.outputs.artifact_id }}': (
+            "must download the selected immutable artifact ID"
+        ),
+        "digest-mismatch: error": "must fail closed on artifact transport drift",
+        "environment: npm-rxls-wasm": (
+            "registry mutation must use the protected deployment environment"
+        ),
+        "id-token: write": "npm publication must mint short-lived OIDC provenance",
+        'registry-url: "https://registry.npmjs.org"': (
+            "publication must explicitly target the public npm registry"
+        ),
+        'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags': (
+            "publication must refetch the exact hosted release tag"
+        ),
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"': (
+            "publication must bind the hosted tag to the candidate commit"
+        ),
+        "existing immutable registry version differs from the verified candidate": (
+            "must reject a registry version with different bytes or provenance"
+        ),
+        "if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' \"$error_log\"": (
+            "registry absence must be distinguished from lookup failures"
+        ),
+        "if: steps.registry.outputs.already_published != 'true'": (
+            "identical immutable releases must make retries idempotent"
+        ),
+        "https://slsa.dev/provenance/v1": (
+            "registry checks must require the npm SLSA provenance predicate"
+        ),
+        "npm audit signatures --json --include-attestations": (
+            "must verify registry signatures and attestations"
+        ),
+        'python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py"': (
+            "must bind DSSE evidence to the exact release identity"
+        ),
+        '--archive "$GITHUB_WORKSPACE/$output/rxls-wasm-$version.tgz"': (
+            "npm evidence must hash the transferred candidate archive directly"
+        ),
+        "--workflow .github/workflows/wasm-package-release.yml": (
+            "npm provenance must identify this publishing workflow"
+        ),
+        '--git-sha "$GITHUB_SHA"': "npm provenance must identify the release commit",
+        '--git-ref "$GITHUB_REF"': "npm provenance must identify the release tag",
+        '--run-id "$GITHUB_RUN_ID"': "npm provenance must identify the publishing run",
+        '--run-attempt "$GITHUB_RUN_ATTEMPT"': (
+            "npm provenance must identify the publishing attempt"
+        ),
+        '--invocation-policy "$invocation_policy"': (
+            "npm provenance must use an explicit retry policy"
+        ),
+        'npm install --ignore-scripts "$spec"': (
+            "must execute a clean registry-installed consumer"
+        ),
+    }
+    for snippet, message in required.items():
+        if snippet not in active:
+            errors.append(f"{path}: {message}")
+
+    exact_assignments = {
+        "CARGO_DENY_VERSION": "0.19.4",
+        "CARGO_DENY_SHA256": (
+            "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
+        ),
+        "WASM_MSRV": "1.85.0",
+        "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
+        "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
+        "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,
+        "NPM_VERSION": RENDER_PACKAGE_NPM_VERSION,
+        "PLAYWRIGHT_VERSION": "1.54.1",
+    }
+    for name, value in exact_assignments.items():
+        assignment = re.compile(
+            rf"^\s*{re.escape(name)}:\s*[\"']?{re.escape(value)}[\"']?\s*$",
+            re.MULTILINE,
+        )
+        if len(assignment.findall(active)) != 1:
+            errors.append(f"{path}: expected exact {name}={value}")
+
+    if active.count('test "$(git rev-parse --is-shallow-repository)" = "false"') != 2:
+        errors.append(f"{path}: both release jobs must reject shallow source history")
+    if active.count('test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"') != 2:
+        errors.append(f"{path}: both release jobs must reject repository forks")
+    package_name_check = (
+        'test "$(node -p \'require("./bindings/wasm/npm/package.json").name\')" '
+        '= "rxls-wasm"'
+    )
+    if active.count(package_name_check) != 2:
+        errors.append(f"{path}: both release jobs must bind the rxls-wasm package name")
+    if active.count('&& "$event" == "push" \\') != 1:
+        errors.append(f"{path}: hosted gates must require exactly one push-event check")
+    exact_main = 'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"'
+    if active.count(exact_main) != 1:
+        errors.append(
+            f"{path}: exact origin/main must be checked once during verification"
+        )
+    if active.count('git merge-base --is-ancestor "$GITHUB_SHA" origin/main') != 1:
+        errors.append(
+            f"{path}: publication retry must require the tag commit to remain in main"
+        )
+    if active.count('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"') != 3:
+        errors.append(
+            f"{path}: candidate creation, late source audit, and publication must "
+            "bind checkout HEAD to GITHUB_SHA"
+        )
+    if active.count('git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags') != 1:
+        errors.append(f"{path}: publication must refetch exactly one hosted tag")
+    if active.count("package-manager-cache: false") != 2:
+        errors.append(f"{path}: both release jobs must disable mutable npm caching")
+    for forbidden in ("NODE_AUTH_TOKEN", "secrets.NPM_TOKEN", "_authToken"):
+        if forbidden in active:
+            errors.append(f"{path}: trusted npm publication must not expose {forbidden}")
+    if active.count("if: github.event_name == 'push'") != 2:
+        errors.append(f"{path}: only hosted gates and the publish job may be tag-only")
+    if any(
+        command.startswith("npm publish") and "--force" in command
+        for command in _normalized_active_commands(active)
+    ):
+        errors.append(f"{path}: forced npm publication is forbidden")
+    if len(re.findall(r"^\s*npm publish\b", active, re.MULTILINE)) != 2:
+        errors.append(f"{path}: expected exactly one dry-run and one real npm publish")
+    if active.count('npm view "$spec" \\') != 2:
+        errors.append(f"{path}: registry preflight and postpublication checks must both run")
+    if active.count("version dist.integrity repository.url dist.attestations --json") != 2:
+        errors.append(f"{path}: registry checks must bind identity, integrity, and attestations")
+    if active.count("https://slsa.dev/provenance/v1") != 2:
+        errors.append(f"{path}: both registry checks must require exact SLSA provenance")
+    if active.count("python3 scripts/render_supply_chain.py sbom") != 3:
+        errors.append(f"{path}: SBOM must be generated twice and checked once")
+    if active.count("python3 scripts/check_wasm_package.py") != 2:
+        errors.append(f"{path}: candidate and transported package must both be validated")
+    if active.count('--npm-pack "$output/npm-pack.json"') != 2:
+        errors.append(f"{path}: both package checks must bind the npm pack receipt")
+    if active.count('--current-attempt "$GITHUB_RUN_ATTEMPT"') != 1:
+        errors.append(
+            f"{path}: WASM candidate selection must bind exactly one current attempt"
+        )
+
+    verify_job = _single_yaml_block(
+        path, active, "verify:", 2, "WASM package verify job", errors
+    )
+    if any(
+        name == "if" for name, _ in _yaml_mapping_entries_at_indent(verify_job, 4)
+    ):
+        errors.append(f"{path}: verification must run for dispatches and tag pushes")
+    verify_step_conditions = [
+        value
+        for name, value in _yaml_mapping_entries_at_indent(verify_job, 8)
+        if name == "if"
+    ]
+    if verify_step_conditions != ["github.event_name == 'push'"]:
+        errors.append(f"{path}: only exact-SHA hosted gates may be conditional in verify")
+
+    publish_job = _single_yaml_block(
+        path, active, "publish:", 2, "WASM package publish job", errors
+    )
+    publish_conditions = [
+        value
+        for name, value in _yaml_mapping_entries_at_indent(publish_job, 4)
+        if name == "if"
+    ]
+    if publish_conditions != ["github.event_name == 'push'"]:
+        errors.append(f"{path}: npm publication must have one exact tag-push job guard")
+    for forbidden in (
+        "build-wasm-package.sh",
+        "cargo build",
+        "install wasm-bindgen-cli",
+        "npm pack ",
+    ):
+        if forbidden in publish_job:
+            errors.append(f"{path}: publish job must not rebuild the verified candidate")
+
+    deny_install_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Install checksum-verified cargo-deny",
+        6,
+        "core WASM cargo-deny install step",
+        errors,
+    )
+    deny_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Audit nested Rust advisories, licenses, and sources",
+        6,
+        "core WASM dependency policy step",
+        errors,
+    )
+    if "sha256sum --check --strict" not in deny_install_step or (
+        "cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+        not in deny_install_step
+    ):
+        errors.append(f"{path}: cargo-deny install must use the reviewed binary and digest")
+    if _normalized_active_commands(deny_step)[3:] != [
+        "set -euo pipefail",
+        'test "$(command -v cargo-deny)" = '
+        '"$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION/cargo-deny"',
+        'test "$(cargo-deny --version)" = "cargo-deny $CARGO_DENY_VERSION"',
+        "cargo-deny --manifest-path bindings/wasm/Cargo.toml "
+        "--locked --all-features check --config deny.toml",
+    ]:
+        errors.append(f"{path}: nested cargo-deny invocation drifted")
+
+    policy_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Enforce source and package policy",
+        6,
+        "WASM package policy step",
+        errors,
+    )
+    expected_policy_commands = [
+        "set -euo pipefail",
+        'test "$(node --version)" = "v$NODE_VERSION"',
+        'test "$(npm --version)" = "$NPM_VERSION"',
+        "python3 scripts/check_release_identity.py",
+        "python3 scripts/check_workflow_policy.py",
+        "python3 scripts/test_workflow_policy.py",
+        "python3 -m unittest scripts.test_release_tools "
+        "scripts.test_check_npm_registry_evidence",
+        "python3 scripts/render_supply_chain.py notice --profile core-wasm "
+        "--manifest-path bindings/wasm/Cargo.toml "
+        "--check bindings/wasm/THIRD_PARTY_NOTICES.txt",
+        "cargo fmt --manifest-path bindings/wasm/Cargo.toml -- --check",
+        "cargo clippy --manifest-path bindings/wasm/Cargo.toml --all-targets "
+        "--target wasm32-unknown-unknown --locked -- -D warnings",
+        "cargo test --manifest-path bindings/wasm/Cargo.toml --locked",
+    ]
+    policy_commands = _normalized_active_commands(policy_step)
+    if policy_commands[:3] != [
+        "- name: Enforce source and package policy",
+        "shell: bash",
+        "run: |",
+    ] or policy_commands[3:] != expected_policy_commands:
+        errors.append(f"{path}: local policy gates must retain the reviewed exact sequence")
+
+    install_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Install exact wasm-bindgen CLI",
+        6,
+        "WASM package wasm-bindgen install step",
+        errors,
+    )
+    build_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Build and exercise exact package",
+        6,
+        "WASM package build and consumer step",
+        errors,
+    )
+    errors.extend(
+        _audit_exact_wasm_bindgen_install(
+            path,
+            active,
+            install_step,
+            build_step,
+            'bash scripts/build-wasm-package.sh "$package"',
+            "WASM package wasm-bindgen install",
+        )
+    )
+
+    pack_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Pack, inspect, dry-run, and attest candidate",
+        6,
+        "WASM package archive step",
+        errors,
+    )
+    pack_order = (
+        "npm pack --json --pack-destination",
+        "python3 scripts/check_wasm_package.py",
+        "python3 scripts/render_supply_chain.py sbom",
+        "cmp --silent \\",
+        '--check "$output/rxls-wasm-sbom.cdx.json"',
+        'sha256sum "$archive"',
+        "npm publish --dry-run --ignore-scripts --access public",
+    )
+    pack_positions = [pack_step.find(value) for value in pack_order]
+    if any(index < 0 for index in pack_positions) or pack_positions != sorted(
+        pack_positions
+    ):
+        errors.append(f"{path}: pack, byte audit, SBOM, checksum, and dry-run order drifted")
+    if "GITHUB_EVENT_NAME" in pack_step or "github.event_name" in pack_step:
+        errors.append(f"{path}: package validation must be identical for dispatch and tag")
+
+    verify_order = (
+        "- name: Validate event and package identity",
+        "- name: Require successful exact-SHA CI and CodeQL",
+        "- name: Install checksum-verified cargo-deny",
+        "- name: Audit nested Rust advisories, licenses, and sources",
+        "- name: Enforce source and package policy",
+        "- name: Install exact wasm-bindgen CLI",
+        "- name: Build and exercise exact package",
+        "- name: Pack, inspect, dry-run, and attest candidate",
+        "- name: Verify evidence source remained exact and clean",
+        "- name: Upload verified package candidate",
+    )
+    verify_positions = [verify_job.find(value) for value in verify_order]
+    if any(index < 0 for index in verify_positions) or verify_positions != sorted(
+        verify_positions
+    ):
+        errors.append(f"{path}: verification stages must retain the reviewed exact order")
+
+    publish_order = (
+        "- name: Select immutable verified candidate",
+        "- name: Reverify immutable candidate and hosted tag",
+        "- name: Detect an identical immutable registry release",
+        "- name: Publish exact package with provenance",
+        "- name: Verify registry provenance and installed consumer",
+        "- name: Upload registry evidence",
+    )
+    publish_positions = [publish_job.find(value) for value in publish_order]
+    if any(index < 0 for index in publish_positions) or publish_positions != sorted(
+        publish_positions
+    ):
+        errors.append(f"{path}: revalidation, preflight, publish, and audit order drifted")
     return errors
 
 
@@ -5475,6 +6014,8 @@ def audit_repository(root: Path) -> list[str]:
             errors.extend(audit_render_browser_workflow(relative, text))
         elif path.name == "render-package-release.yml":
             errors.extend(audit_render_package_release_workflow(relative, text))
+        elif path.name == "wasm-package-release.yml":
+            errors.extend(audit_wasm_package_release_workflow(relative, text))
         elif path.name == "codeql.yml":
             errors.extend(audit_codeql_workflow(relative, text))
 
@@ -5503,6 +6044,11 @@ def audit_repository(root: Path) -> list[str]:
     if not render_package_release.is_file():
         errors.append(
             f"{render_package_release.relative_to(root)}: missing render package release workflow"
+        )
+    wasm_package_release = workflow_root / "wasm-package-release.yml"
+    if not wasm_package_release.is_file():
+        errors.append(
+            f"{wasm_package_release.relative_to(root)}: missing WASM package release workflow"
         )
     return errors
 

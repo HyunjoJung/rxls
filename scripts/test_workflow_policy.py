@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,9 @@ RENDER_HARDENING_WORKFLOW = ROOT / ".github" / "workflows" / "render-hardening.y
 RENDER_BROWSER_WORKFLOW = ROOT / ".github" / "workflows" / "render-browser.yml"
 RENDER_PACKAGE_RELEASE_WORKFLOW = (
     ROOT / ".github" / "workflows" / "render-package-release.yml"
+)
+WASM_PACKAGE_RELEASE_WORKFLOW = (
+    ROOT / ".github" / "workflows" / "wasm-package-release.yml"
 )
 
 
@@ -2559,8 +2564,11 @@ steps:
             self.policy.audit_render_browser_workflow(Path("render-browser.yml"), text),
             [],
         )
-        self.assertEqual(text.count("rxls-render-worker-0.1.3.tgz"), 2)
-        self.assertNotIn("rxls-render-worker-0.1.2.tgz", text)
+        self.assertIn("rxls-render-worker-$version.tgz", text)
+        self.assertIn("rxls-render-worker-${version}.tgz", text)
+        self.assertIsNone(
+            re.search(r"rxls-render-worker-[0-9]+\.[0-9]+\.[0-9]+\.tgz", text)
+        )
 
     def test_render_browser_rejects_mutable_or_commented_wasm_build_tools(self) -> None:
         original = RENDER_BROWSER_WORKFLOW.read_text(encoding="utf-8")
@@ -2689,6 +2697,26 @@ steps:
                 "        working-directory: bindings/render-wasm\n"
                 "        shell: bash\n"
                 "        run: |\n",
+            ),
+            "package_contract_checker": original.replace(
+                '          python3 "$GITHUB_WORKSPACE/scripts/check_render_package.py" . \\\n',
+                "          true\n",
+                1,
+            ),
+            "package_dynamic_archive": original.replace(
+                'archive="$GITHUB_WORKSPACE/target/render-browser-evidence/rxls-render-worker-$version.tgz"',
+                'archive="$GITHUB_WORKSPACE/target/render-browser-evidence/rxls-render-worker-0.1.3.tgz"',
+                1,
+            ),
+            "package_checker_receipt": original.replace(
+                "            --npm-pack ../../target/render-browser-evidence/npm-pack.json \\\n",
+                "",
+                1,
+            ),
+            "installed_dynamic_archive": original.replace(
+                '            "$archive"\n',
+                "            ../render-browser-evidence/rxls-render-worker-0.1.3.tgz\n",
+                1,
             ),
             "browser_pipeline_shell": original.replace(
                 "      - name: Exercise worker under strict CSP in pinned Chromium\n"
@@ -3286,22 +3314,18 @@ steps:
             ),
             "nested_policy_skips_dispatch": original.replace(
                 "      - name: Audit nested Rust advisories, licenses, and sources\n"
-                "        uses: EmbarkStudios/cargo-deny-action@",
+                "        shell: bash\n",
                 "      - name: Audit nested Rust advisories, licenses, and sources\n"
                 "        if: ${{ github.event_name != 'workflow_dispatch' }}\n"
-                "        uses: EmbarkStudios/cargo-deny-action@",
+                "        shell: bash\n",
                 1,
             ),
             "nested_policy_continue_on_error": original.replace(
                 "      - name: Audit nested Rust advisories, licenses, and sources\n"
-                "        uses: EmbarkStudios/cargo-deny-action@"
-                "3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1\n"
-                "        with:\n",
+                "        shell: bash\n",
                 "      - name: Audit nested Rust advisories, licenses, and sources\n"
-                "        uses: EmbarkStudios/cargo-deny-action@"
-                "3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1\n"
                 "        continue-on-error: true\n"
-                "        with:\n",
+                "        shell: bash\n",
                 1,
             ),
             "publish_guard_relocated_to_policy": original.replace(
@@ -3336,9 +3360,13 @@ steps:
                 1,
             ),
             "credential": original.replace(
-                "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}",
-                "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n"
-                "          SECOND_TOKEN: ${{ secrets.NPM_TOKEN }}",
+                "      - name: Publish exact package with provenance\n"
+                "        if: steps.registry.outputs.already_published != 'true'\n",
+                "      - name: Publish exact package with provenance\n"
+                "        if: steps.registry.outputs.already_published != 'true'\n"
+                "        env:\n"
+                "          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n",
+                1,
             ),
             "registry_preflight": original.replace(
                 "      - name: Detect an identical immutable registry release",
@@ -3418,13 +3446,34 @@ steps:
                 "true",
             ),
             "nested_manifest": original.replace(
-                "manifest-path: bindings/render-wasm/Cargo.toml",
-                "manifest-path: Cargo.toml",
+                "cargo-deny --manifest-path bindings/render-wasm/Cargo.toml \\\n",
+                "cargo-deny --manifest-path Cargo.toml \\\n",
                 1,
             ),
             "root_deny_policy": original.replace(
-                "arguments: --config deny.toml --locked --all-features",
-                "arguments: --locked --all-features",
+                "--locked --all-features check --config deny.toml",
+                "--locked --all-features check --config other-deny.toml",
+                1,
+            ),
+            "deny_argument_order": original.replace(
+                "--locked --all-features check --config deny.toml",
+                "--config deny.toml --locked --all-features check",
+                1,
+            ),
+            "cargo_deny_checksum_guard": original.replace(
+                "sha256sum --check --strict",
+                "sha256sum --check",
+                1,
+            ),
+            "candidate_pack_receipt": original.replace(
+                '--npm-pack "$output/npm-pack.json"',
+                '--npm-pack "$output/stale-pack.json"',
+                1,
+            ),
+            "transported_pack_receipt": original.replace(
+                "--npm-pack target/render-package/npm-pack.json",
+                "--npm-pack target/render-package/stale-pack.json",
+                1,
             ),
             "notice": original.replace(
                 "--check bindings/render-wasm/THIRD_PARTY_NOTICES.txt",
@@ -3511,9 +3560,238 @@ steps:
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
-                errors = self.policy.audit_render_package_release_workflow(
-                    Path("render-package-release.yml"), workflow
-                )
+                self.assertNotEqual(workflow, original)
+                approved_hash = hashlib.sha256(workflow.encode("utf-8")).hexdigest()
+                with mock.patch.object(
+                    self.policy,
+                    "RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256",
+                    approved_hash,
+                ):
+                    errors = self.policy.audit_render_package_release_workflow(
+                        Path("render-package-release.yml"), workflow
+                    )
+                self.assertTrue(errors)
+
+    def test_checked_in_wasm_package_release_policy_passes(self) -> None:
+        text = WASM_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            self.policy.audit_wasm_package_release_workflow(
+                Path("wasm-package-release.yml"), text
+            ),
+            [],
+        )
+
+    def test_wasm_package_release_rejects_semantic_drift_after_hash_update(self) -> None:
+        original = WASM_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "tag_namespace": original.replace('      - "wasm-v*"', '      - "v*"', 1),
+            "dispatch_fail_closed": original.replace(
+                '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n',
+                "            true\n",
+                1,
+            ),
+            "fork_identity": original.replace(
+                'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"',
+                'test -n "$GITHUB_REPOSITORY"',
+                1,
+            ),
+            "package_name": original.replace(
+                'require("./bindings/wasm/npm/package.json").name\')" = "rxls-wasm"',
+                'require("./bindings/wasm/npm/package.json").name\')" != ""',
+                1,
+            ),
+            "main_identity": original.replace(
+                'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+                'test -n "$(git rev-parse origin/main)"',
+                1,
+            ),
+            "hosted_event": original.replace(
+                '&& "$event" == "push" \\',
+                '&& "$event" != "" \\',
+                1,
+            ),
+            "deny_manifest": original.replace(
+                "cargo-deny --manifest-path bindings/wasm/Cargo.toml \\\n",
+                "cargo-deny --manifest-path Cargo.toml \\\n",
+                1,
+            ),
+            "deny_policy": original.replace(
+                "--locked --all-features check --config deny.toml",
+                "--locked check --config deny.toml",
+                1,
+            ),
+            "deny_command_policy": original.replace(
+                "--locked --all-features check --config deny.toml",
+                "--locked --all-features check --config other-deny.toml",
+                1,
+            ),
+            "deny_argument_order": original.replace(
+                "--locked --all-features check --config deny.toml",
+                "--config deny.toml --locked --all-features check",
+                1,
+            ),
+            "deny_checksum_guard": original.replace(
+                "sha256sum --check --strict",
+                "sha256sum --check",
+                1,
+            ),
+            "deny_version": original.replace(
+                'CARGO_DENY_VERSION: "0.19.4"',
+                'CARGO_DENY_VERSION: "0.19.3"',
+                1,
+            ),
+            "workflow_policy_tests": original.replace(
+                "python3 scripts/test_workflow_policy.py",
+                "true",
+                1,
+            ),
+            "legal_notice": original.replace(
+                "--check bindings/wasm/THIRD_PARTY_NOTICES.txt",
+                "--output target/notice.txt",
+                1,
+            ),
+            "wasm_tool_root": original.replace(
+                'tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"',
+                'tool_root="$CARGO_HOME"',
+                1,
+            ),
+            "node_consumer": original.replace(
+                "node bindings/wasm/tests/node-smoke.cjs",
+                "true # node smoke",
+                1,
+            ),
+            "browser_consumer": original.replace(
+                "node bindings/wasm/tests/browser-smoke.mjs",
+                "true # browser smoke",
+                1,
+            ),
+            "archive_checker": original.replace(
+                "python3 scripts/check_wasm_package.py",
+                "true # package check",
+                1,
+            ),
+            "sbom_determinism": original.replace("cmp --silent \\", "true \\", 1),
+            "dry_run": original.replace(
+                "npm publish --dry-run --ignore-scripts --access public",
+                "npm pack",
+                1,
+            ),
+            "late_source_audit": original.replace(
+                "- name: Verify evidence source remained exact and clean",
+                "- name: Trust prior source state",
+                1,
+            ),
+            "artifact_digest": original.replace(
+                "digest-mismatch: error", "digest-mismatch: warn", 1
+            ),
+            "artifact_selector": original.replace(
+                "python3 scripts/select_run_artifact.py",
+                "python3 scripts/select_latest_artifact.py",
+                1,
+            ),
+            "artifact_attempt": original.replace(
+                '--current-attempt "$GITHUB_RUN_ATTEMPT"',
+                '--current-attempt "1"',
+                1,
+            ),
+            "artifact_id_download": original.replace(
+                'artifact-ids: ${{ steps.candidate.outputs.artifact_id }}',
+                "name: rxls-wasm-latest",
+                1,
+            ),
+            "publish_main_ancestry": original.replace(
+                'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+                'test -n "$(git rev-parse origin/main)"',
+                1,
+            ),
+            "candidate_pack_receipt": original.replace(
+                '--npm-pack "$output/npm-pack.json"',
+                '--npm-pack "$output/stale-pack.json"',
+                1,
+            ),
+            "publish_environment": original.replace(
+                "environment: npm-rxls-wasm", "environment: production", 1
+            ),
+            "oidc": original.replace("id-token: write", "id-token: none", 1),
+            "hosted_tag": original.replace(
+                'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags',
+                "git fetch origin --tags",
+                1,
+            ),
+            "bootstrap_token_scope": original.replace(
+                "      - name: Publish exact package with provenance\n"
+                "        if: steps.registry.outputs.already_published != 'true'\n",
+                "      - name: Publish exact package with provenance\n"
+                "        if: steps.registry.outputs.already_published != 'true'\n"
+                "        env:\n"
+                "          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n",
+                1,
+            ),
+            "forced_publish": original.replace(
+                "--ignore-scripts --access public\n",
+                "--ignore-scripts --access public --force\n",
+                1,
+            ),
+            "registry_mismatch": original.replace(
+                "existing immutable registry version differs from the verified candidate",
+                "existing release accepted",
+                1,
+            ),
+            "registry_idempotency": original.replace(
+                "if: steps.registry.outputs.already_published != 'true'",
+                "if: always()",
+                1,
+            ),
+            "registry_provenance": original.replace(
+                "https://slsa.dev/provenance/v1",
+                "https://example.invalid/provenance",
+                1,
+            ),
+            "registry_signatures": original.replace(
+                "npm audit signatures --json --include-attestations",
+                "npm audit --json",
+                1,
+            ),
+            "registry_workflow": original.replace(
+                "--workflow .github/workflows/wasm-package-release.yml",
+                "--workflow .github/workflows/attacker.yml",
+                1,
+            ),
+            "invocation_policy": original.replace(
+                '--invocation-policy "$invocation_policy"',
+                "--invocation-policy existing-release",
+                1,
+            ),
+            "registry_consumer": original.replace(
+                'npm install --ignore-scripts "$spec"',
+                "npm view \"$spec\"",
+                1,
+            ),
+            "publish_rebuild": original.replace(
+                "      - name: Reverify immutable candidate and hosted tag",
+                "      - name: Reverify immutable candidate and hosted tag\n"
+                "        run: bash scripts/build-wasm-package.sh target/rebuilt",
+                1,
+            ),
+            "verify_job_conditional": original.replace(
+                "  verify:\n    name:",
+                "  verify:\n    if: github.event_name == 'push'\n    name:",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                approved_hash = hashlib.sha256(workflow.encode("utf-8")).hexdigest()
+                with mock.patch.object(
+                    self.policy,
+                    "WASM_PACKAGE_RELEASE_WORKFLOW_SHA256",
+                    approved_hash,
+                ):
+                    errors = self.policy.audit_wasm_package_release_workflow(
+                        Path("wasm-package-release.yml"), workflow
+                    )
                 self.assertTrue(errors)
 
     def test_checked_in_codeql_explicitly_builds_every_rust_surface(self) -> None:

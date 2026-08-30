@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -25,6 +26,16 @@ POSITIVE_INTEGER_RE = re.compile(r"[1-9][0-9]*")
 CURRENT_RUN_INVOCATION = "current-run"
 EXISTING_RELEASE_INVOCATION = "existing-release"
 INVOCATION_POLICIES = {CURRENT_RUN_INVOCATION, EXISTING_RELEASE_INVOCATION}
+WORKFLOW_RELEASES = {
+    ".github/workflows/render-package-release.yml": {
+        "package": "@rxls/render-worker",
+        "tag_prefix": "render-v",
+    },
+    ".github/workflows/wasm-package-release.yml": {
+        "package": "rxls-wasm",
+        "tag_prefix": "wasm-v",
+    },
+}
 
 
 class EvidenceError(ValueError):
@@ -73,14 +84,20 @@ def _decode_dsse(bundle: dict[str, Any], label: str) -> dict[str, Any]:
     return _object(statement, f"{label}.statement")
 
 
-def _expected_sha512(integrity: str) -> str:
-    _require(integrity.startswith("sha512-"), "pack.integrity_algorithm")
-    try:
-        digest = base64.b64decode(integrity.removeprefix("sha512-"), validate=True)
-    except binascii.Error as error:
-        raise EvidenceError("pack.integrity_encoding") from error
-    _require(len(digest) == 64, "pack.integrity_length")
-    return digest.hex()
+def _validate_archive_identity(
+    package: dict[str, Any], archive: bytes, package_name: str, version: str
+) -> str:
+    expected_filename = (
+        f"{package_name.removeprefix('@').replace('/', '-')}-{version}.tgz"
+    )
+    _require(package.get("filename") == expected_filename, "pack.filename")
+    _require(package.get("size") == len(archive), "pack.size")
+    _require(package.get("shasum") == hashlib.sha1(archive).hexdigest(), "pack.shasum")
+    expected_integrity = "sha512-" + base64.b64encode(
+        hashlib.sha512(archive).digest()
+    ).decode("ascii")
+    _require(package.get("integrity") == expected_integrity, "pack.integrity")
+    return hashlib.sha512(archive).hexdigest()
 
 
 def _validate_subject(
@@ -126,6 +143,7 @@ def validate_evidence(
     report: Any,
     packed: Any,
     *,
+    archive: bytes,
     repository: str,
     workflow: str,
     git_sha: str,
@@ -148,20 +166,20 @@ def validate_evidence(
     package = _object(packed_rows[0], "pack[0]")
     package_name = package.get("name")
     version = package.get("version")
-    integrity = package.get("integrity")
     _require(isinstance(package_name, str) and bool(package_name), "pack.name")
     _require(isinstance(version, str) and bool(version), "pack.version")
-    _require(isinstance(integrity, str), "pack.integrity")
-    sha512 = _expected_sha512(integrity)
+    sha512 = _validate_archive_identity(package, archive, package_name, version)
 
     _require(SHA_RE.fullmatch(git_sha) is not None, "git_sha")
     _require(POSITIVE_INTEGER_RE.fullmatch(run_id) is not None, "run_id")
     _require(POSITIVE_INTEGER_RE.fullmatch(run_attempt) is not None, "run_attempt")
     _require(invocation_policy in INVOCATION_POLICIES, "invocation_policy")
-    expected_ref = f"refs/tags/render-v{version}"
+    release = WORKFLOW_RELEASES.get(workflow)
+    _require(release is not None, "workflow")
+    _require(package_name == release["package"], "pack.name")
+    expected_ref = f"refs/tags/{release['tag_prefix']}{version}"
     _require(git_ref == expected_ref, "git_ref")
     _require(repository == "HyunjoJung/rxls", "repository")
-    _require(workflow == ".github/workflows/render-package-release.yml", "workflow")
 
     entry = _object(verified[0], "report.verified[0]")
     _require(entry.get("name") == package_name, "verified.name")
@@ -274,6 +292,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--pack", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--git-sha", required=True)
@@ -294,6 +313,7 @@ def main() -> int:
         validate_evidence(
             json.loads(args.audit.read_text(encoding="utf-8")),
             json.loads(args.pack.read_text(encoding="utf-8")),
+            archive=args.archive.read_bytes(),
             repository=args.repository,
             workflow=args.workflow,
             git_sha=args.git_sha,

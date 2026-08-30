@@ -22,9 +22,11 @@ of Apache POI's Apache-2.0-licensed `15556.xls`; its immutable source revision,
 source hash, transformation, and output hash are recorded in
 `tests/fixtures/README.md` and `tests/fixtures/MANIFEST.json`.
 
-The repository-only `bindings/wasm` package additionally depends directly on
-[`wasm-bindgen`](https://crates.io/crates/wasm-bindgen), licensed under MIT OR
-Apache-2.0. That binding package is excluded from the published `rxls` crate.
+In addition to `rxls`, the repository-only `bindings/wasm` package depends
+directly on [`js-sys`](https://crates.io/crates/js-sys) and
+[`wasm-bindgen`](https://crates.io/crates/wasm-bindgen). Both are licensed under
+MIT OR Apache-2.0. That binding package is excluded from the published `rxls`
+crate.
 
 ## Format reference
 

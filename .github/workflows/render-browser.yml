@@ -168,19 +168,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          archive="$GITHUB_WORKSPACE/target/render-browser-evidence/rxls-render-worker-$version.tgz"
           npm pack --json --pack-destination ../../target/render-browser-evidence | tee ../../target/render-browser-evidence/npm-pack.json
-          node -e 'const fs=require("node:fs"); const [p]=JSON.parse(fs.readFileSync("../../target/render-browser-evidence/npm-pack.json")); const wasm=p.files.find((f)=>f.path==="pkg/rxls_render_wasm_bg.wasm"); const notices=p.files.find((f)=>f.path==="THIRD_PARTY_NOTICES.txt"); if (p.entryCount !== 12 || p.size > 2*1024*1024 || p.unpackedSize > 5*1024*1024 || !wasm || wasm.size > 4*1024*1024 || !notices) process.exit(1)'
+          python3 "$GITHUB_WORKSPACE/scripts/check_render_package.py" . \
+            --archive "$archive" \
+            --npm-pack ../../target/render-browser-evidence/npm-pack.json \
+            --git-rev "$(git rev-parse HEAD)" \
+            --write-report ../../target/render-browser-evidence/package-report.json
           mkdir -p ../../target/render-browser-consumer
           cd ../../target/render-browser-consumer
           npm init --yes
           npm install --ignore-scripts --no-audit --no-fund \
-            ../render-browser-evidence/rxls-render-worker-0.1.3.tgz
+            "$archive"
           node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v1") process.exit(1)'
           RXLS_RENDER_INSTALLED_PACKAGE_ROOT="$PWD/node_modules/@rxls/render-worker" \
             node --experimental-websocket \
             "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \
             2>&1 | tee ../render-browser-evidence/installed-package-chromium.log
-          sha256sum ../render-browser-evidence/rxls-render-worker-0.1.3.tgz > ../render-browser-evidence/npm-pack.sha256
+          sha256sum "$archive" > ../render-browser-evidence/npm-pack.sha256
       - name: Verify evidence source remained exact and clean
         shell: bash
         env:
