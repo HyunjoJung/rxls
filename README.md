@@ -259,7 +259,7 @@ cargo build --release --manifest-path bindings/mcp/Cargo.toml --locked
 bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 ```
 
-See the [MCP server guide](bindings/mcp/README.md) for its eight tools, client
+See the [MCP server guide](bindings/mcp/README.md) for its nine tools, client
 configuration, filesystem boundary, and resource limits.
 
 Version `0.1.3` is the current published core release. The renderer,

@@ -24,6 +24,10 @@ pub const MAX_SESSION_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_SESSIONS: usize = 4;
 /// Maximum cells returned by one range read.
 pub const MAX_RANGE_CELLS: usize = 10_000;
+/// Maximum cell differences returned by one comparison.
+pub const MAX_COMPARE_DIFFERENCES: usize = 100;
+/// Maximum serialized bytes reserved for comparison difference details.
+pub const MAX_COMPARE_DETAIL_BYTES: usize = MAX_OUTPUT_BYTES / 2;
 /// Maximum cell edits accepted by one atomic MCP call.
 pub const MAX_BATCH_EDITS: usize = 100;
 /// Maximum serialized payload returned by one tool call.

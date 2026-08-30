@@ -26,6 +26,20 @@ pub(crate) struct ReadRangeParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CompareWorkbooksParams {
+    /// Opaque ID for the left workbook returned by `workbook_open`.
+    pub(crate) left_session_id: String,
+    /// Case-sensitive worksheet name in the left workbook.
+    pub(crate) left_sheet: String,
+    /// Opaque ID for the right workbook returned by `workbook_open`.
+    pub(crate) right_session_id: String,
+    /// Case-sensitive worksheet name in the right workbook.
+    pub(crate) right_sheet: String,
+    /// Inclusive A1 range compared at matching coordinates, for example `A1:D20`.
+    pub(crate) range: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ExportSheetParams {
     /// Opaque ID returned by `workbook_open`.
     pub(crate) session_id: String,
@@ -173,7 +187,7 @@ pub(crate) struct InspectWorkbookResult {
     pub(crate) provenance: ParseProvenanceResult,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum TypedCell {
     Text {
@@ -213,6 +227,43 @@ pub(crate) struct ReadRangeResult {
     pub(crate) range: String,
     pub(crate) cell_count: usize,
     pub(crate) rows: Vec<Vec<CellResult>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub(crate) struct ComparedCell {
+    pub(crate) value: Option<TypedCell>,
+    pub(crate) display: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct CellDifference {
+    pub(crate) address: String,
+    pub(crate) row: u32,
+    pub(crate) column: u16,
+    pub(crate) left: ComparedCell,
+    pub(crate) right: ComparedCell,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct CompareWorkbooksResult {
+    pub(crate) left_session_id: String,
+    pub(crate) left_sha256: String,
+    pub(crate) left_sheet: String,
+    pub(crate) right_session_id: String,
+    pub(crate) right_sha256: String,
+    pub(crate) right_sheet: String,
+    pub(crate) range: String,
+    pub(crate) compared_cells: usize,
+    pub(crate) identical: bool,
+    pub(crate) difference_count: usize,
+    pub(crate) returned_differences: usize,
+    pub(crate) max_returned_differences: usize,
+    pub(crate) returned_detail_bytes: usize,
+    pub(crate) max_detail_bytes: usize,
+    pub(crate) differences_truncated: bool,
+    pub(crate) truncated_by_count: bool,
+    pub(crate) truncated_by_size: bool,
+    pub(crate) differences: Vec<CellDifference>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
