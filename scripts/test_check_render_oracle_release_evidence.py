@@ -1088,6 +1088,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             "created": "2026-07-13T00:00:00Z",
             "descriptor": descriptor,
             "labels": {
+                "org.opencontainers.image.title": "rxls LibreOffice render oracle",
                 "org.opencontainers.image.version": "26.2.3.2",
                 "org.rxls.render-oracle.architecture": "linux/amd64",
                 "org.rxls.render-oracle.libreoffice-artifact-sha256": (
@@ -1256,11 +1257,12 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 "repetitions": 2,
                 "shard_count": 4,
                 "parallel_shards": 2,
-                "shard_case_counts": [200, 200, 200, 200],
-                "shard_format_counts": [
-                    {"ods": 50, "xls": 50, "xlsb": 50, "xlsx": 50}
-                    for _ in range(4)
-                ],
+                "shard_case_counts": copy.deepcopy(
+                    self.checker.EXPECTED_SHARD_CASE_COUNTS
+                ),
+                "shard_format_counts": copy.deepcopy(
+                    self.checker.EXPECTED_SHARD_FORMAT_COUNTS
+                ),
                 "sha256": self.checker._canonical_sha256(campaign),
             },
             "summary": {
@@ -1301,7 +1303,7 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
             },
             "renderer": renderer,
             "font_pack": {
-                "alias_count": 10,
+                "alias_count": 11,
                 "attestation_required": True,
                 "configured": True,
                 "font_count": 26,
@@ -3147,6 +3149,13 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 ),
                 "summary_font_pack",
             ),
+            "summary_font_alias_count": (
+                "hosted-summary.json",
+                lambda value: value["font_pack"].update(
+                    {"alias_count": 10}
+                ),
+                "summary_font_pack",
+            ),
             "summary_input_set": (
                 "hosted-summary.json",
                 lambda value: value["corpus"].update(
@@ -3171,6 +3180,19 @@ class RenderOracleReleaseEvidenceTests(unittest.TestCase):
                 lambda value: value["reproducibility"]["identities"][0][
                     "labels"
                 ].update({"private_note": "secret"}),
+                "build_reproducibility_identities",
+            ),
+            "build_title_label": (
+                "build.json",
+                lambda value: value["reproducibility"]["identities"][0][
+                    "labels"
+                ].update(
+                    {
+                        "org.opencontainers.image.title": (
+                            "tampered render oracle"
+                        )
+                    }
+                ),
                 "build_reproducibility_identities",
             ),
         }

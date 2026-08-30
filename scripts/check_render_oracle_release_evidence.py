@@ -130,6 +130,13 @@ EXPECTED_FORMAT_COUNTS = {
     "xlsb": 200,
     "xlsx": 200,
 }
+EXPECTED_SHARD_FORMAT_COUNTS = [
+    {"ods": 55, "xls": 47, "xlsb": 44, "xlsx": 50},
+    {"ods": 46, "xls": 47, "xlsb": 39, "xlsx": 54},
+    {"ods": 56, "xls": 58, "xlsb": 60, "xlsx": 46},
+    {"ods": 43, "xls": 48, "xlsb": 57, "xlsx": 50},
+]
+EXPECTED_SHARD_CASE_COUNTS = [196, 186, 220, 198]
 EXPECTED_FEATURE_COUNTS = {
     "border": 200,
     "cell-fill": 200,
@@ -1753,6 +1760,7 @@ def _validate_identity_row(
         "build_identity_labels",
     )
     expected_labels = {
+        "org.opencontainers.image.title": "rxls LibreOffice render oracle",
         "org.opencontainers.image.version": "26.2.3.2",
         "org.rxls.render-oracle.architecture": "linux/amd64",
         "org.rxls.render-oracle.libreoffice-artifact-sha256": (
@@ -2030,7 +2038,7 @@ def _validate_font_pack(value: object, expected_sha256: object) -> None:
         }
         and value["attestation_required"] is True
         and value["configured"] is True
-        and value["alias_count"] == 10
+        and value["alias_count"] == 11
         and value["font_count"] == 26
         and value["pdf_identity_count"] == 59
         and value["license"] == "SIL-OFL-1.1"
@@ -3644,35 +3652,12 @@ def validate(
     )
     shard_counts = campaign_summary.get("shard_case_counts")
     _require(
-        isinstance(shard_counts, list)
-        and len(shard_counts) == 4
-        and sum(shard_counts) == 800
-        and all(type(count) is int and 180 <= count <= 220 for count in shard_counts),
+        shard_counts == EXPECTED_SHARD_CASE_COUNTS,
         "summary_shards",
     )
     shard_format_counts = campaign_summary["shard_format_counts"]
     _require(
-        isinstance(shard_format_counts, list)
-        and len(shard_format_counts) == 4
-        and all(
-            isinstance(row, dict)
-            and set(row) == set(EXPECTED_FORMAT_COUNTS)
-            and all(
-                type(count) is int and 40 <= count <= 60
-                for count in row.values()
-            )
-            for row in shard_format_counts
-        )
-        and [
-            sum(row.values())
-            for row in shard_format_counts
-        ]
-        == shard_counts
-        and {
-            name: sum(row[name] for row in shard_format_counts)
-            for name in EXPECTED_FORMAT_COUNTS
-        }
-        == EXPECTED_FORMAT_COUNTS,
+        shard_format_counts == EXPECTED_SHARD_FORMAT_COUNTS,
         "summary_shard_formats",
     )
     candidate_campaign = candidate_campaigns[0]
