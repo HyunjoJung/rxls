@@ -1,0 +1,9 @@
+rxls Spreadsheet Preview bundles the rxls public viewer and
+@rxls/render-worker. Complete notices and license texts are packaged at:
+
+  media/viewer/THIRD_PARTY_NOTICES.txt
+  media/viewer/runtime/THIRD_PARTY_NOTICES.txt
+  media/viewer/runtime/LICENSE
+
+The extension source and rxls-owned viewer code are licensed under MIT; see
+LICENSE in this directory.

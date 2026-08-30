@@ -51,6 +51,8 @@ def _run_wasm_output_resolver(requested_output: str) -> subprocess.CompletedProc
         ["bash", "-lc", command],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -59,6 +61,8 @@ def _run_wasm_builder(requested_output: str) -> subprocess.CompletedProcess[str]
         ["bash", _bash_path(BUILD_WASM_PACKAGE), requested_output],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 

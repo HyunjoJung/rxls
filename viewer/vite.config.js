@@ -5,7 +5,7 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    sourcemap: true,
+    sourcemap: process.env.RXLS_SOURCEMAP !== "0",
     target: "es2022"
   },
   server: {

@@ -184,6 +184,13 @@ and document properties, undo or redo changes, and download a new workbook
 while preserving untouched package parts, including VBA. XLS, XLSB, and ODS
 remain explicitly read-only.
 
+The source workspace also builds a separately versioned, read-only
+[VS Code custom editor](extensions/vscode/README.md). It reuses the same local
+worker for XLS, XLSX, XLSM, XLSB, and ODS previews, with sheet/page navigation,
+zoom, reload-on-change, and SVG/PNG export. Workbook bytes stay inside the
+extension host and its webview worker; the extension has no telemetry or
+external network client.
+
 ### Video demos
 
 | English demo | Korean demo |
@@ -205,7 +212,7 @@ export, diagnostics, editing, WASM, and local MCP surfaces build on that model. 
 
 | Guide | Contents |
 |---|---|
-| [Compatibility](docs/compatibility.md) | Format, Cargo feature, metadata, export, CLI, WASM, and local MCP support |
+| [Compatibility](docs/compatibility.md) | Format, Cargo feature, metadata, export, CLI, WASM, MCP, and VS Code support |
 | [Preservation and editing](docs/preservation.md) | XLSX/XLSM edit capability, atomicity, retained parts, and non-goals |
 | [Validation and reproducibility](docs/validation.md) | Public corpus, oracles, release evidence, and reproduction commands |
 | [Format internals](docs/format-internals.md) | BIFF, codepages, OOXML/ODS parsing, bounds, and failure behavior |
@@ -241,7 +248,8 @@ API documentation is published on [docs.rs](https://docs.rs/rxls). The
   `WorkbookReport` JSON with sheet/cell/formula counts, properties, feature
   inventory, and parse provenance.
 - **Portable interfaces:** the native CLI, isolated Node/browser WASM adapter,
-  and local stdio MCP server expose the same core model. MCP sessions are
+  local stdio MCP server, and read-only VS Code preview expose the same core
+  model. MCP sessions are
   path-scoped, return structured output, and preserve XLSX/XLSM package parts;
   workbook bytes never enter protocol messages or a network listener.
 
@@ -263,8 +271,8 @@ See the [MCP server guide](bindings/mcp/README.md) for its nine tools, client
 configuration, filesystem boundary, and resource limits.
 
 Version `0.1.3` is the current published core release. The renderer,
-`@rxls/render-worker`, and local MCP server are separately gated workspace
-surfaces and are not part of the published core crate contract.
+`@rxls/render-worker`, local MCP server, and VS Code preview are separately
+gated workspace surfaces and are not part of the published core crate contract.
 
 ## Contributing
 

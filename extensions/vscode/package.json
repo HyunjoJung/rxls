@@ -1,0 +1,116 @@
+{
+  "name": "rxls-spreadsheet-preview",
+  "displayName": "rxls Spreadsheet Preview",
+  "description": "Local, read-only spreadsheet previews powered by rxls and WebAssembly.",
+  "version": "0.1.0",
+  "publisher": "HyunjoJung",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HyunjoJung/rxls.git",
+    "directory": "extensions/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/HyunjoJung/rxls/issues"
+  },
+  "homepage": "https://hyunjojung.github.io/rxls/",
+  "keywords": [
+    "excel",
+    "xls",
+    "xlsx",
+    "xlsb",
+    "ods",
+    "spreadsheet",
+    "preview",
+    "rust",
+    "wasm"
+  ],
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "engines": {
+    "vscode": "^1.96.0",
+    "node": ">=22"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "rxls.spreadsheetPreview",
+        "displayName": "rxls Spreadsheet Preview",
+        "selector": [
+          {
+            "filenamePattern": "*.xls"
+          },
+          {
+            "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.xlsm"
+          },
+          {
+            "filenamePattern": "*.xlsb"
+          },
+          {
+            "filenamePattern": "*.ods"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "rxls.preview.reload",
+        "title": "rxls: Reload Spreadsheet Preview",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "rxls.preview.reload",
+          "when": "activeCustomEditorId == rxls.spreadsheetPreview",
+          "group": "navigation@10"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "compile": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build:webview": "node scripts/build-viewer.mjs",
+    "build": "npm run clean && npm run compile && npm run build:webview",
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile && node --test dist/test/unit/*.test.js",
+    "test:e2e": "npm run build && node scripts/run-e2e.mjs",
+    "test:install": "node scripts/install-smoke.mjs",
+    "vscode:prepublish": "npm run build",
+    "package:vsix": "node scripts/package.mjs",
+    "verify:vsix": "python scripts/verify_vsix.py"
+  },
+  "devDependencies": {
+    "@rxls/render-worker": "0.2.0",
+    "@types/node": "24.13.3",
+    "@types/vscode": "1.96.0",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.2",
+    "typescript": "6.0.2"
+  },
+  "packageManager": "npm@11.16.0"
+}

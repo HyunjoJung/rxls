@@ -96,7 +96,7 @@ Styles are interned into deduplicated OOXML resource tables. Writer features
 are checked by in-tree `openpyxl` gates. Pivot tables, threaded comments, macro
 creation, and authoring formats other than XLSX are outside the current scope.
 
-## Export, diagnostics, CLI, WASM, and MCP
+## Export, diagnostics, CLI, WASM, MCP, and VS Code
 
 A sheet or workbook can be exported to CSV, HTML, or Markdown. CSV export has
 an explicit formula-text policy for callers that will open output in
@@ -114,7 +114,7 @@ and browser entry points, TypeScript declarations, structured `RxlsError`
 objects, and a synchronous 32 MiB input limit. It is built and distributed
 separately from the native CLI.
 
-The isolated `bindings/mcp` crate exposes eight local stdio tools for opening,
+The isolated `bindings/mcp` crate exposes nine local stdio tools for opening,
 inspecting, reading, exporting, preservation-editing, save-copying, and closing
 workbook sessions. It accepts paths rather than workbook bytes, canonicalizes
 them below one or more configured roots, and opens no network listener. One
@@ -144,6 +144,16 @@ the bounded XLSX/XLSM edit operations above. Downloads preserve the source
 `.xlsm` extension and untouched VBA/package parts. Workbook bytes stay in the
 browser session; the viewer remains a separately versioned product surface
 rather than part of the core crate's SemVer contract.
+
+The separately packaged `extensions/vscode` custom editor provides read-only
+previews for XLS, XLSX, XLSM, XLSB, and ODS through the same worker. It supports
+sheet and page navigation, zoom, explicit and file-change reload, and SVG/PNG
+export. Inputs are capped at 32 MiB, at most four active previews retain 128 MiB
+in aggregate, and export messages are capped at 16 MiB. Workbook bytes remain
+inside the extension host and isolated webview worker. The extension opens no
+external network connection, collects no telemetry, uses a packaged-resource
+CSP, and supports both Restricted Mode and virtual workspaces. It is versioned
+and verified independently from the core crate.
 
 ## Cargo features
 
