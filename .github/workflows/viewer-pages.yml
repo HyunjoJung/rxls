@@ -1,0 +1,133 @@
+name: viewer-pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/viewer-pages.yml"
+      - "bindings/render-wasm/**"
+      - "examples/author_report.rs"
+      - "render/**"
+      - "src/**"
+      - "tests/fixtures/**"
+      - "viewer/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  RENDER_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
+
+jobs:
+  build:
+    name: Build local-only workbook viewer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RENDER_MSRV }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: bindings/render-wasm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+      - name: Verify viewer dependencies and application logic
+        run: |
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          npm ci --prefix viewer --ignore-scripts
+          npm --prefix viewer test
+      - name: Install exact wasm-bindgen CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+      - name: Build exact worker and Pages artifact
+        shell: bash
+        env:
+          RXLS_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          npm --prefix bindings/render-wasm run build:wasm
+          cargo run --locked --example author_report -- "$RUNNER_TEMP/operations-report.xlsx"
+          cmp --silent viewer/samples/operations-report.xlsx "$RUNNER_TEMP/operations-report.xlsx"
+          npm --prefix viewer run prepare:runtime
+          npm --prefix viewer run build
+          test -f viewer/dist/index.html
+          test -f viewer/dist/LICENSE.txt
+          test -f viewer/dist/THIRD_PARTY_NOTICES.txt
+          test -f viewer/dist/runtime/pkg/rxls_render_wasm_bg.wasm
+          test -f viewer/dist/samples/manifest.json
+      - name: Verify source remained exact and clean
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: viewer/dist
+
+  deploy:
+    name: Deploy workbook viewer
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

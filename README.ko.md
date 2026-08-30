@@ -3,13 +3,14 @@
 [English](README.md) | **한국어**
 
 **오래된 형식부터 최신 형식까지 다루는 하나의 Rust 네이티브 스프레드시트
-라이브러리.**
+툴킷.**
 
 XLS, XLSX, XLSB, ODS를 하나의 타입 모델로 읽습니다. XLSX를 새로 만들고,
 수정하지 않은 패키지 파트는 그대로 보존하면서 XLSX/XLSM을 편집합니다.
 
 [![Crates.io](https://img.shields.io/crates/v/rxls.svg)](https://crates.io/crates/rxls)
 [![Docs.rs](https://docs.rs/rxls/badge.svg)](https://docs.rs/rxls)
+[![Live viewer](https://img.shields.io/badge/live-viewer-176b3a.svg)](https://hyunjojung.github.io/rxls/)
 [![CI](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml/badge.svg)](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
@@ -171,6 +172,15 @@ XLSX/XLSM의 셀·수식·범위, 문서와 시트 메타데이터, 시트 추�
 [Validation and reproducibility](docs/validation.md)에 있습니다. (English)
 
 ## 데모와 아키텍처
+
+### 브라우저 뷰어
+
+[rxls 라이브 뷰어](https://hyunjojung.github.io/rxls/)에서는 별도 설치 없이 XLS,
+XLSX, XLSM, XLSB, ODS 파일을 확인할 수 있습니다. 선택한 파일은 업로드하지 않고
+브라우저의 처리 범위가 제한된 WebAssembly worker 안에서 처리합니다. 프로젝트가
+직접 만든 샘플, 시트·페이지 보기, 확대·축소, SVG/PNG 내보내기를 제공합니다.
+
+### 시연 영상
 
 | 한국어 시연 | 영어 시연 |
 |---|---|

@@ -5,9 +5,9 @@ edition = "2021"
 # The resolved dependency graph supports Rust 1.85; CI enforces this floor.
 rust-version = "1.85"
 license = "MIT"
-description = "Native Rust spreadsheet library: reads .xls (BIFF8/5/7), .xlsx, .xlsb, .ods and writes .xlsx. Typed cells, formulas, panic-free, no JVM/POI."
+description = "Native Rust spreadsheet toolkit: reads .xls (BIFF8/5/7), .xlsx, .xlsb, .ods and writes .xlsx. Typed cells, formulas, panic-free, no JVM/POI."
 repository = "https://github.com/HyunjoJung/rxls"
-homepage = "https://github.com/HyunjoJung/rxls"
+homepage = "https://hyunjojung.github.io/rxls/"
 documentation = "https://docs.rs/rxls"
 readme = "README.md"
 authors = ["Hyunjo Jung <j96263732@gmail.com>"]
@@ -80,6 +80,7 @@ exclude = [
     "scripts/test_release_tools.py",
     "scripts/test_summarize_render_oracle_failure.py",
     "scripts/test_workflow_policy.py",
+    "viewer/",
     "MIGRATION-*.md",
     "ROADMAP-*.md",
 ]
