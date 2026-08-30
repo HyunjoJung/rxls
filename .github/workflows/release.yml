@@ -49,10 +49,6 @@ jobs:
             echo "release identity requires complete Git history" >&2
             exit 1
           }
-          test "$(git rev-list --count HEAD)" = "1" || {
-            echo "release source must contain exactly one public commit" >&2
-            exit 1
-          }
           test "$(git rev-list --max-parents=0 --count HEAD)" = "1" || {
             echo "release source must contain exactly one parentless root" >&2
             exit 1

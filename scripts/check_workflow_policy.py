@@ -2022,10 +2022,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
             "must not cancel an in-flight external publication"
         ),
         'test "$(git rev-parse --is-shallow-repository)" = "false"': (
-            "must reject shallow history before enforcing the one-root release"
-        ),
-        'test "$(git rev-list --count HEAD)" = "1"': (
-            "must require the release source to contain exactly one commit"
+            "must reject shallow history before enforcing the single-root release"
         ),
         'test "$(git rev-list --max-parents=0 --count HEAD)" = "1"': (
             "must require exactly one parentless public root"
@@ -2158,11 +2155,23 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
         )
     if "git merge-base --is-ancestor" in identity_step:
         errors.append(f"{path}: ancestor-only release tag validation is forbidden")
-    one_commit = 'test "$(git rev-list --count HEAD)" = "1"'
     one_root = 'test "$(git rev-list --max-parents=0 --count HEAD)" = "1"'
-    if identity_step.count(one_commit) != 1 or identity_step.count(one_root) != 1:
+    if identity_step.count(one_root) != 1:
         errors.append(
-            f"{path}: release identity step must enforce one complete parentless commit"
+            f"{path}: release identity step must enforce one complete parentless root"
+        )
+    total_commit_probes = [
+        line
+        for line in identity_step.splitlines()
+        if "git rev-list" in line
+        and "--count" in line
+        and "HEAD" in line
+        and "--max-parents=0" not in line
+    ]
+    if total_commit_probes:
+        errors.append(
+            f"{path}: release identity must not restrict the public history to a "
+            "fixed total commit count"
         )
     shallow_check = 'test "$(git rev-parse --is-shallow-repository)" = "false"'
     if identity_step.count(shallow_check) != 1:

@@ -500,9 +500,10 @@ steps:
                 "true",
                 1,
             ),
-            "release_commit_count": original.replace(
-                'test "$(git rev-list --count HEAD)" = "1"',
-                'test "$(git rev-list --count HEAD)" -ge "1"',
+            "release_total_commit_restriction": original.replace(
+                '          test "$(git rev-list --max-parents=0 --count HEAD)" = "1" || {\n',
+                '          test "$(git rev-list --count HEAD)" = "1"\n'
+                '          test "$(git rev-list --max-parents=0 --count HEAD)" = "1" || {\n',
                 1,
             ),
             "release_root_count": original.replace(
