@@ -1,0 +1,13 @@
+body {
+  font: 16px/1.5 system-ui, sans-serif;
+  margin: 2rem auto;
+  max-width: 60rem;
+  padding: 0 1rem;
+}
+
+pre {
+  background: #f4f4f4;
+  overflow: auto;
+  padding: 1rem;
+  white-space: pre-wrap;
+}

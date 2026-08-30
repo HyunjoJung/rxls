@@ -2,12 +2,27 @@
   "name": "rxls-wasm",
   "version": "0.1.3",
   "description": "Read and diagnose spreadsheet files in WebAssembly with rxls",
+  "author": {
+    "name": "Hyunjo Jung",
+    "url": "https://github.com/HyunjoJung"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HyunjoJung/rxls.git",
     "directory": "bindings/wasm"
   },
+  "homepage": "https://hyunjojung.github.io/rxls/",
+  "keywords": [
+    "excel",
+    "spreadsheet",
+    "rust",
+    "wasm",
+    "xls",
+    "xlsx",
+    "xlsb",
+    "ods"
+  ],
   "type": "commonjs",
   "main": "./node/rxls_wasm.js",
   "types": "./node/rxls_wasm.d.ts",
@@ -30,7 +45,9 @@
     "web",
     "demo",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "sideEffects": false,
   "engines": {

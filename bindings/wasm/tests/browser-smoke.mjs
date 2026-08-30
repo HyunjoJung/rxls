@@ -27,17 +27,44 @@ const fixtureRoutes = new Map(
   fixtures.map((fixture) => [`/fixtures/${fixture.id}`, fixture]),
 );
 const fixtureManifest = fixtures.map(({ id, format }) => ({ id, format }));
+const contentSecurityPolicy = [
+  "default-src 'none'",
+  "base-uri 'none'",
+  "connect-src 'self'",
+  "font-src 'self'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "img-src 'self'",
+  "manifest-src 'none'",
+  "object-src 'none'",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "style-src 'self'",
+  "worker-src 'self'",
+].join("; ");
 const smokeHtml = `<!doctype html>
 <meta charset="utf-8">
 <title>rxls-wasm browser smoke</title>
-<script type="module">
+<pre id="result" hidden></pre>
+<script type="module" src="/smoke/app.mjs"></script>`;
+const smokeModule = `
   import init, {
     extractText,
+    maxExportOutputBytes,
     maxInputBytes,
     reportJson,
     toCsv,
     toHtml,
+    toMarkdown,
   } from "/package/web/rxls_wasm.js";
+
+  const resultElement = document.querySelector("#result");
+  const cspViolations = [];
+  document.addEventListener("securitypolicyviolation", (event) => {
+    cspViolations.push({
+      blockedURI: event.blockedURI,
+      effectiveDirective: event.effectiveDirective,
+    });
+  });
 
   const capture = (call) => {
     try {
@@ -67,6 +94,7 @@ const smokeHtml = `<!doctype html>
         text: extractText(bytes),
         csv: toCsv(bytes, 0),
         html: toHtml(bytes, 0),
+        markdown: toMarkdown(bytes, 0),
         report: JSON.parse(reportJson(bytes)),
       };
     }
@@ -91,19 +119,27 @@ const smokeHtml = `<!doctype html>
     };
     window.__rxls = {
       outputs,
+      cspViolations,
+      maxExportOutputBytes: maxExportOutputBytes(),
       maxInputBytes: maxInputBytes(),
       malformedErrors,
       rangeErrors,
       limitErrors,
     };
+    resultElement.textContent = JSON.stringify(window.__rxls);
+    resultElement.dataset.state = "complete";
   } catch (error) {
     window.__rxlsFailure = String(error?.stack ?? error);
+    resultElement.textContent = window.__rxlsFailure;
+    resultElement.dataset.state = "failed";
   }
-</script>`;
+`;
 
 const contentTypes = new Map([
+  [".css", "text/css; charset=utf-8"],
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
   [".wasm", "application/wasm"],
 ]);
@@ -111,7 +147,9 @@ const contentTypes = new Map([
 function serveFile(response, filename, contentType) {
   response.writeHead(200, {
     "cache-control": "no-store",
+    "content-security-policy": contentSecurityPolicy,
     "content-type": contentType || contentTypes.get(path.extname(filename)) || "application/octet-stream",
+    "x-content-type-options": "nosniff",
   });
   fs.createReadStream(filename).pipe(response);
 }
@@ -119,8 +157,23 @@ function serveFile(response, filename, contentType) {
 const server = http.createServer((request, response) => {
   const pathname = new URL(request.url, "http://127.0.0.1").pathname;
   if (pathname === "/smoke/") {
-    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-security-policy": contentSecurityPolicy,
+      "content-type": "text/html; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    });
     response.end(smokeHtml);
+    return;
+  }
+  if (pathname === "/smoke/app.mjs") {
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-security-policy": contentSecurityPolicy,
+      "content-type": "text/javascript; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    });
+    response.end(smokeModule);
     return;
   }
   const fixture = fixtureRoutes.get(pathname);
@@ -161,17 +214,41 @@ function assertErrorContract(error, kind, location) {
   });
 }
 
+async function waitForText(locator, predicate, description, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await locator.textContent();
+    if (predicate(value ?? "")) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${description}`);
+}
+
 try {
   const apiPage = await browser.newPage();
   const apiPageErrors = [];
+  const apiConsoleErrors = [];
   apiPage.on("pageerror", (error) => apiPageErrors.push(String(error)));
-  await apiPage.goto(`${origin}/smoke/`);
-  await apiPage.waitForFunction(() => window.__rxls || window.__rxlsFailure);
-  const failure = await apiPage.evaluate(() => window.__rxlsFailure);
-  assert.equal(failure, undefined);
+  apiPage.on("console", (message) => {
+    if (message.type() === "error") apiConsoleErrors.push(message.text());
+  });
+  const apiResponse = await apiPage.goto(`${origin}/smoke/`);
+  assert.equal(apiResponse.headers()["content-security-policy"], contentSecurityPolicy);
+  const apiResult = apiPage.locator("#result");
+  await apiPage.locator('#result[data-state="complete"], #result[data-state="failed"]').waitFor({
+    state: "attached",
+  });
+  assert.equal(
+    await apiResult.getAttribute("data-state"),
+    "complete",
+    await apiResult.textContent(),
+  );
   assert.deepEqual(apiPageErrors, []);
-  const result = await apiPage.evaluate(() => window.__rxls);
+  assert.deepEqual(apiConsoleErrors, []);
+  const result = JSON.parse(await apiResult.textContent());
   assert.equal(result.maxInputBytes, 32 * 1024 * 1024);
+  assert.equal(result.maxExportOutputBytes, 16 * 1024 * 1024);
+  assert.deepEqual(result.cspViolations, []);
   assert.deepEqual(result.outputs, expected, "browser and CommonJS package outputs differ");
   for (const error of Object.values(result.malformedErrors)) {
     assertErrorContract(error, "not_ole2", "container");
@@ -189,9 +266,15 @@ try {
 
   const demoPage = await browser.newPage();
   const demoPageErrors = [];
+  const demoConsoleErrors = [];
   demoPage.on("pageerror", (error) => demoPageErrors.push(String(error)));
-  await demoPage.goto(`${origin}/package/demo/index.html`);
-  await demoPage.waitForFunction(() => document.querySelector("#status")?.textContent.startsWith("Ready."));
+  demoPage.on("console", (message) => {
+    if (message.type() === "error") demoConsoleErrors.push(message.text());
+  });
+  const demoResponse = await demoPage.goto(`${origin}/package/demo/index.html`);
+  assert.equal(demoResponse.headers()["content-security-policy"], contentSecurityPolicy);
+  const status = demoPage.locator("#status");
+  await waitForText(status, (value) => value.startsWith("Ready."), "demo readiness");
   assert.equal(
     await demoPage.locator("#status").textContent(),
     "Ready. Maximum input: 32 MiB.",
@@ -204,9 +287,10 @@ try {
   for (const fixture of fixtures) {
     await demoPage.locator("#file").setInputFiles(fixture.path);
     const filename = path.basename(fixture.path);
-    await demoPage.waitForFunction(
-      (status) => document.querySelector("#status")?.textContent === status,
-      `Parsed ${filename}.`,
+    await waitForText(
+      status,
+      (value) => value === `Parsed ${filename}.`,
+      `${fixture.id} parse completion`,
     );
     assert.deepEqual(
       JSON.parse(await demoPage.locator("#output").textContent()),
@@ -220,6 +304,11 @@ try {
 
   const xlsx = fixtures.find((fixture) => fixture.id === "xlsx");
   await demoPage.locator("#file").setInputFiles(xlsx.path);
+  await waitForText(
+    status,
+    (value) => value === `Parsed ${path.basename(xlsx.path)}.`,
+    "XLSX parse completion",
+  );
   await demoPage.locator("#show-report").click();
   assert.equal(await demoPage.locator("#status").textContent(), `Showing report for ${path.basename(xlsx.path)}.`);
   assert.deepEqual(JSON.parse(await demoPage.locator("#output").textContent()), expected.xlsx.report);
@@ -241,8 +330,10 @@ try {
     mimeType: fixtures.find((fixture) => fixture.id === "xlsx").mimeType,
     buffer: Buffer.from("not a spreadsheet"),
   });
-  await demoPage.waitForFunction(
-    () => document.querySelector("#status")?.textContent.startsWith("Failed:"),
+  await waitForText(
+    status,
+    (value) => value.startsWith("Failed:"),
+    "malformed input failure",
   );
   assert.match(
     await demoPage.locator("#status").textContent(),
@@ -258,8 +349,10 @@ try {
     mimeType: xlsx.mimeType,
     buffer: Buffer.alloc(32 * 1024 * 1024 + 1),
   });
-  await demoPage.waitForFunction(
-    () => document.querySelector("#status")?.textContent.startsWith("Rejected:"),
+  await waitForText(
+    status,
+    (value) => value.startsWith("Rejected:"),
+    "oversized input rejection",
   );
   assert.equal(
     await demoPage.locator("#status").textContent(),
@@ -270,12 +363,22 @@ try {
     assert.equal(await demoPage.locator(selector).isDisabled(), true);
   }
   assert.deepEqual(demoPageErrors, []);
+  assert.deepEqual(demoConsoleErrors, []);
 
   process.stdout.write(`${JSON.stringify({
     runtime: "browser",
     fixtures: fixtures.map((fixture) => fixture.id),
-    exports: ["extractText", "maxInputBytes", "reportJson", "toCsv", "toHtml"],
+    exports: [
+      "extractText",
+      "maxExportOutputBytes",
+      "maxInputBytes",
+      "reportJson",
+      "toCsv",
+      "toHtml",
+      "toMarkdown",
+    ],
     parity: "commonjs",
+    strictCsp: true,
     demo: ["ready", "success", "report", "text", "csv", "html", "malformed", "limit"],
   })}\n`);
 } finally {

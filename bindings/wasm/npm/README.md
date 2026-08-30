@@ -1,18 +1,22 @@
 # rxls-wasm
 
 `rxls-wasm` is the synchronous WebAssembly adapter for the `rxls` spreadsheet
-reader. It accepts spreadsheet bytes and exposes text, CSV, HTML, and stable
-diagnostic JSON outputs.
+reader. It accepts spreadsheet bytes and exposes text, CSV, HTML, Markdown, and
+stable diagnostic JSON outputs.
 
-The package requires Node.js 20 or newer. It reads `.xls`, `.xlsx`, `.xlsm`,
-`.xlsb`, and `.ods` according to the enabled native reader contract; it does not
-expose XLSX authoring or package-preserving editing. The synchronous exports are
-`extractText`, `toCsv`, `toHtml`, `reportJson`, and `maxInputBytes`.
+The package reads `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, and `.ods`. It is read-only:
+it does not create, modify, or preserve spreadsheet packages. The synchronous
+exports are `extractText`, `toCsv`, `toHtml`, `toMarkdown`, `reportJson`,
+`maxInputBytes`, and `maxExportOutputBytes`.
+
+```sh
+npm install rxls-wasm
+```
 
 ## Node.js
 
-The Node binding initializes synchronously when it is loaded; it does not
-export the browser-only default initializer.
+Node.js 20 or newer is required. The Node binding initializes synchronously
+when loaded and does not export the browser-only default initializer.
 
 ```js
 const fs = require("node:fs");
@@ -22,6 +26,12 @@ const bytes = fs.readFileSync("workbook.xlsx");
 if (bytes.byteLength > maxInputBytes()) throw new Error("workbook is too large");
 const report = JSON.parse(reportJson(bytes));
 console.log(report.stats);
+```
+
+Node ESM consumers can use the same named exports:
+
+```js
+import { reportJson } from "rxls-wasm";
 ```
 
 ## Browser
@@ -68,11 +78,6 @@ The same gate enforces these distribution ceilings:
 | Packed npm archive | 2 MiB |
 
 Build and validate the candidate with `bash scripts/build-wasm-package.sh`.
-The release archive also includes the generated TypeScript declarations, demo,
-and license. `wasm-size-report.json` is published beside the archive as GitHub
-Release evidence; it is deliberately not embedded in the npm package it
-describes.
-
-For 0.1.3, the validated `.tgz` is distributed as a GitHub Release asset rather
-than published to the npm registry. Install the downloaded archive with
-`npm install ./rxls-wasm-0.1.3.tgz`.
+The npm package also includes generated TypeScript declarations, the browser
+demo, and license notices. `wasm-size-report.json` is published separately as
+release evidence and is not embedded in the package it describes.

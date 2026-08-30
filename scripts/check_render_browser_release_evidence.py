@@ -32,6 +32,7 @@ from check_render_oracle_release_evidence import (
     EvidenceError as ArtifactDownloadError,
     download_artifact_archive,
 )
+from check_render_package import EXPECTED_FILES as EXPECTED_PACKAGE_FILES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,21 +67,6 @@ MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_BEHAVIOR_PROOF_BYTES = 32 * 1024
 MAX_INTEGER = (1 << 63) - 1
 SUMMARY_NAME = "browser-summary.json"
-EXPECTED_PACKAGE_FILES = {
-    "LICENSE",
-    "README.md",
-    "THIRD_PARTY_NOTICES.txt",
-    "js/client.mjs",
-    "js/protocol.mjs",
-    "js/worker-runtime.mjs",
-    "js/worker.mjs",
-    "package.json",
-    "pkg/rxls_render_wasm.d.ts",
-    "pkg/rxls_render_wasm.js",
-    "pkg/rxls_render_wasm_bg.wasm",
-    "pkg/rxls_render_wasm_bg.wasm.d.ts",
-}
-
 MODE_DESCRIPTIONS = {
     "source": (
         "worker/WASM rich font/image, CSP, limits, virtual tile/page "
@@ -895,7 +881,7 @@ def _validate_pack(
         packed.get("name") == contract["package_name"]
         and packed.get("version") == version
         and packed.get("filename") == expected_filename
-        and packed.get("entryCount") == 12
+        and packed.get("entryCount") == len(EXPECTED_PACKAGE_FILES)
         and _positive_int(packed.get("size"), maximum=2 * 1024 * 1024)
         and _positive_int(packed.get("unpackedSize"), maximum=5 * 1024 * 1024)
         and isinstance(packed.get("shasum"), str)
@@ -907,7 +893,7 @@ def _validate_pack(
     files = packed.get("files")
     _require(
         isinstance(files, list)
-        and len(files) == 12
+        and len(files) == len(EXPECTED_PACKAGE_FILES)
         and all(
             isinstance(row, dict)
             and isinstance(row.get("path"), str)
@@ -1337,7 +1323,7 @@ def validate_summary(
         }
         and package.get("name") == contract["package_name"]
         and package.get("version") == contract["package_version"]
-        and package.get("entry_count") == 12
+        and package.get("entry_count") == len(EXPECTED_PACKAGE_FILES)
         and _positive_int(package.get("archive_bytes"), maximum=2 * 1024 * 1024)
         and _positive_int(package.get("unpacked_bytes"), maximum=5 * 1024 * 1024)
         and isinstance(package.get("archive_sha256"), str)

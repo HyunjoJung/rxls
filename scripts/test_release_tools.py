@@ -6,7 +6,11 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -23,6 +27,115 @@ IDENTITY = ROOT / "scripts" / "check_release_identity.py"
 WASM_PACKAGE = ROOT / "scripts" / "check_wasm_package.py"
 SBOM = ROOT / "scripts" / "generate-sbom.py"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+BUILD_WASM_PACKAGE = ROOT / "scripts" / "build-wasm-package.sh"
+
+
+def _bash_path(path: Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    resolved = path.resolve()
+    drive = resolved.drive
+    if len(drive) != 2 or drive[1] != ":":
+        raise ValueError(f"cannot convert path to WSL form: {resolved}")
+    relative = resolved.as_posix()[3:]
+    return f"/mnt/{drive[0].lower()}/{relative}"
+
+
+def _run_wasm_output_resolver(requested_output: str) -> subprocess.CompletedProcess[str]:
+    command = (
+        f"source {shlex.quote(_bash_path(BUILD_WASM_PACKAGE))}; "
+        f"resolve_wasm_package_output {shlex.quote(requested_output)}"
+    )
+    return subprocess.run(
+        ["bash", "-lc", command],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_wasm_builder(requested_output: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", _bash_path(BUILD_WASM_PACKAGE), requested_output],
+        capture_output=True,
+        text=True,
+    )
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash is required")
+class WasmPackageOutputSafetyTests(unittest.TestCase):
+    def test_accepts_default_and_workflow_target_outputs(self) -> None:
+        for requested in (
+            "target/wasm-package",
+            "target/wasm-release/package",
+        ):
+            with self.subTest(requested=requested):
+                result = _run_wasm_output_resolver(requested)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.strip(), _bash_path(ROOT / Path(requested))
+                )
+
+    def test_absolute_and_outside_outputs_preserve_outside_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT.parent) as tmp:
+            outside = Path(tmp)
+            sentinel = outside / "must-survive.txt"
+            sentinel.write_text("outside sentinel\n", encoding="utf-8")
+            absolute_output = f"{_bash_path(outside)}/package"
+
+            for requested in (absolute_output, f"../{outside.name}/package"):
+                with self.subTest(requested=requested):
+                    result = _run_wasm_builder(requested)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refusing unsafe WASM package output", result.stderr)
+                    self.assertEqual(
+                        sentinel.read_text(encoding="utf-8"), "outside sentinel\n"
+                    )
+
+    def test_traversal_output_preserves_outside_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT.parent) as tmp:
+            outside = Path(tmp)
+            sentinel = outside / "must-survive.txt"
+            sentinel.write_text("outside sentinel\n", encoding="utf-8")
+            requested = f"target/safety/../../../{outside.name}"
+
+            result = _run_wasm_builder(requested)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("refusing unsafe WASM package output", result.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "outside sentinel\n")
+
+    def test_symlink_escapes_preserve_outside_sentinel(self) -> None:
+        (ROOT / "target").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / "target") as inside_tmp, \
+             tempfile.TemporaryDirectory(dir=ROOT.parent) as outside_tmp:
+            inside = Path(inside_tmp)
+            outside = Path(outside_tmp)
+            sentinel = outside / "must-survive.txt"
+            sentinel.write_text("outside sentinel\n", encoding="utf-8")
+            intermediate_link = inside / "outside-parent"
+            final_link = inside / "outside-output"
+            link_command = (
+                f"ln -s -- {shlex.quote(_bash_path(outside))} "
+                f"{shlex.quote(_bash_path(intermediate_link))}; "
+                f"ln -s -- {shlex.quote(_bash_path(outside))} "
+                f"{shlex.quote(_bash_path(final_link))}"
+            )
+            subprocess.run(
+                ["bash", "-lc", link_command],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            for output in (intermediate_link / "package", final_link):
+                requested = output.relative_to(ROOT).as_posix()
+                with self.subTest(requested=requested):
+                    result = _run_wasm_builder(requested)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refusing unsafe WASM package output", result.stderr)
+                    self.assertEqual(
+                        sentinel.read_text(encoding="utf-8"), "outside sentinel\n"
+                    )
 
 
 class ReleaseToolTests(unittest.TestCase):
@@ -471,9 +584,37 @@ class ReleaseToolTests(unittest.TestCase):
             )
             (package / "README.md").write_text("readme", encoding="utf-8")
             (package / "LICENSE").write_text("license", encoding="utf-8")
+            (package / "THIRD_PARTY_LICENSES.md").write_text(
+                "# Third-Party Licenses\n\nwasm-bindgen\n", encoding="utf-8"
+            )
+            (package / "THIRD_PARTY_NOTICES.txt").write_bytes(
+                (
+                    "RXLS WASM THIRD-PARTY NOTICES\n"
+                "Generated by scripts/render_supply_chain.py. Do not edit manually.\n\n"
+                "Scope:\n"
+                "- Manifest: bindings/wasm/Cargo.toml\n"
+                "- Target: wasm32-unknown-unknown\n"
+                f"- Cargo lock SHA-256: {'a' * 64}\n"
+                "- Third-party packages: 1\n"
+                "- Unique legal texts: 1\n\n"
+                "PACKAGE: wasm-bindgen 0.2.126\n\n"
+                "DEDUPLICATED LEGAL TEXTS\n\n"
+                f"LEGAL TEXT SHA-256: {'b' * 64}\n"
+                "----- BEGIN LEGAL TEXT -----\n"
+                "MIT\n"
+                    "----- END LEGAL TEXT -----\n"
+                ).encode("utf-8")
+            )
             (package / "demo").mkdir()
-            (package / "demo" / "index.html").write_text("demo", encoding="utf-8")
+            (package / "demo" / "index.html").write_text(
+                '<link rel="stylesheet" href="./style.css">'
+                '<script type="module" src="./app.js"></script>',
+                encoding="utf-8",
+            )
             (package / "demo" / "app.js").write_text("demo", encoding="utf-8")
+            (package / "demo" / "style.css").write_text(
+                "body { color: black; }\n", encoding="utf-8"
+            )
             declarations = " ".join(module.REQUIRED_TYPES)
             for target in ("node", "web"):
                 output = package / target
@@ -492,7 +633,18 @@ class ReleaseToolTests(unittest.TestCase):
                 '{"type":"module"}', encoding="utf-8"
             )
 
-            errors, report = module.validate(package)
+            errors, report = module.validate(package, git_rev="1" * 40)
+
+            drifted_metadata = json.loads(json.dumps(metadata))
+            drifted_metadata["author"]["url"] = "https://example.invalid/maintainer"
+            drifted_metadata["keywords"] = ["spreadsheet"]
+            (package / "package.json").write_text(
+                json.dumps(drifted_metadata), encoding="utf-8"
+            )
+            metadata_errors, _ = module.validate(package)
+            (package / "package.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
 
             node_declarations = package / "node" / "rxls_wasm.d.ts"
             node_declarations.write_text(
@@ -510,18 +662,51 @@ class ReleaseToolTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            demo_html = package / "demo" / "index.html"
+            valid_demo_html = demo_html.read_text(encoding="utf-8")
+            demo_html.write_text("<style>body{color:red}</style>", encoding="utf-8")
+            unsafe_csp_errors, _ = module.validate(package)
+            demo_html.write_text(valid_demo_html, encoding="utf-8")
+
             stale = package / "wasm-size-report.json"
             stale.write_text("{}", encoding="utf-8")
             stale_errors, _ = module.validate(package)
             stale.unlink()
 
-            archive = root / "rxls-wasm-0.1.2.tgz"
+            archive = root / f"rxls-wasm-{metadata['version']}.tgz"
             with tarfile.open(archive, "w:gz") as bundle:
                 for relative in module.REQUIRED_FILES:
                     bundle.add(package / relative, arcname=f"package/{relative}")
-            archive_errors, _ = module.validate(package, archive)
+            archive_errors, archive_report = module.validate(package, archive)
+            npm_pack = root / "npm-pack.json"
+            npm_pack.write_text(
+                json.dumps(
+                    [
+                        {
+                            "name": metadata["name"],
+                            "version": metadata["version"],
+                            "filename": archive.name,
+                            "size": archive_report["archive"]["bytes"],
+                            "unpackedSize": archive_report["archive"]["unpacked_bytes"],
+                            "shasum": archive_report["archive"]["shasum"],
+                            "integrity": archive_report["archive"]["integrity"],
+                            "entryCount": len(module.EXPECTED_FILES),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            receipt_errors, receipt_report = module.validate(
+                package, archive, npm_pack=npm_pack
+            )
+            stale_receipt = json.loads(npm_pack.read_text(encoding="utf-8"))
+            stale_receipt[0]["integrity"] = "sha512-stale"
+            npm_pack.write_text(json.dumps(stale_receipt), encoding="utf-8")
+            stale_receipt_errors, _ = module.validate(
+                package, archive, npm_pack=npm_pack
+            )
 
-            bad_archive = root / "rxls-wasm-0.1.2-bad.tgz"
+            bad_archive = root / f"rxls-wasm-{metadata['version']}-bad.tgz"
             with tarfile.open(bad_archive, "w:gz") as bundle:
                 for relative in module.REQUIRED_FILES:
                     bundle.add(package / relative, arcname=f"package/{relative}")
@@ -530,9 +715,60 @@ class ReleaseToolTests(unittest.TestCase):
                 )
             bad_archive_errors, _ = module.validate(package, bad_archive)
 
+            tampered_archive = root / f"rxls-wasm-{metadata['version']}.tampered.tgz"
+            with tarfile.open(tampered_archive, "w:gz") as bundle:
+                for relative in module.REQUIRED_FILES:
+                    if relative == "README.md":
+                        payload = b"tampered\n"
+                        info = tarfile.TarInfo("package/README.md")
+                        info.size = len(payload)
+                        bundle.addfile(info, io.BytesIO(payload))
+                    else:
+                        bundle.add(package / relative, arcname=f"package/{relative}")
+            tampered_errors, _ = module.validate(package, tampered_archive)
+
+            unsafe_archive = root / f"rxls-wasm-{metadata['version']}.unsafe.tgz"
+            with tarfile.open(unsafe_archive, "w:gz") as bundle:
+                for relative in module.REQUIRED_FILES:
+                    bundle.add(package / relative, arcname=f"package/{relative}")
+                traversal = tarfile.TarInfo("package/../private.txt")
+                traversal.size = 0
+                bundle.addfile(traversal, io.BytesIO())
+                link = tarfile.TarInfo("package/link")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "/etc/passwd"
+                bundle.addfile(link)
+                directory = tarfile.TarInfo("package/../outside/")
+                directory.type = tarfile.DIRTYPE
+                bundle.addfile(directory)
+                payload = b"\0" * (module.MAX_UNPACKED_BYTES + 1)
+                oversized_traversal = tarfile.TarInfo("package/../oversized.bin")
+                oversized_traversal.size = len(payload)
+                bundle.addfile(oversized_traversal, io.BytesIO(payload))
+            unsafe_errors, _ = module.validate(package, unsafe_archive)
+
+            bomb_archive = root / f"rxls-wasm-{metadata['version']}.bomb.tgz"
+            with tarfile.open(bomb_archive, "w:gz") as bundle:
+                payload = b"\0" * (module.MAX_UNPACKED_BYTES + 1)
+                bomb = tarfile.TarInfo("package/bomb.bin")
+                bomb.size = len(payload)
+                bundle.addfile(bomb, io.BytesIO(payload))
+            bomb_errors, _ = module.validate(package, bomb_archive)
+
         self.assertEqual(errors, [])
         self.assertTrue(report["passed"])
-        self.assertEqual(report["schema"], "rxls.wasm-bundle-budget.v1")
+        self.assertEqual(report["schema"], "rxls.wasm-bundle-budget.v2")
+        self.assertEqual(report["git_rev"], "1" * 40)
+        self.assertRegex(report["license_summary"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(report["third_party_notice"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn(
+            "package.json author must identify the public maintainer",
+            metadata_errors,
+        )
+        self.assertIn(
+            "package.json keywords must identify the supported formats",
+            metadata_errors,
+        )
         self.assertIn(
             "node declarations must not advertise browser initialization",
             node_type_errors,
@@ -541,11 +777,34 @@ class ReleaseToolTests(unittest.TestCase):
             "web declarations must advertise browser initialization",
             web_type_errors,
         )
+        self.assertIn("demo HTML must not require unsafe-inline CSP", unsafe_csp_errors)
         self.assertIn("unexpected package file: wasm-size-report.json", stale_errors)
         self.assertEqual(archive_errors, [])
+        self.assertEqual(receipt_errors, [])
+        self.assertRegex(receipt_report["npm_pack"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("npm pack receipt differs: integrity", stale_receipt_errors)
         self.assertIn(
             "npm archive contains unexpected file: wasm-size-report.json",
             bad_archive_errors,
+        )
+        self.assertIn(
+            "npm archive member differs from package directory: README.md",
+            tampered_errors,
+        )
+        self.assertTrue(
+            any("unsafe member: package/../private.txt" in error for error in unsafe_errors)
+        )
+        self.assertTrue(
+            any("unsafe member: package/../outside" in error for error in unsafe_errors)
+        )
+        self.assertIn("npm archive contains non-file member: link", unsafe_errors)
+        self.assertIn(
+            f"npm archive expands to more than {module.MAX_UNPACKED_BYTES} bytes",
+            unsafe_errors,
+        )
+        self.assertIn(
+            f"npm archive expands to more than {module.MAX_UNPACKED_BYTES} bytes",
+            bomb_errors,
         )
 
     def test_hygiene_detects_secret_local_path_and_internal_trace(self) -> None:

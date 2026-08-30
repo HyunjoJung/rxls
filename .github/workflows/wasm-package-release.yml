@@ -1,0 +1,494 @@
+name: WASM package release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "wasm-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-package-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_DENY_VERSION: "0.19.4"
+  CARGO_DENY_SHA256: "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
+  WASM_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
+  PLAYWRIGHT_VERSION: "1.54.1"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  verify:
+    name: Verify immutable rxls-wasm artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate event and package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          version=$(node -p 'require("./bindings/wasm/npm/package.json").version')
+          test -n "$version"
+          test "$(node -p 'require("./bindings/wasm/npm/package.json").name')" = "rxls-wasm"
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "wasm-v$version"
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            echo "workflow_dispatch is verification-only; npm publish will not run"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.WASM_MSRV }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Require successful exact-SHA CI and CodeQL
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_successful_run() {
+            local workflow="$1"
+            local expected_path="$2"
+            local label="$3"
+            local run_id
+            local record
+            mapfile -t run_ids < <(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$workflow" \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 100 \
+              --json databaseId \
+              --jq '.[].databaseId')
+            for run_id in "${run_ids[@]}"; do
+              record=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+                --jq '[.head_sha, .event, .conclusion, .status, .path] | @tsv')
+              IFS=$'\t' read -r head_sha event conclusion status run_path <<< "$record"
+              [[ "$head_sha" == "$GITHUB_SHA" \
+                && "$event" == "push" \
+                && "$conclusion" == "success" \
+                && "$status" == "completed" \
+                && "$run_path" == "$expected_path" ]] || continue
+              echo "$label exact-SHA gate passed in run $run_id"
+              return 0
+            done
+            echo "$label has no successful push run for exact SHA $GITHUB_SHA" >&2
+            return 1
+          }
+
+          require_successful_run ci.yml .github/workflows/ci.yml CI
+          require_successful_run codeql.yml .github/workflows/codeql.yml CodeQL
+      - name: Install checksum-verified cargo-deny
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          archive="$RUNNER_TEMP/cargo-deny.tar.gz"
+          tool_root="$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 5 \
+            --output "$archive" "$url"
+          echo "$CARGO_DENY_SHA256  $archive" | sha256sum --check --strict
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          tar -xzf "$archive" --strip-components=1 -C "$tool_root"
+          test -f "$tool_root/cargo-deny"
+          test ! -L "$tool_root/cargo-deny"
+          chmod 0755 "$tool_root/cargo-deny"
+          test "$("$tool_root/cargo-deny" --version)" = \
+            "cargo-deny $CARGO_DENY_VERSION"
+          echo "$tool_root" >> "$GITHUB_PATH"
+      - name: Audit nested Rust advisories, licenses, and sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(command -v cargo-deny)" = \
+            "$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION/cargo-deny"
+          test "$(cargo-deny --version)" = "cargo-deny $CARGO_DENY_VERSION"
+          cargo-deny --manifest-path bindings/wasm/Cargo.toml \
+            --locked --all-features check --config deny.toml
+      - name: Enforce source and package policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          python3 scripts/check_release_identity.py
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_workflow_policy.py
+          python3 -m unittest \
+            scripts.test_release_tools \
+            scripts.test_check_npm_registry_evidence
+          python3 scripts/render_supply_chain.py notice \
+            --profile core-wasm \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --check bindings/wasm/THIRD_PARTY_NOTICES.txt
+          cargo fmt --manifest-path bindings/wasm/Cargo.toml -- --check
+          cargo clippy --manifest-path bindings/wasm/Cargo.toml \
+            --all-targets --target wasm32-unknown-unknown --locked -- -D warnings
+          cargo test --manifest-path bindings/wasm/Cargo.toml --locked
+      - name: Install exact wasm-bindgen CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          locked=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
+          test "$locked" = "$WASM_BINDGEN_VERSION"
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
+      - name: Build and exercise exact package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          output=target/wasm-release
+          package="$output/package"
+          mkdir -p "$output"
+          bash scripts/build-wasm-package.sh "$package"
+          cargo run --bin rxls --all-features --locked -- \
+            diagnose tests/fixtures/xlsx/reader-structural.xlsx \
+            > "$output/wasm-native-report.json"
+          node bindings/wasm/tests/node-smoke.cjs \
+            "$package" "$output/wasm-native-report.json"
+          npm install --prefix target/playwright --no-save --ignore-scripts \
+            "playwright@$PLAYWRIGHT_VERSION"
+          npm exec --prefix target/playwright -- \
+            playwright install --with-deps chromium
+          node bindings/wasm/tests/browser-smoke.mjs \
+            "$package" "$output/wasm-native-report.json"
+      - name: Pack, inspect, dry-run, and attest candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          output=target/wasm-release
+          package="$output/package"
+          archive="$output/rxls-wasm-$version.tgz"
+          npm pack --json --pack-destination "$output" "$package" \
+            | tee "$output/npm-pack.json"
+          test -f "$archive"
+          python3 scripts/check_wasm_package.py "$package" \
+            --archive "$archive" \
+            --npm-pack "$output/npm-pack.json" \
+            --git-rev "$GITHUB_SHA" \
+            --write-report "$output/wasm-size-report.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --profile core-wasm \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --output "$output/rxls-wasm-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --profile core-wasm \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --output "$RUNNER_TEMP/rxls-wasm-sbom.cdx.json"
+          cmp --silent \
+            "$output/rxls-wasm-sbom.cdx.json" \
+            "$RUNNER_TEMP/rxls-wasm-sbom.cdx.json"
+          python3 scripts/render_supply_chain.py sbom \
+            --profile core-wasm \
+            --manifest-path bindings/wasm/Cargo.toml \
+            --check "$output/rxls-wasm-sbom.cdx.json"
+          sha256sum "$archive" > "$archive.sha256"
+          sha256sum "$output/rxls-wasm-sbom.cdx.json" \
+            > "$output/rxls-wasm-sbom.cdx.json.sha256"
+          npm publish --dry-run --ignore-scripts --access public "$archive" \
+            | tee "$output/npm-publish-dry-run.txt"
+      - name: Verify evidence source remained exact and clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - name: Upload verified package candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-wasm-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/wasm-release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 9
+
+  publish:
+    name: Publish protected tag to npm
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-rxls-wasm
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Select immutable verified candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/artifact-selection
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            > target/artifact-selection/artifacts.json
+          python3 scripts/select_run_artifact.py \
+            --artifacts target/artifact-selection/artifacts.json \
+            --name-prefix "rxls-wasm-$GITHUB_SHA-$GITHUB_RUN_ID-" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ steps.candidate.outputs.artifact_id }}
+          path: target/wasm-release
+          digest-mismatch: error
+      - name: Reverify immutable candidate and hosted tag
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          version=$(node -p 'require("./bindings/wasm/npm/package.json").version')
+          test "$(node -p 'require("./bindings/wasm/npm/package.json").name')" = "rxls-wasm"
+          test "$GITHUB_REF_NAME" = "wasm-v$version"
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          output=target/wasm-release
+          archive="$output/rxls-wasm-$version.tgz"
+          sha256sum --check "$archive.sha256"
+          sha256sum --check "$output/rxls-wasm-sbom.cdx.json.sha256"
+          python3 scripts/check_wasm_package.py "$output/package" \
+            --archive "$archive" \
+            --npm-pack "$output/npm-pack.json" \
+            --git-rev "$GITHUB_SHA"
+      - name: Detect an identical immutable registry release
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          spec="rxls-wasm@$version"
+          output=target/wasm-release
+          registry="$output/registry-preflight.json"
+          error_log="$output/registry-preflight.stderr"
+          if npm view "$spec" \
+            version dist.integrity repository.url dist.attestations --json \
+            > "$registry" 2> "$error_log"; then
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/wasm-release/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/wasm-release/registry-preflight.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
+          if (
+              registry.get("version") != os.environ["VERSION"]
+              or registry.get("dist.integrity") != packed.get("integrity")
+              or registry.get("repository.url")
+              != "git+https://github.com/HyunjoJung/rxls.git"
+              or not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit(
+                  "existing immutable registry version differs from the verified candidate"
+              )
+          PY
+            rm -f "$error_log"
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)' "$error_log"; then
+              cat "$error_log" >&2
+              exit "$status"
+            fi
+            rm -f "$error_log"
+            VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("target/wasm-release/registry-preflight.json").write_text(
+              json.dumps(
+                  {"status": "absent", "version": os.environ["VERSION"]},
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish exact package with provenance
+        if: steps.registry.outputs.already_published != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          npm publish "target/wasm-release/rxls-wasm-$version.tgz" \
+            --ignore-scripts --access public
+      - name: Verify registry provenance and installed consumer
+        env:
+          ALREADY_PUBLISHED: ${{ steps.registry.outputs.already_published }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          invocation_policy=current-run
+          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
+            invocation_policy=existing-release
+          elif [[ "$ALREADY_PUBLISHED" != "false" ]]; then
+            echo "registry preflight did not produce a valid publication state" >&2
+            exit 1
+          fi
+          version="${{ steps.package.outputs.version }}"
+          spec="rxls-wasm@$version"
+          output=target/wasm-release
+          for attempt in {1..12}; do
+            if npm view "$spec" \
+              version dist.integrity repository.url dist.attestations --json \
+              > "$output/registry.json"; then
+              break
+            fi
+            test "$attempt" -lt 12
+            sleep 5
+          done
+          VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          [packed] = json.loads(
+              Path("target/wasm-release/npm-pack.json").read_text(encoding="utf-8")
+          )
+          registry = json.loads(
+              Path("target/wasm-release/registry.json").read_text(encoding="utf-8")
+          )
+          attestations = registry.get("dist.attestations")
+          provenance = (
+              attestations.get("provenance")
+              if isinstance(attestations, dict)
+              else None
+          )
+          if (
+              registry.get("version") != os.environ["VERSION"]
+              or registry.get("dist.integrity") != packed.get("integrity")
+              or registry.get("repository.url")
+              != "git+https://github.com/HyunjoJung/rxls.git"
+              or not isinstance(provenance, dict)
+              or provenance.get("predicateType")
+              != "https://slsa.dev/provenance/v1"
+          ):
+              raise SystemExit("registry distribution differs from verified candidate")
+          PY
+          consumer="$RUNNER_TEMP/rxls-wasm-registry-consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts "$spec"
+          npm audit signatures --json --include-attestations \
+            > "$GITHUB_WORKSPACE/$output/registry-signatures.json"
+          python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py" \
+            --audit "$GITHUB_WORKSPACE/$output/registry-signatures.json" \
+            --pack "$GITHUB_WORKSPACE/$output/npm-pack.json" \
+            --archive "$GITHUB_WORKSPACE/$output/rxls-wasm-$version.tgz" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow .github/workflows/wasm-package-release.yml \
+            --git-sha "$GITHUB_SHA" \
+            --git-ref "$GITHUB_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --invocation-policy "$invocation_policy"
+          RXLS_WASM_FIXTURE="$GITHUB_WORKSPACE/tests/fixtures/xlsx/reader-structural.xlsx" \
+            node - <<'JS'
+          "use strict";
+
+          const fs = require("node:fs");
+          const { maxInputBytes, reportJson } = require("rxls-wasm");
+          const bytes = fs.readFileSync(process.env.RXLS_WASM_FIXTURE);
+          if (maxInputBytes() !== 32 * 1024 * 1024) process.exit(1);
+          const report = JSON.parse(reportJson(bytes));
+          if (report.format !== "xlsx" || report.stats.sheets < 1) process.exit(1);
+          JS
+      - name: Upload registry evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rxls-wasm-registry-${{ github.sha }}
+          path: |
+            target/wasm-release/registry-preflight.json
+            target/wasm-release/registry.json
+            target/wasm-release/registry-signatures.json
+          if-no-files-found: warn
+          retention-days: 30

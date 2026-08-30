@@ -66,6 +66,7 @@ function adapterOutputs(api, bytes) {
     text: api.extractText(bytes),
     csv: api.toCsv(bytes, 0),
     html: api.toHtml(bytes, 0),
+    markdown: api.toMarkdown(bytes, 0),
     report: JSON.parse(api.reportJson(bytes)),
   };
 }

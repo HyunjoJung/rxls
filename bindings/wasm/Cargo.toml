@@ -13,5 +13,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 js-sys = "0.3.103"
-rxls = { path = "../..", default-features = false, features = ["full"] }
+rxls = { version = "0.1.3", path = "../..", default-features = false, features = ["full"] }
 wasm-bindgen = "0.2.126"

@@ -15,6 +15,27 @@ function run(command, args, options = {}) {
   });
 }
 
+function runNpm(args, options = {}) {
+  const configuredCli = process.env.npm_execpath;
+  if (configuredCli && fs.existsSync(configuredCli)) {
+    return run(process.execPath, [configuredCli, ...args], options);
+  }
+
+  if (process.platform === "win32") {
+    const bundledCli = path.join(
+      path.dirname(process.execPath),
+      "node_modules",
+      "npm",
+      "bin",
+      "npm-cli.js",
+    );
+    assert.ok(fs.existsSync(bundledCli), `npm CLI not found at ${bundledCli}`);
+    return run(process.execPath, [bundledCli, ...args], options);
+  }
+
+  return run("npm", args, options);
+}
+
 function writeConsumerFiles(consumerDir) {
   const common = `
 const assert = require("node:assert/strict");
@@ -174,16 +195,18 @@ export function verifyPackedConsumer(packageDir, fixturePaths) {
     const consumerDir = path.join(root, "consumer");
     fs.mkdirSync(archiveDir);
     fs.mkdirSync(consumerDir);
-    const archiveName = run(
-      "npm",
-      ["pack", packageDir, "--pack-destination", archiveDir, "--silent"],
-    ).trim();
+    const archiveName = runNpm([
+      "pack",
+      packageDir,
+      "--pack-destination",
+      archiveDir,
+      "--silent",
+    ]).trim();
     assert.match(archiveName, /^rxls-wasm-\d+\.\d+\.\d+\.tgz$/);
     const archive = path.join(archiveDir, archiveName);
 
-    run("npm", ["init", "--yes"], { cwd: consumerDir });
-    run(
-      "npm",
+    runNpm(["init", "--yes"], { cwd: consumerDir });
+    runNpm(
       [
         "install",
         "--ignore-scripts",
@@ -198,11 +221,16 @@ export function verifyPackedConsumer(packageDir, fixturePaths) {
     const tsc = path.join(
       consumerDir,
       "node_modules",
-      ".bin",
-      process.platform === "win32" ? "tsc.cmd" : "tsc",
+      "typescript",
+      "bin",
+      "tsc",
     );
-    run(tsc, ["--project", "tsconfig.node.json"], { cwd: consumerDir });
-    run(tsc, ["--project", "tsconfig.browser.json"], { cwd: consumerDir });
+    run(process.execPath, [tsc, "--project", "tsconfig.node.json"], {
+      cwd: consumerDir,
+    });
+    run(process.execPath, [tsc, "--project", "tsconfig.browser.json"], {
+      cwd: consumerDir,
+    });
     for (const fixturePath of fixturePaths) {
       const env = {
         ...process.env,

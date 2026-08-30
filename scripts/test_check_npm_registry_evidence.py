@@ -28,6 +28,7 @@ GIT_SHA = "1" * 40
 GIT_REF = f"refs/tags/render-v{VERSION}"
 RUN_ID = "123"
 RUN_ATTEMPT = "2"
+ARCHIVE = b"verified npm archive"
 
 
 def envelope(statement: dict) -> dict:
@@ -44,8 +45,7 @@ def envelope(statement: dict) -> dict:
 
 
 def evidence() -> tuple[dict, list[dict]]:
-    archive = b"verified npm archive"
-    digest = hashlib.sha512(archive).digest()
+    digest = hashlib.sha512(ARCHIVE).digest()
     integrity = "sha512-" + base64.b64encode(digest).decode("ascii")
     subject = [
         {
@@ -122,7 +122,16 @@ def evidence() -> tuple[dict, list[dict]]:
             }
         ],
     }
-    packed = [{"name": PACKAGE_NAME, "version": VERSION, "integrity": integrity}]
+    packed = [
+        {
+            "name": PACKAGE_NAME,
+            "version": VERSION,
+            "filename": f"rxls-render-worker-{VERSION}.tgz",
+            "size": len(ARCHIVE),
+            "shasum": hashlib.sha1(ARCHIVE).hexdigest(),
+            "integrity": integrity,
+        }
+    ]
     return report, packed
 
 
@@ -135,6 +144,7 @@ def validate(
     MODULE.validate_evidence(
         report,
         packed,
+        archive=ARCHIVE,
         repository=REPOSITORY,
         workflow=WORKFLOW,
         git_sha=GIT_SHA,
@@ -155,9 +165,95 @@ def replace_provenance(report: dict, statement: dict) -> None:
     report["verified"][0]["attestationBundles"][1]["bundle"] = envelope(statement)
 
 
+def wasm_evidence() -> tuple[dict, list[dict]]:
+    report, packed = evidence()
+    package_name = "rxls-wasm"
+    git_ref = f"refs/tags/wasm-v{VERSION}"
+    workflow = ".github/workflows/wasm-package-release.yml"
+    packed[0]["name"] = package_name
+    packed[0]["filename"] = f"rxls-wasm-{VERSION}.tgz"
+    entry = report["verified"][0]
+    entry["name"] = package_name
+    entry["location"] = f"node_modules/{package_name}"
+    for row in entry["attestationBundles"]:
+        statement = json.loads(base64.b64decode(row["bundle"]["dsseEnvelope"]["payload"]))
+        statement["subject"][0]["name"] = f"pkg:npm/{package_name}@{VERSION}"
+        if row["predicateType"] == MODULE.NPM_PUBLISH:
+            statement["predicate"]["name"] = package_name
+        else:
+            definition = statement["predicate"]["buildDefinition"]
+            definition["externalParameters"]["workflow"].update(
+                {"ref": git_ref, "path": workflow}
+            )
+            definition["resolvedDependencies"][0]["uri"] = (
+                f"git+https://github.com/{REPOSITORY}@{git_ref}"
+            )
+        row["bundle"] = envelope(statement)
+    return report, packed
+
+
 class NpmRegistryEvidenceTests(unittest.TestCase):
     def test_exact_registry_evidence_passes(self) -> None:
         validate(*evidence())
+
+    def test_pack_metadata_is_recomputed_from_the_transferred_archive(self) -> None:
+        report, packed = evidence()
+        with self.assertRaises(MODULE.EvidenceError):
+            MODULE.validate_evidence(
+                report,
+                packed,
+                archive=ARCHIVE + b"tampered",
+                repository=REPOSITORY,
+                workflow=WORKFLOW,
+                git_sha=GIT_SHA,
+                git_ref=GIT_REF,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                invocation_policy=MODULE.CURRENT_RUN_INVOCATION,
+            )
+
+        for field, value in (
+            ("filename", "other.tgz"),
+            ("size", len(ARCHIVE) + 1),
+            ("shasum", "0" * 40),
+            ("integrity", "sha512-" + base64.b64encode(b"0" * 64).decode("ascii")),
+        ):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(packed)
+                changed[0][field] = value
+                with self.assertRaises(MODULE.EvidenceError):
+                    validate(report, changed)
+
+    def test_exact_wasm_registry_evidence_passes(self) -> None:
+        report, packed = wasm_evidence()
+        MODULE.validate_evidence(
+            report,
+            packed,
+            archive=ARCHIVE,
+            repository=REPOSITORY,
+            workflow=".github/workflows/wasm-package-release.yml",
+            git_sha=GIT_SHA,
+            git_ref=f"refs/tags/wasm-v{VERSION}",
+            run_id=RUN_ID,
+            run_attempt=RUN_ATTEMPT,
+            invocation_policy=MODULE.CURRENT_RUN_INVOCATION,
+        )
+
+    def test_package_must_match_the_publishing_workflow(self) -> None:
+        report, packed = wasm_evidence()
+        with self.assertRaises(MODULE.EvidenceError):
+            MODULE.validate_evidence(
+                report,
+                packed,
+                archive=ARCHIVE,
+                repository=REPOSITORY,
+                workflow=WORKFLOW,
+                git_sha=GIT_SHA,
+                git_ref=GIT_REF,
+                run_id=RUN_ID,
+                run_attempt=RUN_ATTEMPT,
+                invocation_policy=MODULE.CURRENT_RUN_INVOCATION,
+            )
 
     def test_existing_release_accepts_original_same_repository_invocation(self) -> None:
         report, packed = evidence()

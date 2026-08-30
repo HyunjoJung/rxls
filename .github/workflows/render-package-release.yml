@@ -14,6 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CARGO_DENY_VERSION: "0.19.4"
+  CARGO_DENY_SHA256: "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
   RENDER_MSRV: "1.85.0"
   WASM_BINDGEN_BUILD_RUST: "1.88.0"
   WASM_BINDGEN_VERSION: "0.2.126"
@@ -43,13 +45,35 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
+      - name: Install checksum-verified cargo-deny
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          archive="$RUNNER_TEMP/cargo-deny.tar.gz"
+          tool_root="$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 5 \
+            --output "$archive" "$url"
+          echo "$CARGO_DENY_SHA256  $archive" | sha256sum --check --strict
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          tar -xzf "$archive" --strip-components=1 -C "$tool_root"
+          test -f "$tool_root/cargo-deny"
+          test ! -L "$tool_root/cargo-deny"
+          chmod 0755 "$tool_root/cargo-deny"
+          test "$("$tool_root/cargo-deny" --version)" = \
+            "cargo-deny $CARGO_DENY_VERSION"
+          echo "$tool_root" >> "$GITHUB_PATH"
       - name: Audit nested Rust advisories, licenses, and sources
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          rust-version: "1.85.0"
-          command: check
-          manifest-path: bindings/render-wasm/Cargo.toml
-          arguments: --config deny.toml --locked --all-features
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(command -v cargo-deny)" = \
+            "$RUNNER_TEMP/cargo-deny-$CARGO_DENY_VERSION/cargo-deny"
+          test "$(cargo-deny --version)" = "cargo-deny $CARGO_DENY_VERSION"
+          cargo-deny --manifest-path bindings/render-wasm/Cargo.toml \
+            --locked --all-features check --config deny.toml
       - name: Validate event and package identity
         id: package
         shell: bash
@@ -306,6 +330,7 @@ jobs:
             | tee "$output/npm-pack.json"
           python3 scripts/check_render_package.py bindings/render-wasm \
             --archive "$archive" \
+            --npm-pack "$output/npm-pack.json" \
             --git-rev "$GITHUB_SHA" \
             --write-report "$output/package-report.json"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
@@ -510,7 +535,7 @@ jobs:
       - name: Upload verified package candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: render-worker-${{ github.sha }}
+          name: render-worker-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/render-package/*
           if-no-files-found: error
           retention-days: 14
@@ -524,6 +549,7 @@ jobs:
     timeout-minutes: 15
     environment: npm-render-worker
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
@@ -536,9 +562,25 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
+      - name: Select immutable verified candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/artifact-selection
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            > target/artifact-selection/artifacts.json
+          python3 scripts/select_run_artifact.py \
+            --artifacts target/artifact-selection/artifacts.json \
+            --name-prefix "render-worker-$GITHUB_SHA-$GITHUB_RUN_ID-" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          name: render-worker-${{ github.sha }}
+          artifact-ids: ${{ steps.candidate.outputs.artifact_id }}
           path: target/render-package
           digest-mismatch: error
       - name: Reverify the immutable candidate
@@ -549,7 +591,7 @@ jobs:
           test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git fetch origin main --no-tags
-          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
           git diff --exit-code
@@ -565,6 +607,7 @@ jobs:
             target/render-package/render-worker-sbom.cdx.json.sha256
           python3 scripts/check_render_package.py bindings/render-wasm \
             --archive "$archive" \
+            --npm-pack target/render-package/npm-pack.json \
             --archive-only \
             --git-rev "$GITHUB_SHA"
           ARCHIVE="$archive" python3 - <<'PY'
@@ -897,8 +940,6 @@ jobs:
           fi
       - name: Publish exact package with provenance
         if: steps.registry.outputs.already_published != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${{ steps.package.outputs.version }}"
           npm publish \
@@ -969,6 +1010,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py" \
             --audit "$GITHUB_WORKSPACE/target/render-package/registry-signatures.json" \
             --pack "$GITHUB_WORKSPACE/target/render-package/npm-pack.json" \
+            --archive "$GITHUB_WORKSPACE/target/render-package/rxls-render-worker-$version.tgz" \
             --repository "$GITHUB_REPOSITORY" \
             --workflow .github/workflows/render-package-release.yml \
             --git-sha "$GITHUB_SHA" \
