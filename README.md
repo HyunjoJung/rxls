@@ -46,7 +46,7 @@ cargo add rxls@0.1.3 --features full
 Reading all four formats requires `features = ["full"]`. XLS is always
 available; XLSX/XLSM is enabled by default. See
 [Compatibility](docs/compatibility.md) for the exact format, metadata, feature,
-CLI, export, and WASM boundaries.
+CLI, export, WASM, and local MCP boundaries.
 
 ### Common read surfaces
 
@@ -198,14 +198,14 @@ reopen it with `openpyxl 3.1.5`.
 ![rxls architecture: untrusted bytes pass through bounded format parsers into one typed model and public surfaces](.github/assets/rxls-architecture-en.png)
 
 Format-specific parsing ends at one typed workbook model. The library, CLI,
-export, diagnostics, editing, and WASM surfaces build on that model. See
+export, diagnostics, editing, WASM, and local MCP surfaces build on that model. See
 [Format internals](docs/format-internals.md) for the implementation boundaries.
 
 ## Documentation
 
 | Guide | Contents |
 |---|---|
-| [Compatibility](docs/compatibility.md) | Format, Cargo feature, metadata, export, CLI, and WASM support |
+| [Compatibility](docs/compatibility.md) | Format, Cargo feature, metadata, export, CLI, WASM, and local MCP support |
 | [Preservation and editing](docs/preservation.md) | XLSX/XLSM edit capability, atomicity, retained parts, and non-goals |
 | [Validation and reproducibility](docs/validation.md) | Public corpus, oracles, release evidence, and reproduction commands |
 | [Format internals](docs/format-internals.md) | BIFF, codepages, OOXML/ODS parsing, bounds, and failure behavior |
@@ -240,9 +240,10 @@ API documentation is published on [docs.rs](https://docs.rs/rxls). The
 - **Export and diagnostics:** CSV, HTML, and Markdown output sit alongside
   `WorkbookReport` JSON with sheet/cell/formula counts, properties, feature
   inventory, and parse provenance.
-- **Portable interfaces:** the native CLI and isolated Node/browser WASM adapter
-  expose the same core model. The WASM surface uses structured `RxlsError`
-  objects and a synchronous 32 MiB input limit.
+- **Portable interfaces:** the native CLI, isolated Node/browser WASM adapter,
+  and local stdio MCP server expose the same core model. MCP sessions are
+  path-scoped, return structured output, and preserve XLSX/XLSM package parts;
+  workbook bytes never enter protocol messages or a network listener.
 
 ```sh
 cargo install rxls --version =0.1.3 --locked
@@ -251,9 +252,19 @@ rxls diagnose book.xlsx
 rxls csv book.xlsx --sheet 0 --max-output-bytes 1048576
 ```
 
-Version `0.1.3` is the current published core release. The source workspace also
-contains an experimental renderer and `@rxls/render-worker`; they are separately
-gated and are not part of the published core crate contract.
+The source workspace also provides the currently unpublished local MCP server:
+
+```sh
+cargo build --release --manifest-path bindings/mcp/Cargo.toml --locked
+bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
+```
+
+See the [MCP server guide](bindings/mcp/README.md) for its eight tools, client
+configuration, filesystem boundary, and resource limits.
+
+Version `0.1.3` is the current published core release. The renderer,
+`@rxls/render-worker`, and local MCP server are separately gated workspace
+surfaces and are not part of the published core crate contract.
 
 ## Contributing
 

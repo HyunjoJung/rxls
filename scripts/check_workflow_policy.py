@@ -40,6 +40,16 @@ ADDITIONAL_FEATURE_CLIPPY_COMMANDS = (
     "cargo clippy --manifest-path bindings/render-wasm/Cargo.toml --all-targets --target "
     "wasm32-unknown-unknown --locked -- -D warnings",
 )
+MCP_CI_COMMANDS = (
+    "python3 scripts/render_supply_chain.py notice --profile mcp --check "
+    "bindings/mcp/THIRD_PARTY_NOTICES.txt",
+    "cargo fmt --manifest-path bindings/mcp/Cargo.toml -- --check",
+    "cargo clippy --manifest-path bindings/mcp/Cargo.toml --all-targets --locked -- -D warnings",
+    "cargo test --manifest-path bindings/mcp/Cargo.toml --locked",
+    "cargo doc --manifest-path bindings/mcp/Cargo.toml --no-deps --locked",
+    "cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked",
+    "cargo package --manifest-path bindings/mcp/Cargo.toml --locked",
+)
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
 RENDER_ORACLE_DIAGNOSTIC_CASES = "34"
@@ -4230,6 +4240,7 @@ def audit_codeql_workflow(path: Path, text: str) -> list[str]:
         "cargo build --all-targets --all-features --locked",
         "cargo build --manifest-path render/Cargo.toml --all-targets --locked",
         "cargo build --manifest-path bindings/render-wasm/Cargo.toml --all-targets --locked",
+        "cargo build --manifest-path bindings/mcp/Cargo.toml --all-targets --locked",
     )
     for command in commands:
         if normalized.count(command) != 1:
@@ -4256,11 +4267,33 @@ def audit_ci_feature_matrix(path: Path, text: str) -> list[str]:
     """Keep otherwise-uncovered feature and wasm surfaces warning-clean."""
 
     normalized = re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", _without_commented_lines(text))
-    return [
+    errors = [
         f"{path}: CI must run exactly once with `{command}`"
         for command in ADDITIONAL_FEATURE_CLIPPY_COMMANDS
         if normalized.count(command) != 1
     ]
+    errors.extend(
+        f"{path}: CI must run exactly once with `{command}`"
+        for command in MCP_CI_COMMANDS
+        if normalized.count(command) != 1
+    )
+    required_mcp_fragments = (
+        "name: Local MCP server (MSRV 1.88)",
+        "toolchain: 1.88.0",
+        "manifest-path: ./bindings/mcp/Cargo.toml",
+        "bindings/mcp/target/release/rxls-mcp --version",
+        "scripts/generate-sbom.py --manifest-path Cargo.toml "
+        "--manifest-path bindings/wasm/Cargo.toml "
+        "--manifest-path bindings/mcp/Cargo.toml "
+        "--output target/rxls-sbom.cdx.json",
+        "bindings/mcp/Cargo.lock",
+    )
+    errors.extend(
+        f"{path}: CI MCP gate is missing `{fragment}`"
+        for fragment in required_mcp_fragments
+        if fragment not in normalized
+    )
+    return errors
 
 
 def audit_render_browser_workflow(path: Path, text: str) -> list[str]:

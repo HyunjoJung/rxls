@@ -18,6 +18,7 @@ import tomllib
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -567,6 +568,17 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn(linux_home, rendered)
         self.assertEqual(root_names, {"rxls", "rxls-wasm"})
         self.assertEqual(len(payload["components"]), 1)
+
+    def test_sbom_cargo_metadata_decodes_output_as_utf8(self) -> None:
+        module = _load("generate_sbom_utf8", SBOM)
+        completed = mock.Mock(stdout="{}")
+        with mock.patch.object(
+            module.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(module.cargo_metadata(Path("Cargo.toml")), {})
+
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertTrue(run.call_args.kwargs["text"])
 
     def test_wasm_package_verifier_checks_exports_and_budgets(self) -> None:
         module = _load("check_wasm_package", WASM_PACKAGE)

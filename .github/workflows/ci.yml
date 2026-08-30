@@ -117,8 +117,9 @@ jobs:
           python3 scripts/generate-sbom.py \
             --manifest-path Cargo.toml \
             --manifest-path bindings/wasm/Cargo.toml \
+            --manifest-path bindings/mcp/Cargo.toml \
             --output target/rxls-sbom.cdx.json
-          git diff --exit-code -- Cargo.lock bindings/wasm/Cargo.lock
+          git diff --exit-code -- Cargo.lock bindings/wasm/Cargo.lock bindings/mcp/Cargo.lock
       - name: Package dry run
         run: |
           cargo package --locked
@@ -155,6 +156,55 @@ jobs:
         run: cargo build --manifest-path bindings/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
       - name: Verify frozen public API and rustdoc contracts
         run: python3 scripts/check_public_api.py
+
+  mcp:
+    name: Local MCP server (MSRV 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: bindings/mcp -> target
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: MCP dependency security, license, and source policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.88.0"
+          manifest-path: ./bindings/mcp/Cargo.toml
+          command: check
+          arguments: --locked --all-features
+      - name: Verify MCP third-party notices
+        run: python3 scripts/render_supply_chain.py notice --profile mcp --check bindings/mcp/THIRD_PARTY_NOTICES.txt
+      - name: Format MCP server
+        run: cargo fmt --manifest-path bindings/mcp/Cargo.toml -- --check
+      - name: Clippy MCP server
+        run: cargo clippy --manifest-path bindings/mcp/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test MCP server and protocol
+        run: cargo test --manifest-path bindings/mcp/Cargo.toml --locked
+      - name: Document MCP server
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --manifest-path bindings/mcp/Cargo.toml --no-deps --locked
+      - name: Build and smoke MCP release binary
+        shell: bash
+        run: |
+          cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked
+          bindings/mcp/target/release/rxls-mcp --version | grep -E '^rxls-mcp [0-9]+\.[0-9]+\.[0-9]+$'
+      - name: Verify independently packaged MCP source
+        run: cargo package --manifest-path bindings/mcp/Cargo.toml --locked
 
   installed-product:
     name: Installed product (${{ matrix.os_name }})
