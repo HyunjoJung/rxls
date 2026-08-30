@@ -1,6 +1,11 @@
 import type {
   CloseDocumentResult,
+  DocumentPropertiesInspection,
+  EditableCell,
+  EditMutationResult,
+  EditStatusResult,
   FontPack,
+  InspectedCell,
   OpenDocumentResult,
   PreparePagesResult,
   RenderBinary,
@@ -14,12 +19,21 @@ import type {
   RenderRange,
   RenderSheetResult,
   RenderTileResult,
+  ReadCellResult,
+  SaveDocumentResult,
 } from "./protocol.mjs";
 
 export type {
   CloseDocumentResult,
+  DocumentPropertiesInspection,
+  EditableCachedCell,
+  EditableCell,
+  EditMutationResult,
+  EditState,
+  EditStatusResult,
   FontPack,
   FontPackMember,
+  InspectedCell,
   OpenDocumentResult,
   PreparePagesResult,
   PrintManifest,
@@ -38,6 +52,8 @@ export type {
   RenderReport,
   RenderSheetResult,
   RenderTileResult,
+  ReadCellResult,
+  SaveDocumentResult,
   WorkbookInspection,
 } from "./protocol.mjs";
 
@@ -121,6 +137,42 @@ export declare class RenderWorkerClient {
     documentId: string,
     options?: RenderRequestOptions,
   ): RenderRequest<CloseDocumentResult>;
+  editStatus(
+    documentId: string,
+    options?: RenderRequestOptions,
+  ): RenderRequest<EditStatusResult>;
+  readCell(
+    documentId: string,
+    sheetIndex: number,
+    row: number,
+    col: number,
+    options?: RenderRequestOptions,
+  ): RenderRequest<ReadCellResult>;
+  setCell(
+    documentId: string,
+    sheetIndex: number,
+    row: number,
+    col: number,
+    value: EditableCell,
+    options?: RenderRequestOptions,
+  ): RenderRequest<EditMutationResult>;
+  setDocumentProperties(
+    documentId: string,
+    properties: DocumentPropertiesInspection,
+    options?: RenderRequestOptions,
+  ): RenderRequest<EditMutationResult>;
+  undoEdit(
+    documentId: string,
+    options?: RenderRequestOptions,
+  ): RenderRequest<EditMutationResult>;
+  redoEdit(
+    documentId: string,
+    options?: RenderRequestOptions,
+  ): RenderRequest<EditMutationResult>;
+  saveDocument(
+    documentId: string,
+    options?: RenderRequestOptions,
+  ): RenderRequest<SaveDocumentResult>;
   preparePages(
     documentId: string,
     sheetIndex: number,

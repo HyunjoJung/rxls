@@ -1,9 +1,9 @@
 export const CSP_NEGATIVE_URL =
   "https://rxls-csp-negative.invalid/render-worker-control";
 
-const EXPECTED_CAPABILITIES = Object.freeze({
+export const EXPECTED_CAPABILITIES = Object.freeze({
   schemaVersion: 1,
-  protocol: "rxls.render-worker.v1",
+  protocol: "rxls.render-worker.v2",
   outputs: ["sheet-svg", "tile-svg", "page-svg", "page-png"],
   limits: {
     maxInputBytes: 32 * 1024 * 1024,
@@ -50,6 +50,21 @@ const EXPECTED_CAPABILITIES = Object.freeze({
   embeddedImages: {
     bounded: true,
     painted: true
+  },
+  editing: {
+    supported: true,
+    formats: ["xlsx", "xlsm"],
+    preservation: "untouched-package-parts",
+    operations: [
+      "read-cell",
+      "set-cell",
+      "set-document-properties",
+      "undo-edit",
+      "redo-edit",
+      "save-document"
+    ],
+    maxHistoryEntries: 20,
+    maxHistoryBytes: 32 * 1024 * 1024
   }
 });
 

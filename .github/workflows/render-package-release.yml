@@ -527,7 +527,7 @@ jobs:
           const protocol = await import("@rxls/render-worker/protocol");
           const runtime = await import("@rxls/render-worker/worker-runtime");
           if (typeof root.RenderWorkerClient !== "function" ||
-              protocol.PROTOCOL !== "rxls.render-worker.v1" ||
+              protocol.PROTOCOL !== "rxls.render-worker.v2" ||
               typeof runtime.RenderWorkerRuntime !== "function") {
             process.exit(1);
           }
@@ -616,6 +616,8 @@ jobs:
           import os
           from pathlib import Path
           import re
+
+          from scripts.check_render_package import REPORT_SCHEMA
 
           expected_pending_boundary = {
               "inputBytes": 33554432,
@@ -754,7 +756,7 @@ jobs:
           )
           archive = Path(os.environ["ARCHIVE"])
           archive_payload = archive.read_bytes()
-          if report.get("schema") != "rxls.render-worker-package.v1":
+          if report.get("schema") != REPORT_SCHEMA:
               raise SystemExit("unexpected package-report schema")
           if report.get("passed") is not True or report.get("git_rev") != os.environ["GITHUB_SHA"]:
               raise SystemExit("package report is not bound to this exact commit")
@@ -1019,7 +1021,7 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --invocation-policy "$invocation_policy"
           node --input-type=module -e \
-            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v1") process.exit(1)'
+            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v2") process.exit(1)'
       - name: Upload registry evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

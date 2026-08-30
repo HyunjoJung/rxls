@@ -2067,6 +2067,7 @@
       "inherent_items": [
         "pub fn add_sheet(&mut self, name: &str) -> Result<()>",
         "pub fn append_row<I>(&mut self, sheet_name: &str, values: I) -> Result<u32>where I: IntoIterator<Item = Cell>,",
+        "pub fn clear_cell_value( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",
         "pub fn clear_freeze_panes(&mut self, sheet_name: &str) -> Result<()>",
         "pub fn clear_range( &mut self, sheet_name: &str, start_row: u32, start_col: u16, end_row: u32, end_col: u16, ) -> Result<()>",
         "pub fn delete_comment( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",

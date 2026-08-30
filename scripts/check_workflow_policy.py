@@ -153,7 +153,7 @@ ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "ac477662896b26fef0fb4bfe292efcb2ff1cce2f09fb76e03b43da42143ec152"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "b8e4fe366df65893c6e46d89f9f5271d936c24ed9d58565b1748512847579745"
+    "b125148dde44cb51b9e569c19eccce2b1be9a6dc74e4a9ea52c228d01c4bf6ca"
 )
 WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "02b6d4b68f43dd18d1f2b1c16165332b19346ba27480feea03ecbedfcd2cf3c2"
@@ -4827,6 +4827,12 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         "python3 scripts/check_render_package.py": (
             "must enforce the bounded package/archive contract"
+        ),
+        "from scripts.check_render_package import REPORT_SCHEMA": (
+            "must share the package report schema with the artifact checker"
+        ),
+        'report.get("schema") != REPORT_SCHEMA': (
+            "must reverify the transported report against the shared schema"
         ),
         '--npm-pack "$output/npm-pack.json"': (
             "candidate validation must bind npm's exact pack receipt"

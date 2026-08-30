@@ -87,6 +87,18 @@ jobs:
         run: |
           npm ci --prefix viewer --ignore-scripts
           npm --prefix viewer test
+      - name: Install pinned XLSM reopen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/rxls-viewer-python"
+          "$RUNNER_TEMP/rxls-viewer-python/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement viewer/openpyxl-requirements.txt
+          echo "RXLS_PYTHON=$RUNNER_TEMP/rxls-viewer-python/bin/python" >> "$GITHUB_ENV"
       - name: Install exact wasm-bindgen CLI
         shell: bash
         run: |
@@ -181,7 +193,7 @@ jobs:
           npm init --yes
           npm install --ignore-scripts --no-audit --no-fund \
             "$archive"
-          node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v1") process.exit(1)'
+          node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v2") process.exit(1)'
           RXLS_RENDER_INSTALLED_PACKAGE_ROOT="$PWD/node_modules/@rxls/render-worker" \
             node --experimental-websocket \
             "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \

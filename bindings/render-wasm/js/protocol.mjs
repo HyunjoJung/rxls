@@ -1,4 +1,4 @@
-export const PROTOCOL = "rxls.render-worker.v1";
+export const PROTOCOL = "rxls.render-worker.v2";
 export const MAX_INPUT_BYTES = 32 * 1024 * 1024;
 export const MAX_FONT_BYTES = 64 * 1024 * 1024;
 export const MAX_FONT_MANIFEST_BYTES = 4 * 1024 * 1024;
@@ -7,12 +7,16 @@ export const MAX_FONT_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_OPEN_DOCUMENTS = 4;
 export const MAX_OPEN_RESOURCE_BYTES = 128 * 1024 * 1024;
 export const MAX_OPTIONS_BYTES = 64 * 1024;
+export const MAX_EDIT_REQUEST_BYTES = 128 * 1024;
+export const MAX_EDIT_HISTORY_ENTRIES = 20;
+export const MAX_EDIT_HISTORY_BYTES = MAX_INPUT_BYTES;
 export const MAX_PENDING_REQUESTS = 32;
 export const MAX_PENDING_RESOURCE_BYTES = 128 * 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_PNG_BYTES = 16 * 1024 * 1024;
 export const MAX_SHEETS = 255;
 export const MAX_PAGES = 512;
+export const MAX_MANUAL_PAGE_BREAKS = 1_026;
 export const MIN_DPI = 36;
 export const MAX_DPI = 300;
 
@@ -42,7 +46,14 @@ const OPERATIONS = new Set([
   "render-sheet",
   "render-tile",
   "render-page",
-  "render-page-png"
+  "render-page-png",
+  "edit-status",
+  "read-cell",
+  "set-cell",
+  "set-document-properties",
+  "undo-edit",
+  "redo-edit",
+  "save-document"
 ]);
 
 export class RenderProtocolError extends Error {
@@ -119,6 +130,7 @@ export function parseWorkerMessage(message) {
     );
   }
   if (message.type === "cancel") {
+    assertExactKeys(message, ["protocol", "type", "requestId"], "message");
     return {
       protocol: PROTOCOL,
       type: "cancel",
@@ -132,6 +144,11 @@ export function parseWorkerMessage(message) {
       "type"
     );
   }
+  assertExactKeys(
+    message,
+    ["protocol", "type", "requestId", "operation", "payload"],
+    "message"
+  );
   const requestId = validateRequestId(message.requestId);
   if (!OPERATIONS.has(message.operation)) {
     throw new RenderProtocolError(
@@ -169,6 +186,46 @@ export function preflightRequest({ operation, payload }) {
       assertExactKeys(payload, ["documentId"], "payload");
       validateDocumentId(payload.documentId);
       return 0;
+    case "edit-status":
+    case "undo-edit":
+    case "redo-edit":
+    case "save-document":
+      assertExactKeys(payload, ["documentId"], "payload");
+      validateDocumentId(payload.documentId);
+      return 0;
+    case "read-cell":
+      assertExactKeys(
+        payload,
+        ["documentId", "sheetIndex", "row", "col"],
+        "payload"
+      );
+      validateDocumentId(payload.documentId);
+      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
+      validateCellCoordinate(payload.row, payload.col);
+      return 0;
+    case "set-cell": {
+      assertExactKeys(
+        payload,
+        ["documentId", "sheetIndex", "row", "col", "value"],
+        "payload"
+      );
+      validateDocumentId(payload.documentId);
+      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
+      validateCellCoordinate(payload.row, payload.col);
+      validateEditableCell(payload.value, "payload.value", true);
+      return editJson({
+        sheetIndex: payload.sheetIndex,
+        row: payload.row,
+        col: payload.col,
+        value: payload.value
+      }).byteLength;
+    }
+    case "set-document-properties": {
+      assertExactKeys(payload, ["documentId", "properties"], "payload");
+      validateDocumentId(payload.documentId);
+      validateDocumentProperties(payload.properties);
+      return editJson(payload.properties).byteLength;
+    }
     case "prepare-pages":
     case "render-sheet":
       assertExactKeys(payload, ["documentId", "sheetIndex", "options"], "payload");
@@ -227,6 +284,11 @@ export function validateRange(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new RenderProtocolError("invalid_range", "range must be an object", "payload.range");
   }
+  assertExactKeys(
+    value,
+    ["firstRow", "firstCol", "lastRow", "lastCol"],
+    "payload.range"
+  );
   const range = {
     firstRow: nonNegativeInteger(value.firstRow, "payload.range.firstRow"),
     firstCol: nonNegativeInteger(value.firstCol, "payload.range.firstCol"),
@@ -244,6 +306,33 @@ export function validateRange(value) {
     );
   }
   return range;
+}
+
+export function validateCellCoordinate(rowValue, colValue) {
+  const row = nonNegativeInteger(rowValue, "payload.row");
+  const col = nonNegativeInteger(colValue, "payload.col");
+  if (row > 1_048_575 || col > 16_383) {
+    throw new RenderProtocolError(
+      "cell_out_of_range",
+      "cell is outside the Excel grid",
+      "payload"
+    );
+  }
+  return { row, col };
+}
+
+export function editJson(value) {
+  const json = JSON.stringify(value);
+  const encoded = new TextEncoder().encode(json);
+  if (encoded.byteLength > MAX_EDIT_REQUEST_BYTES) {
+    throw limitError(
+      "editRequestBytes",
+      MAX_EDIT_REQUEST_BYTES,
+      encoded.byteLength,
+      "payload"
+    );
+  }
+  return encoded;
 }
 
 export function boundedIndex(value, location, countLimit, resource) {
@@ -319,6 +408,7 @@ export function fontPackByteLength(fontPack) {
 
 export function validateFontPack(fontPack) {
   assertPlainObject(fontPack, "fontPack");
+  assertExactKeys(fontPack, ["manifest", "members"], "fontPack");
   const manifest = asBytes(fontPack.manifest, "fontPack.manifest");
   if (manifest.byteLength > MAX_FONT_MANIFEST_BYTES) {
     throw limitError(
@@ -349,6 +439,7 @@ export function validateFontPack(fontPack) {
   for (let index = 0; index < fontPack.members.length; index += 1) {
     const member = fontPack.members[index];
     assertPlainObject(member, `fontPack.members[${index}]`);
+    assertExactKeys(member, ["name", "bytes"], `fontPack.members[${index}]`);
     const name = validateFontMemberName(member.name, index);
     if (names.has(name)) {
       throw new RenderProtocolError(
@@ -483,6 +574,122 @@ export function limitError(resource, limit, actual, location = "limits") {
     location,
     { resource, limit, actual }
   );
+}
+
+function validateEditableCell(value, location, allowBlank) {
+  assertPlainObject(value, location);
+  if (typeof value.kind !== "string") {
+    throw new RenderProtocolError(
+      "invalid_edit",
+      `${location}.kind must identify a supported cell value`,
+      `${location}.kind`
+    );
+  }
+  switch (value.kind) {
+    case "blank":
+      if (!allowBlank) {
+        throw new RenderProtocolError(
+          "invalid_edit",
+          "a formula cached value cannot be blank",
+          location
+        );
+      }
+      assertExactKeys(value, ["kind"], location);
+      return;
+    case "text":
+    case "error":
+      assertExactKeys(value, ["kind", "value"], location);
+      validateEditString(value.value, `${location}.value`);
+      return;
+    case "number":
+    case "date":
+      assertExactKeys(value, ["kind", "value"], location);
+      if (typeof value.value !== "number" || !Number.isFinite(value.value)) {
+        throw new RenderProtocolError(
+          "invalid_edit",
+          `${location}.value must be a finite number`,
+          `${location}.value`
+        );
+      }
+      return;
+    case "boolean":
+      assertExactKeys(value, ["kind", "value"], location);
+      if (typeof value.value !== "boolean") {
+        throw new RenderProtocolError(
+          "invalid_edit",
+          `${location}.value must be a boolean`,
+          `${location}.value`
+        );
+      }
+      return;
+    case "formula":
+      if (!allowBlank) {
+        throw new RenderProtocolError(
+          "invalid_edit",
+          "a formula cached value cannot contain a formula",
+          location
+        );
+      }
+      assertExactKeys(value, ["kind", "formula", "cached"], location);
+      validateEditString(value.formula, `${location}.formula`);
+      if (value.formula.trim().replace(/^=+/, "").trim().length === 0) {
+        throw new RenderProtocolError(
+          "invalid_edit",
+          `${location}.formula cannot be empty after removing leading '='`,
+          `${location}.formula`
+        );
+      }
+      validateEditableCell(value.cached, `${location}.cached`, false);
+      return;
+    default:
+      throw new RenderProtocolError(
+        "invalid_edit",
+        `${location}.kind is not supported`,
+        `${location}.kind`
+      );
+  }
+}
+
+function validateDocumentProperties(value) {
+  const location = "payload.properties";
+  assertPlainObject(value, location);
+  const fields = [
+    "title",
+    "subject",
+    "creator",
+    "keywords",
+    "description",
+    "lastModifiedBy",
+    "company",
+    "created"
+  ];
+  assertExactKeys(value, fields, location);
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) {
+      throw new RenderProtocolError(
+        "invalid_edit",
+        `${location}.${field} is required; use null to remove it`,
+        `${location}.${field}`
+      );
+    }
+    if (value[field] !== null) {
+      validateEditString(value[field], `${location}.${field}`);
+    }
+  }
+}
+
+function validateEditString(value, location) {
+  if (typeof value !== "string") {
+    throw new RenderProtocolError(
+      "invalid_edit",
+      `${location} must be a string`,
+      location
+    );
+  }
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes > MAX_EDIT_REQUEST_BYTES) {
+    throw limitError("editRequestBytes", MAX_EDIT_REQUEST_BYTES, bytes, location);
+  }
 }
 
 function validateFontMemberName(value, index) {

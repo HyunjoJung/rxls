@@ -81,6 +81,23 @@ Coordinate limits follow XLSX: rows are zero-based through 1,048,575 and columns
 through 16,383. Public methods return typed errors for invalid sheets,
 coordinates, relationships, or unsupported package state.
 
+## Browser edit boundary
+
+`@rxls/render-worker` owns the retained `Spreadsheet` and every edit snapshot
+inside one dedicated worker. The public protocol exposes cell inspection,
+typed cell/formula replacement, complete document-property replacement,
+undo/redo, and serialization only. Each mutation edits a clone, serializes and
+reopens it, checks the same 32 MiB workbook limit, and commits the candidate
+only after every step succeeds. History is limited to 20 entries and 32 MiB in
+total; older snapshots are discarded deterministically.
+
+The public viewer downloads a new `.xlsx` or `.xlsm` rather than overwriting
+the selected local file. Its pinned Apache POI XLSM fixture contains a real OLE
+compound VBA project. The browser test checks VBA, content types, workbook
+relationships, styles, and theme parts byte-for-byte before and after an edit,
+then reopens the result with `openpyxl 3.1.5`. The same UI presents XLS, XLSB,
+and ODS with their typed read-only reason and does not offer a conversion path.
+
 ## Explicit non-goals
 
 - XLS, XLSB, and ODS mutation or conversion through `Spreadsheet`.

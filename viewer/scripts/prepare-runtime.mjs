@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { PRESERVATION_FIXTURE } from "./preservation-fixture.mjs";
 
 const viewerRoot = fileURLToPath(new URL("..", import.meta.url));
 const repositoryRoot = path.resolve(viewerRoot, "..");
@@ -22,7 +24,7 @@ const samples = [
   },
   {
     id: "legacy-korean",
-    label: "Legacy Korean workbook",
+    label: "Legacy Korean",
     format: "XLS",
     file: "legacy-korean.xls",
     source: path.join(repositoryRoot, "tests", "fixtures", "xls", "korean-cp949-biff5.xls")
@@ -36,10 +38,19 @@ const samples = [
   },
   {
     id: "open-document",
-    label: "OpenDocument workbook",
+    label: "OpenDocument",
     format: "ODS",
     file: "open-document.ods",
     source: path.join(repositoryRoot, "tests", "fixtures", "ods", "repeated-hidden.ods")
+  },
+  {
+    id: "macro-preservation",
+    label: "Macro preservation",
+    format: "XLSM",
+    file: PRESERVATION_FIXTURE.outputFile,
+    source: path.join(viewerRoot, "samples", PRESERVATION_FIXTURE.sourceFile),
+    bytes: PRESERVATION_FIXTURE.bytes,
+    sha256: PRESERVATION_FIXTURE.sha256
   }
 ];
 
@@ -78,6 +89,15 @@ const manifestRows = [];
 for (const sample of samples) {
   await requireFile(sample.source);
   const destination = path.join(sampleRoot, sample.file);
+  if (sample.sha256) {
+    const payload = await readFile(sample.source);
+    const digest = createHash("sha256").update(payload).digest("hex");
+    if (payload.byteLength !== sample.bytes || digest !== sample.sha256) {
+      throw new Error(
+        `viewer sample identity mismatch: ${path.relative(repositoryRoot, sample.source)}`
+      );
+    }
+  }
   await cp(sample.source, destination);
   const info = await stat(destination);
   manifestRows.push({

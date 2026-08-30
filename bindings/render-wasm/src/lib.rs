@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use rxls::Workbook;
+use rxls::{Cell, DocProperties, EditCapability, EditReadOnlyReason, Spreadsheet, Workbook};
 use rxls_render::{
     build_print_page, prepare_print_document, render_print_page_png, render_scene_svg,
     render_sheet_svg, FontPack, FontPackError, FontPackLimits, FontPackMember, LimitKind,
@@ -62,6 +62,8 @@ const MAX_FONT_FILES: u64 = 512;
 const MAX_FONT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FONT_AUXILIARY_BYTES: u64 = 1024 * 1024;
 const MAX_FONT_BUNDLE_BYTES: u64 = MAX_FONT_BYTES + MAX_FONT_MANIFEST_BYTES + 64 * 1024;
+const MAX_EDIT_HISTORY_ENTRIES: usize = 20;
+const MAX_EDIT_HISTORY_BYTES: usize = MAX_INPUT_BYTES;
 
 #[wasm_bindgen(typescript_custom_section)]
 const ERROR_TYPES: &str = r#"
@@ -200,6 +202,7 @@ struct WorkbookInspection<'a> {
     embedded_image_bytes: u64,
     font_pack_sha256: Option<&'a str>,
     font_faces: usize,
+    properties: DocumentPropertiesInspection<'a>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +211,206 @@ struct SheetInspection<'a> {
     index: usize,
     name: &'a str,
     embedded_images: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentPropertiesInspection<'a> {
+    title: Option<&'a str>,
+    subject: Option<&'a str>,
+    creator: Option<&'a str>,
+    keywords: Option<&'a str>,
+    description: Option<&'a str>,
+    last_modified_by: Option<&'a str>,
+    company: Option<&'a str>,
+    created: Option<&'a str>,
+}
+
+impl<'a> From<&'a DocProperties> for DocumentPropertiesInspection<'a> {
+    fn from(properties: &'a DocProperties) -> Self {
+        Self {
+            title: properties.title.as_deref(),
+            subject: properties.subject.as_deref(),
+            creator: properties.creator.as_deref(),
+            keywords: properties.keywords.as_deref(),
+            description: properties.description.as_deref(),
+            last_modified_by: properties.last_modified_by.as_deref(),
+            company: properties.company.as_deref(),
+            created: properties.created.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    bytes: Vec<u8>,
+    dirty: bool,
+    edited_parts: Vec<String>,
+}
+
+struct EditStateView<'a> {
+    dirty: bool,
+    undo_depth: usize,
+    redo_depth: usize,
+    history_bytes: usize,
+    edited_parts: &'a [String],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HistorySide {
+    Undo,
+    Redo,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryProjection {
+    undo_drop: usize,
+    redo_drop: usize,
+    undo_depth: usize,
+    redo_depth: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CellEditRequest {
+    sheet_index: usize,
+    row: u32,
+    col: u16,
+    value: EditableCell,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DocumentPropertiesEditRequest {
+    title: RequiredNullableString,
+    subject: RequiredNullableString,
+    creator: RequiredNullableString,
+    keywords: RequiredNullableString,
+    description: RequiredNullableString,
+    last_modified_by: RequiredNullableString,
+    company: RequiredNullableString,
+    created: RequiredNullableString,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RequiredNullableString {
+    String(String),
+    Null,
+}
+
+impl RequiredNullableString {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::String(value) => Some(value),
+            Self::Null => None,
+        }
+    }
+}
+
+impl From<DocumentPropertiesEditRequest> for DocProperties {
+    fn from(request: DocumentPropertiesEditRequest) -> Self {
+        let mut properties = Self::new();
+        properties.title = request.title.into_option();
+        properties.subject = request.subject.into_option();
+        properties.creator = request.creator.into_option();
+        properties.keywords = request.keywords.into_option();
+        properties.description = request.description.into_option();
+        properties.last_modified_by = request.last_modified_by.into_option();
+        properties.company = request.company.into_option();
+        properties.created = request.created.into_option();
+        properties
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "kebab-case")]
+enum EditableCell {
+    Blank,
+    Text {
+        value: String,
+    },
+    Number {
+        value: f64,
+    },
+    Date {
+        value: f64,
+    },
+    Boolean {
+        value: bool,
+    },
+    Error {
+        value: String,
+    },
+    Formula {
+        formula: String,
+        cached: EditableCachedCell,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields, rename_all = "kebab-case")]
+enum EditableCachedCell {
+    Text { value: String },
+    Number { value: f64 },
+    Date { value: f64 },
+    Boolean { value: bool },
+    Error { value: String },
+}
+
+impl EditableCachedCell {
+    fn into_cell(self) -> Cell {
+        match self {
+            Self::Text { value } => Cell::Text(value),
+            Self::Number { value } => Cell::Number(value),
+            Self::Date { value } => Cell::Date(value),
+            Self::Boolean { value } => Cell::Bool(value),
+            Self::Error { value } => Cell::Error(value),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum InspectedCell<'a> {
+    Blank,
+    Text {
+        value: &'a str,
+    },
+    Number {
+        value: f64,
+    },
+    Date {
+        value: f64,
+    },
+    Boolean {
+        value: bool,
+    },
+    Error {
+        value: &'a str,
+    },
+    Formula {
+        formula: &'a str,
+        cached: Box<InspectedCell<'a>>,
+    },
+}
+
+impl<'a> From<Option<&'a Cell>> for InspectedCell<'a> {
+    fn from(cell: Option<&'a Cell>) -> Self {
+        match cell {
+            None => Self::Blank,
+            Some(Cell::Text(value)) => Self::Text { value },
+            Some(Cell::Number(value)) => Self::Number { value: *value },
+            Some(Cell::Date(value)) => Self::Date { value: *value },
+            Some(Cell::Bool(value)) => Self::Boolean { value: *value },
+            Some(Cell::Error(value)) => Self::Error { value },
+            Some(Cell::Formula { formula, cached }) => Self::Formula {
+                formula,
+                cached: Box::new(Self::from(Some(cached.as_ref()))),
+            },
+        }
+    }
 }
 
 /// Return the immutable workbook input ceiling.
@@ -221,7 +424,7 @@ pub fn max_input_bytes() -> usize {
 pub fn capabilities_json() -> String {
     serde_json::json!({
         "schemaVersion": 1,
-        "protocol": "rxls.render-worker.v1",
+        "protocol": "rxls.render-worker.v2",
         "outputs": ["sheet-svg", "tile-svg", "page-svg", "page-png"],
         "limits": {
             "maxInputBytes": MAX_INPUT_BYTES,
@@ -266,6 +469,21 @@ pub fn capabilities_json() -> String {
             "bundleSchema": "rxls.font-bundle.v1",
         },
         "embeddedImages": {"bounded": true, "painted": true},
+        "editing": {
+            "supported": true,
+            "formats": ["xlsx", "xlsm"],
+            "preservation": "untouched-package-parts",
+            "operations": [
+                "read-cell",
+                "set-cell",
+                "set-document-properties",
+                "undo-edit",
+                "redo-edit",
+                "save-document",
+            ],
+            "maxHistoryEntries": MAX_EDIT_HISTORY_ENTRIES,
+            "maxHistoryBytes": MAX_EDIT_HISTORY_BYTES,
+        },
     })
     .to_string()
 }
@@ -276,9 +494,14 @@ pub fn capabilities_json() -> String {
 /// parsing and font verification for virtual page and tile requests.
 #[wasm_bindgen]
 pub struct RenderSession {
+    spreadsheet: Spreadsheet,
     workbook: Workbook,
     font_pack: Option<FontPack>,
     font_pack_bytes: u64,
+    undo: Vec<EditSnapshot>,
+    redo: Vec<EditSnapshot>,
+    dirty: bool,
+    edited_parts: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -294,6 +517,55 @@ impl RenderSession {
     pub fn inspection_json(&self) -> Result<String, JsValue> {
         self.inspection_json_core(&RequestOptions::default())
             .map_err(js_error)
+    }
+
+    /// Return typed edit capability, history, dirty state, and touched parts.
+    #[wasm_bindgen(js_name = editStateJson)]
+    pub fn edit_state_json(&self) -> String {
+        self.edit_state_value().to_string()
+    }
+
+    /// Read one typed cell for an edit form without exposing the workbook object.
+    #[wasm_bindgen(js_name = readCellJson)]
+    pub fn read_cell_json(
+        &self,
+        sheet_index: usize,
+        row: u32,
+        col: u16,
+    ) -> Result<String, JsValue> {
+        self.read_cell_json_core(sheet_index, row, col)
+            .map_err(js_error)
+    }
+
+    /// Apply one package-preserving cell value, formula, or clear operation.
+    #[wasm_bindgen(js_name = setCellJson)]
+    pub fn set_cell_json(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.set_cell_json_core(request_json).map_err(js_error)
+    }
+
+    /// Replace the bounded workbook document-property set atomically.
+    #[wasm_bindgen(js_name = setDocumentPropertiesJson)]
+    pub fn set_document_properties_json(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.set_document_properties_json_core(request_json)
+            .map_err(js_error)
+    }
+
+    /// Restore the preceding browser edit snapshot.
+    #[wasm_bindgen(js_name = undoEditJson)]
+    pub fn undo_edit_json(&mut self) -> Result<String, JsValue> {
+        self.undo_edit_core().map_err(js_error)
+    }
+
+    /// Reapply the next browser edit snapshot.
+    #[wasm_bindgen(js_name = redoEditJson)]
+    pub fn redo_edit_json(&mut self) -> Result<String, JsValue> {
+        self.redo_edit_core().map_err(js_error)
+    }
+
+    /// Serialize the current retained XLSX/XLSM package for local download.
+    #[wasm_bindgen(js_name = saveDocumentBytes)]
+    pub fn save_document_bytes(&self) -> Result<Vec<u8>, JsValue> {
+        self.save_document_bytes_core().map_err(js_error)
     }
 
     /// Render a whole sheet or options-selected range as SVG.
@@ -508,39 +780,37 @@ impl RenderSession {
     fn new_core(bytes: &[u8], font_bundle: &[u8]) -> Result<Self, FacadeError> {
         check_input(bytes)?;
         let (font_pack, font_pack_bytes) = load_font_bundle(font_bundle)?;
-        let workbook = parse_workbook(bytes)?;
-        if workbook.sheets.len() as u64 > MAX_SHEETS {
-            return Err(FacadeError::limit(
-                "sheets",
-                MAX_SHEETS,
-                workbook.sheets.len() as u64,
-            ));
-        }
-        check_embedded_images(
-            &workbook,
-            EffectiveResourceLimits {
-                image_bytes: MAX_IMAGE_BYTES,
-                images: MAX_IMAGES,
-                font_bytes: MAX_FONT_BYTES,
-            },
-        )?;
+        let spreadsheet = parse_spreadsheet(bytes)?;
+        let workbook = spreadsheet.workbook().clone();
+        validate_session_workbook(&workbook)?;
         Ok(Self {
+            spreadsheet,
             workbook,
             font_pack,
             font_pack_bytes,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dirty: false,
+            edited_parts: Vec::new(),
         })
     }
 
     fn inspection_json_core(&self, options: &RequestOptions) -> Result<String, FacadeError> {
+        self.inspection_json_for(&self.workbook, options)
+    }
+
+    fn inspection_json_for(
+        &self,
+        workbook: &Workbook,
+        options: &RequestOptions,
+    ) -> Result<String, FacadeError> {
         let effective = effective_options(options, self.font_pack.as_ref())?;
         check_font_bytes(self.font_pack_bytes, effective.resources.font_bytes)?;
-        let (image_count, image_bytes) =
-            check_embedded_images(&self.workbook, effective.resources)?;
+        let (image_count, image_bytes) = check_embedded_images(workbook, effective.resources)?;
         let inspection = WorkbookInspection {
             schema_version: 1,
-            sheet_count: self.workbook.sheets.len(),
-            sheets: self
-                .workbook
+            sheet_count: workbook.sheets.len(),
+            sheets: workbook
                 .sheets
                 .iter()
                 .enumerate()
@@ -554,6 +824,7 @@ impl RenderSession {
             embedded_image_bytes: image_bytes,
             font_pack_sha256: self.font_pack.as_ref().map(FontPack::pack_sha256),
             font_faces: self.font_pack.as_ref().map_or(0, FontPack::font_count),
+            properties: DocumentPropertiesInspection::from(&workbook.properties),
         };
         let output = serde_json::to_string(&inspection).map_err(|_| {
             FacadeError::simple(
@@ -564,6 +835,316 @@ impl RenderSession {
         })?;
         enforce_output(output.len(), effective.render.limits.max_output_bytes)?;
         Ok(output)
+    }
+
+    fn edit_state_value(&self) -> serde_json::Value {
+        Self::edit_state_value_for(
+            &self.spreadsheet,
+            EditStateView {
+                dirty: self.dirty,
+                undo_depth: self.undo.len(),
+                redo_depth: self.redo.len(),
+                history_bytes: history_bytes(&self.undo) + history_bytes(&self.redo),
+                edited_parts: &self.edited_parts,
+            },
+        )
+    }
+
+    fn edit_state_value_for(
+        spreadsheet: &Spreadsheet,
+        state: EditStateView<'_>,
+    ) -> serde_json::Value {
+        let (capability, reason) = match spreadsheet.edit_capability() {
+            EditCapability::ReadWrite => ("read-write", None),
+            EditCapability::ReadOnly(reason) => ("read-only", Some(edit_reason(reason))),
+        };
+        serde_json::json!({
+            "schemaVersion": 1,
+            "capability": capability,
+            "reason": reason,
+            "dirty": state.dirty,
+            "canUndo": state.undo_depth > 0,
+            "canRedo": state.redo_depth > 0,
+            "undoDepth": state.undo_depth,
+            "redoDepth": state.redo_depth,
+            "historyBytes": state.history_bytes,
+            "editedParts": state.edited_parts,
+        })
+    }
+
+    fn mutation_result_json_for(
+        &self,
+        spreadsheet: &Spreadsheet,
+        workbook: &Workbook,
+        edit_state: EditStateView<'_>,
+    ) -> Result<String, FacadeError> {
+        let workbook: serde_json::Value =
+            serde_json::from_str(&self.inspection_json_for(workbook, &RequestOptions::default())?)
+                .map_err(|_| {
+                    FacadeError::simple(
+                        "serialization_failed",
+                        "workbook inspection could not be assembled",
+                        "output",
+                    )
+                })?;
+        let output = serde_json::json!({
+            "workbook": workbook,
+            "editState": Self::edit_state_value_for(spreadsheet, edit_state),
+        })
+        .to_string();
+        enforce_output(output.len(), MAX_OUTPUT_BYTES)?;
+        Ok(output)
+    }
+
+    fn read_cell_json_core(
+        &self,
+        sheet_index: usize,
+        row: u32,
+        col: u16,
+    ) -> Result<String, FacadeError> {
+        check_cell_coordinate(row, col)?;
+        let sheet = self.workbook.sheets.get(sheet_index).ok_or_else(|| {
+            FacadeError::simple(
+                "sheet_index_out_of_range",
+                format!(
+                    "sheet index {sheet_index} is out of range for {} sheets",
+                    self.workbook.sheets.len()
+                ),
+                "sheetIndex",
+            )
+        })?;
+        let value = InspectedCell::from(sheet.cell(row, col));
+        let output = serde_json::json!({
+            "schemaVersion": 1,
+            "sheetIndex": sheet_index,
+            "row": row,
+            "col": col,
+            "value": value,
+            "formatted": sheet.formatted(row, col),
+        })
+        .to_string();
+        enforce_output(output.len(), MAX_OUTPUT_BYTES)?;
+        Ok(output)
+    }
+
+    fn set_cell_json_core(&mut self, request_json: &str) -> Result<String, FacadeError> {
+        let request: CellEditRequest = parse_edit_request(request_json, "cell edit")?;
+        check_cell_coordinate(request.row, request.col)?;
+        if let EditableCell::Formula { formula, .. } = &request.value {
+            let body = formula.trim().trim_start_matches('=').trim();
+            if body.is_empty() {
+                return Err(FacadeError::simple(
+                    "invalid_edit",
+                    "formula cannot be empty after removing leading '='",
+                    "edit.value.formula",
+                ));
+            }
+        }
+        let sheet_name = self
+            .workbook
+            .sheets
+            .get(request.sheet_index)
+            .map(|sheet| sheet.name.clone())
+            .ok_or_else(|| {
+                FacadeError::simple(
+                    "sheet_index_out_of_range",
+                    format!(
+                        "sheet index {} is out of range for {} sheets",
+                        request.sheet_index,
+                        self.workbook.sheets.len()
+                    ),
+                    "sheetIndex",
+                )
+            })?;
+        let row = request.row;
+        let col = request.col;
+        self.apply_edit(move |spreadsheet| match request.value {
+            EditableCell::Blank => spreadsheet.clear_cell_value(&sheet_name, row, col),
+            EditableCell::Text { value } => {
+                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Text(value))
+            }
+            EditableCell::Number { value } => {
+                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Number(value))
+            }
+            EditableCell::Date { value } => {
+                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Date(value))
+            }
+            EditableCell::Boolean { value } => {
+                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Bool(value))
+            }
+            EditableCell::Error { value } => {
+                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Error(value))
+            }
+            EditableCell::Formula { formula, cached } => {
+                spreadsheet.set_cell_formula(&sheet_name, row, col, formula, cached.into_cell())
+            }
+        })
+    }
+
+    fn set_document_properties_json_core(
+        &mut self,
+        request_json: &str,
+    ) -> Result<String, FacadeError> {
+        let request: DocumentPropertiesEditRequest =
+            parse_edit_request(request_json, "document properties")?;
+        let properties = DocProperties::from(request);
+        self.apply_edit(move |spreadsheet| spreadsheet.set_document_properties(properties))
+    }
+
+    fn apply_edit(
+        &mut self,
+        edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
+    ) -> Result<String, FacadeError> {
+        ensure_editable(&self.spreadsheet)?;
+        let previous = self.snapshot()?;
+        let mut candidate = self.spreadsheet.clone();
+        edit(&mut candidate).map_err(map_edit_error)?;
+        let bytes = candidate.save().map_err(map_edit_error)?;
+        check_saved_workbook(&bytes)?;
+        let workbook = parse_workbook(&bytes)?;
+        validate_session_workbook(&workbook)?;
+
+        let mut edited_parts = self.edited_parts.clone();
+        for part in candidate.edited_parts() {
+            if !edited_parts.iter().any(|existing| existing == part) {
+                edited_parts.push(part.clone());
+            }
+        }
+        edited_parts.sort();
+
+        let projection = project_history(
+            self.undo
+                .iter()
+                .map(|snapshot| snapshot.bytes.len())
+                .chain(std::iter::once(previous.bytes.len()))
+                .collect(),
+            Vec::new(),
+            HistorySide::Undo,
+        );
+        let output = self.mutation_result_json_for(
+            &candidate,
+            &workbook,
+            EditStateView {
+                dirty: true,
+                undo_depth: projection.undo_depth,
+                redo_depth: projection.redo_depth,
+                history_bytes: projection.bytes,
+                edited_parts: &edited_parts,
+            },
+        )?;
+        self.undo.push(previous);
+        self.redo.clear();
+        apply_history_projection(&mut self.undo, &mut self.redo, &projection);
+        self.spreadsheet = candidate;
+        self.workbook = workbook;
+        self.dirty = true;
+        self.edited_parts = edited_parts;
+        Ok(output)
+    }
+
+    fn undo_edit_core(&mut self) -> Result<String, FacadeError> {
+        ensure_editable(&self.spreadsheet)?;
+        let target = self.undo.last().ok_or_else(|| {
+            FacadeError::simple("history_empty", "there is no edit to undo", "history")
+        })?;
+        let current = self.snapshot()?;
+        let spreadsheet = parse_spreadsheet(&target.bytes)?;
+        let workbook = spreadsheet.workbook().clone();
+        validate_session_workbook(&workbook)?;
+        let dirty = target.dirty;
+        let edited_parts = target.edited_parts.clone();
+        let projection = project_history(
+            self.undo[..self.undo.len() - 1]
+                .iter()
+                .map(|snapshot| snapshot.bytes.len())
+                .collect(),
+            self.redo
+                .iter()
+                .map(|snapshot| snapshot.bytes.len())
+                .chain(std::iter::once(current.bytes.len()))
+                .collect(),
+            HistorySide::Undo,
+        );
+        let output = self.mutation_result_json_for(
+            &spreadsheet,
+            &workbook,
+            EditStateView {
+                dirty,
+                undo_depth: projection.undo_depth,
+                redo_depth: projection.redo_depth,
+                history_bytes: projection.bytes,
+                edited_parts: &edited_parts,
+            },
+        )?;
+        self.undo.pop();
+        self.redo.push(current);
+        apply_history_projection(&mut self.undo, &mut self.redo, &projection);
+        self.spreadsheet = spreadsheet;
+        self.workbook = workbook;
+        self.dirty = dirty;
+        self.edited_parts = edited_parts;
+        Ok(output)
+    }
+
+    fn redo_edit_core(&mut self) -> Result<String, FacadeError> {
+        ensure_editable(&self.spreadsheet)?;
+        let target = self.redo.last().ok_or_else(|| {
+            FacadeError::simple("history_empty", "there is no edit to redo", "history")
+        })?;
+        let current = self.snapshot()?;
+        let spreadsheet = parse_spreadsheet(&target.bytes)?;
+        let workbook = spreadsheet.workbook().clone();
+        validate_session_workbook(&workbook)?;
+        let dirty = target.dirty;
+        let edited_parts = target.edited_parts.clone();
+        let projection = project_history(
+            self.undo
+                .iter()
+                .map(|snapshot| snapshot.bytes.len())
+                .chain(std::iter::once(current.bytes.len()))
+                .collect(),
+            self.redo[..self.redo.len() - 1]
+                .iter()
+                .map(|snapshot| snapshot.bytes.len())
+                .collect(),
+            HistorySide::Redo,
+        );
+        let output = self.mutation_result_json_for(
+            &spreadsheet,
+            &workbook,
+            EditStateView {
+                dirty,
+                undo_depth: projection.undo_depth,
+                redo_depth: projection.redo_depth,
+                history_bytes: projection.bytes,
+                edited_parts: &edited_parts,
+            },
+        )?;
+        self.redo.pop();
+        self.undo.push(current);
+        apply_history_projection(&mut self.undo, &mut self.redo, &projection);
+        self.spreadsheet = spreadsheet;
+        self.workbook = workbook;
+        self.dirty = dirty;
+        self.edited_parts = edited_parts;
+        Ok(output)
+    }
+
+    fn snapshot(&self) -> Result<EditSnapshot, FacadeError> {
+        let bytes = self.spreadsheet.save().map_err(map_edit_error)?;
+        check_saved_workbook(&bytes)?;
+        Ok(EditSnapshot {
+            bytes,
+            dirty: self.dirty,
+            edited_parts: self.edited_parts.clone(),
+        })
+    }
+
+    fn save_document_bytes_core(&self) -> Result<Vec<u8>, FacadeError> {
+        ensure_editable(&self.spreadsheet)?;
+        let bytes = self.spreadsheet.save().map_err(map_edit_error)?;
+        check_saved_workbook(&bytes)?;
+        Ok(bytes)
     }
 
     fn render_sheet_svg_core(
@@ -1047,6 +1628,17 @@ fn check_input(bytes: &[u8]) -> Result<(), FacadeError> {
     Ok(())
 }
 
+fn check_saved_workbook(bytes: &[u8]) -> Result<(), FacadeError> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(FacadeError::limit(
+            "savedWorkbookBytes",
+            MAX_INPUT_BYTES as u64,
+            bytes.len() as u64,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_workbook(bytes: &[u8]) -> Result<Workbook, FacadeError> {
     Workbook::open(bytes).map_err(|_| {
         FacadeError::simple(
@@ -1055,6 +1647,149 @@ fn parse_workbook(bytes: &[u8]) -> Result<Workbook, FacadeError> {
             "input",
         )
     })
+}
+
+fn parse_spreadsheet(bytes: &[u8]) -> Result<Spreadsheet, FacadeError> {
+    Spreadsheet::open(bytes).map_err(|_| {
+        FacadeError::simple(
+            "parse_failed",
+            "spreadsheet input is malformed, encrypted, unsupported, or over budget",
+            "input",
+        )
+    })
+}
+
+fn validate_session_workbook(workbook: &Workbook) -> Result<(), FacadeError> {
+    if workbook.sheets.len() as u64 > MAX_SHEETS {
+        return Err(FacadeError::limit(
+            "sheets",
+            MAX_SHEETS,
+            workbook.sheets.len() as u64,
+        ));
+    }
+    check_embedded_images(
+        workbook,
+        EffectiveResourceLimits {
+            image_bytes: MAX_IMAGE_BYTES,
+            images: MAX_IMAGES,
+            font_bytes: MAX_FONT_BYTES,
+        },
+    )?;
+    Ok(())
+}
+
+fn parse_edit_request<T: for<'de> Deserialize<'de>>(
+    request_json: &str,
+    label: &'static str,
+) -> Result<T, FacadeError> {
+    if request_json.len() > 128 * 1024 {
+        return Err(FacadeError::limit(
+            "editRequestBytes",
+            128 * 1024,
+            request_json.len() as u64,
+        ));
+    }
+    serde_json::from_str(request_json).map_err(|_| {
+        FacadeError::simple(
+            "invalid_edit",
+            format!("{label} request is invalid or contains an unknown field"),
+            "edit",
+        )
+    })
+}
+
+fn check_cell_coordinate(row: u32, col: u16) -> Result<(), FacadeError> {
+    if row > 1_048_575 || col > 16_383 {
+        return Err(FacadeError::simple(
+            "cell_out_of_range",
+            "cell is outside the Excel grid",
+            "cell",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_editable(spreadsheet: &Spreadsheet) -> Result<(), FacadeError> {
+    match spreadsheet.edit_capability() {
+        EditCapability::ReadWrite => Ok(()),
+        EditCapability::ReadOnly(reason) => Err(FacadeError::simple(
+            "edit_read_only",
+            format!(
+                "spreadsheet is read-only for package-preserving edit: {}",
+                edit_reason(reason)
+            ),
+            "editCapability",
+        )),
+    }
+}
+
+fn edit_reason(reason: &EditReadOnlyReason) -> &'static str {
+    match reason {
+        EditReadOnlyReason::LegacyBiff => "legacy-biff",
+        EditReadOnlyReason::BinaryPackage => "binary-package",
+        EditReadOnlyReason::OpenDocument => "open-document",
+        EditReadOnlyReason::PackageMetadataLoss => "package-metadata-loss",
+    }
+}
+
+fn map_edit_error(_error: rxls::Error) -> FacadeError {
+    FacadeError::simple(
+        "edit_failed",
+        "the package-preserving edit was rejected and no change was committed",
+        "edit",
+    )
+}
+
+fn history_bytes(history: &[EditSnapshot]) -> usize {
+    history.iter().fold(0usize, |total, snapshot| {
+        total.saturating_add(snapshot.bytes.len())
+    })
+}
+
+fn project_history(
+    mut undo: Vec<usize>,
+    mut redo: Vec<usize>,
+    tie_evict: HistorySide,
+) -> HistoryProjection {
+    let initial_undo = undo.len();
+    let initial_redo = redo.len();
+    let mut bytes = undo
+        .iter()
+        .chain(&redo)
+        .fold(0usize, |total, size| total.saturating_add(*size));
+    while undo.len().saturating_add(redo.len()) > MAX_EDIT_HISTORY_ENTRIES
+        || bytes > MAX_EDIT_HISTORY_BYTES
+    {
+        let side = match (undo.is_empty(), redo.is_empty()) {
+            (false, true) => HistorySide::Undo,
+            (true, false) => HistorySide::Redo,
+            (false, false) if undo.len() > redo.len() => HistorySide::Undo,
+            (false, false) if redo.len() > undo.len() => HistorySide::Redo,
+            (false, false) => tie_evict,
+            (true, true) => break,
+        };
+        let removed = match side {
+            HistorySide::Undo => undo.remove(0),
+            HistorySide::Redo => redo.remove(0),
+        };
+        bytes = bytes.saturating_sub(removed);
+    }
+    HistoryProjection {
+        undo_drop: initial_undo - undo.len(),
+        redo_drop: initial_redo - redo.len(),
+        undo_depth: undo.len(),
+        redo_depth: redo.len(),
+        bytes,
+    }
+}
+
+fn apply_history_projection(
+    undo: &mut Vec<EditSnapshot>,
+    redo: &mut Vec<EditSnapshot>,
+    projection: &HistoryProjection,
+) {
+    undo.drain(..projection.undo_drop);
+    redo.drain(..projection.redo_drop);
 }
 
 fn check_embedded_images(
@@ -1183,17 +1918,335 @@ mod tests {
         workbook.to_xlsx()
     }
 
+    fn styled_authored_workbook() -> Vec<u8> {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Styled").write_with_format(
+            0,
+            0,
+            "styled",
+            &rxls::Format::new().set_bold(),
+        );
+        workbook.to_xlsx()
+    }
+
     #[test]
     fn capabilities_are_stable_and_enable_verified_memory_fonts() {
         let capabilities: serde_json::Value =
             serde_json::from_str(&capabilities_json()).expect("capabilities JSON");
         assert_eq!(capabilities["schemaVersion"], 1);
-        assert_eq!(capabilities["protocol"], "rxls.render-worker.v1");
+        assert_eq!(capabilities["protocol"], "rxls.render-worker.v2");
         assert_eq!(capabilities["limits"]["maxInputBytes"], MAX_INPUT_BYTES);
         assert_eq!(capabilities["limits"]["maxSheets"], MAX_SHEETS);
         assert_eq!(capabilities["fontUploads"]["supported"], true);
         assert_eq!(capabilities["fontUploads"]["maxBytes"], MAX_FONT_BYTES);
         assert_eq!(capabilities["embeddedImages"]["painted"], true);
+        assert_eq!(
+            capabilities["editing"]["formats"],
+            serde_json::json!(["xlsx", "xlsm"])
+        );
+        assert_eq!(
+            capabilities["editing"]["maxHistoryEntries"],
+            MAX_EDIT_HISTORY_ENTRIES
+        );
+        assert_eq!(
+            capabilities["editing"]["maxHistoryBytes"],
+            MAX_EDIT_HISTORY_BYTES
+        );
+    }
+
+    #[test]
+    fn history_projection_enforces_one_shared_entry_and_byte_budget() {
+        let half_plus_one = MAX_EDIT_HISTORY_BYTES / 2 + 1;
+        let after_undo =
+            project_history(vec![half_plus_one], vec![half_plus_one], HistorySide::Undo);
+        assert_eq!(
+            after_undo,
+            HistoryProjection {
+                undo_drop: 1,
+                redo_drop: 0,
+                undo_depth: 0,
+                redo_depth: 1,
+                bytes: half_plus_one,
+            }
+        );
+
+        let after_redo =
+            project_history(vec![half_plus_one], vec![half_plus_one], HistorySide::Redo);
+        assert_eq!(after_redo.undo_depth, 1);
+        assert_eq!(after_redo.redo_depth, 0);
+        assert_eq!(after_redo.undo_drop, 0);
+        assert_eq!(after_redo.redo_drop, 1);
+        assert!(after_redo.bytes <= MAX_EDIT_HISTORY_BYTES);
+
+        let entry_bound = project_history(vec![1; 10], vec![1; 11], HistorySide::Undo);
+        assert_eq!(entry_bound.undo_depth + entry_bound.redo_depth, 20);
+        assert_eq!(entry_bound.redo_drop, 1);
+        assert!(entry_bound.bytes <= MAX_EDIT_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn editable_session_reparses_cells_and_round_trips_history() {
+        let mut session = RenderSession::new_core(&authored_workbook(), &[]).expect("open session");
+        let initial: serde_json::Value =
+            serde_json::from_str(&session.edit_state_json()).expect("initial edit state");
+        assert_eq!(initial["capability"], "read-write");
+        assert_eq!(initial["dirty"], false);
+
+        let mutation: serde_json::Value = serde_json::from_str(
+            &session
+                .set_cell_json_core(
+                    r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"text","value":"updated"}}"#,
+                )
+                .expect("edit cell"),
+        )
+        .expect("mutation JSON");
+        let edited: serde_json::Value = serde_json::from_str(
+            &session
+                .read_cell_json_core(0, 0, 0)
+                .expect("read edited cell"),
+        )
+        .expect("edited cell JSON");
+        assert_eq!(edited["value"]["kind"], "text");
+        assert_eq!(edited["value"]["value"], "updated");
+        let state = session.edit_state_value();
+        assert_eq!(state["dirty"], true);
+        assert_eq!(state["canUndo"], true);
+        assert_eq!(state["canRedo"], false);
+        assert_eq!(mutation["editState"], state);
+
+        let saved = session
+            .save_document_bytes_core()
+            .expect("save edited package");
+        let reopened = Workbook::open(&saved).expect("reopen edited package");
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Text("updated".to_string()))
+        );
+
+        let undo: serde_json::Value =
+            serde_json::from_str(&session.undo_edit_core().expect("undo edit")).expect("undo JSON");
+        let undone: serde_json::Value = serde_json::from_str(
+            &session
+                .read_cell_json_core(0, 0, 0)
+                .expect("read undone cell"),
+        )
+        .expect("undone cell JSON");
+        assert_eq!(undone["value"]["value"], "hello");
+        assert_eq!(session.edit_state_value()["dirty"], false);
+        assert_eq!(session.edit_state_value()["canRedo"], true);
+        assert_eq!(
+            session.edit_state_value()["editedParts"],
+            serde_json::json!([])
+        );
+        assert_eq!(undo["editState"], session.edit_state_value());
+
+        let redo: serde_json::Value =
+            serde_json::from_str(&session.redo_edit_core().expect("redo edit")).expect("redo JSON");
+        let redone: serde_json::Value = serde_json::from_str(
+            &session
+                .read_cell_json_core(0, 0, 0)
+                .expect("read redone cell"),
+        )
+        .expect("redone cell JSON");
+        assert_eq!(redone["value"]["value"], "updated");
+        assert_eq!(session.edit_state_value()["dirty"], true);
+        assert_eq!(
+            session.edit_state_value()["editedParts"],
+            serde_json::json!(["xl/worksheets/sheet1.xml"])
+        );
+        assert_eq!(redo["editState"], session.edit_state_value());
+    }
+
+    #[test]
+    fn blank_cell_edit_preserves_style_across_save_undo_and_redo() {
+        let mut session =
+            RenderSession::new_core(&styled_authored_workbook(), &[]).expect("open session");
+        let original_style = session.workbook.sheets[0]
+            .cell_style(0, 0)
+            .cloned()
+            .expect("authored style");
+
+        session
+            .set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"blank"}}"#)
+            .expect("clear styled cell value");
+
+        assert_eq!(session.workbook.sheets[0].cell(0, 0), None);
+        assert_eq!(
+            session.edit_state_value()["editedParts"],
+            serde_json::json!(["xl/worksheets/sheet1.xml"])
+        );
+        let saved = session
+            .save_document_bytes_core()
+            .expect("save blank styled cell");
+        let reopened = Workbook::open(&saved).expect("reopen saved workbook");
+        assert_eq!(reopened.sheets[0].cell(0, 0), None);
+
+        let mut restored = RenderSession::new_core(&saved, &[]).expect("open cleared workbook");
+        restored
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"text","value":"restored"}}"#,
+            )
+            .expect("restore cell value");
+        assert_eq!(
+            restored.workbook.sheets[0].cell_style(0, 0),
+            Some(&original_style)
+        );
+
+        session.undo_edit_core().expect("undo blank edit");
+        assert_eq!(
+            session.workbook.sheets[0].cell(0, 0),
+            Some(&Cell::Text("styled".to_string()))
+        );
+        assert_eq!(
+            session.workbook.sheets[0].cell_style(0, 0),
+            Some(&original_style)
+        );
+        assert_eq!(session.edit_state_value()["dirty"], false);
+        assert_eq!(
+            session.edit_state_value()["editedParts"],
+            serde_json::json!([])
+        );
+
+        session.redo_edit_core().expect("redo blank edit");
+        assert_eq!(session.workbook.sheets[0].cell(0, 0), None);
+        assert_eq!(session.edit_state_value()["dirty"], true);
+    }
+
+    #[test]
+    fn editable_session_rejects_empty_formula_without_mutating_state() {
+        let mut session = RenderSession::new_core(&authored_workbook(), &[]).expect("open session");
+        let before_bytes = session
+            .save_document_bytes_core()
+            .expect("save before rejected formula");
+        let before_state = session.edit_state_value();
+
+        let error = session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula","formula":"=","cached":{"kind":"number","value":0}}}"#,
+            )
+            .expect_err("formula without a body must fail");
+
+        assert_eq!(error.code, "invalid_edit");
+        assert_eq!(error.location, "edit.value.formula");
+        assert_eq!(session.edit_state_value(), before_state);
+        assert_eq!(
+            session
+                .save_document_bytes_core()
+                .expect("save after rejected formula"),
+            before_bytes
+        );
+    }
+
+    #[test]
+    fn editable_session_history_evicts_the_oldest_snapshot_at_the_shared_cap() {
+        let mut session = RenderSession::new_core(&authored_workbook(), &[]).expect("open session");
+        for index in 0..=MAX_EDIT_HISTORY_ENTRIES {
+            session
+                .set_cell_json_core(&format!(
+                    r#"{{"sheetIndex":0,"row":0,"col":0,"value":{{"kind":"text","value":"edit-{index}"}}}}"#
+                ))
+                .expect("apply edit");
+        }
+
+        let full = session.edit_state_value();
+        assert_eq!(full["undoDepth"], MAX_EDIT_HISTORY_ENTRIES);
+        assert_eq!(full["redoDepth"], 0);
+        assert!(full["historyBytes"].as_u64().unwrap() <= MAX_EDIT_HISTORY_BYTES as u64);
+
+        for _ in 0..MAX_EDIT_HISTORY_ENTRIES {
+            session.undo_edit_core().expect("undo retained edit");
+        }
+        assert_eq!(
+            session.workbook.sheets[0].cell(0, 0),
+            Some(&Cell::Text("edit-0".to_string()))
+        );
+        assert_eq!(session.edit_state_value()["dirty"], true);
+        assert_eq!(session.edit_state_value()["undoDepth"], 0);
+        assert_eq!(
+            session.edit_state_value()["redoDepth"],
+            MAX_EDIT_HISTORY_ENTRIES
+        );
+        assert_eq!(
+            session
+                .undo_edit_core()
+                .expect_err("oldest snapshot was evicted")
+                .code,
+            "history_empty"
+        );
+
+        session.redo_edit_core().expect("redo retained edit");
+        session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"text","value":"branched"}}"#,
+            )
+            .expect("branch from history");
+        assert_eq!(session.edit_state_value()["canRedo"], false);
+        assert_eq!(session.edit_state_value()["redoDepth"], 0);
+    }
+
+    #[test]
+    fn editable_session_updates_properties_and_rejects_partial_failures() {
+        let mut session = RenderSession::new_core(&authored_workbook(), &[]).expect("open session");
+        session
+            .set_document_properties_json_core(
+                r#"{"title":"Browser report","subject":null,"creator":"rxls","keywords":null,"description":null,"lastModifiedBy":null,"company":"Open source","created":null}"#,
+            )
+            .expect("edit properties");
+        assert_eq!(
+            session.workbook.properties.title.as_deref(),
+            Some("Browser report")
+        );
+        assert_eq!(
+            session.workbook.properties.company.as_deref(),
+            Some("Open source")
+        );
+
+        let before = session
+            .save_document_bytes_core()
+            .expect("save before failure");
+        let before_state = session.edit_state_value();
+        let error = session
+            .set_document_properties_json_core(r#"{"title":"incomplete replacement"}"#)
+            .expect_err("missing property fields must fail");
+        assert_eq!(error.code, "invalid_edit");
+        assert_eq!(
+            session.workbook.properties.title.as_deref(),
+            Some("Browser report")
+        );
+        assert_eq!(session.edit_state_value(), before_state);
+        assert_eq!(
+            session
+                .save_document_bytes_core()
+                .expect("save after rejected properties"),
+            before
+        );
+
+        let error = session
+            .set_cell_json_core(
+                "{\"sheetIndex\":0,\"row\":0,\"col\":0,\"value\":{\"kind\":\"text\",\"value\":\"bad\\u0001text\"}}",
+            )
+            .expect_err("invalid XML text must fail");
+        assert_eq!(error.code, "edit_failed");
+        assert_eq!(session.edit_state_value(), before_state);
+        assert_eq!(
+            session
+                .save_document_bytes_core()
+                .expect("save after failure"),
+            before
+        );
+    }
+
+    #[test]
+    fn legacy_workbook_reports_a_typed_read_only_edit_reason() {
+        let bytes = include_bytes!("../../../tests/fixtures/xls/korean-cp949-biff5.xls");
+        let session = RenderSession::new_core(bytes, &[]).expect("open legacy workbook");
+        let state = session.edit_state_value();
+        assert_eq!(state["capability"], "read-only");
+        assert_eq!(state["reason"], "legacy-biff");
+        assert_eq!(
+            session.save_document_bytes_core().unwrap_err().code,
+            "edit_read_only"
+        );
     }
 
     #[test]
@@ -1354,8 +2407,15 @@ mod tests {
         assert_eq!(error.limit, Some(MAX_INPUT_BYTES as u64));
         assert_eq!(error.actual, Some((MAX_INPUT_BYTES + 1) as u64));
 
+        let saved_error = check_saved_workbook(&oversized).unwrap_err();
+        assert_eq!(saved_error.code, "limit_exceeded");
+        assert_eq!(saved_error.resource, Some("savedWorkbookBytes"));
+        assert_eq!(saved_error.limit, Some(MAX_INPUT_BYTES as u64));
+        assert_eq!(saved_error.actual, Some((MAX_INPUT_BYTES + 1) as u64));
+
         // The boundary itself must stay usable: exactly at the ceiling is fine.
         assert!(check_input(&vec![0_u8; MAX_INPUT_BYTES]).is_ok());
+        assert!(check_saved_workbook(&vec![0_u8; MAX_INPUT_BYTES]).is_ok());
     }
 
     /// Request-time validation (`options_reject_unknown_fields_and_limit_increases`

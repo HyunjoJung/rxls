@@ -485,6 +485,48 @@ fn editable_xlsm_set_cell_value_touches_only_sheet_part() {
     );
 }
 
+#[cfg(feature = "xlsx")]
+#[test]
+fn editable_xlsm_clear_cell_value_preserves_untouched_package_parts() {
+    use rxls::Spreadsheet;
+
+    let input = synthetic_xlsm_with_vba();
+    let preserved = [
+        "[Content_Types].xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/tables/table1.xml",
+        "xl/vbaProject.bin",
+    ]
+    .map(|name| (name, zip_part(&input, name)));
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open editable xlsm");
+
+    spreadsheet
+        .clear_cell_value("Data", 0, 0)
+        .expect("clear cell value");
+
+    assert_eq!(spreadsheet.edited_parts(), &["xl/worksheets/sheet1.xml"]);
+    let saved = spreadsheet.save().expect("save edited package");
+    for (name, original) in preserved {
+        assert_eq!(
+            zip_part(&saved, name),
+            original,
+            "untouched package part changed: {name}"
+        );
+    }
+    assert_ne!(
+        zip_part(&saved, "xl/worksheets/sheet1.xml"),
+        zip_part(&input, "xl/worksheets/sheet1.xml")
+    );
+    let reopened = Workbook::open(&saved).expect("reopen edited xlsm");
+    assert_eq!(
+        reopened
+            .sheet_by_name("Data")
+            .and_then(|sheet| sheet.cell(0, 0)),
+        None
+    );
+}
+
 /// A single unrelated edit must leave a representative multi-surface OOXML
 /// package byte-for-byte intact outside the declared worksheet part. Keeping
 /// these sentinels together catches broad ZIP rebuild or relationship-pruning

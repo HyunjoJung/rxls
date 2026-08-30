@@ -51,7 +51,12 @@ import {
   createRenderWorkerClient,
   getRenderWorkerUrl,
   type CloseDocumentResult,
+  type DocumentPropertiesInspection,
+  type EditableCell,
+  type EditMutationResult,
+  type EditStatusResult,
   type FontPack,
+  type InspectedCell,
   type OpenDocumentResult,
   type PreparePagesResult,
   type RenderCapabilities,
@@ -65,9 +70,12 @@ import {
   type RenderTileResult,
   type RenderWorkerConstructor,
   type RenderWorkerLike,
+  type ReadCellResult,
+  type SaveDocumentResult,
 } from "@rxls/render-worker";
 import {
   MAX_DPI,
+  MAX_EDIT_REQUEST_BYTES,
   MAX_FONT_BYTES,
   MAX_FONT_FILES,
   MAX_FONT_FILE_BYTES,
@@ -88,6 +96,7 @@ import {
   asBytes,
   boundedIndex,
   encodeFontBundle,
+  editJson,
   fontPackByteLength,
   limitError,
   normalizeError,
@@ -96,6 +105,7 @@ import {
   positiveInteger,
   preflightRequest,
   validateDocumentId,
+  validateCellCoordinate,
   validateFontPack,
   validateRange,
   validateRequestId,
@@ -140,6 +150,34 @@ const factoryClient = createRenderWorkerClient(undefined, { WorkerClass });
 const capabilities: RenderRequest<RenderCapabilities> = client.capabilities(requestOptions);
 const opened: RenderRequest<OpenDocumentResult> = client.open(new Uint8Array(), openOptions);
 const closed: RenderRequest<CloseDocumentResult> = client.closeDocument("document-1");
+const editStatus: RenderRequest<EditStatusResult> = client.editStatus("document-1");
+const readCell: RenderRequest<ReadCellResult> = client.readCell("document-1", 0, 0, 0);
+const inspectedCell: Promise<InspectedCell> = readCell.then((result) => result.value);
+const editableCell: EditableCell = { kind: "text", value: "updated" };
+const edited: RenderRequest<EditMutationResult> = client.setCell(
+  "document-1",
+  0,
+  0,
+  0,
+  editableCell,
+);
+const properties: DocumentPropertiesInspection = {
+  title: "Report",
+  subject: null,
+  creator: "rxls",
+  keywords: null,
+  description: null,
+  lastModifiedBy: null,
+  company: null,
+  created: null,
+};
+const propertyEdit: RenderRequest<EditMutationResult> = client.setDocumentProperties(
+  "document-1",
+  properties,
+);
+const undone: RenderRequest<EditMutationResult> = client.undoEdit("document-1");
+const redone: RenderRequest<EditMutationResult> = client.redoEdit("document-1");
+const saved: RenderRequest<SaveDocumentResult> = client.saveDocument("document-1");
 const pages: RenderRequest<PreparePagesResult> = client.preparePages("document-1", 0, {
   gridlines: false,
   limits: { maxPages: 4 },
@@ -170,6 +208,14 @@ void [
   capabilities,
   opened,
   closed,
+  editStatus,
+  readCell,
+  inspectedCell,
+  edited,
+  propertyEdit,
+  undone,
+  redone,
+  saved,
   pages,
   sheet,
   tile,
@@ -210,6 +256,8 @@ const validatedDocumentId: string = validateDocumentId("document-1");
 const index: number = boundedIndex(0, "sheetIndex", MAX_SHEETS, "sheets");
 const positive: number = positiveInteger(1, "dpi");
 const fontBytes: number = fontPackByteLength(fontPack);
+const coordinate: { readonly row: number; readonly col: number } = validateCellCoordinate(0, 0);
+const editBytes: Uint8Array = editJson({ kind: "text", value: "updated" });
 void [
   parsed,
   resourceBytes,
@@ -226,7 +274,10 @@ void [
   index,
   positive,
   fontBytes,
+  coordinate,
+  editBytes,
   MAX_DPI,
+  MAX_EDIT_REQUEST_BYTES,
   MAX_FONT_BYTES,
   MAX_FONT_FILES,
   MAX_FONT_FILE_BYTES,
@@ -246,6 +297,13 @@ void [
 class Session implements RenderWasmSession {
   constructor(_bytes: Uint8Array, _fontBundle: Uint8Array) {}
   inspectionJson(): string { return "{}"; }
+  editStateJson(): string { return "{}"; }
+  readCellJson(_sheetIndex: number, _row: number, _col: number): string { return "{}"; }
+  setCellJson(_requestJson: string): string { return "{}"; }
+  setDocumentPropertiesJson(_requestJson: string): string { return "{}"; }
+  undoEditJson(): string { return "{}"; }
+  redoEditJson(): string { return "{}"; }
+  saveDocumentBytes(): Uint8Array { return new Uint8Array(); }
   printManifestJson(_sheetIndex: number, _optionsJson: string): string { return "{}"; }
   renderSheetSvg(_sheetIndex: number, _optionsJson: string): string { return "<svg></svg>"; }
   renderTileSvg(

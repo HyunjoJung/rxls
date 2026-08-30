@@ -1,6 +1,9 @@
 import {
   MAX_DPI,
+  MAX_EDIT_HISTORY_BYTES,
+  MAX_EDIT_HISTORY_ENTRIES,
   MAX_INPUT_BYTES,
+  MAX_MANUAL_PAGE_BREAKS,
   MAX_OPEN_DOCUMENTS,
   MAX_OPEN_RESOURCE_BYTES,
   MAX_OPTIONS_BYTES,
@@ -28,6 +31,14 @@ import {
   validateSvgOutput
 } from "./protocol.mjs";
 
+const NON_CANCELLABLE_ACTIVE_OPERATIONS = new Set([
+  "close",
+  "set-cell",
+  "set-document-properties",
+  "undo-edit",
+  "redo-edit"
+]);
+
 export class RenderWorkerRuntime {
   #wasm;
   #send;
@@ -39,10 +50,13 @@ export class RenderWorkerRuntime {
   #activeResourceBytes = 0;
   #requestIds = new Set();
   #activeRequestId = null;
+  #activeOperation = null;
   #draining = false;
   #capabilities;
   #maxOutputBytes;
   #maxPngBytes;
+  #maxEditHistoryEntries;
+  #maxEditHistoryBytes;
 
   constructor({ wasm, send }) {
     if (wasm === null || typeof wasm !== "object") {
@@ -67,6 +81,16 @@ export class RenderWorkerRuntime {
       this.#capabilities?.limits?.maxPngBytes ?? MAX_PNG_BYTES,
       MAX_PNG_BYTES,
       "maxPngBytes"
+    );
+    this.#maxEditHistoryEntries = boundedCapability(
+      this.#capabilities?.editing?.maxHistoryEntries,
+      MAX_EDIT_HISTORY_ENTRIES,
+      "maxHistoryEntries"
+    );
+    this.#maxEditHistoryBytes = boundedCapability(
+      this.#capabilities?.editing?.maxHistoryBytes,
+      MAX_EDIT_HISTORY_BYTES,
+      "maxHistoryBytes"
     );
   }
 
@@ -178,13 +202,16 @@ export class RenderWorkerRuntime {
         this.#queuedResourceBytes -= resourceBytes;
         this.#activeResourceBytes = resourceBytes;
         this.#activeRequestId = message.requestId;
+        this.#activeOperation = message.operation;
         await this.#run(message);
         this.#requestIds.delete(message.requestId);
         this.#activeRequestId = null;
+        this.#activeOperation = null;
         this.#activeResourceBytes = 0;
       }
     } finally {
       this.#activeRequestId = null;
+      this.#activeOperation = null;
       this.#activeResourceBytes = 0;
       this.#draining = false;
     }
@@ -200,6 +227,9 @@ export class RenderWorkerRuntime {
       return;
     }
     if (this.#activeRequestId === requestId) {
+      if (NON_CANCELLABLE_ACTIVE_OPERATIONS.has(this.#activeOperation)) {
+        return;
+      }
       this.#cancelled.add(requestId);
     }
   }
@@ -257,6 +287,20 @@ export class RenderWorkerRuntime {
         return this.#renderPage(payload);
       case "render-page-png":
         return this.#renderPagePng(payload);
+      case "edit-status":
+        return this.#editStatus(payload);
+      case "read-cell":
+        return this.#readCell(payload);
+      case "set-cell":
+        return this.#setCell(payload);
+      case "set-document-properties":
+        return this.#setDocumentProperties(payload);
+      case "undo-edit":
+        return this.#historyEdit(payload, "undo");
+      case "redo-edit":
+        return this.#historyEdit(payload, "redo");
+      case "save-document":
+        return this.#saveDocument(payload);
       default:
         throw new RenderProtocolError("unknown_operation", "operation is not supported");
     }
@@ -284,10 +328,15 @@ export class RenderWorkerRuntime {
       throw limitError("inputBytes", MAX_INPUT_BYTES, bytes.byteLength, "payload.bytes");
     }
     const fontBundle = encodeFontBundle(payload.fontPack);
-    const resourceBytes = bytes.byteLength + fontBundle.byteLength;
-    const total = this.#resourceBytes + resourceBytes;
-    if (total > MAX_OPEN_RESOURCE_BYTES) {
-      throw limitError("openResourceBytes", MAX_OPEN_RESOURCE_BYTES, total, "documents");
+    const sourceResourceBytes = bytes.byteLength + fontBundle.byteLength;
+    const sourceTotal = this.#resourceBytes + sourceResourceBytes;
+    if (sourceTotal > MAX_OPEN_RESOURCE_BYTES) {
+      throw limitError(
+        "openResourceBytes",
+        MAX_OPEN_RESOURCE_BYTES,
+        sourceTotal,
+        "documents"
+      );
     }
     const Session = this.#wasm.RenderSession;
     if (typeof Session !== "function") {
@@ -299,24 +348,32 @@ export class RenderWorkerRuntime {
     }
     const session = new Session(bytes, fontBundle);
     try {
-      const workbook = parseBoundedJson(
-        await session.inspectionJson(),
-        "inspection",
-        this.#maxOutputBytes
+      const workbook = validateWorkbookInspection(
+        parseBoundedJson(
+          await session.inspectionJson(),
+          "inspection",
+          this.#maxOutputBytes
+        )
       );
-      if (
-        !Number.isSafeInteger(workbook?.sheetCount) ||
-        workbook.sheetCount < 0 ||
-        workbook.sheetCount > MAX_SHEETS
-      ) {
-        throw new RenderProtocolError(
-          "wasm_api_mismatch",
-          "inspection contains an invalid sheet count",
-          "wasm"
+      const editState = validateEditState(
+        parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes),
+        this.#maxEditHistoryEntries,
+        this.#maxEditHistoryBytes
+      );
+      const historyReservationBytes =
+        editState.capability === "read-write" ? this.#maxEditHistoryBytes : 0;
+      const resourceBytes = sourceResourceBytes + historyReservationBytes;
+      const total = this.#resourceBytes + resourceBytes;
+      if (total > MAX_OPEN_RESOURCE_BYTES) {
+        throw limitError(
+          "openResourceBytes",
+          MAX_OPEN_RESOURCE_BYTES,
+          total,
+          "documents"
         );
       }
       return {
-        value: { documentId, workbook },
+        value: { documentId, workbook, editState },
         openTransaction: {
           documentId,
           document: { session, resourceBytes },
@@ -368,21 +425,14 @@ export class RenderWorkerRuntime {
       MAX_SHEETS,
       "sheets"
     );
-    const manifest = parseBoundedJson(
-      await session.printManifestJson(sheetIndex, optionsJson(payload.options)),
-      "print manifest",
-      this.#maxOutputBytes
+    const manifest = validatePrintManifest(
+      parseBoundedJson(
+        await session.printManifestJson(sheetIndex, optionsJson(payload.options)),
+        "print manifest",
+        this.#maxOutputBytes
+      ),
+      sheetIndex
     );
-    if (!Array.isArray(manifest?.pages)) {
-      throw new RenderProtocolError(
-        "wasm_api_mismatch",
-        "print manifest does not contain a page array",
-        "wasm"
-      );
-    }
-    if (manifest.pages.length > MAX_PAGES) {
-      throw limitError("pages", MAX_PAGES, manifest.pages.length, "output");
-    }
     return { documentId, sheetIndex, manifest };
   }
 
@@ -482,6 +532,111 @@ export class RenderWorkerRuntime {
     };
   }
 
+  async #editStatus(payload) {
+    const { documentId, session } = this.#document(payload);
+    const editState = validateEditState(
+      parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes),
+      this.#maxEditHistoryEntries,
+      this.#maxEditHistoryBytes
+    );
+    return { documentId, editState };
+  }
+
+  async #readCell(payload) {
+    const { documentId, session } = this.#document(payload);
+    const cell = parseBoundedJson(
+      await session.readCellJson(payload.sheetIndex, payload.row, payload.col),
+      "cell inspection",
+      this.#maxOutputBytes
+    );
+    if (
+      !plainRecord(cell) ||
+      !hasExactKeys(cell, ["schemaVersion", "sheetIndex", "row", "col", "value", "formatted"]) ||
+      cell.schemaVersion !== 1 ||
+      cell.sheetIndex !== payload.sheetIndex ||
+      cell.row !== payload.row ||
+      cell.col !== payload.col ||
+      (cell.formatted !== null && typeof cell.formatted !== "string")
+    ) {
+      throw invalidCellInspection();
+    }
+    validateInspectedCell(cell.value);
+    return { value: { documentId, ...cell } };
+  }
+
+  async #setCell(payload) {
+    const { documentId, session } = this.#document(payload);
+    const result = await session.setCellJson(
+      JSON.stringify({
+        sheetIndex: payload.sheetIndex,
+        row: payload.row,
+        col: payload.col,
+        value: payload.value
+      })
+    );
+    return { documentId, ...this.#mutationResult(result) };
+  }
+
+  async #setDocumentProperties(payload) {
+    const { documentId, session } = this.#document(payload);
+    const result = await session.setDocumentPropertiesJson(JSON.stringify(payload.properties));
+    return { documentId, ...this.#mutationResult(result) };
+  }
+
+  async #historyEdit(payload, direction) {
+    const { documentId, session } = this.#document(payload);
+    const result =
+      direction === "undo" ? await session.undoEditJson() : await session.redoEditJson();
+    return { documentId, ...this.#mutationResult(result) };
+  }
+
+  async #saveDocument(payload) {
+    const { documentId, session } = this.#document(payload);
+    const value = asBytes(await session.saveDocumentBytes(), "saved workbook");
+    if (value.byteLength > MAX_INPUT_BYTES) {
+      throw limitError(
+        "savedWorkbookBytes",
+        MAX_INPUT_BYTES,
+        value.byteLength,
+        "output"
+      );
+    }
+    if (!hasZipLocalHeader(value)) {
+      throw new RenderProtocolError(
+        "wasm_api_mismatch",
+        "saved workbook is not an OOXML ZIP package",
+        "wasm"
+      );
+    }
+    const bytes = value.slice();
+    return {
+      value: {
+        documentId,
+        mimeType: "application/octet-stream",
+        bytes
+      },
+      transfer: [bytes.buffer]
+    };
+  }
+
+  #mutationResult(json) {
+    const result = parseBoundedJson(json, "edit result", this.#maxOutputBytes);
+    if (!plainRecord(result) || !hasExactKeys(result, ["workbook", "editState"])) {
+      throw new RenderProtocolError(
+        "wasm_api_mismatch",
+        "edit result does not satisfy the worker contract",
+        "wasm"
+      );
+    }
+    const workbook = validateWorkbookInspection(result.workbook);
+    const editState = validateEditState(
+      result.editState,
+      this.#maxEditHistoryEntries,
+      this.#maxEditHistoryBytes
+    );
+    return { workbook, editState };
+  }
+
   #document(payload) {
     const documentId = validateDocumentId(payload.documentId);
     const document = this.#documents.get(documentId);
@@ -575,6 +730,521 @@ function boundedCapability(value, hardMax, name) {
   return value;
 }
 
+function validatePrintManifest(value, expectedSheetIndex) {
+  if (!validPrintManifest(value, expectedSheetIndex)) {
+    throw new RenderProtocolError(
+      "wasm_api_mismatch",
+      "print manifest does not satisfy the worker contract",
+      "wasm"
+    );
+  }
+  return value;
+}
+
+function validPrintManifest(value, expectedSheetIndex) {
+  const required = [
+    "schema_version",
+    "sheet_index",
+    "sheet_name",
+    "source_report",
+    "source_reports",
+    "paper",
+    "content_rect",
+    "manual_row_breaks",
+    "manual_col_breaks",
+    "scale_permille",
+    "logical_pages",
+    "sparse_pages_omitted",
+    "pages",
+    "warnings"
+  ];
+  if (
+    !plainRecord(value) ||
+    !hasAllowedKeys(value, required, ["layout_override", "page_order"]) ||
+    value.schema_version !== 2 ||
+    value.sheet_index !== expectedSheetIndex ||
+    !boundedText(value.sheet_name, MAX_OUTPUT_BYTES) ||
+    (value.layout_override !== undefined &&
+      value.layout_override !== "single_page_sheets") ||
+    (value.page_order !== undefined &&
+      !["down_then_over", "over_then_down", "unknown"].includes(value.page_order)) ||
+    !nonNegativeSafeInteger(value.scale_permille) ||
+    !nonNegativeSafeInteger(value.logical_pages) ||
+    !nonNegativeSafeInteger(value.sparse_pages_omitted) ||
+    !validRenderReport(value.source_report, expectedSheetIndex, value.sheet_name) ||
+    !Array.isArray(value.source_reports) ||
+    value.source_reports.length === 0 ||
+    value.source_reports.length > MAX_PAGES ||
+    value.source_reports.some(
+      (report) => !validRenderReport(report, expectedSheetIndex, value.sheet_name)
+    ) ||
+    !validPaper(value.paper) ||
+    !validContentRect(value.content_rect) ||
+    !validSortedIntegerArray(value.manual_row_breaks) ||
+    !validSortedIntegerArray(value.manual_col_breaks) ||
+    !Array.isArray(value.pages) ||
+    value.pages.length > MAX_PAGES ||
+    value.pages.some((page, index) => !validPrintPage(page, index)) ||
+    value.logical_pages !== value.pages.length + value.sparse_pages_omitted ||
+    !validWarningSummaries(value.warnings)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function validRenderReport(value, expectedSheetIndex, expectedSheetName) {
+  const keys = [
+    "schema_version",
+    "sheet_index",
+    "sheet_name",
+    "range",
+    "rows_considered",
+    "columns_considered",
+    "cells_considered",
+    "visible_rows",
+    "visible_columns",
+    "rendered_regions",
+    "hidden_rows_skipped",
+    "hidden_columns_skipped",
+    "merged_regions",
+    "text_bytes",
+    "glyphs",
+    "scene_nodes",
+    "svg_bytes",
+    "font_pack_sha256",
+    "font_faces",
+    "warnings"
+  ];
+  const countKeys = [
+    "rows_considered",
+    "columns_considered",
+    "cells_considered",
+    "visible_rows",
+    "visible_columns",
+    "rendered_regions",
+    "hidden_rows_skipped",
+    "hidden_columns_skipped",
+    "merged_regions",
+    "text_bytes",
+    "glyphs",
+    "scene_nodes",
+    "svg_bytes"
+  ];
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, keys) &&
+    value.schema_version === 2 &&
+    value.sheet_index === expectedSheetIndex &&
+    value.sheet_name === expectedSheetName &&
+    validReportRange(value.range) &&
+    countKeys.every((key) => nonNegativeSafeInteger(value[key])) &&
+    (value.font_pack_sha256 === null || validSha256(value.font_pack_sha256)) &&
+    Array.isArray(value.font_faces) &&
+    value.font_faces.length <= 512 &&
+    value.font_faces.every(validRenderedFontFace) &&
+    Array.isArray(value.warnings) &&
+    value.warnings.length <= 1_024 &&
+    value.warnings.every(validRenderWarning)
+  );
+}
+
+function validReportRange(value) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, ["first_row", "first_col", "last_row", "last_col"]) &&
+    nonNegativeSafeInteger(value.first_row) &&
+    nonNegativeSafeInteger(value.first_col) &&
+    nonNegativeSafeInteger(value.last_row) &&
+    nonNegativeSafeInteger(value.last_col) &&
+    value.last_row >= value.first_row &&
+    value.last_col >= value.first_col
+  );
+}
+
+function validRenderedFontFace(value) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, [
+      "source_pack_sha256",
+      "face_sha256",
+      "family",
+      "weight",
+      "italic",
+      "substituted"
+    ]) &&
+    validSha256(value.source_pack_sha256) &&
+    validSha256(value.face_sha256) &&
+    boundedText(value.family, 4_096) &&
+    Number.isSafeInteger(value.weight) &&
+    value.weight > 0 &&
+    value.weight <= 1_000 &&
+    typeof value.italic === "boolean" &&
+    typeof value.substituted === "boolean"
+  );
+}
+
+function validRenderWarning(value) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, ["code", "occurrences", "first_cell"]) &&
+    safeContractText(value.code, 128) &&
+    Number.isSafeInteger(value.occurrences) &&
+    value.occurrences > 0 &&
+    (value.first_cell === null ||
+      (plainRecord(value.first_cell) &&
+        hasExactKeys(value.first_cell, ["row", "col"]) &&
+        nonNegativeSafeInteger(value.first_cell.row) &&
+        nonNegativeSafeInteger(value.first_cell.col)))
+  );
+}
+
+function validPaper(value) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, ["code", "width_raw", "height_raw"]) &&
+    nonNegativeSafeInteger(value.code) &&
+    Number.isSafeInteger(value.width_raw) &&
+    value.width_raw > 0 &&
+    Number.isSafeInteger(value.height_raw) &&
+    value.height_raw > 0
+  );
+}
+
+function validContentRect(value) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, ["x_raw", "y_raw", "width_raw", "height_raw"]) &&
+    Number.isSafeInteger(value.x_raw) &&
+    Number.isSafeInteger(value.y_raw) &&
+    nonNegativeSafeInteger(value.width_raw) &&
+    nonNegativeSafeInteger(value.height_raw)
+  );
+}
+
+function validPrintPage(value, expectedIndex) {
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, [
+      "output_index",
+      "displayed_page_number",
+      "area_index",
+      "horizontal_index",
+      "vertical_index",
+      "manual_col_break_before",
+      "manual_row_break_before",
+      "body_range",
+      "repeat_rows",
+      "repeat_cols",
+      "scale_permille"
+    ]) &&
+    value.output_index === expectedIndex &&
+    Number.isSafeInteger(value.displayed_page_number) &&
+    value.displayed_page_number > 0 &&
+    nonNegativeSafeInteger(value.area_index) &&
+    nonNegativeSafeInteger(value.horizontal_index) &&
+    nonNegativeSafeInteger(value.vertical_index) &&
+    typeof value.manual_col_break_before === "boolean" &&
+    typeof value.manual_row_break_before === "boolean" &&
+    validReportRange(value.body_range) &&
+    validIndexPair(value.repeat_rows) &&
+    validIndexPair(value.repeat_cols) &&
+    Number.isSafeInteger(value.scale_permille) &&
+    value.scale_permille > 0
+  );
+}
+
+function validIndexPair(value) {
+  return (
+    value === null ||
+    (Array.isArray(value) &&
+      value.length === 2 &&
+      nonNegativeSafeInteger(value[0]) &&
+      nonNegativeSafeInteger(value[1]) &&
+      value[1] >= value[0])
+  );
+}
+
+function validSortedIntegerArray(value) {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_MANUAL_PAGE_BREAKS &&
+    value.every(nonNegativeSafeInteger) &&
+    strictlySortedUnique(value)
+  );
+}
+
+function validWarningSummaries(value) {
+  return (
+    Array.isArray(value) &&
+    value.length <= 1_024 &&
+    value.every(
+      (warning) =>
+        plainRecord(warning) &&
+        hasExactKeys(warning, ["code", "occurrences"]) &&
+        safeContractText(warning.code, 128) &&
+        Number.isSafeInteger(warning.occurrences) &&
+        warning.occurrences > 0
+    )
+  );
+}
+
+function hasAllowedKeys(value, required, optional) {
+  const keys = Object.keys(value);
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => Object.hasOwn(value, key)) &&
+    keys.every((key) => allowed.has(key))
+  );
+}
+
+function boundedText(value, maxBytes) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    new TextEncoder().encode(value).byteLength <= maxBytes
+  );
+}
+
+function safeContractText(value, maxBytes) {
+  return boundedText(value, maxBytes) && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function validateWorkbookInspection(value) {
+  if (
+    !plainRecord(value) ||
+    !hasExactKeys(value, [
+      "schemaVersion",
+      "sheetCount",
+      "sheets",
+      "embeddedImages",
+      "embeddedImageBytes",
+      "fontPackSha256",
+      "fontFaces",
+      "properties"
+    ]) ||
+    value.schemaVersion !== 1 ||
+    !Number.isSafeInteger(value.sheetCount) ||
+    value.sheetCount < 0 ||
+    value.sheetCount > MAX_SHEETS ||
+    !Array.isArray(value.sheets) ||
+    value.sheets.length !== value.sheetCount ||
+    !nonNegativeSafeInteger(value.embeddedImages) ||
+    !nonNegativeSafeInteger(value.embeddedImageBytes) ||
+    (value.fontPackSha256 !== null && !validSha256(value.fontPackSha256)) ||
+    !nonNegativeSafeInteger(value.fontFaces) ||
+    !validDocumentProperties(value.properties)
+  ) {
+    throw new RenderProtocolError(
+      "wasm_api_mismatch",
+      "workbook inspection does not satisfy the worker contract",
+      "wasm"
+    );
+  }
+  let embeddedImages = 0;
+  for (const [index, sheet] of value.sheets.entries()) {
+    if (
+      !plainRecord(sheet) ||
+      !hasExactKeys(sheet, ["index", "name", "embeddedImages"]) ||
+      sheet.index !== index ||
+      typeof sheet.name !== "string" ||
+      sheet.name.length === 0 ||
+      !nonNegativeSafeInteger(sheet.embeddedImages)
+    ) {
+      throw new RenderProtocolError(
+        "wasm_api_mismatch",
+        "workbook sheet inspection does not satisfy the worker contract",
+        "wasm"
+      );
+    }
+    embeddedImages += sheet.embeddedImages;
+  }
+  if (!Number.isSafeInteger(embeddedImages) || embeddedImages !== value.embeddedImages) {
+    throw new RenderProtocolError(
+      "wasm_api_mismatch",
+      "workbook image totals do not match its sheets",
+      "wasm"
+    );
+  }
+  return value;
+}
+
+function validDocumentProperties(value) {
+  const fields = [
+    "title",
+    "subject",
+    "creator",
+    "keywords",
+    "description",
+    "lastModifiedBy",
+    "company",
+    "created"
+  ];
+  return (
+    plainRecord(value) &&
+    hasExactKeys(value, fields) &&
+    fields.every((field) => value[field] === null || typeof value[field] === "string")
+  );
+}
+
+function nonNegativeSafeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function validSha256(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function hasZipLocalHeader(value) {
+  return (
+    value.byteLength >= 4 &&
+    value[0] === 0x50 &&
+    value[1] === 0x4b &&
+    value[2] === 0x03 &&
+    value[3] === 0x04
+  );
+}
+
+function validateEditState(value, maxHistoryEntries, maxHistoryBytes) {
+  const reasons = new Set([
+    "legacy-biff",
+    "binary-package",
+    "open-document",
+    "package-metadata-loss"
+  ]);
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.schemaVersion !== 1 ||
+    !["read-write", "read-only"].includes(value.capability) ||
+    (value.reason !== null && !reasons.has(value.reason)) ||
+    typeof value.dirty !== "boolean" ||
+    typeof value.canUndo !== "boolean" ||
+    typeof value.canRedo !== "boolean" ||
+    !Number.isSafeInteger(value.undoDepth) ||
+    value.undoDepth < 0 ||
+    value.undoDepth > maxHistoryEntries ||
+    !Number.isSafeInteger(value.redoDepth) ||
+    value.redoDepth < 0 ||
+    value.redoDepth > maxHistoryEntries ||
+    value.undoDepth + value.redoDepth > maxHistoryEntries ||
+    !Number.isSafeInteger(value.historyBytes) ||
+    value.historyBytes < 0 ||
+    value.historyBytes > maxHistoryBytes ||
+    !Array.isArray(value.editedParts) ||
+    value.editedParts.length > MAX_SHEETS + 8 ||
+    value.editedParts.some((part) => !safeEditedPart(part))
+  ) {
+    throw new RenderProtocolError(
+      "wasm_api_mismatch",
+      "edit state does not satisfy the worker contract",
+      "wasm"
+    );
+  }
+  if (
+    (value.capability === "read-write" && value.reason !== null) ||
+    (value.capability === "read-only" && !reasons.has(value.reason)) ||
+    value.canUndo !== (value.undoDepth > 0) ||
+    value.canRedo !== (value.redoDepth > 0) ||
+    (value.undoDepth + value.redoDepth > 0) !== (value.historyBytes > 0) ||
+    (!value.dirty && value.editedParts.length > 0) ||
+    (value.capability === "read-only" &&
+      (value.dirty || value.undoDepth > 0 || value.redoDepth > 0)) ||
+    !strictlySortedUnique(value.editedParts)
+  ) {
+    throw new RenderProtocolError(
+      "wasm_api_mismatch",
+      "edit state contains contradictory capability or history metadata",
+      "wasm"
+    );
+  }
+  return value;
+}
+
+function validateInspectedCell(value, depth = 0) {
+  if (!plainRecord(value) || depth > 16 || typeof value.kind !== "string") {
+    throw invalidCellInspection();
+  }
+  switch (value.kind) {
+    case "blank":
+      if (!hasExactKeys(value, ["kind"])) {
+        throw invalidCellInspection();
+      }
+      return;
+    case "text":
+    case "error":
+      if (!hasExactKeys(value, ["kind", "value"]) || typeof value.value !== "string") {
+        throw invalidCellInspection();
+      }
+      return;
+    case "number":
+    case "date":
+      if (
+        !hasExactKeys(value, ["kind", "value"]) ||
+        typeof value.value !== "number" ||
+        !Number.isFinite(value.value)
+      ) {
+        throw invalidCellInspection();
+      }
+      return;
+    case "boolean":
+      if (!hasExactKeys(value, ["kind", "value"]) || typeof value.value !== "boolean") {
+        throw invalidCellInspection();
+      }
+      return;
+    case "formula":
+      if (
+        !hasExactKeys(value, ["kind", "formula", "cached"]) ||
+        typeof value.formula !== "string"
+      ) {
+        throw invalidCellInspection();
+      }
+      validateInspectedCell(value.cached, depth + 1);
+      return;
+    default:
+      throw invalidCellInspection();
+  }
+}
+
+function plainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value, expected) {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function invalidCellInspection() {
+  return new RenderProtocolError(
+    "wasm_api_mismatch",
+    "cell inspection does not match the worker contract",
+    "wasm"
+  );
+}
+
+function safeEditedPart(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value.split("/").some((segment) => segment === "" || segment === "." || segment === "..") &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function strictlySortedUnique(values) {
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index - 1] >= values[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function cancelledError() {
   return new RenderProtocolError("cancelled", "render request was cancelled", "request");
 }
@@ -591,6 +1261,16 @@ function operationStage(operation) {
       return "paginating";
     case "close":
       return "closing";
+    case "save-document":
+      return "serializing";
+    case "edit-status":
+    case "read-cell":
+      return "inspecting";
+    case "set-cell":
+    case "set-document-properties":
+    case "undo-edit":
+    case "redo-edit":
+      return "editing";
     default:
       return "rendering";
   }

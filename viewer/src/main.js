@@ -7,14 +7,20 @@ import {
   ExternalLink,
   FileCode2,
   FileSpreadsheet,
+  FileText,
   Files,
   FileUp,
   FolderOpen,
   ImageDown,
   PanelLeft,
+  Pencil,
+  Redo2,
+  RefreshCw,
   Scan,
+  Save,
   ShieldCheck,
   Table2,
+  Undo2,
   X,
   ZoomIn,
   ZoomOut,
@@ -23,11 +29,17 @@ import {
 import {
   acceptsWorkbook,
   clampZoom,
+  createLatestRequestGate,
   describeError,
+  editableCell,
+  editReasonLabel,
   extensionOf,
   fitZoom,
   formatBytes,
   formatLabel,
+  parseCellReference,
+  sameCellTarget,
+  savedWorkbookName,
   safeBaseName,
   svgDimensions
 } from "./core.js";
@@ -47,14 +59,20 @@ const icons = {
   ExternalLink,
   FileCode2,
   FileSpreadsheet,
+  FileText,
   Files,
   FileUp,
   FolderOpen,
   ImageDown,
   PanelLeft,
+  Pencil,
+  Redo2,
+  RefreshCw,
   Scan,
+  Save,
   ShieldCheck,
   Table2,
+  Undo2,
   X,
   ZoomIn,
   ZoomOut
@@ -75,17 +93,24 @@ const elements = Object.fromEntries(
     "meta-format",
     "meta-size",
     "meta-images",
+    "meta-editing",
+    "editing-reason",
     "sheet-view",
     "page-view",
     "page-controls",
     "previous-page",
     "next-page",
     "page-position",
+    "edit-cell",
+    "undo-edit",
+    "redo-edit",
+    "document-properties",
     "zoom-out",
     "zoom-in",
     "zoom-value",
     "fit-view",
     "export-menu",
+    "save-document",
     "export-svg",
     "export-png",
     "viewer-viewport",
@@ -102,7 +127,35 @@ const elements = Object.fromEntries(
     "dismiss-error",
     "sidebar",
     "sidebar-toggle",
-    "sidebar-scrim"
+    "sidebar-scrim",
+    "cell-dialog",
+    "cell-form",
+    "cell-sheet-name",
+    "close-cell-dialog",
+    "cancel-cell-edit",
+    "cell-reference",
+    "read-cell",
+    "cell-kind",
+    "cell-value-field",
+    "cell-value",
+    "cell-formula-fields",
+    "cell-formula",
+    "cell-cached-kind",
+    "cell-cached-value",
+    "cell-current-value",
+    "apply-cell-edit",
+    "properties-dialog",
+    "properties-form",
+    "close-properties-dialog",
+    "cancel-properties-edit",
+    "property-title",
+    "property-subject",
+    "property-creator",
+    "property-keywords",
+    "property-description",
+    "property-last-modified-by",
+    "property-company",
+    "property-created"
   ].map((id) => [id, document.getElementById(id)])
 );
 
@@ -111,6 +164,7 @@ const state = {
   client: null,
   documentId: null,
   workbook: null,
+  editState: null,
   file: null,
   sheetIndex: 0,
   mode: "sheet",
@@ -123,10 +177,16 @@ const state = {
   documentHeight: 768,
   busy: false,
   renderEpoch: 0,
+  openRequest: null,
+  cellReadTarget: null,
+  cellReadPending: false,
+  cellEditPending: false,
   dragDepth: 0
 };
 
 const baseUrl = new URL(import.meta.env.BASE_URL, window.location.origin);
+const openRequests = createLatestRequestGate();
+const cellReads = createLatestRequestGate();
 let samples = [];
 
 bindEvents();
@@ -175,14 +235,31 @@ function bindEvents() {
   elements["page-view"].addEventListener("click", () => void setMode("page"));
   elements["previous-page"].addEventListener("click", () => void movePage(-1));
   elements["next-page"].addEventListener("click", () => void movePage(1));
+  elements["edit-cell"].addEventListener("click", () => void openCellEditor());
+  elements["undo-edit"].addEventListener("click", () => void applyHistoryEdit("undo"));
+  elements["redo-edit"].addEventListener("click", () => void applyHistoryEdit("redo"));
+  elements["document-properties"].addEventListener("click", openPropertiesEditor);
   elements["zoom-out"].addEventListener("click", () => setZoom(state.zoom - ZOOM_STEP));
   elements["zoom-in"].addEventListener("click", () => setZoom(state.zoom + ZOOM_STEP));
   elements["fit-view"].addEventListener("click", fitToWidth);
+  elements["save-document"].addEventListener("click", () => void saveWorkbookCopy());
   elements["export-svg"].addEventListener("click", exportSvg);
   elements["export-png"].addEventListener("click", () => void exportPng());
   elements["dismiss-error"].addEventListener("click", dismissError);
   elements["sidebar-toggle"].addEventListener("click", toggleSidebar);
   elements["sidebar-scrim"].addEventListener("click", closeSidebar);
+  elements["close-cell-dialog"].addEventListener("click", closeCellEditor);
+  elements["cancel-cell-edit"].addEventListener("click", closeCellEditor);
+  elements["read-cell"].addEventListener("click", () => void loadCellIntoEditor());
+  elements["cell-reference"].addEventListener("input", invalidateCellRead);
+  elements["cell-reference"].addEventListener("change", () => void loadCellIntoEditor());
+  elements["cell-kind"].addEventListener("change", updateCellKindUi);
+  elements["cell-form"].addEventListener("submit", (event) => void submitCellEdit(event));
+  elements["close-properties-dialog"].addEventListener("click", closePropertiesEditor);
+  elements["cancel-properties-edit"].addEventListener("click", closePropertiesEditor);
+  elements["properties-form"].addEventListener("submit", (event) =>
+    void submitPropertiesEdit(event)
+  );
 
   const viewport = elements["viewer-viewport"];
   viewport.addEventListener("dragenter", onDragEnter);
@@ -190,6 +267,12 @@ function bindEvents() {
   viewport.addEventListener("dragleave", onDragLeave);
   viewport.addEventListener("drop", onDrop);
   window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("beforeunload", (event) => {
+    if (state.editState?.dirty) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
   window.addEventListener("resize", () => {
     if (state.svgElement && state.zoom <= 1) {
       fitToWidth();
@@ -202,68 +285,153 @@ function chooseFile() {
 }
 
 async function loadLocalFile(file) {
+  if (!confirmDiscardChanges()) {
+    return;
+  }
   if (!acceptsWorkbook(file.name)) {
     showError(new Error("Choose an XLS, XLSX, XLSM, XLSB, or ODS file."));
     return;
   }
   if (file.size > MAX_INPUT_BYTES) {
-    const error = new Error(`The browser viewer accepts files up to ${formatBytes(MAX_INPUT_BYTES)}.`);
+    const error = new Error(
+      `The browser viewer accepts files up to ${formatBytes(MAX_INPUT_BYTES)}.`
+    );
     error.code = "limit_exceeded";
     showError(error);
     return;
   }
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  await openWorkbook(bytes, {
-    name: file.name,
-    size: file.size,
-    source: "Local file"
-  });
+  const request = beginOpenRequest(`Opening ${file.name}`);
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (!isCurrentOpenRequest(request)) {
+      return;
+    }
+    await openWorkbook(
+      bytes,
+      {
+        name: file.name,
+        size: file.size,
+        source: "Local file",
+        sampleId: null
+      },
+      request
+    );
+  } catch (error) {
+    failOpenRequest(request, error);
+  }
 }
 
 async function loadSample(sample) {
-  setBusy(true, `Opening ${sample.name}`);
+  if (!confirmDiscardChanges()) {
+    elements["sample-select"].value = state.file?.sampleId ?? "";
+    return;
+  }
+  const request = beginOpenRequest(`Opening ${sample.name}`);
   try {
-    const response = await fetch(new URL(`samples/${sample.file}`, baseUrl));
+    const response = await fetch(new URL(`samples/${sample.file}`, baseUrl), {
+      signal: request.abortController.signal
+    });
     if (!response.ok) {
       throw new Error(`Sample request failed with HTTP ${response.status}.`);
     }
     const bytes = new Uint8Array(await response.arrayBuffer());
-    await openWorkbook(bytes, {
-      name: sample.name,
-      size: bytes.byteLength,
-      source: "Project sample"
-    });
+    if (!isCurrentOpenRequest(request)) {
+      return;
+    }
+    await openWorkbook(
+      bytes,
+      {
+        name: sample.name,
+        size: bytes.byteLength,
+        source: "Project sample",
+        sampleId: sample.id
+      },
+      request
+    );
   } catch (error) {
-    setBusy(false);
-    showError(error);
+    failOpenRequest(request, error);
   }
 }
 
-async function openWorkbook(bytes, file) {
-  dismissError();
-  setBusy(true, `Opening ${file.name}`);
+function beginOpenRequest(label) {
+  state.openRequest?.abortController.abort();
+  state.openRequest?.client?.terminate();
+  const request = {
+    token: openRequests.begin(),
+    abortController: new AbortController(),
+    client: null
+  };
+  state.openRequest = request;
   state.renderEpoch += 1;
-  state.client?.terminate();
-  const workerUrl = new URL("runtime/js/worker.mjs", baseUrl);
-  state.client = new state.runtime.RenderWorkerClient(workerUrl);
-  state.documentId = `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  state.manifests.clear();
-  state.pageIndex = 0;
-  state.sheetIndex = 0;
-  state.file = file;
+  closeCellEditor();
+  closePropertiesEditor();
+  dismissError();
+  setBusy(true, label);
+  return request;
+}
+
+function isCurrentOpenRequest(request) {
+  return state.openRequest === request && openRequests.isCurrent(request.token);
+}
+
+function failOpenRequest(request, error) {
+  request.client?.terminate();
+  request.client = null;
+  if (!isCurrentOpenRequest(request)) {
+    return;
+  }
+  state.openRequest = null;
+  elements["sample-select"].value = state.file?.sampleId ?? "";
+  setBusy(false);
+  if (!state.workbook) {
+    showEmpty();
+  }
+  showError(error);
+}
+
+async function openWorkbook(bytes, file, request) {
+  if (!isCurrentOpenRequest(request)) {
+    return;
+  }
+  let client = null;
   try {
-    const opened = await state.client.open(bytes, { documentId: state.documentId });
+    const workerUrl = new URL("runtime/js/worker.mjs", baseUrl);
+    client = new state.runtime.RenderWorkerClient(workerUrl);
+    request.client = client;
+    const documentId = `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const opened = await client.open(bytes, { documentId });
+    if (!isCurrentOpenRequest(request)) {
+      client.terminate();
+      return;
+    }
+
+    const previousClient = state.client;
+    state.client = client;
+    state.documentId = documentId;
     state.workbook = opened.workbook;
+    state.editState = opened.editState;
+    state.file = file;
+    state.manifests.clear();
+    state.pageIndex = 0;
+    state.sheetIndex = 0;
+    request.client = null;
+    previousClient?.terminate();
     updateWorkbookUi();
     await renderCurrent({ fit: true });
-    closeSidebar();
+    if (isCurrentOpenRequest(request)) {
+      state.openRequest = null;
+      closeSidebar();
+    }
   } catch (error) {
-    state.client?.terminate();
-    state.client = null;
-    state.workbook = null;
-    setBusy(false);
-    showEmpty();
-    showError(error);
+    client?.terminate();
+    if (state.client === client) {
+      state.client = null;
+      state.documentId = null;
+      state.workbook = null;
+      state.editState = null;
+      state.file = null;
+    }
+    failOpenRequest(request, error);
   }
 }
 
@@ -304,28 +472,34 @@ async function renderCurrent({ fit }) {
     return;
   }
   const epoch = ++state.renderEpoch;
-  const sheet = state.workbook.sheets[state.sheetIndex];
-  setBusy(true, state.mode === "page" ? "Preparing pages" : `Rendering ${sheet.name}`);
+  const client = state.client;
+  const documentId = state.documentId;
+  const sheetIndex = state.sheetIndex;
+  const mode = state.mode;
+  const sheet = state.workbook.sheets[sheetIndex];
+  const isCurrent = () =>
+    epoch === state.renderEpoch && client === state.client && documentId === state.documentId;
+  setBusy(true, mode === "page" ? "Preparing pages" : `Rendering ${sheet.name}`);
   try {
     let rendered;
-    if (state.mode === "page") {
-      let manifest = state.manifests.get(state.sheetIndex);
+    if (mode === "page") {
+      let manifest = state.manifests.get(sheetIndex);
       if (!manifest) {
-        const prepared = await state.client.preparePages(state.documentId, state.sheetIndex);
+        const prepared = await client.preparePages(documentId, sheetIndex);
+        if (!isCurrent()) {
+          return;
+        }
         manifest = prepared.manifest;
-        state.manifests.set(state.sheetIndex, manifest);
+        state.manifests.set(sheetIndex, manifest);
       }
       const pageCount = Math.max(1, manifest.pages.length);
       state.pageIndex = Math.min(state.pageIndex, pageCount - 1);
-      rendered = await state.client.renderPage(
-        state.documentId,
-        state.sheetIndex,
-        state.pageIndex
-      );
+      const pageIndex = state.pageIndex;
+      rendered = await client.renderPage(documentId, sheetIndex, pageIndex);
     } else {
-      rendered = await state.client.renderSheet(state.documentId, state.sheetIndex);
+      rendered = await client.renderSheet(documentId, sheetIndex);
     }
-    if (epoch !== state.renderEpoch) {
+    if (!isCurrent()) {
       return;
     }
     showSvg(rendered.svg);
@@ -338,9 +512,9 @@ async function renderCurrent({ fit }) {
     setBusy(false);
     elements["status-message"].textContent = `${sheet.name} rendered`;
     elements["render-detail"].textContent =
-      state.mode === "page" ? `Page ${state.pageIndex + 1}` : "Full sheet";
+      mode === "page" ? `Page ${state.pageIndex + 1}` : "Full sheet";
   } catch (error) {
-    if (epoch !== state.renderEpoch || error?.name === "AbortError") {
+    if (!isCurrent() || error?.name === "AbortError") {
       return;
     }
     setBusy(false);
@@ -432,6 +606,7 @@ function updateWorkbookUi() {
   elements["meta-format"].textContent = formatLabel(file.name);
   elements["meta-size"].textContent = formatBytes(file.size);
   elements["meta-images"].textContent = String(workbook.embeddedImages ?? 0);
+  elements["sample-select"].value = file.sampleId ?? "";
   elements["sheet-list"].replaceChildren(
     ...workbook.sheets.map((sheet) => {
       const button = document.createElement("button");
@@ -445,6 +620,7 @@ function updateWorkbookUi() {
   );
   updateSheetSelection();
   updateModeUi();
+  updateEditUi();
 }
 
 function updateSheetSelection() {
@@ -473,8 +649,400 @@ function updatePageUi() {
   elements["next-page"].disabled = state.pageIndex >= count - 1;
 }
 
+function updateEditUi() {
+  const editState = state.editState;
+  const editable = editState?.capability === "read-write";
+  const available = Boolean(state.workbook && editable && !state.busy);
+  const readOnly = Boolean(state.workbook && !editable);
+  const reason = readOnly ? editReasonLabel(editState?.reason) : null;
+  const status = editable ? (editState.dirty ? "Modified" : "Available") : "Read-only";
+  elements["meta-editing"].textContent = state.workbook ? status : "-";
+  elements["meta-editing"].title = reason ?? status;
+  elements["meta-editing"].classList.toggle("dirty", Boolean(editState?.dirty));
+  elements["editing-reason"].hidden = !reason;
+  elements["editing-reason"].textContent = reason ?? "";
+  elements["edit-cell"].disabled = !available;
+  elements["document-properties"].disabled = !available;
+  elements["undo-edit"].disabled = !available || !editState.canUndo;
+  elements["redo-edit"].disabled = !available || !editState.canRedo;
+  elements["save-document"].disabled = !available;
+  for (const control of [
+    elements["edit-cell"],
+    elements["document-properties"],
+    elements["save-document"]
+  ]) {
+    control.title = reason ?? control.dataset.commandTitle ?? control.title;
+    if (reason) {
+      control.setAttribute("aria-describedby", "editing-reason");
+    } else {
+      control.removeAttribute("aria-describedby");
+    }
+  }
+  if (editable) {
+    elements["edit-cell"].title = "Edit cell";
+    elements["document-properties"].title = "Document properties";
+    elements["save-document"].title = "Download preserved workbook";
+  }
+  if (state.file) {
+    elements["document-detail"].textContent = `${state.file.source} · ${formatBytes(state.file.size)}${
+      editState?.dirty ? " · Modified" : ""
+    }`;
+  }
+  updateCellEditorControls();
+}
+
+async function openCellEditor() {
+  if (!canEditWorkbook()) {
+    return;
+  }
+  elements["cell-sheet-name"].textContent = state.workbook.sheets[state.sheetIndex].name;
+  if (!elements["cell-dialog"].open) {
+    elements["cell-dialog"].showModal();
+  }
+  invalidateCellRead();
+  elements["cell-reference"].focus();
+  elements["cell-reference"].select();
+  await loadCellIntoEditor();
+}
+
+function closeCellEditor() {
+  cellReads.invalidate();
+  state.cellReadTarget = null;
+  state.cellReadPending = false;
+  state.cellEditPending = false;
+  if (elements["cell-dialog"].open) {
+    elements["cell-dialog"].close();
+  }
+  resetCellEditorFields();
+  updateCellEditorControls();
+}
+
+function invalidateCellRead() {
+  cellReads.invalidate();
+  state.cellReadTarget = null;
+  state.cellReadPending = false;
+  resetCellEditorFields();
+  if (elements["cell-dialog"].open) {
+    elements["cell-current-value"].textContent = "Load this cell before editing it";
+  }
+  updateCellEditorControls();
+}
+
+async function loadCellIntoEditor() {
+  if (!canEditWorkbook()) {
+    return;
+  }
+  const token = cellReads.begin();
+  const client = state.client;
+  const documentId = state.documentId;
+  const sheetIndex = state.sheetIndex;
+  state.cellReadTarget = null;
+  state.cellReadPending = true;
+  resetCellEditorFields();
+  updateCellEditorControls();
+  let coordinate;
+  try {
+    coordinate = parseCellReference(elements["cell-reference"].value);
+    elements["cell-reference"].value = coordinate.normalized;
+    elements["cell-current-value"].textContent = `Loading ${coordinate.normalized}`;
+    const result = await client.readCell(
+      documentId,
+      sheetIndex,
+      coordinate.row,
+      coordinate.col
+    );
+    if (
+      !cellReads.isCurrent(token) ||
+      client !== state.client ||
+      documentId !== state.documentId ||
+      sheetIndex !== state.sheetIndex ||
+      !elements["cell-dialog"].open
+    ) {
+      return;
+    }
+    state.cellReadTarget = cellTarget(coordinate, client, documentId, sheetIndex);
+    state.cellReadPending = false;
+    populateCellEditor(result.value);
+    elements["cell-current-value"].textContent = result.formatted
+      ? `${coordinate.normalized}: ${result.formatted}`
+      : `${coordinate.normalized}: ${describeCell(result.value)}`;
+  } catch (error) {
+    if (!cellReads.isCurrent(token)) {
+      return;
+    }
+    state.cellReadTarget = null;
+    state.cellReadPending = false;
+    elements["cell-current-value"].textContent = describeError(error);
+    showError(error);
+  } finally {
+    if (cellReads.isCurrent(token)) {
+      state.cellReadPending = false;
+      updateCellEditorControls();
+    }
+  }
+}
+
+function populateCellEditor(cell) {
+  resetCellEditorFields();
+  if (cell.kind === "formula") {
+    elements["cell-kind"].value = "formula";
+    elements["cell-formula"].value = cell.formula;
+    elements["cell-cached-kind"].value = cell.cached.kind;
+    elements["cell-cached-value"].value = scalarInputValue(cell.cached);
+  } else {
+    elements["cell-kind"].value = cell.kind;
+    elements["cell-value"].value = scalarInputValue(cell);
+  }
+  updateCellKindUi();
+}
+
+function resetCellEditorFields() {
+  elements["cell-kind"].value = "text";
+  elements["cell-value"].value = "";
+  elements["cell-formula"].value = "";
+  elements["cell-cached-kind"].value = "number";
+  elements["cell-cached-value"].value = "";
+  updateCellKindUi();
+}
+
+function cellTarget(
+  coordinate,
+  client = state.client,
+  documentId = state.documentId,
+  sheetIndex = state.sheetIndex
+) {
+  return {
+    client,
+    documentId,
+    sheetIndex,
+    row: coordinate.row,
+    col: coordinate.col
+  };
+}
+
+function currentCellTarget() {
+  try {
+    return cellTarget(parseCellReference(elements["cell-reference"].value));
+  } catch {
+    return null;
+  }
+}
+
+function updateCellEditorControls() {
+  const dialogOpen = elements["cell-dialog"].open;
+  const loaded = sameCellTarget(state.cellReadTarget, currentCellTarget());
+  const ready = dialogOpen && canEditWorkbook() && loaded && !state.cellReadPending;
+  const valuesDisabled = !ready || state.cellEditPending;
+  for (const control of [
+    elements["cell-kind"],
+    elements["cell-value"],
+    elements["cell-formula"],
+    elements["cell-cached-kind"],
+    elements["cell-cached-value"]
+  ]) {
+    control.disabled = valuesDisabled;
+  }
+  elements["cell-reference"].disabled = state.cellEditPending;
+  elements["read-cell"].disabled =
+    !dialogOpen || !canEditWorkbook() || state.cellReadPending || state.cellEditPending;
+  elements["apply-cell-edit"].disabled = !ready || state.cellEditPending;
+  elements["close-cell-dialog"].disabled = state.cellEditPending;
+  elements["cancel-cell-edit"].disabled = state.cellEditPending;
+}
+
+function updateCellKindUi() {
+  const kind = elements["cell-kind"].value;
+  const formula = kind === "formula";
+  elements["cell-value-field"].hidden = formula || kind === "blank";
+  elements["cell-formula-fields"].hidden = !formula;
+  elements["cell-formula"].required = formula;
+  elements["cell-cached-value"].required = formula;
+  elements["cell-value"].required = !formula && kind !== "blank";
+}
+
+async function submitCellEdit(event) {
+  event.preventDefault();
+  if (!canEditWorkbook()) {
+    return;
+  }
+  try {
+    const coordinate = parseCellReference(elements["cell-reference"].value);
+    if (!sameCellTarget(state.cellReadTarget, cellTarget(coordinate))) {
+      throw new Error(`Load ${coordinate.normalized} before applying an edit.`);
+    }
+    const value = editableCell(elements["cell-kind"].value, elements["cell-value"].value, {
+      formula: elements["cell-formula"].value,
+      cachedKind: elements["cell-cached-kind"].value,
+      cachedValue: elements["cell-cached-value"].value
+    });
+    state.cellEditPending = true;
+    updateCellEditorControls();
+    elements["cell-current-value"].textContent = `Applying ${coordinate.normalized}`;
+    const result = await state.client.setCell(
+      state.documentId,
+      state.sheetIndex,
+      coordinate.row,
+      coordinate.col,
+      value
+    );
+    closeCellEditor();
+    await applyMutationResult(result, `${coordinate.normalized} updated`);
+  } catch (error) {
+    elements["cell-current-value"].textContent = describeError(error);
+    showError(error);
+  } finally {
+    state.cellEditPending = false;
+    updateCellEditorControls();
+    updateCellKindUi();
+  }
+}
+
+function openPropertiesEditor() {
+  if (!canEditWorkbook()) {
+    return;
+  }
+  const properties = state.workbook.properties;
+  for (const [property, elementId] of propertyFields()) {
+    elements[elementId].value = properties[property] ?? "";
+  }
+  if (!elements["properties-dialog"].open) {
+    elements["properties-dialog"].showModal();
+  }
+  elements["property-title"].focus();
+}
+
+function closePropertiesEditor() {
+  if (elements["properties-dialog"].open) {
+    elements["properties-dialog"].close();
+  }
+}
+
+async function submitPropertiesEdit(event) {
+  event.preventDefault();
+  if (!canEditWorkbook()) {
+    return;
+  }
+  try {
+    setFormPending(elements["properties-form"], true);
+    const properties = Object.fromEntries(
+      propertyFields().map(([property, elementId]) => [
+        property,
+        elements[elementId].value || null
+      ])
+    );
+    const result = await state.client.setDocumentProperties(state.documentId, properties);
+    closePropertiesEditor();
+    await applyMutationResult(result, "Document properties updated");
+  } catch (error) {
+    showError(error);
+  } finally {
+    setFormPending(elements["properties-form"], false);
+  }
+}
+
+async function applyHistoryEdit(direction) {
+  if (!canEditWorkbook()) {
+    return;
+  }
+  try {
+    setBusy(true, direction === "undo" ? "Undoing edit" : "Redoing edit");
+    const result =
+      direction === "undo"
+        ? await state.client.undoEdit(state.documentId)
+        : await state.client.redoEdit(state.documentId);
+    await applyMutationResult(result, direction === "undo" ? "Edit undone" : "Edit redone");
+  } catch (error) {
+    setBusy(false);
+    showError(error);
+  }
+}
+
+async function applyMutationResult(result, message) {
+  state.workbook = result.workbook;
+  state.editState = result.editState;
+  state.manifests.clear();
+  state.pageIndex = 0;
+  state.sheetIndex = Math.min(state.sheetIndex, Math.max(0, state.workbook.sheetCount - 1));
+  updateWorkbookUi();
+  await renderCurrent({ fit: false });
+  elements["status-message"].textContent = message;
+}
+
+async function saveWorkbookCopy() {
+  if (!canEditWorkbook()) {
+    return;
+  }
+  try {
+    setBusy(true, "Preparing preserved workbook");
+    const saved = await state.client.saveDocument(state.documentId);
+    const extension = extensionOf(state.file.name);
+    const mimeType =
+      extension === "xlsm"
+        ? "application/vnd.ms-excel.sheet.macroEnabled.12"
+        : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    downloadBlob(new Blob([saved.bytes], { type: mimeType }), savedWorkbookName(state.file.name));
+    elements["status-message"].textContent = "Preserved workbook downloaded";
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(false);
+    elements["export-menu"].removeAttribute("open");
+  }
+}
+
+function canEditWorkbook() {
+  return Boolean(
+    state.client &&
+      state.workbook &&
+      !state.busy &&
+      state.editState?.capability === "read-write"
+  );
+}
+
+function confirmDiscardChanges() {
+  return !state.editState?.dirty || window.confirm("Discard unsaved workbook edits?");
+}
+
+function setFormPending(form, pending) {
+  for (const button of form.querySelectorAll("button")) {
+    button.disabled = pending;
+  }
+}
+
+function propertyFields() {
+  return [
+    ["title", "property-title"],
+    ["subject", "property-subject"],
+    ["creator", "property-creator"],
+    ["keywords", "property-keywords"],
+    ["description", "property-description"],
+    ["lastModifiedBy", "property-last-modified-by"],
+    ["company", "property-company"],
+    ["created", "property-created"]
+  ];
+}
+
+function scalarInputValue(cell) {
+  return cell.kind === "blank" ? "" : String(cell.value);
+}
+
+function describeCell(cell) {
+  if (cell.kind === "blank") {
+    return "Blank";
+  }
+  if (cell.kind === "formula") {
+    return `=${cell.formula}`;
+  }
+  return String(cell.value);
+}
+
 function populateSamples() {
+  const localOption = document.createElement("option");
+  localOption.value = "";
+  localOption.textContent = "Local file";
+  localOption.disabled = true;
   elements["sample-select"].replaceChildren(
+    localOption,
     ...samples.map((sample) => {
       const option = document.createElement("option");
       option.value = sample.id;
@@ -504,6 +1072,7 @@ function setBusy(busy, label = "") {
   if (!busy) {
     updatePageUi();
   }
+  updateEditUi();
 }
 
 function showEmpty() {
@@ -511,6 +1080,7 @@ function showEmpty() {
   elements["empty-state"].hidden = false;
   elements["document-name"].textContent = "No workbook open";
   elements["document-detail"].textContent = "Rust + WebAssembly";
+  updateEditUi();
 }
 
 function showError(error) {
@@ -530,6 +1100,7 @@ function exportSvg() {
     new Blob([state.svgText], { type: "image/svg+xml;charset=utf-8" }),
     `${exportBaseName()}.svg`
   );
+  elements["status-message"].textContent = "SVG exported";
   elements["export-menu"].removeAttribute("open");
 }
 
@@ -564,6 +1135,7 @@ async function exportPng() {
         );
       });
       downloadBlob(png, `${exportBaseName()}.png`);
+      elements["status-message"].textContent = "PNG exported";
     } finally {
       URL.revokeObjectURL(sourceUrl);
     }
@@ -631,17 +1203,43 @@ function onDrop(event) {
 }
 
 function onKeyDown(event) {
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") {
+  const modified = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  const editingText = event.target instanceof Element && event.target.matches("input, textarea, select");
+  if (!modified) {
+    return;
+  }
+  if (key === "o") {
     event.preventDefault();
     chooseFile();
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && ["+", "="].includes(event.key)) {
+  if (!editingText && key === "s" && state.editState?.capability === "read-write") {
+    event.preventDefault();
+    void saveWorkbookCopy();
+    return;
+  }
+  if (!editingText && key === "e" && state.editState?.capability === "read-write") {
+    event.preventDefault();
+    void openCellEditor();
+    return;
+  }
+  if (!editingText && key === "z" && state.editState?.canUndo) {
+    event.preventDefault();
+    void applyHistoryEdit(event.shiftKey ? "redo" : "undo");
+    return;
+  }
+  if (!editingText && key === "y" && state.editState?.canRedo) {
+    event.preventDefault();
+    void applyHistoryEdit("redo");
+    return;
+  }
+  if (["+", "="].includes(event.key)) {
     event.preventDefault();
     setZoom(state.zoom + ZOOM_STEP);
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key === "-") {
+  if (event.key === "-") {
     event.preventDefault();
     setZoom(state.zoom - ZOOM_STEP);
   }
@@ -677,7 +1275,13 @@ export function viewerStateForTest() {
     pageIndex: state.pageIndex,
     zoom: state.zoom,
     busy: state.busy,
-    rendered: Boolean(state.svgElement)
+    rendered: Boolean(state.svgElement),
+    editCapability: state.editState?.capability ?? null,
+    editReason: state.editState?.reason ?? null,
+    dirty: state.editState?.dirty ?? false,
+    canUndo: state.editState?.canUndo ?? false,
+    canRedo: state.editState?.canRedo ?? false,
+    editedParts: [...(state.editState?.editedParts ?? [])]
   };
 }
 

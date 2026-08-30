@@ -9,6 +9,7 @@ import {
   normalizeError,
   optionsJson,
   parseWorkerMessage,
+  preflightRequest,
   validateSvgOutput
 } from "../js/protocol.mjs";
 
@@ -39,6 +40,120 @@ test("protocol accepts exact requests and rejects path-like identifiers", () => 
         payload: {}
       }),
     (error) => error instanceof RenderProtocolError && error.code === "invalid_request_id"
+  );
+  assert.throws(
+    () =>
+      parseWorkerMessage({
+        protocol: PROTOCOL,
+        type: "request",
+        requestId: "request-extra",
+        operation: "capabilities",
+        payload: {},
+        unaccounted: new Uint8Array(32)
+      }),
+    (error) => error.code === "invalid_payload" && error.location === "message"
+  );
+  assert.throws(
+    () =>
+      parseWorkerMessage({
+        protocol: PROTOCOL,
+        type: "cancel",
+        requestId: "cancel-extra",
+        unaccounted: new Uint8Array(32)
+      }),
+    (error) => error.code === "invalid_payload" && error.location === "message"
+  );
+});
+
+test("edit requests are exact, typed, and bounded before entering the worker", () => {
+  const cellBytes = preflightRequest({
+    operation: "set-cell",
+    payload: {
+      documentId: "editable",
+      sheetIndex: 0,
+      row: 1,
+      col: 2,
+      value: {
+        kind: "formula",
+        formula: "SUM(A1:A2)",
+        cached: { kind: "number", value: 3 }
+      }
+    }
+  });
+  assert.ok(cellBytes > 0);
+  assert.equal(
+    preflightRequest({
+      operation: "read-cell",
+      payload: { documentId: "editable", sheetIndex: 0, row: 1, col: 2 }
+    }),
+    0
+  );
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "set-cell",
+        payload: {
+          documentId: "editable",
+          sheetIndex: 0,
+          row: 1_048_576,
+          col: 0,
+          value: { kind: "text", value: "outside" }
+        }
+      }),
+    (error) => error.code === "cell_out_of_range"
+  );
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "set-cell",
+        payload: {
+          documentId: "editable",
+          sheetIndex: 0,
+          row: 0,
+          col: 0,
+          value: { kind: "formula", formula: "1+1", cached: { kind: "blank" } }
+        }
+    }),
+    (error) => error.code === "invalid_edit"
+  );
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "set-cell",
+        payload: {
+          documentId: "editable",
+          sheetIndex: 0,
+          row: 0,
+          col: 0,
+          value: { kind: "formula", formula: "=", cached: { kind: "number", value: 0 } }
+        }
+      }),
+    (error) => error.code === "invalid_edit"
+  );
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "set-cell",
+        payload: {
+          documentId: "editable",
+          sheetIndex: 0,
+          row: 0,
+          col: 0,
+          value: { kind: "formula", formula: "", cached: { kind: "number", value: 0 } }
+        }
+      }),
+    (error) => error.code === "invalid_edit"
+  );
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "set-document-properties",
+        payload: {
+          documentId: "editable",
+          properties: { title: "missing the other explicit fields" }
+        }
+      }),
+    (error) => error.code === "invalid_edit"
   );
 });
 
@@ -72,6 +187,41 @@ test("font bundle encoding is deterministic, bounded, and path-safe", () => {
         ]
       }),
     (error) => error.code === "limit_exceeded" && error.resource === "fontMemberBytes"
+  );
+  assert.throws(
+    () => encodeFontBundle({ ...pack, unaccounted: new Uint8Array(32) }),
+    (error) => error.code === "invalid_payload" && error.location === "fontPack"
+  );
+  assert.throws(
+    () =>
+      encodeFontBundle({
+        manifest: pack.manifest,
+        members: [{ ...pack.members[0], unaccounted: new Uint8Array(32) }]
+      }),
+    (error) =>
+      error.code === "invalid_payload" && error.location === "fontPack.members[0]"
+  );
+});
+
+test("tile ranges reject unaccounted nested fields", () => {
+  assert.throws(
+    () =>
+      preflightRequest({
+        operation: "render-tile",
+        payload: {
+          documentId: "document-1",
+          sheetIndex: 0,
+          range: {
+            firstRow: 0,
+            firstCol: 0,
+            lastRow: 1,
+            lastCol: 1,
+            unaccounted: new Uint8Array(32)
+          },
+          options: {}
+        }
+      }),
+    (error) => error.code === "invalid_payload" && error.location === "payload.range"
   );
 });
 

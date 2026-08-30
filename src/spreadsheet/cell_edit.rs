@@ -77,6 +77,50 @@ impl Spreadsheet {
         )
     }
 
+    /// Clear a worksheet cell's value or formula while retaining its style and
+    /// other non-value cell metadata.
+    ///
+    /// Unlike [`Spreadsheet::clear_range`], this keeps the existing `<c>` node
+    /// and removes only its value representation. A missing or already blank
+    /// cell is left untouched.
+    pub fn clear_cell_value(&mut self, sheet_name: &str, row: u32, col: u16) -> Result<()> {
+        if row > 1_048_575 || col > 16_383 {
+            return Err(Error::Zip("cell is outside the Excel grid"));
+        }
+        let sheet_name = sheet_name.to_string();
+        self.mutate_atomic(move |candidate| {
+            candidate.clear_cell_value_in_place(&sheet_name, row, col)
+        })
+    }
+
+    fn clear_cell_value_in_place(&mut self, sheet_name: &str, row: u32, col: u16) -> Result<()> {
+        self.ensure_editable()?;
+        let package = self.package.as_mut().ok_or(Error::Zip(
+            "spreadsheet is read-only for package-preserving edit",
+        ))?;
+        let path = worksheet_path(package, sheet_name)?;
+        let has_value = peek_part_tree(
+            package,
+            &path,
+            Error::Zip("worksheet XML is missing"),
+            |tree| Ok(sml_cell_has_value(tree, row, col)),
+        )?;
+        if !has_value {
+            return Ok(());
+        }
+
+        let before = package.touched_parts();
+        let tree = package.part_tree_mut(&path)?;
+        sml_clear_cell_value(tree, row, col)?;
+        for touched in newly_touched(&before, package) {
+            remember_edited_part(&mut self.edited_parts, touched);
+        }
+        for touched in invalidate_calc_chain(package)? {
+            remember_edited_part(&mut self.edited_parts, touched);
+        }
+        Ok(())
+    }
+
     /// Append one row of cells to the target worksheet XML part.
     ///
     /// Returns the appended zero-based row index. Text is written as inline
@@ -455,33 +499,56 @@ fn sml_edit_cell(tree: &mut XmlTree, row: u32, col: u16, value: &Cell) -> Result
     sml_set_cell_value(tree, cell, value)
 }
 
-/// Remove the `<c>` for 0-based `(row, col)` entirely (not just its value),
-/// if present -- a no-op if the row or cell doesn't exist. Mirrors the old
-/// string-splicing `clear_range`'s `find_cell_bounds` + whole-span removal.
-fn sml_clear_cell(tree: &mut XmlTree, row: u32, col: u16) -> Result<()> {
-    let Some(worksheet) = tree.root_element() else {
-        return Ok(());
-    };
-    let Some(sheet_data) = tree.child_by_name(worksheet, b"sheetData") else {
-        return Ok(());
-    };
+fn sml_existing_cell(tree: &XmlTree, row: u32, col: u16) -> Option<(NodeId, NodeId)> {
+    let worksheet = tree.root_element()?;
+    let sheet_data = tree.child_by_name(worksheet, b"sheetData")?;
     let row_ref = row + 1;
-    let row_node = tree.children_of(sheet_data).iter().copied().find(|&c| {
-        tree.attr_value(c, b"r")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            == Some(row_ref)
-    });
-    let Some(row_node) = row_node else {
-        return Ok(());
-    };
+    let row_node = tree
+        .children_of(sheet_data)
+        .iter()
+        .copied()
+        .find(|&child| {
+            tree.attr_value(child, b"r")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(row_ref)
+        })?;
     let cell_ref = a1(row, col);
     let cell_node = tree
         .children_of(row_node)
         .iter()
         .copied()
-        .find(|&c| tree.attr_value(c, b"r") == Some(cell_ref.as_bytes()));
-    let Some(cell_node) = cell_node else {
+        .find(|&child| tree.attr_value(child, b"r") == Some(cell_ref.as_bytes()))?;
+    Some((row_node, cell_node))
+}
+
+fn sml_cell_has_value(tree: &XmlTree, row: u32, col: u16) -> bool {
+    let Some((_, cell)) = sml_existing_cell(tree, row, col) else {
+        return false;
+    };
+    [b"v".as_slice(), b"f".as_slice(), b"is".as_slice()]
+        .into_iter()
+        .any(|name| tree.child_by_name(cell, name).is_some())
+}
+
+fn sml_clear_cell_value(tree: &mut XmlTree, row: u32, col: u16) -> Result<()> {
+    let Some((_, cell)) = sml_existing_cell(tree, row, col) else {
+        return Ok(());
+    };
+    for name in [b"v".as_slice(), b"f".as_slice(), b"is".as_slice()] {
+        while let Some(child) = tree.child_by_name(cell, name) {
+            tree.remove_child(cell, child)?;
+        }
+    }
+    tree.remove_attr(cell, b"t");
+    Ok(())
+}
+
+/// Remove the `<c>` for 0-based `(row, col)` entirely (not just its value),
+/// if present -- a no-op if the row or cell doesn't exist. Mirrors the old
+/// string-splicing `clear_range`'s `find_cell_bounds` + whole-span removal.
+fn sml_clear_cell(tree: &mut XmlTree, row: u32, col: u16) -> Result<()> {
+    let Some((row_node, cell_node)) = sml_existing_cell(tree, row, col) else {
         return Ok(());
     };
     tree.remove_child(row_node, cell_node)

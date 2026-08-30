@@ -5,14 +5,16 @@ It keeps parsing, pagination, shaping, SVG serialization, and PNG rasterization
 inside a dedicated module worker and exposes one sheet, tile, or print page at a
 time.
 
-The worker protocol is `rxls.render-worker.v1`. An `open` request creates one
+The worker protocol is `rxls.render-worker.v2`. An `open` request creates one
 `RenderSession`, so later virtual tile/page requests reuse the parsed workbook
 and a verified in-memory font pack. Input, font members, embedded images,
 layout work, scene nodes, page count, raster pixels, and output bytes all have
 hard ceilings. Requests may lower those ceilings but cannot raise them. The
 worker also caps pending requests at 32 and ignores cancellation identifiers
 that do not name active or queued work. Open and queued transferable resources
-share a 128 MiB byte budget in both the client and worker.
+share a 128 MiB byte budget in both the client and worker. Each editable
+session reserves its complete 32 MiB history allowance inside that aggregate
+budget before `open` succeeds.
 
 ```js
 import { RenderWorkerClient, getRenderWorkerUrl } from "@rxls/render-worker";
@@ -23,6 +25,29 @@ const pageMap = await client.preparePages(opened.documentId, 0);
 const firstPage = await client.renderPage(opened.documentId, 0, 0);
 viewer.replaceChildren(svgElement(firstPage.svg));
 ```
+
+For a retained XLSX/XLSM package, `opened.editState.capability` is
+`"read-write"`. Editing and serialization stay inside the same worker session:
+
+```js
+await client.setCell(opened.documentId, 0, 0, 0, {
+  kind: "formula",
+  formula: "SUM(B2:B10)",
+  cached: { kind: "number", value: 0 }
+});
+await client.undoEdit(opened.documentId);
+await client.redoEdit(opened.documentId);
+const saved = await client.saveDocument(opened.documentId);
+```
+
+The `rxls.render-worker.v2` edit surface also supports typed cell
+inspection and complete document-property replacement. XLS, XLSB, ODS, and
+OOXML packages that cannot retain metadata report a stable read-only reason.
+Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
+serialized and reopened before it replaces the live session.
+`saveDocument()` returns `application/octet-stream` because the worker receives
+bytes without a trusted source filename; the host must retain the known
+`.xlsx` or `.xlsm` extension and select its corresponding MIME type.
 
 `getRenderWorkerUrl()` resolves `js/worker.mjs` relative to the installed client
 module, so the worker, its JavaScript imports, and generated WASM stay in the
@@ -39,14 +64,15 @@ faces without filesystem or host-font discovery. PNG text output requires this
 verified pack; SVG remains available without one.
 
 Cancellation uses `AbortSignal` or `client.cancel(requestId)`. Queued work is
-removed before entering WASM. Rendering inside WASM is synchronous and is not
-cooperatively cancellable: once that call is executing, the worker cannot
-receive a soft-cancel message until the call returns. A soft-cancel still
-rejects the local promise and discards any eventual output, but it does not
-promise to stop active CPU work. `client.terminate()` is the active-work
-hard-stop boundary. It destroys the dedicated worker, rejects every active and
-queued request with `client_closed`, releases their transferable buffers, and
-invalidates all open document sessions.
+removed before entering WASM. After dispatch, state-changing operations
+(`close`, cell/property edits, undo, and redo) are deliberately non-cancellable:
+their promise remains pending until the worker returns the authoritative state.
+Rendering inside WASM is synchronous and is not cooperatively cancellable; a
+soft-cancel rejects the local render promise and discards eventual output but
+does not promise to stop active CPU work. `client.terminate()` is the
+active-work hard-stop boundary. It destroys the dedicated worker, rejects every
+active and queued request with `client_closed`, releases their transferable
+buffers, and invalidates all open document sessions.
 
 The package never creates blob workers, uses `eval`, injects scripts, or
 discovers local paths. Applications must serve `js/worker.mjs`, generated WASM,

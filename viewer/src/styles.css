@@ -44,7 +44,9 @@ body {
 }
 
 button,
-select {
+select,
+input,
+textarea {
   font: inherit;
   letter-spacing: 0;
 }
@@ -52,7 +54,9 @@ select {
 button,
 summary,
 a,
-select {
+select,
+input,
+textarea {
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -60,6 +64,8 @@ button:focus-visible,
 summary:focus-visible,
 a:focus-visible,
 select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
@@ -200,6 +206,11 @@ button:disabled {
   color: var(--text);
   background: transparent;
   cursor: pointer;
+}
+
+.compact-command {
+  background: var(--surface);
+  border-color: var(--border);
 }
 
 .command-button {
@@ -352,6 +363,18 @@ button:disabled {
   font-weight: 580;
 }
 
+.metadata-list dd.dirty {
+  color: #9a4c08;
+  font-weight: 700;
+}
+
+.editing-reason {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .viewer-main {
   display: grid;
   min-width: 0;
@@ -409,7 +432,8 @@ button:disabled {
 }
 
 .page-controls,
-.zoom-controls {
+.zoom-controls,
+.edit-controls {
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -477,7 +501,7 @@ button:disabled {
   top: calc(100% + 6px);
   right: 0;
   z-index: 40;
-  width: 128px;
+  width: 184px;
   padding: 5px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -668,6 +692,158 @@ button:disabled {
   line-height: 1.35;
 }
 
+.edit-dialog {
+  width: min(560px, calc(100vw - 28px));
+  max-height: min(720px, calc(100vh - 28px));
+  padding: 0;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+
+.edit-dialog::backdrop {
+  background: rgb(20 25 22 / 48%);
+}
+
+.edit-form {
+  display: grid;
+  max-height: min(720px, calc(100vh - 28px));
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog-header h2,
+.dialog-header p {
+  margin: 0;
+}
+
+.dialog-header h2 {
+  font-size: 15px;
+}
+
+.dialog-header p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.form-grid {
+  display: grid;
+  min-height: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  padding: 16px;
+  overflow: auto;
+}
+
+.form-field {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.form-field > span:first-child,
+.formula-fields legend {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.form-field input,
+.form-field select,
+.form-field textarea {
+  width: 100%;
+  min-width: 0;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+}
+
+.form-field input,
+.form-field select {
+  height: 36px;
+  padding: 0 9px;
+}
+
+.form-field textarea {
+  min-height: 72px;
+  padding: 8px 9px;
+  resize: vertical;
+}
+
+.form-field-wide,
+.formula-fields {
+  grid-column: 1 / -1;
+}
+
+.inline-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 5px;
+}
+
+.field-icon-button {
+  width: 36px;
+  height: 36px;
+  background: var(--panel);
+  border-color: var(--border-strong);
+}
+
+.formula-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.formula-fields[hidden] {
+  display: none;
+}
+
+.dialog-status {
+  min-height: 30px;
+  margin: 0;
+  padding: 7px 16px;
+  overflow: hidden;
+  color: var(--muted);
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  padding: 11px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.dialog-actions .command-button {
+  border-color: var(--border-strong);
+}
+
+.dialog-actions .command-button.primary {
+  width: auto;
+  min-width: 78px;
+}
+
 .sidebar-scrim,
 .mobile-only {
   display: none;
@@ -744,6 +920,7 @@ button:disabled {
   }
 
   .segment span,
+  .compact-command span,
   .zoom-value,
   .export-menu summary span,
   .export-menu summary svg:last-child {
@@ -756,6 +933,11 @@ button:disabled {
 
   .export-menu summary {
     min-width: 34px;
+    padding: 0;
+  }
+
+  .compact-command {
+    width: 34px;
     padding: 0;
   }
 
@@ -775,12 +957,24 @@ button:disabled {
 @media (max-width: 420px) {
   .brand-name,
   .page-position,
-  #fit-view {
+  #fit-view,
+  .zoom-controls {
     display: none;
   }
 
   .toolbar-spacer {
     flex: 1;
+  }
+
+  .form-grid,
+  .formula-fields,
+  .properties-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .form-field-wide,
+  .formula-fields {
+    grid-column: 1;
   }
 }
 

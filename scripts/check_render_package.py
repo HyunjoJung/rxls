@@ -16,6 +16,7 @@ import tomllib
 
 PACKAGE_NAME = "@rxls/render-worker"
 CRATE_NAME = "rxls-render-wasm"
+REPORT_SCHEMA = "rxls.render-worker-package.v2"
 REPOSITORY_URL = "git+https://github.com/HyunjoJung/rxls.git"
 HOMEPAGE_URL = "https://hyunjojung.github.io/rxls/"
 EXPECTED_AUTHOR = {
@@ -576,7 +577,7 @@ def validate(
         errors.append("git revision must be a lowercase 40-character SHA")
 
     report = {
-        "schema": "rxls.render-worker-package.v2",
+        "schema": REPORT_SCHEMA,
         "package": {
             "name": source_metadata.get("name"),
             "version": source_metadata.get("version"),

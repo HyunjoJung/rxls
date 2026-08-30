@@ -3475,6 +3475,16 @@ steps:
                 "--npm-pack target/render-package/stale-pack.json",
                 1,
             ),
+            "package_report_schema_source": original.replace(
+                "from scripts.check_render_package import REPORT_SCHEMA",
+                "REPORT_SCHEMA = 'rxls.render-worker-package.v1'",
+                1,
+            ),
+            "package_report_schema_check": original.replace(
+                'report.get("schema") != REPORT_SCHEMA',
+                'report.get("schema") != "rxls.render-worker-package.v1"',
+                1,
+            ),
             "notice": original.replace(
                 "--check bindings/render-wasm/THIRD_PARTY_NOTICES.txt",
                 "--output target/notice.txt",

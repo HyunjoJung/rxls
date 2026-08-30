@@ -179,6 +179,10 @@ in [Validation and reproducibility](docs/validation.md).
 XLSX, XLSM, XLSB, or ODS files without installing rxls. Files are processed in
 a bounded WebAssembly worker in the browser and are not uploaded. The viewer
 includes project-owned samples, sheet and page modes, zoom, and SVG/PNG export.
+For retained XLSX/XLSM packages it can also edit typed cell values, formulas,
+and document properties, undo or redo changes, and download a new workbook
+while preserving untouched package parts, including VBA. XLS, XLSB, and ODS
+remain explicitly read-only.
 
 ### Video demos
 
