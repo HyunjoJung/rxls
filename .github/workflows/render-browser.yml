@@ -7,8 +7,10 @@ on:
     paths:
       - ".github/workflows/render-browser.yml"
       - "bindings/render-wasm/**"
+      - "examples/author_report.rs"
       - "render/**"
       - "src/**"
+      - "viewer/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "scripts/check_render_browser_release_evidence.py"
@@ -81,6 +83,10 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --locked
           npm test
+      - name: Test public viewer application logic
+        run: |
+          npm ci --prefix viewer --ignore-scripts
+          npm --prefix viewer test
       - name: Install exact wasm-bindgen CLI
         shell: bash
         run: |
@@ -106,6 +112,16 @@ jobs:
           test "$(command -v wasm-bindgen)" = \
             "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
           npm run build:wasm
+      - name: Build public viewer at its deployed base path
+        shell: bash
+        env:
+          RXLS_BASE_PATH: /rxls/
+        run: |
+          set -euo pipefail
+          cargo run --locked --example author_report -- "$RUNNER_TEMP/operations-report.xlsx"
+          cmp --silent viewer/samples/operations-report.xlsx "$RUNNER_TEMP/operations-report.xlsx"
+          npm --prefix viewer run prepare:runtime
+          npm --prefix viewer run build
       - name: Install exact Chrome for Testing
         shell: bash
         run: |
@@ -140,6 +156,13 @@ jobs:
           set -euo pipefail
           mkdir -p ../../target/render-browser-evidence
           npm run test:browser 2>&1 | tee ../../target/render-browser-evidence/chromium.log
+      - name: Exercise public viewer in pinned Chromium
+        shell: bash
+        env:
+          RXLS_CHROMIUM_EXECUTABLE: ${{ env.RXLS_CHROMIUM_BIN }}
+        run: |
+          set -euo pipefail
+          npm --prefix viewer run test:browser
       - name: Pack and consume the publishable artifact
         working-directory: bindings/render-wasm
         shell: bash

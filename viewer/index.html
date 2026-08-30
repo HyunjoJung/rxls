@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; worker-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <meta
+      name="description"
+      content="Open XLS, XLSX, XLSB, and ODS files locally in the rxls browser viewer."
+    />
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" href="data:," />
+    <title>rxls viewer</title>
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="app-bar">
+        <button
+          id="sidebar-toggle"
+          class="icon-button mobile-only"
+          type="button"
+          aria-label="Toggle workbook panel"
+          title="Workbook panel"
+        >
+          <i data-lucide="panel-left"></i>
+        </button>
+        <a
+          class="brand"
+          href="https://github.com/HyunjoJung/rxls"
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="rxls repository"
+        >
+          <span class="brand-mark" aria-hidden="true">r</span>
+          <span class="brand-name">rxls</span>
+          <span class="brand-product">viewer</span>
+        </a>
+        <div class="document-identity" aria-live="polite">
+          <strong id="document-name">Loading sample...</strong>
+          <span id="document-detail">Rust + WebAssembly</span>
+        </div>
+        <div class="app-bar-actions">
+          <span class="local-status" title="Files stay in this browser session">
+            <i data-lucide="shield-check"></i>
+            <span>Local</span>
+          </span>
+          <a
+            class="icon-button"
+            href="https://github.com/HyunjoJung/rxls"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Open rxls on GitHub"
+            title="GitHub"
+          >
+            <i data-lucide="external-link"></i>
+          </a>
+        </div>
+      </header>
+
+      <div class="workbench">
+        <aside id="sidebar" class="sidebar" aria-label="Workbook panel">
+          <div class="sidebar-primary">
+            <button id="open-button" class="command-button primary" type="button">
+              <i data-lucide="folder-open"></i>
+              <span>Open spreadsheet</span>
+            </button>
+            <input
+              id="file-input"
+              type="file"
+              accept=".xls,.xlsx,.xlsm,.xlsb,.ods"
+              hidden
+            />
+
+            <label class="field-label" for="sample-select">Sample</label>
+            <div class="select-wrap">
+              <select id="sample-select" aria-label="Sample workbook"></select>
+              <i data-lucide="chevron-down" aria-hidden="true"></i>
+            </div>
+          </div>
+
+          <section class="sidebar-section sheet-section" aria-labelledby="sheets-title">
+            <div class="section-heading">
+              <h2 id="sheets-title">Sheets</h2>
+              <span id="sheet-count" class="section-count">0</span>
+            </div>
+            <nav id="sheet-list" class="sheet-list" aria-label="Workbook sheets"></nav>
+          </section>
+
+          <section class="sidebar-section metadata-section" aria-labelledby="workbook-title">
+            <h2 id="workbook-title">Workbook</h2>
+            <dl class="metadata-list">
+              <div>
+                <dt>Format</dt>
+                <dd id="meta-format">-</dd>
+              </div>
+              <div>
+                <dt>Size</dt>
+                <dd id="meta-size">-</dd>
+              </div>
+              <div>
+                <dt>Images</dt>
+                <dd id="meta-images">-</dd>
+              </div>
+              <div>
+                <dt>Engine</dt>
+                <dd>WASM worker</dd>
+              </div>
+            </dl>
+          </section>
+        </aside>
+
+        <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="Close workbook panel"></button>
+
+        <main class="viewer-main">
+          <div class="toolbar" aria-label="Viewer controls">
+            <div class="segmented-control" role="group" aria-label="View mode">
+              <button id="sheet-view" class="segment active" type="button" aria-pressed="true">
+                <i data-lucide="table-2"></i>
+                <span>Sheet</span>
+              </button>
+              <button id="page-view" class="segment" type="button" aria-pressed="false">
+                <i data-lucide="files"></i>
+                <span>Pages</span>
+              </button>
+            </div>
+
+            <div id="page-controls" class="page-controls" hidden>
+              <button
+                id="previous-page"
+                class="icon-button"
+                type="button"
+                aria-label="Previous page"
+                title="Previous page"
+              >
+                <i data-lucide="chevron-left"></i>
+              </button>
+              <span id="page-position" class="page-position">1 / 1</span>
+              <button
+                id="next-page"
+                class="icon-button"
+                type="button"
+                aria-label="Next page"
+                title="Next page"
+              >
+                <i data-lucide="chevron-right"></i>
+              </button>
+            </div>
+
+            <span class="toolbar-spacer"></span>
+
+            <div class="zoom-controls" role="group" aria-label="Zoom">
+              <button
+                id="zoom-out"
+                class="icon-button"
+                type="button"
+                aria-label="Zoom out"
+                title="Zoom out"
+              >
+                <i data-lucide="zoom-out"></i>
+              </button>
+              <output id="zoom-value" class="zoom-value" aria-live="polite">100%</output>
+              <button
+                id="zoom-in"
+                class="icon-button"
+                type="button"
+                aria-label="Zoom in"
+                title="Zoom in"
+              >
+                <i data-lucide="zoom-in"></i>
+              </button>
+              <button
+                id="fit-view"
+                class="icon-button"
+                type="button"
+                aria-label="Fit to width"
+                title="Fit to width"
+              >
+                <i data-lucide="scan"></i>
+              </button>
+            </div>
+
+            <details id="export-menu" class="export-menu">
+              <summary class="command-button">
+                <i data-lucide="download"></i>
+                <span>Export</span>
+                <i data-lucide="chevron-down"></i>
+              </summary>
+              <div class="menu-panel">
+                <button id="export-svg" type="button">
+                  <i data-lucide="file-code-2"></i>
+                  <span>SVG</span>
+                </button>
+                <button id="export-png" type="button">
+                  <i data-lucide="image-down"></i>
+                  <span>PNG</span>
+                </button>
+              </div>
+            </details>
+          </div>
+
+          <section
+            id="viewer-viewport"
+            class="viewer-viewport"
+            aria-label="Rendered spreadsheet"
+            tabindex="0"
+          >
+            <div id="drop-overlay" class="drop-overlay" hidden>
+              <i data-lucide="file-up"></i>
+              <strong>Open spreadsheet</strong>
+            </div>
+
+            <div id="empty-state" class="empty-state">
+              <i data-lucide="file-spreadsheet"></i>
+              <strong>No workbook open</strong>
+              <button id="empty-open-button" class="command-button primary" type="button">
+                <i data-lucide="folder-open"></i>
+                <span>Open spreadsheet</span>
+              </button>
+            </div>
+
+            <div id="loading-state" class="loading-state" aria-live="polite">
+              <span class="spinner" aria-hidden="true"></span>
+              <strong id="loading-label">Starting renderer</strong>
+            </div>
+
+            <div id="document-stage" class="document-stage" hidden>
+              <div id="document-surface" class="document-surface"></div>
+            </div>
+          </section>
+
+          <footer class="status-bar">
+            <span id="status-message" aria-live="polite">Starting renderer</span>
+            <span class="status-meta">
+              <a href="./LICENSE.txt" target="_blank" rel="noopener noreferrer">MIT</a>
+              <a
+                href="./THIRD_PARTY_NOTICES.txt"
+                target="_blank"
+                rel="noopener noreferrer"
+              >Notices</a>
+              <span id="render-detail">Bounded local processing</span>
+            </span>
+          </footer>
+        </main>
+      </div>
+    </div>
+
+    <div id="error-banner" class="error-banner" role="alert" hidden>
+      <i data-lucide="circle-alert"></i>
+      <span id="error-message"></span>
+      <button id="dismiss-error" class="icon-button" type="button" aria-label="Dismiss error">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

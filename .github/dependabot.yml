@@ -30,3 +30,12 @@ updates:
       # This action's ref is the Rust compiler version, not an action runtime
       # version. MSRV changes are deliberate and validated separately.
       - dependency-name: "dtolnay/rust-toolchain"
+
+  - package-ecosystem: "npm"
+    directory: "/viewer"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      viewer-minor-patch:
+        update-types: ["minor", "patch"]

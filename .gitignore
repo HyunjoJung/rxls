@@ -18,3 +18,9 @@ fuzz/artifacts/
 # scripts/fetch-xls-reference.sh; never committed (size + upstream licensing).
 /local
 .worktrees/
+/viewer/dist/
+/viewer/node_modules/
+/viewer/public/LICENSE.txt
+/viewer/public/THIRD_PARTY_NOTICES.txt
+/viewer/public/runtime/
+/viewer/public/samples/

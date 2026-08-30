@@ -118,6 +118,12 @@ The source workspace also contains an experimental renderer and
 `@rxls/render-worker`. They are not included in the published core crate and do
 not extend the read, write, edit, CLI, or core WASM compatibility claims.
 
+The [public browser viewer](https://hyunjojung.github.io/rxls/) is built from
+that worker and the static `viewer/` application. It provides local file and
+project-sample inspection, sheet and page rendering, zoom, and SVG/PNG export.
+Workbook bytes stay in the browser session; the viewer remains a separately
+versioned product surface rather than part of the core crate's SemVer contract.
+
 ## Cargo features
 
 | Feature | Default | Surface |

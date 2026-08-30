@@ -2,13 +2,14 @@
 
 **English** | [한국어](README.ko.md)
 
-**One native Rust library for legacy and modern spreadsheet files.**
+**One native Rust toolkit for legacy and modern spreadsheet files.**
 
 Read XLS, XLSX, XLSB, and ODS through one typed model. Create XLSX and modify
 XLSX/XLSM while preserving untouched package parts.
 
 [![Crates.io](https://img.shields.io/crates/v/rxls.svg)](https://crates.io/crates/rxls)
 [![Docs.rs](https://docs.rs/rxls/badge.svg)](https://docs.rs/rxls)
+[![Live viewer](https://img.shields.io/badge/live-viewer-176b3a.svg)](https://hyunjojung.github.io/rxls/)
 [![CI](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml/badge.svg)](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
@@ -171,6 +172,15 @@ commands, release provenance, and the separate rendering evidence are recorded
 in [Validation and reproducibility](docs/validation.md).
 
 ## Demo and architecture
+
+### Browser viewer
+
+[Open the live rxls viewer](https://hyunjojung.github.io/rxls/) to inspect XLS,
+XLSX, XLSM, XLSB, or ODS files without installing rxls. Files are processed in
+a bounded WebAssembly worker in the browser and are not uploaded. The viewer
+includes project-owned samples, sheet and page modes, zoom, and SVG/PNG export.
+
+### Video demos
 
 | English demo | Korean demo |
 |---|---|
