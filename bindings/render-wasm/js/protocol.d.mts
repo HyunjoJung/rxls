@@ -1,4 +1,4 @@
-export declare const PROTOCOL: "rxls.render-worker.v1";
+export declare const PROTOCOL: "rxls.render-worker.v2";
 export declare const MAX_INPUT_BYTES: 33554432;
 export declare const MAX_FONT_BYTES: 67108864;
 export declare const MAX_FONT_MANIFEST_BYTES: 4194304;
@@ -7,12 +7,16 @@ export declare const MAX_FONT_FILE_BYTES: 33554432;
 export declare const MAX_OPEN_DOCUMENTS: 4;
 export declare const MAX_OPEN_RESOURCE_BYTES: 134217728;
 export declare const MAX_OPTIONS_BYTES: 65536;
+export declare const MAX_EDIT_REQUEST_BYTES: 131072;
+export declare const MAX_EDIT_HISTORY_ENTRIES: 20;
+export declare const MAX_EDIT_HISTORY_BYTES: 33554432;
 export declare const MAX_PENDING_REQUESTS: 32;
 export declare const MAX_PENDING_RESOURCE_BYTES: 134217728;
 export declare const MAX_OUTPUT_BYTES: 16777216;
 export declare const MAX_PNG_BYTES: 16777216;
 export declare const MAX_SHEETS: 255;
 export declare const MAX_PAGES: 512;
+export declare const MAX_MANUAL_PAGE_BREAKS: 1026;
 export declare const MIN_DPI: 36;
 export declare const MAX_DPI: 300;
 
@@ -174,6 +178,32 @@ export interface RenderCapabilities {
     readonly bounded: true;
     readonly painted: true;
   };
+  readonly editing: {
+    readonly supported: true;
+    readonly formats: readonly ["xlsx", "xlsm"];
+    readonly preservation: "untouched-package-parts";
+    readonly operations: readonly [
+      "read-cell",
+      "set-cell",
+      "set-document-properties",
+      "undo-edit",
+      "redo-edit",
+      "save-document",
+    ];
+    readonly maxHistoryEntries: number;
+    readonly maxHistoryBytes: number;
+  };
+}
+
+export interface DocumentPropertiesInspection {
+  readonly title: string | null;
+  readonly subject: string | null;
+  readonly creator: string | null;
+  readonly keywords: string | null;
+  readonly description: string | null;
+  readonly lastModifiedBy: string | null;
+  readonly company: string | null;
+  readonly created: string | null;
 }
 
 export interface WorkbookSheetInspection {
@@ -190,6 +220,50 @@ export interface WorkbookInspection {
   readonly embeddedImageBytes: number;
   readonly fontPackSha256: string | null;
   readonly fontFaces: number;
+  readonly properties: DocumentPropertiesInspection;
+}
+
+export type EditableCachedCell =
+  | { readonly kind: "text"; readonly value: string }
+  | { readonly kind: "number"; readonly value: number }
+  | { readonly kind: "date"; readonly value: number }
+  | { readonly kind: "boolean"; readonly value: boolean }
+  | { readonly kind: "error"; readonly value: string };
+
+export type EditableCell =
+  | { readonly kind: "blank" }
+  | EditableCachedCell
+  | {
+      readonly kind: "formula";
+      readonly formula: string;
+      readonly cached: EditableCachedCell;
+    };
+
+export type InspectedCell =
+  | { readonly kind: "blank" }
+  | EditableCachedCell
+  | {
+      readonly kind: "formula";
+      readonly formula: string;
+      readonly cached: InspectedCell;
+    };
+
+export interface EditState {
+  readonly schemaVersion: 1;
+  readonly capability: "read-write" | "read-only";
+  readonly reason:
+    | "legacy-biff"
+    | "binary-package"
+    | "open-document"
+    | "package-metadata-loss"
+    | null;
+  readonly dirty: boolean;
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
+  readonly undoDepth: number;
+  readonly redoDepth: number;
+  readonly historyBytes: number;
+  readonly editedParts: readonly string[];
 }
 
 export interface RenderReportRange {
@@ -215,7 +289,7 @@ export interface RenderWarning {
 }
 
 export interface RenderReport {
-  readonly schema_version: number;
+  readonly schema_version: 2;
   readonly sheet_index: number;
   readonly sheet_name: string;
   readonly range: RenderReportRange;
@@ -252,7 +326,7 @@ export interface PrintPageMapEntry {
 }
 
 export interface PrintManifest {
-  readonly schema_version: number;
+  readonly schema_version: 2;
   readonly sheet_index: number;
   readonly sheet_name: string;
   readonly source_report: RenderReport;
@@ -282,6 +356,7 @@ export interface PrintManifest {
 export interface OpenDocumentResult {
   readonly documentId: string;
   readonly workbook: WorkbookInspection;
+  readonly editState: EditState;
 }
 
 export interface CloseDocumentResult {
@@ -319,6 +394,33 @@ export interface RenderPagePngResult {
   readonly bytes: Uint8Array;
 }
 
+export interface EditStatusResult {
+  readonly documentId: string;
+  readonly editState: EditState;
+}
+
+export interface ReadCellResult {
+  readonly documentId: string;
+  readonly schemaVersion: 1;
+  readonly sheetIndex: number;
+  readonly row: number;
+  readonly col: number;
+  readonly value: InspectedCell;
+  readonly formatted: string | null;
+}
+
+export interface EditMutationResult {
+  readonly documentId: string;
+  readonly workbook: WorkbookInspection;
+  readonly editState: EditState;
+}
+
+export interface SaveDocumentResult {
+  readonly documentId: string;
+  readonly mimeType: "application/octet-stream";
+  readonly bytes: Uint8Array;
+}
+
 export type RenderOperation =
   | "capabilities"
   | "open"
@@ -327,7 +429,14 @@ export type RenderOperation =
   | "render-sheet"
   | "render-tile"
   | "render-page"
-  | "render-page-png";
+  | "render-page-png"
+  | "edit-status"
+  | "read-cell"
+  | "set-cell"
+  | "set-document-properties"
+  | "undo-edit"
+  | "redo-edit"
+  | "save-document";
 
 export interface RenderOperationPayloads {
   readonly capabilities: Readonly<Record<string, never>>;
@@ -337,6 +446,27 @@ export interface RenderOperationPayloads {
     readonly fontPack?: FontPack;
   };
   readonly close: { readonly documentId: string };
+  readonly "edit-status": { readonly documentId: string };
+  readonly "read-cell": {
+    readonly documentId: string;
+    readonly sheetIndex: number;
+    readonly row: number;
+    readonly col: number;
+  };
+  readonly "set-cell": {
+    readonly documentId: string;
+    readonly sheetIndex: number;
+    readonly row: number;
+    readonly col: number;
+    readonly value: EditableCell;
+  };
+  readonly "set-document-properties": {
+    readonly documentId: string;
+    readonly properties: DocumentPropertiesInspection;
+  };
+  readonly "undo-edit": { readonly documentId: string };
+  readonly "redo-edit": { readonly documentId: string };
+  readonly "save-document": { readonly documentId: string };
   readonly "prepare-pages": {
     readonly documentId: string;
     readonly sheetIndex: number;
@@ -372,6 +502,13 @@ export interface RenderOperationResults {
   readonly capabilities: RenderCapabilities;
   readonly open: OpenDocumentResult;
   readonly close: CloseDocumentResult;
+  readonly "edit-status": EditStatusResult;
+  readonly "read-cell": ReadCellResult;
+  readonly "set-cell": EditMutationResult;
+  readonly "set-document-properties": EditMutationResult;
+  readonly "undo-edit": EditMutationResult;
+  readonly "redo-edit": EditMutationResult;
+  readonly "save-document": SaveDocumentResult;
   readonly "prepare-pages": PreparePagesResult;
   readonly "render-sheet": RenderSheetResult;
   readonly "render-tile": RenderTileResult;
@@ -462,6 +599,11 @@ export declare function preflightRequest<Operation extends RenderOperation>(requ
 }): number;
 export declare function preflightRequest(request: ParsedRenderWorkerRequestMessage): number;
 export declare function validateRange(value: unknown): RenderRange;
+export declare function validateCellCoordinate(
+  row: unknown,
+  col: unknown,
+): { readonly row: number; readonly col: number };
+export declare function editJson(value: RenderJsonValue): Uint8Array;
 export declare function boundedIndex(
   value: unknown,
   location: string,

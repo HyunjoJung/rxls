@@ -26,6 +26,7 @@ use crate::{
 /// (`Spreadsheet::set_cell_value`) node-budget regression tests below, so
 /// the pinned budget and the fixture can never drift out of sync.
 const MINIMAL_WORKSHEET_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+const STYLED_WORKSHEET_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="3" t="inlineStr"><is><t>styled</t></is></c></row></sheetData></worksheet>"#;
 const EMPTY_WORKSHEET_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData></sheetData></worksheet>"#;
 const MINIMAL_WORKBOOK_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
 const MINIMAL_CONTENT_TYPES_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
@@ -220,6 +221,74 @@ fn clear_range_rolls_back_when_candidate_package_validation_fails() {
     let before = spreadsheet.save().expect("serialize untouched package");
 
     let result = spreadsheet.clear_range("Data", 0, 0, 0, 0);
+
+    assert!(
+        result.is_err(),
+        "edited untyped worksheet must fail validation"
+    );
+    assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+}
+
+#[test]
+fn clear_cell_value_preserves_the_cell_style_and_removes_only_its_value() {
+    let input = minimal_xlsx_with_worksheet(STYLED_WORKSHEET_XML, MINIMAL_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open styled xlsx");
+
+    spreadsheet
+        .clear_cell_value("Data", 0, 0)
+        .expect("clear styled cell value");
+
+    assert_eq!(
+        spreadsheet.edited_parts(),
+        &["xl/worksheets/sheet1.xml".to_string()]
+    );
+    let saved = spreadsheet.save().expect("save cleared package");
+    let sheet_xml = zip_member(&saved, "xl/worksheets/sheet1.xml");
+    let tree = XmlTree::parse(&sheet_xml).expect("parse saved worksheet");
+    let worksheet = tree.root_element().expect("worksheet root");
+    let sheet_data = tree
+        .child_by_name(worksheet, b"sheetData")
+        .expect("sheetData");
+    let row = tree.child_by_name(sheet_data, b"row").expect("row");
+    let cell = tree.child_by_name(row, b"c").expect("styled cell remains");
+    assert_eq!(tree.attr_value(cell, b"r"), Some(b"A1".as_slice()));
+    assert_eq!(tree.attr_value(cell, b"s"), Some(b"3".as_slice()));
+    assert_eq!(tree.attr_value(cell, b"t"), None);
+    for child in [b"v".as_slice(), b"f".as_slice(), b"is".as_slice()] {
+        assert!(
+            tree.child_by_name(cell, child).is_none(),
+            "value child {child:?} must be removed"
+        );
+    }
+    let reopened = Workbook::open(&saved).expect("reopen cleared package");
+    assert_eq!(reopened.sheets[0].cell(0, 0), None);
+}
+
+#[test]
+fn clear_cell_value_is_a_no_op_for_a_missing_cell() {
+    let input = minimal_xlsx_with_worksheet(EMPTY_WORKSHEET_XML, MINIMAL_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open empty xlsx");
+    let before = spreadsheet.save().expect("serialize original package");
+
+    spreadsheet
+        .clear_cell_value("Data", 0, 0)
+        .expect("clear missing cell");
+
+    assert!(spreadsheet.edited_parts().is_empty());
+    assert_eq!(
+        spreadsheet.save().expect("serialize unchanged package"),
+        before
+    );
+}
+
+#[test]
+fn clear_cell_value_rolls_back_when_candidate_package_validation_fails() {
+    let input =
+        minimal_xlsx_with_worksheet(STYLED_WORKSHEET_XML, UNTYPED_WORKSHEET_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).expect("open readable xlsx");
+    let before = spreadsheet.save().expect("serialize untouched package");
+
+    let result = spreadsheet.clear_cell_value("Data", 0, 0);
 
     assert!(
         result.is_err(),

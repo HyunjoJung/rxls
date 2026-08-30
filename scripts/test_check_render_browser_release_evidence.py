@@ -25,13 +25,16 @@ SPEC.loader.exec_module(MODULE)
 HEAD_SHA = "a" * 40
 RUN_ID = 12345
 RUN_ATTEMPT = 2
+PACKAGE_METADATA = json.loads(MODULE.DEFAULT_PACKAGE.read_text(encoding="utf-8"))
+PACKAGE_NAME = PACKAGE_METADATA["name"]
+PACKAGE_VERSION = PACKAGE_METADATA["version"]
 
 
 class BrowserEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.archive = self.root / "rxls-render-worker-0.1.3.tgz"
+        self.archive = self.root / f"rxls-render-worker-{PACKAGE_VERSION}.tgz"
         self.archive.write_bytes(b"deterministic npm archive fixture\n" * 64)
         archive = self.archive.read_bytes()
         integrity = base64.b64encode(hashlib.sha512(archive).digest()).decode("ascii")
@@ -40,8 +43,8 @@ class BrowserEvidenceTests(unittest.TestCase):
             json.dumps(
                 [
                     {
-                        "name": "@rxls/render-worker",
-                        "version": "0.1.3",
+                        "name": PACKAGE_NAME,
+                        "version": PACKAGE_VERSION,
                         "filename": self.archive.name,
                         "size": len(archive),
                         "unpackedSize": len(MODULE.EXPECTED_PACKAGE_FILES),

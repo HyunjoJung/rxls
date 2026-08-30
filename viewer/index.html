@@ -105,10 +105,15 @@
                 <dd id="meta-images">-</dd>
               </div>
               <div>
+                <dt>Editing</dt>
+                <dd id="meta-editing" aria-describedby="editing-reason">-</dd>
+              </div>
+              <div>
                 <dt>Engine</dt>
                 <dd>WASM worker</dd>
               </div>
             </dl>
+            <p id="editing-reason" class="editing-reason" aria-live="polite" hidden></p>
           </section>
         </aside>
 
@@ -146,6 +151,45 @@
                 title="Next page"
               >
                 <i data-lucide="chevron-right"></i>
+              </button>
+            </div>
+
+            <div class="edit-controls" role="group" aria-label="Workbook editing">
+              <button
+                id="edit-cell"
+                class="command-button compact-command"
+                type="button"
+                title="Edit cell"
+              >
+                <i data-lucide="pencil"></i>
+                <span>Edit cell</span>
+              </button>
+              <button
+                id="undo-edit"
+                class="icon-button"
+                type="button"
+                aria-label="Undo workbook edit"
+                title="Undo edit"
+              >
+                <i data-lucide="undo-2"></i>
+              </button>
+              <button
+                id="redo-edit"
+                class="icon-button"
+                type="button"
+                aria-label="Redo workbook edit"
+                title="Redo edit"
+              >
+                <i data-lucide="redo-2"></i>
+              </button>
+              <button
+                id="document-properties"
+                class="icon-button"
+                type="button"
+                aria-label="Edit document properties"
+                title="Document properties"
+              >
+                <i data-lucide="file-text"></i>
               </button>
             </div>
 
@@ -189,6 +233,10 @@
                 <i data-lucide="chevron-down"></i>
               </summary>
               <div class="menu-panel">
+                <button id="save-document" type="button">
+                  <i data-lucide="save"></i>
+                  <span>Edited workbook</span>
+                </button>
                 <button id="export-svg" type="button">
                   <i data-lucide="file-code-2"></i>
                   <span>SVG</span>
@@ -254,6 +302,136 @@
         <i data-lucide="x"></i>
       </button>
     </div>
+
+    <dialog id="cell-dialog" class="edit-dialog" aria-labelledby="cell-dialog-title">
+      <form id="cell-form" class="edit-form">
+        <header class="dialog-header">
+          <div>
+            <h2 id="cell-dialog-title">Edit cell</h2>
+            <p id="cell-sheet-name">Current sheet</p>
+          </div>
+          <button
+            id="close-cell-dialog"
+            class="icon-button"
+            type="button"
+            aria-label="Close cell editor"
+            title="Close"
+          >
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+
+        <div class="form-grid">
+          <label class="form-field cell-reference-field" for="cell-reference">
+            <span>Cell</span>
+            <span class="inline-field">
+              <input id="cell-reference" name="reference" value="A1" maxlength="12" required />
+              <button
+                id="read-cell"
+                class="icon-button field-icon-button"
+                type="button"
+                aria-label="Load cell"
+                title="Load cell"
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+            </span>
+          </label>
+
+          <label class="form-field" for="cell-kind">
+            <span>Type</span>
+            <select id="cell-kind" name="kind">
+              <option value="text">Text</option>
+              <option value="number">Number</option>
+              <option value="date">Excel date serial</option>
+              <option value="boolean">Boolean</option>
+              <option value="error">Error</option>
+              <option value="formula">Formula</option>
+              <option value="blank">Blank</option>
+            </select>
+          </label>
+
+          <label id="cell-value-field" class="form-field form-field-wide" for="cell-value">
+            <span>Value</span>
+            <input id="cell-value" name="value" maxlength="32767" />
+          </label>
+
+          <fieldset id="cell-formula-fields" class="formula-fields form-field-wide" hidden>
+            <label class="form-field" for="cell-formula">
+              <span>Formula</span>
+              <input id="cell-formula" name="formula" maxlength="8192" placeholder="SUM(A1:A2)" />
+            </label>
+            <label class="form-field" for="cell-cached-kind">
+              <span>Cached type</span>
+              <select id="cell-cached-kind" name="cachedKind">
+                <option value="number">Number</option>
+                <option value="text">Text</option>
+                <option value="date">Excel date serial</option>
+                <option value="boolean">Boolean</option>
+                <option value="error">Error</option>
+              </select>
+            </label>
+            <label class="form-field form-field-wide" for="cell-cached-value">
+              <span>Cached value</span>
+              <input id="cell-cached-value" name="cachedValue" maxlength="32767" />
+            </label>
+          </fieldset>
+        </div>
+
+        <p id="cell-current-value" class="dialog-status" aria-live="polite"></p>
+        <footer class="dialog-actions">
+          <button id="cancel-cell-edit" class="command-button" type="button">Cancel</button>
+          <button
+            id="apply-cell-edit"
+            class="command-button primary dialog-primary"
+            type="submit"
+            disabled
+          >
+            Apply
+          </button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog
+      id="properties-dialog"
+      class="edit-dialog properties-dialog"
+      aria-labelledby="properties-dialog-title"
+    >
+      <form id="properties-form" class="edit-form">
+        <header class="dialog-header">
+          <div>
+            <h2 id="properties-dialog-title">Document properties</h2>
+            <p>OOXML package metadata</p>
+          </div>
+          <button
+            id="close-properties-dialog"
+            class="icon-button"
+            type="button"
+            aria-label="Close document properties"
+            title="Close"
+          >
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+
+        <div class="form-grid properties-grid">
+          <label class="form-field" for="property-title"><span>Title</span><input id="property-title" maxlength="32767" /></label>
+          <label class="form-field" for="property-subject"><span>Subject</span><input id="property-subject" maxlength="32767" /></label>
+          <label class="form-field" for="property-creator"><span>Creator</span><input id="property-creator" maxlength="32767" /></label>
+          <label class="form-field" for="property-last-modified-by"><span>Last modified by</span><input id="property-last-modified-by" maxlength="32767" /></label>
+          <label class="form-field" for="property-company"><span>Company</span><input id="property-company" maxlength="32767" /></label>
+          <label class="form-field" for="property-created"><span>Created</span><input id="property-created" maxlength="32767" placeholder="2026-08-30T00:00:00Z" /></label>
+          <label class="form-field form-field-wide" for="property-keywords"><span>Keywords</span><input id="property-keywords" maxlength="32767" /></label>
+          <label class="form-field form-field-wide" for="property-description"><span>Description</span><textarea id="property-description" maxlength="32767" rows="3"></textarea></label>
+        </div>
+
+        <footer class="dialog-actions">
+          <button id="cancel-properties-edit" class="command-button" type="button">Cancel</button>
+          <button class="command-button primary dialog-primary" type="submit">Apply</button>
+        </footer>
+      </form>
+    </dialog>
 
     <script type="module" src="/src/main.js"></script>
   </body>

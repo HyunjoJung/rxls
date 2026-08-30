@@ -214,6 +214,7 @@ publish = false
 
         self.assertEqual(errors, [])
         self.assertTrue(report["passed"])
+        self.assertEqual(report["schema"], self.checker.REPORT_SCHEMA)
         self.assertEqual(set(report["files"]), self.checker.EXPECTED_FILES)
         self.assertEqual(report["git_rev"], "a" * 40)
         self.assertEqual(report["npm_pack"]["sha256"], receipt_sha256)

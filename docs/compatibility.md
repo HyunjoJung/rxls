@@ -117,12 +117,21 @@ separately from the native CLI.
 The source workspace also contains an experimental renderer and
 `@rxls/render-worker`. They are not included in the published core crate and do
 not extend the read, write, edit, CLI, or core WASM compatibility claims.
+The worker keeps retained workbook bytes inside its dedicated session. For
+editable XLSX/XLSM packages it exposes typed cell inspection, cell value or
+formula replacement, document-property replacement, undo/redo, and preserved
+package serialization. Its history is capped at 20 entries and 32 MiB. XLS,
+XLSB, ODS, and metadata-lossy OOXML return stable read-only reasons before any
+mutation is attempted. An editable session reserves that full history budget
+inside the worker's 128 MiB aggregate open-resource ceiling before it opens.
 
 The [public browser viewer](https://hyunjojung.github.io/rxls/) is built from
 that worker and the static `viewer/` application. It provides local file and
-project-sample inspection, sheet and page rendering, zoom, and SVG/PNG export.
-Workbook bytes stay in the browser session; the viewer remains a separately
-versioned product surface rather than part of the core crate's SemVer contract.
+project-sample inspection, sheet and page rendering, zoom, SVG/PNG export, and
+the bounded XLSX/XLSM edit operations above. Downloads preserve the source
+`.xlsm` extension and untouched VBA/package parts. Workbook bytes stay in the
+browser session; the viewer remains a separately versioned product surface
+rather than part of the core crate's SemVer contract.
 
 ## Cargo features
 

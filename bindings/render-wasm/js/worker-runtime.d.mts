@@ -7,6 +7,17 @@ export type RenderMaybePromise<Value> = Value | PromiseLike<Value>;
 
 export interface RenderWasmSession {
   inspectionJson(): RenderMaybePromise<string>;
+  editStateJson(): RenderMaybePromise<string>;
+  readCellJson(
+    sheetIndex: number,
+    row: number,
+    col: number,
+  ): RenderMaybePromise<string>;
+  setCellJson(requestJson: string): RenderMaybePromise<string>;
+  setDocumentPropertiesJson(requestJson: string): RenderMaybePromise<string>;
+  undoEditJson(): RenderMaybePromise<string>;
+  redoEditJson(): RenderMaybePromise<string>;
+  saveDocumentBytes(): RenderMaybePromise<Uint8Array>;
   printManifestJson(sheetIndex: number, optionsJson: string): RenderMaybePromise<string>;
   renderSheetSvg(sheetIndex: number, optionsJson: string): RenderMaybePromise<string>;
   renderTileSvg(

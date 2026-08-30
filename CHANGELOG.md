@@ -6,7 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Added worker-local, package-preserving XLSX/XLSM browser edits for typed cell
+  values, formulas with cached values, and document properties. The public
+  viewer exposes bounded undo/redo history and save-as download, reports typed
+  read-only reasons for XLS/XLSB/ODS, and verifies a pinned public XLSM
+  fixture's untouched VBA and selected package parts byte-for-byte before an
+  external `openpyxl` reopen.
 
 ## [0.1.3] - 2026-08-22
 
