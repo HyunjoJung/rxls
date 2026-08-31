@@ -16,13 +16,25 @@ and export the current view as SVG or PNG.
 | XLSB | Yes | No |
 | ODS | Yes | No |
 
-## Install a VSIX
+## Install
 
-Download the `.vsix` and matching `.sha256` file from the verified
-[0.1.0 release](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0).
-The expected VSIX SHA-256 is
+| Channel | Recommended use |
+|---|---|
+| [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=HyunjoJung.rxls-spreadsheet-preview) | Install directly in VS Code |
+| [Open VSX Registry](https://open-vsx.org/extension/HyunjoJung/rxls-spreadsheet-preview) | Install in VSCodium and other Open VSX clients |
+| [GitHub release](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0) | Audit or install the canonical VSIX offline |
+
+The extension identifier is `HyunjoJung.rxls-spreadsheet-preview`. From a
+terminal with VS Code on `PATH`:
+
+```console
+code --install-extension HyunjoJung.rxls-spreadsheet-preview
+```
+
+The verified 0.1.0 VSIX in the GitHub release has SHA-256
 `3d1307502220c65d2755d7c1ef214a8117127b475fdae0c6da514f6ab3eecfd8`.
-In VS Code, choose **Extensions: Install from VSIX...** and select the package.
+For a manual install, download the `.vsix` and matching `.sha256`, then choose
+**Extensions: Install from VSIX...** in VS Code.
 
 ## Security and privacy
 

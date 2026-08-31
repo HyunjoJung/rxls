@@ -191,9 +191,14 @@ zoom, reload-on-change, and SVG/PNG export. Workbook bytes stay inside the
 extension host and its webview worker; the extension has no telemetry or
 external network client.
 
-[Download rxls Spreadsheet Preview 0.1.0](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0)
-as a verified VSIX. The release includes the matching SHA-256 file and links
-the package to its exact source commit and cross-platform CI evidence.
+Install rxls Spreadsheet Preview 0.1.0 from the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=HyunjoJung.rxls-spreadsheet-preview)
+for VS Code or the
+[Open VSX Registry](https://open-vsx.org/extension/HyunjoJung/rxls-spreadsheet-preview)
+for compatible clients such as VSCodium. The
+[GitHub release](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0)
+remains the canonical byte-level artifact: it includes the verified VSIX,
+matching SHA-256 file, exact source commit, and cross-platform CI evidence.
 
 ### Video demos
 
