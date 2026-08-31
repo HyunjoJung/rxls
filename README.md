@@ -191,6 +191,10 @@ zoom, reload-on-change, and SVG/PNG export. Workbook bytes stay inside the
 extension host and its webview worker; the extension has no telemetry or
 external network client.
 
+[Download rxls Spreadsheet Preview 0.1.0](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0)
+as a verified VSIX. The release includes the matching SHA-256 file and links
+the package to its exact source commit and cross-platform CI evidence.
+
 ### Video demos
 
 | English demo | Korean demo |

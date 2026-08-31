@@ -18,9 +18,11 @@ and export the current view as SVG or PNG.
 
 ## Install a VSIX
 
-Download the `.vsix` and matching `.sha256` artifact from a verified release or
-workflow run. In VS Code, choose **Extensions: Install from VSIX...** and select
-the package.
+Download the `.vsix` and matching `.sha256` file from the verified
+[0.1.0 release](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0).
+The expected VSIX SHA-256 is
+`3d1307502220c65d2755d7c1ef214a8117127b475fdae0c6da514f6ab3eecfd8`.
+In VS Code, choose **Extensions: Install from VSIX...** and select the package.
 
 ## Security and privacy
 
