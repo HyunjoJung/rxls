@@ -48,3 +48,9 @@ updates:
     groups:
       vscode-extension-minor-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # @types/vscode is the compile-time API contract for engines.vscode.
+      # Keep accepting 1.96.x patches while the extension supports VS Code
+      # 1.96; a newer minor requires an explicit minimum-engine migration.
+      - dependency-name: "@types/vscode"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]

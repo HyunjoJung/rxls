@@ -191,6 +191,10 @@ VBA를 포함한 손대지 않은 패키지 파트는 그대로 보존합니다.
 extension host와 webview worker 밖으로 나가지 않으며 telemetry나 외부 네트워크
 클라이언트가 없습니다.
 
+[rxls Spreadsheet Preview 0.1.0](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0)을
+검증된 VSIX로 내려받을 수 있습니다. 릴리스에는 대응하는 SHA-256 파일과 정확한
+소스 커밋, 크로스 플랫폼 CI 검증 근거가 함께 연결되어 있습니다.
+
 ### 시연 영상
 
 | 한국어 시연 | 영어 시연 |
