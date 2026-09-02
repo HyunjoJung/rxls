@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 1aabdaadb2ee8ec036cc9ca6f2312ffaab2188e85bb61d06b4525c350bd8e3cd
+- Cargo lock SHA-256: cefe2ea10199d1491ba64568b7a9296f545aaf5d2540e2a441e8d7e56df7c32d
 - Third-party packages: 84
 - Unique legal texts: 77
 
@@ -484,10 +484,10 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: serde_json 1.0.150
+PACKAGE: serde_json 1.0.151
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9
+Registry archive SHA-256: c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
@@ -1465,7 +1465,7 @@ Referenced by:
 - serde 1.0.229/LICENSE-MIT
 - serde_core 1.0.229/LICENSE-MIT
 - serde_derive 1.0.229/LICENSE-MIT
-- serde_json 1.0.150/LICENSE-MIT
+- serde_json 1.0.151/LICENSE-MIT
 - syn 2.0.119/LICENSE-MIT
 - syn 3.0.3/LICENSE-MIT
 - thiserror 2.0.20/LICENSE-MIT
@@ -2859,7 +2859,7 @@ Referenced by:
 - serde 1.0.229/LICENSE-APACHE
 - serde_core 1.0.229/LICENSE-APACHE
 - serde_derive 1.0.229/LICENSE-APACHE
-- serde_json 1.0.150/LICENSE-APACHE
+- serde_json 1.0.151/LICENSE-APACHE
 - subsetter 0.2.6/LICENSE-APACHE
 - syn 2.0.119/LICENSE-APACHE
 - syn 3.0.3/LICENSE-APACHE
