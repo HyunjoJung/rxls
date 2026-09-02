@@ -3,8 +3,10 @@ updates:
   - package-ecosystem: "cargo"
     directories:
       - "/"
+      - "/bindings/mcp"
       - "/bindings/render-wasm"
       - "/bindings/wasm"
+      - "/fuzz"
       - "/render"
       - "/render/fuzz"
       - "/render/perf"
