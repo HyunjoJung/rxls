@@ -312,6 +312,10 @@ try {
   const xlsxSource = await readFile(new URL("../samples/operations-report.xlsx", import.meta.url));
   assertZipPartsEqual(xlsxSource, xlsxDownload.bytes, ["xl/styles.xml"]);
   assertZipPartChanged(xlsxSource, xlsxDownload.bytes, "xl/worksheets/sheet1.xml");
+  await assertOpenpyxlReopens(xlsxDownload.path, {
+    expected: "Browser edited XLSX",
+    expectedTitle: "rxls browser preservation proof"
+  });
 
   await Promise.all([
     page.waitForEvent("dialog").then(async (prompt) => {
@@ -419,7 +423,10 @@ try {
   );
   assertZipPartsEqual(xlsmSource, xlsmDownload.bytes, PRESERVED_PARTS);
   assertZipPartChanged(xlsmSource, xlsmDownload.bytes, "xl/worksheets/sheet1.xml");
-  await assertOpenpyxlReopens(xlsmDownload.path, "VBA package preserved");
+  await assertOpenpyxlReopens(xlsmDownload.path, {
+    expected: "VBA package preserved",
+    requireVba: true
+  });
   await page.locator("#undo-edit").click();
   await waitForViewerState(
     page,
@@ -606,22 +613,39 @@ async function downloadWorkbook(page, extension) {
   return { fileName, bytes, path };
 }
 
-async function assertOpenpyxlReopens(workbookPath, expected) {
+async function assertOpenpyxlReopens(
+  workbookPath,
+  { expected, expectedTitle = null, requireVba = false }
+) {
   const python =
     process.env.RXLS_PYTHON || (process.platform === "win32" ? "python" : "python3");
   const script = fileURLToPath(
-    new URL("../scripts/verify-openpyxl-xlsm.py", import.meta.url)
+    new URL("../scripts/verify-openpyxl-workbook.py", import.meta.url)
   );
+  const args = [script, workbookPath, "--cell", "A1", "--expected", expected];
+  if (expectedTitle !== null) {
+    args.push("--expected-title", expectedTitle);
+  }
+  if (requireVba) {
+    args.push("--require-vba");
+  }
   const { stdout } = await execFileAsync(
     python,
-    [script, workbookPath, "--cell", "A1", "--expected", expected],
+    args,
     { timeout: 30_000 }
   );
   const report = JSON.parse(stdout);
-  assert.equal(report.schema, "rxls.viewer-openpyxl-reopen.v1");
+  assert.equal(report.schema, "rxls.viewer-openpyxl-reopen.v2");
   assert.equal(report.openpyxl, "3.1.5");
   assert.equal(report.value, expected);
-  assert.ok(report.vba_bytes >= 512);
+  if (expectedTitle !== null) {
+    assert.equal(report.title, expectedTitle);
+  }
+  if (requireVba) {
+    assert.ok(report.vba_bytes >= 512);
+  } else {
+    assert.equal(report.vba_bytes, null);
+  }
 }
 
 function assertZipPartsEqual(sourceBytes, savedBytes, partNames) {

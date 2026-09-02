@@ -25,12 +25,15 @@ env:
   WASM_BINDGEN_VERSION: "0.2.126"
   NODE_VERSION: "24.18.0"
   NPM_VERSION: "11.16.0"
+  CHROMIUM_VERSION: "150.0.7871.115"
+  CHROMIUM_ARCHIVE_SHA256: "1be2db033133c5e2dd1a4e8664bf67b19a61bcf6ed28d2b00f433b3f0b4f9585"
+  CHROMIUM_ARCHIVE_SIZE: "187332810"
 
 jobs:
   build:
     name: Build local-only workbook viewer
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -67,6 +70,18 @@ jobs:
           test "$(npm --version)" = "$NPM_VERSION"
           npm ci --prefix viewer --ignore-scripts
           npm --prefix viewer test
+      - name: Install pinned workbook reopen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/rxls-viewer-python"
+          "$RUNNER_TEMP/rxls-viewer-python/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement viewer/openpyxl-requirements.txt
+          echo "RXLS_PYTHON=$RUNNER_TEMP/rxls-viewer-python/bin/python" >> "$GITHUB_ENV"
       - name: Install exact wasm-bindgen CLI
         shell: bash
         run: |
@@ -102,6 +117,37 @@ jobs:
           test -f viewer/dist/THIRD_PARTY_NOTICES.txt
           test -f viewer/dist/runtime/pkg/rxls_render_wasm_bg.wasm
           test -f viewer/dist/samples/manifest.json
+      - name: Install exact Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          chrome_dir="$RUNNER_TEMP/rxls-viewer-chrome"
+          mkdir -p "$chrome_dir"
+          curl --fail --location --retry 3 \
+            --output "$chrome_dir/chrome.zip" \
+            "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chrome-linux64.zip"
+          test "$(stat --format=%s "$chrome_dir/chrome.zip")" = "$CHROMIUM_ARCHIVE_SIZE"
+          printf '%s  %s\n' "$CHROMIUM_ARCHIVE_SHA256" "$chrome_dir/chrome.zip" \
+            | sha256sum --check --strict
+          unzip -q "$chrome_dir/chrome.zip" -d "$chrome_dir"
+          chrome_root="$chrome_dir/chrome-linux64"
+          chmod +x "$chrome_root/chrome"
+          test -f "$chrome_root/chrome_sandbox"
+          sudo chown root:root "$chrome_root/chrome_sandbox"
+          sudo chmod 4755 "$chrome_root/chrome_sandbox"
+          test "$(stat --format=%u "$chrome_root/chrome_sandbox")" = "0"
+          test "$(stat --format=%a "$chrome_root/chrome_sandbox")" = "4755"
+          ldd "$chrome_root/chrome" | tee "$RUNNER_TEMP/rxls-viewer-chromium-ldd.txt"
+          if grep -Fq "not found" "$RUNNER_TEMP/rxls-viewer-chromium-ldd.txt"; then
+            exit 1
+          fi
+          echo "RXLS_CHROMIUM_EXECUTABLE=$chrome_root/chrome" >> "$GITHUB_ENV"
+          echo "CHROME_DEVEL_SANDBOX=$chrome_root/chrome_sandbox" >> "$GITHUB_ENV"
+      - name: Exercise exact Pages artifact in pinned Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix viewer run test:browser
       - name: Verify source remained exact and clean
         shell: bash
         env:

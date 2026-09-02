@@ -50,11 +50,13 @@ mobile captures under `target/viewer-e2e/`.
 - Hosted builds regenerate `samples/operations-report.xlsx` from
   `examples/author_report.rs` and require an exact byte-for-byte match.
 - Hosted builds verify and deploy a pinned Apache POI XLSM fixture containing a
-  real VBA project. The browser test edits and downloads it, byte-compares VBA
-  and selected untouched package parts, then reopens it with `openpyxl 3.1.5`.
+  real VBA project. The browser test reopens its edited XLSX and XLSM downloads
+  with `openpyxl 3.1.5`, checking cell and document-property edits as well as
+  byte-comparing VBA and selected untouched package parts.
 - `THIRD_PARTY_NOTICES.txt` records bundled UI and sample licenses. The
   preparation step combines it with the renderer notices in the Pages artifact.
 
-The `viewer-pages` workflow publishes `viewer/dist/` to GitHub Pages after an
-exact-source build. The `render-browser` workflow also exercises the deployed
-base path in the repository's pinned Chromium runtime.
+The `viewer-pages` workflow publishes `viewer/dist/` to GitHub Pages only after
+an exact-source build passes the browser test in the repository's pinned
+Chromium runtime. The `render-browser` workflow independently exercises the
+same deployed base path.

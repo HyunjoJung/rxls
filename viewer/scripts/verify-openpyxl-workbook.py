@@ -1,4 +1,4 @@
-"""Reopen a browser-edited XLSM with a pinned external spreadsheet library."""
+"""Reopen a browser-edited OOXML workbook with a pinned external library."""
 
 from __future__ import annotations
 
@@ -18,31 +18,42 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("workbook", type=Path)
     parser.add_argument("--cell", default="A1")
     parser.add_argument("--expected", required=True)
+    parser.add_argument("--expected-title")
+    parser.add_argument("--require-vba", action="store_true")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     workbook = None
     try:
         workbook = openpyxl.load_workbook(
-            BytesIO(args.workbook.read_bytes()), keep_vba=True, data_only=False
+            BytesIO(args.workbook.read_bytes()),
+            keep_vba=args.require_vba,
+            data_only=False,
         )
         value = workbook.active[args.cell].value
         if value != args.expected:
             raise ValueError(f"{args.cell} is {value!r}, expected {args.expected!r}")
-        if workbook.vba_archive is None:
-            raise ValueError("openpyxl did not retain the VBA package")
-        vba = workbook.vba_archive.read("xl/vbaProject.bin")
-        if not vba.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
-            raise ValueError("xl/vbaProject.bin is not an OLE compound document")
+        title = workbook.properties.title
+        if args.expected_title is not None and title != args.expected_title:
+            raise ValueError(f"document title is {title!r}, expected {args.expected_title!r}")
+        vba_bytes = None
+        if args.require_vba:
+            if workbook.vba_archive is None:
+                raise ValueError("openpyxl did not retain the VBA package")
+            vba = workbook.vba_archive.read("xl/vbaProject.bin")
+            if not vba.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
+                raise ValueError("xl/vbaProject.bin is not an OLE compound document")
+            vba_bytes = len(vba)
         report = {
-            "schema": "rxls.viewer-openpyxl-reopen.v1",
+            "schema": "rxls.viewer-openpyxl-reopen.v2",
             "openpyxl": openpyxl.__version__,
             "sheets": workbook.sheetnames,
             "cell": args.cell,
             "value": value,
-            "vba_bytes": len(vba),
+            "title": title,
+            "vba_bytes": vba_bytes,
         }
     except (InvalidFileException, KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
-        print(f"openpyxl XLSM reopen: {error}", file=sys.stderr)
+        print(f"openpyxl workbook reopen: {error}", file=sys.stderr)
         return 1
     finally:
         if workbook is not None:
