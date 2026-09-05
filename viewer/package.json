@@ -17,10 +17,10 @@
     "test:browser": "node tests/browser.mjs"
   },
   "dependencies": {
-    "lucide": "1.37.0"
+    "lucide": "1.39.0"
   },
   "devDependencies": {
-    "playwright-core": "1.54.1",
+    "playwright-core": "1.62.1",
     "vite": "8.2.2"
   },
   "engines": {
