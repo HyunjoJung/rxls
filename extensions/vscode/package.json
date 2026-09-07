@@ -110,7 +110,7 @@
     "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.2",
-    "typescript": "6.0.2"
+    "typescript": "7.0.2"
   },
   "packageManager": "npm@11.16.0"
 }
