@@ -189,6 +189,14 @@ function editableScalar(kind, value) {
       return { kind, value: String(value ?? "") };
     case "number":
     case "date": {
+      if (
+        (typeof value !== "number" && typeof value !== "string") ||
+        (typeof value === "string" && value.trim() === "")
+      ) {
+        throw new TypeError(
+          kind === "date" ? "Enter a finite Excel date serial." : "Enter a finite number."
+        );
+      }
       const number = Number(value);
       if (!Number.isFinite(number)) {
         throw new TypeError(
