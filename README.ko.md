@@ -24,6 +24,9 @@ panic 대신 처리 범위가 제한된 타입 오류로 반환합니다.
 cargo add rxls@0.1.3 --features full
 ```
 
+기여하고 싶다면 [첫 기여용 이슈](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)와
+[시작 가이드(English)](CONTRIBUTING.md#your-first-contribution)를 확인해 보세요.
+
 ## rxls를 쓰는 이유
 
 - **하나의 읽기 모델.** `Workbook::open` 한 번으로 XLS, XLSX, XLSB, ODS를
@@ -286,8 +289,12 @@ bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 
 ## 기여
 
-이슈와 pull request를 환영합니다. [CONTRIBUTING.md](CONTRIBUTING.md)는 로컬
-검증 절차, 공개 API 요구사항, 입력 범위 제한 정책, 사양 인용 규칙을 설명합니다.
+코드 변경뿐 아니라 예제, 문서, 재현 가능한 버그 보고, 회귀 테스트도 환영합니다.
+[첫 기여용 이슈](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)나
+[도움이 필요한 작업](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22)에서
+시작해 보세요. [기여 가이드(English)](CONTRIBUTING.md#your-first-contribution)는
+환경 설정, 관련 코드 위치, 변경 범위별 검증 명령을 안내합니다. 질문과 draft PR도
+환영하며, 리뷰를 요청하기 위해 전체 릴리스 검증을 먼저 실행할 필요는 없습니다.
 [Code of Conduct](.github/CODE_OF_CONDUCT.md)와
 [Security Policy](.github/SECURITY.md)도 함께 적용됩니다.
 

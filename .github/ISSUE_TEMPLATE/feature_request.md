@@ -17,8 +17,9 @@ The use case, and ideally a minimal public workbook that exercises it.
 
 ## References
 
-Relevant MS-XLS, MS-XLSB, MS-CFB, ECMA-376, or ODF sections, and how an
-independent implementation handles it.
+Relevant MS-XLS, MS-XLSB, MS-CFB, ECMA-376, or ODF sections, or how another
+implementation handles it, if known. Specification research is not required
+to describe a user need.
 
 ## Alternatives
 
