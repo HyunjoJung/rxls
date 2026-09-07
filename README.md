@@ -23,6 +23,9 @@ bounded inputs and typed failures for malformed or unsupported documents.
 cargo add rxls@0.1.3 --features full
 ```
 
+Want to help? Start with a [good first issue](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)
+and the [first-contribution guide](CONTRIBUTING.md#your-first-contribution).
+
 ## Why rxls
 
 - **One read model.** `Workbook::open` detects XLS, XLSX, XLSB, or ODS and
@@ -285,9 +288,13 @@ gated workspace surfaces and are not part of the published core crate contract.
 
 ## Contributing
 
-Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md)
-documents the local gate, public API requirements, bounded-input policy, and
-specification citation rules. See also the
+Examples, documentation, reproducible bug reports, and regression tests are
+welcome alongside code changes. Pick a [good first issue](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)
+or browse [help wanted](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22).
+The [contribution guide](CONTRIBUTING.md#your-first-contribution) explains setup,
+where the code lives, and which focused checks to run for your change. Draft
+PRs and questions are welcome; the full release matrix is not required to
+request review. See also the
 [Code of Conduct](.github/CODE_OF_CONDUCT.md) and
 [Security Policy](.github/SECURITY.md).
 

@@ -54,6 +54,10 @@ test("parses bounded A1 references", () => {
 test("builds strict typed cell edits", () => {
   assert.deepEqual(editableCell("blank"), { kind: "blank" });
   assert.deepEqual(editableCell("number", "42.5"), { kind: "number", value: 42.5 });
+  assert.deepEqual(editableCell("number", "0"), { kind: "number", value: 0 });
+  assert.deepEqual(editableCell("number", 0), { kind: "number", value: 0 });
+  assert.deepEqual(editableCell("date", "0"), { kind: "date", value: 0 });
+  assert.deepEqual(editableCell("date", 45000), { kind: "date", value: 45000 });
   assert.deepEqual(editableCell("boolean", "false"), { kind: "boolean", value: false });
   assert.deepEqual(
     editableCell("formula", "=SUM(A1:A2)", {
@@ -66,9 +70,59 @@ test("builds strict typed cell edits", () => {
       cached: { kind: "number", value: 3 }
     }
   );
+  assert.deepEqual(
+    editableCell("formula", "=A1", {
+      cachedKind: "number",
+      cachedValue: "0"
+    }),
+    {
+      kind: "formula",
+      formula: "A1",
+      cached: { kind: "number", value: 0 }
+    }
+  );
   assert.throws(() => editableCell("number", "not-a-number"), TypeError);
   assert.throws(() => editableCell("formula", "="), TypeError);
   assert.throws(() => editableCell("formula", "A1", { cachedKind: "blank" }), TypeError);
+});
+
+test("rejects empty and whitespace-only numeric and date cell inputs", () => {
+  assert.throws(() => editableCell("number", ""), TypeError);
+  assert.throws(() => editableCell("number", "   "), TypeError);
+  assert.throws(() => editableCell("date", ""), TypeError);
+  assert.throws(() => editableCell("date", "   "), TypeError);
+  assert.throws(
+    () =>
+      editableCell("formula", "=A1", {
+        cachedKind: "number",
+        cachedValue: ""
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      editableCell("formula", "=A1", {
+        cachedKind: "number",
+        cachedValue: "   "
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      editableCell("formula", "=A1", {
+        cachedKind: "date",
+        cachedValue: ""
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      editableCell("formula", "=A1", {
+        cachedKind: "date",
+        cachedValue: "   "
+      }),
+    TypeError
+  );
 });
 
 test("preserves macro-enabled save-as extensions and describes read-only reasons", () => {

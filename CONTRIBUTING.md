@@ -5,12 +5,119 @@ library that reads `.xls` (BIFF8/5/7), `.xlsx`, `.xlsb`, and `.ods`, writes
 and package-preservingly edits `.xlsx`/`.xlsm`, evaluates a deterministic
 formula subset, and exports CSV/HTML/Markdown.
 
+## Your first contribution
+
+Start with a [good first issue] or browse [help wanted]. Each task describes
+the relevant files, expected result, and a focused check. Documentation,
+usage examples, small reproductions, and tests are welcome contributions;
+you do not need to understand every spreadsheet format to help.
+
+1. Read the issue and its comments, then leave a short comment if you plan to
+   work on it so others can coordinate. Ask for pointers when the scope is
+   unclear. Small documentation corrections can go straight to a PR.
+2. Fork the repository and create a branch from `main`. Keep the change about
+   one problem. For a bug fix, add a small regression test that fails before
+   the fix and passes afterward.
+3. Open a PR against `main` with the problem, the change, and the exact checks
+   you ran. A draft PR with a reproduction or a specific question is useful
+   even when the fix is unfinished.
+
+Run the checks for your changed area below before opening a PR. You do not
+need to reproduce the full release matrix to request review. State any check
+you could not run and why; passing the applicable CI and additional
+maintainer-run gates is still required before merge or publication.
+
+If none of the listed tasks fits, open a [contribution question] with the area
+you want to work on. For larger features, discuss the user need and scope in
+an issue before implementation. Please follow the [Code of Conduct].
+
+## Set up only what you need
+
+For core Rust changes, install [Rust through rustup], then run from the
+repository root:
+
+```sh
+rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+cargo +1.85.0 test --lib --all-features --locked
+```
+
+This uses the committed lockfile and does not need Excel, Java, LibreOffice,
+Node.js, or an external workbook corpus. The first build downloads Rust
+dependencies. On macOS, put rustup's proxies before any Homebrew Rust tools
+with `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+For documentation-only edits, start with your editor and `git diff --check`.
+Check links and run any example you change. Python repository checks require
+Python 3.11 or newer.
+
+For viewer or VS Code work, use Node.js 24.18.0 with npm 11.16.0, matching the
+hosted tooling. Install only the package you are changing with
+`npm ci --prefix viewer --ignore-scripts` or
+`npm ci --prefix extensions/vscode --ignore-scripts`.
+
+The core and renderer support Rust 1.85. For the separate MCP adapter, install
+its Rust 1.88 toolchain and use `cargo +1.88.0` for that package:
+
+```sh
+rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+```
+
+Browser and installed-extension tests have extra prerequisites documented in
+their package guides.
+
+## Choose a focused check
+
+All commands below run from the repository root. For Rust changes, also run
+`cargo +1.85.0 fmt --all -- --check` (or the changed package's `cargo fmt`).
+
+| Changed area | Start here | More context |
+| --- | --- | --- |
+| Prose and links | `git diff --check`; check links and any changed example | [README](README.md), [public docs](docs/compatibility.md) |
+| Core readers, writer, editor, or formulas | `cargo +1.85.0 test --lib --all-features --locked` | `src/`, [format internals](docs/format-internals.md) |
+| CLI | `cargo +1.85.0 test --test cli --all-features --locked` | `src/main.rs`, `tests/cli.rs` |
+| Public API or fixture regressions | `cargo +1.85.0 test --test integration --test api_contract --all-features --locked` | `tests/`, [fixture provenance](tests/fixtures/README.md) |
+| Renderer | `cargo +1.85.0 test --manifest-path render/Cargo.toml --all-targets --locked` | [Renderer guide](render/README.md) |
+| Viewer application logic | `npm --prefix viewer test` | [Viewer setup and browser tests](viewer/README.md) |
+| Render worker JavaScript | `npm --prefix bindings/render-wasm test` | [Worker setup and WASM tests](bindings/render-wasm/README.md) |
+| MCP adapter | `cargo +1.88.0 test --manifest-path bindings/mcp/Cargo.toml --locked` | [MCP guide](bindings/mcp/README.md) |
+| VS Code extension | `npm --prefix extensions/vscode test` | [Extension setup and E2E tests](extensions/vscode/README.md) |
+
+You can append a test-name filter to a Cargo test command while iterating.
+Check that the output reports the intended test ran; a result with zero tests
+does not verify the change. Run the containing suite before requesting review.
+User-visible browser or extension changes also need their package's browser
+or E2E journey; unit tests alone do not check the rendered interface.
+
+Changes to readers, XML/ZIP handling, dependencies, or resource limits may
+need corpus, fuzz, or rendering-oracle checks. Describe the affected formats
+in the PR so maintainers can select the appropriate hosted runs. Contributors
+do not need registry credentials or access to maintainer release environments.
+
+## Reproductions and workbook fixtures
+
+A small generated workbook or a test built from in-memory bytes is often the
+best reproduction. Include the command or API call, enabled features, and
+expected versus actual result. An independent reader comparison helps when
+available, but is not required to report an ordinary bug.
+
+For contributed files, record the source, license, producing application when
+known, and expected values. Follow the [fixture guide](tests/fixtures/README.md)
+for committed generated fixtures and their manifest. Include only files you
+may redistribute. Remove confidential data, including hidden sheets,
+properties, comments, and macros, before sharing a workbook; recreating the
+problem with synthetic data is preferable.
+
+Report exploitable crashes, unbounded resource use, and other vulnerabilities
+through the [private security reporting channel], following the
+[Security Policy](.github/SECURITY.md).
+
 ## Ground rules
 
 - **No `unsafe`.** The crate is `#![forbid(unsafe_code)]`. Parsing untrusted
   files must never crash a host process — every byte access is bounds-checked
   and malformed input must never panic. Recovery must be bounded and preserve
-  source meaning; otherwise the input must surface as an [`Error`].
+  source meaning; otherwise the input must surface as an
+  [`Error`](https://docs.rs/rxls/latest/rxls/enum.Error.html).
 - **Document every public item.** The crate denies `missing_docs`.
 - **Keep dependencies minimal.** The default build depends only on `cfb`,
   `encoding_rs`, `thiserror`, `zip`, and `quick-xml` (the latter two behind
@@ -24,12 +131,18 @@ formula subset, and exports CSV/HTML/Markdown.
   read and write/edit paths, and edits must be preflighted so a failed edit
   never leaves a half-mutated package.
 
-## Before opening a PR
+## Full integration and release validation
+
+Maintainers and contributors working across multiple surfaces use the full
+matrix below before integration or release, together with the applicable
+hosted checks. It is a reference for broader validation, not a prerequisite
+for opening a focused or draft PR.
 
 Install the pinned registry-compatibility checker with
 `cargo install cargo-semver-checks --version 0.49.0 --locked`, ensure the
-`wasm32-unknown-unknown` Rust target is installed, then run the full local gate
-(all must pass clean):
+`wasm32-unknown-unknown` Rust target is installed, and install the oracle
+dependencies described in [Validation and reproducibility](docs/validation.md).
+Run the full local gate; all applicable checks must pass clean:
 
 On macOS, put rustup's cargo proxy before any Homebrew Rust installation so
 `cargo +1.85.0`, `cargo +nightly`, and the API checker use the pinned toolchain:
@@ -133,3 +246,9 @@ than interpreted. Larger features are welcome — open an issue first.
 [MS-XLS]: https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/
 [MS-XLSB]: https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xlsb/
 [MS-CFB]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/
+[good first issue]: https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22
+[help wanted]: https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22help%20wanted%22
+[contribution question]: https://github.com/HyunjoJung/rxls/issues/new?template=contribution_question.md
+[Code of Conduct]: .github/CODE_OF_CONDUCT.md
+[Rust through rustup]: https://rustup.rs/
+[private security reporting channel]: https://github.com/HyunjoJung/rxls/security/advisories/new

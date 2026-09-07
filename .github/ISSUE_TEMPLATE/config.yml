@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: First contribution guide
+    url: https://github.com/HyunjoJung/rxls/blob/main/CONTRIBUTING.md
+    about: Find setup instructions, code locations, and focused checks.
+  - name: Report a security vulnerability privately
+    url: https://github.com/HyunjoJung/rxls/security/advisories/new
+    about: Use private reporting for exploitable crashes, resource exhaustion, or other vulnerabilities.
