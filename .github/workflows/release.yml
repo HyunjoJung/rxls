@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
       baseline_run_id:
@@ -25,6 +26,11 @@ env:
   RELEASE_RUST_VERSION: "1.96.1"
   FUZZ_NIGHTLY_VERSION: "nightly-2026-07-10"
   CARGO_FUZZ_VERSION: "0.13.2"
+  WASM_MSRV: "1.85.0"
+  WASM_BINDGEN_BUILD_RUST: "1.88.0"
+  WASM_BINDGEN_VERSION: "0.2.126"
+  NODE_VERSION: "24.18.0"
+  NPM_VERSION: "11.16.0"
 
 jobs:
   publish:
@@ -78,7 +84,8 @@ jobs:
           python-version: "3.11"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
       - name: Dependency security, license, and source release gate
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -90,8 +97,22 @@ jobs:
       - name: Install locked wasm-bindgen and browser runtimes
         shell: bash
         run: |
-          version=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
-          cargo install wasm-bindgen-cli --version "$version" --locked
+          set -euo pipefail
+          locked=$(python3 -c 'import pathlib,tomllib; p=tomllib.loads(pathlib.Path("bindings/wasm/Cargo.lock").read_text()); print(next(x["version"] for x in p["package"] if x["name"] == "wasm-bindgen"))')
+          test "$locked" = "$WASM_BINDGEN_VERSION"
+          test -n "$RUNNER_TEMP"
+          tool_root="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION"
+          rm -rf "$tool_root"
+          mkdir -p "$tool_root"
+          rustup toolchain install "$WASM_MSRV" --profile minimal \
+            --target wasm32-unknown-unknown
+          rustup toolchain install "$WASM_BINDGEN_BUILD_RUST" --profile minimal
+          cargo "+$WASM_BINDGEN_BUILD_RUST" install \
+            wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked \
+            --root "$tool_root"
+          test "$("$tool_root/bin/wasm-bindgen" --version)" = \
+            "wasm-bindgen $WASM_BINDGEN_VERSION"
+          echo "$tool_root/bin" >> "$GITHUB_PATH"
           cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked
           npm install --prefix target/playwright --no-save --ignore-scripts playwright@1.54.1
           npm exec --prefix target/playwright -- playwright install --with-deps chromium
@@ -113,8 +134,15 @@ jobs:
         env:
           RXLS_REQUIRE_OPENPYXL: "1"
           RUSTDOCFLAGS: "-D warnings"
+        shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
+          test -n "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin:$PATH"
+          test "$(command -v wasm-bindgen)" = \
+            "$RUNNER_TEMP/rxls-wasm-bindgen-cli-$WASM_BINDGEN_VERSION/bin/wasm-bindgen"
+          test "$(node --version)" = "v$NODE_VERSION"
+          test "$(npm --version)" = "$NPM_VERSION"
           python3 scripts/check_workflow_policy.py
           python3 scripts/public_hygiene_audit.py
           cargo fmt --all -- --check
@@ -127,7 +155,7 @@ jobs:
           cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --all-features
           cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --default-features
           cargo semver-checks check-release --manifest-path Cargo.toml --baseline-version 0.1.2 --release-type patch --only-explicit-features
-          bash scripts/build-wasm-package.sh
+          RUSTUP_TOOLCHAIN="$WASM_MSRV" bash scripts/build-wasm-package.sh
           cargo run --bin rxls --all-features --locked -- diagnose tests/fixtures/xlsx/reader-structural.xlsx > target/wasm-native-report.json
           node bindings/wasm/tests/node-smoke.cjs target/wasm-package target/wasm-native-report.json \
             | tee target/wasm-node-smoke.json

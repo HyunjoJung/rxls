@@ -403,6 +403,24 @@ steps:
             "            --receipt dist/release-cargo-publish-dry-run.json\n"
         )
         mutations = {
+            "release_tag_namespace": original.replace(
+                '      - "v[0-9]*.[0-9]*.[0-9]*"',
+                '      - "v*"',
+                1,
+            ),
+            "release_tag_additive_bypass": original.replace(
+                '      - "v[0-9]*.[0-9]*.[0-9]*"',
+                '      - "v[0-9]*.[0-9]*.[0-9]*"\n      - "vscode-v*"',
+                1,
+            ),
+            "release_node_pack_runtime": original.replace(
+                'NODE_VERSION: "24.18.0"', 'NODE_VERSION: "20"', 1
+            ),
+            "release_npm_pack_runtime_guard": original.replace(
+                '          test "$(npm --version)" = "$NPM_VERSION"\n',
+                "          true\n",
+                1,
+            ),
             "bare_dry_run": original.replace(
                 runner,
                 "          cargo publish --dry-run --locked --registry crates-io\n",
@@ -3623,6 +3641,16 @@ steps:
                 'test -n "$(git rev-parse origin/main)"',
                 1,
             ),
+            "candidate_core_tag_fetch": original.replace(
+                'git fetch origin "refs/tags/v$version" --no-tags',
+                "git fetch origin --tags",
+                1,
+            ),
+            "candidate_core_tag_commit": original.replace(
+                'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+                'test -n "$(git rev-parse \'FETCH_HEAD^{commit}\')"',
+                1,
+            ),
             "hosted_event": original.replace(
                 '&& "$event" == "push" \\',
                 '&& "$event" != "" \\',
@@ -3694,6 +3722,45 @@ steps:
                 "npm pack",
                 1,
             ),
+            "canonical_latest_release": original.replace(
+                'releases/tags/$core_tag', "releases/latest", 1
+            ),
+            "canonical_draft_release": original.replace(
+                '              or release.get("draft") is not False\n', "", 1
+            ),
+            "canonical_wasm_tag_download": original.replace(
+                'gh release download "$core_tag"',
+                'gh release download "$GITHUB_REF_NAME"',
+                1,
+            ),
+            "canonical_checksum_wildcard": original.replace(
+                '            --pattern "$checksum_name" \\\n',
+                '            --pattern "*.sha256" \\\n',
+                1,
+            ),
+            "canonical_regular_file_guard": original.replace(
+                "not path.is_file() or path.is_symlink()",
+                "False",
+                1,
+            ),
+            "canonical_checksum_guard": original.replace(
+                '(cd "$canonical" && sha256sum --check --strict "$checksum_name")',
+                'test -f "$canonical/$checksum_name"',
+                1,
+            ),
+            "canonical_candidate_comparison": original.replace(
+                'cmp --silent "$output/$archive_name" "$canonical/$archive_name"',
+                'test -f "$canonical/$archive_name"',
+                1,
+            ),
+            "canonical_tag_only": original.replace(
+                "      - name: Authenticate canonical core release package\n"
+                "        env:\n",
+                "      - name: Authenticate canonical core release package\n"
+                "        if: github.event_name == 'push'\n"
+                "        env:\n",
+                1,
+            ),
             "late_source_audit": original.replace(
                 "- name: Verify evidence source remained exact and clean",
                 "- name: Trust prior source state",
@@ -3736,6 +3803,29 @@ steps:
                 "git fetch origin --tags",
                 1,
             ),
+            "publish_core_tag_fetch": original.replace(
+                '          git fetch origin "refs/tags/v$version" --no-tags\n'
+                '          test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"\n'
+                '          test "$(node --version)" = "v$NODE_VERSION"',
+                '          git fetch origin --tags\n'
+                '          test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"\n'
+                '          test "$(node --version)" = "v$NODE_VERSION"',
+                1,
+            ),
+            "publish_core_tag_commit": original.replace(
+                '          git fetch origin "refs/tags/v$version" --no-tags\n'
+                '          test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"\n'
+                '          test "$(node --version)" = "v$NODE_VERSION"',
+                '          git fetch origin "refs/tags/v$version" --no-tags\n'
+                '          test -n "$(git rev-parse \'FETCH_HEAD^{commit}\')"\n'
+                '          test "$(node --version)" = "v$NODE_VERSION"',
+                1,
+            ),
+            "transported_canonical_comparison": original.replace(
+                'cmp --silent "$archive" "$canonical_archive"',
+                'test -f "$canonical_archive"',
+                1,
+            ),
             "bootstrap_token_scope": original.replace(
                 "      - name: Publish exact package with provenance\n"
                 "        if: steps.registry.outputs.already_published != 'true'\n",
@@ -3748,6 +3838,11 @@ steps:
             "forced_publish": original.replace(
                 "--ignore-scripts --access public\n",
                 "--ignore-scripts --access public --force\n",
+                1,
+            ),
+            "publish_local_candidate": original.replace(
+                'npm publish "target/wasm-release/core-release/rxls-wasm-$version.tgz"',
+                'npm publish "target/wasm-release/rxls-wasm-$version.tgz"',
                 1,
             ),
             "registry_mismatch": original.replace(
@@ -3765,6 +3860,11 @@ steps:
                 "https://example.invalid/provenance",
                 1,
             ),
+            "registry_digest": original.replace(
+                'registry.get("dist.integrity") != packed.get("integrity")',
+                "False",
+                1,
+            ),
             "registry_signatures": original.replace(
                 "npm audit signatures --json --include-attestations",
                 "npm audit --json",
@@ -3773,6 +3873,16 @@ steps:
             "registry_workflow": original.replace(
                 "--workflow .github/workflows/wasm-package-release.yml",
                 "--workflow .github/workflows/attacker.yml",
+                1,
+            ),
+            "registry_local_candidate": original.replace(
+                '--archive "$GITHUB_WORKSPACE/$output/core-release/rxls-wasm-$version.tgz"',
+                '--archive "$GITHUB_WORKSPACE/$output/rxls-wasm-$version.tgz"',
+                1,
+            ),
+            "registry_canonical_checksum_evidence": original.replace(
+                "            target/wasm-release/core-release/rxls-wasm-*.tgz.sha256\n",
+                "",
                 1,
             ),
             "invocation_policy": original.replace(

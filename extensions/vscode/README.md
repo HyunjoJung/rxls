@@ -76,6 +76,9 @@ VSIX plus checksum under `extensions/vscode/target/`.
 
 The E2E suite opens all five formats in trusted and Restricted Mode workspaces.
 It also verifies SVG/PNG export and reload-on-change. CI repeats the format
-matrix on Linux, macOS, and Windows with VS Code 1.134.0.
+matrix on Linux, macOS, and Windows with VS Code 1.134.0, exercises a
+provider-backed virtual workspace on Linux, and installs the packaged VSIX in
+clean VS Code 1.96.0 and 1.134.0 profiles before proving activation and an XLSX
+render from the installed extension.
 
 The license is MIT. Bundled dependency notices are included in the VSIX.

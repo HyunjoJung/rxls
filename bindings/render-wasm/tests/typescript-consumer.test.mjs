@@ -54,6 +54,7 @@ import {
   type DocumentPropertiesInspection,
   type EditableCell,
   type EditMutationResult,
+  type RecalculatedEditResult,
   type EditStatusResult,
   type FontPack,
   type InspectedCell,
@@ -67,6 +68,9 @@ import {
   type RenderRequest,
   type RenderRequestOptions,
   type RenderSheetResult,
+  type RenderSheetInteractiveResult,
+  type RenderSheetInteraction,
+  type RenderCellGeometry,
   type RenderTileResult,
   type RenderWorkerConstructor,
   type RenderWorkerLike,
@@ -81,6 +85,8 @@ import {
   MAX_FONT_FILE_BYTES,
   MAX_FONT_MANIFEST_BYTES,
   MAX_INPUT_BYTES,
+  MAX_INTERACTION_CELLS,
+  MAX_INTERACTION_DIMENSION_RAW,
   MAX_OPEN_DOCUMENTS,
   MAX_OPEN_RESOURCE_BYTES,
   MAX_OPTIONS_BYTES,
@@ -110,6 +116,8 @@ import {
   validateRange,
   validateRequestId,
   validateSvgOutput,
+  interactiveSheetLimits,
+  validateInteractiveSheetOutput,
   type RenderErrorPayload,
   type RenderOperationPayloads,
   type RenderOperationResults,
@@ -183,6 +191,33 @@ const pages: RenderRequest<PreparePagesResult> = client.preparePages("document-1
   limits: { maxPages: 4 },
 });
 const sheet: RenderRequest<RenderSheetResult> = client.renderSheet("document-1", 0);
+const interactive: RenderRequest<RenderSheetInteractiveResult> = client.renderSheetInteractive(
+  "document-1", 0, { limits: { maxCells: 20 } }, requestOptions,
+);
+const genericInteractive: RenderRequest<RenderSheetInteractiveResult> = client.request(
+  "render-sheet-interactive", { documentId: "document-1", sheetIndex: 0 },
+);
+const geometry: RenderCellGeometry = [0, 0, 0, 0, 100, 20];
+const interaction: RenderSheetInteraction = { schemaVersion: 1, width: 100, height: 20, cells: [geometry] };
+const interactiveBytes: number = validateInteractiveSheetOutput(
+  { svg: "<svg></svg>", interaction }, interactiveSheetLimits({ limits: { maxCells: 20 } }),
+);
+const automatic: EditableCell = { kind: "formula-auto", formula: "=1+2" };
+client.setCell("document-1", 0, 0, 0, automatic);
+const recalculated: RenderRequest<RecalculatedEditResult> = client.setCellAndRecalculate("document-1", 0, 0, 0, automatic);
+const genericRecalculated: RenderRequest<RecalculatedEditResult> = client.request("set-cell-recalculate",
+  { documentId: "document-1", sheetIndex: 0, row: 0, col: 0, value: automatic });
+void [recalculated, genericRecalculated];
+// @ts-expect-error Geometry tuples have exactly six numeric elements.
+const shortGeometry: RenderCellGeometry = [0, 0, 0, 0, 100];
+// @ts-expect-error Sidecars carry geometry, not workbook text.
+const textGeometry: RenderCellGeometry = [0, 0, "text", 0, 100, 20];
+// @ts-expect-error Automatic formulas cannot supply a caller-invented cache.
+const automaticCache: EditableCell = { kind: "formula-auto", formula: "1", cached: { kind: "number", value: 1 } };
+// @ts-expect-error Automatic formula requests are input-only.
+const inspectedAutomatic: InspectedCell = { kind: "formula-auto", formula: "1" };
+void [interactive, genericInteractive, interactiveBytes, shortGeometry, textGeometry, automaticCache,
+  inspectedAutomatic, MAX_INTERACTION_CELLS, MAX_INTERACTION_DIMENSION_RAW];
 const tile: RenderRequest<RenderTileResult> = client.renderTile(
   "document-1",
   0,
@@ -351,6 +386,7 @@ import {
   getRenderWorkerUrl,
   type RenderCapabilities,
   type RenderPageResult,
+  type RenderSheetInteractiveResult,
 } from "@rxls/render-worker";
 import {
   PROTOCOL,
@@ -367,6 +403,11 @@ import "@rxls/render-worker/worker";
 const worker = new Worker(getRenderWorkerUrl(), { type: "module" });
 const client = new RenderWorkerClient(worker);
 const controller = new AbortController();
+const interactive: Promise<RenderSheetInteractiveResult> = client.renderSheetInteractive(
+  "document-1", 0, {}, { signal: controller.signal },
+);
+client.setCell("document-1", 0, 0, 0, { kind: "formula-auto", formula: "SUM(A2:A3)" });
+void interactive;
 const page: Promise<RenderPageResult> = client.renderPage(
   "document-1",
   0,

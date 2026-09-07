@@ -13,6 +13,8 @@ export const MAX_EDIT_HISTORY_BYTES = MAX_INPUT_BYTES;
 export const MAX_PENDING_REQUESTS = 32;
 export const MAX_PENDING_RESOURCE_BYTES = 128 * 1024 * 1024;
 export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_INTERACTION_CELLS = 250_000;
+export const MAX_INTERACTION_DIMENSION_RAW = 2_000_000 * 1024;
 export const MAX_PNG_BYTES = 16 * 1024 * 1024;
 export const MAX_SHEETS = 255;
 export const MAX_PAGES = 512;
@@ -44,12 +46,14 @@ const OPERATIONS = new Set([
   "close",
   "prepare-pages",
   "render-sheet",
+  "render-sheet-interactive",
   "render-tile",
   "render-page",
   "render-page-png",
   "edit-status",
   "read-cell",
   "set-cell",
+  "set-cell-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit",
@@ -203,7 +207,8 @@ export function preflightRequest({ operation, payload }) {
       boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
       validateCellCoordinate(payload.row, payload.col);
       return 0;
-    case "set-cell": {
+    case "set-cell":
+    case "set-cell-recalculate": {
       assertExactKeys(
         payload,
         ["documentId", "sheetIndex", "row", "col", "value"],
@@ -228,10 +233,12 @@ export function preflightRequest({ operation, payload }) {
     }
     case "prepare-pages":
     case "render-sheet":
+    case "render-sheet-interactive":
       assertExactKeys(payload, ["documentId", "sheetIndex", "options"], "payload");
       validateDocumentId(payload.documentId);
       boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
       optionsJson(payload.options);
+      if (operation === "render-sheet-interactive") interactiveSheetLimits(payload.options);
       return 0;
     case "render-tile":
       assertExactKeys(
@@ -551,6 +558,143 @@ export function validateSvgOutput(svg, maxBytes = MAX_OUTPUT_BYTES) {
   return bytes;
 }
 
+/** Resolve lower request budgets without coupling them to non-interactive paths. */
+export function interactiveSheetLimits(options = {}, capabilities = {}) {
+  const limits = options?.limits ?? {};
+  assertPlainObject(limits, "options.limits");
+  const result = {};
+  for (const [key, hard] of Object.entries({
+    maxCells: MAX_INTERACTION_CELLS,
+    maxDimensionRaw: MAX_INTERACTION_DIMENSION_RAW,
+    maxOutputBytes: MAX_OUTPUT_BYTES
+  })) {
+    const requested = limits[key] ?? hard;
+    if (!Number.isSafeInteger(requested) || requested <= 0 || requested > hard) {
+      throw limitError(key, hard, Number.isSafeInteger(requested) ? requested : 0, "options.limits");
+    }
+    const capability = capabilities[key] ?? hard;
+    if (!Number.isSafeInteger(capability) || capability <= 0 || capability > hard) {
+      throw new RenderProtocolError("wasm_api_mismatch", `invalid ${key} capability`, "wasm");
+    }
+    result[key] = Math.min(requested, capability);
+  }
+  return result;
+}
+
+/** Validate geometry and count the complete JSON envelope without allocating it. */
+export function validateInteractiveSheetOutput(value, limits = {}) {
+  const budget = interactiveSheetLimits({ limits });
+  interactionRecord(value, ["svg", "interaction"]);
+  interactionRecord(value.interaction, ["schemaVersion", "width", "height", "cells"]);
+  const { schemaVersion, width, height, cells } = value.interaction;
+  const maximum = budget.maxDimensionRaw / 1024;
+  if (schemaVersion !== 1 || !finitePositive(width) || !finitePositive(height) ||
+      width > maximum || height > maximum || !Array.isArray(cells)) {
+    throw invalidInteraction("invalid interaction schema or canvas");
+  }
+  if (cells.length > budget.maxCells) {
+    throw limitError("maxCells", budget.maxCells, cells.length, "interaction");
+  }
+  interactionArray(cells, cells.length);
+  if (typeof value.svg !== "string") throw invalidInteraction("SVG must be text");
+  let bytes = '{"svg":'.length;
+  const add = (count) => {
+    bytes += count;
+    if (bytes > budget.maxOutputBytes) {
+      throw limitError("outputBytes", budget.maxOutputBytes, bytes, "output");
+    }
+  };
+  add(2); // JSON string quotes.
+  for (let index = 0; index < value.svg.length; index += 1) {
+    const code = value.svg.charCodeAt(index);
+    if (code === 34 || code === 92) add(2);
+    else if (code < 32) add([8, 9, 10, 12, 13].includes(code) ? 2 : 6);
+    else if (code < 128) add(1);
+    else if (code < 2048) add(2);
+    else if (code >= 0xd800 && code <= 0xdbff &&
+             value.svg.charCodeAt(index + 1) >= 0xdc00 && value.svg.charCodeAt(index + 1) <= 0xdfff) {
+      add(4);
+      index += 1;
+    } else add(code >= 0xd800 && code <= 0xdfff ? 6 : 3);
+  }
+  add(',"interaction":{"schemaVersion":1,"width":'.length + String(width).length);
+  add(',"height":'.length + String(height).length + ',"cells":['.length);
+  const anchors = new Set();
+  for (let index = 0; index < cells.length; index += 1) {
+    const cell = cells[index];
+    interactionArray(cell, 6);
+    const [row, col, x, y, cellWidth, cellHeight] = cell;
+    if (!Number.isSafeInteger(row) || row < 0 || row > 1_048_575 ||
+        !Number.isSafeInteger(col) || col < 0 || col > 16_383 ||
+        !Number.isFinite(x) || x < 0 || !Number.isFinite(y) || y < 0 ||
+        !finitePositive(cellWidth) || !finitePositive(cellHeight) ||
+        x + cellWidth > width || y + cellHeight > height) {
+      throw invalidInteraction("cell rectangle or source coordinate is invalid");
+    }
+    const anchor = row * 16_384 + col;
+    if (anchors.has(anchor)) throw invalidInteraction("duplicate cell anchor");
+    anchors.add(anchor);
+    add((index === 0 ? 0 : 1) + 2 + cell.map((number) => String(number)).join(",").length);
+  }
+  add("]}}".length);
+  validateSvgOutput(value.svg, budget.maxOutputBytes);
+  return bytes;
+}
+
+function invalidInteraction(message) {
+  return new RenderProtocolError("invalid_interaction", message, "interaction");
+}
+
+function finitePositive(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function interactionRecord(value, keys) {
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+      Reflect.ownKeys(value).length !== keys.length) {
+    throw invalidInteraction("interaction record has an invalid shape");
+  }
+  for (const key of keys) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property?.enumerable || !Object.hasOwn(property, "value")) {
+      throw invalidInteraction("interaction fields must be enumerable data properties");
+    }
+  }
+}
+
+function interactionArray(value, length) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype ||
+      value.length !== length || Reflect.ownKeys(value).length !== length + 1) {
+    throw invalidInteraction("interaction arrays must have an exact dense shape");
+  }
+  for (let index = 0; index < length; index += 1) {
+    const property = Object.getOwnPropertyDescriptor(value, index);
+    if (!property?.enumerable || !Object.hasOwn(property, "value")) {
+      throw invalidInteraction("interaction arrays must contain only data elements");
+    }
+  }
+}
+
+export function validateRecalculationSummary(value) {
+  const fail = () => new RenderProtocolError("invalid_recalculation", "recalculation summary is invalid", "recalculation");
+  try {
+    interactionRecord(value, ["computedCells", "unchangedCells", "unsupportedCells", "reasons"]);
+  } catch { throw fail(); }
+  const { computedCells, unchangedCells, unsupportedCells, reasons } = value;
+  const allowed = new Set(["unsupported_function", "volatile", "external_reference",
+    "circular_reference", "unresolved_name", "unparsable_expression", "array_semantics", "sheet_not_found"]);
+  if (![computedCells, unchangedCells, unsupportedCells].every((count) => Number.isSafeInteger(count) && count >= 0) ||
+      computedCells + unsupportedCells > 10_000 || unchangedCells > computedCells ||
+      !Array.isArray(reasons) || reasons.length > allowed.size || reasons.length > unsupportedCells ||
+      (unsupportedCells > 0) !== (reasons.length > 0)) throw fail();
+  try { interactionArray(reasons, reasons.length); } catch { throw fail(); }
+  for (let index = 0; index < reasons.length; index += 1) {
+    if (!allowed.has(reasons[index]) || (index > 0 && reasons[index - 1] >= reasons[index])) throw fail();
+  }
+  return value;
+}
+
 export function normalizeError(error) {
   const code = safeToken(error?.code) ?? "worker_failed";
   const location = safeLocation(error?.location) ?? "worker";
@@ -623,6 +767,7 @@ function validateEditableCell(value, location, allowBlank) {
       }
       return;
     case "formula":
+    case "formula-auto":
       if (!allowBlank) {
         throw new RenderProtocolError(
           "invalid_edit",
@@ -630,7 +775,7 @@ function validateEditableCell(value, location, allowBlank) {
           location
         );
       }
-      assertExactKeys(value, ["kind", "formula", "cached"], location);
+      assertExactKeys(value, value.kind === "formula-auto" ? ["kind", "formula"] : ["kind", "formula", "cached"], location);
       validateEditString(value.formula, `${location}.formula`);
       if (value.formula.trim().replace(/^=+/, "").trim().length === 0) {
         throw new RenderProtocolError(
@@ -639,7 +784,7 @@ function validateEditableCell(value, location, allowBlank) {
           `${location}.formula`
         );
       }
-      validateEditableCell(value.cached, `${location}.cached`, false);
+      if (value.kind === "formula") validateEditableCell(value.cached, `${location}.cached`, false);
       return;
     default:
       throw new RenderProtocolError(

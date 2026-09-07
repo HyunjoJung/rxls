@@ -7,12 +7,15 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod interaction;
+mod recalculation;
+
 use rxls::{Cell, DocProperties, EditCapability, EditReadOnlyReason, Spreadsheet, Workbook};
 use rxls_render::{
     build_print_page, prepare_print_document, render_print_page_png, render_scene_svg,
-    render_sheet_svg, FontPack, FontPackError, FontPackLimits, FontPackMember, LimitKind,
-    PreparedPrintDocument, PrintDocument, PrintLimits, PrintOptions, RenderError, RenderLimits,
-    RenderOptions, RenderRange, RenderSelection,
+    render_sheet_interactive_svg, render_sheet_svg, FontPack, FontPackError, FontPackLimits,
+    FontPackMember, LimitKind, PreparedPrintDocument, PrintDocument, PrintLimits, PrintOptions,
+    RenderError, RenderLimits, RenderOptions, RenderRange, RenderSelection,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -347,6 +350,15 @@ enum EditableCell {
         formula: String,
         cached: EditableCachedCell,
     },
+    FormulaAuto {
+        formula: String,
+    },
+}
+
+enum ResolvedCellEdit {
+    Blank,
+    Scalar(Cell),
+    Formula { formula: String, cached: Cell },
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,6 +555,13 @@ impl RenderSession {
         self.set_cell_json_core(request_json).map_err(js_error)
     }
 
+    /// Apply one edit and atomically refresh supported formula caches with shared budgets.
+    #[wasm_bindgen(js_name = setCellRecalculateJson)]
+    pub fn set_cell_recalculate_json(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.set_cell_recalculate_json_core(request_json)
+            .map_err(js_error)
+    }
+
     /// Replace the bounded workbook document-property set atomically.
     #[wasm_bindgen(js_name = setDocumentPropertiesJson)]
     pub fn set_document_properties_json(&mut self, request_json: &str) -> Result<String, JsValue> {
@@ -576,6 +595,17 @@ impl RenderSession {
         options_json: &str,
     ) -> Result<String, JsValue> {
         self.render_sheet_svg_core(sheet_index, options_json)
+            .map_err(js_error)
+    }
+
+    /// Render a sheet and exact, text-free cell hit geometry from the same layout pass.
+    #[wasm_bindgen(js_name = renderSheetInteractiveJson)]
+    pub fn render_sheet_interactive_json(
+        &self,
+        sheet_index: usize,
+        options_json: &str,
+    ) -> Result<String, JsValue> {
+        self.render_sheet_interactive_json_core(sheet_index, options_json)
             .map_err(js_error)
     }
 
@@ -928,9 +958,26 @@ impl RenderSession {
     }
 
     fn set_cell_json_core(&mut self, request_json: &str) -> Result<String, FacadeError> {
+        self.set_cell_json_with_recalculation(request_json, false)
+    }
+
+    fn set_cell_recalculate_json_core(
+        &mut self,
+        request_json: &str,
+    ) -> Result<String, FacadeError> {
+        self.set_cell_json_with_recalculation(request_json, true)
+    }
+
+    fn set_cell_json_with_recalculation(
+        &mut self,
+        request_json: &str,
+        recalculate: bool,
+    ) -> Result<String, FacadeError> {
         let request: CellEditRequest = parse_edit_request(request_json, "cell edit")?;
         check_cell_coordinate(request.row, request.col)?;
-        if let EditableCell::Formula { formula, .. } = &request.value {
+        if let EditableCell::Formula { formula, .. } | EditableCell::FormulaAuto { formula } =
+            &request.value
+        {
             let body = formula.trim().trim_start_matches('=').trim();
             if body.is_empty() {
                 return Err(FacadeError::simple(
@@ -958,27 +1005,76 @@ impl RenderSession {
             })?;
         let row = request.row;
         let col = request.col;
-        self.apply_edit(move |spreadsheet| match request.value {
-            EditableCell::Blank => spreadsheet.clear_cell_value(&sheet_name, row, col),
-            EditableCell::Text { value } => {
-                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Text(value))
+        let edit = match request.value {
+            EditableCell::Blank => ResolvedCellEdit::Blank,
+            EditableCell::Text { value } => ResolvedCellEdit::Scalar(Cell::Text(value)),
+            EditableCell::Number { value } => ResolvedCellEdit::Scalar(Cell::Number(value)),
+            EditableCell::Date { value } => ResolvedCellEdit::Scalar(Cell::Date(value)),
+            EditableCell::Boolean { value } => ResolvedCellEdit::Scalar(Cell::Bool(value)),
+            EditableCell::Error { value } => ResolvedCellEdit::Scalar(Cell::Error(value)),
+            EditableCell::Formula { formula, cached } => ResolvedCellEdit::Formula {
+                formula,
+                cached: cached.into_cell(),
+            },
+            EditableCell::FormulaAuto { formula } => {
+                let formula = formula.trim().trim_start_matches('=').trim().to_string();
+                let cached = self.evaluate_formula_for_edit(
+                    request.sheet_index,
+                    &sheet_name,
+                    row,
+                    col,
+                    &formula,
+                )?;
+                ResolvedCellEdit::Formula { formula, cached }
             }
-            EditableCell::Number { value } => {
-                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Number(value))
+        };
+        self.apply_edit_with_recalculation(
+            move |spreadsheet| match edit {
+                ResolvedCellEdit::Blank => spreadsheet.clear_cell_value(&sheet_name, row, col),
+                ResolvedCellEdit::Scalar(value) => {
+                    spreadsheet.set_cell_value(&sheet_name, row, col, value)
+                }
+                ResolvedCellEdit::Formula { formula, cached } => {
+                    spreadsheet.set_cell_formula(&sheet_name, row, col, formula, cached)
+                }
+            },
+            recalculate,
+        )
+    }
+
+    fn evaluate_formula_for_edit(
+        &self,
+        sheet_index: usize,
+        sheet_name: &str,
+        row: u32,
+        col: u16,
+        formula: &str,
+    ) -> Result<Cell, FacadeError> {
+        ensure_editable(&self.spreadsheet)?;
+        // The session already holds a validated, bounded workbook. Replace only
+        // the target in a temporary clone; last-write-wins lookup ensures both
+        // direct and transitive cycles see the candidate formula, not old data.
+        // The temporary fallback value is never accepted or persisted.
+        let mut candidate = self.workbook.clone();
+        candidate.sheets[sheet_index].write_formula(
+            row,
+            col,
+            formula,
+            Cell::Error("#N/A".to_string()),
+        );
+        match candidate.evaluate_cell(sheet_name, row, col) {
+            rxls::FormulaEvaluation::Computed(value) => match value {
+                Cell::Number(value) | Cell::Date(value) if !value.is_finite() => {
+                    Err(unsupported_automatic_formula("nonfinite_result"))
+                }
+                Cell::Formula { .. } => Err(unsupported_automatic_formula("non_scalar_result")),
+                value => Ok(value),
+            },
+            rxls::FormulaEvaluation::Fallback { reason, .. } => {
+                Err(unsupported_automatic_formula(reason.code()))
             }
-            EditableCell::Date { value } => {
-                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Date(value))
-            }
-            EditableCell::Boolean { value } => {
-                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Bool(value))
-            }
-            EditableCell::Error { value } => {
-                spreadsheet.set_cell_value(&sheet_name, row, col, Cell::Error(value))
-            }
-            EditableCell::Formula { formula, cached } => {
-                spreadsheet.set_cell_formula(&sheet_name, row, col, formula, cached.into_cell())
-            }
-        })
+            _ => Err(unsupported_automatic_formula("unsupported_evaluation")),
+        }
     }
 
     fn set_document_properties_json_core(
@@ -995,14 +1091,35 @@ impl RenderSession {
         &mut self,
         edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
     ) -> Result<String, FacadeError> {
+        self.apply_edit_with_recalculation(edit, false)
+    }
+
+    fn apply_edit_with_recalculation(
+        &mut self,
+        edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
+        recalculate: bool,
+    ) -> Result<String, FacadeError> {
         ensure_editable(&self.spreadsheet)?;
         let previous = self.snapshot()?;
         let mut candidate = self.spreadsheet.clone();
         edit(&mut candidate).map_err(map_edit_error)?;
         let bytes = candidate.save().map_err(map_edit_error)?;
         check_saved_workbook(&bytes)?;
-        let workbook = parse_workbook(&bytes)?;
+        let mut workbook = parse_workbook(&bytes)?;
         validate_session_workbook(&workbook)?;
+
+        let recalculation = if recalculate {
+            let summary = recalculation::apply(&mut candidate, &workbook)?;
+            if summary.changed_cells() > 0 {
+                let bytes = candidate.save().map_err(map_edit_error)?;
+                check_saved_workbook(&bytes)?;
+                workbook = parse_workbook(&bytes)?;
+                validate_session_workbook(&workbook)?;
+            }
+            Some(summary)
+        } else {
+            None
+        };
 
         let mut edited_parts = self.edited_parts.clone();
         for part in candidate.edited_parts() {
@@ -1032,6 +1149,11 @@ impl RenderSession {
                 edited_parts: &edited_parts,
             },
         )?;
+        let output = if let Some(summary) = recalculation {
+            summary.append_to_result(output)?
+        } else {
+            output
+        };
         self.undo.push(previous);
         self.redo.clear();
         apply_history_projection(&mut self.undo, &mut self.redo, &projection);
@@ -1159,6 +1281,20 @@ impl RenderSession {
         render_sheet_svg(&self.workbook, sheet_index, &effective.render)
             .map(|output| output.svg)
             .map_err(map_render_error)
+    }
+
+    fn render_sheet_interactive_json_core(
+        &self,
+        sheet_index: usize,
+        options_json: &str,
+    ) -> Result<String, FacadeError> {
+        let request = parse_options(options_json)?;
+        let effective = effective_options(&request, self.font_pack.as_ref())?;
+        check_font_bytes(self.font_pack_bytes, effective.resources.font_bytes)?;
+        check_embedded_images(&self.workbook, effective.resources)?;
+        let output = render_sheet_interactive_svg(&self.workbook, sheet_index, &effective.render)
+            .map_err(map_render_error)?;
+        interaction::serialize(output, effective.render.limits.max_output_bytes)
     }
 
     fn render_tile_svg_core(
@@ -1831,6 +1967,14 @@ fn enforce_output(actual: usize, limit: u64) -> Result<(), FacadeError> {
     Ok(())
 }
 
+fn unsupported_automatic_formula(reason: &str) -> FacadeError {
+    FacadeError::simple(
+        "unsupported_formula",
+        format!("formula cannot be evaluated deterministically: {reason}; use the typed editor to supply an explicit cached value"),
+        "edit.value.formula",
+    )
+}
+
 fn map_render_error(error: RenderError) -> FacadeError {
     match error {
         RenderError::SheetIndexOutOfRange {
@@ -1927,6 +2071,344 @@ mod tests {
             &rxls::Format::new().set_bold(),
         );
         workbook.to_xlsx()
+    }
+
+    #[test]
+    fn interactive_sheet_json_is_exact_bounded_and_keeps_standard_svg_unchanged() {
+        let session = RenderSession::new_core(&authored_workbook(), &[]).unwrap();
+        let options = r#"{"range":{"firstRow":0,"firstCol":0,"lastRow":1,"lastCol":1}}"#;
+        let result = session
+            .render_sheet_interactive_json_core(0, options)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert_eq!(
+            value["svg"],
+            session.render_sheet_svg_core(0, options).unwrap()
+        );
+        let map = &value["interaction"];
+        assert_eq!(map.as_object().unwrap().len(), 4);
+        assert_eq!(map["schemaVersion"], 1);
+        assert_eq!(map["cells"].as_array().unwrap().len(), 4);
+        assert!(map["width"].as_f64().unwrap() > 0.0);
+        assert!(map["height"].as_f64().unwrap() > 0.0);
+        for cell in map["cells"].as_array().unwrap() {
+            assert_eq!(cell.as_array().unwrap().len(), 6);
+            assert!(cell[2].as_f64().unwrap() >= 0.0);
+            assert!(cell[3].as_f64().unwrap() >= 0.0);
+            assert!(cell[4].as_f64().unwrap() > 0.0);
+            assert!(cell[5].as_f64().unwrap() > 0.0);
+        }
+        let mut capped: serde_json::Value = serde_json::from_str(options).unwrap();
+        capped["limits"] = serde_json::json!({"maxOutputBytes":result.len()});
+        assert_eq!(
+            session
+                .render_sheet_interactive_json_core(0, &capped.to_string())
+                .unwrap(),
+            result
+        );
+        capped["limits"]["maxOutputBytes"] = serde_json::json!(result.len() - 1);
+        let error = session
+            .render_sheet_interactive_json_core(0, &capped.to_string())
+            .unwrap_err();
+        assert_eq!(error.resource, Some("outputBytes"));
+        assert_eq!(error.limit, Some((result.len() - 1) as u64));
+        assert!(error.actual.unwrap() > error.limit.unwrap());
+        // The old SVG-only operation still fits: the rejected excess is the
+        // combined JSON envelope/escaping/geometry, not merely the SVG bytes.
+        assert!(session
+            .render_sheet_svg_core(0, &capped.to_string())
+            .is_ok());
+        capped["limits"] = serde_json::json!({"maxCells":3});
+        assert_eq!(
+            session
+                .render_sheet_interactive_json_core(0, &capped.to_string())
+                .unwrap_err()
+                .resource,
+            Some("cells")
+        );
+    }
+
+    #[test]
+    fn automatic_formula_uses_deterministic_reference_cache_and_round_trips_history() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data").write_number(0, 0, 7.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"formula-auto","formula":"=A1*2+SUM(A1,3)"}}"#).unwrap();
+        let read: serde_json::Value =
+            serde_json::from_str(&session.read_cell_json_core(0, 0, 1).unwrap()).unwrap();
+        assert_eq!(read["value"]["kind"], "formula");
+        assert_eq!(read["value"]["formula"], "A1*2+SUM(A1,3)");
+        assert_eq!(
+            read["value"]["cached"],
+            serde_json::json!({"kind":"number","value":24.0})
+        );
+        let saved = session.save_document_bytes_core().unwrap();
+        let reopened = Workbook::open(&saved).unwrap();
+        assert!(
+            matches!(reopened.sheets[0].cell(0,1),Some(Cell::Formula { cached,.. }) if **cached==Cell::Number(24.0))
+        );
+        session.undo_edit_core().unwrap();
+        assert!(session.workbook.sheets[0].cell(0, 1).is_none());
+        session.redo_edit_core().unwrap();
+        assert!(
+            matches!(session.workbook.sheets[0].cell(0,1),Some(Cell::Formula { cached,.. }) if **cached==Cell::Number(24.0))
+        );
+    }
+
+    #[test]
+    fn automatic_formula_failures_do_not_mutate_cells_history_or_saved_bytes() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_number(0, 0, 7.0);
+        sheet.write_formula(0, 1, "A1", 7.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let before = session.save_document_bytes_core().unwrap();
+        let state = session.edit_state_value();
+        for formula in [
+            "=NOW()",
+            "=NOTASUPPORTEDFUNCTION(1)",
+            "=A1+1",
+            "=B1+1",
+            "= ",
+            "",
+        ] {
+            let request = serde_json::json!({"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula-auto","formula":formula}});
+            let error = session
+                .set_cell_json_core(&request.to_string())
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if formula.trim().trim_start_matches('=').trim().is_empty() {
+                    "invalid_edit"
+                } else {
+                    "unsupported_formula"
+                },
+                "{formula}"
+            );
+            assert_eq!(session.edit_state_value(), state, "{formula}");
+            assert_eq!(
+                session.save_document_bytes_core().unwrap(),
+                before,
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_formula_supports_cross_sheet_zero_text_boolean_and_error_results() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data");
+        workbook.add_sheet("Other Sheet").write_number(0, 0, 9.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        for (formula, expected) in [
+            ("='Other Sheet'!A1-9", Cell::Number(0.0)),
+            ("=\"hello\"", Cell::Text("hello".to_string())),
+            ("=1=1", Cell::Bool(true)),
+            ("=1/0", Cell::Error("#DIV/0!".to_string())),
+        ] {
+            let request = serde_json::json!({"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula-auto","formula":formula}});
+            session.set_cell_json_core(&request.to_string()).unwrap();
+            assert!(
+                matches!(session.workbook.sheets[0].cell(0,0),Some(Cell::Formula {cached,..}) if **cached==expected),
+                "{formula}"
+            );
+        }
+        let previous = session.save_document_bytes_core().unwrap();
+        assert!(session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula-auto","formula":"=1+1","cached":{"kind":"number","value":99}}}"#).is_err());
+        assert_eq!(session.save_document_bytes_core().unwrap(), previous);
+    }
+
+    #[test]
+    fn recalculating_edit_refreshes_operations_sum_and_saves_the_new_cache() {
+        let bytes = include_bytes!("../../../viewer/public/samples/operations-report.xlsx");
+        let mut session = RenderSession::new_core(bytes, &[]).unwrap();
+        let response = session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":3,"col":2,"value":{"kind":"number","value":7}}"#,
+            )
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["recalculation"],
+            serde_json::json!({
+                "computedCells":1,"unchangedCells":0,"unsupportedCells":0,"reasons":[],
+            })
+        );
+        assert_eq!(response["editState"]["undoDepth"], 1);
+        let reopened = Workbook::open(&session.save_document_bytes_core().unwrap()).unwrap();
+        assert!(
+            matches!(reopened.sheets[0].cell(9, 2), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(954_007.0))
+        );
+        session.undo_edit_core().unwrap();
+        assert!(
+            matches!(session.workbook.sheets[0].cell(9, 2), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(1_374_000.0))
+        );
+        session.redo_edit_core().unwrap();
+        assert!(
+            matches!(session.workbook.sheets[0].cell(9, 2), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(954_007.0))
+        );
+    }
+
+    #[test]
+    fn recalculating_edit_uses_one_snapshot_across_sheets_and_skips_unchanged_parts() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_number(0, 0, 7.0);
+        sheet.write_formula(0, 1, "A1*2", 14.0);
+        workbook
+            .add_sheet("Other")
+            .write_formula(0, 0, "Data!B1+1", 15.0);
+        workbook
+            .add_sheet("Unchanged")
+            .write_formula(0, 0, "1+1", 2.0);
+        let bytes = workbook.to_xlsx();
+        let edit = r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":9}}"#;
+        let mut legacy = RenderSession::new_core(&bytes, &[]).unwrap();
+        let legacy_result: serde_json::Value =
+            serde_json::from_str(&legacy.set_cell_json_core(edit).unwrap()).unwrap();
+        assert!(legacy_result.get("recalculation").is_none());
+        assert!(
+            matches!(legacy.workbook.sheets[0].cell(0, 1), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(14.0))
+        );
+
+        let mut session = RenderSession::new_core(&bytes, &[]).unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&session.set_cell_recalculate_json_core(edit).unwrap()).unwrap();
+        assert_eq!(
+            response["recalculation"],
+            serde_json::json!({
+                "computedCells":3,"unchangedCells":1,"unsupportedCells":0,"reasons":[],
+            })
+        );
+        assert_eq!(
+            response["editState"]["editedParts"],
+            serde_json::json!(["xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"])
+        );
+        assert!(
+            matches!(session.workbook.sheets[0].cell(0, 1), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(18.0))
+        );
+        assert!(
+            matches!(session.workbook.sheets[1].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(19.0))
+        );
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["undoDepth"], 0);
+        assert!(
+            matches!(session.workbook.sheets[1].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(15.0))
+        );
+        session.redo_edit_core().unwrap();
+        assert!(
+            matches!(session.workbook.sheets[1].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(19.0))
+        );
+    }
+
+    #[test]
+    fn recalculating_edit_reports_unsupported_formulas_without_rewriting_their_caches() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data").write_number(0, 0, 7.0);
+        let sheet = workbook.add_sheet("Unsupported");
+        sheet.write_formula(0, 0, "NOW()", 42.0);
+        sheet.write_formula(0, 1, "A1+1", 43.0);
+        sheet.write_formula(0, 2, "NOTSUPPORTED(1)", 99.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let response: serde_json::Value = serde_json::from_str(
+            &session
+                .set_cell_recalculate_json_core(
+                    r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":8}}"#,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            response["recalculation"],
+            serde_json::json!({
+                "computedCells":0,"unchangedCells":0,"unsupportedCells":3,"reasons":["unsupported_function","volatile"],
+            })
+        );
+        assert_eq!(
+            response["editState"]["editedParts"],
+            serde_json::json!(["xl/worksheets/sheet1.xml"])
+        );
+        for (col, expected) in [(0, 42.0), (1, 43.0), (2, 99.0)] {
+            assert!(
+                matches!(session.workbook.sheets[1].cell(0, col), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn formula_text_budget_failures_preserve_edits_saved_bytes_and_redo() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "x");
+        for row in 1..=21 {
+            sheet.write_formula(row, 0, format!("A{row}&A{row}"), 0.0);
+        }
+        sheet.write_number(0, 1, 7.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"number","value":8}}"#,
+            )
+            .unwrap();
+        session.undo_edit_core().unwrap();
+        let before = session.save_document_bytes_core().unwrap();
+        let state = session.edit_state_value();
+        let error = session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"formula-auto","formula":"=A22"}}"#).unwrap_err();
+        assert_eq!(error.code, "unsupported_formula");
+        assert!(error.message.contains("text_limit_exceeded"));
+        assert_eq!(session.edit_state_value(), state);
+        assert_eq!(session.save_document_bytes_core().unwrap(), before);
+
+        let error = session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"number","value":9}}"#,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "recalculation_failed");
+        assert_eq!(error.location, "recalculation");
+        assert!(error.message.contains("text_limit_exceeded"));
+        assert_eq!(session.edit_state_value(), state);
+        assert_eq!(session.save_document_bytes_core().unwrap(), before);
+        assert_eq!(
+            session.workbook.sheets[0].cell(0, 1),
+            Some(&Cell::Number(7.0))
+        );
+        session.redo_edit_core().unwrap();
+        assert_eq!(
+            session.workbook.sheets[0].cell(0, 1),
+            Some(&Cell::Number(8.0))
+        );
+    }
+
+    #[test]
+    fn recalculating_edit_preserves_unchanged_date_formatted_formula_parts() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data").write_number(0, 0, 1.0);
+        workbook.add_sheet("Date").write_formula_with_format(
+            0,
+            0,
+            "45000",
+            45_000.0,
+            &rxls::Format::new().set_num_format("yyyy-mm-dd"),
+        );
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        assert!(
+            matches!(session.workbook.sheets[1].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Date(45_000.0))
+        );
+        let response: serde_json::Value = serde_json::from_str(
+            &session
+                .set_cell_recalculate_json_core(
+                    r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":2}}"#,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["recalculation"]["unchangedCells"], 1);
+        assert_eq!(
+            response["editState"]["editedParts"],
+            serde_json::json!(["xl/worksheets/sheet1.xml"])
+        );
     }
 
     #[test]

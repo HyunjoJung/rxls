@@ -152,6 +152,67 @@ export async function runBrowserScenario({
       throw new Error(`unexpected progress sequence: ${JSON.stringify(progress)}`);
     }
 
+    result.textContent = "STEP interactive sheet geometry";
+    const interactiveOptions = {
+      range: { firstRow: 1, firstCol: 1, lastRow: 2, lastCol: 2 },
+      limits: { maxCells: fixture.metadata.cells, ...imageLimits }
+    };
+    let interactive = await timed(
+      client.renderSheetInteractive(opened.documentId, 0, interactiveOptions),
+      "interactive sheet geometry"
+    );
+    let plainInteractive = await timed(
+      client.renderSheet(opened.documentId, 0, interactiveOptions),
+      "plain sheet interactive parity"
+    );
+    if (interactive.documentId !== opened.documentId || interactive.sheetIndex !== 0 ||
+        interactive.mimeType !== "image/svg+xml" || interactive.svg !== plainInteractive.svg ||
+        interactive.interaction.schemaVersion !== 1 || interactive.interaction.cells.length !== 4 ||
+        !interactive.interaction.cells.some(([row, col]) => row === 1 && col === 1) ||
+        !interactive.interaction.cells.some(([row, col]) => row === 2 && col === 2)) {
+      throw new Error("interactive SVG parity or original cell anchors changed");
+    }
+    validateSvgOutput(interactive.svg);
+    await captureRejection(
+      client.renderSheetInteractive(opened.documentId, 0, {
+        ...interactiveOptions,
+        limits: { ...interactiveOptions.limits, maxOutputBytes: byteLength(interactive.svg) }
+      }),
+      (error) => error.code === "limit_exceeded",
+      "interactive combined SVG and geometry output budget"
+    );
+    interactive = null;
+    plainInteractive = null;
+
+    result.textContent = "STEP atomic dependent recalculation";
+    const editDocument = await timed(client.open(fixture.workbook, { documentId: "browser-recalculation" }), "open recalculation fixture");
+    await timed(client.setCell(editDocument.documentId, 0, 0, 0, { kind: "number", value: 2 }), "seed numeric reference");
+    await timed(client.setCellAndRecalculate(editDocument.documentId, 0, 0, 1,
+      { kind: "formula-auto", formula: "=A1*2" }), "seed automatic formula");
+    const recalculated = await timed(client.setCellAndRecalculate(editDocument.documentId, 0, 0, 0,
+      { kind: "number", value: 3 }), "dependent recalculation");
+    if (recalculated.recalculation.computedCells !== 1 || recalculated.recalculation.unchangedCells !== 0 ||
+        recalculated.recalculation.unsupportedCells !== 0 || recalculated.recalculation.reasons.length !== 0) {
+      throw new Error("dependent recalculation summary changed");
+    }
+    for (const [step, expected] of [["updated", 6], ["undo", 4], ["redo", 6]]) {
+      if (step === "undo") await timed(client.undoEdit(editDocument.documentId), "undo recalculation");
+      if (step === "redo") await timed(client.redoEdit(editDocument.documentId), "redo recalculation");
+      const inspected = await timed(client.readCell(editDocument.documentId, 0, 0, 1), `${step} formula cache`);
+      if (inspected.value.kind !== "formula" || inspected.value.formula !== "A1*2" ||
+          inspected.value.cached.kind !== "number" || inspected.value.cached.value !== expected) {
+        throw new Error(`${step} did not preserve the atomic dependent formula cache`);
+      }
+    }
+    const savedRecalculation = await timed(client.saveDocument(editDocument.documentId), "save recalculated workbook");
+    await client.closeDocument(editDocument.documentId);
+    const reopenedRecalculation = await timed(client.open(savedRecalculation.bytes,
+      { documentId: "browser-recalculation-saved" }), "reopen recalculated workbook");
+    const savedFormula = await timed(client.readCell(reopenedRecalculation.documentId, 0, 0, 1), "read saved formula cache");
+    if (savedFormula.value.kind !== "formula" || savedFormula.value.cached.kind !== "number" ||
+        savedFormula.value.cached.value !== 6) throw new Error("saved dependent cache was stale");
+    await client.closeDocument(reopenedRecalculation.documentId);
+
     result.textContent = "STEP pagination";
     const pageMap = await timed(
       client.preparePages(opened.documentId, 0),

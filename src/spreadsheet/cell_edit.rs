@@ -6,8 +6,9 @@ use crate::{Cell, Error, Result};
 
 use super::{
     invalidate_calc_chain, newly_touched, peek_part_tree, remember_edited_part,
-    validate_edit_cell_text, validate_xml_value, worksheet_path, Spreadsheet,
+    validate_edit_cell_text, validate_xml_value, workbook_path, worksheet_path, Spreadsheet,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_EDIT_RANGE_CELLS: u64 = 10_000;
 
@@ -30,6 +31,97 @@ impl Spreadsheet {
         let sheet_name = sheet_name.to_string();
         self.mutate_atomic(move |candidate| {
             candidate.set_cell_value_in_place(&sheet_name, row, col, &value)
+        })
+    }
+
+    /// Refresh caches of up to 10,000 distinct formula cells in one transaction.
+    ///
+    /// Each tuple contains a sheet name, zero-based row and column, and typed
+    /// scalar cached value. Coordinates, unambiguous sheet names, existing formula
+    /// targets, duplicates, and cell-value limits are validated before mutation.
+    /// Original formula nodes, including shared/array attributes and source text,
+    /// are preserved. A failed update or final serialization leaves the retained
+    /// package and edited-part list unchanged. This method does not evaluate cells.
+    /// The parsed workbook view is unchanged until the saved bytes are reopened.
+    pub fn set_formula_cached_values(&mut self, updates: &[(&str, u32, u16, Cell)]) -> Result<()> {
+        self.ensure_editable()?;
+        if updates.len() as u64 > MAX_EDIT_RANGE_CELLS {
+            return Err(Error::Zip("cell update batch exceeds 10000 cells"));
+        }
+        let package = self.package.as_ref().ok_or(Error::Zip(
+            "spreadsheet is read-only for package-preserving edit",
+        ))?;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        peek_part_tree(
+            package,
+            &workbook_path(package),
+            Error::MissingWorkbook,
+            |tree| {
+                let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+                let sheets = tree
+                    .child_by_name(root, b"sheets")
+                    .ok_or(Error::MissingWorkbook)?;
+                let mut names = BTreeSet::new();
+                for &sheet in tree.children_of(sheets) {
+                    if let Some(name) = tree.attr_value(sheet, b"name") {
+                        if !names.insert(name.to_ascii_lowercase()) {
+                            return Err(Error::Zip(
+                                "formula cache batch requires unambiguous sheet names",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut sheet_paths: BTreeMap<&str, String> = BTreeMap::new();
+        let mut targets: BTreeMap<String, BTreeMap<(u32, u16), usize>> = BTreeMap::new();
+        for (index, (sheet_name, row, col, value)) in updates.iter().enumerate() {
+            if *row > 1_048_575 || *col > 16_383 {
+                return Err(Error::Zip("cell is outside the Excel grid"));
+            }
+            if matches!(value, Cell::Formula { .. }) {
+                return Err(Error::Zip("formula cache must be a scalar cell value"));
+            }
+            validate_edit_cell_value(value)?;
+            let path = match sheet_paths.entry(*sheet_name) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(worksheet_path(package, sheet_name)?)
+                }
+            };
+            if targets
+                .entry(path.clone())
+                .or_default()
+                .insert((*row, *col), index)
+                .is_some()
+            {
+                return Err(Error::Zip("cell update batch contains a duplicate target"));
+            }
+        }
+        for (path, requested) in &targets {
+            peek_part_tree(package, path, Error::MissingWorkbook, |tree| {
+                sml_formula_cache_targets(tree, requested).map(|_| ())
+            })?;
+        }
+        self.mutate_atomic(|candidate| {
+            let package = candidate.package.as_mut().ok_or(Error::MissingWorkbook)?;
+            let before = package.touched_parts();
+            for (path, requested) in &targets {
+                let tree = package.part_tree_mut(path)?;
+                for (index, cell) in sml_formula_cache_targets(tree, requested)? {
+                    sml_set_formula_cached_value(tree, cell, &updates[index].3)?;
+                }
+            }
+            for part in newly_touched(&before, package) {
+                remember_edited_part(&mut candidate.edited_parts, part);
+            }
+            for part in invalidate_calc_chain(package)? {
+                remember_edited_part(&mut candidate.edited_parts, part);
+            }
+            Ok(())
         })
     }
 
@@ -455,6 +547,32 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         }
     };
 
+    sml_replace_cell_value(tree, cell, type_attr, &frag, true)
+}
+
+fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) -> Result<()> {
+    let (type_attr, encoded) = match value {
+        Cell::Text(text) => (CellTypeAttr::Set(b"str"), esc_text(text)),
+        Cell::Number(number) | Cell::Date(number) => (CellTypeAttr::Remove, num_str(*number)),
+        Cell::Bool(value) => (
+            CellTypeAttr::Set(b"b"),
+            if *value { "1" } else { "0" }.to_string(),
+        ),
+        Cell::Error(error) => (CellTypeAttr::Set(b"e"), esc_text(error)),
+        Cell::Formula { .. } => {
+            return Err(Error::Zip("formula cache must be a scalar cell value"))
+        }
+    };
+    sml_replace_cell_value(tree, cell, type_attr, &format!("<v>{encoded}</v>"), false)
+}
+
+fn sml_replace_cell_value(
+    tree: &mut XmlTree,
+    cell: NodeId,
+    type_attr: CellTypeAttr,
+    frag: &str,
+    replace_formula: bool,
+) -> Result<()> {
     // Preflight 1: the value fragment must fit under the node budget. Parse
     // it as a throwaway tree (exactly what `insert_fragment_at` does
     // internally) and compare against `tree`'s CURRENT node count -- valid
@@ -476,6 +594,9 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
     // Both preflights passed: it is now safe to drop the old value before
     // writing the new one.
     for name in [b"v".as_slice(), b"f".as_slice(), b"is".as_slice()] {
+        if name == b"f" && !replace_formula {
+            continue;
+        }
         if let Some(child) = tree.child_by_name(cell, name) {
             tree.remove_child(cell, child)?;
         }
@@ -487,6 +608,43 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
     let idx = tree.children_of(cell).len();
     tree.insert_fragment_at(cell, idx, frag.as_bytes())?;
     Ok(())
+}
+
+fn sml_formula_cache_targets(
+    tree: &XmlTree,
+    requested: &BTreeMap<(u32, u16), usize>,
+) -> Result<Vec<(usize, NodeId)>> {
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    let data = tree
+        .child_by_name(root, b"sheetData")
+        .ok_or(Error::MissingWorkbook)?;
+    let mut found = Vec::with_capacity(requested.len());
+    let mut seen = BTreeSet::new();
+    // Scan the retained cell tree once per sheet, not once per cache update.
+    for &row in tree.children_of(data) {
+        for &cell in tree.children_of(row) {
+            let coordinate = tree
+                .attr_value(cell, b"r")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(super::selection::parse_a1_cell);
+            if let Some((coordinate, index)) = coordinate
+                .and_then(|coordinate| requested.get(&coordinate).map(|index| (coordinate, *index)))
+            {
+                if !seen.insert(coordinate) || tree.child_by_name(cell, b"f").is_none() {
+                    return Err(Error::Zip(
+                        "formula cache target must be one existing formula cell",
+                    ));
+                }
+                found.push((index, cell));
+            }
+        }
+    }
+    if found.len() != requested.len() {
+        return Err(Error::Zip(
+            "formula cache target must be one existing formula cell",
+        ));
+    }
+    Ok(found)
 }
 
 /// Find-or-create the `<c>` for 0-based `(row, col)` in `tree`'s worksheet

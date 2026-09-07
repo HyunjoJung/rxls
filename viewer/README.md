@@ -6,6 +6,21 @@ ODS files in one interface without sending workbook bytes to a server. Retained
 XLSX/XLSM packages can be edited and downloaded as a new workbook; XLS, XLSB,
 and ODS stay read-only.
 
+## Editing a workbook
+
+In the current source build, click a rendered cell once in editable sheet view
+to edit it directly,
+or edit its value in the formula bar. Enter commits and moves down; Tab commits
+and moves across; Escape cancels the draft. A leading `=` enters a formula.
+The typed-cell dialog remains available for explicit value kinds and cached
+formula values.
+
+Committed edits refresh formulas supported by the deterministic evaluator in
+the same undo step. Unsupported formulas keep their cached values and produce
+a visible warning; this is not full Excel recalculation. Save downloads a new
+XLSX/XLSM copy and never overwrites the local source file. XLS, XLSB, ODS, and
+the embedded VS Code preview remain read-only.
+
 ## Development
 
 Build the render worker first, then prepare the static inputs and start Vite:
@@ -60,3 +75,6 @@ The `viewer-pages` workflow publishes `viewer/dist/` to GitHub Pages only after
 an exact-source build passes the browser test in the repository's pinned
 Chromium runtime. The `render-browser` workflow independently exercises the
 same deployed base path.
+Manual dispatch defaults to verification only (`deploy=false`). Publishing
+requires the explicit deployment input on canonical `main`, or the existing
+main-push trigger; both deployment paths verify the exact remote main revision.

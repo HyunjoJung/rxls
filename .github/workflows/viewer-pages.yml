@@ -14,9 +14,15 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to Pages after verification (canonical main only)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
-  group: pages
+  group: viewer-${{ (github.repository == 'HyunjoJung/rxls' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.deploy == true)) && 'pages' || format('verify-{0}', github.ref) }}
   cancel-in-progress: true
 
 env:
@@ -36,6 +42,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      deploy_pages: ${{ steps.mode.outputs.deploy_pages }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,6 +58,23 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+      - name: Select viewer publication mode
+        id: mode
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          REQUEST_DEPLOYMENT: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy == true) }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUEST_DEPLOYMENT" != "true" ]; then
+            echo "deploy_pages=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$GITHUB_REF" = "refs/heads/main"
+          remote_main="$(git ls-remote --exit-code https://github.com/HyunjoJung/rxls.git refs/heads/main)"
+          test "$remote_main" = "$(printf '%s\trefs/heads/main' "$EXPECTED_SHA")"
+          echo "deploy_pages=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.RENDER_MSRV }}
@@ -62,6 +87,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
       - name: Configure GitHub Pages
+        if: steps.mode.outputs.deploy_pages == 'true'
         id: pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Verify viewer dependencies and application logic
@@ -100,7 +126,7 @@ jobs:
       - name: Build exact worker and Pages artifact
         shell: bash
         env:
-          RXLS_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          RXLS_BASE_PATH: ${{ steps.pages.outputs.base_path || '/rxls' }}/
         run: |
           set -euo pipefail
           test -n "$RUNNER_TEMP"
@@ -158,6 +184,7 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
       - name: Upload GitHub Pages artifact
+        if: steps.mode.outputs.deploy_pages == 'true'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: viewer/dist
@@ -165,6 +192,7 @@ jobs:
   deploy:
     name: Deploy workbook viewer
     needs: build
+    if: needs.build.outputs.deploy_pages == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -174,6 +202,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Recheck exact canonical main before deployment
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$GITHUB_REF" = "refs/heads/main"
+          remote_main="$(git ls-remote --exit-code https://github.com/HyunjoJung/rxls.git refs/heads/main)"
+          test "$remote_main" = "$(printf '%s\trefs/heads/main' "$EXPECTED_SHA")"
       - name: Deploy GitHub Pages artifact
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

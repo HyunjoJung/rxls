@@ -420,6 +420,113 @@ fn cell_input_validation_rejects_without_mutating_the_package() {
 }
 
 #[test]
+fn cell_update_batch_refreshes_formula_caches_across_sheets_in_one_transaction() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("Data").write_formula(0, 0, "1+2", 1.0);
+    workbook
+        .add_sheet("Totals")
+        .write_formula(0, 0, "Data!A1*2", 2.0);
+    let mut spreadsheet = Spreadsheet::open(&workbook.to_xlsx()).unwrap();
+    let original = spreadsheet.save().unwrap();
+    spreadsheet.set_formula_cached_values(&[]).unwrap();
+    assert_eq!(spreadsheet.save().unwrap(), original);
+    assert!(spreadsheet.edited_parts().is_empty());
+    spreadsheet
+        .set_formula_cached_values(&[
+            ("Data", 0, 0, Cell::Number(3.0)),
+            ("Totals", 0, 0, Cell::Number(6.0)),
+        ])
+        .unwrap();
+    let reopened = Workbook::open(&spreadsheet.save().unwrap()).unwrap();
+    assert!(
+        matches!(reopened.sheets[0].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(3.0))
+    );
+    assert!(
+        matches!(reopened.sheets[1].cell(0, 0), Some(Cell::Formula { cached, .. }) if **cached == Cell::Number(6.0))
+    );
+    assert_eq!(
+        spreadsheet.edited_parts(),
+        ["xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"]
+    );
+}
+
+#[test]
+fn cell_update_batch_preflights_every_target_and_preserves_failed_packages() {
+    let worksheet = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>1+1</f><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+    let input = minimal_xlsx_with_worksheet(worksheet, MINIMAL_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+    let before = spreadsheet.save().unwrap();
+    for invalid in [
+        ("Missing", 0, 1, Cell::Number(3.0)),
+        ("Data", 1_048_576, 0, Cell::Number(3.0)),
+        ("Data", 0, 16_384, Cell::Number(3.0)),
+        ("Data", 0, 1, Cell::Number(f64::NAN)),
+        ("Data", 0, 1, Cell::Text("x".repeat(32_768))),
+        ("Data", 0, 0, Cell::Number(3.0)),
+        ("Data", 0, 1, Cell::Number(3.0)),
+        ("Data", 0, 2, Cell::Number(3.0)),
+        (
+            "Data",
+            0,
+            1,
+            Cell::Formula {
+                formula: "1+1".to_string(),
+                cached: Box::new(Cell::Number(2.0)),
+            },
+        ),
+    ] {
+        assert!(spreadsheet
+            .set_formula_cached_values(&[("Data", 0, 0, Cell::Number(2.0)), invalid])
+            .is_err());
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+    assert!(spreadsheet
+        .set_formula_cached_values(&vec![("Data", 0, 0, Cell::Number(2.0)); 10_001])
+        .is_err());
+    assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+
+    let invalid_package =
+        minimal_xlsx_with_worksheet(worksheet, UNTYPED_WORKSHEET_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&invalid_package).unwrap();
+    let before = spreadsheet.save().unwrap();
+    assert!(spreadsheet
+        .set_formula_cached_values(&[("Data", 0, 0, Cell::Number(2.0))])
+        .is_err());
+    assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+}
+
+#[test]
+fn cell_update_batch_preserves_shared_and_array_formula_nodes_and_cell_metadata() {
+    let worksheet = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="3" cm="1"><f t="shared" si="0" ref="A1:B1">1+1</f><v>1</v></c><c r="B1"><f t="shared" si="0"/><v>1</v></c><c r="C1"><f t="array" ref="C1:C1">2+2</f><v>1</v></c></row></sheetData></worksheet>"#;
+    let input = minimal_xlsx_with_worksheet(worksheet, MINIMAL_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+    spreadsheet
+        .set_formula_cached_values(&[
+            ("Data", 0, 0, Cell::Number(2.0)),
+            ("Data", 0, 1, Cell::Text("two".to_string())),
+            ("Data", 0, 2, Cell::Number(4.0)),
+        ])
+        .unwrap();
+    let xml = String::from_utf8(
+        super::part_xml_bytes(
+            spreadsheet.package.as_ref().unwrap(),
+            "xl/worksheets/sheet1.xml",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for expected in [
+        "<f t=\"shared\" si=\"0\" ref=\"A1:B1\">1+1</f>",
+        "<f t=\"shared\" si=\"0\"/>",
+        "<f t=\"array\" ref=\"C1:C1\">2+2</f>",
+        "<c r=\"A1\" s=\"3\" cm=\"1\">",
+        "<v>two</v>",
+    ] {
+        assert!(xml.contains(expected), "missing {expected} in {xml}");
+    }
+}
+
+#[test]
 fn defined_name_validation_rejects_invalid_or_colliding_names_without_mutation() {
     let mut workbook = Workbook::new();
     workbook.add_sheet("Data").write(0, 0, 1.0);

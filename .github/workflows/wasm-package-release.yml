@@ -51,6 +51,8 @@ jobs:
           test "$(node -p 'require("./bindings/wasm/npm/package.json").name')" = "rxls-wasm"
           git fetch origin main --no-tags
           test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git fetch origin "refs/tags/v$version" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
             test "$GITHUB_REF_TYPE" = "tag"
@@ -235,6 +237,84 @@ jobs:
             > "$output/rxls-wasm-sbom.cdx.json.sha256"
           npm publish --dry-run --ignore-scripts --access public "$archive" \
             | tee "$output/npm-publish-dry-run.txt"
+      - name: Authenticate canonical core release package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.package.outputs.version }}"
+          output=target/wasm-release
+          core_tag="v$version"
+          archive_name="rxls-wasm-$version.tgz"
+          checksum_name="$archive_name.sha256"
+          canonical="$output/core-release"
+          rm -rf "$canonical"
+          mkdir -p "$canonical"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$core_tag" \
+            > "$output/core-release.json"
+          VERSION="$version" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(
+              Path("target/wasm-release/core-release.json").read_text(encoding="utf-8")
+          )
+          version = os.environ["VERSION"]
+          expected = {
+              f"rxls-wasm-{version}.tgz",
+              f"rxls-wasm-{version}.tgz.sha256",
+          }
+          if (
+              release.get("tag_name") != f"v{version}"
+              or release.get("draft") is not False
+              or release.get("prerelease") is not False
+          ):
+              raise SystemExit("canonical core release is not an exact published release")
+          assets = release.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("canonical core release has no readable asset inventory")
+          selected = [asset for asset in assets if asset.get("name") in expected]
+          if (
+              len(selected) != len(expected)
+              or {asset.get("name") for asset in selected} != expected
+              or any(
+                  asset.get("state") != "uploaded"
+                  or type(asset.get("size")) is not int
+                  or asset["size"] <= 0
+                  for asset in selected
+              )
+          ):
+              raise SystemExit("canonical core release assets are missing or invalid")
+          PY
+          gh release download "$core_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive_name" \
+            --pattern "$checksum_name" \
+            --dir "$canonical"
+          ARCHIVE_NAME="$archive_name" CHECKSUM_NAME="$checksum_name" \
+            python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path("target/wasm-release/core-release")
+          expected = {os.environ["ARCHIVE_NAME"], os.environ["CHECKSUM_NAME"]}
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("canonical download contains an unexpected asset set")
+          for name in expected:
+              path = root / name
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"canonical asset is not a regular file: {name}")
+          PY
+          read -r checksum_digest checksum_asset checksum_extra \
+            < "$canonical/$checksum_name"
+          [[ "$checksum_digest" =~ ^[0-9a-f]{64}$ \
+            && "$checksum_asset" == "$archive_name" \
+            && -z "${checksum_extra:-}" ]]
+          test "$(wc -l < "$canonical/$checksum_name")" -eq 1
+          (cd "$canonical" && sha256sum --check --strict "$checksum_name")
+          cmp --silent "$output/$archive_name" "$canonical/$archive_name"
       - name: Verify evidence source remained exact and clean
         shell: bash
         run: |
@@ -310,15 +390,23 @@ jobs:
           version=$(node -p 'require("./bindings/wasm/npm/package.json").version')
           test "$(node -p 'require("./bindings/wasm/npm/package.json").name')" = "rxls-wasm"
           test "$GITHUB_REF_NAME" = "wasm-v$version"
+          git fetch origin "refs/tags/v$version" --no-tags
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
           test "$(node --version)" = "v$NODE_VERSION"
           test "$(npm --version)" = "$NPM_VERSION"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           output=target/wasm-release
           archive="$output/rxls-wasm-$version.tgz"
+          canonical="$output/core-release"
+          canonical_archive="$canonical/rxls-wasm-$version.tgz"
+          canonical_checksum="$canonical_archive.sha256"
           sha256sum --check "$archive.sha256"
+          (cd "$canonical" && \
+            sha256sum --check --strict "$(basename "$canonical_checksum")")
+          cmp --silent "$archive" "$canonical_archive"
           sha256sum --check "$output/rxls-wasm-sbom.cdx.json.sha256"
           python3 scripts/check_wasm_package.py "$output/package" \
-            --archive "$archive" \
+            --archive "$canonical_archive" \
             --npm-pack "$output/npm-pack.json" \
             --git-rev "$GITHUB_SHA"
       - name: Detect an identical immutable registry release
@@ -397,7 +485,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.package.outputs.version }}"
-          npm publish "target/wasm-release/rxls-wasm-$version.tgz" \
+          npm publish "target/wasm-release/core-release/rxls-wasm-$version.tgz" \
             --ignore-scripts --access public
       - name: Verify registry provenance and installed consumer
         env:
@@ -462,7 +550,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py" \
             --audit "$GITHUB_WORKSPACE/$output/registry-signatures.json" \
             --pack "$GITHUB_WORKSPACE/$output/npm-pack.json" \
-            --archive "$GITHUB_WORKSPACE/$output/rxls-wasm-$version.tgz" \
+            --archive "$GITHUB_WORKSPACE/$output/core-release/rxls-wasm-$version.tgz" \
             --repository "$GITHUB_REPOSITORY" \
             --workflow .github/workflows/wasm-package-release.yml \
             --git-sha "$GITHUB_SHA" \
@@ -487,6 +575,10 @@ jobs:
         with:
           name: rxls-wasm-registry-${{ github.sha }}
           path: |
+            target/wasm-release/core-release.json
+            target/wasm-release/core-release/rxls-wasm-*.tgz.sha256
+            target/wasm-release/npm-pack.json
+            target/wasm-release/rxls-wasm-*.tgz.sha256
             target/wasm-release/registry-preflight.json
             target/wasm-release/registry.json
             target/wasm-release/registry-signatures.json

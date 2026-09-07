@@ -1133,6 +1133,7 @@ fn error(code: &str, message: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Read as _, Write as _};
     use std::path::Path;
 
     use rmcp::model::CallToolRequestParams;
@@ -1151,6 +1152,64 @@ mod tests {
         sheet.write_number(1, 1, 10.0);
         let bytes = workbook.to_xlsx_checked().expect("author sample workbook");
         fs::write(path, bytes).expect("write sample workbook");
+    }
+
+    fn macro_fixture() -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        fn add(archive: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, bytes: &[u8]) {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start macro fixture ZIP part");
+            archive
+                .write_all(bytes)
+                .expect("write macro fixture ZIP part");
+        }
+
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        add(
+            &mut archive,
+            "[Content_Types].xml",
+            br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+        );
+        add(
+            &mut archive,
+            "_rels/.rels",
+            br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+        );
+        add(
+            &mut archive,
+            "xl/workbook.xml",
+            br#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Macro" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        add(
+            &mut archive,
+            "xl/_rels/workbook.xml.rels",
+            br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+        );
+        add(
+            &mut archive,
+            "xl/worksheets/sheet1.xml",
+            br#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>macro</t></is></c></row></sheetData></worksheet>"#,
+        );
+        add(
+            &mut archive,
+            "xl/vbaProject.bin",
+            b"rxls MCP VBA preservation fixture",
+        );
+        archive
+            .finish()
+            .expect("finish macro fixture ZIP")
+            .into_inner()
+    }
+
+    fn zip_part(bytes: &[u8], name: &str) -> Vec<u8> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("open fixture ZIP");
+        let mut part = archive.by_name(name).expect("find fixture ZIP part");
+        let mut output = Vec::new();
+        part.read_to_end(&mut output)
+            .expect("read fixture ZIP part");
+        output
     }
 
     fn write_number_column_xlsx(path: &Path, offset: f64, cells: usize) {
@@ -1273,6 +1332,59 @@ mod tests {
             .err()
             .expect("existing destination must fail");
         assert!(error.starts_with("RXLS_MCP_DESTINATION_EXISTS:"));
+    }
+
+    #[test]
+    fn xlsm_edit_and_save_copy_preserve_vba_payload() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("source.xlsm");
+        let source_bytes = macro_fixture();
+        let expected_vba = zip_part(&source_bytes, "xl/vbaProject.bin");
+        fs::write(&source, &source_bytes).expect("write macro-enabled fixture");
+        let server = server_for(&root);
+        let opened = open_sample(&server, &source);
+        assert_eq!(opened.session.format, "xlsm");
+        assert_eq!(opened.session.edit_capability, "read_write_preserving");
+
+        server
+            .workbook_set_cells(Parameters(SetCellsParams {
+                session_id: opened.session.session_id.clone(),
+                sheet: "Macro".to_string(),
+                edits: vec![CellEdit::Set {
+                    cell: "A1".to_string(),
+                    value: InputValue::Text("MCP preserved VBA".to_string()),
+                }],
+            }))
+            .expect("edit macro-enabled workbook");
+
+        let destination = root.path().join("edited.xlsm");
+        server
+            .workbook_save_copy(Parameters(SaveCopyParams {
+                session_id: opened.session.session_id,
+                path: destination.to_string_lossy().into_owned(),
+            }))
+            .expect("save macro-enabled copy");
+
+        let saved_bytes = fs::read(destination).expect("read saved macro-enabled copy");
+        assert_eq!(
+            zip_part(&saved_bytes, "xl/vbaProject.bin"),
+            expected_vba,
+            "the MCP adapter must preserve the VBA project byte-for-byte"
+        );
+        let reopened = Spreadsheet::open(&saved_bytes).expect("reopen saved macro-enabled copy");
+        assert!(matches!(
+            reopened.workbook().sheet_by_name("Macro").unwrap().cell(0, 0),
+            Some(Cell::Text(value)) if value == "MCP preserved VBA"
+        ));
+        assert!(
+            rxls::WorkbookReport::from_workbook_with_package(
+                "xlsm",
+                reopened.workbook(),
+                &saved_bytes,
+            )
+            .features
+            .vba_project
+        );
     }
 
     #[test]
@@ -1510,11 +1622,103 @@ mod tests {
             .as_ref()
             .and_then(|value| value.get("session_id"))
             .and_then(serde_json::Value::as_str)
-            .expect("open result session ID");
+            .expect("open result session ID")
+            .to_string();
+
+        let listed = client
+            .call_tool(CallToolRequestParams::new("workbook_list_sessions"))
+            .await
+            .expect("call workbook_list_sessions");
+        assert_ne!(listed.is_error, Some(true));
+        assert_eq!(
+            listed
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("sessions"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(listed
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("retained_bytes"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|bytes| bytes > 0));
+
+        let arguments = json!({ "session_id": session_id.clone() })
+            .as_object()
+            .unwrap()
+            .clone();
+        let inspected = client
+            .call_tool(CallToolRequestParams::new("workbook_inspect").with_arguments(arguments))
+            .await
+            .expect("call workbook_inspect");
+        assert_ne!(inspected.is_error, Some(true));
+        assert_eq!(
+            inspected
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("active_sheet"))
+                .and_then(serde_json::Value::as_str),
+            Some("Data")
+        );
+        assert_eq!(
+            inspected
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("edit_capability"))
+                .and_then(serde_json::Value::as_str),
+            Some("read_write_preserving")
+        );
+
         let arguments = json!({
-            "left_session_id": session_id,
+            "session_id": session_id.clone(),
+            "sheet": "Data",
+            "range": "A1:B2"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let read = client
+            .call_tool(CallToolRequestParams::new("workbook_read_range").with_arguments(arguments))
+            .await
+            .expect("call workbook_read_range");
+        assert_ne!(read.is_error, Some(true));
+        assert_eq!(
+            read.structured_content
+                .as_ref()
+                .and_then(|value| value.get("cell_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+
+        let arguments = json!({
+            "session_id": session_id.clone(),
+            "sheet": "Data",
+            "format": "markdown"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let exported = client
+            .call_tool(
+                CallToolRequestParams::new("workbook_export_sheet").with_arguments(arguments),
+            )
+            .await
+            .expect("call workbook_export_sheet");
+        assert_ne!(exported.is_error, Some(true));
+        assert!(exported
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.contains("alpha")));
+
+        let arguments = json!({
+            "left_session_id": session_id.clone(),
             "left_sheet": "Data",
-            "right_session_id": session_id,
+            "right_session_id": session_id.clone(),
             "right_sheet": "Data",
             "range": "A1:B2"
         })
@@ -1533,6 +1737,84 @@ mod tests {
                 .and_then(|value| value.get("identical"))
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+
+        let arguments = json!({
+            "session_id": session_id.clone(),
+            "sheet": "Data",
+            "edits": [{
+                "kind": "set",
+                "cell": "B2",
+                "value": { "type": "number", "value": 42.0 }
+            }]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let edited = client
+            .call_tool(CallToolRequestParams::new("workbook_set_cells").with_arguments(arguments))
+            .await
+            .expect("call workbook_set_cells");
+        assert_ne!(edited.is_error, Some(true));
+        assert_eq!(
+            edited
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("applied_edits"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let destination = root.path().join("protocol-edited.xlsx");
+        let arguments = json!({
+            "session_id": session_id.clone(),
+            "path": destination.to_string_lossy()
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let saved = client
+            .call_tool(CallToolRequestParams::new("workbook_save_copy").with_arguments(arguments))
+            .await
+            .expect("call workbook_save_copy");
+        assert_ne!(saved.is_error, Some(true));
+        assert!(destination.is_file());
+        let reopened = Spreadsheet::open(&fs::read(&destination).unwrap()).unwrap();
+        assert!(matches!(
+            reopened.workbook().sheet_by_name("Data").unwrap().cell(1, 1),
+            Some(Cell::Number(value)) if *value == 42.0
+        ));
+
+        let arguments = json!({ "session_id": session_id })
+            .as_object()
+            .unwrap()
+            .clone();
+        let closed = client
+            .call_tool(CallToolRequestParams::new("workbook_close").with_arguments(arguments))
+            .await
+            .expect("call workbook_close");
+        assert_ne!(closed.is_error, Some(true));
+        assert_eq!(
+            closed
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("remaining_sessions"))
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+
+        let listed = client
+            .call_tool(CallToolRequestParams::new("workbook_list_sessions"))
+            .await
+            .expect("list sessions after close");
+        assert_eq!(
+            listed
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("sessions"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
 
         client.cancel().await.expect("cancel client");

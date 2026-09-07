@@ -15,16 +15,20 @@ import {
   RenderProtocolError,
   asBytes,
   limitError,
+  interactiveSheetLimits,
   parseWorkerMessage,
   preflightRequest,
   validateFontPack,
   validateRange,
+  validateInteractiveSheetOutput,
+  validateRecalculationSummary,
   validateSvgOutput
 } from "./protocol.mjs";
 
 const NON_CANCELLABLE_DISPATCHED_OPERATIONS = new Set([
   "close",
   "set-cell",
+  "set-cell-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit"
@@ -40,6 +44,7 @@ export class RenderWorkerClient {
   #ready = false;
   #outbox = [];
   #pendingResourceBytes = 0;
+  #capabilityLimits = {};
 
   constructor(workerOrUrl, { WorkerClass = globalThis.Worker } = {}) {
     if (workerOrUrl && typeof workerOrUrl.postMessage === "function") {
@@ -118,6 +123,10 @@ export class RenderWorkerClient {
     );
   }
 
+  setCellAndRecalculate(documentId, sheetIndex, row, col, value, options = {}) {
+    return this.request("set-cell-recalculate", { documentId, sheetIndex, row, col, value }, options);
+  }
+
   setDocumentProperties(documentId, properties, options = {}) {
     return this.request("set-document-properties", { documentId, properties }, options);
   }
@@ -145,6 +154,14 @@ export class RenderWorkerClient {
   renderSheet(documentId, sheetIndex, renderOptions = {}, requestOptions = {}) {
     return this.request(
       "render-sheet",
+      { documentId, sheetIndex, options: renderOptions },
+      requestOptions
+    );
+  }
+
+  renderSheetInteractive(documentId, sheetIndex, renderOptions = {}, requestOptions = {}) {
+    return this.request(
+      "render-sheet-interactive",
       { documentId, sheetIndex, options: renderOptions },
       requestOptions
     );
@@ -368,6 +385,7 @@ export class RenderWorkerClient {
         throw invalidWorkerMessage("worker sent ready more than once");
       }
       validateCapabilities(message.capabilities);
+      this.#capabilityLimits = Object.freeze({ ...message.capabilities.limits });
       return { type: "ready" };
     }
     if (!this.#ready) {
@@ -403,7 +421,8 @@ export class RenderWorkerClient {
         validateOperationResult(
           pending.operation,
           pending.responseIdentity,
-          message.result
+          message.result,
+          this.#capabilityLimits
         );
       }
       return { type: "result", pending, message };
@@ -555,6 +574,7 @@ function responseIdentityFor(operation, payload) {
       return Object.freeze({ documentId: payload.documentId });
     case "read-cell":
     case "set-cell":
+    case "set-cell-recalculate":
       return Object.freeze({
         documentId: payload.documentId,
         sheetIndex: payload.sheetIndex,
@@ -566,6 +586,12 @@ function responseIdentityFor(operation, payload) {
       return Object.freeze({
         documentId: payload.documentId,
         sheetIndex: payload.sheetIndex
+      });
+    case "render-sheet-interactive":
+      return Object.freeze({
+        documentId: payload.documentId,
+        sheetIndex: payload.sheetIndex,
+        interactionLimits: Object.freeze(interactiveSheetLimits(payload.options))
       });
     case "render-tile":
       return Object.freeze({
@@ -820,7 +846,7 @@ function validateErrorPayload(error) {
   }
 }
 
-function validateOperationResult(operation, payload, result) {
+function validateOperationResult(operation, payload, result, capabilityLimits) {
   switch (operation) {
     case "capabilities":
       validateCapabilities(result);
@@ -859,6 +885,14 @@ function validateOperationResult(operation, payload, result) {
       validateWorkbookInspection(result.workbook);
       validateEditState(result.editState);
       return;
+    case "set-cell-recalculate":
+      assertPlainRecord(result, "recalculating edit result");
+      assertExactKeys(result, ["documentId", "workbook", "editState", "recalculation"], "recalculating edit result");
+      assertIdentity(result.documentId, payload.documentId, "documentId");
+      validateWorkbookInspection(result.workbook);
+      validateEditState(result.editState);
+      validateRecalculationSummary(result.recalculation);
+      return;
     case "save-document":
       validateSaveResult(payload, result);
       return;
@@ -867,6 +901,19 @@ function validateOperationResult(operation, payload, result) {
       return;
     case "render-sheet":
       validateSvgResult(payload, result, ["documentId", "sheetIndex", "mimeType", "svg"]);
+      return;
+    case "render-sheet-interactive":
+      assertPlainRecord(result, "interactive sheet result");
+      assertExactKeys(result, ["documentId", "sheetIndex", "mimeType", "svg", "interaction"], "interactive sheet result");
+      assertIdentity(result.documentId, payload.documentId, "documentId");
+      assertIdentity(result.sheetIndex, payload.sheetIndex, "sheetIndex");
+      if (result.mimeType !== "image/svg+xml") {
+        throw invalidWorkerMessage("interactive SVG result MIME type is invalid");
+      }
+      validateInteractiveSheetOutput(
+        { svg: result.svg, interaction: result.interaction },
+        interactiveSheetLimits({ limits: payload.interactionLimits }, capabilityLimits)
+      );
       return;
     case "render-tile":
       validateSvgResult(

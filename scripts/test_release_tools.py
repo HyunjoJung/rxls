@@ -473,62 +473,39 @@ class ReleaseToolTests(unittest.TestCase):
         module = _load("check_release_identity_mismatch", IDENTITY)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            wasm = root / "bindings" / "wasm"
-            wasm.mkdir(parents=True)
-            (root / "Cargo.toml").write_text(
-                '[package]\nname = "rxls"\nversion = "0.1.2"\nrust-version = "1.85"\n',
-                encoding="utf-8",
-            )
-            (root / "Cargo.lock").write_text(
-                'version = 4\n[[package]]\nname = "rxls"\nversion = "0.1.1"\n',
-                encoding="utf-8",
-            )
-            (wasm / "Cargo.toml").write_text(
-                '[package]\nname = "rxls-wasm"\nversion = "0.1.0"\n'
-                'rust-version = "1.84"\npublish = false\n'
-                '[dependencies]\nrxls = { path = "../..", default-features = false }\n',
-                encoding="utf-8",
-            )
-            (wasm / "Cargo.lock").write_text(
-                'version = 4\n[[package]]\nname = "rxls"\nversion = "0.1.1"\n'
-                '[[package]]\nname = "rxls-wasm"\nversion = "0.1.0"\n',
-                encoding="utf-8",
-            )
-            (root / "CHANGELOG.md").write_text(
-                "## [0.1.2]\n"
-                "[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.2...HEAD\n"
-                "[0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2\n",
-                encoding="utf-8",
-            )
-            npm = wasm / "npm"
-            npm.mkdir()
-            (npm / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "rxls-wasm",
-                        "version": "0.1.2",
-                        "main": "./node/rxls_wasm.js",
-                        "types": "./node/rxls_wasm.d.ts",
-                        "engines": {"node": ">=20"},
-                        "files": [
-                            "node",
-                            "web",
-                            "demo",
-                            "README.md",
-                            "LICENSE",
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
+            policy = json.loads((ROOT / module.POLICY).read_text(encoding="utf-8"))
+            files = {module.POLICY, "CHANGELOG.md", policy["wasm_toolchain"]["lockfile"]}
+            for rule in policy["cargo"].values():
+                files.add(rule["manifest"])
+                files.add(str(Path(rule["manifest"]).with_name("Cargo.lock")))
+            for rule in policy["npm"].values():
+                files.add(rule["manifest"])
+                if "lockfile" in rule:
+                    files.add(rule["lockfile"])
+            for relative in files:
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, destination)
+
+            for relative in ("Cargo.lock", "bindings/wasm/Cargo.lock"):
+                path = root / relative
+                text = path.read_text(encoding="utf-8")
+                text = re.sub(r'(name = "rxls(?:-wasm)?"\nversion = ")[^"]+',
+                              r'\g<1>9.9.9', text)
+                path.write_text(text, encoding="utf-8")
+            wasm = root / "bindings/wasm/Cargo.toml"
+            text = wasm.read_text(encoding="utf-8")
+            text = re.sub(r'(?m)^version = "[^"]+"', 'version = "9.9.9"', text, count=1)
+            text = re.sub(r'rust-version = "[^"]+"', 'rust-version = "1.84"', text, count=1)
+            wasm.write_text(text, encoding="utf-8")
 
             errors = module.validate(root)
 
         self.assertEqual(len(errors), 5)
-        self.assertTrue(any("root Cargo.lock rxls" in error for error in errors))
-        self.assertTrue(any("WASM Cargo.toml rxls-wasm" in error for error in errors))
-        self.assertTrue(any("WASM Cargo.lock rxls" in error for error in errors))
-        self.assertTrue(any("WASM Cargo.lock rxls-wasm" in error for error in errors))
+        self.assertTrue(any("Cargo.lock rxls" in error for error in errors))
+        self.assertTrue(any("bindings/wasm/Cargo.toml version" in error for error in errors))
+        self.assertTrue(any("bindings/wasm/Cargo.lock rxls:" in error for error in errors))
+        self.assertTrue(any("bindings/wasm/Cargo.lock rxls-wasm" in error for error in errors))
         self.assertTrue(any("rust-version" in error for error in errors))
 
     def test_sbom_references_are_stable_and_cover_native_and_wasm_roots(self) -> None:

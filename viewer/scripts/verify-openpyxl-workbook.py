@@ -20,9 +20,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected", required=True)
     parser.add_argument("--expected-title")
     parser.add_argument("--require-vba", action="store_true")
+    parser.add_argument("--cache-cell")
+    parser.add_argument("--expected-cache", type=float)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     workbook = None
+    cached_workbook = None
     try:
         workbook = openpyxl.load_workbook(
             BytesIO(args.workbook.read_bytes()),
@@ -52,12 +55,27 @@ def main(argv: list[str] | None = None) -> int:
             "title": title,
             "vba_bytes": vba_bytes,
         }
+        if args.cache_cell is not None:
+            if args.expected_cache is None:
+                raise ValueError("--cache-cell requires --expected-cache")
+            cached_workbook = openpyxl.load_workbook(
+                BytesIO(args.workbook.read_bytes()), data_only=True,
+            )
+            cached_value = cached_workbook.active[args.cache_cell].value
+            if cached_value != args.expected_cache:
+                raise ValueError(
+                    f"{args.cache_cell} cached value is {cached_value!r}, "
+                    f"expected {args.expected_cache!r}"
+                )
+            report["cache_value"] = cached_value
     except (InvalidFileException, KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"openpyxl workbook reopen: {error}", file=sys.stderr)
         return 1
     finally:
         if workbook is not None:
             workbook.close()
+        if cached_workbook is not None:
+            cached_workbook.close()
 
     print(json.dumps(report, ensure_ascii=True, sort_keys=True))
     return 0
