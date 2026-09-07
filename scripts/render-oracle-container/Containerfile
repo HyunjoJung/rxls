@@ -44,7 +44,7 @@ RUN set -eux; \
       libxinerama1=2:1.1.4-3; \
     archive=/tmp/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz; \
     primary_url='https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
-    fallback_url='https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz'; \
+    fallback_url='https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz'; \
     downloaded=0; \
     for download_url in "${primary_url}" "${fallback_url}"; do \
       rm -f "${archive}"; \

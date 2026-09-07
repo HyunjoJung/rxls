@@ -653,7 +653,7 @@ pub(super) struct CalcCellScriptAnalysis {
     pub(super) edit_engine_uses_only_complex_role: bool,
 }
 
-pub(super) fn account_automatic_text_bytes(
+pub(super) fn charge_automatic_text_bytes(
     text: &str,
     options: &RenderOptions,
     stats: &mut TypographyStats,

@@ -136,7 +136,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
     "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
-    "dcb70c3f452ab5c7075315dbce68c38ec2da7a20ab20a22da21a2d728faa5ef3",
+    "054c41f51299ec5331abca90af10c81e7538c3588255d358461e23dc26825b48",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
@@ -154,14 +154,14 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
     "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
     "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
-    "7aa2fb46f8d33f6abd1ad0795d7c76aacaf8d47ada5305762a458ac180acad64",
+    "5a0bee8f4f21bda04cd5f69c10d0e9504293a691b4bd112b27ab7d5ebdfc432f",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "dba690b0defabe7bdb4f651fa38c6ece0b0d4ece6f49919e6fe7d71046f2f6a9"
+    "948975307e04cbca76b7c3007cdc4b74e5940c60d400678b550f9e7f6a969998"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "ac477662896b26fef0fb4bfe292efcb2ff1cce2f09fb76e03b43da42143ec152"
+    "b52b8bde803f6cfc2ffb40f533febf6b5d75dcb17326943546497c921e0c60cc"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "b125148dde44cb51b9e569c19eccce2b1be9a6dc74e4a9ea52c228d01c4bf6ca"
@@ -439,8 +439,8 @@ def _audit_oracle_build_retry(
             "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
         ): "locked image retries must bind failures to the exact primary artifact mirror",
         (
-            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
-            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/"
+            "deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz"
         ): "locked image retries must bind failures to the exact fallback artifact mirror",
         r"curl: \((5|6|7|16|18|28|35|52|55|56|92)\)": (
             "locked image retries must use the reviewed curl transport allowlist"

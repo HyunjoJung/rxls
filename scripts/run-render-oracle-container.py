@@ -126,8 +126,8 @@ REPRODUCIBILITY_BUILD_COUNT = 2
 LIBREOFFICE_ARTIFACT_URLS = (
     "https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/"
     "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz",
-    "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
-    "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz",
+    "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/"
+    "deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz",
 )
 LIBREOFFICE_ARTIFACT_SHA256 = (
     "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5"

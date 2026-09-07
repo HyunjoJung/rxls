@@ -502,7 +502,7 @@ jobs:
               'https://mirrors.ibiblio.org/pub/mirrors/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz' \
               "$build_log" &&
               grep --fixed-strings --quiet \
-              'https://download.documentfoundation.org/libreoffice/stable/26.2.3/deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz' \
+              'https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz' \
               "$build_log" &&
               {
                 grep --extended-regexp --quiet \

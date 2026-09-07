@@ -1023,8 +1023,8 @@ steps:
             "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
         )
         fallback_url = (
-            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
-            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/"
+            "deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz"
         )
         for workflow_name, workflow, header, output_path in cases:
             extraction_errors: list[str] = []

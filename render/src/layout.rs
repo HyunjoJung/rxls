@@ -32,11 +32,11 @@ use geometry::{
     verified_ooxml_normal_font_size, visual_column_slots, SourceAxisCursor,
 };
 use text::{
-    account_automatic_text_bytes, build_glyph_run, calc_cell_text_layout_bounds,
-    calc_edit_engine_uses_only_complex_role, calc_script_class_summary_bounded,
-    has_mixed_calc_script_classes, inner_width, map_font_error, measure_automatic_cell_height,
-    multiply_fixed, outlined_horizontal_padding, scale_ratio, shape_text_with_kerning,
-    shaped_width, text_style, CalcCellScriptAnalysis, CalcScriptClassSummary,
+    build_glyph_run, calc_cell_text_layout_bounds, calc_edit_engine_uses_only_complex_role,
+    calc_script_class_summary_bounded, charge_automatic_text_bytes, has_mixed_calc_script_classes,
+    inner_width, map_font_error, measure_automatic_cell_height, multiply_fixed,
+    outlined_horizontal_padding, scale_ratio, shape_text_with_kerning, shaped_width, text_style,
+    CalcCellScriptAnalysis, CalcScriptClassSummary,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -4174,7 +4174,7 @@ fn expand_automatic_row_heights(
             .checked_add(1)
             .ok_or(RenderError::CoordinateOverflow)?;
         enforce(LimitKind::Cells, options.limits.max_cells, automatic_cells)?;
-        account_automatic_text_bytes(cell.formatted, options, typography)?;
+        charge_automatic_text_bytes(cell.formatted, options, typography)?;
         let plain_single_line = alignment
             .is_none_or(|alignment| !alignment.wrap && alignment.rotation == 0)
             && !contains_mandatory_line_break(cell.formatted)

@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +6,7 @@ import { extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BoundedEntryLog, BoundedTextTail } from "./bounded-evidence.mjs";
+import { probeChromiumVersion } from "./chromium-version.mjs";
 import {
   OperationTimeoutError,
   closeServer,
@@ -89,23 +90,11 @@ const chrome =
   (process.platform === "darwin"
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "chromium");
-const version = spawnSync(chrome, ["--version"], {
-  encoding: "utf8",
-  timeout: CDP_HTTP_TIMEOUT_MS,
-  maxBuffer: 16 * 1024,
-  killSignal: "SIGKILL"
-});
-const acceptedProducts = [lock.chromium.product, lock.chromium.testingProduct].filter(Boolean);
-const actualVersion = (version.stdout ?? "").trim();
-if (
-  version.status !== 0 ||
-  !acceptedProducts.some(
-    (product) => actualVersion === `${product} ${lock.chromium.version}`
-  )
-) {
-  console.error(
-    `expected ${acceptedProducts.map((product) => `${product} ${lock.chromium.version}`).join(" or ")}; got ${actualVersion || "unavailable"}`
-  );
+let actualVersion;
+try {
+  actualVersion = probeChromiumVersion(chrome, lock.chromium);
+} catch (error) {
+  console.error(error.message);
   process.exit(2);
 }
 const heapGate = lock.chromium.heapGate;
