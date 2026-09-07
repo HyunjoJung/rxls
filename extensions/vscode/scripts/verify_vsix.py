@@ -88,6 +88,12 @@ def verify(
             "supported": True
         }:
             raise ValueError("untrusted-workspace capability is missing")
+        if manifest.get("capabilities", {}).get("virtualWorkspaces") != {
+            "supported": True
+        }:
+            raise ValueError("virtual-workspace capability is missing")
+        if manifest.get("engines", {}).get("vscode") != "^1.96.0":
+            raise ValueError("minimum VS Code host contract is invalid")
 
         icon = archive.read("extension/media/icon.png")
         if icon[:8] != b"\x89PNG\r\n\x1a\n" or len(icon) < 24:

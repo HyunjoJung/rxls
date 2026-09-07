@@ -20,6 +20,7 @@ import {
   boundedIndex,
   encodeFontBundle,
   limitError,
+  interactiveSheetLimits,
   normalizeError,
   optionsJson,
   parseWorkerMessage,
@@ -28,12 +29,15 @@ import {
   validateDocumentId,
   validateRange,
   validateRequestId,
-  validateSvgOutput
+  validateSvgOutput,
+  validateInteractiveSheetOutput,
+  validateRecalculationSummary
 } from "./protocol.mjs";
 
 const NON_CANCELLABLE_ACTIVE_OPERATIONS = new Set([
   "close",
   "set-cell",
+  "set-cell-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit"
@@ -281,6 +285,8 @@ export class RenderWorkerRuntime {
         return this.#preparePages(payload);
       case "render-sheet":
         return this.#renderSheet(payload);
+      case "render-sheet-interactive":
+        return this.#renderSheetInteractive(payload);
       case "render-tile":
         return this.#renderTile(payload);
       case "render-page":
@@ -293,6 +299,8 @@ export class RenderWorkerRuntime {
         return this.#readCell(payload);
       case "set-cell":
         return this.#setCell(payload);
+      case "set-cell-recalculate":
+        return this.#setCell(payload, true);
       case "set-document-properties":
         return this.#setDocumentProperties(payload);
       case "undo-edit":
@@ -449,6 +457,19 @@ export class RenderWorkerRuntime {
     return { documentId, sheetIndex, mimeType: "image/svg+xml", svg };
   }
 
+  async #renderSheetInteractive(payload) {
+    const { documentId, session } = this.#document(payload);
+    const sheetIndex = boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
+    if (typeof session.renderSheetInteractiveJson !== "function") {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM does not support interactive sheet rendering", "wasm");
+    }
+    const limits = interactiveSheetLimits(payload.options, this.#capabilities?.limits);
+    const json = await session.renderSheetInteractiveJson(sheetIndex, optionsJson(payload.options));
+    const value = parseInteractiveJson(json, limits.maxOutputBytes);
+    validateInteractiveSheetOutput(value, limits);
+    return { documentId, sheetIndex, mimeType: "image/svg+xml", svg: value.svg, interaction: value.interaction };
+  }
+
   async #renderTile(payload) {
     const { documentId, session } = this.#document(payload);
     const sheetIndex = boundedIndex(
@@ -564,9 +585,13 @@ export class RenderWorkerRuntime {
     return { value: { documentId, ...cell } };
   }
 
-  async #setCell(payload) {
+  async #setCell(payload, recalculate = false) {
     const { documentId, session } = this.#document(payload);
-    const result = await session.setCellJson(
+    const method = recalculate ? session.setCellRecalculateJson : session.setCellJson;
+    if (typeof method !== "function") {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM does not support recalculating edits", "wasm");
+    }
+    const result = await method.call(session,
       JSON.stringify({
         sheetIndex: payload.sheetIndex,
         row: payload.row,
@@ -574,7 +599,7 @@ export class RenderWorkerRuntime {
         value: payload.value
       })
     );
-    return { documentId, ...this.#mutationResult(result) };
+    return { documentId, ...this.#mutationResult(result, recalculate) };
   }
 
   async #setDocumentProperties(payload) {
@@ -619,9 +644,10 @@ export class RenderWorkerRuntime {
     };
   }
 
-  #mutationResult(json) {
+  #mutationResult(json, recalculate = false) {
     const result = parseBoundedJson(json, "edit result", this.#maxOutputBytes);
-    if (!plainRecord(result) || !hasExactKeys(result, ["workbook", "editState"])) {
+    const keys = recalculate ? ["workbook", "editState", "recalculation"] : ["workbook", "editState"];
+    if (!plainRecord(result) || !hasExactKeys(result, keys)) {
       throw new RenderProtocolError(
         "wasm_api_mismatch",
         "edit result does not satisfy the worker contract",
@@ -634,7 +660,9 @@ export class RenderWorkerRuntime {
       this.#maxEditHistoryEntries,
       this.#maxEditHistoryBytes
     );
-    return { workbook, editState };
+    return recalculate
+      ? { workbook, editState, recalculation: validateRecalculationSummary(result.recalculation) }
+      : { workbook, editState };
   }
 
   #document(payload) {
@@ -716,6 +744,25 @@ function parseBoundedJson(json, description, maxBytes) {
       `${description} was not valid JSON`,
       "wasm"
     );
+  }
+}
+
+function parseInteractiveJson(json, maxBytes) {
+  if (typeof json !== "string") {
+    throw new RenderProtocolError("wasm_api_mismatch", "interactive result was not JSON text", "wasm");
+  }
+  // Reject before constructing a second unbounded encoded copy or parsing arrays.
+  if (json.length > maxBytes) throw limitError("outputBytes", maxBytes, json.length, "output");
+  let bytes = 0;
+  for (const character of json) {
+    const code = character.codePointAt(0);
+    bytes += code < 128 ? 1 : code < 2048 ? 2 : code < 65536 ? 3 : 4;
+    if (bytes > maxBytes) throw limitError("outputBytes", maxBytes, bytes, "output");
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    throw new RenderProtocolError("wasm_api_mismatch", "interactive result was not valid JSON", "wasm");
   }
 }
 
@@ -1267,6 +1314,7 @@ function operationStage(operation) {
     case "read-cell":
       return "inspecting";
     case "set-cell":
+    case "set-cell-recalculate":
     case "set-document-properties":
     case "undo-edit":
     case "redo-edit":

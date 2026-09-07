@@ -1,5 +1,6 @@
 //! Deterministic formula evaluation for the safe MVP subset.
 
+use std::borrow::Cow;
 use std::cell::Cell as CounterCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -7,12 +8,16 @@ use std::rc::Rc;
 use crate::{Cell, CellErrorType, Workbook};
 
 const MAX_RANGE_CELLS: u64 = 10_000;
+const MAX_RANGE_SCAN_CELLS: usize = 1_000_000;
 
 /// Maximum semantic parser/evaluator work units for one top-level evaluation,
 /// shared by all formulas reached through references. Operands, operators,
 /// postfix operations, and function dispatch each consume one unit. Range
 /// traversal has its own independent `MAX_RANGE_CELLS` limit.
 const MAX_EVALUATION_OPERATIONS: usize = 10_000;
+
+const MAX_TEXT_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_EVALUATION_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum number of formula bodies entered through one top-level evaluation.
 /// This is independent of expression nesting: each referenced formula starts a
@@ -99,6 +104,8 @@ pub enum FormulaUnsupportedReason {
     OperationLimitExceeded,
     /// Formula evaluation exceeded the bounded dependency-chain depth.
     DependencyDepthExceeded,
+    /// Text production exceeded 1 MiB per value or the shared 8 MiB UTF-8 budget.
+    TextLimitExceeded,
 }
 
 impl FormulaUnsupportedReason {
@@ -117,6 +124,7 @@ impl FormulaUnsupportedReason {
             Self::ExpressionTooComplex => "expression_too_complex",
             Self::OperationLimitExceeded => "operation_limit_exceeded",
             Self::DependencyDepthExceeded => "dependency_depth_exceeded",
+            Self::TextLimitExceeded => "text_limit_exceeded",
         }
     }
 }
@@ -163,6 +171,57 @@ impl Workbook {
             },
         }
     }
+
+    /// Evaluate at most 10,000 targets with one shared operation, text, and memo budget.
+    ///
+    /// Results preserve target order. Unsupported semantics retain the original
+    /// cached value with a typed reason; exhausted resource budgets abort the
+    /// entire batch. This method does not modify cells or their stored caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed limit reason if target count, semantic work, dependency
+    /// depth, range traversal, or text allocation exceeds the evaluator budget.
+    pub fn evaluate_cells(
+        &self,
+        targets: &[(&str, u32, u16)],
+    ) -> std::result::Result<Vec<FormulaEvaluation>, FormulaUnsupportedReason> {
+        if targets.len() > MAX_EVALUATION_OPERATIONS {
+            return Err(FormulaUnsupportedReason::OperationLimitExceeded);
+        }
+        let mut state = EvalState::default();
+        let mut results = Vec::with_capacity(targets.len());
+        for &(sheet, row, col) in targets {
+            state.operation_budget.charge()?;
+            match evaluate_cell_inner(self, sheet, row, col, &mut state) {
+                Ok(value) => results.push(FormulaEvaluation::Computed(value)),
+                Err(reason) => {
+                    if matches!(
+                        reason,
+                        FormulaUnsupportedReason::OperationLimitExceeded
+                            | FormulaUnsupportedReason::TextLimitExceeded
+                            | FormulaUnsupportedReason::DependencyDepthExceeded
+                            | FormulaUnsupportedReason::ExpressionTooComplex
+                            | FormulaUnsupportedReason::RangeTooLarge
+                    ) {
+                        return Err(reason);
+                    }
+                    let original = self
+                        .sheet_by_name(sheet)
+                        .and_then(|sheet| sheet.cell(row, col));
+                    let cached = match original {
+                        Some(Cell::Formula { cached, .. }) => {
+                            state.operation_budget.clone_cell(cached)?
+                        }
+                        Some(value) => state.operation_budget.clone_cell(value)?,
+                        None => Cell::Text(String::new()),
+                    };
+                    results.push(FormulaEvaluation::Fallback { cached, reason });
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -174,12 +233,47 @@ struct EvalState {
     formula_dependency_depth: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct OperationBudget {
     used: Rc<CounterCell<usize>>,
+    text_used: Rc<CounterCell<usize>>,
+    max_text_value: usize,
+    max_text_total: usize,
+    range_used: Rc<CounterCell<u64>>,
+    range_scanned: Rc<CounterCell<usize>>,
+}
+
+impl Default for OperationBudget {
+    fn default() -> Self {
+        Self {
+            used: Rc::default(),
+            text_used: Rc::default(),
+            max_text_value: MAX_TEXT_VALUE_BYTES,
+            max_text_total: MAX_EVALUATION_TEXT_BYTES,
+            range_used: Rc::default(),
+            range_scanned: Rc::default(),
+        }
+    }
 }
 
 impl OperationBudget {
+    fn charge_range(&self, cells: u64) -> std::result::Result<(), FormulaUnsupportedReason> {
+        let total = self.range_used.get().saturating_add(cells);
+        if total > MAX_RANGE_CELLS {
+            return Err(FormulaUnsupportedReason::RangeTooLarge);
+        }
+        self.range_used.set(total);
+        Ok(())
+    }
+
+    fn scan_range_cell(&self) -> std::result::Result<(), FormulaUnsupportedReason> {
+        let total = self.range_scanned.get().saturating_add(1);
+        if total > MAX_RANGE_SCAN_CELLS {
+            return Err(FormulaUnsupportedReason::RangeTooLarge);
+        }
+        self.range_scanned.set(total);
+        Ok(())
+    }
     fn charge(&self) -> std::result::Result<(), FormulaUnsupportedReason> {
         let used = self.used.get() + 1;
         self.used.set(used);
@@ -187,6 +281,60 @@ impl OperationBudget {
             return Err(FormulaUnsupportedReason::OperationLimitExceeded);
         }
         Ok(())
+    }
+
+    fn grow_text(
+        &self,
+        current: usize,
+        added: usize,
+    ) -> std::result::Result<(), FormulaUnsupportedReason> {
+        let size = current
+            .checked_add(added)
+            .ok_or(FormulaUnsupportedReason::TextLimitExceeded)?;
+        if size > self.max_text_value {
+            return Err(FormulaUnsupportedReason::TextLimitExceeded);
+        }
+        self.charge_text_storage(added)
+    }
+
+    fn charge_text_storage(
+        &self,
+        added: usize,
+    ) -> std::result::Result<(), FormulaUnsupportedReason> {
+        let total = self
+            .text_used
+            .get()
+            .checked_add(added)
+            .ok_or(FormulaUnsupportedReason::TextLimitExceeded)?;
+        if total > self.max_text_total {
+            return Err(FormulaUnsupportedReason::TextLimitExceeded);
+        }
+        self.text_used.set(total);
+        Ok(())
+    }
+
+    fn clone_cell(&self, cell: &Cell) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+        match cell {
+            Cell::Text(text) | Cell::Error(text) => self.grow_text(0, text.len())?,
+            Cell::Formula { .. } => return Err(FormulaUnsupportedReason::ArraySemantics),
+            _ => {}
+        }
+        Ok(cell.clone())
+    }
+
+    // Reserve a conservative copy allowance before functions that may select,
+    // coerce, or propagate text arguments. Nested ranges share the same cap.
+    fn reserve_value_copy(
+        &self,
+        value: &Value,
+    ) -> std::result::Result<(), FormulaUnsupportedReason> {
+        match value {
+            Value::Text(text) | Value::Error(text) => self.grow_text(0, text.len()),
+            Value::Range(values) => values
+                .iter()
+                .try_for_each(|value| self.reserve_value_copy(value)),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -197,10 +345,12 @@ fn evaluate_cell_inner(
     col: u16,
     state: &mut EvalState,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    state.operation_budget.grow_text(0, sheet_name.len())?;
     let key = (sheet_name.to_string(), row, col);
     if let Some(cell) = state.memo.get(&key) {
-        return Ok(cell.clone());
+        return state.operation_budget.clone_cell(cell);
     }
+    state.operation_budget.grow_text(0, sheet_name.len())?;
     if !state.visiting.insert(key.clone()) {
         return Err(FormulaUnsupportedReason::CircularReference);
     }
@@ -215,12 +365,14 @@ fn evaluate_cell_inner(
             Cell::Formula { formula, .. } => {
                 evaluate_formula_in_context(workbook, sheet_name, formula, state)
             }
-            _ => Ok(cell.clone()),
+            _ => state.operation_budget.clone_cell(cell),
         }
     })();
     state.visiting.remove(&key);
     if let Ok(cell) = &result {
-        state.memo.insert(key, cell.clone());
+        state
+            .memo
+            .insert(key, state.operation_budget.clone_cell(cell)?);
     }
     result
 }
@@ -266,6 +418,18 @@ fn resolve_reference(
             } else {
                 return Err(FormulaUnsupportedReason::UnresolvedName);
             };
+            let key_bytes = canonical
+                .len()
+                .checked_add(if local_scope {
+                    current_sheet.len() + 1
+                } else {
+                    1
+                })
+                .ok_or(FormulaUnsupportedReason::TextLimitExceeded)?;
+            // ASCII-normalized pieces, formatted key, and visiting-set copy.
+            for _ in 0..3 {
+                state.operation_budget.grow_text(0, key_bytes)?;
+            }
             let key = if local_scope {
                 format!(
                     "{}!{}",
@@ -279,12 +443,17 @@ fn resolve_reference(
                 return Err(FormulaUnsupportedReason::CircularReference);
             }
             let result = evaluate_formula_in_context(workbook, current_sheet, refers_to, state)
-                .map(|cell| cell_to_value(&cell));
+                .map(cell_to_value);
             state.visiting_names.remove(&key);
             result
         }
         RefRequest::Cell { sheet, reference } => {
             let target_names = target_sheet_names(workbook, current_sheet, sheet.as_deref())?;
+            if target_names.len() > 1 {
+                state
+                    .operation_budget
+                    .charge_range(target_names.len() as u64)?;
+            }
             let (row, col) =
                 parse_a1_ref(&reference).ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
             let mut values = Vec::with_capacity(target_names.len());
@@ -293,13 +462,7 @@ fn resolve_reference(
                     .sheet_by_name(target_name)
                     .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
                 let value = if target.cell(row, col).is_some() {
-                    cell_to_value(&evaluate_cell_inner(
-                        workbook,
-                        target_name,
-                        row,
-                        col,
-                        state,
-                    )?)
+                    cell_to_value(evaluate_cell_inner(workbook, target_name, row, col, state)?)
                 } else {
                     Value::Blank
                 };
@@ -334,10 +497,13 @@ fn resolve_reference(
                         {
                             return Err(FormulaUnsupportedReason::RangeTooLarge);
                         }
+                        state
+                            .operation_budget
+                            .charge_range(row_count.saturating_mul(col_count))?;
                         for row in start_row..=end_row {
                             for col in start_col..=end_col {
                                 let value = if target.cell(row, col).is_some() {
-                                    cell_to_value(&evaluate_cell_inner(
+                                    cell_to_value(evaluate_cell_inner(
                                         workbook,
                                         target_name,
                                         row,
@@ -388,16 +554,18 @@ fn append_sparse_range_values(
         .ok_or(FormulaUnsupportedReason::SheetNotFound)?;
     let mut effective = std::collections::BTreeSet::new();
     for entry in sheet.cells.iter().rev() {
-        if includes(entry.row, entry.col) {
+        state.operation_budget.scan_range_cell()?;
+        if includes(entry.row, entry.col) && !effective.contains(&(entry.row, entry.col)) {
+            if (values.len() as u64).saturating_add(effective.len() as u64) >= MAX_RANGE_CELLS {
+                return Err(FormulaUnsupportedReason::RangeTooLarge);
+            }
+            state.operation_budget.charge_range(1)?;
             effective.insert((entry.row, entry.col));
         }
     }
-    if (values.len() as u64).saturating_add(effective.len() as u64) > MAX_RANGE_CELLS {
-        return Err(FormulaUnsupportedReason::RangeTooLarge);
-    }
     for (row, col) in effective {
         let cell = evaluate_cell_inner(workbook, sheet_name, row, col, state)?;
-        values.push(cell_to_value(&cell));
+        values.push(cell_to_value(cell));
     }
     Ok(())
 }
@@ -434,6 +602,9 @@ fn target_sheet_names<'a>(
     } else {
         (last_index, first_index)
     };
+    if end - start + 1 > MAX_RANGE_CELLS as usize {
+        return Err(FormulaUnsupportedReason::RangeTooLarge);
+    }
     Ok(workbook.sheets[start..=end]
         .iter()
         .map(|sheet| sheet.name.as_str())
@@ -446,6 +617,7 @@ fn evaluate_formula_with_refs(
     mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
     let formula = formula.trim().strip_prefix('=').unwrap_or(formula.trim());
+    operation_budget.charge_text_storage(formula.len())?;
     let normalized = normalize_formula_syntax(formula)?;
     let formula = normalized.as_str();
     if formula.contains('[') {
@@ -464,13 +636,13 @@ fn evaluate_formula_with_refs(
     }
 }
 
-fn cell_to_value(cell: &Cell) -> Value {
+fn cell_to_value(cell: Cell) -> Value {
     match cell {
-        Cell::Text(s) => Value::Text(s.clone()),
-        Cell::Number(n) | Cell::Date(n) => Value::Number(*n),
-        Cell::Bool(b) => Value::Bool(*b),
-        Cell::Error(e) => Value::Error(e.clone()),
-        Cell::Formula { cached, .. } => cell_to_value(cached),
+        Cell::Text(s) => Value::Text(s),
+        Cell::Number(n) | Cell::Date(n) => Value::Number(n),
+        Cell::Bool(b) => Value::Bool(b),
+        Cell::Error(e) => Value::Error(e),
+        Cell::Formula { cached, .. } => cell_to_value(*cached),
     }
 }
 
@@ -485,6 +657,13 @@ enum Value {
 }
 
 impl Value {
+    fn into_number(self) -> std::result::Result<f64, Value> {
+        if matches!(self, Value::Error(_)) {
+            return Err(self);
+        }
+        self.as_number()
+    }
+
     fn into_cell(self) -> Cell {
         match self {
             Value::Number(n) => Cell::Number(n),
@@ -510,12 +689,12 @@ impl Value {
         }
     }
 
-    fn as_text(&self) -> std::result::Result<String, Value> {
+    fn as_text(&self) -> std::result::Result<Cow<'_, str>, Value> {
         match self {
-            Value::Number(n) => Ok(crate::format_number(*n)),
-            Value::Text(s) => Ok(s.clone()),
-            Value::Blank => Ok(String::new()),
-            Value::Bool(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_string()),
+            Value::Number(n) => Ok(Cow::Owned(crate::format_number(*n))),
+            Value::Text(s) => Ok(Cow::Borrowed(s)),
+            Value::Blank => Ok(Cow::Borrowed("")),
+            Value::Bool(b) => Ok(Cow::Borrowed(if *b { "TRUE" } else { "FALSE" })),
             Value::Error(e) => Err(Value::Error(e.clone())),
             Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
         }
@@ -665,7 +844,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             }
             self.charge_operation()?;
             let right = self.parse_add()?;
-            left = binary_text(left, right);
+            left = binary_text(left, right, &self.operation_budget)?;
         }
     }
 
@@ -695,9 +874,9 @@ impl<'a, 'r> Parser<'a, 'r> {
             } else if self.consume_char('/') {
                 self.charge_operation()?;
                 let right = self.parse_power()?;
-                left = match right.as_number() {
+                left = match right.into_number() {
                     Ok(0.0) => Value::Error("#DIV/0!".to_string()),
-                    Ok(_) => binary_number(left, right, |a, b| a / b),
+                    Ok(number) => binary_number(left, Value::Number(number), |a, b| a / b),
                     Err(e) => e,
                 };
             } else {
@@ -738,7 +917,7 @@ impl<'a, 'r> Parser<'a, 'r> {
         }
         if self.consume_char('-') {
             self.charge_operation()?;
-            return Ok(match self.parse_unary()?.as_number() {
+            return Ok(match self.parse_unary()?.into_number() {
                 Ok(n) => Value::Number(-n),
                 Err(e) => e,
             });
@@ -752,7 +931,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             self.skip_ws();
             if self.consume_char('%') {
                 self.charge_operation()?;
-                value = match value.as_number() {
+                value = match value.into_number() {
                     Ok(n) => Value::Number(n / 100.0),
                     Err(e) => e,
                 };
@@ -782,7 +961,7 @@ impl<'a, 'r> Parser<'a, 'r> {
         match self.peek() {
             Some('"') => self.parse_string().map(Value::Text),
             Some('\'') => self.parse_quoted_sheet_reference(),
-            Some('#') => Ok(Value::Error(self.parse_error())),
+            Some('#') => self.parse_error().map(Value::Error),
             Some('$') => self.parse_unqualified_reference(),
             Some('0'..='9') if self.starts_whole_row_range() => self.parse_unqualified_reference(),
             Some('0'..='9') | Some('.') => self.parse_number().map(Value::Number),
@@ -827,14 +1006,14 @@ impl<'a, 'r> Parser<'a, 'r> {
             self.skip_ws();
             if self.consume_char(')') {
                 self.charge_operation()?;
-                return evaluate_function(&ident_upper, &args);
+                return evaluate_function(&ident_upper, &args, &self.operation_budget);
             }
             loop {
                 args.push(self.parse_comparison()?);
                 self.skip_ws();
                 if self.consume_char(')') {
                     self.charge_operation()?;
-                    return evaluate_function(&ident_upper, &args);
+                    return evaluate_function(&ident_upper, &args, &self.operation_budget);
                 }
                 if self.consume_char(',') {
                     continue;
@@ -1000,9 +1179,15 @@ impl<'a, 'r> Parser<'a, 'r> {
         let mut out = String::new();
         loop {
             match self.bump() {
-                Some('"') if self.consume_char('"') => out.push('"'),
+                Some('"') if self.consume_char('"') => {
+                    self.operation_budget.grow_text(out.len(), 1)?;
+                    out.push('"');
+                }
                 Some('"') => return Ok(out),
-                Some(c) => out.push(c),
+                Some(c) => {
+                    self.operation_budget.grow_text(out.len(), c.len_utf8())?;
+                    out.push(c);
+                }
                 None => return Err(FormulaUnsupportedReason::UnparsableExpression),
             }
         }
@@ -1029,7 +1214,7 @@ impl<'a, 'r> Parser<'a, 'r> {
             .map_err(|_| FormulaUnsupportedReason::UnparsableExpression)
     }
 
-    fn parse_error(&mut self) -> String {
+    fn parse_error(&mut self) -> std::result::Result<String, FormulaUnsupportedReason> {
         // Try the fixed canonical error literals first (greedy exact match
         // at the current position) so #N/A and #DIV/0! -- the two literals
         // that contain a '/', which the generic operator-stopping scan below
@@ -1038,7 +1223,8 @@ impl<'a, 'r> Parser<'a, 'r> {
         for literal in error_literals() {
             if self.input[self.pos..].starts_with(literal) {
                 self.pos += literal.len();
-                return literal.to_string();
+                self.operation_budget.grow_text(0, literal.len())?;
+                return Ok(literal.to_string());
             }
         }
         let start = self.pos;
@@ -1046,7 +1232,8 @@ impl<'a, 'r> Parser<'a, 'r> {
         {
             self.bump();
         }
-        self.input[start..self.pos].to_string()
+        self.operation_budget.grow_text(0, self.pos - start)?;
+        Ok(self.input[start..self.pos].to_string())
     }
 
     fn consume_comparison_op(&mut self) -> Option<CompareOp> {
@@ -1143,9 +1330,13 @@ fn is_deterministic_function(ident: &str) -> bool {
 fn evaluate_function(
     ident: &str,
     args: &[Value],
+    budget: &OperationBudget,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
     if !valid_function_arity(ident, args.len()) {
         return Ok(Value::Error("#VALUE!".to_string()));
+    }
+    for arg in args {
+        budget.reserve_value_copy(arg)?;
     }
     match ident {
         "SUM" => Ok(eval_sum(args)),
@@ -1170,12 +1361,12 @@ fn evaluate_function(
         "MOD" => eval_mod(args),
         "LEN" => eval_len(args),
         "TRIM" => eval_trim(args),
-        "UPPER" => eval_case(args, |s| s.to_uppercase()),
-        "LOWER" => eval_case(args, |s| s.to_lowercase()),
+        "UPPER" => eval_case(args, true, budget),
+        "LOWER" => eval_case(args, false, budget),
         "LEFT" => eval_left_or_right(args, true),
         "RIGHT" => eval_left_or_right(args, false),
         "MID" => eval_mid(args),
-        "CONCATENATE" => Ok(eval_concat(args)),
+        "CONCATENATE" => eval_concat(args, budget),
         "AND" => eval_and_or_or(args, false),
         "OR" => eval_and_or_or(args, true),
         "NOT" => eval_not(args),
@@ -1586,13 +1777,33 @@ fn eval_trim(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedRea
 
 fn eval_case(
     args: &[Value],
-    map: impl FnOnce(String) -> String,
+    upper: bool,
+    budget: &OperationBudget,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
     let text = match required_text(args, 0) {
         Ok(text) => text,
         Err(error) => return Ok(error),
     };
-    Ok(Value::Text(map(text)))
+    let mut out = String::new();
+    if upper {
+        for c in text.chars().flat_map(char::to_uppercase) {
+            budget.grow_text(out.len(), c.len_utf8())?;
+            out.push(c);
+        }
+    } else {
+        // Final sigma is context-sensitive but has the same UTF-8 length as
+        // ordinary sigma. Count exact Unicode expansion before allocating.
+        let size = text
+            .chars()
+            .flat_map(char::to_lowercase)
+            .try_fold(0usize, |size, c| {
+                size.checked_add(c.len_utf8())
+                    .ok_or(FormulaUnsupportedReason::TextLimitExceeded)
+            })?;
+        budget.grow_text(0, size)?;
+        out = text.to_lowercase();
+    }
+    Ok(Value::Text(out))
 }
 
 fn eval_left_or_right(
@@ -1670,15 +1881,21 @@ fn eval_mid(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReas
     Ok(Value::Text(chars[start..end].iter().collect()))
 }
 
-fn eval_concat(args: &[Value]) -> Value {
+fn eval_concat(
+    args: &[Value],
+    budget: &OperationBudget,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
     let mut out = String::new();
     for arg in args {
         match arg.as_text() {
-            Ok(text) => out.push_str(&text),
-            Err(error) => return error,
+            Ok(text) => {
+                budget.grow_text(out.len(), text.len())?;
+                out.push_str(&text);
+            }
+            Err(error) => return Ok(error),
         }
     }
-    Value::Text(out)
+    Ok(Value::Text(out))
 }
 
 fn eval_and_or_or(
@@ -1800,16 +2017,36 @@ fn eval_value(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedRe
 }
 
 fn binary_number(left: Value, right: Value, f: impl FnOnce(f64, f64) -> f64) -> Value {
-    match (left.as_number(), right.as_number()) {
+    match (left.into_number(), right.into_number()) {
         (Err(e), _) | (_, Err(e)) => e,
         (Ok(a), Ok(b)) => Value::Number(f(a, b)),
     }
 }
 
-fn binary_text(left: Value, right: Value) -> Value {
+fn binary_text(
+    left: Value,
+    right: Value,
+    budget: &OperationBudget,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    if matches!(left, Value::Error(_)) {
+        return Ok(left);
+    }
+    if matches!(right, Value::Error(_)) {
+        return Ok(right);
+    }
     match (left.as_text(), right.as_text()) {
-        (Err(e), _) | (_, Err(e)) => e,
-        (Ok(a), Ok(b)) => Value::Text(format!("{a}{b}")),
+        (Err(e), _) | (_, Err(e)) => Ok(e),
+        (Ok(a), Ok(b)) => {
+            let size = a
+                .len()
+                .checked_add(b.len())
+                .ok_or(FormulaUnsupportedReason::TextLimitExceeded)?;
+            budget.grow_text(0, size)?;
+            let mut text = String::with_capacity(size);
+            text.push_str(&a);
+            text.push_str(&b);
+            Ok(Value::Text(text))
+        }
     }
 }
 
@@ -1826,7 +2063,7 @@ fn numeric_power(base: f64, exponent: f64) -> Value {
 }
 
 fn binary_power(left: Value, right: Value) -> Value {
-    match (left.as_number(), right.as_number()) {
+    match (left.into_number(), right.into_number()) {
         (Err(e), _) | (_, Err(e)) => e,
         (Ok(a), Ok(b)) => numeric_power(a, b),
     }
@@ -1845,7 +2082,7 @@ fn required_number(args: &[Value], index: usize) -> std::result::Result<f64, Val
 }
 
 /// Text-argument counterpart to `required_number`.
-fn required_text(args: &[Value], index: usize) -> std::result::Result<String, Value> {
+fn required_text(args: &[Value], index: usize) -> std::result::Result<Cow<'_, str>, Value> {
     match args.get(index) {
         Some(value) => value.as_text(),
         None => Err(Value::Error("#VALUE!".to_string())),
@@ -1873,11 +2110,11 @@ fn compare_rank(value: &Value) -> u8 {
 }
 
 fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
-    if let Value::Error(e) = &left {
-        return Value::Error(e.clone());
+    if matches!(left, Value::Error(_)) {
+        return left;
     }
-    if let Value::Error(e) = &right {
-        return Value::Error(e.clone());
+    if matches!(right, Value::Error(_)) {
+        return right;
     }
     // A bare range (e.g. `A1:A3=5`) was never a valid scalar comparison
     // operand -- both `as_number` and `as_text` already rejected it with
@@ -1888,9 +2125,11 @@ fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
     }
     let ordering = if compare_rank(&left) == compare_rank(&right) {
         match (&left, &right) {
-            (Value::Text(a), Value::Text(b)) => {
-                Some(a.to_ascii_uppercase().cmp(&b.to_ascii_uppercase()))
-            }
+            (Value::Text(a), Value::Text(b)) => Some(
+                a.bytes()
+                    .map(|byte| byte.to_ascii_uppercase())
+                    .cmp(b.bytes().map(|byte| byte.to_ascii_uppercase())),
+            ),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             // Number vs Number, Number vs Blank, or Blank vs Blank: compare
             // numerically (blank reads as 0.0, matching `as_number`).
@@ -2109,6 +2348,302 @@ mod tests {
         MAX_EVALUATION_OPERATIONS, MAX_EXPR_DEPTH, MAX_FORMULA_DEPENDENCY_DEPTH,
     };
     use crate::{Cell, Workbook};
+
+    fn small_text_budget(value: usize, total: usize) -> super::OperationBudget {
+        super::OperationBudget {
+            max_text_value: value,
+            max_text_total: total,
+            ..super::OperationBudget::default()
+        }
+    }
+
+    #[test]
+    fn text_budget_rejects_concat_and_unicode_expansion_before_growth() {
+        for formula in [
+            r#""abcd"&"efghi""#,
+            r#"CONCATENATE("abcd","efghi")"#,
+            r#"UPPER("ΐΐ")"#,
+            r#"LOWER("İİİ")"#,
+        ] {
+            let result =
+                super::evaluate_formula_with_refs(formula, small_text_budget(8, 128), |_| {
+                    Err(FormulaUnsupportedReason::UnresolvedName)
+                });
+            assert_eq!(
+                result.unwrap_err().code(),
+                "text_limit_exceeded",
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_budget_is_shared_across_small_doubling_dependencies_and_memo_hits() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_string(0, 0, "x");
+        for row in 1..10 {
+            sheet.write_formula(row, 0, format!("A{row}&A{row}"), "cached");
+        }
+        let mut state = super::EvalState {
+            operation_budget: small_text_budget(64, 256),
+            ..super::EvalState::default()
+        };
+        assert_eq!(
+            super::evaluate_cell_inner(&workbook, "Data", 9, 0, &mut state)
+                .unwrap_err()
+                .code(),
+            "text_limit_exceeded"
+        );
+        assert!(state.operation_budget.text_used.get() <= 256);
+    }
+
+    #[test]
+    fn text_budget_bounds_sibling_outputs_even_when_final_result_is_numeric() {
+        let result = super::evaluate_formula_with_refs(
+            r#"LEN("abcd"&"efgh")+LEN("ijkl"&"mnop")"#,
+            small_text_budget(16, 24),
+            |_| Err(FormulaUnsupportedReason::UnresolvedName),
+        );
+        assert_eq!(result.unwrap_err().code(), "text_limit_exceeded");
+    }
+
+    #[test]
+    fn text_budget_utf8_boundary_and_failed_growth_are_exact() {
+        let budget = small_text_budget(8, 64);
+        assert_eq!(
+            super::binary_text(
+                super::Value::Text("한".into()),
+                super::Value::Text("글!!".into()),
+                &budget
+            )
+            .unwrap(),
+            super::Value::Text("한글!!".into())
+        );
+        assert_eq!(budget.text_used.get(), 8);
+        assert!(budget.grow_text(8, 1).is_err());
+        assert_eq!(budget.text_used.get(), 8);
+        assert_eq!(
+            super::evaluate_formula_with_refs(
+                r#"LOWER("ABCDEFGH")"#,
+                small_text_budget(8, 128),
+                |_| Err(FormulaUnsupportedReason::UnresolvedName)
+            )
+            .unwrap(),
+            Cell::Text("abcdefgh".into())
+        );
+        assert_eq!(
+            super::evaluate_formula_with_refs(
+                r#"LOWER("ΟΣ")"#,
+                small_text_budget(8, 128),
+                |_| Err(FormulaUnsupportedReason::UnresolvedName)
+            )
+            .unwrap(),
+            Cell::Text("ος".into())
+        );
+    }
+
+    #[test]
+    fn text_budget_memo_copies_and_fallback_reason_remain_bounded() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("Data").write_string(0, 0, "12345678");
+        let mut state = super::EvalState {
+            operation_budget: small_text_budget(8, 31),
+            ..super::EvalState::default()
+        };
+        assert_eq!(
+            super::evaluate_cell_inner(&workbook, "Data", 0, 0, &mut state).unwrap(),
+            Cell::Text("12345678".into())
+        );
+        assert_eq!(state.operation_budget.text_used.get(), 24);
+        assert_eq!(
+            super::evaluate_cell_inner(&workbook, "Data", 0, 0, &mut state),
+            Err(FormulaUnsupportedReason::TextLimitExceeded)
+        );
+        assert_eq!(state.operation_budget.text_used.get(), 28);
+        assert_eq!(
+            FormulaUnsupportedReason::TextLimitExceeded.code(),
+            "text_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn batch_evaluation_keeps_order_cross_sheet_dependencies_and_unsupported_caches() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_number(0, 0, 3.0);
+        sheet.write_formula(0, 1, "A1*2", 0.0);
+        sheet.write_formula(0, 2, "NOW()", "cached volatile");
+        workbook
+            .add_sheet("Other")
+            .write_formula(0, 0, "Data!B1+1", 0.0);
+        assert_eq!(
+            workbook
+                .evaluate_cells(&[("Other", 0, 0), ("Data", 0, 1), ("Data", 0, 2)])
+                .unwrap(),
+            vec![
+                FormulaEvaluation::Computed(Cell::Number(7.0)),
+                FormulaEvaluation::Computed(Cell::Number(6.0)),
+                FormulaEvaluation::Fallback {
+                    cached: Cell::Text("cached volatile".into()),
+                    reason: FormulaUnsupportedReason::Volatile
+                }
+            ]
+        );
+        assert!(workbook.evaluate_cells(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_evaluation_shares_operation_budget_and_caps_targets() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        for col in 0..2 {
+            sheet.write_formula(0, col, format!("{}1", "1+".repeat(2999)), 0.0);
+        }
+        assert!(matches!(
+            workbook.evaluate_cell("Data", 0, 0),
+            FormulaEvaluation::Computed(_)
+        ));
+        assert_eq!(
+            workbook.evaluate_cells(&[("Data", 0, 0), ("Data", 0, 1)]),
+            Err(FormulaUnsupportedReason::OperationLimitExceeded)
+        );
+        assert_eq!(
+            workbook.evaluate_cells(&vec![("Data", 0, 0); 10_001]),
+            Err(FormulaUnsupportedReason::OperationLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn batch_evaluation_aborts_budget_exhaustion_instead_of_faking_cached_success() {
+        let mut workbook = Workbook::new();
+        workbook
+            .add_sheet("Data")
+            .write_formula(0, 0, "SUM(A1:A10001)", "cached");
+        assert_eq!(
+            workbook.evaluate_cells(&[("Data", 0, 0)]),
+            Err(FormulaUnsupportedReason::RangeTooLarge)
+        );
+        workbook.sheets[0].write_string(1, 0, "x".repeat(1024));
+        workbook.sheets[0].write_formula(1, 1, "A2", "cached");
+        assert_eq!(
+            workbook.evaluate_cells(&vec![("Data", 1, 1); 10_000]),
+            Err(FormulaUnsupportedReason::TextLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn batch_range_visits_are_shared_and_sparse_indexes_stop_before_growth() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_formula(0, 1, "SUM(A1:A6000)", 0.0);
+        sheet.write_formula(0, 2, "SUM(A6001:A12000)", 0.0);
+        assert_eq!(
+            workbook.evaluate_cells(&[("Data", 0, 1), ("Data", 0, 2)]),
+            Err(FormulaUnsupportedReason::RangeTooLarge)
+        );
+        let mut state = super::EvalState::default();
+        state
+            .operation_budget
+            .range_used
+            .set(super::MAX_RANGE_CELLS);
+        let mut values = Vec::new();
+        assert_eq!(
+            super::append_sparse_range_values(
+                &workbook,
+                "Data",
+                &mut state,
+                &mut values,
+                |_, _| true
+            ),
+            Err(FormulaUnsupportedReason::RangeTooLarge)
+        );
+        assert_eq!(state.operation_budget.range_scanned.get(), 1);
+        assert!(values.is_empty());
+        state
+            .operation_budget
+            .range_scanned
+            .set(super::MAX_RANGE_SCAN_CELLS);
+        assert_eq!(
+            super::append_sparse_range_values(
+                &workbook,
+                "Data",
+                &mut state,
+                &mut values,
+                |_, _| false
+            ),
+            Err(FormulaUnsupportedReason::RangeTooLarge)
+        );
+        assert_eq!(
+            state.operation_budget.range_scanned.get(),
+            super::MAX_RANGE_SCAN_CELLS
+        );
+    }
+
+    #[test]
+    fn three_dimensional_single_cell_expansion_uses_shared_range_budget() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("First").write_number(0, 0, 1.0);
+        workbook.add_sheet("Last").write_number(0, 0, 2.0);
+        let mut state = super::EvalState::default();
+        state
+            .operation_budget
+            .range_used
+            .set(super::MAX_RANGE_CELLS - 1);
+        assert_eq!(
+            super::resolve_reference(
+                &workbook,
+                "First",
+                &mut state,
+                super::RefRequest::Cell {
+                    sheet: Some("First:Last".into()),
+                    reference: "A1".into()
+                }
+            ),
+            Err(FormulaUnsupportedReason::RangeTooLarge)
+        );
+        assert!(state.memo.is_empty());
+    }
+
+    #[test]
+    fn text_budget_rejects_large_error_tokens_and_sheet_keys_before_copy() {
+        assert_eq!(
+            super::evaluate_formula_with_refs("#ABCDEFGHI", small_text_budget(8, 64), |_| Err(
+                FormulaUnsupportedReason::UnresolvedName
+            )),
+            Err(FormulaUnsupportedReason::TextLimitExceeded)
+        );
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("LongSheetName").write_number(0, 0, 1.0);
+        let mut state = super::EvalState {
+            operation_budget: small_text_budget(8, 64),
+            ..super::EvalState::default()
+        };
+        assert_eq!(
+            super::evaluate_cell_inner(&workbook, "LongSheetName", 0, 0, &mut state),
+            Err(FormulaUnsupportedReason::TextLimitExceeded)
+        );
+        assert!(state.memo.is_empty());
+        assert_eq!(state.operation_budget.text_used.get(), 0);
+    }
+
+    #[test]
+    fn consuming_operators_move_error_text_instead_of_copying_each_intermediate() {
+        let mut error = super::Value::Error("x".repeat(1024));
+        let original = match &error {
+            super::Value::Error(text) => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        for _ in 0..100 {
+            error = super::binary_number(error, super::Value::Number(1.0), |a, b| a + b);
+            error = super::binary_power(error, super::Value::Number(1.0));
+            error = super::binary_text(error, super::Value::Number(1.0), &small_text_budget(8, 8))
+                .unwrap();
+            error = super::compare_values(error, super::Value::Number(1.0), super::CompareOp::Eq);
+            error = error.into_number().unwrap_err();
+            assert!(matches!(&error, super::Value::Error(text) if text.as_ptr() == original));
+        }
+    }
 
     #[test]
     fn evaluates_literal_arithmetic_formula() {

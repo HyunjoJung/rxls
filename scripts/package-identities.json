@@ -1,0 +1,62 @@
+{
+  "schema": "rxls.package-identities.v1",
+  "rust_floors": {
+    "core": "1.85",
+    "mcp": "1.88"
+  },
+  "cargo": {
+    "rxls": {
+      "manifest": "Cargo.toml",
+      "rust_floor": "core",
+      "dependencies": []
+    },
+    "rxls-wasm": {
+      "manifest": "bindings/wasm/Cargo.toml",
+      "rust_floor": "core",
+      "version_from": "rxls",
+      "publish": false,
+      "dependencies": ["rxls"]
+    },
+    "rxls-render": {
+      "manifest": "render/Cargo.toml",
+      "rust_floor": "core",
+      "publish": false,
+      "dependencies": ["rxls"]
+    },
+    "rxls-render-wasm": {
+      "manifest": "bindings/render-wasm/Cargo.toml",
+      "rust_floor": "core",
+      "publish": false,
+      "dependencies": ["rxls", "rxls-render"]
+    },
+    "rxls-mcp": {
+      "manifest": "bindings/mcp/Cargo.toml",
+      "rust_floor": "mcp",
+      "publish": false,
+      "dependencies": ["rxls"]
+    }
+  },
+  "npm": {
+    "rxls-wasm": {
+      "manifest": "bindings/wasm/npm/package.json",
+      "version_from": "rxls"
+    },
+    "@rxls/render-worker": {
+      "manifest": "bindings/render-wasm/package.json",
+      "version_from": "rxls-render-wasm"
+    },
+    "rxls-viewer": {
+      "manifest": "viewer/package.json",
+      "lockfile": "viewer/package-lock.json"
+    },
+    "rxls-spreadsheet-preview": {
+      "manifest": "extensions/vscode/package.json",
+      "lockfile": "extensions/vscode/package-lock.json"
+    }
+  },
+  "wasm_toolchain": {
+    "lockfile": "bindings/render-wasm/toolchain-lock.json",
+    "rust_floor": "core",
+    "packages": ["rxls-wasm", "rxls-render-wasm"]
+  }
+}

@@ -14,9 +14,15 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to Pages after verification (canonical main only)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
-  group: pages
+  group: viewer-${{ (github.repository == 'HyunjoJung/rxls' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.deploy == true)) && 'pages' || format('verify-{0}', github.ref) }}
   cancel-in-progress: true
 
 env:
@@ -25,14 +31,19 @@ env:
   WASM_BINDGEN_VERSION: "0.2.126"
   NODE_VERSION: "24.18.0"
   NPM_VERSION: "11.16.0"
+  CHROMIUM_VERSION: "150.0.7871.115"
+  CHROMIUM_ARCHIVE_SHA256: "1be2db033133c5e2dd1a4e8664bf67b19a61bcf6ed28d2b00f433b3f0b4f9585"
+  CHROMIUM_ARCHIVE_SIZE: "187332810"
 
 jobs:
   build:
     name: Build local-only workbook viewer
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      deploy_pages: ${{ steps.mode.outputs.deploy_pages }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,6 +58,23 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+      - name: Select viewer publication mode
+        id: mode
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          REQUEST_DEPLOYMENT: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy == true) }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUEST_DEPLOYMENT" != "true" ]; then
+            echo "deploy_pages=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$GITHUB_REF" = "refs/heads/main"
+          remote_main="$(git ls-remote --exit-code https://github.com/HyunjoJung/rxls.git refs/heads/main)"
+          test "$remote_main" = "$(printf '%s\trefs/heads/main' "$EXPECTED_SHA")"
+          echo "deploy_pages=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: ${{ env.RENDER_MSRV }}
@@ -59,6 +87,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
       - name: Configure GitHub Pages
+        if: steps.mode.outputs.deploy_pages == 'true'
         id: pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Verify viewer dependencies and application logic
@@ -67,6 +96,18 @@ jobs:
           test "$(npm --version)" = "$NPM_VERSION"
           npm ci --prefix viewer --ignore-scripts
           npm --prefix viewer test
+      - name: Install pinned workbook reopen oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/rxls-viewer-python"
+          "$RUNNER_TEMP/rxls-viewer-python/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement viewer/openpyxl-requirements.txt
+          echo "RXLS_PYTHON=$RUNNER_TEMP/rxls-viewer-python/bin/python" >> "$GITHUB_ENV"
       - name: Install exact wasm-bindgen CLI
         shell: bash
         run: |
@@ -85,7 +126,7 @@ jobs:
       - name: Build exact worker and Pages artifact
         shell: bash
         env:
-          RXLS_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          RXLS_BASE_PATH: ${{ steps.pages.outputs.base_path || '/rxls' }}/
         run: |
           set -euo pipefail
           test -n "$RUNNER_TEMP"
@@ -102,6 +143,37 @@ jobs:
           test -f viewer/dist/THIRD_PARTY_NOTICES.txt
           test -f viewer/dist/runtime/pkg/rxls_render_wasm_bg.wasm
           test -f viewer/dist/samples/manifest.json
+      - name: Install exact Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          chrome_dir="$RUNNER_TEMP/rxls-viewer-chrome"
+          mkdir -p "$chrome_dir"
+          curl --fail --location --retry 3 \
+            --output "$chrome_dir/chrome.zip" \
+            "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chrome-linux64.zip"
+          test "$(stat --format=%s "$chrome_dir/chrome.zip")" = "$CHROMIUM_ARCHIVE_SIZE"
+          printf '%s  %s\n' "$CHROMIUM_ARCHIVE_SHA256" "$chrome_dir/chrome.zip" \
+            | sha256sum --check --strict
+          unzip -q "$chrome_dir/chrome.zip" -d "$chrome_dir"
+          chrome_root="$chrome_dir/chrome-linux64"
+          chmod +x "$chrome_root/chrome"
+          test -f "$chrome_root/chrome_sandbox"
+          sudo chown root:root "$chrome_root/chrome_sandbox"
+          sudo chmod 4755 "$chrome_root/chrome_sandbox"
+          test "$(stat --format=%u "$chrome_root/chrome_sandbox")" = "0"
+          test "$(stat --format=%a "$chrome_root/chrome_sandbox")" = "4755"
+          ldd "$chrome_root/chrome" | tee "$RUNNER_TEMP/rxls-viewer-chromium-ldd.txt"
+          if grep -Fq "not found" "$RUNNER_TEMP/rxls-viewer-chromium-ldd.txt"; then
+            exit 1
+          fi
+          echo "RXLS_CHROMIUM_EXECUTABLE=$chrome_root/chrome" >> "$GITHUB_ENV"
+          echo "CHROME_DEVEL_SANDBOX=$chrome_root/chrome_sandbox" >> "$GITHUB_ENV"
+      - name: Exercise exact Pages artifact in pinned Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix viewer run test:browser
       - name: Verify source remained exact and clean
         shell: bash
         env:
@@ -112,6 +184,7 @@ jobs:
           git diff --exit-code
           git diff --cached --exit-code
       - name: Upload GitHub Pages artifact
+        if: steps.mode.outputs.deploy_pages == 'true'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: viewer/dist
@@ -119,6 +192,7 @@ jobs:
   deploy:
     name: Deploy workbook viewer
     needs: build
+    if: needs.build.outputs.deploy_pages == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -128,6 +202,16 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Recheck exact canonical main before deployment
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$GITHUB_REF" = "refs/heads/main"
+          remote_main="$(git ls-remote --exit-code https://github.com/HyunjoJung/rxls.git refs/heads/main)"
+          test "$remote_main" = "$(printf '%s\trefs/heads/main' "$EXPECTED_SHA")"
       - name: Deploy GitHub Pages artifact
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

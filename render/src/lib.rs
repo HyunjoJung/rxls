@@ -11,6 +11,7 @@
 mod embed;
 mod error;
 mod font;
+mod interaction;
 mod layout;
 mod media;
 mod pdf;
@@ -22,6 +23,9 @@ mod typography;
 
 pub use error::{LimitKind, RenderError};
 pub use font::{FontFaceIdentity, FontPack, FontPackError, FontPackLimits, FontPackMember};
+pub use interaction::{
+    render_sheet_interactive_svg, CellInteractionRegion, InteractiveRenderOutput,
+};
 pub use layout::{
     build_scene, build_sheet_scene, CellCoordinate, RenderLimits, RenderOptions, RenderRange,
     RenderReport, RenderSelection, RenderWarning, RenderedFontFace, SceneBuild, WarningCode,

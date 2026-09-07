@@ -1038,6 +1038,27 @@ class RenderOracleContainerTests(unittest.TestCase):
             ):
                 MODULE.validate_lock(mutated)
 
+    def test_archived_artifact_preserves_exact_version_bytes_and_digest(self) -> None:
+        lock, _, _ = MODULE.load_lock()
+        artifact = lock["libreoffice"]["artifact"]
+        self.assertEqual(
+            artifact["fallback_url"],
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/"
+            "deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz",
+        )
+        self.assertEqual(lock["libreoffice"]["version"], "26.2.3.2")
+        self.assertEqual(artifact["bytes"], 216_816_909)
+        self.assertEqual(
+            artifact["sha256"],
+            "18838cb9d028b664a9d0e966cd4c8ca47ca3ea363c393b41d1b5124740b121a5",
+        )
+        artifact["fallback_url"] = (
+            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
+            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+        )
+        with self.assertRaisesRegex(MODULE.OracleContainerError, "lock_artifact_url"):
+            MODULE.validate_lock(lock)
+
     def test_containerfile_has_exact_architecture_artifact_and_snapshot_pins(self) -> None:
         lock, _, _ = MODULE.load_lock()
         containerfile = (CONTAINER_DIR / "Containerfile").read_text()

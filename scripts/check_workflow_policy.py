@@ -26,6 +26,7 @@ RELEASE_VERSIONS = {
 SEMVER_CHECKS_VERSION = "0.49.0"
 SEMVER_BASELINE_VERSION = "0.1.2"
 SEMVER_RELEASE_TYPE = "patch"
+CORE_RELEASE_TAG_PATTERN = "v[0-9]*.[0-9]*.[0-9]*"
 SEMVER_FEATURE_MODES = (
     "--all-features",
     "--default-features",
@@ -135,7 +136,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
     "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
-    "dcb70c3f452ab5c7075315dbce68c38ec2da7a20ab20a22da21a2d728faa5ef3",
+    "054c41f51299ec5331abca90af10c81e7538c3588255d358461e23dc26825b48",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
@@ -153,20 +154,20 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
     "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
     "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
-    "7aa2fb46f8d33f6abd1ad0795d7c76aacaf8d47ada5305762a458ac180acad64",
+    "5a0bee8f4f21bda04cd5f69c10d0e9504293a691b4bd112b27ab7d5ebdfc432f",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "dba690b0defabe7bdb4f651fa38c6ece0b0d4ece6f49919e6fe7d71046f2f6a9"
+    "948975307e04cbca76b7c3007cdc4b74e5940c60d400678b550f9e7f6a969998"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "ac477662896b26fef0fb4bfe292efcb2ff1cce2f09fb76e03b43da42143ec152"
+    "b52b8bde803f6cfc2ffb40f533febf6b5d75dcb17326943546497c921e0c60cc"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "b125148dde44cb51b9e569c19eccce2b1be9a6dc74e4a9ea52c228d01c4bf6ca"
 )
 WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "02b6d4b68f43dd18d1f2b1c16165332b19346ba27480feea03ecbedfcd2cf3c2"
+    "39a36f584d18859cb9ddcdbf0ee45cc2ef5712acb0448bfde575818b7ebfeac8"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -438,8 +439,8 @@ def _audit_oracle_build_retry(
             "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
         ): "locked image retries must bind failures to the exact primary artifact mirror",
         (
-            "https://download.documentfoundation.org/libreoffice/stable/26.2.3/"
-            "deb/x86_64/LibreOffice_26.2.3_Linux_x86-64_deb.tar.gz"
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.3.2/"
+            "deb/x86_64/LibreOffice_26.2.3.2_Linux_x86-64_deb.tar.gz"
         ): "locked image retries must bind failures to the exact fallback artifact mirror",
         r"curl: \((5|6|7|16|18|28|35|52|55|56|92)\)": (
             "locked image retries must use the reviewed curl transport allowlist"
@@ -1978,6 +1979,36 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
 
     active = _without_commented_lines(text)
     errors: list[str] = []
+    on_block = _single_yaml_block(
+        path, active, "on:", 0, "core release trigger block", errors
+    )
+    push_block = _single_yaml_block(
+        path, on_block, "push:", 2, "core release push trigger", errors
+    )
+    tags_block = _single_yaml_block(
+        path, push_block, "tags:", 4, "core release tag filter", errors
+    )
+    tag_patterns: list[str] = []
+    readable_tags = bool(tags_block)
+    for line in tags_block.splitlines()[1:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        content = line.lstrip(" ")
+        if indent != 6 or not content.startswith("- "):
+            readable_tags = False
+            continue
+        pattern = _yaml_scalar_name(content[2:])
+        if pattern is None:
+            readable_tags = False
+            continue
+        tag_patterns.append(pattern)
+    if not readable_tags or tag_patterns != [CORE_RELEASE_TAG_PATTERN]:
+        errors.append(
+            f"{path}: core release must trigger only on the reviewed numeric "
+            f"SemVer tag pattern {CORE_RELEASE_TAG_PATTERN!r}"
+        )
+
     required = {
         "scripts/check_cargo_publish_dry_run.py": (
             "must use the dependency-free crates.io dry-run runner and verifier"
@@ -2080,6 +2111,39 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
     for snippet, message in required.items():
         if snippet not in active:
             errors.append(f"{path}: {message}")
+
+    for name, value in (
+        ("WASM_MSRV", "1.85.0"),
+        ("WASM_BINDGEN_BUILD_RUST", RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST),
+        ("WASM_BINDGEN_VERSION", RENDER_PACKAGE_WASM_BINDGEN_VERSION),
+        ("NODE_VERSION", RENDER_PACKAGE_NODE_VERSION),
+        ("NPM_VERSION", RENDER_PACKAGE_NPM_VERSION),
+    ):
+        assignment = re.compile(
+            rf"^\s*{name}:\s*[\"']?{re.escape(value)}[\"']?\s*$",
+            re.MULTILINE,
+        )
+        if len(assignment.findall(active)) != 1:
+            errors.append(f"{path}: core WASM packing must pin exact {name}={value}")
+
+    setup_node_header = (
+        "- uses: actions/setup-node@"
+        "820762786026740c76f36085b0efc47a31fe5020 # v7.0.0"
+    )
+    setup_node_step = _single_yaml_block(
+        path,
+        active,
+        setup_node_header,
+        6,
+        "core release Node setup step",
+        errors,
+    )
+    if setup_node_step.count("node-version: ${{ env.NODE_VERSION }}") != 1 or (
+        setup_node_step.count("package-manager-cache: false") != 1
+    ):
+        errors.append(
+            f"{path}: core WASM packing must use the exact shared Node/npm environment"
+        )
 
     checkout_header = f"- uses: {ORACLE_CHECKOUT_ACTION} # v7.0.1"
     checkout_step = _single_yaml_block(
@@ -2223,6 +2287,41 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
         "canonical release gate step",
         errors,
     )
+    wasm_install_step = _single_yaml_block(
+        path,
+        active,
+        "- name: Install locked wasm-bindgen and browser runtimes",
+        6,
+        "core release WASM tool install step",
+        errors,
+    )
+    errors.extend(
+        _audit_exact_wasm_bindgen_install(
+            path,
+            active,
+            wasm_install_step,
+            canonical_step,
+            'RUSTUP_TOOLCHAIN="$WASM_MSRV" bash scripts/build-wasm-package.sh',
+            "core release wasm-bindgen install",
+        )
+    )
+    if wasm_install_step.count(
+        'rustup toolchain install "$WASM_MSRV" --profile minimal \\\n'
+        "            --target wasm32-unknown-unknown"
+    ) != 1:
+        errors.append(
+            f"{path}: core WASM build must install the exact package compiler and target"
+        )
+    if wasm_install_step.count('test "$locked" = "$WASM_BINDGEN_VERSION"') != 1:
+        errors.append(f"{path}: core WASM build must bind wasm-bindgen to Cargo.lock")
+    for command in (
+        'test "$(node --version)" = "v$NODE_VERSION"',
+        'test "$(npm --version)" = "$NPM_VERSION"',
+    ):
+        if canonical_step.count(command) != 1:
+            errors.append(
+                f"{path}: canonical release gate must verify the shared packaging runtime"
+            )
     package_gate = (
         "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate"
     )
@@ -5637,6 +5736,9 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"': (
             "must require the candidate to equal the public main head"
         ),
+        'git fetch origin "refs/tags/v$version" --no-tags': (
+            "must bind the package version to its exact core release tag"
+        ),
         "require_successful_run ci.yml .github/workflows/ci.yml CI": (
             "must require exact-SHA push CI"
         ),
@@ -5692,6 +5794,36 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         "npm publish --dry-run --ignore-scripts --access public": (
             "must execute a registry publication dry run"
         ),
+        "Authenticate canonical core release package": (
+            "must consume the package owned by the matching core GitHub release"
+        ),
+        'gh api "repos/$GITHUB_REPOSITORY/releases/tags/$core_tag"': (
+            "must authenticate the exact core GitHub release record"
+        ),
+        'release.get("tag_name") != f"v{version}"': (
+            "must bind the canonical release record to the package version"
+        ),
+        'release.get("draft") is not False': (
+            "must reject draft core releases"
+        ),
+        'release.get("prerelease") is not False': (
+            "must reject prerelease core releases"
+        ),
+        'gh release download "$core_tag"': (
+            "must download the exact canonical core release assets"
+        ),
+        '--pattern "$archive_name"': (
+            "must download the canonical rxls-wasm archive by exact name"
+        ),
+        '--pattern "$checksum_name"': (
+            "must download the canonical archive checksum by exact name"
+        ),
+        'sha256sum --check --strict "$checksum_name"': (
+            "must authenticate the canonical archive with its release checksum"
+        ),
+        'cmp --silent "$output/$archive_name" "$canonical/$archive_name"': (
+            "must compare the rebuilt candidate and canonical release bytes"
+        ),
         "Verify evidence source remained exact and clean": (
             "must recheck the source after candidate construction"
         ),
@@ -5739,8 +5871,8 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         'python3 "$GITHUB_WORKSPACE/scripts/check_npm_registry_evidence.py"': (
             "must bind DSSE evidence to the exact release identity"
         ),
-        '--archive "$GITHUB_WORKSPACE/$output/rxls-wasm-$version.tgz"': (
-            "npm evidence must hash the transferred candidate archive directly"
+        '--archive "$GITHUB_WORKSPACE/$output/core-release/rxls-wasm-$version.tgz"': (
+            "npm evidence must hash the authenticated canonical archive directly"
         ),
         "--workflow .github/workflows/wasm-package-release.yml": (
             "npm provenance must identify this publishing workflow"
@@ -5756,6 +5888,15 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         ),
         'npm install --ignore-scripts "$spec"': (
             "must execute a clean registry-installed consumer"
+        ),
+        "target/wasm-release/core-release.json": (
+            "registry evidence must retain the authenticated core release record"
+        ),
+        "target/wasm-release/core-release/rxls-wasm-*.tgz.sha256": (
+            "registry evidence must retain the canonical release checksum"
+        ),
+        "target/wasm-release/npm-pack.json": (
+            "registry evidence must retain the digest-bound npm pack receipt"
         ),
     }
     for snippet, message in required.items():
@@ -5810,6 +5951,10 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         )
     if active.count('git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags') != 1:
         errors.append(f"{path}: publication must refetch exactly one hosted tag")
+    if active.count('git fetch origin "refs/tags/v$version" --no-tags') != 2:
+        errors.append(
+            f"{path}: verification and publication must each refetch the exact core tag"
+        )
     if active.count("package-manager-cache: false") != 2:
         errors.append(f"{path}: both release jobs must disable mutable npm caching")
     for forbidden in ("NODE_AUTH_TOKEN", "secrets.NPM_TOKEN", "_authToken"):
@@ -5828,6 +5973,10 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(f"{path}: registry preflight and postpublication checks must both run")
     if active.count("version dist.integrity repository.url dist.attestations --json") != 2:
         errors.append(f"{path}: registry checks must bind identity, integrity, and attestations")
+    if active.count('registry.get("dist.integrity") != packed.get("integrity")') != 2:
+        errors.append(
+            f"{path}: registry preflight and postpublication must bind the canonical digest"
+        )
     if active.count("https://slsa.dev/provenance/v1") != 2:
         errors.append(f"{path}: both registry checks must require exact SLSA provenance")
     if active.count("python3 scripts/render_supply_chain.py sbom") != 3:
@@ -5991,6 +6140,122 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
     if "GITHUB_EVENT_NAME" in pack_step or "github.event_name" in pack_step:
         errors.append(f"{path}: package validation must be identical for dispatch and tag")
 
+    identity_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Validate event and package identity",
+        6,
+        "WASM package identity step",
+        errors,
+    )
+    identity_order = (
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+        'git fetch origin "refs/tags/v$version" --no-tags',
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+        'if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then',
+    )
+    identity_positions = [identity_step.find(value) for value in identity_order]
+    if any(index < 0 for index in identity_positions) or identity_positions != sorted(
+        identity_positions
+    ) or identity_step.count(
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"'
+    ) != 1:
+        errors.append(
+            f"{path}: candidate identity must bind the exact core tag before event routing"
+        )
+
+    canonical_step = _single_yaml_block(
+        path,
+        verify_job,
+        "- name: Authenticate canonical core release package",
+        6,
+        "canonical core release package step",
+        errors,
+    )
+    canonical_required_once = (
+        "GH_TOKEN: ${{ github.token }}",
+        'gh api "repos/$GITHUB_REPOSITORY/releases/tags/$core_tag"',
+        'release.get("tag_name") != f"v{version}"',
+        'release.get("draft") is not False',
+        'release.get("prerelease") is not False',
+        'asset.get("state") != "uploaded"',
+        "path.is_file() or path.is_symlink()",
+        '"$checksum_digest" =~ ^[0-9a-f]{64}$',
+        'test "$(wc -l < "$canonical/$checksum_name")" -eq 1',
+        'sha256sum --check --strict "$checksum_name"',
+        'cmp --silent "$output/$archive_name" "$canonical/$archive_name"',
+    )
+    if any(canonical_step.count(value) != 1 for value in canonical_required_once):
+        errors.append(
+            f"{path}: canonical release download, inventory, checksum, and byte comparison drifted"
+        )
+    canonical_order = (
+        'gh api "repos/$GITHUB_REPOSITORY/releases/tags/$core_tag"',
+        'gh release download "$core_tag"',
+        "read -r checksum_digest checksum_asset checksum_extra",
+        'sha256sum --check --strict "$checksum_name"',
+        'cmp --silent "$output/$archive_name" "$canonical/$archive_name"',
+    )
+    canonical_positions = [canonical_step.find(value) for value in canonical_order]
+    if any(index < 0 for index in canonical_positions) or canonical_positions != sorted(
+        canonical_positions
+    ):
+        errors.append(
+            f"{path}: canonical release must be authenticated before candidate comparison"
+        )
+    if "GITHUB_EVENT_NAME" in canonical_step or "github.event_name" in canonical_step:
+        errors.append(
+            f"{path}: canonical release authentication must be identical for dispatch and tag"
+        )
+
+    reverify_step = _single_yaml_block(
+        path,
+        publish_job,
+        "- name: Reverify immutable candidate and hosted tag",
+        6,
+        "WASM canonical publication revalidation step",
+        errors,
+    )
+    reverify_required_once = (
+        'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags',
+        'git fetch origin "refs/tags/v$version" --no-tags',
+        'canonical_archive="$canonical/rxls-wasm-$version.tgz"',
+        'sha256sum --check --strict "$(basename "$canonical_checksum")"',
+        'cmp --silent "$archive" "$canonical_archive"',
+        '--archive "$canonical_archive"',
+    )
+    if any(reverify_step.count(value) != 1 for value in reverify_required_once):
+        errors.append(
+            f"{path}: publication must reauthenticate the core tag and canonical package bytes"
+        )
+    hosted_fetch = reverify_step.find(
+        'git fetch origin "refs/tags/$GITHUB_REF_NAME" --no-tags'
+    )
+    first_tag_check = reverify_step.find(
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+        hosted_fetch,
+    )
+    core_fetch = reverify_step.find('git fetch origin "refs/tags/v$version" --no-tags')
+    core_tag_check = reverify_step.find(
+        'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"',
+        core_fetch,
+    )
+    if not (
+        0 <= hosted_fetch < first_tag_check < core_fetch < core_tag_check
+        and reverify_step.count(
+            'test "$(git rev-parse \'FETCH_HEAD^{commit}\')" = "$GITHUB_SHA"'
+        )
+        == 2
+    ):
+        errors.append(
+            f"{path}: hosted WASM and core tags must each resolve to the publication commit"
+        )
+    if (
+        'npm publish "target/wasm-release/core-release/rxls-wasm-$version.tgz"'
+        not in publish_job
+    ):
+        errors.append(f"{path}: npm must publish only the canonical core release archive")
+
     verify_order = (
         "- name: Validate event and package identity",
         "- name: Require successful exact-SHA CI and CodeQL",
@@ -6000,6 +6265,7 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         "- name: Install exact wasm-bindgen CLI",
         "- name: Build and exercise exact package",
         "- name: Pack, inspect, dry-run, and attest candidate",
+        "- name: Authenticate canonical core release package",
         "- name: Verify evidence source remained exact and clean",
         "- name: Upload verified package candidate",
     )
@@ -6022,6 +6288,114 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         publish_positions
     ):
         errors.append(f"{path}: revalidation, preflight, publish, and audit order drifted")
+    return errors
+
+
+def audit_viewer_release_boundary(path: Path, text: str) -> list[str]:
+    """Keep manual viewer verification separate from canonical Pages promotion."""
+
+    active = _without_commented_lines(text)
+    errors: list[str] = []
+
+    def block(source: str, header: str, indent: int) -> str:
+        return _single_yaml_block(path, source, header, indent, header, errors)
+
+    def require(source: str, snippet: str, label: str) -> None:
+        if source.count(snippet) != 1:
+            errors.append(f"{path}: viewer boundary requires exactly one {label}")
+
+    on = block(active, "on:", 0)
+    dispatch = block(on, "workflow_dispatch:", 2)
+    inputs = block(dispatch, "inputs:", 4)
+    deploy_input = block(inputs, "deploy:", 6)
+    entries = _yaml_mapping_entries_at_indent(deploy_input, 8)
+    for key, value in (("type", "boolean"), ("default", "false")):
+        if [entry for entry in entries if entry[0] == key] != [(key, value)]:
+            errors.append(f"{path}: viewer dispatch deploy must have {key}: {value}")
+    require(
+        block(active, "concurrency:", 0),
+        "  group: viewer-${{ (github.repository == 'HyunjoJung/rxls' && "
+        "github.ref == 'refs/heads/main' && (github.event_name == 'push' || "
+        "inputs.deploy == true)) && 'pages' || format('verify-{0}', github.ref) }}",
+        "separate verification/deployment concurrency group",
+    )
+    jobs = block(active, "jobs:", 0)
+    if [name for name, _ in _yaml_mapping_entries_at_indent(jobs, 2)] != ["build", "deploy"]:
+        errors.append(f"{path}: viewer workflow must contain only build and deploy jobs")
+    build = block(jobs, "build:", 2)
+    deploy = block(jobs, "deploy:", 2)
+    permissions = block(build, "permissions:", 4)
+    if _yaml_mapping_entries_at_indent(permissions, 6) != [("contents", "read")]:
+        errors.append(f"{path}: viewer build must have only contents: read permission")
+    publish_permissions = block(deploy, "permissions:", 4)
+    if _yaml_mapping_entries_at_indent(publish_permissions, 6) != [
+        ("pages", "write"), ("id-token", "write")
+    ]:
+        errors.append(f"{path}: viewer deployment permissions must be Pages/OIDC only")
+    require(build, "      deploy_pages: ${{ steps.mode.outputs.deploy_pages }}", "mode output")
+    require(deploy, "    needs: build", "verified build dependency")
+    require(deploy, "    if: needs.build.outputs.deploy_pages == 'true'", "deployment job guard")
+    for step_name in ("Configure GitHub Pages", "Upload GitHub Pages artifact"):
+        step = block(build, f"- name: {step_name}", 6)
+        action = (
+            "actions/configure-pages@" if step_name == "Configure GitHub Pages"
+            else "actions/upload-pages-artifact@"
+        )
+        uses = [value for name, value in _yaml_mapping_entries_at_indent(step, 8) if name == "uses"]
+        if len(uses) != 1 or not uses[0].startswith(action):
+            errors.append(f"{path}: {step_name} must contain its guarded Pages action")
+        if [value for name, value in _yaml_mapping_entries_at_indent(step, 8) if name == "if"] != [
+            "steps.mode.outputs.deploy_pages == 'true'"
+        ]:
+            errors.append(f"{path}: {step_name} must require explicit publication mode")
+    require(build, "${{ steps.pages.outputs.base_path || '/rxls' }}/", "verification base path")
+    browser = block(build, "- name: Exercise exact Pages artifact in pinned Chromium", 6)
+    require(browser, "          npm --prefix viewer run test:browser", "production browser gate")
+    if any(name == "if" for name, _ in _yaml_mapping_entries_at_indent(browser, 8)):
+        errors.append(f"{path}: viewer browser verification must be unconditional")
+
+    selector = block(build, "- name: Select viewer publication mode", 6)
+    final_guard = block(deploy, "- name: Recheck exact canonical main before deployment", 6)
+    require(selector, "        id: mode", "publication selector identity")
+    require(
+        selector,
+        "          REQUEST_DEPLOYMENT: ${{ github.event_name == 'push' || "
+        "(github.event_name == 'workflow_dispatch' && inputs.deploy == true) }}",
+        "explicit deployment request expression",
+    )
+    identity_script = [
+        'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"',
+        'test "$GITHUB_REF" = "refs/heads/main"',
+        'remote_main="$(git ls-remote --exit-code https://github.com/HyunjoJung/rxls.git refs/heads/main)"',
+        'test "$remote_main" = "$(printf \'%s\\trefs/heads/main\' "$EXPECTED_SHA")"',
+    ]
+    expected_scripts = (
+        (selector, [
+            "set -euo pipefail",
+            'if [ "$REQUEST_DEPLOYMENT" != "true" ]; then',
+            '  echo "deploy_pages=false" >> "$GITHUB_OUTPUT"',
+            "  exit 0", "fi", *identity_script,
+            'echo "deploy_pages=true" >> "$GITHUB_OUTPUT"',
+        ]),
+        (final_guard, ["set -euo pipefail", *identity_script]),
+    )
+    for step, expected in expected_scripts:
+        require(step, "          EXPECTED_SHA: ${{ github.sha }}", "exact source binding")
+        require(step, "        shell: bash", "fail-closed Bash interpreter")
+        if any(name in {"if", "continue-on-error"} for name, _ in _yaml_mapping_entries_at_indent(step, 8)):
+            errors.append(f"{path}: viewer identity checks must not be skipped or tolerated")
+        scripts = _workflow_run_scripts("    steps:\n" + step)
+        if len(scripts) != 1 or scripts[0].strip() != "\n".join(expected):
+            errors.append(f"{path}: viewer publication identity script differs from reviewed gate")
+    if deploy.find("- name: Recheck exact canonical main before deployment") > deploy.find("- name: Deploy GitHub Pages artifact"):
+        errors.append(f"{path}: exact main identity must be checked before Pages deployment")
+    deployment = block(deploy, "- name: Deploy GitHub Pages artifact", 6)
+    uses = [value for name, value in _yaml_mapping_entries_at_indent(deployment, 8) if name == "uses"]
+    if len(uses) != 1 or not uses[0].startswith("actions/deploy-pages@"):
+        errors.append(f"{path}: final viewer deployment step must contain the Pages action")
+    for action, expected_count in (("actions/configure-pages@", 1), ("actions/upload-pages-artifact@", 1), ("actions/deploy-pages@", 1)):
+        if active.count(action) != expected_count:
+            errors.append(f"{path}: viewer workflow has an unexpected {action} action count")
     return errors
 
 
@@ -6057,6 +6431,8 @@ def audit_repository(root: Path) -> list[str]:
             errors.extend(audit_wasm_package_release_workflow(relative, text))
         elif path.name == "codeql.yml":
             errors.extend(audit_codeql_workflow(relative, text))
+        elif path.name == "viewer-pages.yml":
+            errors.extend(audit_viewer_release_boundary(relative, text))
 
     release = workflow_root / "release.yml"
     if not release.is_file():

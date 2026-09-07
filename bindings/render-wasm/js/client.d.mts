@@ -3,6 +3,7 @@ import type {
   DocumentPropertiesInspection,
   EditableCell,
   EditMutationResult,
+  RecalculatedEditResult,
   EditStatusResult,
   FontPack,
   InspectedCell,
@@ -18,6 +19,7 @@ import type {
   RenderPageResult,
   RenderRange,
   RenderSheetResult,
+  RenderSheetInteractiveResult,
   RenderTileResult,
   ReadCellResult,
   SaveDocumentResult,
@@ -29,6 +31,8 @@ export type {
   EditableCachedCell,
   EditableCell,
   EditMutationResult,
+  RecalculatedEditResult,
+  RecalculationSummary,
   EditState,
   EditStatusResult,
   FontPack,
@@ -41,6 +45,8 @@ export type {
   RenderBinary,
   RenderCapabilities,
   RenderErrorPayload,
+  RenderCellGeometry,
+  RenderInteractionLimits,
   RenderLimits,
   RenderOperation,
   RenderOperationPayloads,
@@ -51,6 +57,8 @@ export type {
   RenderRange,
   RenderReport,
   RenderSheetResult,
+  RenderSheetInteraction,
+  RenderSheetInteractiveResult,
   RenderTileResult,
   ReadCellResult,
   SaveDocumentResult,
@@ -156,6 +164,14 @@ export declare class RenderWorkerClient {
     value: EditableCell,
     options?: RenderRequestOptions,
   ): RenderRequest<EditMutationResult>;
+  setCellAndRecalculate(
+    documentId: string,
+    sheetIndex: number,
+    row: number,
+    col: number,
+    value: EditableCell,
+    options?: RenderRequestOptions,
+  ): RenderRequest<RecalculatedEditResult>;
   setDocumentProperties(
     documentId: string,
     properties: DocumentPropertiesInspection,
@@ -185,6 +201,12 @@ export declare class RenderWorkerClient {
     renderOptions?: RenderOptions,
     requestOptions?: RenderRequestOptions,
   ): RenderRequest<RenderSheetResult>;
+  renderSheetInteractive(
+    documentId: string,
+    sheetIndex: number,
+    renderOptions?: RenderOptions,
+    requestOptions?: RenderRequestOptions,
+  ): RenderRequest<RenderSheetInteractiveResult>;
   renderTile(
     documentId: string,
     sheetIndex: number,

@@ -9,21 +9,24 @@
     />
     <meta
       name="description"
-      content="Open XLS, XLSX, XLSB, and ODS files locally in the rxls browser viewer."
+      content="Open, inspect, and edit spreadsheets locally with rxls. Files stay on your device."
     />
     <meta name="referrer" content="no-referrer" />
     <link rel="icon" href="data:," />
-    <title>rxls viewer</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>rxls — Spreadsheets</title>
   </head>
   <body>
     <div id="app" class="app-shell">
       <header class="app-bar">
         <button
           id="sidebar-toggle"
-          class="icon-button mobile-only"
+          class="icon-button"
           type="button"
           aria-label="Toggle workbook panel"
           title="Workbook panel"
+          aria-controls="sidebar"
+          aria-expanded="false"
         >
           <i data-lucide="panel-left"></i>
         </button>
@@ -34,13 +37,12 @@
           rel="noopener noreferrer"
           aria-label="rxls repository"
         >
-          <span class="brand-mark" aria-hidden="true">r</span>
-          <span class="brand-name">rxls</span>
-          <span class="brand-product">viewer</span>
+          <span class="brand-mark" aria-hidden="true">r</span
+          ><span class="brand-name">rxls</span>
         </a>
         <div class="document-identity" aria-live="polite">
-          <strong id="document-name">Loading sample...</strong>
-          <span id="document-detail">Rust + WebAssembly</span>
+          <strong id="document-name">Opening workbook…</strong>
+          <span id="document-detail">Local spreadsheet workspace</span>
         </div>
         <div class="app-bar-actions">
           <button
@@ -52,10 +54,11 @@
           >
             <i data-lucide="refresh-cw"></i>
           </button>
-          <span class="local-status" title="Files stay in this browser session">
-            <i data-lucide="shield-check"></i>
-            <span>Local</span>
-          </span>
+          <span
+            class="local-status"
+            title="Workbook data is processed on your device, never uploaded"
+            ><i data-lucide="shield-check"></i><span>On this device</span></span
+          >
           <a
             class="icon-button"
             href="https://github.com/HyunjoJung/rxls"
@@ -63,18 +66,28 @@
             rel="noopener noreferrer"
             aria-label="Open rxls on GitHub"
             title="GitHub"
-          >
-            <i data-lucide="external-link"></i>
-          </a>
+            ><i data-lucide="external-link"></i
+          ></a>
         </div>
       </header>
 
       <div class="workbench">
-        <aside id="sidebar" class="sidebar" aria-label="Workbook panel">
+        <aside id="sidebar" class="sidebar" aria-label="Workbook panel" inert>
           <div class="sidebar-primary">
-            <button id="open-button" class="command-button primary" type="button">
-              <i data-lucide="folder-open"></i>
-              <span>Open spreadsheet</span>
+            <div class="section-heading">
+              <h2>Open a workbook</h2>
+              <span class="panel-eyebrow">LOCAL FILES</span>
+            </div>
+            <p class="panel-description">
+              Work with your own file, or explore an example. Nothing is
+              uploaded.
+            </p>
+            <button
+              id="panel-open"
+              class="command-button primary"
+              type="button"
+            >
+              <i data-lucide="folder-open"></i>Browse files
             </button>
             <input
               id="file-input"
@@ -82,181 +95,290 @@
               accept=".xls,.xlsx,.xlsm,.xlsb,.ods"
               hidden
             />
-
-            <label class="field-label" for="sample-select">Sample</label>
+            <label class="field-label" for="sample-select"
+              >Example workbooks</label
+            >
             <div class="select-wrap">
-              <select id="sample-select" aria-label="Sample workbook"></select>
-              <i data-lucide="chevron-down" aria-hidden="true"></i>
+              <select id="sample-select" aria-label="Sample workbook"></select
+              ><i data-lucide="chevron-down" aria-hidden="true"></i>
             </div>
           </div>
-
-          <section class="sidebar-section sheet-section" aria-labelledby="sheets-title">
-            <div class="section-heading">
-              <h2 id="sheets-title">Sheets</h2>
-              <span id="sheet-count" class="section-count">0</span>
-            </div>
-            <nav id="sheet-list" class="sheet-list" aria-label="Workbook sheets"></nav>
-          </section>
-
-          <section class="sidebar-section metadata-section" aria-labelledby="workbook-title">
-            <h2 id="workbook-title">Workbook</h2>
+          <section
+            class="sidebar-section metadata-section"
+            aria-labelledby="workbook-title"
+          >
+            <h2 id="workbook-title">Workbook details</h2>
             <dl class="metadata-list">
               <div>
                 <dt>Format</dt>
-                <dd id="meta-format">-</dd>
+                <dd id="meta-format">—</dd>
               </div>
               <div>
                 <dt>Size</dt>
-                <dd id="meta-size">-</dd>
+                <dd id="meta-size">—</dd>
               </div>
               <div>
                 <dt>Images</dt>
-                <dd id="meta-images">-</dd>
+                <dd id="meta-images">—</dd>
               </div>
               <div>
                 <dt>Editing</dt>
-                <dd id="meta-editing" aria-describedby="editing-reason">-</dd>
+                <dd id="meta-editing" aria-describedby="editing-reason">—</dd>
               </div>
               <div>
                 <dt>Engine</dt>
-                <dd>WASM worker</dd>
+                <dd>Rust · WebAssembly</dd>
               </div>
             </dl>
-            <p id="editing-reason" class="editing-reason" aria-live="polite" hidden></p>
+            <p
+              id="editing-reason"
+              class="editing-reason"
+              aria-live="polite"
+              hidden
+            ></p>
           </section>
+          <p class="sidebar-note">
+            XLSX and XLSM support preserved edits.<br />XLS, XLSB, and ODS open
+            read-only.
+          </p>
         </aside>
-
-        <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="Close workbook panel"></button>
+        <button
+          id="sidebar-scrim"
+          class="sidebar-scrim"
+          type="button"
+          aria-label="Close workbook panel"
+          tabindex="-1"
+        ></button>
 
         <main class="viewer-main">
-          <div class="toolbar" aria-label="Viewer controls">
-            <div class="segmented-control" role="group" aria-label="View mode">
-              <button id="sheet-view" class="segment active" type="button" aria-pressed="true">
-                <i data-lucide="table-2"></i>
-                <span>Sheet</span>
+          <div class="ribbon-navigation">
+            <button
+              id="ribbon-file"
+              class="ribbon-file"
+              type="button"
+              aria-controls="sidebar"
+              aria-expanded="false"
+            >
+              File
+            </button>
+            <div class="ribbon-tabs" role="tablist" aria-label="Ribbon">
+              <button
+                id="tab-home"
+                class="ribbon-tab"
+                role="tab"
+                type="button"
+                aria-selected="true"
+                aria-controls="ribbon-home"
+              >
+                Home
               </button>
-              <button id="page-view" class="segment" type="button" aria-pressed="false">
-                <i data-lucide="files"></i>
-                <span>Pages</span>
+              <button
+                id="tab-view"
+                class="ribbon-tab"
+                role="tab"
+                type="button"
+                aria-selected="false"
+                aria-controls="ribbon-view"
+                tabindex="-1"
+              >
+                View
               </button>
             </div>
-
-            <div id="page-controls" class="page-controls" hidden>
-              <button
-                id="previous-page"
-                class="icon-button"
-                type="button"
-                aria-label="Previous page"
-                title="Previous page"
+            <span id="workbook-mode" class="workbook-mode">Opening…</span>
+          </div>
+          <div class="toolbar">
+            <section
+              id="ribbon-home"
+              class="ribbon-panel"
+              role="tabpanel"
+              aria-labelledby="tab-home"
+            >
+              <div class="ribbon-group file-commands">
+                <div class="ribbon-commands">
+                  <button id="open-button" class="ribbon-command" type="button">
+                    <i data-lucide="folder-open"></i><span>Open</span>
+                  </button>
+                  <button
+                    id="quick-save"
+                    class="ribbon-command"
+                    type="button"
+                    disabled
+                  >
+                    <i data-lucide="save"></i><span>Save a copy</span>
+                  </button>
+                </div>
+                <span class="group-label">File</span>
+              </div>
+              <div
+                class="ribbon-group edit-controls"
+                role="group"
+                aria-label="Workbook editing"
               >
-                <i data-lucide="chevron-left"></i>
-              </button>
-              <span id="page-position" class="page-position">1 / 1</span>
-              <button
-                id="next-page"
-                class="icon-button"
-                type="button"
-                aria-label="Next page"
-                title="Next page"
-              >
-                <i data-lucide="chevron-right"></i>
-              </button>
-            </div>
-
-            <div class="edit-controls" role="group" aria-label="Workbook editing">
-              <button
-                id="edit-cell"
-                class="command-button compact-command"
-                type="button"
-                title="Edit cell"
-              >
-                <i data-lucide="pencil"></i>
-                <span>Edit cell</span>
-              </button>
-              <button
-                id="undo-edit"
-                class="icon-button"
-                type="button"
-                aria-label="Undo workbook edit"
-                title="Undo edit"
-              >
-                <i data-lucide="undo-2"></i>
-              </button>
-              <button
-                id="redo-edit"
-                class="icon-button"
-                type="button"
-                aria-label="Redo workbook edit"
-                title="Redo edit"
-              >
-                <i data-lucide="redo-2"></i>
-              </button>
-              <button
-                id="document-properties"
-                class="icon-button"
-                type="button"
-                aria-label="Edit document properties"
-                title="Document properties"
-              >
-                <i data-lucide="file-text"></i>
-              </button>
-            </div>
-
-            <span class="toolbar-spacer"></span>
-
-            <div class="zoom-controls" role="group" aria-label="Zoom">
-              <button
-                id="zoom-out"
-                class="icon-button"
-                type="button"
-                aria-label="Zoom out"
-                title="Zoom out"
-              >
-                <i data-lucide="zoom-out"></i>
-              </button>
-              <output id="zoom-value" class="zoom-value" aria-live="polite">100%</output>
-              <button
-                id="zoom-in"
-                class="icon-button"
-                type="button"
-                aria-label="Zoom in"
-                title="Zoom in"
-              >
-                <i data-lucide="zoom-in"></i>
-              </button>
-              <button
-                id="fit-view"
-                class="icon-button"
-                type="button"
-                aria-label="Fit to width"
-                title="Fit to width"
-              >
-                <i data-lucide="scan"></i>
-              </button>
-            </div>
-
+                <div class="ribbon-commands">
+                  <button
+                    id="edit-cell"
+                    class="ribbon-command"
+                    type="button"
+                    title="Advanced typed cell options"
+                  >
+                    <i data-lucide="pencil"></i><span>Cell options</span>
+                  </button>
+                  <div class="history-commands">
+                    <button
+                      id="undo-edit"
+                      class="icon-button"
+                      type="button"
+                      aria-label="Undo workbook edit"
+                      title="Undo edit"
+                    >
+                      <i data-lucide="undo-2"></i>
+                    </button>
+                    <button
+                      id="redo-edit"
+                      class="icon-button"
+                      type="button"
+                      aria-label="Redo workbook edit"
+                      title="Redo edit"
+                    >
+                      <i data-lucide="redo-2"></i>
+                    </button>
+                  </div>
+                </div>
+                <span class="group-label">Changes</span>
+              </div>
+              <div class="ribbon-group edit-controls">
+                <div class="ribbon-commands">
+                  <button
+                    id="document-properties"
+                    class="ribbon-command"
+                    type="button"
+                    aria-label="Edit document properties"
+                    title="Document properties"
+                  >
+                    <i data-lucide="file-text"></i><span>Properties</span>
+                  </button>
+                </div>
+                <span class="group-label">Workbook</span>
+              </div>
+              <p class="ribbon-hint">
+                Click a cell and start typing.<span
+                  >Enter to apply · Escape to cancel · Save a copy to keep
+                  edits.</span
+                >
+              </p>
+            </section>
+            <section
+              id="ribbon-view"
+              class="ribbon-panel"
+              role="tabpanel"
+              aria-labelledby="tab-view"
+              hidden
+            >
+              <div class="ribbon-group">
+                <div class="ribbon-commands">
+                  <button
+                    id="view-workbook-panel"
+                    class="ribbon-command"
+                    type="button"
+                    aria-controls="sidebar"
+                    aria-expanded="false"
+                  >
+                    <i data-lucide="panel-left"></i><span>Workbook panel</span>
+                  </button>
+                  <button
+                    id="toggle-inspector"
+                    class="ribbon-command"
+                    type="button"
+                    aria-pressed="true"
+                  >
+                    <i data-lucide="table-2"></i><span>Cell inspector</span>
+                  </button>
+                </div>
+                <span class="group-label">Show</span>
+              </div>
+              <div class="ribbon-group">
+                <div class="ribbon-commands">
+                  <button id="reset-zoom" class="ribbon-command" type="button">
+                    <i data-lucide="scan"></i><span>100%</span>
+                  </button>
+                </div>
+                <span class="group-label">Zoom</span>
+              </div>
+              <p class="ribbon-hint">
+                Sheet or print layout.<span
+                  >Switch views and zoom from the status bar.</span
+                >
+              </p>
+            </section>
             <details id="export-menu" class="export-menu">
-              <summary class="command-button">
-                <i data-lucide="download"></i>
-                <span>Export</span>
-                <i data-lucide="chevron-down"></i>
+              <summary class="command-button" aria-label="Download options">
+                <i data-lucide="download"></i><span>Download</span
+                ><i data-lucide="chevron-down"></i>
               </summary>
               <div class="menu-panel">
                 <button id="save-document" type="button">
-                  <i data-lucide="save"></i>
-                  <span>Edited workbook</span>
+                  <i data-lucide="save"></i><span>Edited workbook</span>
                 </button>
                 <button id="export-svg" type="button">
-                  <i data-lucide="file-code-2"></i>
-                  <span>SVG</span>
+                  <i data-lucide="file-code-2"></i><span>SVG image</span>
                 </button>
                 <button id="export-png" type="button">
-                  <i data-lucide="image-down"></i>
-                  <span>PNG</span>
+                  <i data-lucide="image-down"></i><span>PNG image</span>
                 </button>
               </div>
             </details>
           </div>
+          <form
+            id="cell-inspector"
+            class="formula-bar"
+            aria-label="Cell inspector"
+          >
+            <label class="visually-hidden" for="inspector-reference"
+              >Cell address</label
+            >
+            <input
+              id="inspector-reference"
+              value="A1"
+              maxlength="12"
+              autocomplete="off"
+              spellcheck="false"
+              aria-describedby="inspector-status"
+            />
+            <button
+              id="inspect-cell"
+              class="icon-button"
+              type="submit"
+              aria-label="Inspect cell"
+              title="Read this cell"
+            >
+              <i data-lucide="refresh-cw"></i>
+            </button>
+            <span class="formula-symbol" aria-hidden="true">fx</span>
+            <label class="visually-hidden" for="inspector-value"
+              >Cell value or formula</label
+            >
+            <input
+              id="inspector-value"
+              readonly
+              placeholder="Enter a cell address to inspect its value or formula"
+            />
+            <span id="inspector-kind" class="inspector-kind"></span>
+            <button
+              id="inspector-edit"
+              class="icon-button"
+              type="button"
+              aria-label="Edit inspected cell"
+              title="Edit inspected cell"
+              disabled
+            >
+              <i data-lucide="pencil"></i>
+            </button>
+            <span
+              id="inspector-status"
+              class="visually-hidden"
+              role="status"
+            ></span>
+          </form>
 
           <section
             id="viewer-viewport"
@@ -265,40 +387,175 @@
             tabindex="0"
           >
             <div id="drop-overlay" class="drop-overlay" hidden>
-              <i data-lucide="file-up"></i>
-              <strong>Open spreadsheet</strong>
+              <i data-lucide="file-up"></i><strong>Open spreadsheet</strong>
             </div>
-
             <div id="empty-state" class="empty-state">
-              <i data-lucide="file-spreadsheet"></i>
-              <strong>No workbook open</strong>
-              <button id="empty-open-button" class="command-button primary" type="button">
-                <i data-lucide="folder-open"></i>
-                <span>Open spreadsheet</span>
+              <i data-lucide="file-spreadsheet"></i
+              ><strong>No workbook open</strong>
+              <p>Open a spreadsheet to get started.</p>
+              <button
+                id="empty-open-button"
+                class="command-button primary"
+                type="button"
+              >
+                <i data-lucide="folder-open"></i><span>Open spreadsheet</span>
               </button>
             </div>
-
             <div id="loading-state" class="loading-state" aria-live="polite">
-              <span class="spinner" aria-hidden="true"></span>
-              <strong id="loading-label">Starting renderer</strong>
+              <span class="spinner" aria-hidden="true"></span
+              ><strong id="loading-label">Starting renderer</strong>
             </div>
-
             <div id="document-stage" class="document-stage" hidden>
-              <div id="document-surface" class="document-surface"></div>
+              <div
+                id="document-surface"
+                class="document-surface"
+                tabindex="0"
+                role="group"
+                aria-label="Worksheet cells"
+                aria-describedby="grid-help grid-status"
+              >
+                <div id="grid-layer" class="grid-layer">
+                  <div id="grid-selection" class="grid-selection" hidden>
+                    <textarea
+                      id="grid-input"
+                      class="grid-input"
+                      rows="1"
+                      hidden
+                      aria-label="Edit selected cell"
+                      spellcheck="false"
+                      autocomplete="off"
+                      autocapitalize="off"
+                      aria-describedby="grid-help grid-status"
+                    ></textarea>
+                  </div>
+                </div>
+              </div>
             </div>
+            <p id="grid-help" class="visually-hidden">
+              Click a cell once to edit its existing value. Select all to
+              replace it. Enter applies an edit, Tab moves to the next cell, and
+              Escape cancels. Prefix text with an apostrophe to keep it as text.
+              Dates use Excel serial values. Formula calculation supports a
+              limited deterministic subset.
+            </p>
+            <span
+              id="grid-status"
+              class="visually-hidden"
+              role="status"
+              aria-live="polite"
+            ></span>
           </section>
-
+          <div class="sheet-strip">
+            <span class="sheet-strip-icon" aria-hidden="true"
+              ><i data-lucide="table-2"></i
+            ></span>
+            <nav
+              id="sheet-list"
+              class="sheet-list"
+              aria-label="Workbook sheets"
+            ></nav>
+            <span class="sheet-total"
+              ><span id="sheet-count">0</span> sheets</span
+            >
+          </div>
           <footer class="status-bar">
-            <span id="status-message" aria-live="polite">Starting renderer</span>
-            <span class="status-meta">
-              <a href="./LICENSE.txt" target="_blank" rel="noopener noreferrer">MIT</a>
-              <a
+            <span id="status-message" aria-live="polite"
+              >Starting renderer</span
+            >
+            <span id="render-detail" class="render-detail"
+              >Bounded local processing</span
+            >
+            <div class="status-controls">
+              <div
+                class="segmented-control"
+                role="group"
+                aria-label="View mode"
+              >
+                <button
+                  id="sheet-view"
+                  class="segment active"
+                  type="button"
+                  aria-label="Sheet"
+                  aria-pressed="true"
+                  title="Sheet view"
+                >
+                  <i data-lucide="table-2"></i><span>Sheet</span>
+                </button>
+                <button
+                  id="page-view"
+                  class="segment"
+                  type="button"
+                  aria-label="Pages"
+                  aria-pressed="false"
+                  title="Page view"
+                >
+                  <i data-lucide="files"></i><span>Pages</span>
+                </button>
+              </div>
+              <div id="page-controls" class="page-controls" hidden>
+                <button
+                  id="previous-page"
+                  class="icon-button"
+                  type="button"
+                  aria-label="Previous page"
+                  title="Previous page"
+                >
+                  <i data-lucide="chevron-left"></i>
+                </button>
+                <span id="page-position" class="page-position">1 / 1</span>
+                <button
+                  id="next-page"
+                  class="icon-button"
+                  type="button"
+                  aria-label="Next page"
+                  title="Next page"
+                >
+                  <i data-lucide="chevron-right"></i>
+                </button>
+              </div>
+              <div class="zoom-controls" role="group" aria-label="Zoom">
+                <button
+                  id="zoom-out"
+                  class="icon-button"
+                  type="button"
+                  aria-label="Zoom out"
+                  title="Zoom out"
+                >
+                  <i data-lucide="zoom-out"></i>
+                </button>
+                <output id="zoom-value" class="zoom-value" aria-live="polite"
+                  >100%</output
+                >
+                <button
+                  id="zoom-in"
+                  class="icon-button"
+                  type="button"
+                  aria-label="Zoom in"
+                  title="Zoom in"
+                >
+                  <i data-lucide="zoom-in"></i>
+                </button>
+                <button
+                  id="fit-view"
+                  class="icon-button"
+                  type="button"
+                  aria-label="Fit to width"
+                  title="Fit to width"
+                >
+                  <i data-lucide="scan"></i>
+                </button>
+              </div>
+            </div>
+            <span class="status-meta"
+              ><a href="./LICENSE.txt" target="_blank" rel="noopener noreferrer"
+                >MIT</a
+              ><a
                 href="./THIRD_PARTY_NOTICES.txt"
                 target="_blank"
                 rel="noopener noreferrer"
-              >Notices</a>
-              <span id="render-detail">Bounded local processing</span>
-            </span>
+                >Notices</a
+              ></span
+            >
           </footer>
         </main>
       </div>
@@ -307,16 +564,25 @@
     <div id="error-banner" class="error-banner" role="alert" hidden>
       <i data-lucide="circle-alert"></i>
       <span id="error-message"></span>
-      <button id="dismiss-error" class="icon-button" type="button" aria-label="Dismiss error">
+      <button
+        id="dismiss-error"
+        class="icon-button"
+        type="button"
+        aria-label="Dismiss error"
+      >
         <i data-lucide="x"></i>
       </button>
     </div>
 
-    <dialog id="cell-dialog" class="edit-dialog" aria-labelledby="cell-dialog-title">
+    <dialog
+      id="cell-dialog"
+      class="edit-dialog"
+      aria-labelledby="cell-dialog-title"
+    >
       <form id="cell-form" class="edit-form">
         <header class="dialog-header">
           <div>
-            <h2 id="cell-dialog-title">Edit cell</h2>
+            <h2 id="cell-dialog-title">Cell options</h2>
             <p id="cell-sheet-name">Current sheet</p>
           </div>
           <button
@@ -334,7 +600,13 @@
           <label class="form-field cell-reference-field" for="cell-reference">
             <span>Cell</span>
             <span class="inline-field">
-              <input id="cell-reference" name="reference" value="A1" maxlength="12" required />
+              <input
+                id="cell-reference"
+                name="reference"
+                value="A1"
+                maxlength="12"
+                required
+              />
               <button
                 id="read-cell"
                 class="icon-button field-icon-button"
@@ -360,15 +632,28 @@
             </select>
           </label>
 
-          <label id="cell-value-field" class="form-field form-field-wide" for="cell-value">
+          <label
+            id="cell-value-field"
+            class="form-field form-field-wide"
+            for="cell-value"
+          >
             <span>Value</span>
             <input id="cell-value" name="value" maxlength="32767" />
           </label>
 
-          <fieldset id="cell-formula-fields" class="formula-fields form-field-wide" hidden>
+          <fieldset
+            id="cell-formula-fields"
+            class="formula-fields form-field-wide"
+            hidden
+          >
             <label class="form-field" for="cell-formula">
               <span>Formula</span>
-              <input id="cell-formula" name="formula" maxlength="8192" placeholder="SUM(A1:A2)" />
+              <input
+                id="cell-formula"
+                name="formula"
+                maxlength="8192"
+                placeholder="SUM(A1:A2)"
+              />
             </label>
             <label class="form-field" for="cell-cached-kind">
               <span>Cached type</span>
@@ -382,14 +667,20 @@
             </label>
             <label class="form-field form-field-wide" for="cell-cached-value">
               <span>Cached value</span>
-              <input id="cell-cached-value" name="cachedValue" maxlength="32767" />
+              <input
+                id="cell-cached-value"
+                name="cachedValue"
+                maxlength="32767"
+              />
             </label>
           </fieldset>
         </div>
 
         <p id="cell-current-value" class="dialog-status" aria-live="polite"></p>
         <footer class="dialog-actions">
-          <button id="cancel-cell-edit" class="command-button" type="button">Cancel</button>
+          <button id="cancel-cell-edit" class="command-button" type="button">
+            Cancel
+          </button>
           <button
             id="apply-cell-edit"
             class="command-button primary dialog-primary"
@@ -425,19 +716,54 @@
         </header>
 
         <div class="form-grid properties-grid">
-          <label class="form-field" for="property-title"><span>Title</span><input id="property-title" maxlength="32767" /></label>
-          <label class="form-field" for="property-subject"><span>Subject</span><input id="property-subject" maxlength="32767" /></label>
-          <label class="form-field" for="property-creator"><span>Creator</span><input id="property-creator" maxlength="32767" /></label>
-          <label class="form-field" for="property-last-modified-by"><span>Last modified by</span><input id="property-last-modified-by" maxlength="32767" /></label>
-          <label class="form-field" for="property-company"><span>Company</span><input id="property-company" maxlength="32767" /></label>
-          <label class="form-field" for="property-created"><span>Created</span><input id="property-created" maxlength="32767" placeholder="2026-08-30T00:00:00Z" /></label>
-          <label class="form-field form-field-wide" for="property-keywords"><span>Keywords</span><input id="property-keywords" maxlength="32767" /></label>
-          <label class="form-field form-field-wide" for="property-description"><span>Description</span><textarea id="property-description" maxlength="32767" rows="3"></textarea></label>
+          <label class="form-field" for="property-title"
+            ><span>Title</span><input id="property-title" maxlength="32767"
+          /></label>
+          <label class="form-field" for="property-subject"
+            ><span>Subject</span><input id="property-subject" maxlength="32767"
+          /></label>
+          <label class="form-field" for="property-creator"
+            ><span>Creator</span><input id="property-creator" maxlength="32767"
+          /></label>
+          <label class="form-field" for="property-last-modified-by"
+            ><span>Last modified by</span
+            ><input id="property-last-modified-by" maxlength="32767"
+          /></label>
+          <label class="form-field" for="property-company"
+            ><span>Company</span><input id="property-company" maxlength="32767"
+          /></label>
+          <label class="form-field" for="property-created"
+            ><span>Created</span
+            ><input
+              id="property-created"
+              maxlength="32767"
+              placeholder="2026-08-30T00:00:00Z"
+          /></label>
+          <label class="form-field form-field-wide" for="property-keywords"
+            ><span>Keywords</span
+            ><input id="property-keywords" maxlength="32767"
+          /></label>
+          <label class="form-field form-field-wide" for="property-description"
+            ><span>Description</span
+            ><textarea
+              id="property-description"
+              maxlength="32767"
+              rows="3"
+            ></textarea>
+          </label>
         </div>
 
         <footer class="dialog-actions">
-          <button id="cancel-properties-edit" class="command-button" type="button">Cancel</button>
-          <button class="command-button primary dialog-primary" type="submit">Apply</button>
+          <button
+            id="cancel-properties-edit"
+            class="command-button"
+            type="button"
+          >
+            Cancel
+          </button>
+          <button class="command-button primary dialog-primary" type="submit">
+            Apply
+          </button>
         </footer>
       </form>
     </dialog>

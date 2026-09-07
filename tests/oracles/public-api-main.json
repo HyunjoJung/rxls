@@ -1247,7 +1247,7 @@
       ]
     },
     {
-      "declaration": "#[non_exhaustive]pub enum FormulaUnsupportedReason { UnsupportedFunction, Volatile, ExternalRef, CircularReference, UnresolvedName, UnparsableExpression, ArraySemantics, RangeTooLarge, SheetNotFound, ExpressionTooComplex, OperationLimitExceeded, DependencyDepthExceeded, }",
+      "declaration": "#[non_exhaustive]pub enum FormulaUnsupportedReason { UnsupportedFunction, Volatile, ExternalRef, CircularReference, UnresolvedName, UnparsableExpression, ArraySemantics, RangeTooLarge, SheetNotFound, ExpressionTooComplex, OperationLimitExceeded, DependencyDepthExceeded, TextLimitExceeded, }",
       "inherent_items": [
         "pub fn code(self) -> &'static str"
       ],
@@ -2091,6 +2091,7 @@
         "pub fn set_defined_name( &mut self, name: impl AsRef<str>, refers_to: impl AsRef<str>, ) -> Result<()>",
         "pub fn set_document_properties( &mut self, properties: DocProperties, ) -> Result<()>",
         "pub fn set_external_hyperlink( &mut self, sheet_name: &str, row: u32, col: u16, target: &str, ) -> Result<()>",
+        "pub fn set_formula_cached_values( &mut self, updates: &[(&str, u32, u16, Cell)], ) -> Result<()>",
         "pub fn set_freeze_panes( &mut self, sheet_name: &str, row: u32, col: u16, ) -> Result<()>",
         "pub fn set_internal_hyperlink( &mut self, sheet_name: &str, row: u32, col: u16, location: &str, ) -> Result<()>",
         "pub fn set_print_area( &mut self, sheet_name: &str, area: Option<(u32, u16, u32, u16)>, ) -> Result<()>",
@@ -2218,6 +2219,7 @@
         "pub fn define_name(&mut self, name: impl AsRef<str>, refers_to: impl AsRef<str>)",
         "pub fn defined_names(&self) -> &[(String, String)]",
         "pub fn evaluate_cell( &self, sheet: &str, row: u32, col: u16, ) -> FormulaEvaluation",
+        "pub fn evaluate_cells( &self, targets: &[(&str, u32, u16)], ) -> Result<Vec<FormulaEvaluation>, FormulaUnsupportedReason>",
         "pub fn has_1904_epoch(&self) -> bool",
         "pub fn header_row(&self) -> HeaderRow",
         "pub fn is_partial(&self) -> bool",

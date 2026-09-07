@@ -14,6 +14,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read-only reasons for XLS/XLSB/ODS, and verifies a pinned public XLSM
   fixture's untouched VBA and selected package parts byte-for-byte before an
   external `openpyxl` reopen.
+- Added single-click in-cell editing and a live formula bar to the viewer,
+  backed by bounded cell geometry from the same renderer layout as the SVG.
+- Added `Workbook::evaluate_cells` for shared-budget batch evaluation and
+  `Spreadsheet::set_formula_cached_values` for transactional cache updates
+  that preserve formula XML. Worker edits can refresh supported formulas as
+  one undoable change; unsupported formulas retain their cached values with
+  explicit diagnostics.
+- Added a verification-only release pipeline command with exact-main identity
+  checks and locally persisted run identities for safe resumption.
+
+### Changed
+
+- Split renderer layout responsibilities and viewer controllers into focused
+  modules, and refreshed the viewer ribbon, sheet navigation, and edit controls.
+- Made manual Pages verification non-deploying by default and checked exact
+  canonical main again immediately before an explicit deployment.
+- Aligned release toolchain checks and authenticated the general WASM npm
+  package against the canonical core release archive.
+- Expanded MCP protocol and VS Code installed, restricted, and virtual-workspace
+  regression coverage.
 
 ## [0.1.3] - 2026-08-22
 

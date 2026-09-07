@@ -45,6 +45,19 @@ inspection and complete document-property replacement. XLS, XLSB, ODS, and
 OOXML packages that cannot retain metadata report a stable read-only reason.
 Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
 serialized and reopened before it replaces the live session.
+
+The current source build additionally exposes `renderSheetInteractive()` and
+`setCellAndRecalculate()`; these additions are not in the published 0.2.0 package.
+The former returns bounded, text-free cell rectangles from the same layout pass
+as the SVG. The latter applies a cell edit and refreshes supported formula
+caches as one atomic, undoable change. Its `recalculation` summary reports
+computed and unsupported formula counts plus typed reason codes; unchanged
+caches are counted within the computed total and reported separately.
+Unsupported formulas retain their old caches; a resource-limit or cache-write
+failure rejects the whole edit. Cache refresh preserves existing formula XML
+and unrelated package parts. Use ordinary `setCell()` when automatic cache
+refresh is not wanted.
+
 `saveDocument()` returns `application/octet-stream` because the worker receives
 bytes without a trusted source filename; the host must retain the known
 `.xlsx` or `.xlsm` extension and select its corresponding MIME type.

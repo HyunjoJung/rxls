@@ -14,12 +14,17 @@ export interface RenderWasmSession {
     col: number,
   ): RenderMaybePromise<string>;
   setCellJson(requestJson: string): RenderMaybePromise<string>;
+  setCellRecalculateJson?(requestJson: string): RenderMaybePromise<string>;
   setDocumentPropertiesJson(requestJson: string): RenderMaybePromise<string>;
   undoEditJson(): RenderMaybePromise<string>;
   redoEditJson(): RenderMaybePromise<string>;
   saveDocumentBytes(): RenderMaybePromise<Uint8Array>;
   printManifestJson(sheetIndex: number, optionsJson: string): RenderMaybePromise<string>;
   renderSheetSvg(sheetIndex: number, optionsJson: string): RenderMaybePromise<string>;
+  renderSheetInteractiveJson?(
+    sheetIndex: number,
+    optionsJson: string,
+  ): RenderMaybePromise<string>;
   renderTileSvg(
     sheetIndex: number,
     firstRow: number,

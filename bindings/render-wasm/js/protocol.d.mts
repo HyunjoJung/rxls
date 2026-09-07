@@ -13,6 +13,8 @@ export declare const MAX_EDIT_HISTORY_BYTES: 33554432;
 export declare const MAX_PENDING_REQUESTS: 32;
 export declare const MAX_PENDING_RESOURCE_BYTES: 134217728;
 export declare const MAX_OUTPUT_BYTES: 16777216;
+export declare const MAX_INTERACTION_CELLS: 250000;
+export declare const MAX_INTERACTION_DIMENSION_RAW: 2048000000;
 export declare const MAX_PNG_BYTES: 16777216;
 export declare const MAX_SHEETS: 255;
 export declare const MAX_PAGES: 512;
@@ -233,6 +235,7 @@ export type EditableCachedCell =
 export type EditableCell =
   | { readonly kind: "blank" }
   | EditableCachedCell
+  | { readonly kind: "formula-auto"; readonly formula: string }
   | {
       readonly kind: "formula";
       readonly formula: string;
@@ -377,6 +380,29 @@ export interface RenderSheetResult {
   readonly svg: string;
 }
 
+/** Original zero-based cell anchor and its rectangle in CSS pixels. */
+export type RenderCellGeometry = readonly [
+  row: number, col: number, x: number, y: number, width: number, height: number,
+];
+
+/** Text-free geometry resolved in the same layout pass as the SVG. */
+export interface RenderSheetInteraction {
+  readonly schemaVersion: 1;
+  readonly width: number;
+  readonly height: number;
+  readonly cells: readonly RenderCellGeometry[];
+}
+
+export interface RenderSheetInteractiveResult extends RenderSheetResult {
+  readonly interaction: RenderSheetInteraction;
+}
+
+export interface RenderInteractionLimits {
+  readonly maxCells: number;
+  readonly maxDimensionRaw: number;
+  readonly maxOutputBytes: number;
+}
+
 export interface RenderTileResult extends RenderSheetResult {
   readonly range: RenderRange;
 }
@@ -415,6 +441,19 @@ export interface EditMutationResult {
   readonly editState: EditState;
 }
 
+export interface RecalculationSummary {
+  /** All successfully computed formulas, including unchanged caches. */
+  readonly computedCells: number;
+  readonly unchangedCells: number;
+  readonly unsupportedCells: number;
+  /** Sorted, unique semantic fallback codes; never formulas or cell text. */
+  readonly reasons: readonly string[];
+}
+
+export interface RecalculatedEditResult extends EditMutationResult {
+  readonly recalculation: RecalculationSummary;
+}
+
 export interface SaveDocumentResult {
   readonly documentId: string;
   readonly mimeType: "application/octet-stream";
@@ -427,12 +466,14 @@ export type RenderOperation =
   | "close"
   | "prepare-pages"
   | "render-sheet"
+  | "render-sheet-interactive"
   | "render-tile"
   | "render-page"
   | "render-page-png"
   | "edit-status"
   | "read-cell"
   | "set-cell"
+  | "set-cell-recalculate"
   | "set-document-properties"
   | "undo-edit"
   | "redo-edit"
@@ -460,6 +501,7 @@ export interface RenderOperationPayloads {
     readonly col: number;
     readonly value: EditableCell;
   };
+  readonly "set-cell-recalculate": RenderOperationPayloads["set-cell"];
   readonly "set-document-properties": {
     readonly documentId: string;
     readonly properties: DocumentPropertiesInspection;
@@ -473,6 +515,11 @@ export interface RenderOperationPayloads {
     readonly options?: RenderOptions;
   };
   readonly "render-sheet": {
+    readonly documentId: string;
+    readonly sheetIndex: number;
+    readonly options?: RenderOptions;
+  };
+  readonly "render-sheet-interactive": {
     readonly documentId: string;
     readonly sheetIndex: number;
     readonly options?: RenderOptions;
@@ -505,12 +552,14 @@ export interface RenderOperationResults {
   readonly "edit-status": EditStatusResult;
   readonly "read-cell": ReadCellResult;
   readonly "set-cell": EditMutationResult;
+  readonly "set-cell-recalculate": RecalculatedEditResult;
   readonly "set-document-properties": EditMutationResult;
   readonly "undo-edit": EditMutationResult;
   readonly "redo-edit": EditMutationResult;
   readonly "save-document": SaveDocumentResult;
   readonly "prepare-pages": PreparePagesResult;
   readonly "render-sheet": RenderSheetResult;
+  readonly "render-sheet-interactive": RenderSheetInteractiveResult;
   readonly "render-tile": RenderTileResult;
   readonly "render-page": RenderPageResult;
   readonly "render-page-png": RenderPagePngResult;
@@ -616,7 +665,16 @@ export declare function encodeFontBundle(fontPack?: FontPack | null): Uint8Array
 export declare function fontPackByteLength(fontPack?: FontPack | null): number;
 export declare function validateFontPack(fontPack: unknown): ValidatedFontPack;
 export declare function validateSvgOutput(svg: unknown, maxBytes?: number): number;
+export declare function interactiveSheetLimits(
+  options?: RenderOptions,
+  capabilities?: Partial<RenderInteractionLimits>,
+): RenderInteractionLimits;
+export declare function validateInteractiveSheetOutput(
+  value: unknown,
+  limits?: Partial<RenderInteractionLimits>,
+): number;
 export declare function normalizeError(error: unknown): RenderErrorPayload;
+export declare function validateRecalculationSummary(value: unknown): RecalculationSummary;
 export declare function limitError(
   resource: string,
   limit: number,
