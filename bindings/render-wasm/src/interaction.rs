@@ -92,9 +92,7 @@ struct BoundedWriter {
 
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let actual = (self.bytes.len() as u64)
-            .checked_add(bytes.len() as u64)
-            .unwrap_or(u64::MAX);
+        let actual = (self.bytes.len() as u64).saturating_add(bytes.len() as u64);
         if actual > self.limit {
             self.exceeded = Some(actual);
             return Err(io::Error::other("interactive output byte limit exceeded"));

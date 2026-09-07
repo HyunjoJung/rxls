@@ -2221,7 +2221,7 @@ mod tests {
 
     #[test]
     fn recalculating_edit_refreshes_operations_sum_and_saves_the_new_cache() {
-        let bytes = include_bytes!("../../../viewer/public/samples/operations-report.xlsx");
+        let bytes = include_bytes!("../../../viewer/samples/operations-report.xlsx");
         let mut session = RenderSession::new_core(bytes, &[]).unwrap();
         let response = session
             .set_cell_recalculate_json_core(
