@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -601,6 +602,75 @@ steps:
                         Path("release.yml"), workflow
                     )
                 )
+
+    def test_core_release_privilege_handoff_is_mutation_guarded(self) -> None:
+        original = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        replacements = {
+            "workflow_write": ("permissions:\n  actions: read\n  contents: read", "permissions:\n  actions: read\n  contents: write"),
+            "verification_write": ("      contents: read\n    outputs:", "      contents: write\n    outputs:"),
+            "publication_dependency": ("    needs: verify", "    needs: []"),
+            "publication_environment": ("    environment: crates-io", "    environment: unprotected"),
+            "publication_event": ("if: github.repository == 'HyunjoJung/rxls' && github.event_name == 'push'", "if: github.repository == 'HyunjoJung/rxls' && github.event_name != 'push'"),
+            "publication_source": ("          ref: ${{ github.sha }}", "          ref: main"),
+            "publication_tag": ('test "$GITHUB_REF" = "refs/tags/v$VERIFIED_VERSION"', "true"),
+            "publication_version": ('test "$version" = "$VERIFIED_VERSION"', "true"),
+            "artifact_output": ("artifact_id: ${{ steps.publication_bundle.outputs.artifact-id }}", "artifact_id: 1234"),
+            "artifact_input": ("artifact-ids: ${{ needs.verify.outputs.artifact_id }}", "name: latest-release"),
+            "artifact_digest_mode": ("digest-mismatch: error", "digest-mismatch: warn"),
+            "artifact_digest": ('"digest": f"sha256:{expected_digest}",', '"digest": artifact["digest"],'),
+            "artifact_run": ('"id": int(os.environ["GITHUB_RUN_ID"]),', '"id": 123,'),
+            "artifact_sha": ('"head_sha": os.environ["GITHUB_SHA"],', '"head_sha": "main",'),
+            "artifact_repository": ('"head_repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),', '"head_repository_id": 123,'),
+            "artifact_expired": ('"expired": False,', '"expired": True,'),
+            "archive_bytes": ('cmp "target/package/rxls-${version}.crate" "dist/rxls-${version}.crate"', "true"),
+            "handoff_skip": ("      - name: Verify publication handoff and package bytes\n", "      - name: Verify publication handoff and package bytes\n        if: false\n"),
+            "publish_after_failure": ("      - name: Publish to crates.io\n        if: github.event_name == 'push'", "      - name: Publish to crates.io\n        if: always() && github.event_name == 'push'"),
+            "stale_version": ('--registry-version "$version"', "--registry-version 0.1.3"),
+        }
+        self.assertEqual(self.policy.audit_core_release_evidence(Path("release.yml"), original), [])
+        for label, (old, new) in replacements.items():
+            with self.subTest(mutation=label):
+                mutated = original.replace(old, new, 1)
+                self.assertNotEqual(original, mutated)
+                self.assertTrue(self.policy.audit_core_release_evidence(Path("release.yml"), mutated))
+
+    def test_core_release_artifact_metadata_authentication(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        step = workflow.split("      - name: Authenticate verified publication artifact\n", 1)[1].split("      - name:", 1)[0]
+        script = textwrap.dedent(step.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
+        environment = {
+            "ARTIFACT_ID": "456", "ARTIFACT_DIGEST": "a" * 64,
+            "SOURCE_ATTEMPT": "1", "VERIFIED_VERSION": "0.1.4",
+            "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_SHA": "b" * 40, "GITHUB_REPOSITORY_ID": "789",
+        }
+        metadata = {
+            "id": 456, "name": f"rxls-0.1.4-publication-{'b' * 40}-123-1",
+            "digest": f"sha256:{'a' * 64}", "expired": False,
+            "workflow_run": {"id": 123, "head_sha": "b" * 40, "repository_id": 789, "head_repository_id": 789},
+        }
+
+        def authenticate(data, env):
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(Path, "read_text", return_value=json.dumps(data)):
+                exec(compile(script, "release-artifact-authentication", "exec"), {})
+
+        # A publication-only rerun may reuse its successful verification job's
+        # exact earlier attempt, never a name-selected latest artifact.
+        authenticate(metadata, environment)
+        authenticate(metadata, {**environment, "ARTIFACT_DIGEST": f"sha256:{'a' * 64}"})
+        for key, value in (
+            ("id", 457), ("id", True), ("expired", True),
+            ("name", metadata["name"].replace("-123-1", "-123-2")),
+            ("digest", f"sha256:{'c' * 64}"), ("workflow_run", None),
+        ):
+            with self.subTest(field=key, value=value), self.assertRaises(SystemExit):
+                authenticate({**metadata, key: value}, environment)
+        for key in metadata["workflow_run"]:
+            with self.subTest(run_field=key), self.assertRaises(SystemExit):
+                authenticate({**metadata, "workflow_run": {**metadata["workflow_run"], key: "wrong"}}, environment)
+        for key, value in (("SOURCE_ATTEMPT", "0"), ("SOURCE_ATTEMPT", "3"), ("ARTIFACT_DIGEST", "invalid")):
+            with self.subTest(environment=key), self.assertRaises(SystemExit):
+                authenticate(metadata, {**environment, key: value})
 
     def test_github_release_reconciler_invariants_are_mutation_guarded(self) -> None:
         path = Path("scripts/reconcile_github_release.py")
@@ -3978,11 +4048,11 @@ steps:
         self.assertIn("cargo test --test cli --locked", workflow)
         self.assertIn("cargo package --locked", workflow)
         self.assertIn(
-            "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate",
+            'python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"',
             workflow,
         )
         self.assertIn(
-            "cargo install --path target/package/rxls-0.1.3 --locked --root target/installed-product",
+            'cargo install --path "target/package/rxls-${version}" --locked --root target/installed-product',
             workflow,
         )
         self.assertIn('installed="target/installed-product/bin/', workflow)
@@ -3992,11 +4062,24 @@ steps:
 
         self.assertEqual(
             workflow.count(
-                "python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate"
+                'python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"'
             ),
             2,
         )
         self.assertNotIn("target/package/rxls-0.1.2", workflow)
+        self.assertNotIn("target/package/rxls-0.1.3", workflow)
+        self.assertEqual(self.policy.audit_ci_package_versions(Path("ci.yml"), workflow), [])
+        mutations = (
+            ('python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"', 'python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate'),
+            ('PACKAGE_VERSION: ${{ steps.package.outputs.version }}', 'PACKAGE_VERSION: 0.1.3'),
+            ('cargo install --path "target/package/rxls-${version}"', 'cargo install --path .'),
+            ('      - name: Package crate\n        id: package\n        shell: bash', '      - name: Package crate\n        id: package\n        shell: pwsh'),
+        )
+        for old, new in mutations:
+            with self.subTest(mutation=old):
+                changed = workflow.replace(old, new, 1)
+                self.assertNotEqual(changed, workflow)
+                self.assertTrue(self.policy.audit_ci_package_versions(Path("ci.yml"), changed))
 
 
 if __name__ == "__main__":

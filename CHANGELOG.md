@@ -34,6 +34,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   package against the canonical core release archive.
 - Expanded MCP protocol and VS Code installed, restricted, and virtual-workspace
   regression coverage.
+- Separated read-only core release verification from protected publication,
+  binding the publishing job to the exact verified artifact and package bytes.
+
+### Fixed
+
+- Kept cached-formula warnings through document-property edits and aligned
+  their restoration with undo/redo without carrying them into another workbook.
+- Preserved the current print-preview page when applying edits or undo/redo,
+  clamping only when refreshed pagination requires it.
+- Allowed Tab and Shift+Tab to leave the worksheet at its cell boundaries,
+  while retaining a failed edit's draft and keyboard focus for correction.
+- Released pending document-property controls even when the workbook changes
+  before a request finishes.
 
 ## [0.1.3] - 2026-08-22
 
