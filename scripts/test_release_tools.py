@@ -369,14 +369,30 @@ class ReleaseToolTests(unittest.TestCase):
         registry_index = workflow.index("name: Smoke published crates.io distribution")
         self.assertLess(local_index, assembly_index)
         self.assertLess(publish_index, registry_index)
-        self.assertIn("--crate target/package/rxls-0.1.3.crate", workflow)
-        self.assertIn("--registry-version 0.1.3", workflow)
+        self.assertIn('--crate "target/package/rxls-${version}.crate"', workflow)
+        self.assertIn('--registry-version "$version"', workflow)
+        self.assertNotIn("rxls-0.1.3", workflow)
         self.assertIn("dist/release-crate-distribution-smoke.json", workflow)
         registry_upload = workflow.index(
             "name: Upload published crates.io distribution evidence"
         )
         self.assertGreater(registry_upload, registry_index)
         self.assertIn("target/release-crates-io-distribution-smoke.json", workflow)
+
+    def test_release_separates_read_only_verification_from_publication(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        verification = workflow.split("  verify:\n", 1)[1].split("  publish:\n", 1)[0]
+        publication = workflow.split("  publish:\n", 1)[1]
+        self.assertIn("  contents: read\n", workflow.split("concurrency:", 1)[0])
+        self.assertNotIn("contents: write", verification)
+        self.assertNotIn("secrets.", verification)
+        self.assertIn("needs: verify", publication)
+        self.assertIn("environment: crates-io", publication)
+        self.assertIn("artifact-ids: ${{ needs.verify.outputs.artifact_id }}", publication)
+        self.assertIn("digest-mismatch: error", publication)
+        compare = publication.index('cmp "target/package/rxls-${version}.crate"')
+        self.assertLess(compare, publication.index("name: Publish to crates.io"))
+        self.assertIn('"$smoke/assets/wasm-native-report.json"', publication)
 
     def test_hosted_candidate_release_bundle_contract_is_exactly_48_files(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

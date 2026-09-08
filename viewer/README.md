@@ -11,7 +11,9 @@ and ODS stay read-only.
 In the current source build, click a rendered cell once in editable sheet view
 to edit it directly,
 or edit its value in the formula bar. Enter commits and moves down; Tab commits
-and moves across; Escape cancels the draft. A leading `=` enters a formula.
+and moves across; Escape cancels the draft. Tab at the last cell and Shift+Tab
+at the first cell leave the worksheet after any draft is successfully saved.
+A leading `=` enters a formula.
 The typed-cell dialog remains available for explicit value kinds and cached
 formula values.
 

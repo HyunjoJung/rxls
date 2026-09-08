@@ -257,8 +257,40 @@ grid = createGridEditor({
     void workbench.selectCell(selection);
   },
   onDraft: (draft) => workbench.setDraft(draft),
+  focusOutsideGrid,
   showError,
 });
+
+function focusOutsideGrid(direction) {
+  const surface = elements["document-surface"];
+  // Resolve the current tab order after a commit: rendering may replace controls.
+  const stops = [
+    ...document.querySelectorAll(
+      "a[href], button, input, select, textarea, summary, [tabindex]",
+    ),
+  ]
+    .filter(
+      (element) =>
+        (element === surface || !surface.contains(element)) &&
+        element.tabIndex >= 0 &&
+        !element.matches(":disabled") &&
+        !element.closest("[hidden], [inert]") &&
+        element.getClientRects().length > 0 &&
+        getComputedStyle(element).visibility === "visible",
+    )
+    .sort((a, b) => {
+      if (a.tabIndex === b.tabIndex) return 0;
+      if (a.tabIndex === 0) return 1;
+      if (b.tabIndex === 0) return -1;
+      return a.tabIndex - b.tabIndex;
+    });
+  const index = stops.indexOf(surface);
+  if (index < 0 || !["next", "previous"].includes(direction)) return false;
+  const target = stops[index + (direction === "next" ? 1 : -1)];
+  if (!target) return false;
+  target.focus();
+  return document.activeElement === target;
+}
 
 bindEvents();
 setBusy(true, "Starting renderer");

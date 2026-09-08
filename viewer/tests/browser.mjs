@@ -9,7 +9,7 @@ import {
   PRESERVATION_FIXTURE,
   PRESERVED_PARTS,
 } from "../scripts/preservation-fixture.mjs";
-import { readZipEntries } from "../scripts/zip.mjs";
+import { createStoredZip, readZipEntries } from "../scripts/zip.mjs";
 
 const execFileAsync = promisify(execFile);
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
@@ -172,6 +172,7 @@ try {
   );
 
   await exerciseInlineEditing(page);
+  await exerciseMutationContinuity(page);
 
   const state = await page.evaluate(() => globalThis.__rxlsViewerState());
   if (
@@ -611,7 +612,11 @@ try {
   await page.locator("#page-view").click();
   await page.locator("#page-controls").waitFor({ state: "visible" });
   await page.locator("#document-surface svg").waitFor({ state: "visible" });
-  const pageState = await page.evaluate(() => globalThis.__rxlsViewerState());
+  const pageState = await waitForViewerState(
+    page,
+    (value) => value.mode === "page" && !value.busy && value.rendered,
+    "initial print preview rendered",
+  );
   if (pageState.mode !== "page" || pageState.pageIndex !== 0) {
     throw new Error(`page mode did not settle: ${JSON.stringify(pageState)}`);
   }
@@ -840,6 +845,50 @@ async function exerciseInlineEditing(page) {
     "reverse Tab navigation",
   );
 
+  await select("A1", "Q3 Operations Snapshot");
+  await input.press("Shift+Tab");
+  await waitForCondition(
+    () =>
+      page
+        .locator("#viewer-viewport")
+        .evaluate((element) => document.activeElement === element),
+    "Shift+Tab exits the first cell to the preceding focus stop",
+  );
+
+  await select("E10");
+  await input.click();
+  await input.fill("Last cell saved before leaving");
+  await input.press("Tab");
+  await waitForCondition(
+    () =>
+      page
+        .locator('#sheet-list button[data-index="0"]')
+        .evaluate((element) => document.activeElement === element),
+    "Tab commits the last cell and focuses the next outside control",
+  );
+  await select("E10", "Last cell saved before leaving");
+  await undo();
+  await select("E10");
+  await input.click();
+  await input.fill("=UNKNOWNFUNCTION(1)");
+  await input.press("Tab");
+  await page.locator("#error-banner").waitFor({ state: "visible" });
+  await waitForCondition(
+    async () => !(await input.isDisabled()),
+    "failed edge commit settled",
+  );
+  assert.equal(await input.inputValue(), "=UNKNOWNFUNCTION(1)");
+  assert.equal(
+    await input.evaluate((element) => document.activeElement === element),
+    true,
+  );
+  assert.equal(
+    (await page.evaluate(() => globalThis.__rxlsViewerState())).dirty,
+    false,
+  );
+  await input.press("Escape");
+  await page.locator("#dismiss-error").click();
+
   await select("C4", "420000");
   await input.click();
   assert.equal(await input.inputValue(), "420000");
@@ -962,6 +1011,165 @@ async function exerciseInlineEditing(page) {
     (value) => !value.busy && value.mode === "sheet",
     "interactive sheet restored",
   );
+}
+
+async function exerciseMutationContinuity(page) {
+  // Derive a bounded, project-owned workbook in memory: multiple print pages
+  // and one unsupported formula whose existing cache must remain explicit.
+  const entries = readZipEntries(
+    await readFile(
+      new URL("../samples/operations-report.xlsx", import.meta.url),
+    ),
+  );
+  const sheetName = "xl/worksheets/sheet1.xml";
+  entries.set(
+    sheetName,
+    Buffer.from(
+      entries
+        .get(sheetName)
+        .toString()
+        .replace('fitToPage="1"', 'fitToPage="0"')
+        .replace(/<pageSetup[^>]*\/>/, '<pageSetup paperSize="9" scale="100"/>')
+        .replace(
+          "</sheetData>",
+          '<row r="80"><c r="E80"><f>UNKNOWNFUNCTION(1)</f><v>7</v></c></row></sheetData>',
+        ),
+    ),
+  );
+  entries.set(
+    "xl/workbook.xml",
+    Buffer.from(
+      entries
+        .get("xl/workbook.xml")
+        .toString()
+        .replace("'Operations'!$A$1:$E$10", "'Operations'!$A$1:$E$80"),
+    ),
+  );
+  await page.locator("#file-input").setInputFiles({
+    name: "mutation-continuity.xlsx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buffer: createStoredZip(
+      [...entries].map(([name, data]) => ({ name, data })),
+    ),
+  });
+  await waitForViewerState(
+    page,
+    (value) => value.fileName === "mutation-continuity.xlsx" && !value.busy,
+    "continuity workbook opened",
+  );
+  await page.locator("#page-view").click();
+  await waitForViewerState(
+    page,
+    (value) => value.mode === "page" && !value.busy,
+    "continuity pages prepared",
+  );
+  assert.equal(
+    await page.locator("#next-page").isDisabled(),
+    false,
+    "fixture has multiple pages",
+  );
+  await page.locator("#next-page").click();
+  await waitForViewerState(
+    page,
+    (value) => value.pageIndex === 1 && !value.busy,
+    "second print page",
+  );
+
+  await page.locator("#edit-cell").click();
+  await page.locator("#cell-dialog").waitFor({ state: "visible" });
+  await page.locator("#cell-reference").fill("C4");
+  await page.locator("#read-cell").click();
+  await waitForCondition(
+    async () => !(await page.locator("#apply-cell-edit").isDisabled()),
+    "continuity cell ready",
+  );
+  await page.locator("#cell-value").fill("125000");
+  await page.locator("#apply-cell-edit").click();
+  await waitForViewerState(
+    page,
+    (value) => value.dirty && !value.busy,
+    "second-page cell mutation",
+  );
+  assert.equal(
+    (await page.evaluate(() => globalThis.__rxlsViewerState())).pageIndex,
+    1,
+  );
+  await page.locator("#error-banner").waitFor({ state: "visible" });
+  const assertCachedWarning = async () => {
+    assert.equal(await page.locator("#error-banner").isHidden(), false);
+    assert.match(
+      await page.locator("#error-message").textContent(),
+      /1 unsupported formula cell.*cached value/i,
+    );
+  };
+  await assertCachedWarning();
+
+  await page.locator("#document-properties").click();
+  await page.locator("#properties-dialog").waitFor({ state: "visible" });
+  await page
+    .locator("#property-title")
+    .fill("Metadata does not recalculate formulas");
+  await page.locator('#properties-form button[type="submit"]').click();
+  await waitForCondition(
+    () => page.locator("#properties-dialog").isHidden(),
+    "metadata submitted",
+  );
+  await waitForViewerState(page, (value) => !value.busy, "metadata rendered");
+  assert.equal(
+    (await page.evaluate(() => globalThis.__rxlsViewerState())).pageIndex,
+    1,
+  );
+  await assertCachedWarning();
+
+  await page.locator("#undo-edit").click();
+  await waitForViewerState(
+    page,
+    (value) => !value.busy && value.canRedo,
+    "metadata undo",
+  );
+  assert.equal(
+    (await page.evaluate(() => globalThis.__rxlsViewerState())).pageIndex,
+    1,
+  );
+  await assertCachedWarning();
+  await page.locator("#undo-edit").click();
+  await waitForViewerState(
+    page,
+    (value) => !value.busy && !value.dirty,
+    "cell undo clears stale-cache warning",
+  );
+  assert.equal(await page.locator("#error-banner").isHidden(), true);
+  await page.locator("#redo-edit").click();
+  await waitForViewerState(
+    page,
+    (value) => !value.busy && value.dirty,
+    "cell redo restores stale-cache warning",
+  );
+  await assertCachedWarning();
+  assert.equal(
+    (await page.evaluate(() => globalThis.__rxlsViewerState())).pageIndex,
+    1,
+  );
+  await page.locator("#undo-edit").click();
+  await waitForViewerState(
+    page,
+    (value) => !value.busy && !value.dirty,
+    "continuity source restored",
+  );
+  await selectSample(page, "operations-report");
+  await waitForViewerState(
+    page,
+    (value) => value.fileName === "operations-report.xlsx" && !value.busy,
+    "original sample restored",
+  );
+  await page.locator("#sheet-view").click();
+  await waitForViewerState(
+    page,
+    (value) => value.mode === "sheet" && !value.busy,
+    "original sheet view restored",
+  );
+  assert.equal(await page.locator("#error-banner").isHidden(), true);
 }
 
 async function builtBasePath() {

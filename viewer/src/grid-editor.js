@@ -118,6 +118,7 @@ export function createGridEditor({
   elements,
   onSelection = () => {},
   onDraft = () => {},
+  focusOutsideGrid = () => false,
   showError,
   readOnly = false,
 }) {
@@ -525,6 +526,8 @@ export function createGridEditor({
       cancel();
       return true;
     }
+    const ownerDocument = input.ownerDocument;
+    const hadInputFocus = ownerDocument?.activeElement === input;
     try {
       const value = inlineCellValue(input.value, current.original);
       committing = true;
@@ -549,6 +552,19 @@ export function createGridEditor({
     } finally {
       committing = false;
       update();
+      // Disabling a focused native textarea blurs it. Keep failed edits keyboard-retryable,
+      // without stealing focus from a toolbar command or a newer document/control.
+      if (
+        draft === current &&
+        sameContext(current.target) &&
+        hadInputFocus &&
+        available() &&
+        !input.disabled &&
+        !input.hidden &&
+        (ownerDocument.activeElement === ownerDocument.body ||
+          ownerDocument.activeElement === input)
+      )
+        input.focus({ preventScroll: true });
       if (!draft && available()) void readSelected();
     }
   }
@@ -585,16 +601,8 @@ export function createGridEditor({
   function adjacent(direction) {
     if (!selected) return null;
     if (direction === "next" || direction === "previous") {
-      return cells[
-        Math.max(
-          0,
-          Math.min(
-            cells.length - 1,
-            cells.findIndex((cell) => cell.key === selected.key) +
-              (direction === "next" ? 1 : -1),
-          ),
-        )
-      ];
+      const index = cells.findIndex((cell) => cell.key === selected.key);
+      return cells[index + (direction === "next" ? 1 : -1)] ?? null;
     }
     const x = selected.x + Math.min(1, selected.width / 2);
     const y = selected.y + Math.min(1, selected.height / 2);
@@ -662,7 +670,30 @@ export function createGridEditor({
           : event.shiftKey
             ? "up"
             : "down";
-      if (await commit()) {
+      const target = { ...snapshot(), key: selected.key };
+      const exit = event.key === "Tab" && !adjacent(direction);
+      const ownerDocument = input.ownerDocument;
+      const activeElement = ownerDocument?.activeElement;
+      if (
+        (await commit()) &&
+        available() &&
+        sameContext(target) &&
+        (selected?.key === target.key || (exit && !selected))
+      ) {
+        if (exit) {
+          // The native Tab action cannot resume after an asynchronous commit.
+          // Move to an actual outside control, unless the user moved focus meanwhile.
+          const currentFocus = ownerDocument?.activeElement;
+          if (
+            !ownerDocument ||
+            currentFocus === activeElement ||
+            currentFocus === input ||
+            currentFocus === surface ||
+            currentFocus === ownerDocument.body
+          )
+            focusOutsideGrid(direction);
+          return;
+        }
         const next = adjacent(direction);
         if (next) await select(next.row, next.col);
       }

@@ -121,9 +121,13 @@ jobs:
             --output target/rxls-sbom.cdx.json
           git diff --exit-code -- Cargo.lock bindings/wasm/Cargo.lock bindings/mcp/Cargo.lock
       - name: Package dry run
+        shell: bash
         run: |
+          set -euo pipefail
+          python3 scripts/check_release_identity.py
+          version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
           cargo package --locked
-          python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
+          python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"
 
   msrv:
     name: MSRV 1.85
@@ -245,11 +249,23 @@ jobs:
           CARGO_BIN_EXE_rxls: target/debug/${{ matrix.executable }}
         run: cargo test --test cli --locked
       - name: Package crate
+        id: package
+        shell: bash
         run: |
+          set -euo pipefail
+          python3 scripts/check_release_identity.py
+          version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
           cargo package --locked
-          python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
+          python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Install CLI from the exact packaged crate contents
-        run: cargo install --path target/package/rxls-0.1.3 --locked --root target/installed-product
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$PACKAGE_VERSION"
+          cargo install --path "target/package/rxls-${version}" --locked --root target/installed-product
       - name: Smoke installed CLI
         shell: bash
         run: |
