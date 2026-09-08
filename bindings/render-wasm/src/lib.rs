@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 mod interaction;
+mod range_edit;
 mod recalculation;
 
 use rxls::{Cell, DocProperties, EditCapability, EditReadOnlyReason, Spreadsheet, Workbook};
@@ -327,7 +328,7 @@ impl From<DocumentPropertiesEditRequest> for DocProperties {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "kebab-case")]
 enum EditableCell {
     Blank,
@@ -361,7 +362,7 @@ enum ResolvedCellEdit {
     Formula { formula: String, cached: Cell },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "kebab-case")]
 enum EditableCachedCell {
     Text { value: String },
@@ -559,6 +560,13 @@ impl RenderSession {
     #[wasm_bindgen(js_name = setCellRecalculateJson)]
     pub fn set_cell_recalculate_json(&mut self, request_json: &str) -> Result<String, JsValue> {
         self.set_cell_recalculate_json_core(request_json)
+            .map_err(js_error)
+    }
+
+    /// Atomically replace one bounded rectangle, refresh formula caches, and add one undo entry.
+    #[wasm_bindgen(js_name = setRangeRecalculateJson)]
+    pub fn set_range_recalculate_json(&mut self, request_json: &str) -> Result<String, JsValue> {
+        self.set_range_recalculate_json_core(request_json)
             .map_err(js_error)
     }
 
@@ -1099,6 +1107,15 @@ impl RenderSession {
         edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
         recalculate: bool,
     ) -> Result<String, FacadeError> {
+        self.apply_edit_checked(edit, recalculate, &std::collections::BTreeSet::new())
+    }
+
+    fn apply_edit_checked(
+        &mut self,
+        edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
+        recalculate: bool,
+        required_formulas: &std::collections::BTreeSet<(usize, u32, u16)>,
+    ) -> Result<String, FacadeError> {
         ensure_editable(&self.spreadsheet)?;
         let previous = self.snapshot()?;
         let mut candidate = self.spreadsheet.clone();
@@ -1109,7 +1126,7 @@ impl RenderSession {
         validate_session_workbook(&workbook)?;
 
         let recalculation = if recalculate {
-            let summary = recalculation::apply(&mut candidate, &workbook)?;
+            let summary = recalculation::apply(&mut candidate, &workbook, required_formulas)?;
             if summary.changed_cells() > 0 {
                 let bytes = candidate.save().map_err(map_edit_error)?;
                 check_saved_workbook(&bytes)?;

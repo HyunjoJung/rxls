@@ -357,11 +357,12 @@
             <label class="visually-hidden" for="inspector-value"
               >Cell value or formula</label
             >
-            <input
+            <textarea
               id="inspector-value"
+              rows="1"
               readonly
               placeholder="Enter a cell address to inspect its value or formula"
-            />
+            ></textarea>
             <span id="inspector-kind" class="inspector-kind"></span>
             <button
               id="inspector-edit"
@@ -436,9 +437,9 @@
               replace it. Enter applies an edit, Tab moves to the next cell, and
               Escape cancels. At the last cell, Tab leaves the worksheet;
               Shift+Tab at the first cell moves back to the preceding control.
-              Prefix text with an apostrophe to keep it as text.
-              Dates use Excel serial values. Formula calculation supports a
-              limited deterministic subset.
+              Prefix text with an apostrophe to keep it as text. Dates use Excel
+              serial values. Formula calculation supports a limited
+              deterministic subset.
             </p>
             <span
               id="grid-status"
@@ -768,6 +769,46 @@
           </button>
         </footer>
       </form>
+    </dialog>
+
+    <dialog
+      id="paste-dialog"
+      class="edit-dialog"
+      aria-labelledby="paste-title"
+      aria-describedby="paste-status"
+    >
+      <div class="edit-form paste-form">
+        <header class="dialog-header">
+          <div>
+            <h2 id="paste-title">Paste cells</h2>
+            <p id="paste-summary"></p>
+          </div>
+        </header>
+        <div class="paste-preview-container">
+          <table
+            class="paste-preview"
+            aria-label="Clipboard preview, first five rows and columns"
+          >
+            <tbody id="paste-preview"></tbody>
+          </table>
+        </div>
+        <p id="paste-status" class="dialog-status" aria-live="polite"></p>
+        <footer class="dialog-actions">
+          <button id="cancel-range-paste" class="command-button" type="button">
+            Cancel
+          </button>
+          <button id="paste-as-text" class="command-button" type="button">
+            Paste as one text cell
+          </button>
+          <button
+            id="apply-range-paste"
+            class="command-button primary"
+            type="button"
+          >
+            Apply range
+          </button>
+        </footer>
+      </div>
     </dialog>
 
     <script type="module" src="/src/main.js"></script>

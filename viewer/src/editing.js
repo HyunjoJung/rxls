@@ -25,7 +25,11 @@ export function createEditingController({
   confirm = (message) => globalThis.confirm(message),
 }) {
   const cellReads = createLatestRequestGate();
-  let mutationPending = false;
+  let mutationPending = null;
+  let cellBaseline = null;
+  let propertiesBaseline = null;
+  let cellDialogGeneration = 0;
+  let propertiesDialogGeneration = 0;
   let recalculationWarning = "";
   let warningContext = null;
   let warningSummary = null;
@@ -49,6 +53,9 @@ export function createEditingController({
     applyHistoryEdit,
     saveWorkbookCopy,
     commitCellEdit,
+    commitRangeEdit,
+    hasDraftChanges,
+    hasPendingMutation,
     confirmDiscardChanges,
   };
 
@@ -75,6 +82,10 @@ export function createEditingController({
     );
     elements["close-cell-dialog"].addEventListener("click", closeCellEditor);
     elements["cancel-cell-edit"].addEventListener("click", closeCellEditor);
+    elements["cell-dialog"].addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!editing.cellEditPending) closeCellEditor();
+    });
     elements["read-cell"].addEventListener(
       "click",
       () => void loadCellIntoEditor(),
@@ -97,6 +108,10 @@ export function createEditingController({
       "click",
       closePropertiesEditor,
     );
+    elements["properties-dialog"].addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!hasPendingMutation()) closePropertiesEditor();
+    });
     elements["properties-form"].addEventListener(
       "submit",
       (event) => void submitPropertiesEdit(event),
@@ -164,16 +179,21 @@ export function createEditingController({
   }
 
   async function openCellEditor() {
-    if (state.busy || mutationPending) return;
+    if (state.busy || hasPendingMutation()) return;
+    const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canEditWorkbook()) {
       return;
     }
+    if (elements["cell-dialog"].open) return;
     elements["cell-sheet-name"].textContent =
       state.workbook.sheets[state.sheetIndex].name;
     if (!elements["cell-dialog"].open) {
       elements["cell-dialog"].showModal();
     }
+    cellDialogGeneration++;
+    resetCellEditorFields();
+    cellBaseline = snapshot(cellFields());
     invalidateCellRead();
     elements["cell-reference"].focus();
     elements["cell-reference"].select();
@@ -181,6 +201,8 @@ export function createEditingController({
   }
 
   function closeCellEditor() {
+    cellDialogGeneration++;
+    cellBaseline = null;
     cellReads.invalidate();
     editing.cellReadTarget = null;
     editing.cellReadPending = false;
@@ -194,9 +216,7 @@ export function createEditingController({
 
   function invalidateCellRead() {
     cellReads.invalidate();
-    editing.cellReadTarget = null;
     editing.cellReadPending = false;
-    resetCellEditorFields();
     if (elements["cell-dialog"].open) {
       elements["cell-current-value"].textContent =
         "Load this cell before editing it";
@@ -208,6 +228,14 @@ export function createEditingController({
     if (!canEditWorkbook()) {
       return;
     }
+    if (
+      changedSnapshot(cellBaseline, cellFields().slice(1)) &&
+      !confirm(
+        "Discard unapplied Cell Options changes before loading this cell?",
+      )
+    )
+      return;
+    const target = currentTarget();
     const token = cellReads.begin();
     const client = state.client;
     const documentId = state.documentId;
@@ -220,6 +248,7 @@ export function createEditingController({
     try {
       coordinate = parseCellReference(elements["cell-reference"].value);
       elements["cell-reference"].value = coordinate.normalized;
+      cellBaseline = snapshot(cellFields());
       elements["cell-current-value"].textContent =
         `Loading ${coordinate.normalized}`;
       const result = await client.readCell(
@@ -230,6 +259,7 @@ export function createEditingController({
       );
       if (
         !cellReads.isCurrent(token) ||
+        !isCurrentTarget(target) ||
         client !== state.client ||
         documentId !== state.documentId ||
         sheetIndex !== state.sheetIndex ||
@@ -245,11 +275,12 @@ export function createEditingController({
       );
       editing.cellReadPending = false;
       populateCellEditor(result.value);
+      cellBaseline = snapshot(cellFields());
       elements["cell-current-value"].textContent = result.formatted
         ? `${coordinate.normalized}: ${result.formatted}`
         : `${coordinate.normalized}: ${describeCell(result.value)}`;
     } catch (error) {
-      if (!cellReads.isCurrent(token)) {
+      if (!cellReads.isCurrent(token) || !isCurrentTarget(target)) {
         return;
       }
       editing.cellReadTarget = null;
@@ -257,7 +288,7 @@ export function createEditingController({
       elements["cell-current-value"].textContent = describeError(error);
       showError(error);
     } finally {
-      if (cellReads.isCurrent(token)) {
+      if (cellReads.isCurrent(token) && isCurrentTarget(target)) {
         editing.cellReadPending = false;
         updateCellEditorControls();
       }
@@ -351,6 +382,10 @@ export function createEditingController({
     if (!canEditWorkbook()) {
       return;
     }
+    const target = currentTarget();
+    const dialogGeneration = cellDialogGeneration;
+    const isCurrent = () =>
+      isCurrentTarget(target) && dialogGeneration === cellDialogGeneration;
     try {
       const coordinate = parseCellReference(elements["cell-reference"].value);
       if (!sameCellTarget(editing.cellReadTarget, cellTarget(coordinate))) {
@@ -371,28 +406,37 @@ export function createEditingController({
       updateCellEditorControls();
       elements["cell-current-value"].textContent =
         `Applying ${coordinate.normalized}`;
-      if (await commitCellEdit(cellTarget(coordinate), value))
+      if ((await commitCellEdit(cellTarget(coordinate), value)) && isCurrent())
         closeCellEditor();
     } catch (error) {
-      elements["cell-current-value"].textContent = describeError(error);
-      showError(error);
+      if (isCurrent()) {
+        elements["cell-current-value"].textContent = describeError(error);
+        showError(error);
+      }
     } finally {
-      editing.cellEditPending = false;
-      updateCellEditorControls();
-      updateCellKindUi();
+      if (isCurrent()) {
+        editing.cellEditPending = false;
+        updateCellEditorControls();
+        updateCellKindUi();
+      }
     }
   }
 
   async function openPropertiesEditor() {
-    if (state.busy || mutationPending) return;
+    if (state.busy || hasPendingMutation()) return;
+    const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canEditWorkbook()) {
       return;
     }
+    if (elements["properties-dialog"].open) return;
     const properties = state.workbook.properties;
     for (const [property, elementId] of propertyFields()) {
       elements[elementId].value = properties[property] ?? "";
     }
+    propertiesDialogGeneration++;
+    propertiesBaseline = snapshot(propertyFields().map(([, id]) => id));
+    setFormPending(elements["properties-form"], false);
     if (!elements["properties-dialog"].open) {
       elements["properties-dialog"].showModal();
     }
@@ -400,6 +444,9 @@ export function createEditingController({
   }
 
   function closePropertiesEditor() {
+    propertiesDialogGeneration++;
+    propertiesBaseline = null;
+    setFormPending(elements["properties-form"], false);
     if (elements["properties-dialog"].open) {
       elements["properties-dialog"].close();
     }
@@ -411,7 +458,8 @@ export function createEditingController({
       return;
     }
     const target = currentTarget();
-    mutationPending = true;
+    const dialogGeneration = propertiesDialogGeneration;
+    mutationPending = target;
     try {
       setFormPending(elements["properties-form"], true);
       setBusy(true, "Updating document properties");
@@ -431,8 +479,10 @@ export function createEditingController({
     } catch (error) {
       if (isCurrentTarget(target)) showError(error);
     } finally {
-      mutationPending = false;
-      setFormPending(elements["properties-form"], false);
+      if (mutationPending === target) mutationPending = null;
+      if (dialogGeneration === propertiesDialogGeneration) {
+        setFormPending(elements["properties-form"], false);
+      }
       if (isCurrentTarget(target)) {
         setBusy(false);
       }
@@ -440,12 +490,13 @@ export function createEditingController({
   }
 
   async function applyHistoryEdit(direction) {
-    if (state.busy || mutationPending) return;
+    if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
+    const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canEditWorkbook()) {
       return;
     }
-    const target = currentTarget();
+    mutationPending = target;
     try {
       setBusy(true, direction === "undo" ? "Undoing edit" : "Redoing edit");
       const result =
@@ -460,9 +511,11 @@ export function createEditingController({
       );
     } catch (error) {
       if (isCurrentTarget(target)) {
-        setBusy(false);
         showError(error);
       }
+    } finally {
+      if (mutationPending === target) mutationPending = null;
+      if (isCurrentTarget(target)) setBusy(false);
     }
   }
 
@@ -585,7 +638,47 @@ export function createEditingController({
 
   /** Commit a captured cell target through the same retained-package/render path as the dialog. */
   async function commitCellEdit(target, value) {
-    if (!canEditWorkbook() || mutationPending) {
+    return commitMutation(
+      target,
+      (operation) => {
+        const setCell =
+          typeof operation.client.setCellAndRecalculate === "function"
+            ? operation.client.setCellAndRecalculate
+            : operation.client.setCell;
+        return setCell.call(
+          operation.client,
+          operation.documentId,
+          operation.sheetIndex,
+          target.row,
+          target.col,
+          value,
+        );
+      },
+      () => `${cellReference(target.row, target.col)} updated`,
+    );
+  }
+
+  /** Apply a bounded rectangular paste as one worker mutation and one undo entry. */
+  async function commitRangeEdit(target, values) {
+    if (typeof target?.client?.setRangeAndRecalculate !== "function") {
+      throw new Error("This rendering runtime does not support range editing.");
+    }
+    return commitMutation(
+      target,
+      (operation) =>
+        operation.client.setRangeAndRecalculate(
+          operation.documentId,
+          operation.sheetIndex,
+          target.row,
+          target.col,
+          values,
+        ),
+      "Pasted cells updated",
+    );
+  }
+
+  async function commitMutation(target, apply, message) {
+    if (!canEditWorkbook() || hasPendingMutation()) {
       throw new Error(
         "Cell editing is unavailable while the workbook is read-only or busy.",
       );
@@ -607,30 +700,23 @@ export function createEditingController({
         "The cell reference is outside the XLSX worksheet grid.",
       );
     }
-    mutationPending = true;
+    const operation = currentTarget();
+    mutationPending = operation;
     setBusy(true, "Applying cell edit");
     try {
-      const setCell =
-        typeof target.client.setCellAndRecalculate === "function"
-          ? target.client.setCellAndRecalculate
-          : target.client.setCell;
-      const result = await setCell.call(
-        target.client,
-        target.documentId,
-        target.sheetIndex,
-        target.row,
-        target.col,
-        value,
-      );
-      if (!isCurrentTarget(target)) return false;
+      const result = await apply(operation);
+      if (!isCurrentTarget(operation)) return false;
       return await applyMutationResult(
         result,
-        `${cellReference(target.row, target.col)} updated`,
-        target,
+        typeof message === "function" ? message() : message,
+        operation,
       );
+    } catch (error) {
+      if (!isCurrentTarget(operation)) return false;
+      throw error;
     } finally {
-      mutationPending = false;
-      if (isCurrentTarget(target)) setBusy(false);
+      if (mutationPending === operation) mutationPending = null;
+      if (isCurrentTarget(operation)) setBusy(false);
     }
   }
 
@@ -639,7 +725,9 @@ export function createEditingController({
       target &&
         target.client === state.client &&
         target.documentId === state.documentId &&
-        target.sheetIndex === state.sheetIndex,
+        target.sheetIndex === state.sheetIndex &&
+        (target.openGeneration === undefined ||
+          target.openGeneration === (state.openGeneration ?? 0)),
     );
   }
 
@@ -648,6 +736,7 @@ export function createEditingController({
       client: state.client,
       documentId: state.documentId,
       sheetIndex: state.sheetIndex,
+      openGeneration: state.openGeneration ?? 0,
     };
   }
 
@@ -660,36 +749,45 @@ export function createEditingController({
   }
 
   async function saveWorkbookCopy() {
-    if (state.busy || mutationPending) return;
+    if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
+    const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!canEditWorkbook()) {
+    if (
+      !isCurrentTarget(target) ||
+      !canEditWorkbook() ||
+      rejectUnappliedDrafts()
+    ) {
       return;
     }
+    const fileName = state.file.name;
     try {
       setBusy(true, "Preparing preserved workbook");
-      const saved = await state.client.saveDocument(state.documentId);
-      const extension = extensionOf(state.file.name);
+      const saved = await target.client.saveDocument(target.documentId);
+      if (!isCurrentTarget(target)) return;
+      const extension = extensionOf(fileName);
       const mimeType =
         extension === "xlsm"
           ? "application/vnd.ms-excel.sheet.macroEnabled.12"
           : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
       download(
         new Blob([saved.bytes], { type: mimeType }),
-        savedWorkbookName(state.file.name),
+        savedWorkbookName(fileName),
       );
       elements["status-message"].textContent = "Preserved workbook downloaded";
     } catch (error) {
-      showError(error);
+      if (isCurrentTarget(target)) showError(error);
     } finally {
-      setBusy(false);
-      elements["export-menu"].removeAttribute("open");
+      if (isCurrentTarget(target)) {
+        setBusy(false);
+        elements["export-menu"].removeAttribute("open");
+      }
     }
   }
 
   function canEditWorkbook() {
     return Boolean(
       !readOnly &&
-        !mutationPending &&
+        !hasPendingMutation() &&
         state.client &&
         state.workbook &&
         !state.busy &&
@@ -698,13 +796,73 @@ export function createEditingController({
   }
 
   function confirmDiscardChanges() {
+    const draft = hasDraftChanges();
     return (
-      !state.editState?.dirty || confirm("Discard unsaved workbook edits?")
+      !(state.editState?.dirty || draft) ||
+      confirm(
+        draft
+          ? "Discard unsaved workbook edits and unapplied dialog changes?"
+          : "Discard unsaved workbook edits?",
+      )
     );
   }
 
+  function hasPendingMutation() {
+    return Boolean(mutationPending && isCurrentTarget(mutationPending));
+  }
+
+  function cellFields() {
+    return [
+      "cell-reference",
+      "cell-kind",
+      "cell-value",
+      "cell-formula",
+      "cell-cached-kind",
+      "cell-cached-value",
+    ];
+  }
+
+  function snapshot(fields) {
+    return {
+      target: currentTarget(),
+      values: Object.fromEntries(fields.map((id) => [id, elements[id].value])),
+    };
+  }
+
+  function changedSnapshot(baseline, fields) {
+    return Boolean(
+      baseline &&
+        isCurrentTarget(baseline.target) &&
+        fields.some((id) => baseline.values[id] !== elements[id].value),
+    );
+  }
+
+  function hasDraftChanges() {
+    return Boolean(
+      (elements["cell-dialog"].open &&
+        changedSnapshot(cellBaseline, cellFields())) ||
+        (elements["properties-dialog"].open &&
+          changedSnapshot(
+            propertiesBaseline,
+            propertyFields().map(([, id]) => id),
+          )),
+    );
+  }
+
+  function rejectUnappliedDrafts() {
+    if (!hasDraftChanges()) return false;
+    showError(
+      new Error(
+        "Apply or Cancel the unapplied dialog changes before continuing.",
+      ),
+    );
+    return true;
+  }
+
   function setFormPending(form, pending) {
-    for (const button of form.querySelectorAll("button")) {
+    for (const button of form.querySelectorAll(
+      "button, input, textarea, select",
+    )) {
       button.disabled = pending;
     }
   }

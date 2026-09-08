@@ -10,6 +10,8 @@ import {
   PRESERVED_PARTS,
 } from "../scripts/preservation-fixture.mjs";
 import { createStoredZip, readZipEntries } from "../scripts/zip.mjs";
+import { exerciseRangePaste, exerciseLargeRangePaste } from "./range-paste.mjs";
+import { exerciseEditingGuards } from "./editing-guards.mjs";
 
 const execFileAsync = promisify(execFile);
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
@@ -172,6 +174,19 @@ try {
   );
 
   await exerciseInlineEditing(page);
+  await exerciseEditingGuards(page, { waitForCondition, waitForViewerState });
+  await exerciseRangePaste(page, {
+    waitForCondition,
+    waitForViewerState,
+    downloadWorkbook,
+    assertOpenpyxlReopens,
+  });
+  await exerciseLargeRangePaste(page, {
+    waitForCondition,
+    waitForViewerState,
+    downloadWorkbook,
+    assertOpenpyxlReopens,
+  });
   await exerciseMutationContinuity(page);
 
   const state = await page.evaluate(() => globalThis.__rxlsViewerState());

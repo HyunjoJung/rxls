@@ -2083,6 +2083,7 @@
         "pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()>",
         "pub fn set_active_sheet(&mut self, sheet_name: &str) -> Result<()>",
         "pub fn set_cell_formula( &mut self, sheet_name: &str, row: u32, col: u16, formula: impl AsRef<str>, cached: impl Into<Cell>, ) -> Result<()>",
+        "pub fn set_cell_range_values( &mut self, sheet_name: &str, start_row: u32, start_col: u16, values: &[Vec<Option<Cell>>], ) -> Result<()>",
         "pub fn set_cell_value( &mut self, sheet_name: &str, row: u32, col: u16, value: Cell, ) -> Result<()>",
         "pub fn set_column_hidden( &mut self, sheet_name: &str, col: u16, hidden: bool, ) -> Result<()>",
         "pub fn set_column_width( &mut self, sheet_name: &str, col: u16, width: f32, ) -> Result<()>",

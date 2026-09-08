@@ -172,6 +172,14 @@ export declare class RenderWorkerClient {
     value: EditableCell,
     options?: RenderRequestOptions,
   ): RenderRequest<RecalculatedEditResult>;
+  setRangeAndRecalculate(
+    documentId: string,
+    sheetIndex: number,
+    startRow: number,
+    startCol: number,
+    values: readonly (readonly EditableCell[])[],
+    options?: RenderRequestOptions,
+  ): RenderRequest<RecalculatedEditResult>;
   setDocumentProperties(
     documentId: string,
     properties: DocumentPropertiesInspection,

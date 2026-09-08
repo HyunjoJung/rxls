@@ -35,11 +35,13 @@ impl Summary {
 pub(super) fn apply(
     candidate: &mut Spreadsheet,
     workbook: &Workbook,
+    required_formulas: &std::collections::BTreeSet<(usize, u32, u16)>,
 ) -> Result<Summary, FacadeError> {
     let mut targets = Vec::new();
     let mut originals = Vec::new();
+    let mut required = Vec::new();
     let mut sheet_names = std::collections::BTreeSet::new();
-    for sheet in &workbook.sheets {
+    for (sheet_index, sheet) in workbook.sheets.iter().enumerate() {
         if !sheet_names.insert(sheet.name.to_ascii_lowercase()) {
             return Err(failure("ambiguous_sheet_names"));
         }
@@ -52,16 +54,23 @@ pub(super) fn apply(
                 }
                 targets.push((sheet.name.as_str(), cell.row, cell.col));
                 originals.push(cached.as_ref());
+                required.push(required_formulas.contains(&(sheet_index, cell.row, cell.col)));
             }
         }
+    }
+    if required.iter().filter(|&&value| value).count() != required_formulas.len() {
+        return Err(failure("missing_pasted_formula"));
     }
     let evaluated = workbook
         .evaluate_cells(&targets)
         .map_err(|reason| failure(reason.code()))?;
     let mut summary = Summary::default();
     let mut updates = Vec::new();
-    for (((sheet, row, col), cached), evaluation) in
-        targets.into_iter().zip(originals).zip(evaluated)
+    for ((((sheet, row, col), cached), evaluation), required) in targets
+        .into_iter()
+        .zip(originals)
+        .zip(evaluated)
+        .zip(required)
     {
         match evaluation {
             FormulaEvaluation::Computed(value) => {
@@ -80,6 +89,9 @@ pub(super) fn apply(
                 }
             }
             FormulaEvaluation::Fallback { reason, .. } => {
+                if required {
+                    return Err(super::unsupported_automatic_formula(reason.code()));
+                }
                 summary.unsupported_cells += 1;
                 if !summary.reasons.contains(&reason.code()) {
                     summary.reasons.push(reason.code());

@@ -208,6 +208,17 @@ const recalculated: RenderRequest<RecalculatedEditResult> = client.setCellAndRec
 const genericRecalculated: RenderRequest<RecalculatedEditResult> = client.request("set-cell-recalculate",
   { documentId: "document-1", sheetIndex: 0, row: 0, col: 0, value: automatic });
 void [recalculated, genericRecalculated];
+const rangeRecalculated: RenderRequest<RecalculatedEditResult> = client.setRangeAndRecalculate(
+  "document-1", 0, 0, 0, [[automatic, { kind: "number", value: 7 }]], requestOptions,
+);
+const genericRange: RenderRequest<RecalculatedEditResult> = client.request("set-range-recalculate", {
+  documentId: "document-1", sheetIndex: 0, startRow: 0, startCol: 0, values: [[automatic]],
+});
+void [rangeRecalculated, genericRange];
+// @ts-expect-error Range input is a matrix of typed cells, not scalar numbers.
+client.setRangeAndRecalculate("document-1", 0, 0, 0, [[7]]);
+// @ts-expect-error Range payload uses startRow/startCol and a values matrix.
+client.request("set-range-recalculate", { documentId: "document-1", sheetIndex: 0, row: 0, col: 0, value: automatic });
 // @ts-expect-error Geometry tuples have exactly six numeric elements.
 const shortGeometry: RenderCellGeometry = [0, 0, 0, 0, 100];
 // @ts-expect-error Sidecars carry geometry, not workbook text.

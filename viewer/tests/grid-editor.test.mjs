@@ -1,176 +1,107 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  createGridEditor,
-  gridCells,
-  gridPointer,
-  inlineCellValue,
-} from "../src/grid-editor.js";
+import { gridCells, gridPointer, inlineCellValue } from "../src/grid-editor.js";
 
-const interaction = {
-  schemaVersion: 1,
-  width: 150,
-  height: 40,
-  cells: [
-    [0, 0, 0, 0, 100, 20],
-    [0, 2, 100, 0, 50, 20],
-    [2, 0, 0, 20, 50, 20],
-    [2, 2, 100, 20, 50, 20],
-  ],
-};
-const flush = () => new Promise((resolve) => setImmediate(resolve));
-function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((yes, no) => {
-    resolve = yes;
-    reject = no;
-  });
-  return { promise, resolve, reject };
-}
-function element() {
-  const listeners = new Map();
-  const classes = new Set();
-  const attrs = new Map();
-  let value = "";
-  let disabled = false;
-  return {
-    get value() {
-      return value;
-    },
-    set value(next) {
-      value = String(next).replace(/\r\n?/g, "\n");
-    },
-    hidden: true,
-    get disabled() {
-      return disabled;
-    },
-    set disabled(next) {
-      disabled = Boolean(next);
-      if (disabled && this.ownerDocument?.activeElement === this)
-        this.ownerDocument.activeElement = this.ownerDocument.body;
-    },
-    style: {},
-    dataset: {},
-    parentElement: null,
-    classList: {
-      contains: (name) => classes.has(name),
-      toggle(name, value) {
-        if (value) classes.add(name);
-        else classes.delete(name);
-      },
-    },
-    addEventListener(type, listener) {
-      listeners.set(type, listener);
-    },
-    async fire(type, details = {}) {
-      const event = {
-        target: this,
-        prevented: false,
-        stopped: false,
-        preventDefault() {
-          this.prevented = true;
-        },
-        stopPropagation() {
-          this.stopped = true;
-        },
-        ...details,
-      };
-      await listeners.get(type)?.(event);
-      await flush();
-      return event;
-    },
-    append(child) {
-      child.parentElement = this;
-    },
-    setAttribute(name, value) {
-      attrs.set(name, value);
-    },
-    getAttribute: (name) => attrs.get(name),
-    focus() {
-      if (this.disabled) return;
-      this.focused = true;
-      if (this.ownerDocument) this.ownerDocument.activeElement = this;
-    },
-    setSelectionRange(start, end) {
-      this.selectionStart = start;
-      this.selectionEnd = end;
-    },
-    getBoundingClientRect: () => ({ left: 100, top: 50 }),
-  };
-}
-function setup({ readOnly = false, readCell, commitCellEdit, focusOutsideGrid } = {}) {
-  const calls = { reads: [], commits: [], selections: [], errors: [], exits: [] };
-  const exitTargets = { previous: element(), next: element() };
-  const elements = Object.fromEntries(
-    [
-      "document-surface",
-      "grid-layer",
-      "grid-selection",
-      "grid-input",
-      "grid-status",
-    ].map((id) => [id, element()]),
-  );
-  const svg = {
-    getScreenCTM: () => ({
-      a: 2,
-      b: 0,
-      c: 0,
-      d: 2,
-      e: 100,
-      f: 50,
-      inverse: () => ({ a: 0.5, b: 0, c: 0, d: 0.5, e: -50, f: -25 }),
-    }),
-  };
-  const state = {
-    mode: "sheet",
-    busy: false,
-    documentId: "one",
-    sheetIndex: 0,
-    workbook: { sheetCount: 1 },
-    editState: { capability: "read-write" },
-    client: {
-      readCell: async (...args) => {
-        calls.reads.push(args);
-        return readCell
-          ? readCell(...args)
-          : { value: { kind: "number", value: 10 }, formatted: "10" };
-      },
-    },
-  };
-  const grid = createGridEditor({
-    state,
-    elements,
-    readOnly,
-    editing: {
-      commitCellEdit: async (...args) => {
-        calls.commits.push(args);
-        return commitCellEdit ? commitCellEdit(...args) : true;
-      },
-    },
-    onSelection: (value) => calls.selections.push(value),
-    focusOutsideGrid: (direction) => {
-      calls.exits.push(direction);
-      if (focusOutsideGrid) return focusOutsideGrid(direction);
-      exitTargets[direction].focus();
+import {
+  setup,
+  element,
+  deferred,
+  flush,
+  interaction,
+} from "./support/grid-editor.mjs";
+
+test("range paste keeps the draft on failure and clears it only after one successful transaction", async () => {
+  let fail = true;
+  const env = setup({
+    commitRangeEdit: async () => {
+      if (fail) throw new Error("Merged cell interior");
       return true;
     },
-    showError: (error) => calls.errors.push(error),
   });
-  grid.mount(interaction, svg);
-  return {
-    grid,
-    state,
-    calls,
-    elements,
-    svg,
-    exitTargets,
-    input: elements["grid-input"],
-    outline: elements["grid-selection"],
-    layer: elements["grid-layer"],
-    surface: elements["document-surface"],
-  };
-}
+  await flush();
+  await env.grid.beginEdit("original draft");
+  const target = env.grid.getPasteTarget();
+  const values = [[{ kind: "number", value: 2 }, { kind: "blank" }]];
+  assert.equal(await env.grid.applyRange(target, values), false);
+  assert.equal(env.input.value, "original draft");
+  assert.equal(env.grid.hasChanges(), true);
+  assert.equal(env.calls.commits.length, 0);
+  fail = false;
+  assert.equal(await env.grid.applyRange(target, values), true);
+  assert.equal(env.grid.hasDraft(), false);
+  assert.equal(env.calls.ranges.length, 2);
+  assert.deepEqual(env.calls.ranges[1][1], values);
+});
+
+test("range paste is unavailable in read-only, busy, IME and stale-open contexts", async () => {
+  assert.equal(setup({ readOnly: true }).grid.getPasteTarget(), null);
+  const env = setup();
+  await flush();
+  const target = env.grid.getPasteTarget();
+  env.state.openGeneration = 1;
+  assert.equal(await env.grid.applyRange(target, [[{ kind: "blank" }]]), false);
+  assert.equal(env.calls.ranges.length, 0);
+  env.state.busy = true;
+  assert.equal(env.grid.getPasteTarget(), null);
+  env.state.busy = false;
+  await env.input.fire("compositionstart");
+  assert.equal(env.grid.getPasteTarget(), null);
+});
+
+test("a late range completion cannot clear a draft or focus a replacement workbook", async () => {
+  const pending = deferred();
+  const env = setup({ commitRangeEdit: () => pending.promise });
+  await flush();
+  await env.grid.beginEdit("keep me");
+  const applying = env.grid.applyRange(env.grid.getPasteTarget(), [
+    [{ kind: "blank" }],
+  ]);
+  env.state.openGeneration = 1;
+  pending.resolve(true);
+  assert.equal(await applying, false);
+  assert.equal(env.input.value, "keep me");
+  assert.equal(env.grid.hasChanges(), true);
+});
+
+test("large-grid selection and Tab avoid linear lookup and arrows avoid candidate sorting", async () => {
+  const env = setup();
+  const cells = Array.from({ length: 10_000 }, (_, i) => [
+    Math.floor(i / 100),
+    i % 100,
+    (i % 100) * 50,
+    Math.floor(i / 100) * 20,
+    50,
+    20,
+  ]);
+  env.grid.mount(
+    { schemaVersion: 1, width: 5000, height: 2000, cells },
+    env.svg,
+  );
+  await flush();
+  assert.equal(await env.grid.select("50", 50), false);
+  const originals = Object.fromEntries(
+    ["find", "findIndex", "filter", "sort"].map((key) => [
+      key,
+      Array.prototype[key],
+    ]),
+  );
+  const scans = [];
+  try {
+    for (const [key, original] of Object.entries(originals))
+      Array.prototype[key] = function (...args) {
+        if (this.length >= 100 && this[0]?.reference) scans.push(key);
+        return Reflect.apply(original, this, args);
+      };
+    await env.grid.select(50, 50);
+    await env.input.fire("keydown", { key: "Tab" });
+    await env.input.fire("keydown", { key: "ArrowDown" });
+    assert.equal(env.outline.dataset.reference, "AZ52");
+    assert.deepEqual(scans, []);
+  } finally {
+    for (const [key, original] of Object.entries(originals))
+      Array.prototype[key] = original;
+  }
+});
 
 test("inline values preserve text intent and date serials without fabricating formula caches", () => {
   for (const [text, expected] of [
@@ -453,7 +384,11 @@ test("edge Tab waits for its own async commit and remount before moving focus", 
     await fixture.grid.select(row, col);
     await fixture.grid.beginEdit("77");
     const event = await fixture.input.fire("keydown", { key: "Tab", shiftKey });
-    assert.equal(event.prevented, true, "default is cancelled before the async write");
+    assert.equal(
+      event.prevented,
+      true,
+      "default is cancelled before the async write",
+    );
     assert.deepEqual(fixture.calls.exits, []);
     assert.equal(fixture.grid.hasDraft(), true);
     pending.resolve(true);
@@ -491,7 +426,9 @@ test("failed keyboard commits restore the retained draft after disabling blurs t
   for (const key of ["Tab", "Enter"]) {
     for (const outcome of ["failed", "rejected"]) {
       const pending = deferred();
-      const { grid, input, calls } = setup({ commitCellEdit: () => pending.promise });
+      const { grid, input, calls } = setup({
+        commitCellEdit: () => pending.promise,
+      });
       const document = { activeElement: null, body: element() };
       input.ownerDocument = document;
       await grid.select(2, 2);
@@ -500,7 +437,8 @@ test("failed keyboard commits restore the retained draft after disabling blurs t
       await input.fire("keydown", { key });
       assert.equal(input.disabled, true);
       assert.equal(document.activeElement, document.body);
-      if (outcome === "failed") pending.reject(new Error("Unsupported formula"));
+      if (outcome === "failed")
+        pending.reject(new Error("Unsupported formula"));
       else pending.resolve(false);
       await flush();
       assert.equal(input.disabled, false);
@@ -515,7 +453,9 @@ test("failed keyboard commits restore the retained draft after disabling blurs t
 test("failed commits never steal focus after a user focus move or workbook change", async () => {
   for (const outcome of ["other-control", "stale", "toolbar"]) {
     const pending = deferred();
-    const { grid, state, input } = setup({ commitCellEdit: () => pending.promise });
+    const { grid, state, input } = setup({
+      commitCellEdit: () => pending.promise,
+    });
     const document = { activeElement: null, body: element() };
     input.ownerDocument = document;
     await grid.select(2, 2);
@@ -527,7 +467,10 @@ test("failed commits never steal focus after a user focus move or workbook chang
     if (outcome === "stale") state.documentId = "another workbook";
     pending.resolve(false);
     assert.equal(await committing, false);
-    assert.equal(document.activeElement, outcome === "stale" ? document.body : otherControl);
+    assert.equal(
+      document.activeElement,
+      outcome === "stale" ? document.body : otherControl,
+    );
     assert.equal(grid.hasDraft(), true);
     assert.equal(input.value, "77");
   }
@@ -536,7 +479,10 @@ test("failed commits never steal focus after a user focus move or workbook chang
 test("edge Tab can exit when its committed blank removes the last rendered cell", async () => {
   const fixture = setup({
     commitCellEdit: async () => {
-      fixture.grid.mount({ ...interaction, cells: interaction.cells.slice(0, 1) }, fixture.svg);
+      fixture.grid.mount(
+        { ...interaction, cells: interaction.cells.slice(0, 1) },
+        fixture.svg,
+      );
       return true;
     },
   });
@@ -564,7 +510,9 @@ test("edge Tab preserves selection when no outside target can accept focus", asy
 
 test("a successful edge commit does not steal focus from another control", async () => {
   const pending = deferred();
-  const { grid, input, calls } = setup({ commitCellEdit: () => pending.promise });
+  const { grid, input, calls } = setup({
+    commitCellEdit: () => pending.promise,
+  });
   const document = { activeElement: input, body: element() };
   input.ownerDocument = document;
   await grid.select(2, 2);

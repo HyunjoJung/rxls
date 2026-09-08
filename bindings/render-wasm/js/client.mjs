@@ -29,6 +29,7 @@ const NON_CANCELLABLE_DISPATCHED_OPERATIONS = new Set([
   "close",
   "set-cell",
   "set-cell-recalculate",
+  "set-range-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit"
@@ -125,6 +126,10 @@ export class RenderWorkerClient {
 
   setCellAndRecalculate(documentId, sheetIndex, row, col, value, options = {}) {
     return this.request("set-cell-recalculate", { documentId, sheetIndex, row, col, value }, options);
+  }
+
+  setRangeAndRecalculate(documentId, sheetIndex, startRow, startCol, values, options = {}) {
+    return this.request("set-range-recalculate", { documentId, sheetIndex, startRow, startCol, values }, options);
   }
 
   setDocumentProperties(documentId, properties, options = {}) {
@@ -568,6 +573,7 @@ function responseIdentityFor(operation, payload) {
     case "close":
     case "edit-status":
     case "set-document-properties":
+    case "set-range-recalculate":
     case "undo-edit":
     case "redo-edit":
     case "save-document":
@@ -886,6 +892,7 @@ function validateOperationResult(operation, payload, result, capabilityLimits) {
       validateEditState(result.editState);
       return;
     case "set-cell-recalculate":
+    case "set-range-recalculate":
       assertPlainRecord(result, "recalculating edit result");
       assertExactKeys(result, ["documentId", "workbook", "editState", "recalculation"], "recalculating edit result");
       assertIdentity(result.documentId, payload.documentId, "documentId");

@@ -390,9 +390,21 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("environment: crates-io", publication)
         self.assertIn("artifact-ids: ${{ needs.verify.outputs.artifact_id }}", publication)
         self.assertIn("digest-mismatch: error", publication)
-        compare = publication.index('cmp "target/package/rxls-${version}.crate"')
+        compare = publication.index('python3 scripts/core_release_handoff.py verify')
         self.assertLess(compare, publication.index("name: Publish to crates.io"))
         self.assertIn('"$smoke/assets/wasm-native-report.json"', publication)
+
+    def test_manual_rehearsal_transfers_the_real_publication_bundle_without_secrets(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("      rehearse_publication:", workflow)
+        rehearsal = workflow.split("  rehearse:\n", 1)[1].split("  publish:\n", 1)[0]
+        self.assertIn("      contents: read", rehearsal)
+        self.assertNotIn("secrets.", rehearsal)
+        self.assertNotIn("environment:", rehearsal)
+        self.assertIn("artifact-ids: ${{ needs.verify.outputs.artifact_id }}", rehearsal)
+        self.assertIn("digest-mismatch: error", rehearsal)
+        self.assertIn("python3 scripts/core_release_handoff.py verify", rehearsal)
+        self.assertNotIn("cargo publish", rehearsal)
 
     def test_hosted_candidate_release_bundle_contract_is_exactly_48_files(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

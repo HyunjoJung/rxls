@@ -46,10 +46,11 @@ OOXML packages that cannot retain metadata report a stable read-only reason.
 Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
 serialized and reopened before it replaces the live session.
 
-The current source build additionally exposes `renderSheetInteractive()` and
-`setCellAndRecalculate()`; these additions are not in the published 0.2.0 package.
-The former returns bounded, text-free cell rectangles from the same layout pass
-as the SVG. The latter applies a cell edit and refreshes supported formula
+The current source build additionally exposes `renderSheetInteractive()`,
+`setCellAndRecalculate()`, and `setRangeAndRecalculate()`; these additions are not
+in the published 0.2.0 package. Interactive rendering returns bounded, text-free
+cell rectangles from the same layout pass as the SVG. Recalculating edits apply
+a cell or rectangular range and refresh supported formula
 caches as one atomic, undoable change. Its `recalculation` summary reports
 computed and unsupported formula counts plus typed reason codes; unchanged
 caches are counted within the computed total and reported separately.
@@ -57,6 +58,25 @@ Unsupported formulas retain their old caches; a resource-limit or cache-write
 failure rejects the whole edit. Cache refresh preserves existing formula XML
 and unrelated package parts. Use ordinary `setCell()` when automatic cache
 refresh is not wanted.
+
+```js
+await client.setRangeAndRecalculate(opened.documentId, 0, 0, 0, [[
+  { kind: "number", value: 7 },
+  { kind: "formula-auto", formula: "A1*3" }
+]]);
+```
+
+Range coordinates are zero-based. The nonempty rectangular matrix is limited
+to 10,000 cells, 1 MiB of serialized request JSON, and 128 KiB of serialized
+JSON per cell; existing text, worksheet, and evaluator limits also apply.
+Automatic formulas are evaluated against the complete proposed range, so the
+example caches `21`. A newly pasted unsupported formula or a covered merged-cell
+target rejects the whole range. Formula text is used as supplied, without
+relative-reference translation. One undo restores the entire paste; save and
+reopen preserve the resulting formula caches and untouched package parts.
+Build and serve the client, worker, and WASM from the same source revision to
+use these methods; mixing the new client with an older WASM adapter rejects
+range editing with `wasm_api_mismatch`.
 
 `saveDocument()` returns `application/octet-stream` because the worker receives
 bytes without a trusted source filename; the host must retain the known

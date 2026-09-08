@@ -38,6 +38,7 @@ const NON_CANCELLABLE_ACTIVE_OPERATIONS = new Set([
   "close",
   "set-cell",
   "set-cell-recalculate",
+  "set-range-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit"
@@ -301,6 +302,8 @@ export class RenderWorkerRuntime {
         return this.#setCell(payload);
       case "set-cell-recalculate":
         return this.#setCell(payload, true);
+      case "set-range-recalculate":
+        return this.#setRange(payload);
       case "set-document-properties":
         return this.#setDocumentProperties(payload);
       case "undo-edit":
@@ -606,6 +609,18 @@ export class RenderWorkerRuntime {
     const { documentId, session } = this.#document(payload);
     const result = await session.setDocumentPropertiesJson(JSON.stringify(payload.properties));
     return { documentId, ...this.#mutationResult(result) };
+  }
+
+  async #setRange(payload) {
+    const { documentId, session } = this.#document(payload);
+    if (typeof session.setRangeRecalculateJson !== "function") {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM does not support recalculating range edits", "wasm");
+    }
+    const result = await session.setRangeRecalculateJson(JSON.stringify({
+      sheetIndex: payload.sheetIndex, startRow: payload.startRow,
+      startCol: payload.startCol, values: payload.values
+    }));
+    return { documentId, ...this.#mutationResult(result, true) };
   }
 
   async #historyEdit(payload, direction) {
@@ -1315,6 +1330,7 @@ function operationStage(operation) {
       return "inspecting";
     case "set-cell":
     case "set-cell-recalculate":
+    case "set-range-recalculate":
     case "set-document-properties":
     case "undo-edit":
     case "redo-edit":

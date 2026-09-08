@@ -617,12 +617,10 @@ steps:
             "artifact_output": ("artifact_id: ${{ steps.publication_bundle.outputs.artifact-id }}", "artifact_id: 1234"),
             "artifact_input": ("artifact-ids: ${{ needs.verify.outputs.artifact_id }}", "name: latest-release"),
             "artifact_digest_mode": ("digest-mismatch: error", "digest-mismatch: warn"),
-            "artifact_digest": ('"digest": f"sha256:{expected_digest}",', '"digest": artifact["digest"],'),
-            "artifact_run": ('"id": int(os.environ["GITHUB_RUN_ID"]),', '"id": 123,'),
-            "artifact_sha": ('"head_sha": os.environ["GITHUB_SHA"],', '"head_sha": "main",'),
-            "artifact_repository": ('"head_repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),', '"head_repository_id": 123,'),
-            "artifact_expired": ('"expired": False,', '"expired": True,'),
-            "archive_bytes": ('cmp "target/package/rxls-${version}.crate" "dist/rxls-${version}.crate"', "true"),
+            "artifact_digest": ('ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}', 'ARTIFACT_DIGEST: guessed'),
+            "artifact_attempt": ('SOURCE_ATTEMPT: ${{ needs.verify.outputs.source_attempt }}', 'SOURCE_ATTEMPT: 1'),
+            "artifact_authentication": ('python3 scripts/core_release_handoff.py authenticate', "true"),
+            "archive_bytes": ('python3 scripts/core_release_handoff.py verify', "true"),
             "handoff_skip": ("      - name: Verify publication handoff and package bytes\n", "      - name: Verify publication handoff and package bytes\n        if: false\n"),
             "publish_after_failure": ("      - name: Publish to crates.io\n        if: github.event_name == 'push'", "      - name: Publish to crates.io\n        if: always() && github.event_name == 'push'"),
             "stale_version": ('--registry-version "$version"', "--registry-version 0.1.3"),
@@ -635,14 +633,15 @@ steps:
                 self.assertTrue(self.policy.audit_core_release_evidence(Path("release.yml"), mutated))
 
     def test_core_release_artifact_metadata_authentication(self) -> None:
-        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        step = workflow.split("      - name: Authenticate verified publication artifact\n", 1)[1].split("      - name:", 1)[0]
-        script = textwrap.dedent(step.split("python3 - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
+        spec = importlib.util.spec_from_file_location("core_release_handoff", ROOT / "scripts/core_release_handoff.py")
+        handoff = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handoff)
         environment = {
             "ARTIFACT_ID": "456", "ARTIFACT_DIGEST": "a" * 64,
             "SOURCE_ATTEMPT": "1", "VERIFIED_VERSION": "0.1.4",
             "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
             "GITHUB_SHA": "b" * 40, "GITHUB_REPOSITORY_ID": "789",
+            "GITHUB_REPOSITORY": "HyunjoJung/rxls",
         }
         metadata = {
             "id": 456, "name": f"rxls-0.1.4-publication-{'b' * 40}-123-1",
@@ -651,8 +650,7 @@ steps:
         }
 
         def authenticate(data, env):
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(Path, "read_text", return_value=json.dumps(data)):
-                exec(compile(script, "release-artifact-authentication", "exec"), {})
+            handoff.authenticate(data, env)
 
         # A publication-only rerun may reuse its successful verification job's
         # exact earlier attempt, never a name-selected latest artifact.
@@ -663,14 +661,51 @@ steps:
             ("name", metadata["name"].replace("-123-1", "-123-2")),
             ("digest", f"sha256:{'c' * 64}"), ("workflow_run", None),
         ):
-            with self.subTest(field=key, value=value), self.assertRaises(SystemExit):
+            with self.subTest(field=key, value=value), self.assertRaises(handoff.HandoffError):
                 authenticate({**metadata, key: value}, environment)
         for key in metadata["workflow_run"]:
-            with self.subTest(run_field=key), self.assertRaises(SystemExit):
+            with self.subTest(run_field=key), self.assertRaises(handoff.HandoffError):
                 authenticate({**metadata, "workflow_run": {**metadata["workflow_run"], key: "wrong"}}, environment)
         for key, value in (("SOURCE_ATTEMPT", "0"), ("SOURCE_ATTEMPT", "3"), ("ARTIFACT_DIGEST", "invalid")):
-            with self.subTest(environment=key), self.assertRaises(SystemExit):
+            with self.subTest(environment=key), self.assertRaises(handoff.HandoffError):
                 authenticate(metadata, {**environment, key: value})
+
+    def test_rehearsal_input_is_early_typed_and_cannot_enable_publication(self) -> None:
+        original = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        step = self.policy._yaml_blocks(original, "- name: Validate release identity", 6)[0]
+        script = self.policy._workflow_run_scripts("    steps:\n" + step)[0].split("version=$(python3", 1)[0]
+        base = {
+            "REQUEST_REHEARSAL": "true", "BASELINE_RUN_ID": "",
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REPOSITORY": "HyunjoJung/rxls", "GITHUB_REF": "refs/heads/main",
+        }
+        for changes, expected in (
+            ({}, 0), ({"REQUEST_REHEARSAL": "false", "BASELINE_RUN_ID": "123"}, 0),
+            ({"BASELINE_RUN_ID": "123"}, 1), ({"REQUEST_REHEARSAL": '"true"'}, 1),
+            ({"REQUEST_REHEARSAL": "null"}, 1), ({"REQUEST_REHEARSAL": "true "}, 1),
+            ({"GITHUB_EVENT_NAME": "push"}, 1), ({"GITHUB_REF": "refs/heads/topic"}, 1),
+            ({"GITHUB_REPOSITORY": "other/rxls"}, 1),
+        ):
+            with self.subTest(input=changes):
+                result = subprocess.run(["bash", "-c", script], env={**os.environ, **base, **changes}, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
+        mutations = (
+            ("        default: false\n        type: boolean", "        default: true\n        type: boolean"),
+            ('test -z "$BASELINE_RUN_ID" || {', "true || {"),
+            ("github.event_name == 'push' || steps.release.outputs.rehearse == 'true'", "github.event_name == 'push'"),
+            ("    name: Rehearse publication handoff (read-only)", "    name: Rehearse publication handoff (read-only)\n    environment: crates-io"),
+            ("    name: Rehearse publication handoff (read-only)", "    name: Rehearse publication handoff (read-only)\n    env:\n      TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+            ("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')", "inputs.rehearse_publication == true"),
+            ("      - name: Rehearse publication handoff and package bytes\n", "      - name: Rehearse publication handoff and package bytes\n        if: false\n"),
+            ("      - name: Validate rehearsal identity\n", "      - name: Validate rehearsal identity\n        if: false\n"),
+            ("      - name: Upload successful rehearsal receipt\n", "      - name: Upload successful rehearsal receipt\n        if: always()\n"),
+            ("          digest-mismatch: error", "          digest-mismatch: warn"),
+        )
+        for old, new in mutations:
+            with self.subTest(mutation=old):
+                modified = original.replace(old, new, 1)
+                self.assertNotEqual(modified, original)
+                self.assertTrue(self.policy.audit_core_release_evidence(Path("release.yml"), modified))
 
     def test_github_release_reconciler_invariants_are_mutation_guarded(self) -> None:
         path = Path("scripts/reconcile_github_release.py")
@@ -3990,6 +4025,23 @@ steps:
                         Path("wasm-package-release.yml"), workflow
                     )
                 self.assertTrue(errors)
+
+    def test_shared_core_handoff_is_review_bound(self) -> None:
+        path = Path("scripts/core_release_handoff.py")
+        original = (ROOT / path).read_text(encoding="utf-8")
+        self.assertEqual(self.policy.audit_core_handoff_helper(path, original), [])
+        for old, new in (
+            ('"expired": False', '"expired": True'),
+            ('"head_repository_id": repository_id', '"head_repository_id": 1'),
+            ('"--expected-files", "52"', '"--expected-files", "48"'),
+            ('require(actual == expected,', 'require(True,'),
+            ('["cargo", "package", "--locked"]', '["cargo", "publish", "--locked"]'),
+            ('timeout=COMMAND_TIMEOUT', 'timeout=None'),
+        ):
+            with self.subTest(mutation=old):
+                modified = original.replace(old, new, 1)
+                self.assertNotEqual(modified, original)
+                self.assertTrue(self.policy.audit_core_handoff_helper(path, modified))
 
     def test_checked_in_codeql_explicitly_builds_every_rust_surface(self) -> None:
         text = CODEQL_WORKFLOW.read_text(encoding="utf-8")

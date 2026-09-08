@@ -40,6 +40,7 @@ STAGES = (
     ("viewer", "viewer-pages.yml", {"deploy": False}),
     ("core-baseline", "release.yml", {"baseline_run_id": ""}),
     ("core-compare", "release.yml", None),
+    ("core-rehearsal", "release.yml", {"baseline_run_id": "", "rehearse_publication": True}),
     ("render-package", "render-package-release.yml", {}),
 )
 STAGE_KEYS = {stage[0] for stage in STAGES}
@@ -273,7 +274,7 @@ def activate_checkout(root, sha, runner):
     origin = runner.run(["git", "remote", "get-url", "origin"]).strip()
     if origin not in {f"git@github.com:{REPOSITORY}.git", f"https://github.com/{REPOSITORY}.git", f"https://github.com/{REPOSITORY}"}:
         raise PipelineError("origin is not the canonical GitHub repository")
-    files = ["scripts/release_pipeline.py", "scripts/check_workflow_policy.py", "scripts/package-identities.json"] + [f".github/workflows/{stage[1]}" for stage in STAGES]
+    files = ["scripts/release_pipeline.py", "scripts/check_workflow_policy.py", "scripts/core_release_handoff.py", "scripts/package-identities.json"] + [f".github/workflows/{stage[1]}" for stage in STAGES]
     runner.run(["git", "ls-files", "--error-unmatch", "--", *files])
     runner.run(["git", "check-ignore", "--", f"target/release-pipeline/{sha}/state.json"])
     # Reuse the canonical semantic guard audit, including verification/deploy
