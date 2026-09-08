@@ -201,6 +201,10 @@ async function runtimeHarness({ render = () => JSON.stringify(output()), limits 
     calls.push(["set-cell-recalculate", JSON.parse(json)]);
     return JSON.stringify({ workbook, editState, recalculation: recalculation() });
   };
+  if (!legacy) Session.prototype.setRangeRecalculateJson = function (json) {
+    calls.push(["set-range-recalculate", JSON.parse(json)]);
+    return JSON.stringify({ workbook, editState, recalculation: recalculation() });
+  };
   const capabilities = structuredClone(EXPECTED_CAPABILITIES);
   Object.assign(capabilities.limits, limits);
   const runtime = new RenderWorkerRuntime({
@@ -400,5 +404,113 @@ test("plain set-cell still rejects a recalculation summary as an extra field", a
   await h.settle();
   worker.emit(h.result(pending.requestId));
   await assert.rejects(pending, { code: "worker_message_error" });
+  h.runtime.closeAll();
+});
+
+const rangePayload = (values = [[{ kind: "number", value: 7 }]]) => ({
+  documentId: "doc", sheetIndex: 0, startRow: 0, startCol: 0, values
+});
+
+test("rectangular edits are authoritative, isolated, and preserve the recalculation response", async () => {
+  const h = await runtimeHarness();
+  const worker = new FakeWorker();
+  const client = new RenderWorkerClient(worker);
+  const values = [[{ kind: "number", value: 7 }, { kind: "formula-auto", formula: "=A1+1" }]];
+  const pending = client.setRangeAndRecalculate("doc", 0, 0, 0, values);
+  values[0][1].formula = "mutated";
+  values.push([{ kind: "blank" }]);
+  worker.emit({ protocol: protocol.PROTOCOL, type: "ready", capabilities: structuredClone(EXPECTED_CAPABILITIES) });
+  assert.equal(worker.sent[0].operation, "set-range-recalculate");
+  assert.equal(worker.sent[0].payload.values.length, 1);
+  assert.equal(worker.sent[0].payload.values[0][1].formula, "=A1+1");
+  assert.equal(client.cancel(pending.requestId), false);
+  h.runtime.receive(worker.sent[0]);
+  await h.settle();
+  worker.emit(h.result(pending.requestId));
+  assert.equal((await pending).recalculation.computedCells, 2);
+  assert.deepEqual(h.calls.find(([op]) => op === "set-range-recalculate")[1], {
+    sheetIndex: 0, startRow: 0, startCol: 0,
+    values: [[{ kind: "number", value: 7 }, { kind: "formula-auto", formula: "=A1+1" }]]
+  });
+  client.terminate(); h.runtime.closeAll();
+});
+
+test("range preflight rejects empty, jagged, sparse, oversized, unknown and out-of-grid input", () => {
+  const invalid = [
+    rangePayload([]), rangePayload([[]]), rangePayload([[{ kind: "blank" }], []]),
+    rangePayload(new Array(2)), rangePayload([new Array(1)]),
+    rangePayload([{ get length() { throw new Error("row getter executed"); } }]),
+    rangePayload(Array.from({ length: 101 }, () => Array(100).fill({ kind: "blank" }))),
+    rangePayload([[{ kind: "number", value: Infinity }]]),
+    rangePayload([[{ kind: "formula-auto", formula: "=" }]]),
+    rangePayload([[{ kind: "blank", extra: "secret" }]]),
+    { ...rangePayload(), startRow: 1_048_576 },
+    { ...rangePayload([[{ kind: "blank" }, { kind: "blank" }]]), startCol: 16_383 },
+    { ...rangePayload(), extra: 1 },
+    rangePayload(Object.assign([[{ kind: "blank" }]], { extra: 1 })),
+    rangePayload([[Object.defineProperty({}, "kind", { enumerable: true, get() { throw new Error("getter executed"); } })]])
+  ];
+  for (const payload of invalid) {
+    assert.throws(() => protocol.preflightRequest({ operation: "set-range-recalculate", payload }),
+      (error) => error instanceof protocol.RenderProtocolError && error.code !== "unknown_operation");
+  }
+});
+
+test("range requests have an exact 1MiB UTF-8/JSON budget without raising the single-cell limit", () => {
+  const values = Array.from({ length: 10 }, () => [{ kind: "text", value: "x".repeat(20_000) }]);
+  const payload = rangePayload(values);
+  const request = { sheetIndex: 0, startRow: 0, startCol: 0, values };
+  assert.equal(protocol.preflightRequest({ operation: "set-range-recalculate", payload }),
+    new TextEncoder().encode(JSON.stringify(request)).byteLength);
+  const expanded = rangePayload(Array.from({ length: 10 }, () => [{ kind: "text", value: "\u0000".repeat(20_000) }]));
+  assert.throws(() => protocol.preflightRequest({ operation: "set-range-recalculate", payload: expanded }),
+    (error) => error.resource === "editRequestBytes" && error.limit === 1_048_576);
+  assert.throws(() => protocol.preflightRequest({ operation: "set-cell", payload: {
+    documentId: "doc", sheetIndex: 0, row: 0, col: 0, value: { kind: "text", value: "x".repeat(140_000) }
+  } }), (error) => error.limit === 131_072);
+  const unicode = rangePayload([[{ kind: "text", value: "한국😀\ud800\n" }]]);
+  assert.equal(protocol.preflightRequest({ operation: "set-range-recalculate", payload: unicode }),
+    new TextEncoder().encode(JSON.stringify({ sheetIndex: 0, startRow: 0, startCol: 0, values: unicode.values })).byteLength);
+  const boundary = rangePayload(Array.from({ length: 9 }, () => [{ kind: "text", value: "x".repeat(120_000) }]));
+  boundary.values[8][0].value = "";
+  const prefixBytes = protocol.preflightRequest({ operation: "set-range-recalculate", payload: boundary });
+  boundary.values[8][0].value = "x".repeat(1_048_576 - prefixBytes);
+  assert.equal(protocol.preflightRequest({ operation: "set-range-recalculate", payload: boundary }), 1_048_576);
+  boundary.values[8][0].value += "x";
+  assert.throws(() => protocol.preflightRequest({ operation: "set-range-recalculate", payload: boundary }),
+    (error) => error.limit === 1_048_576 && error.actual === 1_048_577);
+  assert.throws(() => protocol.preflightRequest({ operation: "set-range-recalculate", payload: rangePayload([[{
+    kind: "text", value: "\u0000".repeat(25_000)
+  }]]) }), (error) => error.limit === 131_072);
+  const tenThousand = rangePayload(Array.from({ length: 100 }, () => Array(100).fill({ kind: "blank" })));
+  assert.ok(protocol.preflightRequest({ operation: "set-range-recalculate", payload: tenThousand }) < 1_048_576);
+});
+
+test("range response validation rejects malformed summaries and document drift", async () => {
+  for (const mutate of [
+    (result) => { result.documentId = "other"; },
+    (result) => { result.recalculation.unchangedCells = 9; },
+    (result) => { result.extra = 1; }
+  ]) {
+    const h = await runtimeHarness();
+    const { client, worker } = clientHarness();
+    const pending = client.setRangeAndRecalculate("doc", 0, 0, 0, [[{ kind: "blank" }]]);
+    h.runtime.receive(worker.sent[0]); await h.settle();
+    const reply = h.result(pending.requestId); mutate(reply.result); worker.emit(reply);
+    await assert.rejects(pending, { code: "worker_message_error" });
+    h.runtime.closeAll();
+  }
+});
+
+test("range editing is optional for legacy adapters and malformed requests never enter WASM", async () => {
+  const h = await runtimeHarness({ legacy: true });
+  h.request("range", "set-range-recalculate", rangePayload());
+  h.request("invalid", "set-range-recalculate", rangePayload([[]]));
+  h.request("plain", "set-cell", { documentId: "doc", sheetIndex: 0, row: 0, col: 0, value: { kind: "blank" } });
+  await h.settle();
+  assert.equal(h.result("range").error.code, "wasm_api_mismatch");
+  assert.equal(h.result("invalid").ok, false);
+  assert.equal(h.result("plain").ok, true);
+  assert.equal(h.calls.filter(([op]) => op === "set-range-recalculate").length, 0);
   h.runtime.closeAll();
 });

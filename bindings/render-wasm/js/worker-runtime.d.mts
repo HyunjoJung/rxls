@@ -15,6 +15,7 @@ export interface RenderWasmSession {
   ): RenderMaybePromise<string>;
   setCellJson(requestJson: string): RenderMaybePromise<string>;
   setCellRecalculateJson?(requestJson: string): RenderMaybePromise<string>;
+  setRangeRecalculateJson?(requestJson: string): RenderMaybePromise<string>;
   setDocumentPropertiesJson(requestJson: string): RenderMaybePromise<string>;
   undoEditJson(): RenderMaybePromise<string>;
   redoEditJson(): RenderMaybePromise<string>;

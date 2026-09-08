@@ -13,6 +13,73 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_EDIT_RANGE_CELLS: u64 = 10_000;
 
 impl Spreadsheet {
+    /// Replace a nonempty rectangular cell range in one package transaction.
+    ///
+    /// The range starts at the zero-based row and column. `Some` writes a typed
+    /// value; `None` clears only value/formula content, retaining cell metadata.
+    /// At most 10,000 cells and 1 MiB of aggregate UTF-8 text are accepted. Ragged
+    /// rows, invalid values, grid overflow, ambiguous targets, and merged-cell
+    /// interiors are rejected without changing the package. Shared or array
+    /// formula groups may only be replaced in their entirety. Formula values must
+    /// carry explicit caches; this method does not evaluate formulas. Styles,
+    /// unrelated parts, and the parsed workbook view are preserved.
+    pub fn set_cell_range_values(
+        &mut self,
+        sheet_name: &str,
+        start_row: u32,
+        start_col: u16,
+        values: &[Vec<Option<Cell>>],
+    ) -> Result<()> {
+        self.ensure_editable()?;
+        let columns = values.first().map_or(0, Vec::len);
+        if columns == 0
+            || values.len().saturating_mul(columns) as u64 > MAX_EDIT_RANGE_CELLS
+            || values.iter().any(|row| row.len() != columns)
+        {
+            return Err(Error::Zip(
+                "cell range must be rectangular and contain 1 to 10000 cells",
+            ));
+        }
+        let last_row = u64::from(start_row) + values.len() as u64 - 1;
+        let last_col = u64::from(start_col) + columns as u64 - 1;
+        if last_row > 1_048_575 || last_col > 16_383 {
+            return Err(Error::Zip("cell range is outside the Excel grid"));
+        }
+        let mut text_bytes = 0_usize;
+        for value in values.iter().flatten().flatten() {
+            validate_edit_cell_value(value)?;
+            text_bytes = text_bytes.saturating_add(edit_value_text_bytes(value));
+            if text_bytes > 1 << 20 {
+                return Err(Error::Zip("cell range text exceeds 1 MiB"));
+            }
+        }
+        let package = self.package.as_ref().ok_or(Error::MissingWorkbook)?;
+        let mut names = BTreeSet::new();
+        for name in &self.workbook.sheets {
+            if !names.insert(name.name.to_ascii_lowercase()) {
+                return Err(Error::Zip("cell range requires unambiguous sheet names"));
+            }
+        }
+        let path = worksheet_path(package, sheet_name)?;
+        let range = (start_row, start_col, last_row as u32, last_col as u16);
+        peek_part_tree(package, &path, Error::MissingWorkbook, |tree| {
+            validate_range_targets(tree, range)
+        })?;
+        self.mutate_atomic(|candidate| {
+            let package = candidate.package.as_mut().ok_or(Error::MissingWorkbook)?;
+            let before = package.touched_parts();
+            let tree = package.part_tree_mut(&path)?;
+            sml_edit_cell_range(tree, start_row, start_col, values)?;
+            for part in newly_touched(&before, package) {
+                remember_edited_part(&mut candidate.edited_parts, part);
+            }
+            for part in invalidate_calc_chain(package)? {
+                remember_edited_part(&mut candidate.edited_parts, part);
+            }
+            Ok(())
+        })
+    }
+
     /// Set a worksheet cell in the retained OOXML package.
     ///
     /// The parsed [`crate::Workbook`] view is intentionally not mutated; reopen the
@@ -342,6 +409,196 @@ fn validate_formula_cached_value(value: &Cell) -> Result<()> {
         )),
         Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => Ok(()),
     }
+}
+
+fn edit_value_text_bytes(value: &Cell) -> usize {
+    match value {
+        Cell::Text(text) | Cell::Error(text) => text.len(),
+        Cell::Formula { formula, cached } => {
+            formula.len().saturating_add(edit_value_text_bytes(cached))
+        }
+        _ => 0,
+    }
+}
+
+fn validate_range_targets(tree: &XmlTree, range: (u32, u16, u32, u16)) -> Result<()> {
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    if let Some(merges) = tree.child_by_name(root, b"mergeCells") {
+        for &merge in tree.children_of(merges) {
+            let (r0, c0, r1, c1) = tree
+                .attr_value(merge, b"ref")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(super::selection::parse_a1_range)
+                .ok_or(Error::Zip(
+                    "cell range cannot edit malformed merged metadata",
+                ))?;
+            let first_row = r0.max(range.0);
+            let first_col = c0.max(range.1);
+            let last_row = r1.min(range.2);
+            let last_col = c1.min(range.3);
+            if first_row <= last_row
+                && first_col <= last_col
+                && (first_row != r0 || first_col != c0 || last_row != r0 || last_col != c0)
+            {
+                return Err(Error::Zip("cell range includes a merged-cell interior"));
+            }
+        }
+    }
+    let mut targets = BTreeSet::new();
+    let mut target_rows = BTreeSet::new();
+    if let Some(data) = tree.child_by_name(root, b"sheetData") {
+        for &row in tree.children_of(data) {
+            let source_row = sml_row_ref(tree, row);
+            if let Some(index) = source_row.and_then(|row| row.checked_sub(1)) {
+                if index >= range.0 && index <= range.2 && !target_rows.insert(index) {
+                    return Err(Error::Zip("cell range contains an ambiguous source row"));
+                }
+            }
+            for &cell in tree.children_of(row) {
+                if let Some(coordinate) = tree
+                    .attr_value(cell, b"r")
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .and_then(super::selection::parse_a1_cell)
+                {
+                    if coordinate.0 >= range.0
+                        && coordinate.0 <= range.2
+                        && coordinate.1 >= range.1
+                        && coordinate.1 <= range.3
+                        && (source_row != Some(coordinate.0 + 1) || !targets.insert(coordinate))
+                    {
+                        return Err(Error::Zip("cell range contains an ambiguous source target"));
+                    }
+                }
+                if let Some(formula) = tree.child_by_name(cell, b"f") {
+                    if matches!(tree.attr_value(formula, b"t"), Some(b"shared" | b"array")) {
+                        if let Some(reference) = tree.attr_value(formula, b"ref") {
+                            let grouped = std::str::from_utf8(reference)
+                                .ok()
+                                .and_then(super::selection::parse_a1_range)
+                                .ok_or(Error::Zip(
+                                    "cell range cannot edit malformed formula metadata",
+                                ))?;
+                            if super::selection::ranges_overlap(range, grouped)
+                                && !(range.0 <= grouped.0
+                                    && range.1 <= grouped.1
+                                    && range.2 >= grouped.2
+                                    && range.3 >= grouped.3)
+                            {
+                                return Err(Error::Zip(
+                                    "cell range cannot partially replace a shared or array formula",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sml_edit_cell_range(
+    tree: &mut XmlTree,
+    start_row: u32,
+    start_col: u16,
+    values: &[Vec<Option<Cell>>],
+) -> Result<()> {
+    let data = sml_sheet_data(tree)?;
+    let (rows, row_positions) = range_node_plan(tree, data, start_row, values.len(), |node| {
+        sml_row_ref(tree, node)?
+            .checked_sub(1)
+            .map(|row| (row, true))
+    });
+    let mut inserted_rows = 0;
+    for (row_offset, values) in values.iter().enumerate() {
+        let row = start_row + row_offset as u32;
+        let row_node = match rows[row_offset] {
+            Some(node) => node,
+            None if values.iter().all(Option::is_none) => continue,
+            None => {
+                let fragment = format!(r#"<row r="{}"></row>"#, row + 1);
+                let node = tree.insert_fragment_at(
+                    data,
+                    row_positions[row_offset + 1] + inserted_rows,
+                    fragment.as_bytes(),
+                )?;
+                inserted_rows += 1;
+                node
+            }
+        };
+        let (cells, cell_positions) =
+            range_node_plan(tree, row_node, u32::from(start_col), values.len(), |node| {
+                let reference = tree.attr_value(node, b"r")?;
+                let col = sml_col_of_ref(reference)?;
+                let exact = std::str::from_utf8(reference)
+                    .ok()
+                    .and_then(super::selection::parse_a1_cell)
+                    .is_some_and(|(cell_row, cell_col)| {
+                        cell_row == row && u32::from(cell_col) == col
+                    });
+                Some((col, exact))
+            });
+        let mut inserted_cells = 0;
+        for (offset, value) in values.iter().enumerate() {
+            let col = start_col + offset as u16;
+            let cell = match (cells[offset], value) {
+                (Some(cell), _) => cell,
+                (None, None) => continue,
+                (None, Some(_)) => {
+                    let fragment = format!(r#"<c r="{}"></c>"#, a1(row, col));
+                    let node = tree.insert_fragment_at(
+                        row_node,
+                        cell_positions[offset + 1] + inserted_cells,
+                        fragment.as_bytes(),
+                    )?;
+                    inserted_cells += 1;
+                    node
+                }
+            };
+            if let Some(value) = value {
+                sml_set_cell_value(tree, cell, value)?;
+            } else {
+                for name in [b"v".as_slice(), b"f".as_slice(), b"is".as_slice()] {
+                    while let Some(child) = tree.child_by_name(cell, name) {
+                        tree.remove_child(cell, child)?;
+                    }
+                }
+                tree.remove_attr(cell, b"t");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Index only the bounded target span, retaining document-order insertion
+/// semantics even when source siblings are unsorted. Suffix minima locate the
+/// first original sibling above each target; increasing target coordinates then
+/// require only a running count of prior insertions, not repeated source scans.
+fn range_node_plan(
+    tree: &XmlTree,
+    parent: NodeId,
+    start: u32,
+    count: usize,
+    coordinate: impl Fn(NodeId) -> Option<(u32, bool)>,
+) -> (Vec<Option<NodeId>>, Vec<usize>) {
+    let children = tree.children_of(parent);
+    let mut nodes = vec![None; count];
+    let mut positions = vec![children.len(); count + 1];
+    for (position, &node) in children.iter().enumerate() {
+        if let Some((key, exact)) = coordinate(node) {
+            if let Some(offset) = key.checked_sub(start) {
+                let offset = (offset as usize).min(count);
+                positions[offset] = positions[offset].min(position);
+                if exact && offset < count {
+                    nodes[offset] = Some(node);
+                }
+            }
+        }
+    }
+    for offset in (0..count).rev() {
+        positions[offset] = positions[offset].min(positions[offset + 1]);
+    }
+    (nodes, positions)
 }
 
 fn validate_edit_cell_value(value: &Cell) -> Result<()> {

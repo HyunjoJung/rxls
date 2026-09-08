@@ -128,6 +128,7 @@ export function createGridEditor({
   const input = elements["grid-input"];
   const status = elements["grid-status"];
   let cells = [];
+  const cellIndices = new Map();
   let svg = null;
   let context = null;
   let selected = null;
@@ -177,6 +178,8 @@ export function createGridEditor({
     commit,
     select,
     beginEdit,
+    getPasteTarget,
+    applyRange,
   };
 
   function snapshot() {
@@ -248,6 +251,9 @@ export function createGridEditor({
         return false;
       }
       cells = nextCells;
+      cellIndices.clear();
+      for (let index = 0; index < cells.length; index++)
+        cellIndices.set(cells[index].key, index);
       context = nextContext;
       svg = nextSvg;
       if (layer.parentElement !== surface) surface.append(layer);
@@ -256,7 +262,7 @@ export function createGridEditor({
         loaded = null;
         request += 1;
       }
-      selected = cells.find((cell) => cell.key === selected?.key) ?? null;
+      selected = cells[cellIndices.get(selected?.key)] ?? null;
       if (committing || draft) {
         update();
         reposition();
@@ -284,6 +290,7 @@ export function createGridEditor({
     readPromise = null;
     svg = null;
     cells = [];
+    cellIndices.clear();
     if (!preserveSelection) selected = null;
     layer.hidden = true;
     outline.hidden = true;
@@ -355,7 +362,8 @@ export function createGridEditor({
 
   async function select(row, col, { focus = true } = {}) {
     if (!available()) return false;
-    const next = cells.find((cell) => cell.row === row && cell.col === col);
+    if (!Number.isInteger(row) || !Number.isInteger(col)) return false;
+    const next = cells[cellIndices.get(`${row}:${col}`)];
     if (!next) return false;
     if (selected?.key === next.key) {
       if (focus) {
@@ -391,6 +399,7 @@ export function createGridEditor({
       row: selected.row,
       col: selected.col,
       key: selected.key,
+      openGeneration: state.openGeneration,
     };
     const promise = (async () => {
       try {
@@ -403,6 +412,7 @@ export function createGridEditor({
         if (
           token !== request ||
           !sameContext(target) ||
+          target.openGeneration !== state.openGeneration ||
           target.key !== selected?.key
         )
           return null;
@@ -423,7 +433,11 @@ export function createGridEditor({
         );
         return loaded;
       } catch (error) {
-        if (token === request && sameContext(target)) {
+        if (
+          token === request &&
+          sameContext(target) &&
+          target.openGeneration === state.openGeneration
+        ) {
           announce(describeError(error));
           showError(error);
         }
@@ -477,9 +491,15 @@ export function createGridEditor({
     startDraft(replacement);
     if (!draft) return false;
     const current = draft;
+    const generation = state.openGeneration;
     input.focus({ preventScroll: true });
     if (!current.original) await (readPromise ?? readSelected());
-    if (draft !== current || !sameContext(current.target)) return false;
+    if (
+      draft !== current ||
+      !sameContext(current.target) ||
+      generation !== state.openGeneration
+    )
+      return false;
     if (!current.original) {
       announce(
         "The cell could not be read. Your draft is retained; retry or press Escape.",
@@ -503,6 +523,63 @@ export function createGridEditor({
     return true;
   }
 
+  function getPasteTarget() {
+    if (!available() || !selected || composing) return null;
+    return {
+      ...snapshot(),
+      row: selected.row,
+      col: selected.col,
+      key: selected.key,
+      openGeneration: state.openGeneration,
+    };
+  }
+
+  async function applyRange(target, values) {
+    const isCurrent = () =>
+      sameContext(target) &&
+      target.openGeneration === state.openGeneration &&
+      selected?.key === target.key;
+    if (!available() || composing || !isCurrent()) return false;
+    try {
+      committing = true;
+      update();
+      const applied = await editing.commitRangeEdit(target, values);
+      if (
+        !applied ||
+        !sameContext(target) ||
+        target.openGeneration !== state.openGeneration
+      )
+        return false;
+      draft = null;
+      input.value = "";
+      loaded = null;
+      notifyDraft();
+      announce("Pasted range updated. Undo restores the entire range.");
+      return true;
+    } catch (error) {
+      if (
+        sameContext(target) &&
+        target.openGeneration === state.openGeneration
+      ) {
+        announce(
+          `${describeError(error)} The range was not applied; your draft is retained.`,
+        );
+        showError(error);
+      }
+      return false;
+    } finally {
+      committing = false;
+      update();
+      if (
+        !draft &&
+        available() &&
+        sameContext(target) &&
+        target.openGeneration === state.openGeneration
+      )
+        void readSelected();
+    }
+  }
+
   async function commit() {
     if (committing || composing) return false;
     if (!draft) return true;
@@ -513,11 +590,13 @@ export function createGridEditor({
       return false;
     }
     const current = draft;
+    const generation = state.openGeneration;
     if (!current.original) {
       await readSelected();
       if (
         draft !== current ||
         !current.original ||
+        generation !== state.openGeneration ||
         !sameContext(current.target)
       )
         return false;
@@ -533,7 +612,12 @@ export function createGridEditor({
       committing = true;
       update();
       const applied = await editing.commitCellEdit(current.target, value);
-      if (!applied || !sameContext(current.target)) {
+      if (
+        !applied ||
+        !sameContext(current.target) ||
+        generation !== state.openGeneration
+      ) {
+        if (generation !== state.openGeneration) return false;
         announce(
           "The workbook changed before the edit completed. The draft was retained.",
         );
@@ -546,8 +630,10 @@ export function createGridEditor({
       announce(`${selected?.reference ?? "Cell"} updated.`);
       return true;
     } catch (error) {
-      announce(`${describeError(error)} Your draft is retained.`);
-      showError(error);
+      if (sameContext(current.target) && generation === state.openGeneration) {
+        announce(`${describeError(error)} Your draft is retained.`);
+        showError(error);
+      }
       return false;
     } finally {
       committing = false;
@@ -557,6 +643,7 @@ export function createGridEditor({
       if (
         draft === current &&
         sameContext(current.target) &&
+        generation === state.openGeneration &&
         hadInputFocus &&
         available() &&
         !input.disabled &&
@@ -565,7 +652,8 @@ export function createGridEditor({
           ownerDocument.activeElement === input)
       )
         input.focus({ preventScroll: true });
-      if (!draft && available()) void readSelected();
+      if (!draft && available() && generation === state.openGeneration)
+        void readSelected();
     }
   }
 
@@ -601,12 +689,12 @@ export function createGridEditor({
   function adjacent(direction) {
     if (!selected) return null;
     if (direction === "next" || direction === "previous") {
-      const index = cells.findIndex((cell) => cell.key === selected.key);
+      const index = cellIndices.get(selected.key);
       return cells[index + (direction === "next" ? 1 : -1)] ?? null;
     }
     const x = selected.x + Math.min(1, selected.width / 2);
     const y = selected.y + Math.min(1, selected.height / 2);
-    const eligible = cells.filter((cell) => {
+    const eligible = (cell) => {
       if (direction === "right")
         return (
           cell.x >= selected.x + selected.width - 0.001 &&
@@ -630,7 +718,7 @@ export function createGridEditor({
         x >= cell.x &&
         x < cell.x + cell.width
       );
-    });
+    };
     const distance = (cell) =>
       direction === "right"
         ? cell.x - selected.x
@@ -639,7 +727,17 @@ export function createGridEditor({
           : direction === "down"
             ? cell.y - selected.y
             : selected.y - cell.y - cell.height;
-    return eligible.sort((a, b) => distance(a) - distance(b))[0] ?? selected;
+    let nearest = selected;
+    let nearestDistance = Infinity;
+    for (const cell of cells) {
+      if (!eligible(cell)) continue;
+      const nextDistance = distance(cell);
+      if (nextDistance < nearestDistance) {
+        nearest = cell;
+        nearestDistance = nextDistance;
+      }
+    }
+    return nearest;
   }
 
   async function keydown(event) {

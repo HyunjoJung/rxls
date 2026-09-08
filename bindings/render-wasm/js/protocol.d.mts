@@ -8,6 +8,8 @@ export declare const MAX_OPEN_DOCUMENTS: 4;
 export declare const MAX_OPEN_RESOURCE_BYTES: 134217728;
 export declare const MAX_OPTIONS_BYTES: 65536;
 export declare const MAX_EDIT_REQUEST_BYTES: 131072;
+export declare const MAX_RANGE_EDIT_REQUEST_BYTES: 1048576;
+export declare const MAX_RANGE_EDIT_CELLS: 10000;
 export declare const MAX_EDIT_HISTORY_ENTRIES: 20;
 export declare const MAX_EDIT_HISTORY_BYTES: 33554432;
 export declare const MAX_PENDING_REQUESTS: 32;
@@ -474,6 +476,7 @@ export type RenderOperation =
   | "read-cell"
   | "set-cell"
   | "set-cell-recalculate"
+  | "set-range-recalculate"
   | "set-document-properties"
   | "undo-edit"
   | "redo-edit"
@@ -502,6 +505,13 @@ export interface RenderOperationPayloads {
     readonly value: EditableCell;
   };
   readonly "set-cell-recalculate": RenderOperationPayloads["set-cell"];
+  readonly "set-range-recalculate": {
+    readonly documentId: string;
+    readonly sheetIndex: number;
+    readonly startRow: number;
+    readonly startCol: number;
+    readonly values: readonly (readonly EditableCell[])[];
+  };
   readonly "set-document-properties": {
     readonly documentId: string;
     readonly properties: DocumentPropertiesInspection;
@@ -553,6 +563,7 @@ export interface RenderOperationResults {
   readonly "read-cell": ReadCellResult;
   readonly "set-cell": EditMutationResult;
   readonly "set-cell-recalculate": RecalculatedEditResult;
+  readonly "set-range-recalculate": RecalculatedEditResult;
   readonly "set-document-properties": EditMutationResult;
   readonly "undo-edit": EditMutationResult;
   readonly "redo-edit": EditMutationResult;

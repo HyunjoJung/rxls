@@ -42,6 +42,7 @@ import { createEditingController } from "./editing.js";
 import { createExportController } from "./exports.js";
 import { createWorkbench } from "./workbench.js";
 import { createGridEditor } from "./grid-editor.js";
+import { createRangePasteController } from "./range-paste.js";
 
 const MAX_INPUT_BYTES = 32 * 1024 * 1024;
 const ZOOM_STEP = 0.15;
@@ -169,6 +170,13 @@ const elements = Object.fromEntries(
     "property-last-modified-by",
     "property-company",
     "property-created",
+    "paste-dialog",
+    "paste-status",
+    "paste-summary",
+    "paste-preview",
+    "apply-range-paste",
+    "paste-as-text",
+    "cancel-range-paste",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -191,6 +199,7 @@ const state = {
   busy: false,
   renderEpoch: 0,
   openRequest: null,
+  openGeneration: 0,
   dragDepth: 0,
   hostGeneration: 0,
   hostWorker: null,
@@ -202,6 +211,7 @@ const baseUrl = hostResourceBase
 const openRequests = createLatestRequestGate();
 let samples = [];
 let grid = null;
+let rangePaste = null;
 
 const editing = createEditingController({
   state,
@@ -211,7 +221,7 @@ const editing = createEditingController({
   showError,
   updateWorkbookUi,
   renderCurrent,
-  beforeCommand: () => (grid ? grid.commit() : Promise.resolve(true)),
+  beforeCommand: commitGridDraft,
 });
 const {
   updateEditUi,
@@ -260,6 +270,13 @@ grid = createGridEditor({
   focusOutsideGrid,
   showError,
 });
+
+rangePaste = createRangePasteController({ grid, elements, showError });
+
+async function commitGridDraft() {
+  if (rangePaste && !rangePaste.ready()) return false;
+  return grid ? grid.commit() : true;
+}
 
 function focusOutsideGrid(direction) {
   const surface = elements["document-surface"];
@@ -383,7 +400,12 @@ function bindEvents() {
   }
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("beforeunload", (event) => {
-    if (state.editState?.dirty || grid.hasChanges()) {
+    if (
+      state.editState?.dirty ||
+      grid.hasChanges() ||
+      editing.hasDraftChanges() ||
+      rangePaste.hasPending()
+    ) {
       event.preventDefault();
       event.returnValue = "";
     }
@@ -400,7 +422,8 @@ function chooseFile() {
 }
 
 async function loadLocalFile(file) {
-  if (!(await grid.commit())) return;
+  if (!canReplaceWorkbook()) return;
+  if (!(await commitGridDraft())) return;
   if (!confirmDiscardChanges()) {
     return;
   }
@@ -438,7 +461,11 @@ async function loadLocalFile(file) {
 }
 
 async function loadSample(sample) {
-  if (!(await grid.commit())) {
+  if (!canReplaceWorkbook()) {
+    elements["sample-select"].value = state.file?.sampleId ?? "";
+    return;
+  }
+  if (!(await commitGridDraft())) {
     elements["sample-select"].value = state.file?.sampleId ?? "";
     return;
   }
@@ -473,7 +500,19 @@ async function loadSample(sample) {
   }
 }
 
+function canReplaceWorkbook() {
+  if (!editing.hasPendingMutation()) return true;
+  showError(
+    new Error(
+      "Wait for the current edit to finish before opening another workbook.",
+    ),
+  );
+  return false;
+}
+
 function beginOpenRequest(label) {
+  rangePaste.cancel();
+  state.openGeneration += 1;
   state.openRequest?.abortController.abort();
   state.openRequest?.client?.terminate();
   const request = {
@@ -736,7 +775,7 @@ async function selectSheet(index) {
   if (state.busy || index === state.sheetIndex || !state.workbook) {
     return;
   }
-  if (!(await grid.commit())) return;
+  if (!(await commitGridDraft())) return;
   if (state.busy || !state.workbook || index === state.sheetIndex) return;
   grid.invalidate();
   state.sheetIndex = index;
@@ -750,7 +789,7 @@ async function setMode(mode) {
   if (!state.workbook || state.busy || state.mode === mode) {
     return;
   }
-  if (!(await grid.commit())) return;
+  if (!(await commitGridDraft())) return;
   if (state.busy || !state.workbook || mode === state.mode) return;
   grid.invalidate();
   state.mode = mode;
@@ -932,7 +971,7 @@ function applyZoom() {
 }
 
 async function exportWithDraft(kind) {
-  if (!(await grid.commit())) return;
+  if (!(await commitGridDraft())) return;
   if (kind === "svg") exportSvg();
   else await exportPng();
 }
@@ -1112,11 +1151,7 @@ function onKeyDown(event) {
     chooseFile();
     return;
   }
-  if (
-    (!editingText || event.target === elements["grid-input"]) &&
-    key === "s" &&
-    state.editState?.capability === "read-write"
-  ) {
+  if (key === "s" && state.editState?.capability === "read-write") {
     event.preventDefault();
     void saveWorkbookCopy();
     return;

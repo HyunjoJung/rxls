@@ -8,6 +8,8 @@ export const MAX_OPEN_DOCUMENTS = 4;
 export const MAX_OPEN_RESOURCE_BYTES = 128 * 1024 * 1024;
 export const MAX_OPTIONS_BYTES = 64 * 1024;
 export const MAX_EDIT_REQUEST_BYTES = 128 * 1024;
+export const MAX_RANGE_EDIT_REQUEST_BYTES = 1024 * 1024;
+export const MAX_RANGE_EDIT_CELLS = 10_000;
 export const MAX_EDIT_HISTORY_ENTRIES = 20;
 export const MAX_EDIT_HISTORY_BYTES = MAX_INPUT_BYTES;
 export const MAX_PENDING_REQUESTS = 32;
@@ -54,6 +56,7 @@ const OPERATIONS = new Set([
   "read-cell",
   "set-cell",
   "set-cell-recalculate",
+  "set-range-recalculate",
   "set-document-properties",
   "undo-edit",
   "redo-edit",
@@ -225,6 +228,14 @@ export function preflightRequest({ operation, payload }) {
         value: payload.value
       }).byteLength;
     }
+    case "set-range-recalculate": {
+      rangeCellData(payload, "payload");
+      assertExactKeys(payload, ["documentId", "sheetIndex", "startRow", "startCol", "values"], "payload");
+      validateDocumentId(payload.documentId);
+      boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
+      validateCellCoordinate(payload.startRow, payload.startCol);
+      return rangeEditBytes(payload);
+    }
     case "set-document-properties": {
       assertExactKeys(payload, ["documentId", "properties"], "payload");
       validateDocumentId(payload.documentId);
@@ -340,6 +351,79 @@ export function editJson(value) {
     );
   }
   return encoded;
+}
+
+// Count each bounded cell before cloning or serializing the complete matrix.
+function rangeEditBytes({ sheetIndex, startRow, startCol, values }) {
+  const location = "payload.values";
+  if (!Array.isArray(values) || values.length === 0 || values.length > MAX_RANGE_EDIT_CELLS) {
+    throw new RenderProtocolError("invalid_edit", "values must be a nonempty bounded matrix", location);
+  }
+  rangeArray(values, values.length, location);
+  if (!Array.isArray(values[0])) {
+    throw new RenderProtocolError("invalid_edit", "each range row must be an array", location);
+  }
+  const width = values[0].length;
+  if (!Number.isSafeInteger(width) || width <= 0 || width * values.length > MAX_RANGE_EDIT_CELLS) {
+    throw new RenderProtocolError("invalid_edit", "range must contain at most 10000 cells", location);
+  }
+  validateCellCoordinate(startRow + values.length - 1, startCol + width - 1);
+  let bytes = JSON.stringify({ sheetIndex, startRow, startCol, values: [] }).length;
+  const add = (count) => {
+    bytes += count;
+    if (bytes > MAX_RANGE_EDIT_REQUEST_BYTES) {
+      throw limitError("editRequestBytes", MAX_RANGE_EDIT_REQUEST_BYTES, bytes, location);
+    }
+  };
+  for (let row = 0; row < values.length; row += 1) {
+    rangeArray(values[row], width, `${location}[${row}]`);
+    add(2 + (row === 0 ? 0 : 1));
+    for (let col = 0; col < width; col += 1) {
+      const cell = values[row][col];
+      const cellLocation = `${location}[${row}][${col}]`;
+      rangeCellData(cell, cellLocation);
+      validateEditableCell(cell, cellLocation, true);
+      // Per-cell strings remain capped by the original 128KiB input contract.
+      const cellBytes = new TextEncoder().encode(JSON.stringify(cell)).byteLength;
+      if (cellBytes > MAX_EDIT_REQUEST_BYTES) {
+        throw limitError("editRequestBytes", MAX_EDIT_REQUEST_BYTES, cellBytes, cellLocation);
+      }
+      add(cellBytes + (col === 0 ? 0 : 1));
+    }
+  }
+  return bytes;
+}
+
+function rangeArray(value, length, location) {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length !== length || Reflect.ownKeys(value).length !== length + 1) {
+    throw new RenderProtocolError("invalid_edit", "range rows must be dense and rectangular", location);
+  }
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new RenderProtocolError("invalid_edit", "range entries must be own data values", location);
+    }
+  }
+}
+
+function rangeCellData(value, location) {
+  assertPlainObject(value, location);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== "string" || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new RenderProtocolError("invalid_edit", "cell fields must be own data values", location);
+    }
+  }
+  // Formula caches contain scalars, so inspect at most this one extra level.
+  if (value.kind === "formula") {
+    assertPlainObject(value.cached, `${location}.cached`);
+    for (const key of Reflect.ownKeys(value.cached)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value.cached, key);
+      if (typeof key !== "string" || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new RenderProtocolError("invalid_edit", "cached fields must be own data values", location);
+      }
+    }
+  }
 }
 
 export function boundedIndex(value, location, countLimit, resource) {
@@ -830,6 +914,9 @@ function validateEditString(value, location) {
       `${location} must be a string`,
       location
     );
+  }
+  if (value.length > MAX_EDIT_REQUEST_BYTES) {
+    throw limitError("editRequestBytes", MAX_EDIT_REQUEST_BYTES, value.length, location);
   }
   const bytes = new TextEncoder().encode(value).byteLength;
   if (bytes > MAX_EDIT_REQUEST_BYTES) {

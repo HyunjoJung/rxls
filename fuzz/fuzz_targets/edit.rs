@@ -16,6 +16,8 @@ use rxls::{Cell, Color, DocProperties, SheetVisible, Spreadsheet};
 
 /// Bound on Unstructured-derived loop counts so the target stays fast.
 const MAX_ITERS: u8 = 8;
+/// Keep rectangular transactions small while varying shape and clear/write cells.
+const MAX_RANGE_SIDE: usize = 4;
 
 fn arbitrary_cell(u: &mut Unstructured) -> Cell {
     match u.int_in_range(0u8..=5).unwrap_or(0) {
@@ -78,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let name = &names[u.int_in_range(0usize..=names.len() - 1).unwrap_or(0)];
         let (row, col) = arbitrary_coord(&mut u);
-        match u.int_in_range(0u8..=9).unwrap_or(0) {
+        match u.int_in_range(0u8..=10).unwrap_or(0) {
             0 => {
                 let value = arbitrary_cell(&mut u);
                 let _ = sheet.set_cell_value(name, row, col, value);
@@ -145,6 +147,31 @@ fuzz_target!(|data: &[u8]| {
             }
             8 => {
                 let _ = sheet.set_active_sheet(name);
+            }
+            9 => {
+                let rows = u.int_in_range(0usize..=MAX_RANGE_SIDE).unwrap_or(0);
+                let cols = u.int_in_range(0usize..=MAX_RANGE_SIDE).unwrap_or(0);
+                let mut values: Vec<Vec<Option<Cell>>> = (0..rows)
+                    .map(|_| {
+                        (0..cols)
+                            .map(|_| {
+                                if bool::arbitrary(&mut u).unwrap_or(false) {
+                                    Some(arbitrary_cell(&mut u))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                // Empty and occasionally ragged matrices cover rejection paths
+                // alongside the normal <=16-cell rectangular transaction.
+                if u.ratio(1u8, 4).unwrap_or(false) {
+                    if let Some(last) = values.last_mut() {
+                        let _ = last.pop();
+                    }
+                }
+                let _ = sheet.set_cell_range_values(name, row, col, &values);
             }
             _ => {
                 let rgb = <[u8; 3]>::arbitrary(&mut u).unwrap_or([0, 0, 0]);

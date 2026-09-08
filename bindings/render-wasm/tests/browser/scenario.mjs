@@ -213,6 +213,33 @@ export async function runBrowserScenario({
         savedFormula.value.cached.value !== 6) throw new Error("saved dependent cache was stale");
     await client.closeDocument(reopenedRecalculation.documentId);
 
+    result.textContent = "STEP atomic rectangular paste";
+    const rangeDocument = await timed(client.open(fixture.workbook, { documentId: "browser-range" }), "open range fixture");
+    const rangeBefore = await Promise.all([0, 1].map((col) => timed(client.readCell(rangeDocument.documentId, 0, 0, col), "read original paste target")));
+    const pasted = await timed(client.setRangeAndRecalculate(rangeDocument.documentId, 0, 0, 0, [[
+      { kind: "number", value: 7 }, { kind: "formula-auto", formula: "=A1*3" }
+    ]]), "atomic rectangular paste");
+    if (pasted.editState.undoDepth !== 1 || pasted.recalculation.unsupportedCells !== 0) {
+      throw new Error("range paste did not produce one clean atomic undo entry");
+    }
+    await timed(client.undoEdit(rangeDocument.documentId), "undo rectangular paste");
+    for (let col = 0; col < 2; col += 1) {
+      const restored = await timed(client.readCell(rangeDocument.documentId, 0, 0, col), "read undone paste target");
+      if (JSON.stringify(restored.value) !== JSON.stringify(rangeBefore[col].value)) {
+        throw new Error("one undo did not restore every pasted cell");
+      }
+    }
+    await timed(client.redoEdit(rangeDocument.documentId), "redo rectangular paste");
+    const rangeSaved = await timed(client.saveDocument(rangeDocument.documentId), "save pasted workbook");
+    await client.closeDocument(rangeDocument.documentId);
+    const rangeReopened = await timed(client.open(rangeSaved.bytes, { documentId: "browser-range-saved" }), "reopen pasted workbook");
+    const rangeFormula = await timed(client.readCell(rangeReopened.documentId, 0, 0, 1), "read pasted formula cache");
+    if (rangeFormula.value.kind !== "formula" || rangeFormula.value.formula !== "A1*3" ||
+        rangeFormula.value.cached.kind !== "number" || rangeFormula.value.cached.value !== 21) {
+      throw new Error("pasted formula source or atomic computed cache was not preserved");
+    }
+    await client.closeDocument(rangeReopened.documentId);
+
     result.textContent = "STEP pagination";
     const pageMap = await timed(
       client.preparePages(opened.documentId, 0),

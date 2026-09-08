@@ -10,12 +10,23 @@ and ODS stay read-only.
 
 In the current source build, click a rendered cell once in editable sheet view
 to edit it directly,
-or edit its value in the formula bar. Enter commits and moves down; Tab commits
+or use the formula bar's Edit cell control. Enter commits and moves down; Tab commits
 and moves across; Escape cancels the draft. Tab at the last cell and Shift+Tab
 at the first cell leave the worksheet after any draft is successfully saved.
 A leading `=` enters a formula.
 The typed-cell dialog remains available for explicit value kinds and cached
 formula values.
+
+Paste tab-separated cells into the selected cell to preview a rectangular range
+before applying it. Quoted tabs, line breaks, and blank cells are preserved.
+One undo restores the entire paste, including recalculated formula caches.
+Paste is limited to 10,000 cells and a 1 MiB request; merged-cell interiors and
+unsupported new formulas reject the whole range. Formula references are used as
+written, without relative-reference translation. The preview also offers an
+explicit single-text-cell option for intentional multiline text.
+
+Unapplied Cell Options and Properties fields are protected when opening another
+file or leaving the page. Apply or cancel those fields before saving a copy.
 
 Committed edits refresh formulas supported by the deterministic evaluator in
 the same undo step. Unsupported formulas keep their cached values and produce
@@ -51,6 +62,12 @@ npm --prefix viewer run test:browser
 Set `RXLS_CHROMIUM_EXECUTABLE` when the browser test should use a specific
 Chrome or Chromium binary. Set `RXLS_VIEWER_SCREENSHOTS=1` to write desktop and
 mobile captures under `target/viewer-e2e/`.
+
+For a repeatable local navigation diagnostic, run
+`node viewer/scripts/benchmark-grid.mjs` from the repository root. Add
+`--baseline-ref <git-ref>` to compare an earlier grid implementation with the
+same harness. This isolates selection and keyboard navigation at up to 250,000
+rendered anchors; it does not measure browser rendering or worker execution.
 
 ## Runtime boundaries
 

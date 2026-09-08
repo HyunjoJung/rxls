@@ -45,6 +45,7 @@ function setup({
   client = {},
   beforeCommand,
   renderCurrent,
+  confirmResult = false,
 } = {}) {
   const elements = new Proxy(
     {},
@@ -72,6 +73,7 @@ function setup({
     sheetIndex: 0,
     pageIndex: 3,
     busy: false,
+    openGeneration: 0,
     manifests: new Map([[0, { pages: [1] }]]),
     file: { name: "Quarter.xlsm", size: 100, source: "Local file" },
   };
@@ -104,7 +106,7 @@ function setup({
     download: (blob, name) => calls.downloads.push({ blob, name }),
     confirm: (message) => {
       calls.confirms.push(message);
-      return false;
+      return confirmResult;
     },
   });
   elements["cell-reference"].value = "A1";
@@ -113,6 +115,362 @@ function setup({
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+const readNumber = async () => ({ value: { kind: "number", value: 4 } });
+
+test("every unapplied dialog field participates in discard checks without counting untouched dialogs", async () => {
+  for (const [dialog, fields] of [
+    [
+      "cell",
+      [
+        "cell-reference",
+        "cell-kind",
+        "cell-value",
+        "cell-formula",
+        "cell-cached-kind",
+        "cell-cached-value",
+      ],
+    ],
+    [
+      "properties",
+      [
+        "property-title",
+        "property-subject",
+        "property-creator",
+        "property-keywords",
+        "property-description",
+        "property-last-modified-by",
+        "property-company",
+        "property-created",
+      ],
+    ],
+  ]) {
+    for (const field of fields) {
+      const { controller, elements, calls } = setup({
+        client: { readCell: readNumber },
+      });
+      await (dialog === "cell"
+        ? controller.openCellEditor()
+        : controller.openPropertiesEditor());
+      assert.equal(controller.hasDraftChanges(), false, `${field}: untouched`);
+      const original = elements[field].value;
+      elements[field].value = "invalid unapplied draft";
+      assert.equal(controller.hasDraftChanges(), true, field);
+      assert.equal(controller.confirmDiscardChanges(), false, field);
+      assert.equal(elements[field].value, "invalid unapplied draft", field);
+      assert.equal(calls.confirms.length, 1, field);
+      elements[field].value = original;
+      assert.equal(controller.hasDraftChanges(), false, `${field}: reverted`);
+    }
+  }
+});
+
+test("Cancel and Escape explicitly discard dialog drafts; reopening starts clean", async () => {
+  const { controller, elements } = setup({ client: { readCell: readNumber } });
+  for (const kind of ["cell", "properties"]) {
+    const open =
+      kind === "cell"
+        ? controller.openCellEditor
+        : controller.openPropertiesEditor;
+    const field = kind === "cell" ? "cell-value" : "property-title";
+    for (const action of ["button", "escape"]) {
+      await open();
+      elements[field].value = "draft";
+      if (action === "button") elements[`cancel-${kind}-edit`].emit("click");
+      else elements[`${kind}-dialog`].emit("cancel");
+      assert.equal(elements[`${kind}-dialog`].open, false);
+      assert.equal(controller.hasDraftChanges(), false);
+      await open();
+      assert.notEqual(elements[field].value, "draft");
+      assert.equal(controller.hasDraftChanges(), false);
+    }
+    (kind === "cell"
+      ? controller.closeCellEditor
+      : controller.closePropertiesEditor)();
+  }
+});
+
+test("save refuses unapplied invalid dialog fields without submitting or losing them", async () => {
+  let saves = 0;
+  const { controller, elements, calls } = setup({
+    client: {
+      readCell: readNumber,
+      saveDocument: async () => {
+        saves++;
+        return { bytes: new Uint8Array([1]) };
+      },
+    },
+  });
+  await controller.openCellEditor();
+  elements["cell-value"].value = "not a number";
+  await controller.saveWorkbookCopy();
+  assert.equal(saves, 0);
+  assert.match(calls.errors.at(-1).message, /Apply or Cancel/);
+  assert.equal(elements["cell-value"].value, "not a number");
+  controller.closeCellEditor();
+  await controller.openPropertiesEditor();
+  elements["property-created"].value = "invalid date";
+  await controller.saveWorkbookCopy();
+  assert.equal(saves, 0);
+  controller.closePropertiesEditor();
+  await controller.saveWorkbookCopy();
+  assert.equal(saves, 1);
+});
+
+test("changing the cell address or rereading cannot silently erase a value draft", async () => {
+  let reads = 0;
+  const { controller, elements, calls } = setup({
+    client: {
+      readCell: async () => {
+        reads++;
+        return readNumber();
+      },
+    },
+  });
+  await controller.openCellEditor();
+  elements["cell-value"].value = "draft";
+  elements["cell-reference"].value = "B2";
+  elements["cell-reference"].emit("input");
+  elements["cell-reference"].emit("change");
+  await flush();
+  assert.equal(reads, 1);
+  assert.equal(elements["cell-value"].value, "draft");
+  assert.equal(calls.confirms.length, 1);
+  assert.equal(elements["apply-cell-edit"].disabled, true);
+  elements["cell-reference"].value = "A1";
+  elements["cell-reference"].emit("input");
+  assert.equal(elements["apply-cell-edit"].disabled, false);
+});
+
+test("accepted discard allows loading a different cell and establishes a clean baseline", async () => {
+  const { controller, elements } = setup({
+    client: { readCell: readNumber },
+    confirmResult: true,
+  });
+  await controller.openCellEditor();
+  elements["cell-value"].value = "draft";
+  assert.equal(controller.confirmDiscardChanges(), true);
+  elements["cell-reference"].value = "B2";
+  elements["cell-reference"].emit("input");
+  elements["cell-reference"].emit("change");
+  await flush();
+  assert.equal(elements["cell-value"].value, "4");
+  assert.equal(controller.hasDraftChanges(), false);
+});
+
+for (const outcome of ["resolve", "reject"]) {
+  for (const replace of [false, true]) {
+    test(`save ${outcome} cannot affect a ${replace ? "replaced" : "pending-open"} workbook`, async () => {
+      const pending = deferred();
+      const { controller, state, calls, elements } = setup({
+        client: { saveDocument: () => pending.promise },
+      });
+      const saved = controller.saveWorkbookCopy();
+      state.openGeneration++;
+      if (replace) {
+        state.client = {};
+        state.documentId = "replacement";
+        state.file.name = "New.xlsx";
+      }
+      state.busy = true;
+      elements["status-message"].textContent = "Opening replacement";
+      if (outcome === "resolve")
+        pending.resolve({ bytes: new Uint8Array([1]) });
+      else pending.reject(new Error("Old client closed"));
+      await saved;
+      assert.equal(state.busy, true);
+      assert.deepEqual(calls.errors, []);
+      assert.deepEqual(calls.downloads, []);
+      assert.equal(
+        elements["status-message"].textContent,
+        "Opening replacement",
+      );
+    });
+  }
+  test(`cell-submit ${outcome} cannot affect a pending open or its new dialog`, async () => {
+    const pending = deferred();
+    const fixture = setup({
+      client: { readCell: readNumber, setCell: () => pending.promise },
+    });
+    const { controller, state, calls, elements } = fixture;
+    await controller.openCellEditor();
+    elements["cell-value"].value = "9";
+    elements["cell-form"].emit("submit");
+    state.openGeneration++;
+    controller.closeCellEditor();
+    state.busy = false;
+    await controller.openPropertiesEditor();
+    elements["property-title"].value = "Replacement draft";
+    state.busy = true;
+    if (outcome === "resolve")
+      pending.resolve({
+        workbook: fixture.workbook,
+        editState: { capability: "read-write", dirty: true },
+      });
+    else pending.reject(new Error("Old client closed"));
+    await flush();
+    assert.equal(state.busy, true);
+    assert.deepEqual(calls.errors, []);
+    assert.equal(calls.updates, 0);
+    assert.equal(elements["properties-dialog"].open, true);
+    assert.equal(elements["property-title"].value, "Replacement draft");
+  });
+}
+
+test("an open beginning during beforeCommand cancels the suspended command", async () => {
+  const gate = deferred();
+  let saves = 0;
+  const { controller, state } = setup({
+    beforeCommand: () => gate.promise,
+    client: {
+      saveDocument: async () => {
+        saves++;
+        return { bytes: new Uint8Array() };
+      },
+    },
+  });
+  const pending = controller.saveWorkbookCopy();
+  state.openGeneration++;
+  gate.resolve(true);
+  await pending;
+  assert.equal(saves, 0);
+});
+
+test("range commits share the one-mutation render, history, and warning path", async () => {
+  const fixture = setup();
+  const requests = [];
+  fixture.state.client.setRangeAndRecalculate = async (...args) => {
+    requests.push(args);
+    return {
+      workbook: fixture.workbook,
+      editState: {
+        capability: "read-write",
+        dirty: true,
+        undoDepth: 1,
+        redoDepth: 0,
+      },
+      recalculation: {
+        computedCells: 1,
+        unchangedCells: 0,
+        unsupportedCells: 1,
+      },
+    };
+  };
+  const values = [
+    [
+      { kind: "number", value: 7 },
+      { kind: "formula-auto", formula: "=A1+1" },
+    ],
+  ];
+  assert.equal(
+    await fixture.controller.commitRangeEdit(
+      {
+        client: fixture.state.client,
+        documentId: fixture.state.documentId,
+        sheetIndex: 0,
+        row: 0,
+        col: 0,
+      },
+      values,
+    ),
+    true,
+  );
+  assert.deepEqual(requests, [["document-one", 0, 0, 0, values]]);
+  assert.equal(fixture.calls.renders.length, 1);
+  assert.equal(fixture.state.pageIndex, 3);
+  assert.equal(fixture.state.editState.undoDepth, 1);
+  assert.match(
+    fixture.elements["status-message"].textContent,
+    /unsupported formula/,
+  );
+});
+
+test("stale operation cleanup cannot unlock a newer properties submission", async () => {
+  const old = deferred();
+  const current = deferred();
+  const fixture = setup({
+    client: { setDocumentProperties: () => old.promise },
+  });
+  const { controller, state, elements, calls } = fixture;
+  const buttons = [control(), control()];
+  elements["properties-form"].querySelectorAll = () => buttons;
+  await controller.openPropertiesEditor();
+  elements["properties-form"].emit("submit");
+  state.openGeneration++;
+  controller.closePropertiesEditor();
+  state.busy = false;
+  state.client = { setDocumentProperties: () => current.promise };
+  await controller.openPropertiesEditor();
+  elements["properties-form"].emit("submit");
+  old.reject(new Error("old client closed"));
+  await flush();
+  assert.equal(state.busy, true);
+  assert.ok(buttons.every((button) => button.disabled));
+  assert.deepEqual(calls.errors, []);
+  current.resolve({
+    workbook: fixture.workbook,
+    editState: { capability: "read-write", dirty: true },
+  });
+  await flush();
+  assert.equal(state.busy, false);
+  assert.ok(buttons.every((button) => !button.disabled));
+});
+
+test("a new open generation ignores read failures before document identity changes", async () => {
+  const pending = deferred();
+  const { controller, state, calls } = setup({
+    client: { readCell: () => pending.promise },
+  });
+  const opened = controller.openCellEditor();
+  state.openGeneration++;
+  pending.reject(new Error("stale read"));
+  await opened;
+  assert.deepEqual(calls.errors, []);
+});
+
+test("pending mutation reporting includes history but excludes saves and obsolete generations", async () => {
+  for (const direction of ["undo", "redo"]) {
+    const pending = deferred();
+    const fixture = setup({
+      client: { [`${direction}Edit`]: () => pending.promise },
+    });
+    const { controller, state } = fixture;
+    assert.equal(controller.hasPendingMutation(), false);
+    const editing = controller.applyHistoryEdit(direction);
+    assert.equal(controller.hasPendingMutation(), true);
+    state.openGeneration++;
+    assert.equal(controller.hasPendingMutation(), false);
+    pending.resolve({ workbook: fixture.workbook, editState: state.editState });
+    await editing;
+    assert.equal(controller.hasPendingMutation(), false);
+  }
+  const pending = deferred();
+  const { controller } = setup({
+    client: { saveDocument: () => pending.promise },
+  });
+  const saving = controller.saveWorkbookCopy();
+  assert.equal(
+    controller.hasPendingMutation(),
+    false,
+    "read-only serialization may be superseded by opening",
+  );
+  pending.resolve({ bytes: new Uint8Array([1]) });
+  await saving;
+});
+
+test("current history failures always release the authoritative mutation guard", async () => {
+  const pending = deferred();
+  const { controller, state, calls } = setup({
+    client: { undoEdit: () => pending.promise },
+  });
+  const undo = controller.applyHistoryEdit("undo");
+  assert.equal(controller.hasPendingMutation(), true);
+  pending.reject(new Error("undo rejected"));
+  await undo;
+  assert.equal(controller.hasPendingMutation(), false);
+  assert.equal(state.busy, false);
+  assert.equal(calls.errors.length, 1);
+});
 
 test("editing UI is safe before loading a workbook and stays read-only in VS Code", async () => {
   const fixture = setup({ readOnly: true });
@@ -349,6 +707,10 @@ test("shared cell commit requires the current bounded editable target", async ()
   );
   await assert.rejects(
     controller.commitCellEdit({ ...target, row: -1 }, { kind: "blank" }),
+    /grid/,
+  );
+  await assert.rejects(
+    controller.commitCellEdit({ ...target, col: Infinity }, { kind: "blank" }),
     /grid/,
   );
   state.busy = true;

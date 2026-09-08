@@ -420,7 +420,8 @@ button:disabled {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
-.formula-bar input {
+.formula-bar input,
+.formula-bar textarea {
   min-width: 0;
   height: 29px;
   border: 1px solid transparent;
@@ -434,6 +435,7 @@ button:disabled {
   text-align: center;
 }
 #inspector-value {
+  resize: none;
   flex: 1;
   font-family: "Segoe UI", sans-serif;
   text-overflow: ellipsis;
@@ -882,6 +884,36 @@ button:disabled {
 
 .edit-dialog::backdrop {
   background: rgb(20 25 22 / 48%);
+}
+
+.paste-preview-container {
+  overflow: auto;
+  min-height: 0;
+  padding: 16px;
+}
+
+.paste-preview {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.paste-preview td {
+  min-width: 70px;
+  max-width: 220px;
+  padding: 7px;
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.paste-form .dialog-actions {
+  flex-wrap: wrap;
+}
+
+.paste-form .dialog-status {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .edit-form {

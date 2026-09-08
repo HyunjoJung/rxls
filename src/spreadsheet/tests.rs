@@ -527,6 +527,197 @@ fn cell_update_batch_preserves_shared_and_array_formula_nodes_and_cell_metadata(
 }
 
 #[test]
+fn rectangular_cell_values_write_and_clear_in_one_preserving_transaction() {
+    let mut spreadsheet = Spreadsheet::open(&minimal_xlsx_with_worksheet(
+        STYLED_WORKSHEET_XML,
+        MINIMAL_CONTENT_TYPES_XML,
+    ))
+    .unwrap();
+    spreadsheet
+        .set_cell_range_values(
+            "Data",
+            0,
+            0,
+            &[
+                vec![None, Some(Cell::Number(7.0))],
+                vec![Some(Cell::Text("new".into())), Some(Cell::Bool(true))],
+            ],
+        )
+        .unwrap();
+    let saved = spreadsheet.save().unwrap();
+    let reopened = Workbook::open(&saved).unwrap();
+    assert_eq!(reopened.sheets[0].cell(0, 0), None);
+    assert_eq!(reopened.sheets[0].cell(0, 1), Some(&Cell::Number(7.0)));
+    assert_eq!(
+        reopened.sheets[0].cell(1, 0),
+        Some(&Cell::Text("new".into()))
+    );
+    let xml = String::from_utf8(
+        super::part_xml_bytes(
+            spreadsheet.package.as_ref().unwrap(),
+            "xl/worksheets/sheet1.xml",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(xml.contains("s=\"3\""));
+    assert_eq!(spreadsheet.edited_parts(), ["xl/worksheets/sheet1.xml"]);
+}
+
+#[test]
+fn rectangular_cell_values_reject_invalid_batches_without_partial_mutation() {
+    let input = minimal_xlsx_with_worksheet(MINIMAL_WORKSHEET_XML, MINIMAL_CONTENT_TYPES_XML);
+    let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+    let original = spreadsheet.save().unwrap();
+    for values in [
+        vec![],
+        vec![vec![]],
+        vec![vec![None], vec![]],
+        vec![vec![Some(Cell::Number(4.0)), Some(Cell::Number(f64::NAN))]],
+        vec![vec![
+            Some(Cell::Number(4.0)),
+            Some(Cell::Text("bad\0xml".into())),
+        ]],
+        vec![vec![None; 101]; 100],
+        vec![vec![Some(Cell::Text("x".repeat(32767))); 33]],
+    ] {
+        assert!(spreadsheet
+            .set_cell_range_values("Data", 0, 0, &values)
+            .is_err());
+        assert_rejected_edit_is_unchanged(&spreadsheet, &original);
+    }
+    assert!(spreadsheet
+        .set_cell_range_values("Data", 1_048_575, 0, &[vec![None], vec![None]])
+        .is_err());
+    assert!(spreadsheet
+        .set_cell_range_values("Data", 0, 16_383, &[vec![None, None]])
+        .is_err());
+    assert_rejected_edit_is_unchanged(&spreadsheet, &original);
+    let mut broken = Spreadsheet::open(&minimal_xlsx_with_worksheet(
+        MINIMAL_WORKSHEET_XML,
+        UNTYPED_WORKSHEET_CONTENT_TYPES_XML,
+    ))
+    .unwrap();
+    let original = broken.save().unwrap();
+    assert!(broken
+        .set_cell_range_values(
+            "Data",
+            0,
+            0,
+            &[vec![Some(Cell::Number(8.0)), Some(Cell::Bool(false))]]
+        )
+        .is_err());
+    assert_rejected_edit_is_unchanged(&broken, &original);
+}
+
+#[test]
+fn rectangular_cell_values_reject_ambiguous_targets_and_partial_formula_groups() {
+    for data in [
+        r#"<row r="2"><c r="A1"><v>1</v></c></row>"#,
+        r#"<row r="1"><c r="A1"><v>1</v></c></row><row r="1"><c r="B1"><v>2</v></c></row>"#,
+        r#"<row r="1"><c r="A1"><v>1</v></c><c r="A1"><v>2</v></c></row>"#,
+        r#"<row r="1"><c r="A1"><f t="shared" si="0" ref="A1:B1">1+1</f><v>2</v></c><c r="B1"><f t="shared" si="0"/><v>2</v></c></row>"#,
+        r#"<row r="1"><c r="A1"><f t="array" ref="A1:B1">1+1</f><v>2</v></c><c r="B1"><v>2</v></c></row>"#,
+    ] {
+        let worksheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{data}</sheetData></worksheet>"#
+        );
+        let mut spreadsheet = Spreadsheet::open(&minimal_xlsx_with_worksheet(
+            worksheet.as_bytes(),
+            MINIMAL_CONTENT_TYPES_XML,
+        ))
+        .unwrap();
+        let before = spreadsheet.save().unwrap();
+        assert!(
+            spreadsheet
+                .set_cell_range_values("Data", 0, 0, &[vec![Some(Cell::Number(9.0))]])
+                .is_err(),
+            "{data}"
+        );
+        assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+    }
+}
+
+#[test]
+fn rectangular_cell_values_match_sequential_writes_with_unsorted_siblings() {
+    for (start_row, start_col) in [(0, 0), (1, 1), (4, 4)] {
+        let worksheet = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="5"><c r="E5"><v>5</v></c><c r="A5" s="3"><v>1</v></c></row><row r="1"><c r="E1"><v>5</v></c><c r="C1"><v>3</v></c><c r="A1" s="3"><v>1</v></c></row><row r="3"><c r="C3"><v>3</v></c><c r="A3"><v>1</v></c></row></sheetData></worksheet>"#;
+        let input = minimal_xlsx_with_worksheet(worksheet, MINIMAL_CONTENT_TYPES_XML);
+        let mut batch = Spreadsheet::open(&input).unwrap();
+        let mut sequential = Spreadsheet::open(&input).unwrap();
+        let values = vec![vec![Some(Cell::Number(9.0)); 4]; 4];
+        for row in start_row..start_row + 4 {
+            for col in start_col..start_col + 4 {
+                sequential
+                    .set_cell_value("Data", row, col, Cell::Number(9.0))
+                    .unwrap();
+            }
+        }
+        batch
+            .set_cell_range_values("Data", start_row, start_col, &values)
+            .unwrap();
+        assert_eq!(batch.save().unwrap(), sequential.save().unwrap());
+    }
+}
+
+#[test]
+fn rectangular_cell_values_roll_back_a_late_tree_budget_failure() {
+    let input = minimal_xlsx_with_one_valued_cell();
+    let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+    let before = spreadsheet.save().unwrap();
+    // Enough room for the first replacement, but not a newly inserted second
+    // row. The transaction must roll back the earlier successful value write.
+    let nodes = XmlTree::parse(MINIMAL_WORKSHEET_XML).unwrap().node_count();
+    set_test_node_budget(nodes + 2);
+    let result = spreadsheet.set_cell_range_values(
+        "Data",
+        0,
+        0,
+        &[vec![Some(Cell::Number(7.0))], vec![Some(Cell::Number(8.0))]],
+    );
+    reset_test_node_budget();
+    assert!(result.is_err());
+    assert_rejected_edit_is_unchanged(&spreadsheet, &before);
+}
+
+#[test]
+fn rectangular_cell_values_preserve_all_untouched_macro_package_parts() {
+    let mut package =
+        crate::package::Package::from_bytes(&minimal_xlsx_with_one_valued_cell()).unwrap();
+    package.ensure_content_type(
+        "xl/workbook.xml",
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    );
+    package.set_part(
+        "xl/vbaProject.bin",
+        b"\0\x01synthetic macro payload\xff".to_vec(),
+        Some("application/vnd.ms-office.vbaProject"),
+    );
+    let before = package.to_bytes().unwrap();
+    let package = crate::package::Package::from_bytes(&before).unwrap();
+    let mut spreadsheet = Spreadsheet::open(&before).unwrap();
+    spreadsheet
+        .set_cell_range_values(
+            "Data",
+            0,
+            0,
+            &[
+                vec![Some(Cell::Number(7.0)), Some(Cell::Bool(true))],
+                vec![None, Some(Cell::Text("replacement".into()))],
+            ],
+        )
+        .unwrap();
+    let saved = spreadsheet.save().unwrap();
+    let after = crate::package::Package::from_bytes(&saved).unwrap();
+    for name in package
+        .part_names()
+        .filter(|name| *name != "xl/worksheets/sheet1.xml")
+    {
+        assert_eq!(after.part_bytes(name), package.part_bytes(name), "{name}");
+    }
+}
+
+#[test]
 fn defined_name_validation_rejects_invalid_or_colliding_names_without_mutation() {
     let mut workbook = Workbook::new();
     workbook.add_sheet("Data").write(0, 0, 1.0);
