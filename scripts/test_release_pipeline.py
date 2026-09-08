@@ -174,16 +174,17 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.gh.posts, [])
 
     def test_two_pass_release_uses_exact_owned_first_run(self):
-        for _ in range(7):
+        for _ in pipeline.STAGES:
             result = self.cli.advance(execute=True)
             self.assertEqual(result["action"], "dispatched", result)
             record = self.store.load()["records"][result["next_stage"]]
             self.gh.runs[record["run_id"]].update(status="completed", conclusion="success")
         release_posts = [(endpoint, body) for endpoint, body in self.gh.posts if "/release.yml/" in endpoint]
-        self.assertEqual(len(release_posts), 2)
+        self.assertEqual(len(release_posts), 3)
         baseline = self.store.load()["records"]["core-baseline"]["run_id"]
         self.assertEqual(release_posts[0][1]["inputs"], {"baseline_run_id": ""})
         self.assertEqual(release_posts[1][1]["inputs"], {"baseline_run_id": str(baseline)})
+        self.assertEqual(release_posts[2][1]["inputs"], {"baseline_run_id": "", "rehearse_publication": True})
         self.assertEqual(self.cli.advance()["action"], "verification_runs_complete")
         self.assertFalse(self.cli.status()["publication_allowed"])
 
@@ -309,6 +310,7 @@ class AdapterTests(unittest.TestCase):
         runner.run.assert_any_call([pipeline.sys.executable, "scripts/check_workflow_policy.py", "--root", str(ROOT)])
         tracked = next(call.args[0] for call in runner.run.call_args_list if "ls-files" in call.args[0])
         self.assertIn("scripts/check_workflow_policy.py", tracked)
+        self.assertIn("scripts/core_release_handoff.py", tracked)
 
     def test_timeout_kills_group_even_after_leader_exits_with_open_pipes(self):
         if pipeline.os.name != "posix":

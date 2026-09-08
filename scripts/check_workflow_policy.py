@@ -27,6 +27,9 @@ SEMVER_CHECKS_VERSION = "0.49.0"
 SEMVER_BASELINE_VERSION = "0.1.2"
 SEMVER_RELEASE_TYPE = "patch"
 CORE_RELEASE_TAG_PATTERN = "v[0-9]*.[0-9]*.[0-9]*"
+# The shared handoff executes in both read-only and privileged jobs. Changes to
+# its commands, budgets, or authentication require an explicit policy review.
+CORE_HANDOFF_HELPER_SHA256 = "2748295a2f32b22f674d39a69b25e26eef88f4154122748e11681f52cc8c689b"
 SEMVER_FEATURE_MODES = (
     "--all-features",
     "--default-features",
@@ -2025,13 +2028,15 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
     active = _without_commented_lines(text)
     errors: list[str] = []
     jobs = _single_yaml_block(path, active, "jobs:", 0, "core release jobs", errors)
-    if _yaml_mapping_entries_at_indent(jobs, 2) != [("verify", ""), ("publish", "")]:
+    if _yaml_mapping_entries_at_indent(jobs, 2) != [("verify", ""), ("rehearse", ""), ("publish", "")]:
         errors.append(f"{path}: core release must separate verify and publish jobs")
     verify_job = _single_yaml_block(path, jobs, "verify:", 2, "read-only verification job", errors)
     publish_job = _single_yaml_block(path, jobs, "publish:", 2, "privileged publication job", errors)
+    rehearse_job = _single_yaml_block(path, jobs, "rehearse:", 2, "read-only rehearsal job", errors)
     for block, indent, expected, label in (
         (active, 0, [("actions", "read"), ("contents", "read")], "workflow"),
         (verify_job, 4, [("actions", "read"), ("contents", "read")], "verification"),
+        (rehearse_job, 4, [("actions", "read"), ("contents", "read")], "rehearsal"),
         (publish_job, 4, [("actions", "read"), ("contents", "write")], "publication"),
     ):
         permissions = _single_yaml_block(path, block, "permissions:", indent, f"{label} permissions", errors)
@@ -2065,6 +2070,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
     outputs = _single_yaml_block(path, verify_job, "outputs:", 4, "verification outputs", errors)
     if _yaml_mapping_entries_at_indent(outputs, 6) != [
         ("version", "${{ steps.release.outputs.version }}"),
+        ("rehearse", "${{ steps.release.outputs.rehearse }}"),
         ("source_attempt", "${{ steps.release.outputs.source_attempt }}"),
         ("artifact_id", "${{ steps.publication_bundle.outputs.artifact-id }}"),
         ("artifact_digest", "${{ steps.publication_bundle.outputs.artifact-digest }}"),
@@ -2289,9 +2295,9 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: expected exactly one dependency-free crates.io dry-run runner"
         )
-    if len(verify_pattern.findall(active)) != 8:
+    if len(verify_pattern.findall(active)) != 7:
         errors.append(
-            f"{path}: expected eight exact crates.io dry-run evidence verifications"
+            f"{path}: expected seven in-workflow dry-run verifications plus the shared handoff helper"
         )
     if "cargo publish --dry-run" in active:
         errors.append(
@@ -2316,7 +2322,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: release identity step must bind the tag to exact origin/main"
         )
-    if active.count(exact_main) != 3:
+    if active.count(exact_main) != 4:
         errors.append(
             f"{path}: exact origin/main must be checked at tag validation and again "
             "at the publication handoff and immediately before crates.io publication"
@@ -2463,11 +2469,6 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
             "final publication assembly",
         ),
         (
-            "- name: Verify publication handoff and package bytes",
-            ["dist/release-cargo-publish-dry-run.json"],
-            "publication handoff",
-        ),
-        (
             "- name: Verify published crate, WASM, docs, assets, and checksums",
             ['"$smoke/assets/release-cargo-publish-dry-run.json"'],
             "post-download release verification",
@@ -2562,7 +2563,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: candidate bundle must be verified twice at exactly 48 files"
         )
-    if active.count("--expected-files 52") != 4:
+    if active.count("--expected-files 52") != 3:
         errors.append(
             f"{path}: public bundle must be assembled, transferred, published, and downloaded "
             "at exactly 52 files"
@@ -2691,6 +2692,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
             f"{path}: wildcard GitHub Release upload must not bypass exact inventory"
         )
     errors.extend(_audit_core_publication_handoff(path, verify_job, publish_job))
+    errors.extend(_audit_core_rehearsal(path, active, verify_job, rehearse_job))
     return errors
 
 
@@ -2723,77 +2725,157 @@ def _audit_core_publication_handoff(path: Path, verify_job: str, publish_job: st
             errors.append(f"{path}: publication identity must retain {required!r}")
     upload = _single_yaml_block(path, verify_job, "- name: Upload verified publication bundle", 6, "publication bundle upload", errors)
     for required in (
-        "id: publication_bundle", "if: github.event_name == 'push'",
+        "id: publication_bundle", "if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'",
         "name: rxls-${{ steps.release.outputs.version }}-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
         "path: dist/*", "if-no-files-found: error",
     ):
         if upload.count(required) != 1:
             errors.append(f"{path}: publication bundle upload must retain {required!r}")
-    download = _single_yaml_block(path, publish_job, "- name: Download exact verified publication bundle", 6, "publication bundle download", errors)
+    errors.extend(_audit_core_handoff_steps(
+        path, publish_job, "Authenticate verified publication artifact",
+        "Download exact verified publication bundle", "Verify publication handoff and package bytes",
+    ))
+    handoff_at = publish_job.find("- name: Verify publication handoff and package bytes")
+    if not 0 <= handoff_at < publish_job.find("- name: Publish to crates.io"):
+        errors.append(f"{path}: handoff must precede registry publication")
+    for block in (verify_job, publish_job):
+        if "rxls-0.1.3" in block or "--registry-version 0.1.3" in block:
+            errors.append(f"{path}: release paths must use validated versions")
+    if '"$smoke/assets/wasm-native-report.json"' not in publish_job:
+        errors.append(f"{path}: installed browser smoke must use the verified native report")
+    if "set -euo pipefail" not in identity or re.search(r"^ {8}if:", identity, re.MULTILINE):
+        errors.append(f"{path}: publication identity must run unconditionally and fail closed")
+    return errors
+
+
+def _audit_core_handoff_steps(path: Path, job: str, auth_name: str, download_name: str, verify_name: str) -> list[str]:
+    """Require identical artifact authentication and package checks in both jobs."""
+    errors: list[str] = []
+    env = _single_yaml_block(path, job, "env:", 4, "handoff environment", errors)
+    expected_env = [
+        ("ARTIFACT_ID", "${{ needs.verify.outputs.artifact_id }}"),
+        ("ARTIFACT_DIGEST", "${{ needs.verify.outputs.artifact_digest }}"),
+        ("SOURCE_ATTEMPT", "${{ needs.verify.outputs.source_attempt }}"),
+        ("VERIFIED_VERSION", "${{ needs.verify.outputs.version }}"),
+    ]
+    if _yaml_mapping_entries_at_indent(env, 6) != expected_env:
+        errors.append(f"{path}: handoff must use only the producing job's exact identity outputs")
+    auth = _single_yaml_block(path, job, f"- name: {auth_name}", 6, "artifact authentication", errors)
+    expected_auth = [
+        "set -euo pipefail",
+        '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]',
+        "mkdir -p target/publication",
+        'gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" \\',
+        "  > target/publication/artifact.json",
+        "python3 scripts/core_release_handoff.py authenticate",
+    ]
+    scripts = _workflow_run_scripts("    steps:\n" + auth)
+    if len(scripts) != 1 or scripts[0].strip() != "\n".join(expected_auth):
+        errors.append(f"{path}: artifact authentication must use the exact shared helper")
+    if "GH_TOKEN: ${{ github.token }}" not in auth:
+        errors.append(f"{path}: artifact reads must use the scoped workflow token")
+    download = _single_yaml_block(path, job, f"- name: {download_name}", 6, "exact artifact transfer", errors)
     expected_download = [
         ("artifact-ids", "${{ needs.verify.outputs.artifact_id }}"),
         ("path", "dist"), ("merge-multiple", "true"), ("digest-mismatch", "error"),
     ]
     if _yaml_mapping_entries_at_indent(download, 10) != expected_download:
-        errors.append(f"{path}: publication download must use exact immutable ID and fail on digest mismatch")
-    metadata = _single_yaml_block(path, publish_job, "- name: Authenticate verified publication artifact", 6, "publication artifact authentication", errors)
-    for required in (
-        "GH_TOKEN: ${{ github.token }}",
-        "ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}",
-        "ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}",
-        "SOURCE_ATTEMPT: ${{ needs.verify.outputs.source_attempt }}",
-        "VERIFIED_VERSION: ${{ needs.verify.outputs.version }}",
-        '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]',
-        'gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID"',
-        'expected_digest = os.environ["ARTIFACT_DIGEST"].removeprefix("sha256:")',
-        'if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):',
-        'if not re.fullmatch(r"[1-9][0-9]*", attempt) or int(attempt) > int(os.environ["GITHUB_RUN_ATTEMPT"]):',
-        'f"rxls-{os.environ[\'VERIFIED_VERSION\']}-publication-"',
-        'f"{os.environ[\'GITHUB_SHA\']}-{os.environ[\'GITHUB_RUN_ID\']}-{attempt}"',
-        '"id": int(os.environ["ARTIFACT_ID"]),',
-        '"name": expected_name,', '"digest": f"sha256:{expected_digest}",',
-        '"expired": False,',
-        'if any(type(artifact.get(key)) is not type(value) or artifact[key] != value for key, value in expected.items()):',
-        '"id": int(os.environ["GITHUB_RUN_ID"]),',
-        '"head_sha": os.environ["GITHUB_SHA"],',
-        '"repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),',
-        '"head_repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),',
-        'if not isinstance(run, dict) or any(type(run.get(key)) is not type(value) or run[key] != value for key, value in expected_run.items()):',
-    ):
-        if metadata.count(required) != 1:
-            errors.append(f"{path}: publication artifact authentication must retain {required!r}")
-    handoff = _single_yaml_block(path, publish_job, "- name: Verify publication handoff and package bytes", 6, "publication package handoff", errors)
-    for required in (
-        "python3 scripts/check_workflow_policy.py", "python3 scripts/check_release_identity.py",
-        "--verify-bundle dist", "--expected-files 52",
-        'python3 scripts/check_core_package.py "dist/rxls-${version}.crate"',
-        "cargo package --locked",
-        'cmp "target/package/rxls-${version}.crate" "dist/rxls-${version}.crate"',
-    ):
-        if handoff.count(required) != 1:
-            errors.append(f"{path}: publication package handoff must retain {required!r}")
-    if not (0 <= handoff.find("cargo package --locked") < handoff.find('cmp "target/package/')):
-        errors.append(f"{path}: publication must compare the newly packed crate bytes")
-    ordered_headers = (
-        "- name: Authenticate verified publication artifact",
-        "- name: Download exact verified publication bundle",
-        "- name: Verify publication handoff and package bytes",
-        "- name: Publish to crates.io",
-    )
-    positions = [publish_job.find(header) for header in ordered_headers]
+        errors.append(f"{path}: transfer must use the exact artifact ID and enforce its digest")
+    verifier = _single_yaml_block(path, job, f"- name: {verify_name}", 6, "shared package verification", errors)
+    if _yaml_mapping_entries_at_indent(verifier, 8) != [("run", "python3 scripts/core_release_handoff.py verify")]:
+        errors.append(f"{path}: package transfer must use the unconditional shared verification helper")
+    positions = [job.find(f"- name: {name}") for name in (auth_name, download_name, verify_name)]
     if not all(left >= 0 and left < right for left, right in zip(positions, positions[1:])):
-        errors.append(f"{path}: publication must authenticate, download, and verify before publishing")
-    for block in (identity, metadata, handoff):
-        if "set -euo pipefail" not in block or re.search(r"^ {8}if:", block, re.MULTILINE):
-            errors.append(f"{path}: critical publication gates must run unconditionally and fail closed")
-    if re.search(r"^ {8}if:", download, re.MULTILINE):
-        errors.append(f"{path}: publication download must not be conditionally skipped")
-    for block in (verify_job, publish_job):
-        if "rxls-0.1.3" in block or "--registry-version 0.1.3" in block:
-            errors.append(f"{path}: release package names and registry smokes must use validated version")
-    if '"$smoke/assets/wasm-native-report.json"' not in publish_job:
-        errors.append(f"{path}: installed browser smoke must use the verified native report")
+        errors.append(f"{path}: handoff must authenticate, transfer, then verify")
+    for block in (auth, download, verifier):
+        if any(key in {"if", "continue-on-error"} for key, _ in _yaml_mapping_entries_at_indent(block, 8)):
+            errors.append(f"{path}: handoff checks must not be skipped or bypassed")
     return errors
+
+
+def _audit_core_rehearsal(path: Path, active: str, verify_job: str, rehearsal: str) -> list[str]:
+    """Keep manual rehearsal read-only and behind the real release evidence."""
+    errors: list[str] = []
+    expected_guard = (
+        "github.repository == 'HyunjoJung/rxls' && github.event_name == 'workflow_dispatch' "
+        "&& github.ref == 'refs/heads/main' && needs.verify.outputs.rehearse == 'true'"
+    )
+    fields = dict(_yaml_mapping_entries_at_indent(rehearsal, 4))
+    for key, expected in (("needs", "verify"), ("if", expected_guard), ("timeout-minutes", "30")):
+        if fields.get(key) != expected:
+            errors.append(f"{path}: rehearsal must retain exact {key} guard")
+    if any(token in rehearsal for token in ("secrets.", "environment:", "cargo publish", "gh release", "contents: write")):
+        errors.append(f"{path}: rehearsal must have no publication authority")
+    input_block = _single_yaml_block(path, active, "rehearse_publication:", 6, "typed rehearsal input", errors)
+    if dict(_yaml_mapping_entries_at_indent(input_block, 8)) != {
+        "description": '"Rehearse the exact verified publication handoff without publishing"',
+        "required": "false", "default": "false", "type": "boolean",
+    }:
+        errors.append(f"{path}: rehearsal input must be an explicit default-false boolean")
+    identity = _single_yaml_block(path, verify_job, "- name: Validate release identity", 6, "early release identity", errors)
+    for required in (
+        "REQUEST_REHEARSAL: ${{ github.event_name == 'workflow_dispatch' && toJSON(inputs.rehearse_publication) || 'false' }}",
+        "BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}",
+        'case "$REQUEST_REHEARSAL" in', 'true|false) ;;',
+        '*) echo "rehearsal input must be a boolean" >&2; exit 1 ;;',
+        'if [[ "$REQUEST_REHEARSAL" == "true" ]]; then',
+        'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"',
+        'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"',
+        'test "$GITHUB_REF" = "refs/heads/main"',
+        'test -z "$BASELINE_RUN_ID" || {',
+        'echo "rehearse=$REQUEST_REHEARSAL" >> "$GITHUB_OUTPUT"',
+    ):
+        if identity.count(required) != 1:
+            errors.append(f"{path}: early rehearsal identity must retain {required!r}")
+    gate_names = (
+        "Require successful exact-SHA CI and CodeQL runs",
+        "Require exact-SHA two-candidate publication attestation",
+        "Bind publication provenance into release manifest",
+        "Upload verified publication bundle",
+    )
+    for name in gate_names:
+        block = _single_yaml_block(path, verify_job, f"- name: {name}", 6, name, errors)
+        conditions = [value for key, value in _yaml_mapping_entries_at_indent(block, 8) if key == "if"]
+        if conditions != ["github.event_name == 'push' || steps.release.outputs.rehearse == 'true'"]:
+            errors.append(f"{path}: rehearsal must retain the actual {name} gate")
+    checkout = _single_yaml_block(path, rehearsal, f"- uses: {ORACLE_CHECKOUT_ACTION} # v7.0.1", 6, "rehearsal checkout", errors)
+    for required in ("ref: ${{ github.sha }}", "fetch-depth: 0", "persist-credentials: false"):
+        if checkout.count(required) != 1:
+            errors.append(f"{path}: rehearsal checkout must retain {required}")
+    identity = _single_yaml_block(path, rehearsal, "- name: Validate rehearsal identity", 6, "rehearsal source identity", errors)
+    expected_identity = [
+        "set -euo pipefail", 'test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"',
+        'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"',
+        'test "$GITHUB_REF" = "refs/heads/main"',
+        'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        "git fetch origin main --no-tags",
+        'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"',
+    ]
+    scripts = _workflow_run_scripts("    steps:\n" + identity)
+    if len(scripts) != 1 or scripts[0].strip() != "\n".join(expected_identity):
+        errors.append(f"{path}: rehearsal must recheck exact canonical main before artifacts")
+    if any(key in {"if", "continue-on-error"} for key, _ in _yaml_mapping_entries_at_indent(identity, 8)):
+        errors.append(f"{path}: rehearsal source identity must not be skipped")
+    headers = re.findall(r"^ {6}(- (?:name|uses|run):[^\r\n]+)$", rehearsal, re.MULTILINE)
+    if len(headers) < 2 or headers[1] != "- name: Validate rehearsal identity":
+        errors.append(f"{path}: rehearsal identity must immediately follow checkout")
+    errors.extend(_audit_core_handoff_steps(
+        path, rehearsal, "Authenticate rehearsal artifact",
+        "Download exact rehearsal bundle", "Rehearse publication handoff and package bytes",
+    ))
+    receipt = _single_yaml_block(path, rehearsal, "- name: Upload successful rehearsal receipt", 6, "rehearsal receipt", errors)
+    if "if-no-files-found: error" not in receipt or "path: target/publication/handoff.json" not in receipt:
+        errors.append(f"{path}: successful rehearsal must retain its exact handoff receipt")
+    if any(key in {"if", "continue-on-error"} for key, _ in _yaml_mapping_entries_at_indent(receipt, 8)):
+        errors.append(f"{path}: rehearsal receipt must be uploaded only after successful verification")
+    return errors
+
+
+def audit_core_handoff_helper(path: Path, text: str) -> list[str]:
+    """Keep both receiving jobs on the reviewed bounded, non-publishing helper."""
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != CORE_HANDOFF_HELPER_SHA256:
+        return [f"{path}: shared release handoff differs from its reviewed implementation"]
+    return []
 
 
 def audit_github_release_reconciler(path: Path, text: str) -> list[str]:
@@ -6649,6 +6731,13 @@ def audit_repository(root: Path) -> list[str]:
         errors.extend(
             audit_core_release_evidence(release.relative_to(root), release_text)
         )
+    handoff_helper = root / "scripts" / "core_release_handoff.py"
+    if not handoff_helper.is_file():
+        errors.append(f"{handoff_helper.relative_to(root)}: missing shared release handoff verifier")
+    else:
+        errors.extend(audit_core_handoff_helper(
+            handoff_helper.relative_to(root), handoff_helper.read_text(encoding="utf-8")
+        ))
     github_release_reconciler = root / "scripts" / "reconcile_github_release.py"
     if not github_release_reconciler.is_file():
         errors.append(

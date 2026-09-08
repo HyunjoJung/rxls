@@ -10,6 +10,11 @@ on:
         description: "Prior clean verification run ID to compare against"
         required: false
         type: string
+      rehearse_publication:
+        description: "Rehearse the exact verified publication handoff without publishing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -41,6 +46,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.release.outputs.version }}
+      rehearse: ${{ steps.release.outputs.rehearse }}
       source_attempt: ${{ steps.release.outputs.source_attempt }}
       artifact_id: ${{ steps.publication_bundle.outputs.artifact-id }}
       artifact_digest: ${{ steps.publication_bundle.outputs.artifact-digest }}
@@ -51,9 +57,25 @@ jobs:
           persist-credentials: false
       - name: Validate release identity
         id: release
+        env:
+          REQUEST_REHEARSAL: ${{ github.event_name == 'workflow_dispatch' && toJSON(inputs.rehearse_publication) || 'false' }}
+          BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}
         shell: bash
         run: |
           set -euo pipefail
+          case "$REQUEST_REHEARSAL" in
+            true|false) ;;
+            *) echo "rehearsal input must be a boolean" >&2; exit 1 ;;
+          esac
+          if [[ "$REQUEST_REHEARSAL" == "true" ]]; then
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+            test "$GITHUB_REF" = "refs/heads/main"
+            test -z "$BASELINE_RUN_ID" || {
+              echo "rehearsal and baseline comparison are mutually exclusive" >&2
+              exit 1
+            }
+          fi
           version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
             echo "Cargo.toml contains an invalid release version" >&2
@@ -81,6 +103,7 @@ jobs:
             echo "workflow_dispatch is verification-only; no publish will run"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "rehearse=$REQUEST_REHEARSAL" >> "$GITHUB_OUTPUT"
           echo "source_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
@@ -594,7 +617,7 @@ jobs:
           if-no-files-found: error
 
       - name: Require successful exact-SHA CI and CodeQL runs
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -633,7 +656,7 @@ jobs:
           require_successful_push codeql.yml .github/workflows/codeql.yml CodeQL
 
       - name: Require exact-SHA two-candidate publication attestation
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -829,10 +852,10 @@ jobs:
           python3 scripts/compare_release_bundles.py \
             target/attested-candidate-release dist \
             --output target/publication-attestation/rxls-tag-release-comparison.json
-          echo "publication authorized by candidate runs $selected_baseline and $selected_run; tag bundle matches the attested candidate"
+          echo "candidate runs $selected_baseline and $selected_run verified; current bundle matches the attested candidate"
 
       - name: Bind publication provenance into release manifest
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -869,11 +892,75 @@ jobs:
 
       - name: Upload verified publication bundle
         id: publication_bundle
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rxls-${{ steps.release.outputs.version }}-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  rehearse:
+    name: Rehearse publication handoff (read-only)
+    needs: verify
+    if: github.repository == 'HyunjoJung/rxls' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.verify.outputs.rehearse == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    env:
+      ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+      SOURCE_ATTEMPT: ${{ needs.verify.outputs.source_attempt }}
+      VERIFIED_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate rehearsal identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "HyunjoJung/rxls"
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: ${{ env.RELEASE_RUST_VERSION }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Authenticate rehearsal artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          mkdir -p target/publication
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" \
+            > target/publication/artifact.json
+          python3 scripts/core_release_handoff.py authenticate
+      - name: Download exact rehearsal bundle
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          path: dist
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Rehearse publication handoff and package bytes
+        run: python3 scripts/core_release_handoff.py verify
+      - name: Upload successful rehearsal receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-handoff-rehearsal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/publication/handoff.json
           if-no-files-found: error
           retention-days: 30
 
@@ -887,6 +974,11 @@ jobs:
     permissions:
       actions: read
       contents: write
+    env:
+      ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+      SOURCE_ATTEMPT: ${{ needs.verify.outputs.source_attempt }}
+      VERIFIED_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -925,10 +1017,6 @@ jobs:
       - name: Authenticate verified publication artifact
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
-          ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
-          SOURCE_ATTEMPT: ${{ needs.verify.outputs.source_attempt }}
-          VERIFIED_VERSION: ${{ needs.verify.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -936,43 +1024,7 @@ jobs:
           mkdir -p target/publication
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" \
             > target/publication/artifact.json
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          artifact = json.loads(Path("target/publication/artifact.json").read_text())
-          expected_digest = os.environ["ARTIFACT_DIGEST"].removeprefix("sha256:")
-          attempt = os.environ["SOURCE_ATTEMPT"]
-          if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
-              raise SystemExit("invalid verified artifact digest")
-          if not re.fullmatch(r"[1-9][0-9]*", attempt) or int(attempt) > int(os.environ["GITHUB_RUN_ATTEMPT"]):
-              raise SystemExit("invalid verified source attempt")
-          expected_name = (
-              f"rxls-{os.environ['VERIFIED_VERSION']}-publication-"
-              f"{os.environ['GITHUB_SHA']}-{os.environ['GITHUB_RUN_ID']}-{attempt}"
-          )
-          if not isinstance(artifact, dict):
-              raise SystemExit("invalid publication artifact metadata")
-          expected = {
-              "id": int(os.environ["ARTIFACT_ID"]),
-              "name": expected_name,
-              "digest": f"sha256:{expected_digest}",
-              "expired": False,
-          }
-          if any(type(artifact.get(key)) is not type(value) or artifact[key] != value for key, value in expected.items()):
-              raise SystemExit("publication artifact identity differs from verified output")
-          run = artifact.get("workflow_run")
-          expected_run = {
-              "id": int(os.environ["GITHUB_RUN_ID"]),
-              "head_sha": os.environ["GITHUB_SHA"],
-              "repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),
-              "head_repository_id": int(os.environ["GITHUB_REPOSITORY_ID"]),
-          }
-          if not isinstance(run, dict) or any(type(run.get(key)) is not type(value) or run[key] != value for key, value in expected_run.items()):
-              raise SystemExit("publication artifact source differs from this verified run")
-          PY
+          python3 scripts/core_release_handoff.py authenticate
       - name: Download exact verified publication bundle
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
@@ -981,26 +1033,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
       - name: Verify publication handoff and package bytes
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          python3 scripts/check_workflow_policy.py
-          python3 scripts/check_release_identity.py
-          python3 scripts/check_cargo_publish_dry_run.py verify \
-            --manifest Cargo.toml \
-            --git-sha "$GITHUB_SHA" \
-            --receipt dist/release-cargo-publish-dry-run.json
-          python3 scripts/release_manifest.py \
-            --verify-bundle dist \
-            --expected-files 52 \
-            --version "$version" \
-            --git-rev "$GITHUB_SHA"
-          python3 scripts/check_core_package.py "dist/rxls-${version}.crate"
-          # Cargo has no stable publish-existing-archive command. Repacking the
-          # exact clean source must reproduce the verified archive byte for byte.
-          cargo package --locked
-          cmp "target/package/rxls-${version}.crate" "dist/rxls-${version}.crate"
+        run: python3 scripts/core_release_handoff.py verify
       - name: Install published WASM browser smoke runtime
         shell: bash
         run: |
