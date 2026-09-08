@@ -33,6 +33,7 @@ function element() {
   const classes = new Set();
   const attrs = new Map();
   let value = "";
+  let disabled = false;
   return {
     get value() {
       return value;
@@ -41,7 +42,14 @@ function element() {
       value = String(next).replace(/\r\n?/g, "\n");
     },
     hidden: true,
-    disabled: false,
+    get disabled() {
+      return disabled;
+    },
+    set disabled(next) {
+      disabled = Boolean(next);
+      if (disabled && this.ownerDocument?.activeElement === this)
+        this.ownerDocument.activeElement = this.ownerDocument.body;
+    },
     style: {},
     dataset: {},
     parentElement: null,
@@ -80,7 +88,9 @@ function element() {
     },
     getAttribute: (name) => attrs.get(name),
     focus() {
+      if (this.disabled) return;
       this.focused = true;
+      if (this.ownerDocument) this.ownerDocument.activeElement = this;
     },
     setSelectionRange(start, end) {
       this.selectionStart = start;
@@ -89,8 +99,9 @@ function element() {
     getBoundingClientRect: () => ({ left: 100, top: 50 }),
   };
 }
-function setup({ readOnly = false, readCell, commitCellEdit } = {}) {
-  const calls = { reads: [], commits: [], selections: [], errors: [] };
+function setup({ readOnly = false, readCell, commitCellEdit, focusOutsideGrid } = {}) {
+  const calls = { reads: [], commits: [], selections: [], errors: [], exits: [] };
+  const exitTargets = { previous: element(), next: element() };
   const elements = Object.fromEntries(
     [
       "document-surface",
@@ -138,6 +149,12 @@ function setup({ readOnly = false, readCell, commitCellEdit } = {}) {
       },
     },
     onSelection: (value) => calls.selections.push(value),
+    focusOutsideGrid: (direction) => {
+      calls.exits.push(direction);
+      if (focusOutsideGrid) return focusOutsideGrid(direction);
+      exitTargets[direction].focus();
+      return true;
+    },
     showError: (error) => calls.errors.push(error),
   });
   grid.mount(interaction, svg);
@@ -147,6 +164,7 @@ function setup({ readOnly = false, readCell, commitCellEdit } = {}) {
     calls,
     elements,
     svg,
+    exitTargets,
     input: elements["grid-input"],
     outline: elements["grid-selection"],
     layer: elements["grid-layer"],
@@ -389,7 +407,7 @@ test("focused navigation reveals the cell while inspector synchronization never 
 });
 
 test("keyboard navigation skips hidden/covered cells and stays bounded to rendered anchors", async () => {
-  const { input, outline } = setup();
+  const { input, outline, calls } = setup();
   await input.fire("keydown", { key: "ArrowRight" });
   assert.equal(outline.dataset.reference, "C1");
   await input.fire("keydown", { key: "Tab" });
@@ -400,6 +418,178 @@ test("keyboard navigation skips hidden/covered cells and stays bounded to render
   assert.equal(outline.dataset.reference, "A1");
   await input.fire("keydown", { key: "ArrowLeft" });
   assert.equal(outline.dataset.reference, "A1");
+  assert.deepEqual(calls.exits, []);
+});
+
+test("Tab and Shift+Tab focus real outside targets at the last and first cell", async () => {
+  for (const [direction, row, col, shiftKey] of [
+    ["next", 2, 2, false],
+    ["previous", 0, 0, true],
+  ]) {
+    const { grid, input, calls, exitTargets } = setup();
+    await grid.select(row, col);
+    const event = await input.fire("keydown", { key: "Tab", shiftKey });
+    assert.equal(event.prevented, true);
+    assert.equal(event.stopped, true);
+    assert.deepEqual(calls.exits, [direction]);
+    assert.equal(exitTargets[direction].focused, true);
+    assert.deepEqual(calls.commits, []);
+    assert.equal(grid.hasDraft(), false);
+  }
+});
+
+test("edge Tab waits for its own async commit and remount before moving focus", async () => {
+  for (const [direction, row, col, shiftKey] of [
+    ["next", 2, 2, false],
+    ["previous", 0, 0, true],
+  ]) {
+    const pending = deferred();
+    const fixture = setup({
+      commitCellEdit: () => {
+        fixture.grid.mount(interaction, fixture.svg);
+        return pending.promise;
+      },
+    });
+    await fixture.grid.select(row, col);
+    await fixture.grid.beginEdit("77");
+    const event = await fixture.input.fire("keydown", { key: "Tab", shiftKey });
+    assert.equal(event.prevented, true, "default is cancelled before the async write");
+    assert.deepEqual(fixture.calls.exits, []);
+    assert.equal(fixture.grid.hasDraft(), true);
+    pending.resolve(true);
+    await flush();
+    assert.deepEqual(fixture.calls.exits, [direction]);
+    assert.equal(fixture.exitTargets[direction].focused, true);
+    assert.equal(fixture.grid.hasDraft(), false);
+    assert.equal(fixture.calls.commits.length, 1);
+  }
+});
+
+test("edge Tab preserves failed or stale drafts without moving focus", async () => {
+  for (const outcome of ["failed", "rejected", "stale"]) {
+    const pending = deferred();
+    const { grid, state, input, calls } = setup({
+      commitCellEdit: () => pending.promise,
+    });
+    await grid.select(2, 2);
+    await grid.beginEdit("77");
+    await input.fire("keydown", { key: "Tab" });
+    if (outcome === "failed") pending.reject(new Error("Save failed"));
+    else if (outcome === "rejected") pending.resolve(false);
+    else {
+      state.documentId = "another workbook";
+      pending.resolve(true);
+    }
+    await flush();
+    assert.deepEqual(calls.exits, [], outcome);
+    assert.equal(grid.hasDraft(), true, outcome);
+    assert.equal(input.value, "77", outcome);
+  }
+});
+
+test("failed keyboard commits restore the retained draft after disabling blurs the input", async () => {
+  for (const key of ["Tab", "Enter"]) {
+    for (const outcome of ["failed", "rejected"]) {
+      const pending = deferred();
+      const { grid, input, calls } = setup({ commitCellEdit: () => pending.promise });
+      const document = { activeElement: null, body: element() };
+      input.ownerDocument = document;
+      await grid.select(2, 2);
+      await grid.beginEdit("=UNKNOWNFUNCTION()");
+      assert.equal(document.activeElement, input);
+      await input.fire("keydown", { key });
+      assert.equal(input.disabled, true);
+      assert.equal(document.activeElement, document.body);
+      if (outcome === "failed") pending.reject(new Error("Unsupported formula"));
+      else pending.resolve(false);
+      await flush();
+      assert.equal(input.disabled, false);
+      assert.equal(document.activeElement, input, `${key}: ${outcome}`);
+      assert.equal(input.value, "=UNKNOWNFUNCTION()");
+      assert.equal(grid.hasDraft(), true);
+      assert.deepEqual(calls.exits, []);
+    }
+  }
+});
+
+test("failed commits never steal focus after a user focus move or workbook change", async () => {
+  for (const outcome of ["other-control", "stale", "toolbar"]) {
+    const pending = deferred();
+    const { grid, state, input } = setup({ commitCellEdit: () => pending.promise });
+    const document = { activeElement: null, body: element() };
+    input.ownerDocument = document;
+    await grid.select(2, 2);
+    await grid.beginEdit("77");
+    const otherControl = element();
+    if (outcome === "toolbar") document.activeElement = otherControl;
+    const committing = grid.commit();
+    if (outcome === "other-control") document.activeElement = otherControl;
+    if (outcome === "stale") state.documentId = "another workbook";
+    pending.resolve(false);
+    assert.equal(await committing, false);
+    assert.equal(document.activeElement, outcome === "stale" ? document.body : otherControl);
+    assert.equal(grid.hasDraft(), true);
+    assert.equal(input.value, "77");
+  }
+});
+
+test("edge Tab can exit when its committed blank removes the last rendered cell", async () => {
+  const fixture = setup({
+    commitCellEdit: async () => {
+      fixture.grid.mount({ ...interaction, cells: interaction.cells.slice(0, 1) }, fixture.svg);
+      return true;
+    },
+  });
+  await fixture.grid.select(2, 2);
+  await fixture.grid.beginEdit("");
+  await fixture.input.fire("keydown", { key: "Tab" });
+  assert.equal(fixture.grid.hasDraft(), false);
+  assert.deepEqual(fixture.calls.commits[0][1], { kind: "blank" });
+  assert.deepEqual(fixture.calls.exits, ["next"]);
+  assert.equal(fixture.exitTargets.next.focused, true);
+});
+
+test("edge Tab preserves selection when no outside target can accept focus", async () => {
+  const { grid, input, outline, calls, exitTargets } = setup({
+    focusOutsideGrid: () => false,
+  });
+  await grid.select(2, 2);
+  await input.fire("keydown", { key: "Tab" });
+  assert.deepEqual(calls.exits, ["next"]);
+  assert.equal(exitTargets.next.focused, undefined);
+  assert.equal(outline.dataset.reference, "C3");
+  assert.equal(grid.hasDraft(), false);
+  assert.deepEqual(calls.commits, []);
+});
+
+test("a successful edge commit does not steal focus from another control", async () => {
+  const pending = deferred();
+  const { grid, input, calls } = setup({ commitCellEdit: () => pending.promise });
+  const document = { activeElement: input, body: element() };
+  input.ownerDocument = document;
+  await grid.select(2, 2);
+  await grid.beginEdit("77");
+  await input.fire("keydown", { key: "Tab" });
+  const otherControl = element();
+  document.activeElement = otherControl;
+  pending.resolve(true);
+  await flush();
+  assert.equal(grid.hasDraft(), false);
+  assert.deepEqual(calls.exits, []);
+  assert.equal(document.activeElement, otherControl);
+});
+
+test("edge Tab leaves IME composition to the native input without committing", async () => {
+  const { grid, input, calls } = setup();
+  await grid.select(2, 2);
+  await input.fire("compositionstart");
+  input.value = "한글";
+  await input.fire("input");
+  const event = await input.fire("keydown", { key: "Tab", isComposing: true });
+  assert.equal(event.prevented, false);
+  assert.deepEqual(calls.exits, []);
+  assert.deepEqual(calls.commits, []);
+  assert.equal(grid.hasDraft(), true);
 });
 
 test("F2/Enter edit the selected source value; Escape and blur never write", async () => {

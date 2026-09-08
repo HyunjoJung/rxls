@@ -27,6 +27,12 @@ export function createEditingController({
   const cellReads = createLatestRequestGate();
   let mutationPending = false;
   let recalculationWarning = "";
+  let warningContext = null;
+  let warningSummary = null;
+  const warningUndo = [];
+  const warningRedo = [];
+  // Match the worker's bounded edit history; retain counts, never workbook text.
+  const maxWarningHistory = 20;
   const editing = {
     cellReadTarget: null,
     cellReadPending: false,
@@ -98,6 +104,7 @@ export function createEditingController({
   }
 
   function updateEditUi() {
+    syncWarningContext();
     const editState = state.editState;
     const editable = editState?.capability === "read-write";
     const hostReadOnly = Boolean(state.workbook && readOnly);
@@ -403,24 +410,32 @@ export function createEditingController({
     if (!canEditWorkbook()) {
       return;
     }
+    const target = currentTarget();
+    mutationPending = true;
     try {
       setFormPending(elements["properties-form"], true);
+      setBusy(true, "Updating document properties");
       const properties = Object.fromEntries(
         propertyFields().map(([property, elementId]) => [
           property,
           elements[elementId].value || null,
         ]),
       );
-      const result = await state.client.setDocumentProperties(
-        state.documentId,
+      const result = await target.client.setDocumentProperties(
+        target.documentId,
         properties,
       );
+      if (!isCurrentTarget(target)) return;
       closePropertiesEditor();
-      await applyMutationResult(result, "Document properties updated");
+      await applyMutationResult(result, "Document properties updated", target);
     } catch (error) {
-      showError(error);
+      if (isCurrentTarget(target)) showError(error);
     } finally {
+      mutationPending = false;
       setFormPending(elements["properties-form"], false);
+      if (isCurrentTarget(target)) {
+        setBusy(false);
+      }
     }
   }
 
@@ -430,46 +445,56 @@ export function createEditingController({
     if (!canEditWorkbook()) {
       return;
     }
+    const target = currentTarget();
     try {
       setBusy(true, direction === "undo" ? "Undoing edit" : "Redoing edit");
       const result =
         direction === "undo"
-          ? await state.client.undoEdit(state.documentId)
-          : await state.client.redoEdit(state.documentId);
+          ? await target.client.undoEdit(target.documentId)
+          : await target.client.redoEdit(target.documentId);
       await applyMutationResult(
         result,
         direction === "undo" ? "Edit undone" : "Edit redone",
+        target,
+        direction,
       );
     } catch (error) {
-      setBusy(false);
-      showError(error);
+      if (isCurrentTarget(target)) {
+        setBusy(false);
+        showError(error);
+      }
     }
   }
 
-  async function applyMutationResult(result, message, target = null) {
-    if (target && !isCurrentTarget(target)) return false;
+  async function applyMutationResult(
+    result,
+    message,
+    target,
+    history = "edit",
+  ) {
+    if (!isCurrentTarget(target)) return false;
+    syncWarningContext();
+    const report = updateWarningHistory(result, history);
     state.workbook = result.workbook;
     state.editState = result.editState;
     state.manifests.clear();
-    state.pageIndex = 0;
+    // Pagination may change; renderCurrent clamps against the refreshed manifest.
     state.sheetIndex = Math.min(
       state.sheetIndex,
       Math.max(0, state.workbook.sheetCount - 1),
     );
     updateWorkbookUi();
     await renderCurrent({ fit: false });
-    if (!target || isCurrentTarget(target)) {
+    if (isCurrentTarget(target)) {
       elements["status-message"].textContent = summarizeRecalculation(
-        result.recalculation,
+        report,
         message,
       );
     }
-    return !target || isCurrentTarget(target);
+    return isCurrentTarget(target);
   }
 
-  function summarizeRecalculation(report, message) {
-    // This is a successful edit with an explicit cached-value fallback, not a failed edit.
-    // Never display formulas or workbook text from a recalculation diagnostic.
+  function clearWarning() {
     if (
       recalculationWarning &&
       elements["error-message"].textContent === recalculationWarning
@@ -477,7 +502,51 @@ export function createEditingController({
       elements["error-banner"].hidden = true;
       elements["error-message"].textContent = "";
     }
+    if (
+      recalculationWarning &&
+      elements["status-message"].textContent === recalculationWarning
+    ) {
+      elements["status-message"].textContent = "";
+    }
     recalculationWarning = "";
+  }
+
+  function syncWarningContext() {
+    if (
+      state.workbook &&
+      warningContext &&
+      warningContext.client === state.client &&
+      warningContext.documentId === state.documentId
+    )
+      return;
+    clearWarning();
+    warningSummary = null;
+    warningUndo.length = warningRedo.length = 0;
+    warningContext = state.workbook ? currentTarget() : null;
+  }
+
+  function updateWarningHistory(result, direction) {
+    if (direction === "undo" || direction === "redo") {
+      const source = direction === "undo" ? warningUndo : warningRedo;
+      const destination = direction === "undo" ? warningRedo : warningUndo;
+      destination.push(warningSummary);
+      // If an older snapshot was evicted, retain uncertainty rather than claiming clean caches.
+      if (source.length) warningSummary = source.pop();
+    } else {
+      warningUndo.push(warningSummary);
+      warningRedo.length = 0;
+    }
+    for (const [entries, depth] of [
+      [warningUndo, result.editState?.undoDepth],
+      [warningRedo, result.editState?.redoDepth],
+    ]) {
+      const limit =
+        Number.isSafeInteger(depth) && depth >= 0
+          ? Math.min(depth, maxWarningHistory)
+          : maxWarningHistory;
+      entries.splice(0, Math.max(0, entries.length - limit));
+    }
+    const report = result.recalculation;
     if (
       !report ||
       !Number.isSafeInteger(report.computedCells) ||
@@ -485,7 +554,26 @@ export function createEditingController({
       !Number.isSafeInteger(report.unsupportedCells) ||
       report.unsupportedCells < 0
     )
-      return message;
+      return null;
+    const summary = {
+      computedCells: report.computedCells,
+      unsupportedCells: report.unsupportedCells,
+    };
+    warningSummary = summary.unsupportedCells > 0 ? summary : null;
+    return summary;
+  }
+
+  function summarizeRecalculation(report, message) {
+    // Metadata/history do not recalculate; an absent report must not claim clean caches.
+    clearWarning();
+    if (!report && !warningSummary) return message;
+    if (!report) {
+      const count = warningSummary.unsupportedCells;
+      recalculationWarning = `${message}. ${count} unsupported formula cell${count === 1 ? " still uses" : "s still use"} cached values.`;
+      elements["error-message"].textContent = recalculationWarning;
+      elements["error-banner"].hidden = false;
+      return recalculationWarning;
+    }
     const computed = `${report.computedCells} formula cell${report.computedCells === 1 ? "" : "s"} recalculated`;
     if (report.unsupportedCells === 0) return `${message}. ${computed}.`;
     const unsupported = `${report.unsupportedCells} unsupported formula cell${report.unsupportedCells === 1 ? "" : "s"}`;
@@ -553,6 +641,14 @@ export function createEditingController({
         target.documentId === state.documentId &&
         target.sheetIndex === state.sheetIndex,
     );
+  }
+
+  function currentTarget() {
+    return {
+      client: state.client,
+      documentId: state.documentId,
+      sheetIndex: state.sheetIndex,
+    };
   }
 
   function cellReference(row, col) {

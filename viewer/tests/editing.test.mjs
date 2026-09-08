@@ -40,7 +40,12 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function setup({ readOnly = false, client = {}, beforeCommand } = {}) {
+function setup({
+  readOnly = false,
+  client = {},
+  beforeCommand,
+  renderCurrent,
+} = {}) {
   const elements = new Proxy(
     {},
     {
@@ -93,6 +98,7 @@ function setup({ readOnly = false, client = {}, beforeCommand } = {}) {
     },
     renderCurrent: async (options) => {
       calls.renders.push(options);
+      await renderCurrent?.(state);
       state.busy = false;
     },
     download: (blob, name) => calls.downloads.push({ blob, name }),
@@ -205,7 +211,7 @@ test("a loaded cell submits a typed edit and refreshes the rendered workbook", a
   assert.equal(elements["cell-dialog"].open, false);
   assert.equal(state.editState.dirty, true);
   assert.equal(state.manifests.size, 0);
-  assert.equal(state.pageIndex, 0);
+  assert.equal(state.pageIndex, 3);
   assert.deepEqual(calls.renders, [{ fit: false }]);
   assert.equal(elements["status-message"].textContent, "A1 updated");
 });
@@ -535,6 +541,289 @@ test("a fully recalculated later edit clears its previous unsupported warning", 
     fixture.elements["status-message"].textContent,
     "A1 updated. 1 formula cell recalculated.",
   );
+});
+
+function warningFixture() {
+  const fixture = setup();
+  fixture.state.client.setCellAndRecalculate = async () => ({
+    workbook: fixture.workbook,
+    editState: { ...fixture.state.editState, dirty: true },
+    recalculation: {
+      computedCells: 4,
+      unchangedCells: 2,
+      unsupportedCells: 1,
+      reasons: ["unsupported_function"],
+    },
+  });
+  fixture.state.client.setDocumentProperties = async () => ({
+    workbook: fixture.workbook,
+    editState: fixture.state.editState,
+  });
+  fixture.state.client.undoEdit = fixture.state.client.redoEdit = async () => ({
+    workbook: fixture.workbook,
+    editState: fixture.state.editState,
+  });
+  fixture.commit = () =>
+    fixture.controller.commitCellEdit(
+      {
+        client: fixture.state.client,
+        documentId: fixture.state.documentId,
+        sheetIndex: fixture.state.sheetIndex,
+        row: 0,
+        col: 0,
+      },
+      { kind: "number", value: 7 },
+    );
+  fixture.properties = async () => {
+    await fixture.controller.openPropertiesEditor();
+    fixture.elements["property-title"].value = "Updated title";
+    fixture.elements["properties-form"].emit("submit");
+    await flush();
+  };
+  return fixture;
+}
+
+test("metadata edits retain the current page and existing cached-formula warning", async () => {
+  const fixture = warningFixture();
+  await fixture.commit();
+  fixture.state.pageIndex = 3;
+  await fixture.properties();
+  assert.equal(fixture.state.pageIndex, 3);
+  assert.equal(fixture.elements["error-banner"].hidden, false);
+  assert.match(
+    fixture.elements["error-message"].textContent,
+    /1 unsupported formula cell/,
+  );
+  assert.doesNotMatch(
+    fixture.elements["status-message"].textContent,
+    /recalculated/,
+  );
+  assert.deepEqual(fixture.calls.errors, []);
+});
+
+test("undo and redo restore cached-formula warning state without changing pages", async () => {
+  const fixture = warningFixture();
+  await fixture.commit();
+  await fixture.properties();
+  for (const [direction, warning] of [
+    ["undo", true],
+    ["undo", false],
+    ["redo", true],
+    ["redo", true],
+  ]) {
+    fixture.state.pageIndex = 3;
+    await fixture.controller.applyHistoryEdit(direction);
+    assert.equal(fixture.state.pageIndex, 3);
+    assert.equal(fixture.elements["error-banner"].hidden, !warning, direction);
+    assert.doesNotMatch(
+      fixture.elements["status-message"].textContent,
+      /recalculated/,
+    );
+  }
+});
+
+test("undo restores a prior warning after a fully recalculated edit and redo clears it", async () => {
+  const fixture = warningFixture();
+  await fixture.commit();
+  fixture.state.client.setCellAndRecalculate = async () => ({
+    workbook: fixture.workbook,
+    editState: fixture.state.editState,
+    recalculation: {
+      computedCells: 2,
+      unchangedCells: 0,
+      unsupportedCells: 0,
+      reasons: [],
+    },
+  });
+  await fixture.commit();
+  assert.equal(fixture.elements["error-banner"].hidden, true);
+  await fixture.controller.applyHistoryEdit("undo");
+  assert.equal(fixture.elements["error-banner"].hidden, false);
+  await fixture.controller.applyHistoryEdit("redo");
+  assert.equal(fixture.elements["error-banner"].hidden, true);
+});
+
+test("warning history follows worker snapshot eviction and new edit branches", async () => {
+  const fixture = warningFixture();
+  await fixture.commit();
+  fixture.state.client.setDocumentProperties = async () => ({
+    workbook: fixture.workbook,
+    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0 },
+  });
+  await fixture.properties();
+  fixture.state.client.undoEdit = async () => ({
+    workbook: fixture.workbook,
+    editState: { ...fixture.state.editState, undoDepth: 0, redoDepth: 1 },
+  });
+  await fixture.controller.applyHistoryEdit("undo");
+  assert.equal(fixture.elements["error-banner"].hidden, false);
+  fixture.state.client.setCellAndRecalculate = async () => ({
+    workbook: fixture.workbook,
+    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0 },
+    recalculation: {
+      computedCells: 1,
+      unchangedCells: 0,
+      unsupportedCells: 0,
+      reasons: [],
+    },
+  });
+  await fixture.commit();
+  assert.equal(fixture.elements["error-banner"].hidden, true);
+  await fixture.controller.applyHistoryEdit("undo");
+  assert.equal(fixture.elements["error-banner"].hidden, false);
+  fixture.state.client.redoEdit = async () => ({
+    workbook: fixture.workbook,
+    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0 },
+  });
+  await fixture.controller.applyHistoryEdit("redo");
+  assert.equal(fixture.elements["error-banner"].hidden, true);
+});
+
+test("the refreshed renderer may clamp a retained page after cell, metadata, and history edits", async () => {
+  const pages = [];
+  const fixture = setup({
+    renderCurrent(state) {
+      pages.push(state.pageIndex);
+      state.pageIndex = Math.min(state.pageIndex, 1);
+    },
+  });
+  const result = () => ({
+    workbook: fixture.workbook,
+    editState: fixture.state.editState,
+  });
+  fixture.state.client.setCell = async () => result();
+  fixture.state.client.setDocumentProperties = async () => result();
+  fixture.state.client.undoEdit = async () => result();
+  await fixture.controller.commitCellEdit(
+    {
+      client: fixture.state.client,
+      documentId: fixture.state.documentId,
+      sheetIndex: 0,
+      row: 0,
+      col: 0,
+    },
+    { kind: "number", value: 1 },
+  );
+  assert.equal(fixture.state.pageIndex, 1);
+  fixture.state.pageIndex = 3;
+  await fixture.controller.openPropertiesEditor();
+  fixture.elements["properties-form"].emit("submit");
+  await flush();
+  assert.equal(fixture.state.pageIndex, 1);
+  fixture.state.pageIndex = 3;
+  await fixture.controller.applyHistoryEdit("undo");
+  assert.equal(fixture.state.pageIndex, 1);
+  assert.deepEqual(pages, [3, 3, 3]);
+});
+
+test("new document identity clears warning history without clearing unrelated errors", async () => {
+  for (const field of ["client", "documentId"]) {
+    const fixture = warningFixture();
+    await fixture.commit();
+    fixture.state[field] = field === "client" ? {} : "document-two";
+    fixture.controller.updateEditUi();
+    assert.equal(fixture.elements["error-banner"].hidden, true);
+    assert.equal(fixture.elements["error-message"].textContent, "");
+    assert.doesNotMatch(
+      fixture.elements["status-message"].textContent,
+      /unsupported formula/,
+    );
+  }
+  const fixture = warningFixture();
+  await fixture.commit();
+  fixture.elements["error-message"].textContent = "Current renderer error";
+  fixture.state.documentId = "document-two";
+  fixture.controller.updateEditUi();
+  assert.equal(fixture.elements["error-banner"].hidden, false);
+  assert.equal(
+    fixture.elements["error-message"].textContent,
+    "Current renderer error",
+  );
+});
+
+test("failed and stale metadata/history results cannot change current warnings or pages", async () => {
+  for (const operation of ["properties", "undo", "redo"]) {
+    for (const outcome of ["failed", "stale-result", "stale-error"]) {
+      const stale = outcome !== "failed";
+      const fixture = warningFixture();
+      await fixture.commit();
+      const warning = fixture.elements["error-message"].textContent;
+      const pending = deferred();
+      const method =
+        operation === "properties"
+          ? "setDocumentProperties"
+          : `${operation}Edit`;
+      fixture.state.client[method] = () => pending.promise;
+      const task =
+        operation === "properties"
+          ? fixture.properties()
+          : fixture.controller.applyHistoryEdit(operation);
+      await flush();
+      const currentWorkbook = {
+        ...fixture.workbook,
+        properties: { title: "Current" },
+      };
+      if (stale) {
+        fixture.state.documentId = "document-two";
+        fixture.state.workbook = currentWorkbook;
+        fixture.state.busy = false;
+        fixture.controller.updateEditUi();
+        fixture.elements["error-message"].textContent = "Current diagnostic";
+        fixture.elements["status-message"].textContent = "Current status";
+        fixture.elements["error-banner"].hidden = false;
+        fixture.state.pageIndex = 5;
+        if (outcome === "stale-error")
+          pending.reject(new Error("Old document error"));
+        else
+          pending.resolve({
+            workbook: fixture.workbook,
+            editState: fixture.state.editState,
+          });
+      } else {
+        pending.reject(new Error("Mutation rejected"));
+      }
+      await task;
+      await flush();
+      if (stale) {
+        assert.equal(fixture.state.workbook, currentWorkbook);
+        assert.equal(fixture.state.pageIndex, 5);
+        assert.equal(
+          fixture.elements["error-message"].textContent,
+          "Current diagnostic",
+        );
+        assert.equal(
+          fixture.elements["status-message"].textContent,
+          "Current status",
+        );
+        assert.equal(fixture.state.busy, false);
+        assert.deepEqual(fixture.calls.errors, []);
+      } else {
+        assert.equal(fixture.elements["error-message"].textContent, warning);
+        assert.equal(fixture.elements["error-banner"].hidden, false);
+      }
+    }
+  }
+});
+
+test("a stale metadata request releases form buttons for the next document", async () => {
+  const fixture = warningFixture();
+  const buttons = [control(), control()];
+  fixture.elements["properties-form"].querySelectorAll = () => buttons;
+  const pending = deferred();
+  fixture.state.client.setDocumentProperties = () => pending.promise;
+  await fixture.properties();
+  assert.ok(buttons.every((button) => button.disabled));
+  fixture.state.documentId = "document-two";
+  fixture.state.busy = false;
+  fixture.controller.closePropertiesEditor();
+  pending.resolve({
+    workbook: fixture.workbook,
+    editState: fixture.state.editState,
+  });
+  await flush();
+  assert.ok(buttons.every((button) => !button.disabled));
+  await fixture.controller.openPropertiesEditor();
+  assert.equal(fixture.elements["properties-dialog"].open, true);
 });
 
 test("a stale recalculation result cannot overwrite a new document or its visible diagnostic", async () => {
