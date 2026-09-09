@@ -3074,6 +3074,155 @@ steps:
             [],
         )
 
+    def test_render_package_manual_rehearsal_contract(self) -> None:
+        original = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(original.count('test "$(npm config get force)" = "false"'), 2)
+        self.assertEqual(original.count("--access public --force"), 1)
+        self.assertIn('sha256sum --check --strict "$archive.sha256"', original)
+        self.assertIn("python3 scripts/test_npm_dry_run.py", original)
+        with mock.patch.object(
+            self.policy,
+            "RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256",
+            hashlib.sha256(original.encode("utf-8")).hexdigest(),
+        ):
+            self.assertEqual(
+                self.policy.audit_render_package_release_workflow(
+                    Path("render-package-release.yml"), original
+                ),
+                [],
+            )
+
+    def test_render_package_rehearsal_rejects_scope_and_archive_mutations(self) -> None:
+        original = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        force_guard = '          test "$(npm config get force)" = "false"\n'
+        before_hash = '          sha256sum "$archive" > "$archive.sha256"\n'
+        after_hash = '          sha256sum --check --strict "$archive.sha256"\n'
+        manual_publish = (
+            '            npm publish --dry-run --ignore-scripts --access public --force "$archive" \\\n'
+            '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
+        )
+        tag_publish = manual_publish.replace(" --force", "")
+        dispatch_guard = '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
+        publish_prefix = (
+            "      - name: Publish exact package with provenance\n"
+            "        if: steps.registry.outputs.already_published != 'true'\n"
+            "        run: |\n"
+        )
+        mutations = {
+            "manual_missing_dry_run": original.replace(
+                manual_publish, manual_publish.replace(" --dry-run", ""), 1
+            ),
+            "manual_missing_ignore_scripts": original.replace(
+                manual_publish, manual_publish.replace(" --ignore-scripts", ""), 1
+            ),
+            "tag_dry_run_forced": original.replace(tag_publish, manual_publish, 1),
+            "manual_dry_run_unforced": original.replace(manual_publish, tag_publish, 1),
+            "manual_dry_run_outside_guard": original.replace(manual_publish, "", 1).replace(
+                after_hash, after_hash + manual_publish, 1
+            ),
+            "manual_force_duplicated": original.replace(
+                manual_publish, manual_publish + manual_publish, 1
+            ),
+            "manual_event_guard_relaxed": original.replace(
+                dispatch_guard, '            test "$GITHUB_EVENT_NAME" != "push"\n', 1
+            ),
+            "manual_event_guard_after_publish": original.replace(dispatch_guard, "", 1).replace(
+                manual_publish, manual_publish + dispatch_guard, 1
+            ),
+            "manual_failure_swallowed": original.replace(
+                manual_publish, manual_publish.rstrip("\n") + " || true\n", 1
+            ),
+            "dry_run_record_not_retained": original.replace(
+                manual_publish, manual_publish.replace('"$output/npm-publish-dry-run.txt"', "/dev/null"), 1
+            ),
+            "force_environment_uppercase": original.replace(
+                force_guard, force_guard + "          export NPM_CONFIG_FORCE=true\n", 1
+            ),
+            "force_environment_lowercase": original.replace(
+                force_guard, force_guard + "          export npm_config_force=true\n", 1
+            ),
+            "force_global_config": original.replace(
+                force_guard, force_guard + "          npm config set force true\n", 1
+            ),
+            "force_npmrc_override": original.replace(
+                force_guard, force_guard + '          echo "force=true" >> "$HOME/.npmrc"\n', 1
+            ),
+            "verify_force_guard_removed": original.replace(force_guard, "", 1),
+            "verify_force_guard_inverted": original.replace(
+                force_guard, force_guard.replace('= "false"', '= "true"'), 1
+            ),
+            "verify_force_guard_late": original.replace(force_guard, "", 1).replace(
+                after_hash, after_hash + force_guard, 1
+            ),
+            "verify_force_guard_swallowed": original.replace(
+                force_guard, force_guard.rstrip("\n") + " || true\n", 1
+            ),
+            "publish_force_guard_removed": original.replace(
+                publish_prefix + force_guard, publish_prefix, 1
+            ),
+            "publish_force_guard_late": original.replace(
+                publish_prefix + force_guard, publish_prefix, 1
+            ).replace(
+                '            --ignore-scripts --access public\n',
+                '            --ignore-scripts --access public\n' + force_guard,
+                1,
+            ),
+            "publish_force_guard_swallowed": original.replace(
+                publish_prefix + force_guard,
+                publish_prefix + force_guard.rstrip("\n") + " || true\n",
+                1,
+            ),
+            "actual_publication_forced": original.replace(
+                '            --ignore-scripts --access public\n',
+                '            --ignore-scripts --access public --force\n',
+                1,
+            ),
+            "archive_hash_missing_before": original.replace(before_hash, "", 1),
+            "archive_hash_captured_after": original.replace(before_hash, "", 1).replace(
+                after_hash, before_hash + after_hash, 1
+            ),
+            "archive_hash_replaced_after": original.replace(
+                after_hash, before_hash + after_hash, 1
+            ),
+            "archive_hash_missing_after": original.replace(after_hash, "", 1),
+            "archive_hash_not_strict": original.replace(
+                after_hash, after_hash.replace(" --strict", ""), 1
+            ),
+            "archive_hash_failure_swallowed": original.replace(
+                after_hash, after_hash.rstrip("\n") + " || true\n", 1
+            ),
+            "archive_modified_after_check": original.replace(
+                after_hash, after_hash + '          touch "$archive"\n', 1
+            ),
+            "consumer_moved_before_hash": original.replace(after_hash, "", 1).replace(
+                '          npm install --ignore-scripts "$GITHUB_WORKSPACE/$archive"\n',
+                '          npm install --ignore-scripts "$GITHUB_WORKSPACE/$archive"\n' + after_hash,
+                1,
+            ),
+            "dry_run_test_removed": original.replace(
+                "          python3 scripts/test_npm_dry_run.py\n", "", 1
+            ),
+            "pack_errexit_removed": original.replace(
+                "      - name: Pack, inspect, dry-run, and consume\n"
+                "        shell: bash\n        run: |\n          set -euo pipefail\n",
+                "      - name: Pack, inspect, dry-run, and consume\n"
+                "        shell: bash\n        run: |\n          set -eu\n",
+                1,
+            ),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                with mock.patch.object(
+                    self.policy,
+                    "RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256",
+                    hashlib.sha256(workflow.encode("utf-8")).hexdigest(),
+                ):
+                    errors = self.policy.audit_render_package_release_workflow(
+                        Path("render-package-release.yml"), workflow
+                    )
+                self.assertTrue(errors)
+
     def test_render_package_release_rejects_unsafe_publication_paths(self) -> None:
         original = RENDER_PACKAGE_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         mutations = {
@@ -3331,10 +3480,10 @@ steps:
             ),
             "manual_suffix_independent_event_guard": original.replace(
                 "          fi\n"
-                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                '          sha256sum --check --strict "$archive.sha256"\n',
                 "          fi\n"
                 '          if [[ "${{ github.event_name }}" == "push" ]]; then\n'
-                "            npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                '            sha256sum --check --strict "$archive.sha256"\n',
                 1,
             ).replace(
                 "          NODE\n"
@@ -3346,8 +3495,8 @@ steps:
             ),
             "manual_downstream_inside_event_guard": original.replace(
                 "          fi\n"
-                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
-                "          npm publish --dry-run --ignore-scripts --access public \"$archive\" \\\n",
+                '          sha256sum --check --strict "$archive.sha256"\n',
+                '          sha256sum --check --strict "$archive.sha256"\n',
                 1,
             ).replace(
                 "          NODE\n"
@@ -3378,14 +3527,23 @@ steps:
                 1,
             ).replace(
                 "          PY\n"
+                '            npm publish --dry-run --ignore-scripts --access public "$archive" \\\n'
+                '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
                 "          else\n"
                 '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
-                "            echo \"workflow_dispatch verified the locally rebuilt package without publication prerequisites\"\n"
+                '            echo "workflow_dispatch packaging rehearsal; registry availability not checked"\n'
+                '            npm publish --dry-run --ignore-scripts --access public --force "$archive" \\\n'
+                '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
                 "          fi\n",
                 "          PY\n"
                 '          if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then\n'
                 '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
-                "            echo \"workflow_dispatch verified the locally rebuilt package without publication prerequisites\"\n"
+                '            echo "workflow_dispatch packaging rehearsal; registry availability not checked"\n'
+                '            npm publish --dry-run --ignore-scripts --access public --force "$archive" \\\n'
+                '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
+                "          else\n"
+                '            npm publish --dry-run --ignore-scripts --access public "$archive" \\\n'
+                '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
                 "          fi\n",
                 1,
             ),

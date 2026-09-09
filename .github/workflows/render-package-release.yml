@@ -275,6 +275,7 @@ jobs:
           python3 scripts/test_check_render_browser_release_evidence.py
           python3 scripts/test_check_render_package.py
           python3 scripts/test_check_npm_registry_evidence.py
+          python3 scripts/test_npm_dry_run.py
           python3 scripts/test_render_supply_chain.py
           python3 scripts/test_check_render_oracle_release_evidence.py
           python3 scripts/render_supply_chain.py notice \
@@ -333,6 +334,8 @@ jobs:
             --npm-pack "$output/npm-pack.json" \
             --git-rev "$GITHUB_SHA" \
             --write-report "$output/package-report.json"
+          test "$(npm config get force)" = "false"
+          sha256sum "$archive" > "$archive.sha256"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             ARCHIVE="$archive" python3 - <<'PY'
           import hashlib
@@ -509,13 +512,15 @@ jobs:
                   "browser-proven package differs from release candidate"
               )
           PY
+            npm publish --dry-run --ignore-scripts --access public "$archive" \
+              2>&1 | tee "$output/npm-publish-dry-run.txt"
           else
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
-            echo "workflow_dispatch verified the locally rebuilt package without publication prerequisites"
+            echo "workflow_dispatch packaging rehearsal; registry availability not checked"
+            npm publish --dry-run --ignore-scripts --access public --force "$archive" \
+              2>&1 | tee "$output/npm-publish-dry-run.txt"
           fi
-          npm publish --dry-run --ignore-scripts --access public "$archive" \
-            2>&1 | tee "$output/npm-publish-dry-run.txt"
-          sha256sum "$archive" > "$archive.sha256"
+          sha256sum --check --strict "$archive.sha256"
           consumer="$RUNNER_TEMP/render-worker-consumer"
           rm -rf "$consumer"
           mkdir -p "$consumer"
@@ -943,6 +948,7 @@ jobs:
       - name: Publish exact package with provenance
         if: steps.registry.outputs.already_published != 'true'
         run: |
+          test "$(npm config get force)" = "false"
           version="${{ steps.package.outputs.version }}"
           npm publish \
             "target/render-package/rxls-render-worker-$version.tgz" \
