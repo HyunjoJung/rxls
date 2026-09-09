@@ -46,9 +46,9 @@ OOXML packages that cannot retain metadata report a stable read-only reason.
 Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
 serialized and reopened before it replaces the live session.
 
-The current source build additionally exposes `renderSheetInteractive()`,
-`setCellAndRecalculate()`, and `setRangeAndRecalculate()`; these additions are not
-in the published 0.2.0 package. Interactive rendering returns bounded, text-free
+Version 0.3.0 adds `renderSheetInteractive()`, `setCellAndRecalculate()`, and
+`setRangeAndRecalculate()` to the existing version 2 protocol. These methods are
+not available in 0.2.0. Interactive rendering returns bounded, text-free
 cell rectangles from the same layout pass as the SVG. Recalculating edits apply
 a cell or rectangular range and refresh supported formula
 caches as one atomic, undoable change. Its `recalculation` summary reports
