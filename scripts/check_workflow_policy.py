@@ -167,7 +167,7 @@ ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b52b8bde803f6cfc2ffb40f533febf6b5d75dcb17326943546497c921e0c60cc"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "b125148dde44cb51b9e569c19eccce2b1be9a6dc74e4a9ea52c228d01c4bf6ca"
+    "8e89442f1843fdf417b87424b1c4c79875b78384e62a1d5d6d128ffdbf73f311"
 )
 WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "39a36f584d18859cb9ddcdbf0ee45cc2ef5712acb0448bfde575818b7ebfeac8"
@@ -5445,10 +5445,23 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: pull requests must never enter the registry release workflow"
         )
-    if re.search(r"\bnpm\s+publish\b[^\n]*--force\b", text):
-        errors.append(f"{path}: forced npm publication is forbidden")
-    if len(re.findall(r"^\s*npm publish\b", text, re.MULTILINE)) != 2:
-        errors.append(f"{path}: expected exactly one dry-run and one real npm publish")
+    force_guard = 'test "$(npm config get force)" = "false"'
+    manual_dry_run = (
+        'npm publish --dry-run --ignore-scripts --access public --force "$archive"'
+    )
+    # The manual rehearsal may bypass registry availability, never --dry-run.
+    # All other force settings, including fresh-runner config, remain forbidden.
+    other_force_uses = text.replace(force_guard, "").replace(manual_dry_run, "", 1)
+    if re.search(r"\bforce\b|npm_config_force", other_force_uses, re.IGNORECASE):
+        errors.append(
+            f"{path}: npm force is allowed only on the exact manual dry-run command"
+        )
+    if text.count(force_guard) != 2:
+        errors.append(
+            f"{path}: verification and publication must each reject inherited npm force"
+        )
+    if len(re.findall(r"^\s*npm publish\b", text, re.MULTILINE)) != 3:
+        errors.append(f"{path}: expected exactly two scoped dry-runs and one real npm publish")
     if text.count('npm view "$spec" \\') != 2:
         errors.append(
             f"{path}: registry preflight and postpublication verification must both run"
@@ -5624,6 +5637,27 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         errors.append(
             f"{path}: npm publication must have exactly one exact tag-push job guard"
         )
+    publication_step = _single_yaml_block(
+        path,
+        publish_job,
+        "- name: Publish exact package with provenance",
+        6,
+        "render package protected publication step",
+        errors,
+    )
+    if _normalized_active_commands(publication_step) != [
+        "- name: Publish exact package with provenance",
+        "if: steps.registry.outputs.already_published != 'true'",
+        "run: |",
+        force_guard,
+        'version="${{ steps.package.outputs.version }}"',
+        'npm publish "target/render-package/rxls-render-worker-$version.tgz" '
+        "--ignore-scripts --access public",
+    ]:
+        errors.append(
+            f"{path}: protected publication must reject inherited force first and "
+            "publish only the exact unforced candidate"
+        )
     reverify_step = _single_yaml_block(
         path,
         publish_job,
@@ -5793,6 +5827,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         "python3 scripts/test_check_render_browser_release_evidence.py",
         "python3 scripts/test_check_render_package.py",
         "python3 scripts/test_check_npm_registry_evidence.py",
+        "python3 scripts/test_npm_dry_run.py",
         "python3 scripts/test_render_supply_chain.py",
         "python3 scripts/test_check_render_oracle_release_evidence.py",
         "python3 scripts/render_supply_chain.py notice --manifest-path "
@@ -5826,6 +5861,13 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             f"{path}: local pack, dry-run, and consumer verification must be one "
             "unconditional step"
         )
+    if _normalized_active_commands(pack_step)[:4] != [
+        "- name: Pack, inspect, dry-run, and consume",
+        "shell: bash",
+        "run: |",
+        "set -euo pipefail",
+    ]:
+        errors.append(f"{path}: pack and dry-run verification must retain strict shell errors")
     push_guard = 'if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then'
     dispatch_guard = 'test "$GITHUB_EVENT_NAME" = "workflow_dispatch"'
     if pack_step.count(push_guard) != 1 or pack_step.count(dispatch_guard) != 1:
@@ -5839,16 +5881,19 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
     )
     tag_branch_close = (
         "          PY\n"
+        '            npm publish --dry-run --ignore-scripts --access public "$archive" \\\n'
+        '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
         "          else\n"
         '            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"\n'
-        "            echo \"workflow_dispatch verified the locally rebuilt package "
-        "without publication prerequisites\"\n"
+        '            echo "workflow_dispatch packaging rehearsal; registry availability not checked"\n'
+        f"            {manual_dry_run} \\\n"
+        '              2>&1 | tee "$output/npm-publish-dry-run.txt"\n'
         "          fi\n"
     )
     if pack_step.count(tag_branch_open) != 1 or pack_step.count(tag_branch_close) != 1:
         errors.append(
-            f"{path}: browser receipt must use one exact push branch with a "
-            "fail-closed dispatch alternative"
+            f"{path}: browser receipt and unforced tag dry-run must use one exact "
+            "push branch with a fail-closed manual-only force dry-run alternative"
         )
     tag_start = pack_step.find(tag_branch_open)
     tag_close_start = pack_step.find(tag_branch_close, max(tag_start, 0))
@@ -5880,6 +5925,8 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         'sha256sum "$output/render-worker-sbom.cdx.json"',
         "npm pack --json --pack-destination",
         "python3 scripts/check_render_package.py",
+        force_guard,
+        'sha256sum "$archive" > "$archive.sha256"',
     )
     prefix_positions = [pack_prefix.find(value) for value in prefix_order]
     if (
@@ -5890,10 +5937,21 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         or pack_prefix.count("python3 scripts/check_render_package.py") != 1
         or pack_prefix.count('--npm-pack "$output/npm-pack.json"') != 1
         or pack_prefix.count("npm pack --json --pack-destination") != 1
+        or pack_prefix.count(force_guard) != 1
+        or pack_step.count('sha256sum "$archive" > "$archive.sha256"') != 1
     ):
         errors.append(
-            f"{path}: dispatch must run deterministic SBOM, package, and archive "
-            "validation before the tag-only browser binding"
+            f"{path}: dispatch must run deterministic SBOM, package, archive "
+            "validation, force rejection, and hash capture before event selection"
+        )
+    if not pack_prefix.endswith(
+        '            --write-report "$output/package-report.json"\n'
+        f"          {force_guard}\n"
+        '          sha256sum "$archive" > "$archive.sha256"\n'
+    ):
+        errors.append(
+            f"{path}: package validation must immediately precede the force guard "
+            "and original archive hash capture"
         )
     browser_receipt = 'Path("target/render-package/browser-prerequisite.json")'
     browser_mismatch = "browser-proven package differs from release candidate"
@@ -5909,8 +5967,7 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
             "during local package verification"
         )
     suffix_order = (
-        "npm publish --dry-run --ignore-scripts --access public",
-        'sha256sum "$archive" > "$archive.sha256"',
+        'sha256sum --check --strict "$archive.sha256"',
         'consumer="$RUNNER_TEMP/render-worker-consumer"',
         'rm -rf "$consumer"',
         'mkdir -p "$consumer"',
@@ -5924,10 +5981,12 @@ def audit_render_package_release_workflow(path: Path, text: str) -> list[str]:
         any(index < 0 for index in suffix_positions)
         or suffix_positions != sorted(suffix_positions)
         or any(pack_step.count(value) != 1 for value in suffix_order)
+        or _normalized_active_commands(pack_suffix)[: len(suffix_order)]
+        != list(suffix_order)
     ):
         errors.append(
-            f"{path}: dry-run, checksum, and clean installed consumer must run "
-            "after the event-specific browser branch"
+            f"{path}: strict unchanged-archive verification and the clean installed "
+            "consumer must run immediately after the scoped dry-run branch"
         )
     build_step = _single_yaml_block(
         path,
