@@ -2,9 +2,27 @@
 
 [Back to README](../README.md)
 
-This document defines the format and feature boundaries of the published
-`rxls` core crate. Reading, authoring, and preservation editing are separate
-capabilities; support for one does not imply support for the others.
+This document distinguishes the published `rxls` core **0.1.3**, additions in
+the current source checkout, and separately versioned adapters. Reading,
+authoring, and preservation editing are separate capabilities; support for one
+does not imply support for the others.
+
+## Release and source boundaries
+
+| Surface | Version boundary | Formula/cache contract |
+|---|---|---|
+| Native `rxls` core from the registry | 0.1.3 (`v0.1.3`) | Single-cell `Workbook::evaluate_cell`; no `evaluate_cells`, `set_formula_cached_values`, or `TextLimitExceeded` |
+| Current native source | Additions after core 0.1.3, not a new published core release | Shared-budget batch evaluation, atomic formula-cache batches, and bounded UTF-8 text production |
+| npm `rxls-wasm` | Core adapter 0.1.3 | Its own synchronous JavaScript API, not an automatic export of every native Rust method |
+| npm `@rxls/render-worker` | Worker 0.3.0, versioned independently | Interactive rendering and atomic recalculating edits through the worker API |
+
+The source manifest may still say `0.1.3`. Installing registry
+`rxls = "=0.1.3"` does not select newer source APIs. The examples marked
+current source in [Formula support](formulas.md) and
+[Preservation and editing](preservation.md) require a path dependency or an
+appropriate pinned source revision. Their evaluator budgets and edit limits
+are separate contracts; successful evaluation is not proof that a cache value
+can be written to XLSX.
 
 ## Format matrix
 
@@ -109,10 +127,11 @@ property, feature inventory, and parse-provenance data. The CLI exposes this as
 operational errors use stderr. Exit classifications and diagnose schema changes
 are compatibility-controlled behavior.
 
-The isolated `bindings/wasm` crate exposes the core model through generated Node
-and browser entry points, TypeScript declarations, structured `RxlsError`
-objects, and a synchronous 32 MiB input limit. It is built and distributed
-separately from the native CLI.
+The isolated `bindings/wasm` crate is distributed as npm **`rxls-wasm` 0.1.3**.
+It exposes the core model through generated Node and browser entry points,
+TypeScript declarations, structured `RxlsError` objects, and a synchronous
+32 MiB input limit. It is built and distributed separately from the native CLI
+and is not the `@rxls/render-worker` package.
 
 The isolated `bindings/mcp` crate exposes nine local stdio tools for opening,
 inspecting, reading, exporting, preservation-editing, save-copying, and closing
@@ -125,10 +144,11 @@ XLSX/XLSM sessions with `EditCapability::ReadWrite` can mutate or save. The MCP
 crate is currently built from the source workspace and is not independently
 published.
 
-The source workspace also contains an experimental renderer,
-`@rxls/render-worker`, and the local MCP server. They are not included in the
-published core crate and do not extend the read, write, edit, CLI, or core WASM
-compatibility claims.
+The source workspace also contains the renderer and local MCP server. The
+browser facade is distributed separately as **`@rxls/render-worker` 0.3.0**;
+its version and protocol do not change the published native core or
+`rxls-wasm` compatibility claims. See its [README](../bindings/render-wasm/README.md)
+for the worker's interactive rendering and recalculating-edit methods.
 The worker keeps retained workbook bytes inside its dedicated session. For
 editable XLSX/XLSM packages it exposes typed cell inspection, cell value or
 formula replacement, document-property replacement, undo/redo, and preserved

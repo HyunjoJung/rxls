@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Native-core API additions below are not part of registry `rxls` 0.1.3.
+The npm `rxls-wasm` 0.1.3 and `@rxls/render-worker` 0.3.0 distributions have
+separate interfaces and version histories; worker features do not imply a
+native-core release.
+
 ### Added
 
 - Added worker-local, package-preserving XLSX/XLSM browser edits for typed cell
@@ -16,16 +21,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   external `openpyxl` reopen.
 - Added single-click in-cell editing and a live formula bar to the viewer,
   backed by bounded cell geometry from the same renderer layout as the SVG.
-- Added `Workbook::evaluate_cells` for shared-budget batch evaluation and
-  `Spreadsheet::set_formula_cached_values` for transactional cache updates
-  that preserve formula XML. Worker edits can refresh supported formulas as
-  one undoable change; unsupported formulas retain their cached values with
-  explicit diagnostics.
+- Added current-source `Workbook::evaluate_cells` for ordered, non-mutating
+  batch evaluation and `Spreadsheet::set_formula_cached_values` for atomic
+  cache updates that preserve formula XML. Each accepts at most 10,000 targets;
+  cache updates require distinct existing formula cells and separate edit-value
+  validation. Reopen saved bytes to refresh the parsed workbook view.
+- Added current-source `FormulaUnsupportedReason::TextLimitExceeded`
+  (`text_limit_exceeded`): 1 MiB per produced/copied text value and a shared
+  8 MiB UTF-8 generation/copy allowance, including intermediates and memo copies.
+  Batch evaluation returns an outer error on resource exhaustion, rather than
+  partial results. Worker 0.3.0 recalculating edits remain one undoable change;
+  unsupported formulas retain their cached values with explicit diagnostics.
 - Added a verification-only release pipeline command with exact-main identity
   checks and locally persisted run identities for safe resumption.
 
 ### Changed
 
+- Documented released core 0.1.3 versus current-source formula/cache APIs,
+  shared evaluation budgets, and the independently versioned npm packages in
+  the formula, preservation, compatibility, and worker guides.
 - Split renderer layout responsibilities and viewer controllers into focused
   modules, and refreshed the viewer ribbon, sheet navigation, and edit controls.
 - Made manual Pages verification non-deploying by default and checked exact
