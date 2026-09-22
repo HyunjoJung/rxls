@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
 import unittest
 from contextlib import chdir
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from public_corpus_manifest import corpus_files, manifest_files
 
@@ -17,7 +19,8 @@ class CorpusSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # getcwd() resolves macOS /var -> /private/var when a test changes cwd.
+        self.root = Path(temporary.name).resolve()
 
     def make_file(self, name: str) -> Path:
         path = self.root / name
@@ -84,6 +87,42 @@ class CorpusSelectionTests(unittest.TestCase):
         selected = self.make_file("book.xls")
         self.assertEqual(corpus_files(self.root / "missing", {".xls"}), [])
         self.assertEqual(corpus_files(selected, {".xls"}), [])
+
+    def test_flat_scan_open_errors_are_not_reported_as_empty_corpora(self) -> None:
+        for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O")):
+            with self.subTest(error=type(error).__name__):
+                with patch("public_corpus_manifest.os.scandir", side_effect=error):
+                    with self.assertRaises(type(error)) as raised:
+                        corpus_files(self.root, {".xls"})
+                self.assertIs(raised.exception, error)
+
+    def test_flat_scan_iteration_errors_do_not_return_partial_selection(self) -> None:
+        entry = MagicMock()
+        entry.name = "a.xls"
+        entry.is_file.return_value = True
+        error = OSError(errno.EIO, "I/O")
+
+        def entries():
+            yield entry
+            raise error
+
+        with patch("public_corpus_manifest.os.scandir") as scan:
+            scan.return_value.__enter__.return_value = entries()
+            with self.assertRaises(OSError) as raised:
+                corpus_files(self.root, {".xls"}, limit=1)
+        self.assertIs(raised.exception, error)
+        entry.is_file.assert_called_once_with()
+
+    def test_flat_entry_stat_errors_are_not_silently_skipped(self) -> None:
+        entry = MagicMock()
+        entry.name = "a.xls"
+        error = PermissionError(errno.EACCES, "denied")
+        entry.is_file.side_effect = error
+        with patch("public_corpus_manifest.os.scandir") as scan:
+            scan.return_value.__enter__.return_value = iter([entry])
+            with self.assertRaises(PermissionError) as raised:
+                corpus_files(self.root, {".xls"})
+        self.assertIs(raised.exception, error)
 
     def test_flat_relative_root_preserves_relative_output_paths(self) -> None:
         self.make_file("payload/book.xls")

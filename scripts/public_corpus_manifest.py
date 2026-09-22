@@ -184,6 +184,8 @@ def corpus_files(
 
     Extension dots are optional. Keep the previous flat, non-hidden selection
     policy, but do not interpret glob metacharacters in paths or extensions.
+    Missing or non-directory roots select nothing. Permission and other I/O
+    errors propagate so oracle runs cannot silently use a partial selection.
     """
     normalized_exts = _normalize_extensions(extensions)
     if not normalized_exts:
