@@ -102,7 +102,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-cfb = "0.14"
+cfb = "0.15"
 encoding_rs = "0.8"
 thiserror = "2.0"
 # .xlsx (OOXML) support — on by default; disable for the dependency-light
