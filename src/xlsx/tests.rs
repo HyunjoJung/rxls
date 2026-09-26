@@ -4593,6 +4593,73 @@ fn reads_merged_ranges_and_formula() {
 }
 
 #[test]
+fn differential_solid_fill_background_losses_do_not_hide_other_color_losses() {
+    let cases = [
+        (
+            "known solid foreground",
+            r#"<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>"#,
+            0,
+        ),
+        (
+            "background before foreground",
+            r#"<fill><patternFill patternType="solid"><bgColor indexed="64"/><fgColor rgb="FFFFC7CE"/></patternFill></fill>"#,
+            0,
+        ),
+        (
+            "pattern background remains meaningful",
+            r#"<fill><patternFill patternType="darkGrid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>"#,
+            1,
+        ),
+        (
+            "missing solid foreground",
+            r#"<fill><patternFill patternType="solid"><bgColor indexed="64"/></patternFill></fill>"#,
+            1,
+        ),
+        (
+            "unresolved solid foreground",
+            r#"<fill><patternFill patternType="solid"><fgColor theme="99"/><bgColor indexed="64"/></patternFill></fill>"#,
+            2,
+        ),
+        (
+            "unresolved font is independent",
+            r#"<font><color theme="99"/></font><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>"#,
+            1,
+        ),
+        (
+            "next fill cannot discard an unfinished background loss",
+            r#"<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/></patternFill></fill></fill>"#,
+            1,
+        ),
+    ];
+    let mut xml = String::from("<styleSheet><dxfs>");
+    for (_, dxf, _) in &cases {
+        xml.push_str("<dxf>");
+        xml.push_str(dxf);
+        xml.push_str("</dxf>");
+    }
+    xml.push_str("</dxfs></styleSheet>");
+    let styles = parse_styles(&xml, &ThemeColors::default());
+    assert_eq!(styles.differential_styles.len(), cases.len());
+    for ((label, _, expected), parsed) in cases.iter().zip(&styles.differential_styles) {
+        let unresolved = parsed
+            .losses
+            .iter()
+            .filter(|loss| loss.kind == StyleLossKind::UnresolvedColor)
+            .map(|loss| loss.occurrences)
+            .sum::<u32>();
+        assert_eq!(unresolved, *expected, "{label}");
+    }
+    for parsed in &styles.differential_styles[..2] {
+        assert!(parsed.losses.is_empty());
+        assert_eq!(parsed.style.fill, Some(Color::rgb(255, 199, 206)));
+        let fill = parsed.style.pattern_fill.unwrap();
+        assert_eq!(fill.pattern, crate::FormatPattern::Solid);
+        assert_eq!(fill.foreground, parsed.style.fill);
+        assert_eq!(fill.background, None);
+    }
+}
+
+#[test]
 fn conditional_metadata_retains_priority_stop_full_dxf_and_losses() {
     let styles_xml = r#"<styleSheet>
             <dxfs count="1"><dxf>

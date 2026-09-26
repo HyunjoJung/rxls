@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import importlib.metadata
 import json
@@ -127,9 +126,17 @@ def entry_path(manifest_path: str | os.PathLike[str], entry: dict) -> str | None
         os.path.abspath(os.path.join(manifest_dir, local_path)),
     ]
     for candidate in candidates:
-        if os.path.exists(candidate):
+        if os.path.isfile(candidate):
             return candidate
     return candidates[0]
+
+
+def _normalize_extensions(extensions: Iterable[str]) -> set[str]:
+    """Normalize case and optional leading dots without interpreting patterns."""
+    return {
+        (extension if extension.startswith(".") else f".{extension}").lower()
+        for extension in extensions
+    }
 
 
 def manifest_files(
@@ -137,8 +144,8 @@ def manifest_files(
     extensions: Iterable[str],
     limit: int | None = None,
 ) -> list[str]:
-    """Select ready local files with one of `extensions` from a corpus manifest."""
-    normalized_exts = {ext.lower() for ext in extensions}
+    """Select ready local regular files by case-insensitive extension."""
+    normalized_exts = _normalize_extensions(extensions)
     with open(manifest_path, encoding="utf-8") as fh:
         manifest = json.load(fh)
     entries = manifest.get("files", manifest) if isinstance(manifest, dict) else manifest
@@ -160,7 +167,7 @@ def manifest_files(
         if Path(source_path).suffix.lower() not in normalized_exts:
             continue
         path = entry_path(manifest_path, entry)
-        if path and os.path.exists(path):
+        if path and os.path.isfile(path):
             files.append(path)
     files = sorted(set(files))
     if limit is not None:
@@ -173,14 +180,28 @@ def corpus_files(
     extensions: Iterable[str],
     limit: int | None = None,
 ) -> list[str]:
-    """Select files with one of `extensions` from a flat corpus directory."""
-    normalized_exts = {ext.lower() for ext in extensions}
+    """Select regular files by case-insensitive suffix from one literal directory.
+
+    Extension dots are optional. Keep the previous flat, non-hidden selection
+    policy, but do not interpret glob metacharacters in paths or extensions.
+    Missing or non-directory roots select nothing. Permission and other I/O
+    errors propagate so oracle runs cannot silently use a partial selection.
+    """
+    normalized_exts = _normalize_extensions(extensions)
+    if not normalized_exts:
+        return []
     root = os.fspath(corpus_path)
-    files: list[str] = []
-    for ext in sorted(normalized_exts):
-        suffix = ext if ext.startswith(".") else f".{ext}"
-        files.extend(glob.glob(os.path.join(root, f"*{suffix}")))
-    files.sort()
+    try:
+        with os.scandir(root or os.curdir) as entries:
+            files = sorted(
+                os.path.join(root, entry.name)
+                for entry in entries
+                if not entry.name.startswith(".")
+                and Path(entry.name).suffix.lower() in normalized_exts
+                and entry.is_file()
+            )
+    except (FileNotFoundError, NotADirectoryError):
+        return []
     if limit is not None:
         return files[:limit]
     return files

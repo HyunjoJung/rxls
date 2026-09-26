@@ -56,6 +56,10 @@ EXPECTED_CI_RELEASE_ONLY_SCRIPTS = {
     "test_release_tools.py",
     "test_workflow_policy.py",
 }
+EXPECTED_HOSTED_ORACLE_STORAGE_SCRIPTS = {
+    "render-oracle-build-storage.sh",
+    "test_render_oracle_build_storage.py",
+}
 
 
 def write_crate(
@@ -143,6 +147,26 @@ class CorePackageGateTests(unittest.TestCase):
             f"scripts/{name}" for name in EXPECTED_CI_RELEASE_ONLY_SCRIPTS
         }
         self.assertEqual(expected - excluded, set())
+
+    def test_manifest_excludes_hosted_oracle_storage_scripts(self) -> None:
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        excluded = set(manifest["package"]["exclude"])
+        expected = {
+            f"scripts/{name}" for name in EXPECTED_HOSTED_ORACLE_STORAGE_SCRIPTS
+        }
+        self.assertEqual(expected - excluded, set())
+
+    def test_rejects_hosted_oracle_storage_scripts(self) -> None:
+        for name in sorted(EXPECTED_HOSTED_ORACLE_STORAGE_SCRIPTS):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                crate = Path(directory) / "rxls.crate"
+                write_crate(crate, {f"scripts/{name}": b"hosted oracle storage tooling"})
+                errors, report = MODULE.validate(crate)
+                self.assertIn(
+                    f"render-only script entered the core package: {name}",
+                    errors,
+                )
+                self.assertFalse(report["passed"])
 
     def test_rejects_absolute_fidelity_gate_script(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -39,6 +39,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Fixed fill-only conditional formatting failing automatic row layout when a
+  solid fill has a resolved foreground and an unused automatic background color.
 - Fixed default-style columns collapsing to zero width in Excel after
   `Workbook::open` followed by `to_xlsx` (#94). Column records now include
   their inherited width while retaining explicit widths, hidden/grouped

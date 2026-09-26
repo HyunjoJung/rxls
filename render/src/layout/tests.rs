@@ -4100,6 +4100,51 @@ fn implicit_xlsx_unattested_complex_base_falls_back_without_inflation() {
 }
 
 #[test]
+fn solid_conditional_fill_ignores_unused_automatic_background_in_text_layout() {
+    let range = RenderRange::new(0, 0, 0, 0);
+    let options = outlined_options(range);
+    let styles = |background: &str| {
+        format!(
+            r#"<styleSheet><fonts count="1"><font><sz val="11"/><name val="{}"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><dxfs count="1"><dxf><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/>{background}</patternFill></fill></dxf></dxfs></styleSheet>"#,
+            options.default_font_family,
+        )
+    };
+    let worksheet = |threshold: u32| {
+        format!(
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>123</v></c></row></sheetData><conditionalFormatting sqref="A1"><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>{threshold}</formula></cfRule></conditionalFormatting></worksheet>"#,
+        )
+    };
+    let normal = imported_xlsx(&styles(""), &worksheet(0));
+    let normal_axes = measure_sheet_axes(&normal.sheets[0], range, &options).unwrap();
+    let normal_scene = build_scene(&normal, 0, &options).unwrap();
+    let fill = Some(Rgb::new(255, 199, 206));
+    let painted = |build: &SceneBuild| {
+        build
+            .scene
+            .nodes
+            .iter()
+            .any(|node| matches!(node, SceneNode::Rect(rectangle) if rectangle.fill == fill))
+    };
+    assert!(painted(&normal_scene));
+
+    for (threshold, expected_fill) in [(0, true), (1000, false)] {
+        let workbook = imported_xlsx(&styles(r#"<bgColor indexed="64"/>"#), &worksheet(threshold));
+        let sheet = &workbook.sheets[0];
+        let measured = measure_sheet_axes(sheet, range, &options)
+            .expect("a fill-only rule must not make automatic text layout unresolved");
+        assert_eq!(measured.0[0].size, normal_axes.0[0].size);
+        assert!(!has_conditional_text_layout_overlay(sheet));
+        let build = build_scene(&workbook, 0, &options).unwrap();
+        assert_eq!(painted(&build), expected_fill);
+        assert!(!build
+            .report
+            .warnings
+            .iter()
+            .any(|warning| { warning.code == WarningCode::ConditionalFormattingDeferred }));
+    }
+}
+
+#[test]
 fn color_only_conditional_format_preserves_calc_layout_and_sizes_affected_rows() {
     let pack = synthetic_test_pack();
     let family = pack.default_family().to_string();

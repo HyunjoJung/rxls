@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 from datetime import datetime
 import hashlib
@@ -14,9 +15,15 @@ from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from typing import Any, Callable, Sequence
+import urllib.error
+import urllib.request
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +44,52 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_DISTRIBUTION_FILES = 50_000
 MAX_LIBRARIES = 512
+MAX_APT_INSTALLED_RECORDS = 20_000
+# Preinstalled runner companions with version-coupled dependencies on locked
+# libraries. The matching builds are in the unchanged August Ubuntu snapshot;
+# do not install these extras when they are absent from the runner.
+APT_COMPANION_SOURCES = {
+    "bzip2": "libbz2-1.0",
+    "libc6-i386": "libc6",
+    "libssl-dev": "libssl3t64",
+    "p11-kit": "libp11-kit0",
+    "p11-kit-modules": "libp11-kit0",
+    "zlib1g-dev": "zlib1g",
+}
+APT_RESTORATION_TIMEOUT_SECONDS = 30
+APT_RESTORATION_DEADLINE_SECONDS = 60
+MAX_APT_RESTORATION_BYTES = 1024 * 1024
+# These archive hashes and sizes were authenticated against Ubuntu's signed
+# 20260909T000000Z noble-updates/main/binary-amd64/Packages.xz index:
+# SHA256 3720dbb6f08b7a99bb77874fb0cd41d3180ec2187f558f264f6e612698df01a7.
+# Its InRelease (SHA256
+# 6698bd464397e9d49eddbc978c926c63e0b23aa3f196345e1aebe93b891f24b1)
+# verified with Ubuntu Archive Automatic Signing Key 2018 fingerprint
+# F6ECB3762474EDA9D21B7022871920D1991BC93C. Only these already-locked
+# versions are restored; this does not advance the configured apt snapshot.
+APT_RESTORATIONS = tuple(
+    {
+        "name": name,
+        "version": "1.20.1-6ubuntu2.8",
+        "architecture": "amd64",
+        "bytes": size,
+        "sha256": digest,
+        "url": (
+            "https://snapshot.ubuntu.com/ubuntu/20260909T000000Z/"
+            f"pool/main/k/krb5/{name}_1.20.1-6ubuntu2.8_amd64.deb"
+        ),
+    }
+    for name, size, digest in (
+        ("libgssapi-krb5-2", 142680,
+         "6cd99ec16ae12eb465712f950e43eaf03a8d2a6ab24c00178df56470d5343b66"),
+        ("libk5crypto3", 81946,
+         "48f689737191cfafaf3c158e9b07d6448f9e6217ad7abbaacc4f96dc95403fa2"),
+        ("libkrb5-3", 347620,
+         "63ab8110daea359f55d8135d395de198257acb1f948500c561745addddfece4c"),
+        ("libkrb5support0", 34688,
+         "cee1efc93d4ce4a97db756269824b5a2b90d2cb993cd76102432db60890819fc"),
+    )
+)
 EXPECTED_LOCK_KEYS = {
     "cairo",
     "expected_identity",
@@ -933,19 +986,20 @@ def validate_scoped_identity(
 #: has an exact ``libc6 (= <version>)`` dependency.  That is a dated drift, not
 #: a fidelity property — glibc 2.39-0ubuntu8.8 published 2026-07-27, after the
 #: pinned 20260718 snapshot, and runner images picked it up.  ``libc6-dev``
-#: contributes nothing to rendering or measurement, so it resolves freely while
-#: every package that does affect the oracle stays exactly pinned.  The
-#: ``poppler`` and ``all`` scopes are unaffected because they pin ``libc6``
-#: alongside it and are therefore self-consistent.
+#: contributes nothing to rendering or measurement, so it resolves freely in
+#: the default mode. The default ``poppler`` and ``all`` scopes also leave the
+#: coupled C runtime family unpinned. Explicit authenticated restoration below
+#: instead reconstructs the fully captured runtime for strict identity equality.
 BOOTSTRAP_UNPINNED_PACKAGES = frozenset({"libc6-dev:amd64"})
 
-#: The C runtime family, requested by name and never pinned.
+#: The C runtime family requested by name in the default acquisition mode.
+#: Opt-in authenticated restoration instead pins its complete coupled family.
 LIBC_FAMILY_UNPINNED_PACKAGES = frozenset(
     {"libc6:amd64", "libc6-dev:amd64", "libc-dev-bin"}
 )
 
 
-def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
+def default_apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     if scope == "bootstrap":
         top_level = [
             item["name"]
@@ -965,7 +1019,7 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
         # fails the run for a reason unrelated to the oracle.  Requesting the
         # attested closure makes the captured identity comparable by
         # construction instead of exempting libraries one at a time.
-        return sorted(set(top_level) | set(apt_specs(lock, "all")))
+        return sorted(set(top_level) | set(default_apt_specs(lock, "all")))
     expected = lock["expected_identity"]
     if expected is None:
         raise HostToolError("host_identity_pin_required")
@@ -978,11 +1032,9 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     elif scope != "poppler":
         raise HostToolError("scope")
     packages: dict[str, str] = {}
-    # The libc6 family resolves freely.  `libc6-dev` and `libc-dev-bin` each
-    # carry a strict `libc6 (= version)` dependency, so pinning any of them to
-    # the snapshot forces a downgrade of whatever C runtime the runner already
-    # carries.  None of the three participates in the identity requirement, so
-    # they are requested by name and left to apt.
+    # Retain the default mode's freely resolving C runtime family. Its strict
+    # inter-package dependencies require the opt-in restoration mode to pin
+    # every coupled member together when full captured identity must match.
     unpinned = sorted(LIBC_FAMILY_UNPINNED_PACKAGES)
     for row in sources:
         name = row["package_name"]
@@ -1003,6 +1055,318 @@ def apt_specs(lock: dict[str, Any], scope: str) -> list[str]:
     return sorted(
         unpinned + [f"{name}={packages[name]}" for name in sorted(packages)]
     )
+
+
+def restoration_specs(record: dict[str, Any]) -> set[str]:
+    return {
+        f"{record['name']}={record['version']}",
+        f"{record['name']}:{record['architecture']}={record['version']}",
+    }
+
+
+def relevant_apt_restorations(lock: dict[str, Any]) -> list[dict[str, Any]]:
+    if lock["expected_identity"] is None:
+        return []
+    specs = set(default_apt_specs(lock, "all"))
+    return [row for row in APT_RESTORATIONS if specs & restoration_specs(row)]
+
+
+def restoration_directory(path: Path, *, create: bool = False) -> Path:
+    """Require a non-symlink directory and safe, line-oriented absolute path."""
+    raw = str(path)
+    if (
+        not raw or len(raw) > 4096 or ".." in path.parts
+        or any(character.isspace() or character in "\"'\\" or ord(character) < 32
+               or ord(character) == 127 for character in raw)
+    ):
+        raise HostToolError("apt_restoration_path")
+    absolute = Path(os.path.abspath(path))
+    try:
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current /= part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                if not create:
+                    raise HostToolError("apt_restoration_path")
+                current.mkdir(mode=0o755)
+                metadata = current.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise HostToolError("apt_restoration_path")
+        metadata = absolute.lstat()
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+            raise HostToolError("apt_restoration_path")
+    except OSError as error:
+        raise HostToolError("apt_restoration_path") from error
+    return absolute
+
+
+def verify_restoration_payload(payload: bytes, record: dict[str, Any]) -> None:
+    size = positive_int(record["bytes"], "apt_restoration_size", MAX_APT_RESTORATION_BYTES)
+    if len(payload) != size:
+        raise HostToolError("apt_restoration_size")
+    if sha256_bytes(payload) != record["sha256"]:
+        raise HostToolError("apt_restoration_sha256")
+
+
+def verify_apt_restoration(path: Path, record: dict[str, Any]) -> Path:
+    """Authenticate an archive before inspecting metadata, without executing it."""
+    path = restoration_directory(path.parent) / path.name
+    size = positive_int(record["bytes"], "apt_restoration_size", MAX_APT_RESTORATION_BYTES)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as archive:
+            before = os.fstat(archive.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid != os.geteuid() or before.st_mode & 0o022
+            ):
+                raise HostToolError("apt_restoration_path")
+            if before.st_size != size:
+                raise HostToolError("apt_restoration_size")
+            verify_restoration_payload(archive.read(size + 1), record)
+            # --field reads the control metadata only; it never extracts or
+            # installs payloads or executes package maintainer scripts.
+            output = run_text(
+                ["dpkg-deb", "--field", str(path), "Package", "Version", "Architecture"],
+                "apt_restoration_metadata",
+            )
+            expected = {
+                "Package": record["name"], "Version": record["version"],
+                "Architecture": record["architecture"],
+            }
+            fields: dict[str, str] = {}
+            if len(output) > 1024:
+                raise HostToolError("apt_restoration_metadata")
+            for line in output.splitlines():
+                key, separator, value = line.partition(": ")
+                if not separator or key in fields:
+                    raise HostToolError("apt_restoration_metadata")
+                fields[key] = value
+            if fields != expected:
+                raise HostToolError("apt_restoration_metadata")
+            after = path.lstat()
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                 before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                 after.st_ctime_ns)
+                or not stat.S_ISREG(after.st_mode)
+            ):
+                raise HostToolError("apt_restoration_changed")
+    except OSError as error:
+        raise HostToolError("apt_restoration_path") from error
+    return path
+
+
+class NoRestorationRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HostToolError("apt_restoration_redirect")
+
+
+@contextmanager
+def restoration_download_deadline():
+    """Bound DNS, TLS, headers and body together on the supported POSIX host."""
+    def expired(_signum, _frame):
+        raise HostToolError("apt_restoration_timeout")
+
+    # This Linux acquisition CLI runs on the main thread. Refuse to borrow an
+    # active timer rather than masking a caller's existing deadline. A socket
+    # idle timeout alone does not stop an arbitrarily slow HTTP trickle.
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        raise HostToolError("apt_restoration_timer")
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, APT_RESTORATION_DEADLINE_SECONDS)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def download_apt_restoration(record: dict[str, Any]) -> bytes:
+    """Read at most the pinned size plus one with a total wall-clock limit."""
+    with restoration_download_deadline():
+        return read_apt_restoration_response(record)
+
+
+def read_apt_restoration_response(record: dict[str, Any]) -> bytes:
+    size = positive_int(record["bytes"], "apt_restoration_size", MAX_APT_RESTORATION_BYTES)
+    deadline = time.monotonic() + APT_RESTORATION_DEADLINE_SECONDS
+    request = urllib.request.Request(record["url"], headers={"Accept-Encoding": "identity"})
+    opener = urllib.request.build_opener(NoRestorationRedirect())
+    try:
+        with opener.open(request, timeout=APT_RESTORATION_TIMEOUT_SECONDS) as response:
+            if response.status != 200 or response.geturl() != record["url"]:
+                raise HostToolError("apt_restoration_response")
+            length = response.headers.get("Content-Length")
+            if length is not None and length != str(size):
+                raise HostToolError("apt_restoration_size")
+            if response.headers.get("Content-Encoding", "identity") != "identity":
+                raise HostToolError("apt_restoration_response")
+            payload = bytearray()
+            while len(payload) <= size:
+                if time.monotonic() >= deadline:
+                    raise HostToolError("apt_restoration_timeout")
+                chunk = response.read1(min(64 * 1024, size + 1 - len(payload)))
+                if time.monotonic() >= deadline:
+                    raise HostToolError("apt_restoration_timeout")
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > size:
+                    raise HostToolError("apt_restoration_size")
+    except (OSError, urllib.error.URLError) as error:
+        raise HostToolError("apt_restoration_download") from error
+    result = bytes(payload)
+    verify_restoration_payload(result, record)
+    return result
+
+
+def fetch_apt_restorations(lock: dict[str, Any], output_dir: Path) -> list[Path]:
+    records = relevant_apt_restorations(lock)
+    if not records:
+        return []
+    directory = restoration_directory(output_dir, create=True)
+    paths: list[Path] = []
+    for record in records:
+        destination = directory / record["url"].rsplit("/", 1)[1]
+        if os.path.lexists(destination):
+            paths.append(verify_apt_restoration(destination, record))
+            continue
+        payload = download_apt_restoration(record)
+        verify_restoration_payload(payload, record)
+        temporary: Path | None = None
+        try:
+            descriptor, name = tempfile.mkstemp(prefix=".restoration-", suffix=".deb", dir=directory)
+            temporary = Path(name)
+            with os.fdopen(descriptor, "wb") as archive:
+                archive.write(payload)
+                archive.flush()
+                os.fchmod(archive.fileno(), 0o644)
+            verify_apt_restoration(temporary, record)
+            # Publish without replacing an existing name, even under a race.
+            os.link(temporary, destination)
+            temporary.unlink()
+            temporary = None
+            paths.append(destination)
+        except OSError as error:
+            raise HostToolError("apt_restoration_path") from error
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return paths
+
+
+def exact_libc_specs(lock: dict[str, Any]) -> list[str]:
+    expected = lock["expected_identity"]
+    if expected is None:
+        raise HostToolError("host_identity_pin_required")
+    family = {"libc6", "libc6-dev", "libc-dev-bin", "libc-bin"}
+    versions: set[str] = set()
+    for section in ("poppler", "cairo", "python"):
+        for row in expected[section]["native_libraries"]:
+            name = row.get("package_name", row.get("provider", ""))
+            if name.split(":", 1)[0] not in family:
+                continue
+            version = row.get("package_version", row.get("provider_version", ""))
+            if (
+                name not in family and name not in {f"{item}:amd64" for item in family}
+                or DEBIAN_VERSION_RE.fullmatch(version) is None
+            ):
+                raise HostToolError("apt_restoration_libc_identity")
+            versions.add(version)
+    bootstrap = [row["version"] for row in lock["ubuntu_apt"]["bootstrap_packages"]
+                 if row["name"] == "libc6-dev:amd64"]
+    if len(versions) != 1 or len(bootstrap) != 1 or bootstrap[0] not in versions:
+        raise HostToolError("apt_restoration_libc_identity")
+    return [f"{name}:amd64={bootstrap[0]}" for name in sorted(family)]
+
+
+def installed_apt_companions() -> set[str]:
+    # Query the database once: requesting individual absent names makes
+    # dpkg-query fail, which must not be mistaken for a broken database. The
+    # existing process helper bounds wall time and output size; bound rows too.
+    output = run_text(
+        ["dpkg-query", "--show",
+         "--showformat=${Package}\t${Architecture}\t${db:Status-Status}\n"],
+        "apt_companion_query",
+    )
+    if output.count("\n") > MAX_APT_INSTALLED_RECORDS or (output and not output.endswith("\n")):
+        raise HostToolError("apt_companion_query")
+    installed: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise HostToolError("apt_companion_query")
+        name, architecture, status = fields
+        if (
+            DEBIAN_PACKAGE_RE.fullmatch(name) is None or ":" in name
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*", architecture) is None
+        ):
+            raise HostToolError("apt_companion_query")
+        if name not in APT_COMPANION_SOURCES:
+            continue
+        if (name, architecture) in seen:
+            raise HostToolError("apt_companion_query")
+        seen.add((name, architecture))
+        if status in {"not-installed", "config-files"}:
+            continue
+        if status != "installed":
+            raise HostToolError("apt_companion_status")
+        if architecture != "amd64":
+            raise HostToolError("apt_companion_architecture")
+        installed.add(name)
+    return installed
+
+
+def companion_apt_specs(lock: dict[str, Any]) -> list[str]:
+    expected = lock["expected_identity"]
+    if expected is None:
+        raise HostToolError("host_identity_pin_required")
+    specs: list[str] = []
+    for companion in sorted(installed_apt_companions()):
+        source = APT_COMPANION_SOURCES[companion]
+        versions: set[str] = set()
+        for section in ("poppler", "cairo", "python"):
+            for row in expected[section]["native_libraries"]:
+                name = row.get("package_name", row.get("provider", ""))
+                if name.split(":", 1)[0] != source:
+                    continue
+                version = row.get("package_version", row.get("provider_version", ""))
+                if (
+                    name not in {source, f"{source}:amd64"}
+                    or DEBIAN_VERSION_RE.fullmatch(version) is None
+                ):
+                    raise HostToolError("apt_companion_source_identity")
+                versions.add(version)
+        if len(versions) != 1:
+            raise HostToolError("apt_companion_source_identity")
+        specs.append(f"{companion}:amd64={next(iter(versions))}")
+    return sorted(specs)
+
+
+def apt_specs(
+    lock: dict[str, Any], scope: str, *, restoration_dir: Path | None = None
+) -> list[str]:
+    specs = default_apt_specs(lock, scope)
+    if restoration_dir is None or lock["expected_identity"] is None:
+        return specs
+    libc_specs = exact_libc_specs(lock)
+    directory = restoration_directory(restoration_dir)
+    replacements: dict[str, str] = {}
+    for record in relevant_apt_restorations(lock):
+        matches = set(specs) & restoration_specs(record)
+        if matches:
+            path = verify_apt_restoration(directory / record["url"].rsplit("/", 1)[1], record)
+            replacements.update({spec: str(path) for spec in matches})
+    family = {row.split(":", 1)[0] for row in libc_specs}
+    return sorted(set(libc_specs) | set(companion_apt_specs(lock)) | {
+        replacements.get(spec, spec) for spec in specs
+        if spec.split("=", 1)[0].split(":", 1)[0] not in family
+    })
 
 
 def apt_sources(lock: dict[str, Any]) -> str:
@@ -1146,6 +1510,10 @@ def build_parser() -> argparse.ArgumentParser:
     apt.add_argument(
         "--scope", choices=("all", "bootstrap", "poppler"), default="all"
     )
+    apt.add_argument("--restoration-dir", type=Path)
+
+    restorations = subparsers.add_parser("fetch-apt-restorations")
+    restorations.add_argument("--output-dir", type=Path, required=True)
 
     apt_source = subparsers.add_parser("apt-sources")
     apt_source.set_defaults(action="apt-sources")
@@ -1189,8 +1557,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.action == "apt-specs":
             lock, _ = load_lock(args.lock)
-            for spec in apt_specs(lock, args.scope):
+            for spec in apt_specs(lock, args.scope, restoration_dir=args.restoration_dir):
                 print(spec)
+            return 0
+        if args.action == "fetch-apt-restorations":
+            lock, _ = load_lock(args.lock)
+            for path in fetch_apt_restorations(lock, args.output_dir):
+                print(path)
             return 0
         if args.action == "apt-sources":
             lock, _ = load_lock(args.lock)
