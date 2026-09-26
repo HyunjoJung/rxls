@@ -165,6 +165,147 @@ class RestorationResponse(io.BytesIO):
 
 
 class RenderOracleHostToolsTests(unittest.TestCase):
+    def test_installed_companion_specs_derive_exact_versions_from_locked_libraries(self) -> None:
+        lock, _ = MODULE.load_lock()
+        installed = {
+            "bzip2", "libc6-i386", "libssl-dev", "p11-kit",
+            "p11-kit-modules", "zlib1g-dev",
+        }
+        with mock.patch.object(MODULE, "installed_apt_companions", return_value=installed):
+            self.assertEqual(MODULE.companion_apt_specs(lock), [
+                "bzip2:amd64=1.0.8-5.1build0.1",
+                "libc6-i386:amd64=2.39-0ubuntu8.8",
+                "libssl-dev:amd64=3.0.13-0ubuntu3.12",
+                "p11-kit-modules:amd64=0.25.3-4ubuntu2.1",
+                "p11-kit:amd64=0.25.3-4ubuntu2.1",
+                "zlib1g-dev:amd64=1:1.3.dfsg-3.1ubuntu2.1",
+            ])
+
+    def test_absent_companions_are_not_added_and_installed_query_is_bounded(self) -> None:
+        lock, _ = MODULE.load_lock()
+        output = (
+            "bash\tamd64\tinstalled\n"
+            "bzip2\tamd64\tconfig-files\n"
+            "libc6-i386\tamd64\tnot-installed\n"
+        )
+        with mock.patch.object(MODULE, "run_text", return_value=output) as query:
+            self.assertEqual(MODULE.companion_apt_specs(lock), [])
+            self.assertEqual(query.call_count, 1)
+            self.assertEqual(query.call_args.args, (
+                ["dpkg-query", "--show", "--showformat=${Package}\t${Architecture}\t${db:Status-Status}\n"],
+                "apt_companion_query",
+            ))
+
+    def test_companion_inventory_rejects_malformed_duplicate_foreign_or_partial_state(self) -> None:
+        for output, code in (
+            ("bzip2\tamd64\tinstalled", "apt_companion_query"),
+            ("bzip2\tinstalled\n", "apt_companion_query"),
+            ("bzip2:amd64\tamd64\tinstalled\n", "apt_companion_query"),
+            ("bzip2\t$(id)\tinstalled\n", "apt_companion_query"),
+            ("bzip2\tamd64\tinstalled\nbzip2\tamd64\tinstalled\n", "apt_companion_query"),
+            ("bzip2\ti386\tinstalled\n", "apt_companion_architecture"),
+            ("libc6-i386\tarm64\tinstalled\n", "apt_companion_architecture"),
+            ("libssl-dev\tamd64\thalf-installed\n", "apt_companion_status"),
+            ("p11-kit\tamd64\tunpacked\n", "apt_companion_status"),
+            ("zlib1g-dev\tamd64\ttriggers-pending\n", "apt_companion_status"),
+        ):
+            with self.subTest(output=output):
+                with mock.patch.object(MODULE, "run_text", return_value=output):
+                    with self.assertRaisesRegex(MODULE.HostToolError, code):
+                        MODULE.installed_apt_companions()
+        with mock.patch.object(MODULE, "MAX_APT_INSTALLED_RECORDS", 2):
+            with mock.patch.object(MODULE, "run_text", return_value="bash\tamd64\tinstalled\n" * 3):
+                with self.assertRaisesRegex(MODULE.HostToolError, "apt_companion_query"):
+                    MODULE.installed_apt_companions()
+
+    def test_companion_inventory_query_failure_is_not_treated_as_absence(self) -> None:
+        lock, _ = MODULE.load_lock()
+        with mock.patch.object(MODULE, "run_text", side_effect=MODULE.HostToolError("apt_companion_query")):
+            with self.assertRaisesRegex(MODULE.HostToolError, "apt_companion_query"):
+                MODULE.companion_apt_specs(lock)
+        result = subprocess.CompletedProcess([], 1, b"", b"database failure")
+        with mock.patch.object(MODULE.subprocess, "run", return_value=result) as query:
+            with self.assertRaisesRegex(MODULE.HostToolError, "apt_companion_query"):
+                MODULE.installed_apt_companions()
+            self.assertEqual(query.call_args.kwargs["timeout"], 15)
+            self.assertFalse(query.call_args.kwargs.get("shell", False))
+
+    def test_companion_sources_reject_missing_conflicting_foreign_or_unsafe_versions(self) -> None:
+        original, _ = MODULE.load_lock()
+        self.assertEqual(MODULE.APT_COMPANION_SOURCES, {
+            "bzip2": "libbz2-1.0", "libc6-i386": "libc6",
+            "libssl-dev": "libssl3t64", "p11-kit": "libp11-kit0",
+            "p11-kit-modules": "libp11-kit0", "zlib1g-dev": "zlib1g",
+        })
+        for companion, source in MODULE.APT_COMPANION_SOURCES.items():
+            for mutation in ("missing", "conflict", "architecture", "unsafe"):
+                lock = json.loads(json.dumps(original))
+                matches = []
+                for section in ("poppler", "cairo", "python"):
+                    rows = lock["expected_identity"][section]["native_libraries"]
+                    for row in rows:
+                        key = "provider" if section == "python" else "package_name"
+                        if row[key].split(":", 1)[0] == source:
+                            matches.append((row, key, "provider_version" if section == "python" else "package_version"))
+                    if mutation == "missing":
+                        lock["expected_identity"][section]["native_libraries"] = [
+                            row for row in rows
+                            if row.get("package_name", row.get("provider", "")).split(":", 1)[0] != source
+                        ]
+                self.assertTrue(matches)
+                row, name_key, version_key = matches[0]
+                if mutation == "conflict":
+                    # Add a contradictory row even for a source present only
+                    # once, rather than accidentally creating a consistent pin.
+                    conflict = dict(row)
+                    conflict[version_key] = "different-version"
+                    section = "python" if name_key == "provider" else "poppler"
+                    lock["expected_identity"][section]["native_libraries"].append(conflict)
+                elif mutation == "architecture":
+                    row[name_key] = f"{source}:arm64"
+                elif mutation == "unsafe":
+                    row[version_key] = "$(id)"
+                with self.subTest(companion=companion, mutation=mutation):
+                    with mock.patch.object(MODULE, "installed_apt_companions", return_value={companion}):
+                        with self.assertRaisesRegex(MODULE.HostToolError, "apt_companion_source_identity"):
+                            MODULE.companion_apt_specs(lock)
+
+    def test_companion_versions_are_derived_not_hardcoded(self) -> None:
+        lock, _ = MODULE.load_lock()
+        for section in ("poppler", "cairo", "python"):
+            for row in lock["expected_identity"][section]["native_libraries"]:
+                name = row.get("package_name", row.get("provider", ""))
+                if name.split(":", 1)[0] == "zlib1g":
+                    row["provider_version" if section == "python" else "package_version"] = "2:1.3.fixture-1"
+        with mock.patch.object(MODULE, "installed_apt_companions", return_value={"zlib1g-dev"}):
+            self.assertEqual(MODULE.companion_apt_specs(lock), ["zlib1g-dev:amd64=2:1.3.fixture-1"])
+
+    def test_companions_are_only_queried_for_pinned_opt_in_and_only_installed_are_added(self) -> None:
+        lock, _ = MODULE.load_lock()
+        with mock.patch.object(MODULE, "installed_apt_companions") as query:
+            for scope in ("all", "poppler", "bootstrap"):
+                self.assertEqual(MODULE.apt_specs(lock, scope), MODULE.default_apt_specs(lock, scope))
+            unpinned = json.loads(json.dumps(lock))
+            unpinned["expected_identity"] = None
+            self.assertEqual(
+                MODULE.apt_specs(unpinned, "bootstrap", restoration_dir=Path("/not-used")),
+                MODULE.default_apt_specs(unpinned, "bootstrap"),
+            )
+            query.assert_not_called()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            with (
+                mock.patch.object(MODULE, "verify_apt_restoration", side_effect=lambda path, _: path),
+                mock.patch.object(MODULE, "run_text", return_value="bzip2\tamd64\tinstalled\n") as query,
+            ):
+                for scope in ("all", "poppler", "bootstrap"):
+                    query.reset_mock()
+                    specs = MODULE.apt_specs(lock, scope, restoration_dir=root)
+                    self.assertEqual(query.call_count, 1)
+                    self.assertIn("bzip2:amd64=1.0.8-5.1build0.1", specs)
+                    for absent in set(MODULE.APT_COMPANION_SOURCES) - {"bzip2"}:
+                        self.assertFalse(any(spec.startswith(f"{absent}:amd64=") for spec in specs))
+
     def test_restoration_records_are_the_four_authenticated_exact_archives(self) -> None:
         records = MODULE.APT_RESTORATIONS
         self.assertEqual(len(records), 4)
@@ -201,7 +342,10 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
-            with mock.patch.object(MODULE, "verify_apt_restoration", side_effect=lambda path, _: path):
+            with (
+                mock.patch.object(MODULE, "verify_apt_restoration", side_effect=lambda path, _: path),
+                mock.patch.object(MODULE, "installed_apt_companions", return_value=set()),
+            ):
                 for scope in ("all", "poppler", "bootstrap"):
                     with self.subTest(scope=scope):
                         specs = MODULE.apt_specs(lock, scope, restoration_dir=root)

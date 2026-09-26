@@ -44,6 +44,18 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_DISTRIBUTION_FILES = 50_000
 MAX_LIBRARIES = 512
+MAX_APT_INSTALLED_RECORDS = 20_000
+# Preinstalled runner companions with version-coupled dependencies on locked
+# libraries. The matching builds are in the unchanged August Ubuntu snapshot;
+# do not install these extras when they are absent from the runner.
+APT_COMPANION_SOURCES = {
+    "bzip2": "libbz2-1.0",
+    "libc6-i386": "libc6",
+    "libssl-dev": "libssl3t64",
+    "p11-kit": "libp11-kit0",
+    "p11-kit-modules": "libp11-kit0",
+    "zlib1g-dev": "zlib1g",
+}
 APT_RESTORATION_TIMEOUT_SECONDS = 30
 APT_RESTORATION_DEADLINE_SECONDS = 60
 MAX_APT_RESTORATION_BYTES = 1024 * 1024
@@ -1272,6 +1284,70 @@ def exact_libc_specs(lock: dict[str, Any]) -> list[str]:
     return [f"{name}:amd64={bootstrap[0]}" for name in sorted(family)]
 
 
+def installed_apt_companions() -> set[str]:
+    # Query the database once: requesting individual absent names makes
+    # dpkg-query fail, which must not be mistaken for a broken database. The
+    # existing process helper bounds wall time and output size; bound rows too.
+    output = run_text(
+        ["dpkg-query", "--show",
+         "--showformat=${Package}\t${Architecture}\t${db:Status-Status}\n"],
+        "apt_companion_query",
+    )
+    if output.count("\n") > MAX_APT_INSTALLED_RECORDS or (output and not output.endswith("\n")):
+        raise HostToolError("apt_companion_query")
+    installed: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise HostToolError("apt_companion_query")
+        name, architecture, status = fields
+        if (
+            DEBIAN_PACKAGE_RE.fullmatch(name) is None or ":" in name
+            or re.fullmatch(r"[a-z0-9][a-z0-9-]*", architecture) is None
+        ):
+            raise HostToolError("apt_companion_query")
+        if name not in APT_COMPANION_SOURCES:
+            continue
+        if (name, architecture) in seen:
+            raise HostToolError("apt_companion_query")
+        seen.add((name, architecture))
+        if status in {"not-installed", "config-files"}:
+            continue
+        if status != "installed":
+            raise HostToolError("apt_companion_status")
+        if architecture != "amd64":
+            raise HostToolError("apt_companion_architecture")
+        installed.add(name)
+    return installed
+
+
+def companion_apt_specs(lock: dict[str, Any]) -> list[str]:
+    expected = lock["expected_identity"]
+    if expected is None:
+        raise HostToolError("host_identity_pin_required")
+    specs: list[str] = []
+    for companion in sorted(installed_apt_companions()):
+        source = APT_COMPANION_SOURCES[companion]
+        versions: set[str] = set()
+        for section in ("poppler", "cairo", "python"):
+            for row in expected[section]["native_libraries"]:
+                name = row.get("package_name", row.get("provider", ""))
+                if name.split(":", 1)[0] != source:
+                    continue
+                version = row.get("package_version", row.get("provider_version", ""))
+                if (
+                    name not in {source, f"{source}:amd64"}
+                    or DEBIAN_VERSION_RE.fullmatch(version) is None
+                ):
+                    raise HostToolError("apt_companion_source_identity")
+                versions.add(version)
+        if len(versions) != 1:
+            raise HostToolError("apt_companion_source_identity")
+        specs.append(f"{companion}:amd64={next(iter(versions))}")
+    return sorted(specs)
+
+
 def apt_specs(
     lock: dict[str, Any], scope: str, *, restoration_dir: Path | None = None
 ) -> list[str]:
@@ -1287,7 +1363,7 @@ def apt_specs(
             path = verify_apt_restoration(directory / record["url"].rsplit("/", 1)[1], record)
             replacements.update({spec: str(path) for spec in matches})
     family = {row.split(":", 1)[0] for row in libc_specs}
-    return sorted(set(libc_specs) | {
+    return sorted(set(libc_specs) | set(companion_apt_specs(lock)) | {
         replacements.get(spec, spec) for spec in specs
         if spec.split("=", 1)[0].split(":", 1)[0] not in family
     })
