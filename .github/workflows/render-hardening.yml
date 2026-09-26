@@ -13,11 +13,13 @@ on:
       - "scripts/render-oracle-host-requirements.txt"
       - "scripts/render-oracle-host-tools-lock.json"
       - "scripts/render-oracle-host-tools.py"
+      - "scripts/render-oracle-build-storage.sh"
       - "scripts/render-oracle-container/**"
       - "scripts/render-performance-gates.py"
       - "scripts/run-render-oracle-container.py"
       - "scripts/test_render_oracle_container.py"
       - "scripts/test_render_oracle_host_tools.py"
+      - "scripts/test_render_oracle_build_storage.py"
       - "scripts/test_render_fuzz_assets.py"
       - "scripts/test_render_performance_gates.py"
       - "scripts/test_workflow_policy.py"
@@ -113,6 +115,9 @@ jobs:
           set -euo pipefail
           APT_ROOT="$PWD/target/render-oracle-apt"
           mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          RESTORATION_ROOT="$APT_ROOT/restored"
+          python3 scripts/render-oracle-host-tools.py fetch-apt-restorations \
+            --output-dir "$RESTORATION_ROOT"
           python3 scripts/render-oracle-host-tools.py apt-sources \
             > "$APT_ROOT/ubuntu.sources"
           APT_OPTIONS=(
@@ -124,7 +129,8 @@ jobs:
           )
           python3 scripts/test_render_oracle_host_tools.py
           SYSTEM_PACKAGE_TEXT="$(
-            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler \
+              --restoration-dir "$RESTORATION_ROOT"
           )"
           mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
           [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
@@ -133,6 +139,7 @@ jobs:
             --yes \
             --no-install-recommends \
             --allow-downgrades \
+            --no-remove \
             "${SYSTEM_PACKAGES[@]}"
           python3 scripts/render-oracle-host-tools.py verify \
             --scope poppler \
@@ -176,6 +183,23 @@ jobs:
         env:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Prepare deterministic oracle build storage
+        id: oracle_build_storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}"
+          test "$(timeout 30 docker context show)" = default
+          test "$(timeout 30 docker context inspect default --format '{{.Endpoints.docker.Host}}')" = unix:///var/run/docker.sock
+          builder_names="$(timeout 30 docker buildx ls --format '{{.Name}}')"
+          while IFS= read -r builder_name; do
+            [[ "$builder_name" != rxls-oracle-client && "$builder_name" != 'rxls-oracle-client*' ]]
+          done <<< "$builder_names"
+          test -f scripts/render-oracle-build-storage.sh && test ! -L scripts/render-oracle-build-storage.sh
+          printf '%s  %s\n' cdea6bf846ecd4be1829ecd70afa789c198a70f23b2e54eb3791d6689798bf48 scripts/render-oracle-build-storage.sh | sha256sum --check --status
+          sudo --preserve-env=RUNNER_TEMP,RUNNER_OS,RUNNER_ENVIRONMENT,GITHUB_ACTIONS,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_JOB \
+            bash scripts/render-oracle-build-storage.sh prepare
+          printf '%s\n' 'active=true' >> "$GITHUB_OUTPUT"
       - name: Set up the pinned Buildx client
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -188,7 +212,10 @@ jobs:
             provenance-add-gha=false
           buildkitd-flags: --oci-worker-snapshotter=native
       - name: Enforce hosted workflow policy
-        run: python3 scripts/check_workflow_policy.py
+        run: |
+          python3 scripts/check_workflow_policy.py
+          python3 scripts/test_render_oracle_build_storage.py
+          bash -n scripts/render-oracle-build-storage.sh
       - name: Build and verify the locked oracle image
         shell: bash
         env:
@@ -313,6 +340,47 @@ jobs:
           assert evidence["expected_image_id"] == expected == evidence["built_image_id"], evidence
           assert evidence["expected_manifest_digest"] == expected_manifest == evidence["built_manifest_digest"], evidence
           PY
+      - name: Restore original Docker build storage
+        if: ${{ always() && steps.oracle_build_storage.outcome != 'skipped' }}
+        shell: bash
+        env:
+          ORACLE_BUILD_STORAGE_ACTIVE: ${{ steps.oracle_build_storage.outputs.active }}
+        run: |
+          set -euo pipefail
+          restore_status=0
+          client_present() {
+            local builder_names builder_name
+            builder_names="$(timeout 30 docker buildx ls --format '{{.Name}}')" || return 2
+            while IFS= read -r builder_name; do
+              if [[ "$builder_name" == rxls-oracle-client || "$builder_name" == 'rxls-oracle-client*' ]]; then
+                return 0
+              fi
+            done <<< "$builder_names"
+            return 1
+          }
+          if [[ "$ORACLE_BUILD_STORAGE_ACTIVE" == "true" ]]; then
+            if client_present; then
+              if timeout 30 docker buildx inspect rxls-oracle-client > /dev/null 2>&1; then
+                timeout 120 docker buildx rm --force rxls-oracle-client || restore_status=$?
+              else
+                restore_status=$?
+              fi
+            else
+              inventory_status=$?
+              if [[ "$inventory_status" != 1 ]]; then restore_status="$inventory_status"; fi
+            fi
+            if client_present; then
+              restore_status=1
+            else
+              inventory_status=$?
+              if [[ "$inventory_status" != 1 ]]; then restore_status="$inventory_status"; fi
+            fi
+          fi
+          test -f scripts/render-oracle-build-storage.sh && test ! -L scripts/render-oracle-build-storage.sh
+          printf '%s  %s\n' cdea6bf846ecd4be1829ecd70afa789c198a70f23b2e54eb3791d6689798bf48 scripts/render-oracle-build-storage.sh | sha256sum --check --status
+          sudo --preserve-env=RUNNER_TEMP,RUNNER_OS,RUNNER_ENVIRONMENT,GITHUB_ACTIONS,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_JOB \
+            bash scripts/render-oracle-build-storage.sh restore || restore_status=$?
+          exit "$restore_status"
       - name: Upload oracle image identity evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

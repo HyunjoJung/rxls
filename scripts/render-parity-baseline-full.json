@@ -6442,7 +6442,7 @@
     }
   },
   "comparable_files": 800,
-  "configuration_sha256": "854490cba04fd43eb5b662a938030d7d18dd45b7540ce111671085d42aa5cec9",
+  "configuration_sha256": "a4b34649a1f7cadae6a18cb25d6cf5129070c2d23cd5272ff83196c94a891fe8",
   "input_files": 800,
   "input_set_sha256": "45dfaaac5e94e98da038c561d98eed48e8785f56749760d39bac8a720b132db9",
   "schema": "rxls.render-parity-ratchet-envelope.v1",
@@ -6450,8 +6450,8 @@
     "candidate_count": 2,
     "candidate_schema": "rxls.render-parity-observed-candidate.v1",
     "candidate_sha256s": [
-      "aca72422ac93c63862bd8d70595d79f951116ed06cb98e3ef16e180699112716",
-      "aca72422ac93c63862bd8d70595d79f951116ed06cb98e3ef16e180699112716"
+      "c9734b5eafb15af635ce3b47baaabc7527134232e675ae247ca92dbb32876fba",
+      "c9734b5eafb15af635ce3b47baaabc7527134232e675ae247ca92dbb32876fba"
     ],
     "delta_bounds": [
       "p90",
@@ -6479,7 +6479,6 @@
   },
   "warning_counts": {
     "cached_formula_display": 400,
-    "conditional_formatting_deferred": 100,
     "font_family_substituted": 3827,
     "numeric_overflow_hashed": 100,
     "source_styles_partial": 400
