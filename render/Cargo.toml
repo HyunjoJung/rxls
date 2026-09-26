@@ -32,5 +32,5 @@ unicode-segmentation = "1.12.0"
 subsetter = { version = "0.2.6", default-features = false }
 
 [dev-dependencies]
-cfb = "0.14"
+cfb = "0.15"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
