@@ -1279,6 +1279,474 @@ steps:
                             expected_attempts,
                         )
 
+    def test_oracle_build_storage_is_temporary_guarded_and_fail_closed(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+
+        def audit(text):
+            errors = []
+            self.policy._audit_oracle_build_storage(
+                RENDER_ORACLE_WORKFLOW, text, errors
+            )
+            return errors
+
+        self.assertEqual(audit(original), [])
+        prepare = self.policy._yaml_blocks(
+            original, "- name: Prepare deterministic oracle build storage", 6
+        )[0]
+        restore = self.policy._yaml_blocks(
+            original, "- name: Restore original Docker build storage", 6
+        )[0]
+        mutations = {
+            "missing_prepare": original.replace(prepare, "", 1),
+            "missing_restore": original.replace(restore, "", 1),
+            "wrong_prepare_mode": original.replace(
+                "render-oracle-build-storage.sh prepare", "render-oracle-build-storage.sh restore", 1
+            ),
+            "restore_success_only": original.replace(
+                "always() && steps.oracle_build_storage.outcome != 'skipped'",
+                "success() && steps.oracle_build_storage.outcome != 'skipped'", 1
+            ),
+            "remove_without_ownership": original.replace(
+                'if [[ "$ORACLE_BUILD_STORAGE_ACTIVE" == "true" ]]; then',
+                "if true; then", 1
+            ),
+            "no_client_removal": original.replace(
+                "timeout 120 docker buildx rm --force rxls-oracle-client",
+                "echo retained-client", 1
+            ),
+            "ignore_restore_failure": original.replace(
+                "render-oracle-build-storage.sh restore || restore_status=$?",
+                "render-oracle-build-storage.sh restore || true", 1
+            ),
+            "restore_after_campaign": original.replace(restore, "", 1).replace(
+                "      - name: Verify evidence source remained exact and clean",
+                restore + "      - name: Verify evidence source remained exact and clean", 1
+            ),
+            "no_preexisting_builder_check": original.replace(
+                "[[ \"$builder_name\" != rxls-oracle-client && \"$builder_name\" != 'rxls-oracle-client*' ]]",
+                "true", 1
+            ),
+            "missing_helper_tests": original.replace(
+                "          python3 scripts/test_render_oracle_build_storage.py\n", "", 1
+            ),
+            "best_effort_restore": original.replace(
+                "      - name: Restore original Docker build storage\n",
+                "      - name: Restore original Docker build storage\n        continue-on-error: true\n", 1
+            ),
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(mutated, original)
+                self.assertTrue(audit(mutated))
+
+    def test_oracle_build_storage_run_allowlist_is_exact_and_contextual(self) -> None:
+        allowed = self.policy.ORACLE_BUILD_STORAGE_RUN_SHA256
+        self.assertIsInstance(allowed, frozenset)
+        self.assertEqual(len(allowed), 2)
+        headers = (
+            "- name: Prepare deterministic oracle build storage",
+            "- name: Restore original Docker build storage",
+        )
+        for workflow_path in (
+            RENDER_ORACLE_WORKFLOW,
+            RENDER_HARDENING_WORKFLOW,
+        ):
+            original = workflow_path.read_text(encoding="utf-8")
+            self.assertTrue(self.policy._direct_docker_build_commands(original))
+            self.assertEqual(
+                self.policy._direct_docker_build_commands(
+                    original,
+                    allowed_run_sha256=allowed,
+                ),
+                [],
+            )
+            for header in headers:
+                blocks = self.policy._yaml_blocks(original, header, 6)
+                self.assertEqual(len(blocks), 1)
+                scripts = self.policy._workflow_run_scripts(
+                    "    steps:\n" + blocks[0]
+                )
+                self.assertEqual(len(scripts), 1)
+                self.assertIn(
+                    hashlib.sha256(scripts[0].encode("utf-8")).hexdigest(),
+                    allowed,
+                )
+                mutated = original.replace(
+                    blocks[0],
+                    blocks[0].replace("set -euo pipefail", "set -euo pipefail\n          :", 1),
+                    1,
+                )
+                self.assertNotEqual(mutated, original)
+                self.assertTrue(
+                    self.policy._direct_docker_build_commands(
+                        mutated,
+                        allowed_run_sha256=allowed,
+                    )
+                )
+
+    @unittest.skipIf(os.name == "nt", "requires symlink semantics")
+    def test_oracle_build_storage_helper_requires_exact_regular_file(self) -> None:
+        helper = ROOT / "scripts" / "render-oracle-build-storage.sh"
+        payload = helper.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(payload).hexdigest(),
+            self.policy.ORACLE_BUILD_STORAGE_HELPER_SHA256,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            target = scripts / helper.name
+
+            self.assertTrue(self.policy._audit_oracle_build_storage_helper(root))
+
+            target.write_bytes(payload)
+            self.assertEqual(
+                self.policy._audit_oracle_build_storage_helper(root),
+                [],
+            )
+
+            target.write_bytes(payload + b"\n")
+            self.assertTrue(self.policy._audit_oracle_build_storage_helper(root))
+
+            target.unlink()
+            target.symlink_to(helper)
+            self.assertTrue(self.policy._audit_oracle_build_storage_helper(root))
+
+    @unittest.skipIf(os.name == "nt", "executes an Ubuntu workflow shell")
+    def test_oracle_build_storage_restore_executes_and_fails_closed(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        extraction_errors: list[str] = []
+        step = self.policy._single_yaml_block(
+            RENDER_ORACLE_WORKFLOW,
+            original,
+            "- name: Restore original Docker build storage",
+            6,
+            "oracle build storage restoration",
+            extraction_errors,
+        )
+        self.assertEqual(extraction_errors, [])
+        run_marker = "        run: |\n"
+        self.assertIn(run_marker, step)
+        run_script = textwrap.dedent(step.split(run_marker, 1)[1])
+
+        timeout_stub = textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            shift
+            exec "$@"
+            """
+        )
+        docker_stub = textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+            if [[ "$1" == buildx && "$2" == ls ]]; then
+              count=0
+              if [[ -f "$MOCK_STATE_DIR/list-count" ]]; then
+                count="$(<"$MOCK_STATE_DIR/list-count")"
+              fi
+              count=$((count + 1))
+              printf '%s\n' "$count" > "$MOCK_STATE_DIR/list-count"
+              case "$MOCK_SCENARIO:$count" in
+                initial_inventory_fail:1) exit 74 ;;
+                initial_inventory_timeout:1) exit 124 ;;
+                post_inventory_fail:2) exit 75 ;;
+              esac
+              if [[ -f "$MOCK_STATE_DIR/client-present" ]]; then
+                printf '%s\n' 'rxls-oracle-client*'
+              else
+                printf '%s\n' 'default*'
+              fi
+              exit 0
+            fi
+            if [[ "$1" == buildx && "$2" == inspect ]]; then
+              case "$MOCK_SCENARIO" in
+                initial_inventory_fail) exit 74 ;;
+                initial_inventory_timeout) exit 124 ;;
+                inspect_fail) exit 76 ;;
+              esac
+              [[ -f "$MOCK_STATE_DIR/client-present" ]]
+              exit
+            fi
+            if [[ "$1" == buildx && "$2" == rm ]]; then
+              if [[ "$MOCK_SCENARIO" == rm_fail ]]; then
+                exit 77
+              fi
+              rm -f "$MOCK_STATE_DIR/client-present"
+              exit 0
+            fi
+            exit 99
+            """
+        )
+        sudo_stub = textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            printf '%s\n' restore >> "$MOCK_RESTORE_LOG"
+            exit "$MOCK_RESTORE_STATUS"
+            """
+        )
+        sha256sum_stub = textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            checksum_line="$(cat)"
+            [[ "$checksum_line" == "$MOCK_HELPER_SHA  scripts/render-oracle-build-storage.sh" ]]
+            [[ "$MOCK_HELPER_HASH_MATCH" == true ]]
+            """
+        )
+        scenarios = {
+            "normal_client_cleanup": (True, 0, True, True, 1, 1),
+            "already_absent": (False, 0, True, True, 0, 1),
+            "initial_inventory_fail": (True, 0, True, False, 0, 1),
+            "initial_inventory_timeout": (True, 0, True, False, 0, 1),
+            "post_inventory_fail": (True, 0, True, False, 1, 1),
+            "inspect_fail": (True, 0, True, False, 0, 1),
+            "rm_fail": (True, 0, True, False, 1, 1),
+            "restore_fail": (False, 78, True, False, 0, 1),
+            "helper_hash_mismatch": (False, 0, False, False, 0, 0),
+        }
+        for scenario, (
+            client_present,
+            restore_status,
+            helper_hash_match,
+            expected_success,
+            expected_removals,
+            expected_restores,
+        ) in scenarios.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                bin_dir = root / "bin"
+                state_dir = root / "state"
+                scripts_dir = root / "scripts"
+                bin_dir.mkdir()
+                state_dir.mkdir()
+                scripts_dir.mkdir()
+                (scripts_dir / "render-oracle-build-storage.sh").write_text(
+                    "#!/usr/bin/env bash\n",
+                    encoding="utf-8",
+                )
+                for name, content in (
+                    ("timeout", timeout_stub),
+                    ("docker", docker_stub),
+                    ("sha256sum", sha256sum_stub),
+                    ("sudo", sudo_stub),
+                ):
+                    executable = bin_dir / name
+                    executable.write_text(content, encoding="utf-8")
+                    executable.chmod(0o755)
+                if client_present:
+                    (state_dir / "client-present").touch()
+                docker_log = root / "docker.log"
+                restore_log = root / "restore.log"
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "MOCK_DOCKER_LOG": str(docker_log),
+                        "MOCK_HELPER_HASH_MATCH": (
+                            "true" if helper_hash_match else "false"
+                        ),
+                        "MOCK_HELPER_SHA": (
+                            self.policy.ORACLE_BUILD_STORAGE_HELPER_SHA256
+                        ),
+                        "MOCK_RESTORE_LOG": str(restore_log),
+                        "MOCK_RESTORE_STATUS": str(restore_status),
+                        "MOCK_SCENARIO": scenario,
+                        "MOCK_STATE_DIR": str(state_dir),
+                        "ORACLE_BUILD_STORAGE_ACTIVE": "true",
+                        "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+                    }
+                )
+                result = subprocess.run(
+                    ["bash"],
+                    input=run_script,
+                    text=True,
+                    cwd=root,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                if expected_success:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    (
+                        restore_log.read_text(encoding="utf-8").splitlines()
+                        if restore_log.exists()
+                        else []
+                    ),
+                    ["restore"] * expected_restores,
+                )
+                docker_commands = docker_log.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                self.assertEqual(
+                    sum(command.startswith("buildx rm ") for command in docker_commands),
+                    expected_removals,
+                )
+
+    @unittest.skipIf(os.name == "nt", "executes an Ubuntu workflow shell")
+    def test_oracle_build_storage_prepare_authenticates_before_sudo(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        extraction_errors: list[str] = []
+        step = self.policy._single_yaml_block(
+            RENDER_ORACLE_WORKFLOW,
+            original,
+            "- name: Prepare deterministic oracle build storage",
+            6,
+            "oracle build storage preparation",
+            extraction_errors,
+        )
+        self.assertEqual(extraction_errors, [])
+        run_marker = "        run: |\n"
+        self.assertIn(run_marker, step)
+        run_script = textwrap.dedent(step.split(run_marker, 1)[1])
+        stubs = {
+            "timeout": textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                shift
+                exec "$@"
+                """
+            ),
+            "docker": textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                case "$1:$2" in
+                  context:show) printf '%s\n' default ;;
+                  context:inspect) printf '%s\n' unix:///var/run/docker.sock ;;
+                  buildx:ls) printf '%s\n' 'default*' ;;
+                  *) exit 99 ;;
+                esac
+                """
+            ),
+            "sha256sum": textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                checksum_line="$(cat)"
+                [[ "$checksum_line" == "$MOCK_HELPER_SHA  scripts/render-oracle-build-storage.sh" ]]
+                [[ "$MOCK_HELPER_HASH_MATCH" == true ]]
+                """
+            ),
+            "sudo": textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                printf '%s\n' prepare >> "$MOCK_SUDO_LOG"
+                """
+            ),
+        }
+        for helper_hash_match in (True, False):
+            with self.subTest(
+                helper_hash_match=helper_hash_match
+            ), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                bin_dir = root / "bin"
+                scripts_dir = root / "scripts"
+                bin_dir.mkdir()
+                scripts_dir.mkdir()
+                (scripts_dir / "render-oracle-build-storage.sh").write_text(
+                    "#!/usr/bin/env bash\n",
+                    encoding="utf-8",
+                )
+                for name, content in stubs.items():
+                    executable = bin_dir / name
+                    executable.write_text(content, encoding="utf-8")
+                    executable.chmod(0o755)
+                sudo_log = root / "sudo.log"
+                github_output = root / "github-output.txt"
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "DOCKER_CONTEXT": "",
+                        "DOCKER_HOST": "",
+                        "GITHUB_OUTPUT": str(github_output),
+                        "MOCK_HELPER_HASH_MATCH": (
+                            "true" if helper_hash_match else "false"
+                        ),
+                        "MOCK_HELPER_SHA": (
+                            self.policy.ORACLE_BUILD_STORAGE_HELPER_SHA256
+                        ),
+                        "MOCK_SUDO_LOG": str(sudo_log),
+                        "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
+                    }
+                )
+                result = subprocess.run(
+                    ["bash"],
+                    input=run_script,
+                    text=True,
+                    cwd=root,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
+                    helper_hash_match,
+                    result.stderr,
+                )
+                self.assertEqual(
+                    (
+                        sudo_log.read_text(encoding="utf-8").splitlines()
+                        if sudo_log.exists()
+                        else []
+                    ),
+                    ["prepare"] if helper_hash_match else [],
+                )
+                self.assertEqual(
+                    (
+                        github_output.read_text(encoding="utf-8").splitlines()
+                        if github_output.exists()
+                        else []
+                    ),
+                    ["active=true"] if helper_hash_match else [],
+                )
+
+    def test_oracle_image_job_reuses_guarded_storage_lifecycle(self) -> None:
+        oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        headers = (
+            "- name: Prepare deterministic oracle build storage",
+            "- name: Restore original Docker build storage",
+        )
+        for header in headers:
+            self.assertEqual(
+                self.policy._yaml_blocks(oracle, header, 6),
+                self.policy._yaml_blocks(hardening, header, 6),
+            )
+        errors = []
+        self.policy._audit_oracle_build_storage(
+            RENDER_HARDENING_WORKFLOW, hardening, errors, image_only=True
+        )
+        self.assertEqual(errors, [])
+        restore = self.policy._yaml_blocks(hardening, headers[1], 6)[0]
+        mutations = (
+            hardening.replace(restore, "", 1),
+            hardening.replace(restore, "", 1).replace(
+                "      - name: Build and verify the locked oracle image",
+                restore + "      - name: Build and verify the locked oracle image", 1
+            ),
+            hardening.replace("python3 scripts/test_render_oracle_build_storage.py", "true", 1),
+        )
+        for mutated in mutations:
+            self.assertNotEqual(mutated, hardening)
+            errors = []
+            self.policy._audit_oracle_build_storage(
+                RENDER_HARDENING_WORKFLOW, mutated, errors, image_only=True
+            )
+            self.assertTrue(errors)
+
     def test_oracle_build_jobs_reject_unreviewed_step_surface(self) -> None:
         oracle = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
         hardening = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
@@ -2555,8 +3023,8 @@ steps:
                 "    runs-on: ubuntu-24.04", "    runs-on: ubuntu-latest"
             ),
             "oci_policy_step": mutate_image(
-                "        run: python3 scripts/check_workflow_policy.py",
-                "        run: true",
+                "          python3 scripts/check_workflow_policy.py\n",
+                "          true\n",
             ),
             "oci_buildx_version": mutate_image(
                 "          version: v0.35.0",
