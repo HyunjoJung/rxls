@@ -209,6 +209,9 @@ jobs:
           set -euo pipefail
           APT_ROOT="$PWD/target/render-oracle-apt"
           mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          RESTORATION_ROOT="$APT_ROOT/restored"
+          python3 scripts/render-oracle-host-tools.py fetch-apt-restorations \
+            --output-dir "$RESTORATION_ROOT"
           python3 scripts/render-oracle-host-tools.py apt-sources \
             > "$APT_ROOT/ubuntu.sources"
           APT_OPTIONS=(
@@ -220,11 +223,13 @@ jobs:
           )
           if [[ "$RXLS_IDENTITY_BOOTSTRAP" == "1" ]]; then
             SYSTEM_PACKAGE_TEXT="$(
-              python3 scripts/render-oracle-host-tools.py apt-specs --scope bootstrap
+              python3 scripts/render-oracle-host-tools.py apt-specs --scope bootstrap \
+                --restoration-dir "$RESTORATION_ROOT"
             )"
           else
             SYSTEM_PACKAGE_TEXT="$(
-              python3 scripts/render-oracle-host-tools.py apt-specs --scope all
+              python3 scripts/render-oracle-host-tools.py apt-specs --scope all \
+                --restoration-dir "$RESTORATION_ROOT"
             )"
           fi
           mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
@@ -234,6 +239,7 @@ jobs:
             --yes \
             --no-install-recommends \
             --allow-downgrades \
+            --no-remove \
             "${SYSTEM_PACKAGES[@]}"
           python3 -m pip install \
             --disable-pip-version-check \

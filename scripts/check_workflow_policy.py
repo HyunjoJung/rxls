@@ -134,7 +134,7 @@ ORACLE_RENDER_STEP_SHA256 = (
     "f14b7dfb812098fb6d42a40b09a3eeae8fc9f8be29182170c2ae3db46477c6bb",
     "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
     "736adb4fbe36521a6ca77d28b07fa4a62106b89cca089c048893a00b712ef2ab",
-    "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
+    "450afbeb424f03bb000719f015ac895f147f98bad6f4f00c76dc019f0297bf99",
     "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
@@ -161,7 +161,7 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "948975307e04cbca76b7c3007cdc4b74e5940c60d400678b550f9e7f6a969998"
+    "adaf574d6028e1bcfe83b5a4007553108f4e37e7ee27a0c71d283659d221f02b"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
     "b52b8bde803f6cfc2ffb40f533febf6b5d75dcb17326943546497c921e0c60cc"
@@ -1700,6 +1700,8 @@ def _audit_snapshot_apt_block(
     label: str,
     scopes: tuple[str, ...],
     errors: list[str],
+    *,
+    require_restorations: bool = False,
 ) -> None:
     """Require one isolated, immutable Ubuntu snapshot acquisition."""
 
@@ -1745,20 +1747,74 @@ def _audit_snapshot_apt_block(
             )
 
     commands = _normalized_active_commands(block)
+    if require_restorations:
+        restoration_root = 'RESTORATION_ROOT="$APT_ROOT/restored"'
+        fetch = (
+            "python3 scripts/render-oracle-host-tools.py fetch-apt-restorations "
+            '--output-dir "$RESTORATION_ROOT"'
+        )
+        restored_specs = [
+            "python3 scripts/render-oracle-host-tools.py apt-specs "
+            f'--scope {scope} --restoration-dir "$RESTORATION_ROOT"'
+            for scope in scopes
+        ]
+        ordered_commands = [
+            'APT_ROOT="$PWD/target/render-oracle-apt"',
+            'mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"',
+            restoration_root,
+            fetch,
+            "python3 scripts/render-oracle-host-tools.py apt-sources "
+            '> "$APT_ROOT/ubuntu.sources"',
+            *restored_specs,
+            'mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"',
+            '[[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]',
+            'sudo apt-get "${APT_OPTIONS[@]}" update',
+        ]
+        positions = [
+            commands.index(command)
+            for command in ordered_commands
+            if commands.count(command) == 1
+        ]
+        if (
+            [command for command in commands if "fetch-apt-restorations" in command]
+            != [fetch]
+            or [
+                command
+                for command in commands
+                if command.startswith("RESTORATION_ROOT=")
+            ] != [restoration_root]
+            or [
+                command
+                for command in commands
+                if command.startswith(
+                    "python3 scripts/render-oracle-host-tools.py apt-specs "
+                )
+            ] != restored_specs
+            or len(positions) != len(ordered_commands)
+            or positions != sorted(positions)
+        ):
+            errors.append(
+                f"{path}: {label} restoration must use the exact job-local root, "
+                "verified fetch, and restored package specs in the reviewed order"
+            )
+
     apt_commands = [
         command for command in commands if command.startswith("sudo apt-get ")
     ]
+    removal_guard = "--no-remove " if require_restorations else ""
     if apt_commands != [
         'sudo apt-get "${APT_OPTIONS[@]}" update',
         (
             'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
             "--no-install-recommends --allow-downgrades "
+            f"{removal_guard}"
             '"${SYSTEM_PACKAGES[@]}"'
         ),
     ]:
         errors.append(
             f"{path}: {label} must update and install only through the isolated "
             "snapshot options"
+            + (" without package removals" if require_restorations else "")
         )
     forbidden = (
         "archive.ubuntu.com",
@@ -3328,6 +3384,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "host comparison acquisition",
         ("bootstrap", "all"),
         errors,
+        require_restorations=True,
     )
     required = {
         '      - "scripts/render_parity_geometry_gate.py"': (

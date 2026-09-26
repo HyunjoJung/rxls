@@ -872,6 +872,89 @@ steps:
 
         self.assertTrue(any("no workflows found" in error for error in errors))
 
+    def test_render_oracle_requires_verified_apt_restorations(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        root = '          RESTORATION_ROOT="$APT_ROOT/restored"\n'
+        fetch = (
+            "          python3 scripts/render-oracle-host-tools.py fetch-apt-restorations \\\n"
+            '            --output-dir "$RESTORATION_ROOT"\n'
+        )
+        apt_root = '          APT_ROOT="$PWD/target/render-oracle-apt"\n'
+        caches = (
+            '          mkdir -p "$APT_ROOT/lists/partial" '
+            '"$APT_ROOT/cache/archives/partial"\n'
+        )
+        update = '          sudo apt-get "${APT_OPTIONS[@]}" update\n'
+        mutations = {
+            "fetch_omitted": original.replace(fetch, "", 1),
+            "fetch_commented": original.replace(
+                fetch, "\n".join("# " + line for line in fetch.splitlines()) + "\n", 1
+            ),
+            "fetch_duplicated": original.replace(fetch, fetch + fetch, 1),
+            "fetch_wrong_path": original.replace(
+                '--output-dir "$RESTORATION_ROOT"', '--output-dir "$APT_ROOT"', 1
+            ),
+            "fetch_ignored_failure": original.replace(
+                fetch, fetch.rstrip("\n") + " || true\n", 1
+            ),
+            "root_omitted": original.replace(root, "", 1),
+            "root_altered": original.replace(
+                root, '          RESTORATION_ROOT="/tmp/restored"\n', 1
+            ),
+            "root_before_apt_root": original.replace(root, "", 1).replace(
+                apt_root, root + apt_root, 1
+            ),
+            "fetch_before_root": original.replace(root + fetch, fetch + root, 1),
+            "fetch_before_caches": original.replace(
+                caches + root + fetch, root + fetch + caches, 1
+            ),
+            "fetch_after_spec_resolution": original.replace(fetch, "", 1).replace(
+                update, fetch + update, 1
+            ),
+            "fetch_after_apt_update": original.replace(fetch, "", 1).replace(
+                update, update + fetch, 1
+            ),
+        }
+        for scope in ("bootstrap", "all"):
+            spec_command = (
+                "              python3 scripts/render-oracle-host-tools.py "
+                f"apt-specs --scope {scope}"
+            )
+            spec = (
+                f"{spec_command} \\\n"
+                '                --restoration-dir "$RESTORATION_ROOT"\n'
+            )
+            mutations[f"{scope}_restoration_omitted"] = original.replace(
+                spec, f"{spec_command}\n", 1
+            )
+            mutations[f"{scope}_restoration_path"] = original.replace(
+                spec, spec.replace('"$RESTORATION_ROOT"', '"$APT_ROOT"'), 1
+            )
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_oracle_workflow(
+                    Path("render-oracle.yml"), workflow
+                )
+                self.assertTrue(
+                    any(
+                        "host comparison acquisition restoration" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_render_oracle_forbids_package_removal_during_restoration(self) -> None:
+        original = RENDER_ORACLE_WORKFLOW.read_text(encoding="utf-8")
+        mutated = original.replace("            --no-remove \\\n", "", 1)
+        self.assertNotEqual(mutated, original)
+        errors = self.policy.audit_render_oracle_workflow(
+            Path("render-oracle.yml"), mutated
+        )
+        self.assertTrue(
+            any("without package removals" in error for error in errors), errors
+        )
+
     def test_render_oracle_rejects_mutable_python_pip_apt_and_identity_status(
         self,
     ) -> None:
