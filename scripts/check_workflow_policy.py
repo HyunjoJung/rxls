@@ -177,7 +177,7 @@ ORACLE_RENDER_WORKFLOW_SHA256 = (
     "802ea7d98349d84fb02478e9b97d284563e396e997c7a58fec999dc33f6c8816"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "2b13ca4edcff5f1ce1f48f38d7cc5e8c70211c8e0b36852d6f5ccf846b2610fb"
+    "d7a82aae13ec0231abefd30a3d954c2fbd2034083f04872c60da6af153510c7f"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "8e89442f1843fdf417b87424b1c4c79875b78384e62a1d5d6d128ffdbf73f311"
@@ -4530,12 +4530,15 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     )
     strict_commands = _normalized_active_commands(strict_host)
     for command, message in {
-        "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler": (
+        (
+            "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler "
+            '--restoration-dir "$RESTORATION_ROOT"'
+        ): (
             "strict PDF gate must install the pinned Poppler closure"
         ),
         (
             'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
-            "--no-install-recommends --allow-downgrades "
+            "--no-install-recommends --allow-downgrades --no-remove "
             '"${SYSTEM_PACKAGES[@]}"'
         ): ("strict PDF gate must install only exact locked package specs"),
         (
@@ -4551,6 +4554,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "strict Poppler verification",
         ("poppler",),
         errors,
+        require_restorations=True,
     )
     bootstrap_index = pdf_job.find("Capture an unpinned host identity and fail closed")
     strict_index = pdf_job.find("Verify the pinned Poppler PDF gate")

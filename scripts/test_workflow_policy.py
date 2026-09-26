@@ -955,6 +955,57 @@ steps:
             any("without package removals" in error for error in errors), errors
         )
 
+    def test_render_hardening_requires_verified_poppler_apt_restorations(self) -> None:
+        original = RENDER_HARDENING_WORKFLOW.read_text(encoding="utf-8")
+        marker = "      - name: Verify the pinned Poppler PDF gate and complete native closure\n"
+        head, separator, strict = original.partition(marker)
+        self.assertEqual(separator, marker)
+
+        def mutate_strict(before: str, after: str) -> str:
+            self.assertIn(before, strict)
+            return head + marker + strict.replace(before, after, 1)
+
+        root = '          RESTORATION_ROOT="$APT_ROOT/restored"\n'
+        fetch = (
+            "          python3 scripts/render-oracle-host-tools.py fetch-apt-restorations \\\n"
+            '            --output-dir "$RESTORATION_ROOT"\n'
+        )
+        spec = (
+            "            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler \\\n"
+            '              --restoration-dir "$RESTORATION_ROOT"\n'
+        )
+        mutations = {
+            "fetch_omitted": mutate_strict(fetch, ""),
+            "fetch_ignored_failure": mutate_strict(fetch, fetch.rstrip("\n") + " || true\n"),
+            "fetch_wrong_directory": mutate_strict(
+                '--output-dir "$RESTORATION_ROOT"', '--output-dir "$APT_ROOT"'
+            ),
+            "restoration_root_omitted": mutate_strict(root, ""),
+            "restoration_root_changed": mutate_strict(
+                root, '          RESTORATION_ROOT="/tmp/restored"\n'
+            ),
+            "restored_spec_omitted": mutate_strict(
+                spec,
+                "            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler\n",
+            ),
+            "restored_spec_wrong_directory": mutate_strict(
+                '--restoration-dir "$RESTORATION_ROOT"',
+                '--restoration-dir "$APT_ROOT"',
+            ),
+            "package_removal_allowed": mutate_strict("            --no-remove \\\n", ""),
+        }
+        for name, workflow in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(workflow, original)
+                errors = self.policy.audit_render_hardening_workflow(
+                    Path("render-hardening.yml"), workflow
+                )
+                expected = (
+                    "without package removals" if name == "package_removal_allowed"
+                    else "strict Poppler verification restoration"
+                )
+                self.assertTrue(any(expected in error for error in errors), errors)
+
     def test_render_oracle_rejects_mutable_python_pip_apt_and_identity_status(
         self,
     ) -> None:

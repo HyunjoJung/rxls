@@ -115,6 +115,9 @@ jobs:
           set -euo pipefail
           APT_ROOT="$PWD/target/render-oracle-apt"
           mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
+          RESTORATION_ROOT="$APT_ROOT/restored"
+          python3 scripts/render-oracle-host-tools.py fetch-apt-restorations \
+            --output-dir "$RESTORATION_ROOT"
           python3 scripts/render-oracle-host-tools.py apt-sources \
             > "$APT_ROOT/ubuntu.sources"
           APT_OPTIONS=(
@@ -126,7 +129,8 @@ jobs:
           )
           python3 scripts/test_render_oracle_host_tools.py
           SYSTEM_PACKAGE_TEXT="$(
-            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler
+            python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler \
+              --restoration-dir "$RESTORATION_ROOT"
           )"
           mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"
           [[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]
@@ -135,6 +139,7 @@ jobs:
             --yes \
             --no-install-recommends \
             --allow-downgrades \
+            --no-remove \
             "${SYSTEM_PACKAGES[@]}"
           python3 scripts/render-oracle-host-tools.py verify \
             --scope poppler \
