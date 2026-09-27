@@ -116,6 +116,7 @@ FORBIDDEN_RELEASE_SCRIPTS = {
     "test_reconcile_github_release.py",
     "test_release_tools.py",
     "test_workflow_policy.py",
+    "test_verify_vscode_vsix.py",
 }
 
 

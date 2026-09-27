@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/mcp/Cargo.toml
 - Target: Linux, macOS, and Windows (x86_64/aarch64)
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 9e3897652a7ade17b2bacd5d05cbec7c897cfdb5da9cdfeb81215762f30e64a3
+- Cargo lock SHA-256: 00dff12a1989d9ad1484824696b95364847c07f77470d8dbfc75b26a357f366c
 - Third-party packages: 86
 - Unique legal texts: 69
 

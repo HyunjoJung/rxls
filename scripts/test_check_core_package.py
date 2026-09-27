@@ -58,6 +58,7 @@ EXPECTED_CI_RELEASE_ONLY_SCRIPTS = {
     "test_reconcile_github_release.py",
     "test_release_tools.py",
     "test_workflow_policy.py",
+    "test_verify_vscode_vsix.py",
 }
 EXPECTED_HOSTED_ORACLE_STORAGE_SCRIPTS = {
     "render-oracle-build-storage.sh",
