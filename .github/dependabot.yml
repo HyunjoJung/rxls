@@ -17,6 +17,10 @@ updates:
       synchronized-cargo-locks:
         group-by: dependency-name
     ignore:
+      # encoding_rs 0.8.40+ requires Rust 1.88; the core supports Rust 1.85.
+      # Revisit this range with an explicit core MSRV migration.
+      - dependency-name: "encoding_rs"
+        versions: [">=0.8.40"]
       # zip 8.x raises the dependency MSRV to 1.88. Keep accepting compatible
       # 2.x updates while rxls promises Rust 1.85; revisit with an explicit MSRV
       # migration and corpus run.
