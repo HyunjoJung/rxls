@@ -87,16 +87,21 @@ const extensionLock = JSON.parse(
 );
 const lockedRenderer = extensionLock.packages?.["node_modules/@rxls/render-worker"];
 const lockedBundler = extensionLock.packages?.["node_modules/esbuild"];
+const extensionManifest = JSON.parse(
+  await readFile(path.join(extensionRoot, "package.json"), "utf8")
+);
+const rendererVersion = extensionManifest.devDependencies?.["@rxls/render-worker"];
 const rendererManifest = JSON.parse(
   await readFile(path.join(renderPackage, "package.json"), "utf8")
 );
 if (
   rendererManifest.name !== "@rxls/render-worker" ||
-  rendererManifest.version !== "0.2.0" ||
+  !/^\d+\.\d+\.\d+$/.test(rendererVersion ?? "") ||
+  rendererManifest.version !== rendererVersion ||
   lockedRenderer?.version !== rendererManifest.version ||
     typeof lockedRenderer?.integrity !== "string"
   ) {
-  throw new Error("installed renderer does not match the locked 0.2.0 package");
+  throw new Error("installed renderer does not match the manifest and locked package");
 }
 if (lockedBundler?.version !== "0.28.2" || typeof lockedBundler.integrity !== "string") {
   throw new Error("installed worker bundler does not match the locked esbuild 0.28.2 package");

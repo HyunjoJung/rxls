@@ -69,6 +69,18 @@ REVIEWED_ACTION_ALLOWLIST = {
         "820762786026740c76f36085b0efc47a31fe5020",
         "v7.0.0",
     ),
+    "github/codeql-action/init": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "github/codeql-action/analyze": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "actions/deploy-pages": (
+        "368f82528645a54fb793d4d04e342629a3f51346",
+        "v5.0.1",
+    ),
 }
 ORACLE_BUILDX_VERSION = "v0.35.0"
 ORACLE_PR_PILOT_LABEL = "rxls-render-oracle-pilot"

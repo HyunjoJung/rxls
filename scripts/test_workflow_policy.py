@@ -141,6 +141,40 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(self.policy.audit_action_pins(path, workflow))
 
+    def test_codeql_and_pages_require_reviewed_identity_and_comment(self) -> None:
+        path = Path(".github/workflows/example.yml")
+        for action in (
+            "github/codeql-action/init",
+            "github/codeql-action/analyze",
+            "actions/deploy-pages",
+        ):
+            commit, version = self.policy.REVIEWED_ACTION_ALLOWLIST[action]
+            valid = f"steps:\n  - uses: {action}@{commit} # {version}\n"
+            with self.subTest(action=action, state="valid"):
+                self.assertEqual(self.policy.audit_action_pins(path, valid), [])
+            for name, modified in (
+                ("commit", valid.replace(commit, "a" * 40)),
+                ("comment", valid.replace(f"# {version}", "# v1.0.0")),
+            ):
+                with self.subTest(action=action, mutation=name):
+                    self.assertTrue(self.policy.audit_action_pins(path, modified))
+
+    def test_codeql_rejects_updating_only_one_action(self) -> None:
+        original = CODEQL_WORKFLOW.read_text(encoding="utf-8")
+        updated = "1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1"
+        previous = "db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8"
+        for action in ("init", "analyze"):
+            modified = original.replace(
+                f"github/codeql-action/{action}@{updated}",
+                f"github/codeql-action/{action}@{previous}",
+                1,
+            )
+            with self.subTest(action=action):
+                self.assertNotEqual(modified, original)
+                self.assertTrue(
+                    self.policy.audit_action_pins(Path("codeql.yml"), modified)
+                )
+
     def test_pull_request_checkouts_require_exact_head_and_immediate_verifier(
         self,
     ) -> None:
