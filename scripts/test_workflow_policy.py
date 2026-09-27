@@ -71,7 +71,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     1,
                 ),
                 "baseline": original.replace(
-                    "--baseline-version 0.1.2", "--baseline-version 0.1.3", 1
+                    "--baseline-version 0.1.3", "--baseline-version 0.1.2", 1
                 ),
                 "release_type": original.replace(
                     "--release-type patch", "--release-type minor", 1

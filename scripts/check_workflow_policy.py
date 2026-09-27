@@ -24,7 +24,7 @@ RELEASE_VERSIONS = {
     "CARGO_FUZZ_VERSION": "0.13.2",
 }
 SEMVER_CHECKS_VERSION = "0.49.0"
-SEMVER_BASELINE_VERSION = "0.1.2"
+SEMVER_BASELINE_VERSION = "0.1.3"
 SEMVER_RELEASE_TYPE = "patch"
 CORE_RELEASE_TAG_PATTERN = "v[0-9]*.[0-9]*.[0-9]*"
 # The shared handoff executes in both read-only and privileged jobs. Changes to

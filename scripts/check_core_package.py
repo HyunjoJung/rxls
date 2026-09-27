@@ -7,11 +7,14 @@ import argparse
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 import tarfile
 import tomllib
 
 
 SCHEMA = "rxls.core-package-gate.v1"
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE_VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 MAX_ARCHIVE_BYTES = 1 << 20
 MAX_UNPACKED_BYTES = 5 << 20
 # Parser domains are intentionally split into private source modules. Keep a
@@ -123,8 +126,25 @@ def _safe_member_name(name: str) -> PurePosixPath | None:
     return path
 
 
-def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
+def validate(
+    crate: Path, manifest: Path = ROOT / "Cargo.toml"
+) -> tuple[list[str], dict[str, object]]:
     errors: list[str] = []
+    expected_version = None
+    try:
+        source_package = tomllib.loads(manifest.read_text(encoding="utf-8"))["package"]
+        if not isinstance(source_package, dict):
+            raise ValueError("invalid source core package metadata")
+        candidate_version = source_package.get("version")
+        if (
+            source_package.get("name") != "rxls"
+            or not isinstance(candidate_version, str)
+            or RELEASE_VERSION.fullmatch(candidate_version) is None
+        ):
+            raise ValueError("invalid source core package identity")
+        expected_version = candidate_version
+    except (OSError, UnicodeError, KeyError, TypeError, ValueError):
+        errors.append("source manifest must identify an rxls stable release")
     archive_bytes = crate.stat().st_size if crate.is_file() else 0
     archive_sha256 = ""
     file_count = 0
@@ -174,6 +194,8 @@ def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
                     root = None
                 else:
                     root = next(iter(roots))
+                    if expected_version is not None and root != f"rxls-{expected_version}":
+                        errors.append("archive root does not match source package identity")
                 if file_count > MAX_FILES:
                     errors.append(f"file count {file_count} exceeds {MAX_FILES}")
                 if unpacked_bytes > MAX_UNPACKED_BYTES:
@@ -243,8 +265,10 @@ def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
                             metadata = manifest.get("package", {})
                             package_name = metadata.get("name")
                             package_version = metadata.get("version")
-                            if package_name != "rxls" or package_version != "0.1.3":
-                                errors.append("package identity is not rxls 0.1.3")
+                            if package_name != "rxls" or package_version != expected_version:
+                                errors.append(
+                                    "package identity does not match source manifest"
+                                )
                             if metadata.get("rust-version") != "1.85":
                                 errors.append("packaged core MSRV is not 1.85")
                             dependencies = sorted(manifest.get("dependencies", {}))
@@ -292,9 +316,13 @@ def validate(crate: Path) -> tuple[list[str], dict[str, object]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("crate", type=Path)
+    parser.add_argument(
+        "--manifest", type=Path, default=ROOT / "Cargo.toml",
+        help="checked-out source manifest that owns the expected package version",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    errors, report = validate(args.crate)
+    errors, report = validate(args.crate, args.manifest)
     rendered = json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     print(rendered)
     if args.output is not None:
