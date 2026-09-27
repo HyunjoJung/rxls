@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/mcp/Cargo.toml
 - Target: Linux, macOS, and Windows (x86_64/aarch64)
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: fc5c7abd01782b641e0de5d8f28be0a706181add9d22a28403591f0a16c57010
+- Cargo lock SHA-256: 9e3897652a7ade17b2bacd5d05cbec7c897cfdb5da9cdfeb81215762f30e64a3
 - Third-party packages: 86
 - Unique legal texts: 69
 
@@ -52,10 +52,10 @@ Legal files:
 - LICENSE: 45f522cacecb1023856e46df79ca625dfc550c94910078bd8aec6e02880b3d42
 
 ===============================================================================
-PACKAGE: cfb 0.14.0
+PACKAGE: cfb 0.15.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3
+Registry archive SHA-256: 0f13298d9178622b7916ec5d01d470425c04273c8ed07e87b1c38b34c4f4612b
 Legal files:
 - LICENSE: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 
@@ -5600,7 +5600,7 @@ MIT OR Apache-2.0
 ===============================================================================
 LEGAL TEXT SHA-256: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 Referenced by:
-- cfb 0.14.0/LICENSE
+- cfb 0.15.0/LICENSE
 ----- BEGIN LEGAL TEXT -----
 MIT License
 

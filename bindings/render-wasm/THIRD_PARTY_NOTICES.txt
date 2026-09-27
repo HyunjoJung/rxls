@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 4ec9aa075a35b53c0d1d1ea3142c07246d5217e58babf2600b686e0d24ba3894
+- Cargo lock SHA-256: ff42e947c0abda3750f67e1e73f444a106cf32970ed26a8ee8c3b4f96b4fa8ea
 - Third-party packages: 84
 - Unique legal texts: 77
 
@@ -90,10 +90,10 @@ Legal files:
 - LICENSE-ZLIB: 84b34dd7608f7fb9b17bd588a6bf392bf7de504e2716f024a77d89f1b145a151
 
 ===============================================================================
-PACKAGE: cfb 0.14.0
+PACKAGE: cfb 0.15.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3
+Registry archive SHA-256: 0f13298d9178622b7916ec5d01d470425c04273c8ed07e87b1c38b34c4f4612b
 Legal files:
 - LICENSE: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 
@@ -6316,7 +6316,7 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 Referenced by:
-- cfb 0.14.0/LICENSE
+- cfb 0.15.0/LICENSE
 ----- BEGIN LEGAL TEXT -----
 MIT License
 
