@@ -5,9 +5,9 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 4ec9aa075a35b53c0d1d1ea3142c07246d5217e58babf2600b686e0d24ba3894
-- Third-party packages: 84
-- Unique legal texts: 77
+- Cargo lock SHA-256: 70b4b0d7e5f557e7ee5dce5ee23b18cf239a693fe84de09932616e613f866332
+- Third-party packages: 86
+- Unique legal texts: 78
 
 The npm package has no npm runtime dependencies. This notice conservatively
 covers every third-party crate reachable through normal Cargo edges used to
@@ -90,10 +90,10 @@ Legal files:
 - LICENSE-ZLIB: 84b34dd7608f7fb9b17bd588a6bf392bf7de504e2716f024a77d89f1b145a151
 
 ===============================================================================
-PACKAGE: cfb 0.14.0
+PACKAGE: cfb 0.15.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3
+Registry archive SHA-256: 0f13298d9178622b7916ec5d01d470425c04273c8ed07e87b1c38b34c4f4612b
 Legal files:
 - LICENSE: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 
@@ -224,10 +224,10 @@ Legal files:
 - LICENSE-MIT: c77a4cf9da729987d0fe7ccd811e3bd27393914ddf3d23467c18cc22954513b3
 
 ===============================================================================
-PACKAGE: flate2 1.1.9
+PACKAGE: flate2 1.1.10
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c
+Registry archive SHA-256: 6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb
 Legal files:
 - LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 - LICENSE-MIT: 025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112
@@ -353,6 +353,17 @@ PACKAGE: miniz_oxide 0.8.9
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Zlib OR Apache-2.0
 Registry archive SHA-256: 1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316
+Legal files:
+- LICENSE: 4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b
+- LICENSE-APACHE.md: 0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594
+- LICENSE-MIT.md: 799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d
+- LICENSE-ZLIB.md: 0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39
+
+===============================================================================
+PACKAGE: miniz_oxide 0.9.1
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: MIT OR Zlib OR Apache-2.0
+Registry archive SHA-256: b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c
 Legal files:
 - LICENSE: 4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b
 - LICENSE-APACHE.md: 0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594
@@ -753,6 +764,14 @@ Legal files:
 - LICENSE: 04dc52136d82400b11df5f474949863a70a5d05d2278dec45b99c479494450a6
 
 ===============================================================================
+PACKAGE: zlib-rs 0.6.8
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: Zlib
+Registry archive SHA-256: b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112
+Legal files:
+- LICENSE: e72111c52b7d96ebe25348dee19f0744f444d3c95ae6b1ecb6ccaecc5bce05ba
+
+===============================================================================
 PACKAGE: zmij 1.0.23
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
@@ -992,7 +1011,7 @@ You may use this code under the terms of either license.
 ===============================================================================
 LEGAL TEXT SHA-256: 025436edff4cfcdde17a5811fdea78892d8482efd1abdec5a17872d07a4f2112
 Referenced by:
-- flate2 1.1.9/LICENSE-MIT
+- flate2 1.1.10/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2014-2026 Alex Crichton
 
@@ -1089,6 +1108,7 @@ DEALINGS IN THE SOFTWARE.
 LEGAL TEXT SHA-256: 0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39
 Referenced by:
 - miniz_oxide 0.8.9/LICENSE-ZLIB.md
+- miniz_oxide 0.9.1/LICENSE-ZLIB.md
 ----- BEGIN LEGAL TEXT -----
 Copyright 2013-2014 RAD Game Tools and Valve Software
 Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
@@ -1143,6 +1163,7 @@ LEGAL TEXT SHA-256: 0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e9
 Referenced by:
 - fdeflate 0.3.7/LICENSE-APACHE
 - miniz_oxide 0.8.9/LICENSE-APACHE.md
+- miniz_oxide 0.9.1/LICENSE-APACHE.md
 - pin-project-lite 0.2.17/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
 
@@ -2164,6 +2185,7 @@ DEALINGS IN THE SOFTWARE.
 LEGAL TEXT SHA-256: 4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b
 Referenced by:
 - miniz_oxide 0.8.9/LICENSE
+- miniz_oxide 0.9.1/LICENSE
 ----- BEGIN LEGAL TEXT -----
 MIT License
 
@@ -3824,6 +3846,7 @@ DEALINGS IN THE SOFTWARE.
 LEGAL TEXT SHA-256: 799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d
 Referenced by:
 - miniz_oxide 0.8.9/LICENSE-MIT.md
+- miniz_oxide 0.9.1/LICENSE-MIT.md
 ----- BEGIN LEGAL TEXT -----
 MIT License
 
@@ -4987,7 +5010,7 @@ Referenced by:
 - displaydoc 0.2.6/LICENSE-APACHE
 - either 1.16.0/LICENSE-APACHE
 - equivalent 1.0.2/LICENSE-APACHE
-- flate2 1.1.9/LICENSE-APACHE
+- flate2 1.1.10/LICENSE-APACHE
 - fnv 1.0.7/LICENSE-APACHE
 - hashbrown 0.17.1/LICENSE-APACHE
 - indexmap 2.14.0/LICENSE-APACHE
@@ -6282,6 +6305,32 @@ limitations under the License.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
+LEGAL TEXT SHA-256: e72111c52b7d96ebe25348dee19f0744f444d3c95ae6b1ecb6ccaecc5bce05ba
+Referenced by:
+- zlib-rs 0.6.8/LICENSE
+----- BEGIN LEGAL TEXT -----
+(C) 2024 Trifecta Tech Foundation 
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
+----- END LEGAL TEXT -----
+
+===============================================================================
 LEGAL TEXT SHA-256: eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652
 Referenced by:
 - png 0.17.16/LICENSE-MIT
@@ -6316,7 +6365,7 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 Referenced by:
-- cfb 0.14.0/LICENSE
+- cfb 0.15.0/LICENSE
 ----- BEGIN LEGAL TEXT -----
 MIT License
 

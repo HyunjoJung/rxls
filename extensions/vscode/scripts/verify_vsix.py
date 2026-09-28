@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import struct
 import zipfile
 
@@ -105,9 +106,20 @@ def verify(
         build_manifest = json.loads(
             archive.read("extension/media/viewer/build-manifest.json")
         )
+        renderer_version = manifest.get("devDependencies", {}).get(
+            "@rxls/render-worker"
+        )
+        installed_renderer = json.loads(
+            (renderer_root / "package.json").read_text(encoding="utf-8")
+        )
         if (
             build_manifest.get("schema") != "rxls.vscode-viewer.v1"
-            or build_manifest.get("renderer", {}).get("version") != "0.2.0"
+            or not isinstance(renderer_version, str)
+            or re.fullmatch(r"\d+\.\d+\.\d+", renderer_version) is None
+            or build_manifest.get("renderer", {}).get("name") != "@rxls/render-worker"
+            or installed_renderer.get("name") != "@rxls/render-worker"
+            or installed_renderer.get("version") != renderer_version
+            or build_manifest.get("renderer", {}).get("version") != renderer_version
             or not str(build_manifest.get("renderer", {}).get("integrity", "")).startswith(
                 "sha512-"
             )

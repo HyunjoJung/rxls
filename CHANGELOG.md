@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-28
+
 ### Added
 
 - Added worker-local, package-preserving XLSX/XLSM browser edits for typed cell
@@ -36,6 +38,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   regression coverage.
 - Separated read-only core release verification from protected publication,
   binding the publishing job to the exact verified artifact and package bytes.
+- Updated `cfb` to 0.15.0 and `flate2` to 1.1.10 across the affected dependency
+  locks, with regenerated notices for the WASM and MCP distributions.
+- Synchronized reviewed CodeQL init/analysis pins and refreshed the Pages
+  deployment action. VS Code builds use renderer 0.3.0 and TypeScript 7, with
+  manifest and lockfile checks for the bundled renderer.
 
 ### Fixed
 
@@ -53,6 +60,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while retaining a failed edit's draft and keyboard focus for correction.
 - Released pending document-property controls even when the workbook changes
   before a request finishes.
+- Pinned `encoding_rs` to 0.8.35 so fresh core consumers retain the promised
+  Rust 1.85 minimum instead of resolving a release that requires Rust 1.88.
 
 ## [0.1.3] - 2026-08-22
 
@@ -423,7 +432,8 @@ Apache POI, or runtime subprocess dependency.
   comments, metadata, charts, drawings, and editable package parts after the
   `quick-xml` migration.
 
-[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4
 [0.1.3]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.3
 [0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2
 [0.1.1]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.1

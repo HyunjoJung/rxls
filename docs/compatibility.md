@@ -171,7 +171,9 @@ Features are additive. Use `default-features = false` for an XLS-only library
 build or `features = ["full"]` for every reader and typed-data helper. The
 minimum supported Rust version is 1.85.
 
-Version 0.1.3 defines the current published API and semantics. Compatible
-updates may add APIs and `#[non_exhaustive]` variants under the crate's SemVer
-policy. Pin an exact version when the dependency graph or documented behavior
-must remain exact.
+Version 0.1.3 defines the current published API and semantics; this checkout
+prepares the compatible 0.1.4 update. CI and release verification compare all,
+default, and no-default feature APIs against the published 0.1.3 baseline.
+Compatible updates may add APIs and `#[non_exhaustive]` variants under the
+crate's SemVer policy. Pin an exact version when the dependency graph or
+documented behavior must remain exact.

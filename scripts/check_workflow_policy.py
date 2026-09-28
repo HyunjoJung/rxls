@@ -24,7 +24,7 @@ RELEASE_VERSIONS = {
     "CARGO_FUZZ_VERSION": "0.13.2",
 }
 SEMVER_CHECKS_VERSION = "0.49.0"
-SEMVER_BASELINE_VERSION = "0.1.2"
+SEMVER_BASELINE_VERSION = "0.1.3"
 SEMVER_RELEASE_TYPE = "patch"
 CORE_RELEASE_TAG_PATTERN = "v[0-9]*.[0-9]*.[0-9]*"
 # The shared handoff executes in both read-only and privileged jobs. Changes to
@@ -52,7 +52,9 @@ MCP_CI_COMMANDS = (
     "cargo test --manifest-path bindings/mcp/Cargo.toml --locked",
     "cargo doc --manifest-path bindings/mcp/Cargo.toml --no-deps --locked",
     "cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked",
-    "cargo package --manifest-path bindings/mcp/Cargo.toml --locked",
+    "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
+    "python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'",
+    'python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"',
 )
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
@@ -68,6 +70,18 @@ REVIEWED_ACTION_ALLOWLIST = {
     "actions/setup-node": (
         "820762786026740c76f36085b0efc47a31fe5020",
         "v7.0.0",
+    ),
+    "github/codeql-action/init": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "github/codeql-action/analyze": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "actions/deploy-pages": (
+        "368f82528645a54fb793d4d04e342629a3f51346",
+        "v5.0.1",
     ),
 }
 ORACLE_BUILDX_VERSION = "v0.35.0"
@@ -4851,12 +4865,26 @@ def audit_ci_feature_matrix(path: Path, text: str) -> list[str]:
         "--manifest-path bindings/mcp/Cargo.toml "
         "--output target/rxls-sbom.cdx.json",
         "bindings/mcp/Cargo.lock",
+        "name: Verify independently packaged MCP source",
+        "name: mcp-package-candidate-${{ github.run_attempt }}",
+        "path: bindings/mcp/target/package-candidate/*",
     )
     errors.extend(
         f"{path}: CI MCP gate is missing `{fragment}`"
         for fragment in required_mcp_fragments
         if fragment not in normalized
     )
+    if "cargo package --manifest-path bindings/mcp/Cargo.toml" in normalized:
+        errors.append(f"{path}: MCP packaging must use the verified unpublished-core overlay")
+    mcp = re.search(r"(?ms)^  mcp:\n(.*?)(?=^  [a-z][a-z0-9_-]*:|\Z)", normalized)
+    if mcp is None:
+        errors.append(f"{path}: exactly one bounded MCP job is required")
+    else:
+        required = ("timeout-minutes: 45", "toolchain: 1.88.0",
+                    f"EXPECTED_SHA: {PR_HEAD_EXPRESSION}", *MCP_CI_COMMANDS)
+        for fragment in required:
+            if fragment not in mcp.group(1):
+                errors.append(f"{path}: MCP job is missing `{fragment}`")
     return errors
 
 

@@ -488,13 +488,19 @@ class RenderSupplyChainTests(unittest.TestCase):
             deny["advisories"]["ignore"],
             ["RUSTSEC-2026-0192", "RUSTSEC-2026-0206"],
         )
-        self.assertEqual(binding["dependencies"]["rxls"]["version"], "0.1.3")
+        core = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            binding["dependencies"]["rxls"]["version"], core["package"]["version"]
+        )
         self.assertEqual(
             binding["dependencies"]["rxls-render"]["version"], "0.1.0"
         )
-        self.assertEqual(renderer["dependencies"]["rxls"]["version"], "0.1.3")
+        self.assertEqual(
+            renderer["dependencies"]["rxls"]["version"], core["package"]["version"]
+        )
 
     def test_tracked_renderer_locks_match_the_current_local_dependency_closure(self) -> None:
+        core = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         lock_paths = (
             ROOT / "render" / "Cargo.lock",
             ROOT / "render" / "perf" / "Cargo.lock",
@@ -516,7 +522,9 @@ class RenderSupplyChainTests(unittest.TestCase):
                     self.assertEqual(len(matches), 1, f"{path}: {name}")
                     return matches[0]
 
-                self.assertEqual(package("rxls").get("version"), "0.1.3")
+                self.assertEqual(
+                    package("rxls").get("version"), core["package"]["version"]
+                )
                 renderer = package("rxls-render")
                 self.assertEqual(renderer.get("version"), "0.1.0")
                 self.assertIn("subsetter", renderer.get("dependencies", []))

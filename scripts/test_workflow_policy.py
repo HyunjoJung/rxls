@@ -71,7 +71,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                     1,
                 ),
                 "baseline": original.replace(
-                    "--baseline-version 0.1.2", "--baseline-version 0.1.3", 1
+                    "--baseline-version 0.1.3", "--baseline-version 0.1.2", 1
                 ),
                 "release_type": original.replace(
                     "--release-type patch", "--release-type minor", 1
@@ -105,6 +105,25 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(
                     self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, removed)
                 )
+
+    def test_mcp_packaging_rejects_unbound_source_and_mutable_cargo(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "mutable cargo": original.replace(
+                "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
+                "rustup toolchain install stable --profile minimal", 1),
+            "unbound source": original.replace(
+                'package_candidate.py --expected-sha "$EXPECTED_SHA"',
+                "package_candidate.py", 1),
+            "bare package": original + "\n      - run: cargo package --manifest-path bindings/mcp/Cargo.toml --locked\n",
+            "missing receipt": original.replace(
+                "path: bindings/mcp/target/package-candidate/*", "path: bindings/mcp/target/release/*", 1),
+            "wrong MCP compiler": original.replace("toolchain: 1.88.0", "toolchain: stable", 1),
+            "unbounded MCP job": original.replace("    timeout-minutes: 45\n", "", 1),
+        }
+        for name, text in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertTrue(self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, text))
 
     def test_mutable_action_ref_is_rejected(self) -> None:
         errors = self.policy.audit_action_pins(
@@ -140,6 +159,40 @@ class WorkflowPolicyTests(unittest.TestCase):
         for name, workflow in mutations.items():
             with self.subTest(name=name):
                 self.assertTrue(self.policy.audit_action_pins(path, workflow))
+
+    def test_codeql_and_pages_require_reviewed_identity_and_comment(self) -> None:
+        path = Path(".github/workflows/example.yml")
+        for action in (
+            "github/codeql-action/init",
+            "github/codeql-action/analyze",
+            "actions/deploy-pages",
+        ):
+            commit, version = self.policy.REVIEWED_ACTION_ALLOWLIST[action]
+            valid = f"steps:\n  - uses: {action}@{commit} # {version}\n"
+            with self.subTest(action=action, state="valid"):
+                self.assertEqual(self.policy.audit_action_pins(path, valid), [])
+            for name, modified in (
+                ("commit", valid.replace(commit, "a" * 40)),
+                ("comment", valid.replace(f"# {version}", "# v1.0.0")),
+            ):
+                with self.subTest(action=action, mutation=name):
+                    self.assertTrue(self.policy.audit_action_pins(path, modified))
+
+    def test_codeql_rejects_updating_only_one_action(self) -> None:
+        original = CODEQL_WORKFLOW.read_text(encoding="utf-8")
+        updated = "1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1"
+        previous = "db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8"
+        for action in ("init", "analyze"):
+            modified = original.replace(
+                f"github/codeql-action/{action}@{updated}",
+                f"github/codeql-action/{action}@{previous}",
+                1,
+            )
+            with self.subTest(action=action):
+                self.assertNotEqual(modified, original)
+                self.assertTrue(
+                    self.policy.audit_action_pins(Path("codeql.yml"), modified)
+                )
 
     def test_pull_request_checkouts_require_exact_head_and_immediate_verifier(
         self,

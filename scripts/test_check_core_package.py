@@ -33,10 +33,13 @@ DEPENDENCIES = "\n".join(
     f'[dependencies.{name}]\nversion = "1"'
     for name in sorted(MODULE.ALLOWED_DEPENDENCIES)
 )
+VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))[
+    "package"
+]["version"]
 MANIFEST = f"""
 [package]
 name = "rxls"
-version = "0.1.3"
+version = "{VERSION}"
 rust-version = "1.85"
 {FEATURES}
 {DEPENDENCIES}
@@ -55,6 +58,7 @@ EXPECTED_CI_RELEASE_ONLY_SCRIPTS = {
     "test_reconcile_github_release.py",
     "test_release_tools.py",
     "test_workflow_policy.py",
+    "test_verify_vscode_vsix.py",
 }
 EXPECTED_HOSTED_ORACLE_STORAGE_SCRIPTS = {
     "render-oracle-build-storage.sh",
@@ -66,29 +70,83 @@ def write_crate(
     path: Path,
     extra: dict[str, bytes] | None = None,
     duplicate: str | None = None,
+    version: str = VERSION,
+    root: str | None = None,
 ) -> None:
     files = {
         "Cargo.lock": b"lock",
-        "Cargo.toml": MANIFEST.encode(),
+        "Cargo.toml": MANIFEST.replace(
+            f'version = "{VERSION}"', f'version = "{version}"', 1
+        ).encode(),
         "Cargo.toml.orig": b"original",
         "LICENSE": b"MIT",
         "README.md": b"rxls",
         "src/lib.rs": b"#![forbid(unsafe_code)]",
     }
     files.update(extra or {})
+    package_root = root or f"rxls-{version}"
     with tarfile.open(path, "w:gz") as package:
         for relative, payload in files.items():
-            info = tarfile.TarInfo(f"rxls-0.1.3/{relative}")
+            info = tarfile.TarInfo(f"{package_root}/{relative}")
             info.size = len(payload)
             package.addfile(info, io.BytesIO(payload))
         if duplicate is not None:
             payload = b"duplicate"
-            info = tarfile.TarInfo(f"rxls-0.1.3/{duplicate}")
+            info = tarfile.TarInfo(f"{package_root}/{duplicate}")
             info.size = len(payload)
             package.addfile(info, io.BytesIO(payload))
 
 
 class CorePackageGateTests(unittest.TestCase):
+    def test_accepts_version_owned_by_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "Cargo.toml"
+            manifest.write_text(
+                '[package]\nname = "rxls"\nversion = "1.2.3"\n',
+                encoding="utf-8",
+            )
+            crate = Path(directory) / "rxls.crate"
+            write_crate(crate, version="1.2.3")
+            errors, report = MODULE.validate(crate, manifest)
+        self.assertEqual(errors, [])
+        self.assertEqual(report["package"], {"name": "rxls", "version": "1.2.3"})
+
+    def test_rejects_archive_version_different_from_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            write_crate(crate, version="9.9.9")
+            errors, report = MODULE.validate(crate)
+        self.assertIn("package identity does not match source manifest", errors)
+        self.assertFalse(report["passed"])
+
+    def test_rejects_archive_root_different_from_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            write_crate(crate, root="rxls-9.9.9")
+            errors, _ = MODULE.validate(crate)
+        self.assertIn("archive root does not match source package identity", errors)
+
+    def test_rejects_missing_or_invalid_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            write_crate(crate)
+            manifest = Path(directory) / "Cargo.toml"
+            for content in (
+                None,
+                "invalid TOML",
+                'package = "not a table"',
+                '[package]\nname = "other"\nversion = "1.2.3"\n',
+                '[package]\nname = "rxls"\nversion = "1.2.3-rc.1"\n',
+            ):
+                with self.subTest(content=content):
+                    if content is not None:
+                        manifest.write_text(content, encoding="utf-8")
+                    errors, report = MODULE.validate(crate, manifest)
+                    self.assertIn(
+                        "source manifest must identify an rxls stable release", errors
+                    )
+                    self.assertFalse(report["passed"])
+
     def test_accepts_bounded_core_only_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             crate = Path(directory) / "rxls.crate"

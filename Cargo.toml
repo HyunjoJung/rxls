@@ -1,6 +1,6 @@
 [package]
 name = "rxls"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 # The resolved dependency graph supports Rust 1.85; CI enforces this floor.
 rust-version = "1.85"
@@ -83,6 +83,7 @@ exclude = [
     "scripts/test_release_tools.py",
     "scripts/test_summarize_render_oracle_failure.py",
     "scripts/test_workflow_policy.py",
+    "scripts/test_verify_vscode_vsix.py",
     "viewer/",
     "MIGRATION-*.md",
     "ROADMAP-*.md",
@@ -102,8 +103,9 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-cfb = "0.14"
-encoding_rs = "0.8"
+cfb = "0.15"
+# 0.8.40 and newer require Rust 1.88; keep fresh consumers on the core MSRV.
+encoding_rs = "=0.8.35"
 thiserror = "2.0"
 # .xlsx (OOXML) support — on by default; disable for the dependency-light
 # .xls-only build (`default-features = false`).
