@@ -78,6 +78,8 @@ The same gate enforces these distribution ceilings:
 | Packed npm archive | 2 MiB |
 
 Build and validate the candidate with `bash scripts/build-wasm-package.sh`.
+The adapter's separate Cargo manifest uses size optimization and link-time
+optimization for release builds; native and render-worker profiles are unchanged.
 The npm package also includes generated TypeScript declarations, the browser
 demo, and license notices. `wasm-size-report.json` is published separately as
 release evidence and is not embedded in the package it describes.

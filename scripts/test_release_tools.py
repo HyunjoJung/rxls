@@ -497,6 +497,21 @@ class ReleaseToolTests(unittest.TestCase):
 
         self.assertEqual(module.validate(ROOT), [])
 
+    def test_wasm_release_profile_keeps_original_budget_and_native_isolation(self) -> None:
+        root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        binding_manifest = tomllib.loads(
+            (ROOT / "bindings" / "wasm" / "Cargo.toml").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            binding_manifest.get("profile", {}).get("release", {}),
+            {"opt-level": "s", "lto": True, "codegen-units": 1},
+        )
+        self.assertNotIn("release", root_manifest.get("profile", {}))
+        self.assertEqual(binding_manifest["dependencies"]["rxls"]["features"], ["full"])
+        module = _load("check_wasm_package", WASM_PACKAGE)
+        self.assertEqual(module.MAX_WASM_BYTES, 2 * 1024 * 1024)
+
     def test_release_identity_reports_every_version_mismatch(self) -> None:
         module = _load("check_release_identity_mismatch", IDENTITY)
         with tempfile.TemporaryDirectory() as tmp:
@@ -655,6 +670,25 @@ class ReleaseToolTests(unittest.TestCase):
             )
 
             errors, report = module.validate(package, git_rev="1" * 40)
+
+            self.assertEqual(module.MAX_WASM_BYTES, 2 * 1024 * 1024)
+            for target in ("node", "web"):
+                with self.subTest(wasm_budget_target=target):
+                    wasm = package / target / "rxls_wasm_bg.wasm"
+                    original = wasm.read_bytes()
+                    wasm.write_bytes(b"\0asm" + b"\0" * (module.MAX_WASM_BYTES - 4))
+                    boundary_errors, _ = module.validate(package)
+                    self.assertEqual(boundary_errors, [])
+                    wasm.write_bytes(b"\0asm" + b"\0" * (module.MAX_WASM_BYTES - 3))
+                    over_budget_errors, _ = module.validate(package)
+                    self.assertEqual(
+                        over_budget_errors,
+                        [
+                            f"{target} wasm bundle is {module.MAX_WASM_BYTES + 1} "
+                            f"bytes; budget is {module.MAX_WASM_BYTES}"
+                        ],
+                    )
+                    wasm.write_bytes(original)
 
             drifted_metadata = json.loads(json.dumps(metadata))
             drifted_metadata["author"]["url"] = "https://example.invalid/maintainer"
