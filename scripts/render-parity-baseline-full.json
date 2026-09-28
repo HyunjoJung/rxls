@@ -6442,7 +6442,7 @@
     }
   },
   "comparable_files": 800,
-  "configuration_sha256": "a4b34649a1f7cadae6a18cb25d6cf5129070c2d23cd5272ff83196c94a891fe8",
+  "configuration_sha256": "bda9083bc50e53cb44af5ba19a1e6986e6c615ddf97a73d78eb4581fd98bcb8a",
   "input_files": 800,
   "input_set_sha256": "45dfaaac5e94e98da038c561d98eed48e8785f56749760d39bac8a720b132db9",
   "schema": "rxls.render-parity-ratchet-envelope.v1",
@@ -6450,8 +6450,8 @@
     "candidate_count": 2,
     "candidate_schema": "rxls.render-parity-observed-candidate.v1",
     "candidate_sha256s": [
-      "c9734b5eafb15af635ce3b47baaabc7527134232e675ae247ca92dbb32876fba",
-      "c9734b5eafb15af635ce3b47baaabc7527134232e675ae247ca92dbb32876fba"
+      "d66fc820d79c8e2c3270b2fc37896a1716b6a5f44005125b68170bb6d2419c95",
+      "d66fc820d79c8e2c3270b2fc37896a1716b6a5f44005125b68170bb6d2419c95"
     ],
     "delta_bounds": [
       "p90",
