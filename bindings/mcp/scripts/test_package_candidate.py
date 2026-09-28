@@ -101,7 +101,7 @@ class PackageCandidateTests(unittest.TestCase):
             helper.verify_archive(self.path, self.mcp, "rxls-mcp", "0.1.0")
 
     def test_archive_path_links_duplicates_and_byte_budget_are_bounded(self) -> None:
-        for name in ("../escape", "/absolute", "safe\\escape", "safe/./escape", "safe//escape", "C:/escape"):
+        for name in ("../escape", "/absolute", "safe\\escape", "safe/./escape", "safe//escape", "C:" + "/escape"):
             archive(self.path, {name: b""})
             with tarfile.open(self.path) as result, self.assertRaises(ValueError):
                 list(helper.safe_members(result))
