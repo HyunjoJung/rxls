@@ -52,7 +52,9 @@ MCP_CI_COMMANDS = (
     "cargo test --manifest-path bindings/mcp/Cargo.toml --locked",
     "cargo doc --manifest-path bindings/mcp/Cargo.toml --no-deps --locked",
     "cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked",
-    "cargo package --manifest-path bindings/mcp/Cargo.toml --locked",
+    "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
+    "python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'",
+    'python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"',
 )
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
@@ -4863,12 +4865,26 @@ def audit_ci_feature_matrix(path: Path, text: str) -> list[str]:
         "--manifest-path bindings/mcp/Cargo.toml "
         "--output target/rxls-sbom.cdx.json",
         "bindings/mcp/Cargo.lock",
+        "name: Verify independently packaged MCP source",
+        "name: mcp-package-candidate-${{ github.run_attempt }}",
+        "path: bindings/mcp/target/package-candidate/*",
     )
     errors.extend(
         f"{path}: CI MCP gate is missing `{fragment}`"
         for fragment in required_mcp_fragments
         if fragment not in normalized
     )
+    if "cargo package --manifest-path bindings/mcp/Cargo.toml" in normalized:
+        errors.append(f"{path}: MCP packaging must use the verified unpublished-core overlay")
+    mcp = re.search(r"(?ms)^  mcp:\n(.*?)(?=^  [a-z][a-z0-9_-]*:|\Z)", normalized)
+    if mcp is None:
+        errors.append(f"{path}: exactly one bounded MCP job is required")
+    else:
+        required = ("timeout-minutes: 45", "toolchain: 1.88.0",
+                    f"EXPECTED_SHA: {PR_HEAD_EXPRESSION}", *MCP_CI_COMMANDS)
+        for fragment in required:
+            if fragment not in mcp.group(1):
+                errors.append(f"{path}: MCP job is missing `{fragment}`")
     return errors
 
 

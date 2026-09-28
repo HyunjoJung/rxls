@@ -164,6 +164,7 @@ jobs:
   mcp:
     name: Local MCP server (MSRV 1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,7 +209,20 @@ jobs:
           cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked
           bindings/mcp/target/release/rxls-mcp --version | grep -E '^rxls-mcp [0-9]+\.[0-9]+\.[0-9]+$'
       - name: Verify independently packaged MCP source
-        run: cargo package --manifest-path bindings/mcp/Cargo.toml --locked
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --no-self-update
+          python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'
+          python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"
+      - name: Upload independently verified MCP package evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-package-candidate-${{ github.run_attempt }}
+          path: bindings/mcp/target/package-candidate/*
+          if-no-files-found: error
+          retention-days: 14
 
   installed-product:
     name: Installed product (${{ matrix.os_name }})

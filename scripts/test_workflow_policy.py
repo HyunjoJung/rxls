@@ -106,6 +106,25 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, removed)
                 )
 
+    def test_mcp_packaging_rejects_unbound_source_and_mutable_cargo(self) -> None:
+        original = CI_WORKFLOW.read_text(encoding="utf-8")
+        mutations = {
+            "mutable cargo": original.replace(
+                "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
+                "rustup toolchain install stable --profile minimal", 1),
+            "unbound source": original.replace(
+                'package_candidate.py --expected-sha "$EXPECTED_SHA"',
+                "package_candidate.py", 1),
+            "bare package": original + "\n      - run: cargo package --manifest-path bindings/mcp/Cargo.toml --locked\n",
+            "missing receipt": original.replace(
+                "path: bindings/mcp/target/package-candidate/*", "path: bindings/mcp/target/release/*", 1),
+            "wrong MCP compiler": original.replace("toolchain: 1.88.0", "toolchain: stable", 1),
+            "unbounded MCP job": original.replace("    timeout-minutes: 45\n", "", 1),
+        }
+        for name, text in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertTrue(self.policy.audit_ci_feature_matrix(CI_WORKFLOW.name, text))
+
     def test_mutable_action_ref_is_rejected(self) -> None:
         errors = self.policy.audit_action_pins(
             Path(".github/workflows/example.yml"),
