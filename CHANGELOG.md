@@ -62,6 +62,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before a request finishes.
 - Pinned `encoding_rs` to 0.8.35 so fresh core consumers retain the promised
   Rust 1.85 minimum instead of resolving a release that requires Rust 1.88.
+- Kept the general WASM adapter within its existing 2 MiB per-target budget
+  with a package-local optimized release profile, without removing exports or
+  supported formats or changing native and render-worker build profiles.
 
 ## [0.1.3] - 2026-08-22
 
