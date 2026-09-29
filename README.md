@@ -25,6 +25,7 @@ cargo add rxls@0.1.3 --features full
 
 Want to help? Start with a [good first issue](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)
 and the [first-contribution guide](CONTRIBUTING.md#your-first-contribution).
+See the [roadmap](ROADMAP.md) for project direction and focused contribution priorities.
 
 ## Why rxls
 
