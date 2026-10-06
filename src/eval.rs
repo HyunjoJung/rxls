@@ -653,11 +653,8 @@ fn evaluate_formula_value_with_refs(
     operation_budget.charge_text_storage(formula.len())?;
     let normalized = normalize_formula_syntax(formula)?;
     let formula = normalized.as_str();
-    if formula.contains('[') {
-        return Err(FormulaUnsupportedReason::ExternalRef);
-    }
-    if formula.contains('{') || formula.contains('}') || formula.contains('@') {
-        return Err(FormulaUnsupportedReason::ArraySemantics);
+    if let Some(reason) = unsupported_formula_syntax(formula) {
+        return Err(reason);
     }
     let mut parser = Parser::new(formula, operation_budget, &mut resolve_ref);
     let value = parser.parse_comparison()?;
@@ -1083,27 +1080,32 @@ impl<'a, 'r> Parser<'a, 'r> {
             return self.parse_sheet_reference(ident);
         }
         if self.consume_char('(') {
-            if is_volatile(&ident_upper) {
+            // MS-XLSX §2.2.3 lists this exact future-function storage spelling.
+            let function = match ident_upper.as_str() {
+                "_XLFN.IFNA" => "IFNA",
+                name => name,
+            };
+            if is_volatile(function) {
                 return Err(FormulaUnsupportedReason::Volatile);
             }
-            if is_dynamic_array_function(&ident_upper) {
+            if is_dynamic_array_function(function) {
                 return Err(FormulaUnsupportedReason::ArraySemantics);
             }
-            if !is_deterministic_function(&ident_upper) {
+            if !is_deterministic_function(function) {
                 return Err(FormulaUnsupportedReason::UnsupportedFunction);
             };
             let mut args = Vec::new();
             self.skip_ws();
             if self.consume_char(')') {
                 self.charge_operation()?;
-                return evaluate_function(&ident_upper, &args, &self.operation_budget);
+                return evaluate_function(function, &args, &self.operation_budget);
             }
             loop {
                 args.push(self.parse_comparison()?);
                 self.skip_ws();
                 if self.consume_char(')') {
                     self.charge_operation()?;
-                    return evaluate_function(&ident_upper, &args, &self.operation_budget);
+                    return evaluate_function(function, &args, &self.operation_budget);
                 }
                 if self.consume_char(',') {
                     continue;
@@ -2387,6 +2389,56 @@ fn parse_whole_col_ref(reference: &str) -> Option<u16> {
     (1..=16_384).contains(&col).then(|| (col - 1) as u16)
 }
 
+/// Return the UTF-8 boundary after a quoted region, preserving doubled quotes.
+/// OpenFormula §5.4 strings and §5.8 quoted sheet names use doubled delimiters.
+fn formula_quote_end(formula: &str, start: usize, quote: char) -> Option<usize> {
+    let mut chars = formula.get(start..)?.char_indices().peekable();
+    if chars.next()?.1 != quote {
+        return None;
+    }
+    while let Some((index, ch)) = chars.next() {
+        if ch != quote {
+            continue;
+        }
+        if chars.peek().is_some_and(|(_, next)| *next == quote) {
+            chars.next();
+        } else {
+            return Some(start + index + ch.len_utf8());
+        }
+    }
+    None
+}
+
+/// Inspect syntax only outside text; brackets in sheet quotes remain external.
+fn unsupported_formula_syntax(formula: &str) -> Option<FormulaUnsupportedReason> {
+    let mut index = 0;
+    let mut external = false;
+    let mut array = false;
+    while let Some(ch) = formula.get(index..).and_then(|rest| rest.chars().next()) {
+        if matches!(ch, '"' | '\'') {
+            // Leave unterminated quotes to the parser's existing typed failure.
+            let Some(end) = formula_quote_end(formula, index, ch) else {
+                break;
+            };
+            if ch == '\'' && formula[index..end].contains('[') {
+                external = true;
+            }
+            index = end;
+            continue;
+        }
+        external |= ch == '[';
+        array |= matches!(ch, '{' | '}' | '@');
+        index += ch.len_utf8();
+    }
+    if external {
+        Some(FormulaUnsupportedReason::ExternalRef)
+    } else if array {
+        Some(FormulaUnsupportedReason::ArraySemantics)
+    } else {
+        None
+    }
+}
+
 /// Convert the bounded OpenFormula reference spelling surfaced by the ODS
 /// reader to the evaluator's Excel-like reference grammar. External workbook
 /// and array syntax remain typed fallbacks rather than being guessed.
@@ -2397,31 +2449,39 @@ fn normalize_formula_syntax(
         return Ok(formula.to_string());
     }
     let mut out = String::with_capacity(formula.len());
-    let mut chars = formula.char_indices().peekable();
-    let mut in_string = false;
-    while let Some((index, ch)) = chars.next() {
-        if ch == '"' {
-            in_string = !in_string;
-            out.push(ch);
+    let mut index = 0;
+    while let Some(ch) = formula.get(index..).and_then(|rest| rest.chars().next()) {
+        if matches!(ch, '"' | '\'') {
+            let end = formula_quote_end(formula, index, ch).unwrap_or(formula.len());
+            out.push_str(&formula[index..end]);
+            index = end;
             continue;
         }
-        if ch != '[' || in_string {
-            out.push(if ch == ';' && !in_string { ',' } else { ch });
+        if ch != '[' {
+            out.push(if ch == ';' { ',' } else { ch });
+            index += ch.len_utf8();
             continue;
         }
         let content_start = index + ch.len_utf8();
-        let mut content_end = None;
-        for (candidate, candidate_ch) in chars.by_ref() {
-            if candidate_ch == ']' {
-                content_end = Some(candidate);
-                break;
+        let mut content_end = content_start;
+        loop {
+            match formula
+                .get(content_end..)
+                .and_then(|rest| rest.chars().next())
+            {
+                Some(']') => break,
+                Some(quote @ ('"' | '\'')) => {
+                    content_end = formula_quote_end(formula, content_end, quote)
+                        .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+                }
+                Some(next) => content_end += next.len_utf8(),
+                None => return Err(FormulaUnsupportedReason::UnparsableExpression),
             }
         }
-        let Some(content_end) = content_end else {
-            return Err(FormulaUnsupportedReason::UnparsableExpression);
-        };
-        let content = &formula[content_start..content_end];
-        out.push_str(&normalize_odf_reference(content)?);
+        out.push_str(&normalize_odf_reference(
+            &formula[content_start..content_end],
+        )?);
+        index = content_end + 1;
     }
     Ok(out)
 }
@@ -2501,6 +2561,33 @@ mod tests {
             max_text_value: value,
             max_text_total: total,
             ..super::OperationBudget::default()
+        }
+    }
+
+    #[test]
+    fn quoted_punctuation_utf8_and_escaped_quotes_obey_text_budgets() {
+        let formula = r#""한""@;[]""#;
+        let decoded = "한\"@;[]";
+        assert_eq!(decoded.len(), 8);
+        let exact = small_text_budget(8, formula.len() + decoded.len());
+        assert_eq!(
+            super::evaluate_formula_with_refs(formula, exact.clone(), |_| {
+                Err(FormulaUnsupportedReason::UnresolvedName)
+            }),
+            Ok(Cell::Text(decoded.into()))
+        );
+        assert_eq!(exact.text_used.get(), formula.len() + decoded.len());
+        for budget in [
+            small_text_budget(7, 128),
+            small_text_budget(8, formula.len() + decoded.len() - 1),
+        ] {
+            assert_eq!(
+                super::evaluate_formula_with_refs(formula, budget.clone(), |_| {
+                    Err(FormulaUnsupportedReason::UnresolvedName)
+                }),
+                Err(FormulaUnsupportedReason::TextLimitExceeded)
+            );
+            assert!(budget.text_used.get() <= budget.max_text_total);
         }
     }
 
