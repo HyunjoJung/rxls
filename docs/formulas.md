@@ -71,6 +71,18 @@ AND OR NOT ISNA ISERROR ISNUMBER ISTEXT ISBLANK
 Invalid argument counts produce Excel-compatible value errors where the
 supported function contract defines them.
 
+The source checkout preserves punctuation inside double-quoted formula text:
+`LEN("a@b.com")` returns 7 and `LEN("[x]")` returns 3. Embedded double quotes
+use doubled quotes. OpenFormula semicolon separators and bracket references
+normalize only outside quoted text; quoted sheet names keep their punctuation
+and doubled apostrophes. Actual external references and array syntax retain
+their typed fallbacks. Stored source and caches are unchanged by evaluation.
+
+The next-release source accepts the exact case-insensitive `_xlfn.IFNA(...)`
+storage spelling as an IFNA call. This alias applies only to function calls;
+text, defined names and sheet names retain their original meaning. Other
+qualified future functions remain outside the supported subset.
+
 The source checkout includes aggregate coercion fixes for the next core
 release. `SUM`, `AVERAGE`, `MIN`, `MAX` and `PRODUCT` ignore referenced text,
 booleans and blanks, including single-cell ranges and defined references.

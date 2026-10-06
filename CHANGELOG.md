@@ -14,6 +14,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved punctuation and doubled quotes inside formula text literals (#135),
+  including email, bracket and brace strings. OpenFormula separators/references
+  normalize outside quoted text and sheet names; real external/array syntax
+  retains its typed fallback and stored cache.
+- Recognized the exact case-insensitive `_xlfn.IFNA` function-call spelling
+  stored by Excel, using existing IFNA semantics without changing formula source,
+  literals, defined names or other future-function support.
 - Coalesced adjacent columns with identical resolved layout into compact XLSX
   intervals (#127), avoiding expansion of a full-width format into 16,384
   singleton records. Width flags, styles, visibility, outline boundaries and
