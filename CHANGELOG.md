@@ -14,6 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Normalized XLSX ISO date cells and date formula caches to the workbook's date
+  system (#128), preserving calendar values in 1904 rewrites and before March
+  1900. Time-only values retain their day fractions in either system.
 - Preserved SpreadsheetML ST_Xstring cell text across shared/inline/rich reads,
   authoring, edits and text formula-cache updates (#131). Literal escape-shaped
   strings, carriage returns, encodable controls and cache whitespace retain

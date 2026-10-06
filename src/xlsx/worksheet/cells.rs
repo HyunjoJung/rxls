@@ -38,11 +38,24 @@ pub(super) fn build_cell(
         "e" if !value.is_empty() => Some((Cell::Error(value.to_string()), value.to_string())),
         // ISO-8601 date/time cell (`t="d"`, emitted by some non-Excel writers).
         "d" if !value.is_empty() => format::iso_date_to_serial(value).map(|serial| {
+            // The shared parser uses Gregorian days since 1899-12-30. Adapt
+            // calendar dates to this workbook's serial system, including the
+            // 1900 system's fictitious leap day. Time-only values have no epoch.
+            // https://support.microsoft.com/en-us/excel/date-systems-in-excel
+            let serial = if value.as_bytes().get(2) == Some(&b':') {
+                serial
+            } else if date1904 {
+                serial - 1_462.0
+            } else if (2.0..61.0).contains(&serial) {
+                serial - 1.0
+            } else {
+                serial
+            };
             let kind = styles.kind(style_idx);
             let display = if let Some(code) = styles.custom_format(style_idx) {
-                format::render_format(serial, code, false)
+                format::render_format(serial, code, date1904)
             } else if kind.is_datetime() {
-                format::render_value(serial, kind, false)
+                format::render_value(serial, kind, date1904)
             } else {
                 value.to_string()
             };
