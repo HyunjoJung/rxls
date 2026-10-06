@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved `.svg` and `.png` suffixes when VS Code export filenames exceed
+  120 characters (#136). Export status now reflects accepted bytes, completed
+  saves, cancellation and failures; invalid matching API responses reject promptly.
 - Coalesced adjacent columns with identical resolved layout into compact XLSX
   intervals (#127), avoiding expansion of a full-width format into 16,384
   singleton records. Width flags, styles, visibility, outline boundaries and

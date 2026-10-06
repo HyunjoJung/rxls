@@ -11,6 +11,7 @@ import {
   MAX_WORKBOOK_BYTES,
   WebviewMessage,
   parentUriPath,
+  parseExportIdentity,
   parseWebviewMessage
 } from "./protocol";
 
@@ -196,8 +197,12 @@ export class RxlsPreviewProvider implements vscode.CustomReadonlyEditorProvider<
   }
 
   private async onMessage(session: PanelSession, value: unknown): Promise<void> {
+    if (session.disposed) {
+      return;
+    }
     const message = parseWebviewMessage(value);
-    if (!message || session.disposed) {
+    if (!message) {
+      await this.onRejectedExport(session, value);
       return;
     }
     switch (message.type) {
@@ -235,38 +240,78 @@ export class RxlsPreviewProvider implements vscode.CustomReadonlyEditorProvider<
     }
   }
 
+  private async onRejectedExport(session: PanelSession, value: unknown): Promise<void> {
+    const identity = parseExportIdentity(value);
+    if (!identity) {
+      return;
+    }
+    let kind = identity.kind;
+    if (identity.requestId !== null) {
+      const pending = session.pendingExports.get(identity.requestId);
+      if (!pending) {
+        return;
+      }
+      kind = pending.kind;
+      clearTimeout(pending.timer);
+      session.pendingExports.delete(identity.requestId);
+      pending.reject(new Error("The rxls export response was invalid."));
+    }
+    await this.sendExportStatus(session, kind, "export failed");
+  }
+
   private async onExport(session: PanelSession, message: ExportMessage): Promise<void> {
-    if (message.requestId) {
+    if (message.requestId !== null) {
       const pending = session.pendingExports.get(message.requestId);
       if (pending) {
         clearTimeout(pending.timer);
         session.pendingExports.delete(message.requestId);
         if (pending.kind !== message.kind) {
           pending.reject(new Error("The rxls export response kind did not match the request."));
+          await this.sendExportStatus(session, pending.kind, "export failed");
         } else {
           pending.resolve({ kind: message.kind, fileName: message.fileName, bytes: message.bytes });
+          await this.sendExportStatus(session, message.kind, "export ready");
         }
       }
       return;
     }
 
-    const parent = session.document.uri.with({ path: parentUriPath(session.document.uri.path) });
-    const destination = await vscode.window.showSaveDialog({
-      defaultUri: vscode.Uri.joinPath(parent, message.fileName),
-      saveLabel: `Export ${message.kind.toUpperCase()}`,
-      filters:
-        message.kind === "svg"
-          ? { "Scalable Vector Graphics": ["svg"] }
-          : { "Portable Network Graphics": ["png"] }
-    });
-    if (!destination) {
+    let destination: vscode.Uri | undefined;
+    try {
+      const parent = session.document.uri.with({ path: parentUriPath(session.document.uri.path) });
+      destination = await vscode.window.showSaveDialog({
+        defaultUri: vscode.Uri.joinPath(parent, message.fileName),
+        saveLabel: `Export ${message.kind.toUpperCase()}`,
+        filters:
+          message.kind === "svg"
+            ? { "Scalable Vector Graphics": ["svg"] }
+            : { "Portable Network Graphics": ["png"] }
+      });
+      if (destination) {
+        await vscode.workspace.fs.writeFile(destination, message.bytes);
+      }
+    } catch {
+      await this.sendExportStatus(session, message.kind, "export failed");
       return;
     }
-    await vscode.workspace.fs.writeFile(destination, message.bytes);
-    await session.panel.webview.postMessage({
-      type: "host-status",
-      message: `${message.kind.toUpperCase()} exported`
-    });
+    await this.sendExportStatus(
+      session,
+      message.kind,
+      destination ? "exported" : "export cancelled"
+    );
+  }
+
+  private async sendExportStatus(
+    session: PanelSession,
+    kind: ExportKind,
+    status: "exported" | "export ready" | "export cancelled" | "export failed"
+  ): Promise<void> {
+    if (!session.disposed) {
+      await session.panel.webview.postMessage({
+        type: "host-status",
+        message: `${kind.toUpperCase()} ${status}`
+      });
+    }
   }
 
   private onDocumentChange(session: PanelSession, kind: DocumentChangeKind): void {
