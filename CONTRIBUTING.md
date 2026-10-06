@@ -165,11 +165,11 @@ cargo test --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 python3 scripts/check_public_api.py
 cargo semver-checks check-release --manifest-path Cargo.toml \
-  --baseline-version 0.1.2 --release-type patch --all-features
+  --baseline-version 0.1.3 --release-type patch --all-features
 cargo semver-checks check-release --manifest-path Cargo.toml \
-  --baseline-version 0.1.2 --release-type patch --default-features
+  --baseline-version 0.1.3 --release-type patch --default-features
 cargo semver-checks check-release --manifest-path Cargo.toml \
-  --baseline-version 0.1.2 --release-type patch --only-explicit-features
+  --baseline-version 0.1.3 --release-type patch --only-explicit-features
 cargo fmt --manifest-path render/Cargo.toml -- --check
 cargo clippy --manifest-path render/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path render/Cargo.toml --all-targets --locked

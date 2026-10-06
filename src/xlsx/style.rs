@@ -315,6 +315,7 @@ fn parse_differential_styles(
     let mut current: Option<CellStyle> = None;
     let mut font: Option<Font> = None;
     let mut fill: Option<Fill> = None;
+    let mut unresolved_fill_backgrounds = 0_u32;
     let mut border: Option<Border> = None;
     let mut border_edge = None;
     let mut losses = Vec::<StyleLoss>::new();
@@ -334,6 +335,11 @@ fn parse_differential_styles(
                 }
                 match name {
                     b"dxf" => {
+                        add_differential_loss(
+                            &mut losses,
+                            StyleLossKind::UnresolvedColor,
+                            std::mem::take(&mut unresolved_fill_backgrounds),
+                        );
                         if current.is_some() && styles.len() < MAX_DXFS {
                             styles.push(DifferentialStyle {
                                 style: current.take().unwrap_or_default(),
@@ -360,6 +366,11 @@ fn parse_differential_styles(
                         font = (!e.is_empty()).then(Font::default);
                     }
                     b"fill" if current.is_some() => {
+                        add_differential_loss(
+                            &mut losses,
+                            StyleLossKind::UnresolvedColor,
+                            std::mem::take(&mut unresolved_fill_backgrounds),
+                        );
                         fill = (!e.is_empty()).then(Fill::default);
                     }
                     b"border" if current.is_some() => {
@@ -458,7 +469,8 @@ fn parse_differential_styles(
                     b"bgColor" if fill.is_some() => {
                         let color = color_attr(&e, theme, indexed);
                         if color.is_none() {
-                            add_differential_loss(&mut losses, StyleLossKind::UnresolvedColor, 1);
+                            unresolved_fill_backgrounds =
+                                unresolved_fill_backgrounds.saturating_add(1);
                         }
                         fill.as_mut().expect("dxf fill").background = color;
                     }
@@ -549,6 +561,17 @@ fn parse_differential_styles(
                 }
                 b"fill" if current.is_some() => {
                     let value = fill.take().unwrap_or_default();
+                    let unresolved_backgrounds = std::mem::take(&mut unresolved_fill_backgrounds);
+                    // ECMA-376 18.8.32: a solid pattern uses fgColor only. A
+                    // resolved foreground makes an automatic/unknown bgColor
+                    // irrelevant to paint and, therefore, to text layout.
+                    if value.pattern != FormatPattern::Solid || value.foreground.is_none() {
+                        add_differential_loss(
+                            &mut losses,
+                            StyleLossKind::UnresolvedColor,
+                            unresolved_backgrounds,
+                        );
+                    }
                     if value != Fill::default() {
                         if value.pattern == FormatPattern::Solid {
                             current.as_mut().expect("dxf").fill =
@@ -565,6 +588,11 @@ fn parse_differential_styles(
                     }
                 }
                 b"dxf" if current.is_some() => {
+                    add_differential_loss(
+                        &mut losses,
+                        StyleLossKind::UnresolvedColor,
+                        std::mem::take(&mut unresolved_fill_backgrounds),
+                    );
                     if styles.len() < MAX_DXFS {
                         styles.push(DifferentialStyle {
                             style: current.take().unwrap_or_default(),

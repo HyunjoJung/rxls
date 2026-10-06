@@ -2,8 +2,8 @@
 
 [Back to README](../README.md)
 
-This document distinguishes the published `rxls` core **0.1.3**, additions in
-the current source checkout, and separately versioned adapters. Reading,
+This document distinguishes the published `rxls` core **0.1.4**, source
+checkouts, and separately versioned adapters. Reading,
 authoring, and preservation editing are separate capabilities; support for one
 does not imply support for the others.
 
@@ -11,16 +11,16 @@ does not imply support for the others.
 
 | Surface | Version boundary | Formula/cache contract |
 |---|---|---|
-| Native `rxls` core from the registry | 0.1.3 (`v0.1.3`) | Single-cell `Workbook::evaluate_cell`; no `evaluate_cells`, `set_formula_cached_values`, or `TextLimitExceeded` |
-| Current native source | Additions after core 0.1.3, not a new published core release | Shared-budget batch evaluation, atomic formula-cache batches, and bounded UTF-8 text production |
-| npm `rxls-wasm` | Core adapter 0.1.3 | Its own synchronous JavaScript API, not an automatic export of every native Rust method |
+| Native `rxls` core from the registry | 0.1.4 (`v0.1.4`) | Single-cell and shared-budget batch evaluation, atomic formula-cache batches, and bounded UTF-8 text production |
+| Historical native core | 0.1.3 (`v0.1.3`) | Single-cell `Workbook::evaluate_cell`; no `evaluate_cells`, `set_formula_cached_values`, or `TextLimitExceeded` |
+| Current native source | Pin a reviewed revision | Check that revision's API and verification evidence |
+| npm `rxls-wasm` | Core adapter 0.1.4 | Its own synchronous JavaScript API, not an automatic export of every native Rust method |
 | npm `@rxls/render-worker` | Worker 0.3.0, versioned independently | Interactive rendering and atomic recalculating edits through the worker API |
 
-The source manifest may still say `0.1.3`. Installing registry
-`rxls = "=0.1.3"` does not select newer source APIs. The examples marked
-current source in [Formula support](formulas.md) and
-[Preservation and editing](preservation.md) require a path dependency or an
-appropriate pinned source revision. Their evaluator budgets and edit limits
+Installing registry `rxls = "=0.1.3"` does not select the APIs added in 0.1.4.
+The batch examples in [Formula support](formulas.md) and
+[Preservation and editing](preservation.md) work with `rxls = "=0.1.4"` or an
+appropriate source checkout. Their evaluator budgets and edit limits
 are separate contracts; successful evaluation is not proof that a cache value
 can be written to XLSX.
 
@@ -127,7 +127,7 @@ property, feature inventory, and parse-provenance data. The CLI exposes this as
 operational errors use stderr. Exit classifications and diagnose schema changes
 are compatibility-controlled behavior.
 
-The isolated `bindings/wasm` crate is distributed as npm **`rxls-wasm` 0.1.3**.
+The isolated `bindings/wasm` crate is distributed as npm **`rxls-wasm` 0.1.4**.
 It exposes the core model through generated Node and browser entry points,
 TypeScript declarations, structured `RxlsError` objects, and a synchronous
 32 MiB input limit. It is built and distributed separately from the native CLI
@@ -191,7 +191,9 @@ Features are additive. Use `default-features = false` for an XLS-only library
 build or `features = ["full"]` for every reader and typed-data helper. The
 minimum supported Rust version is 1.85.
 
-Version 0.1.3 defines the current published API and semantics. Compatible
-updates may add APIs and `#[non_exhaustive]` variants under the crate's SemVer
-policy. Pin an exact version when the dependency graph or documented behavior
-must remain exact.
+Version 0.1.4 defines the current published API and semantics. CI and release
+verification compare all,
+default, and no-default feature APIs against the published 0.1.3 baseline.
+Compatible updates may add APIs and `#[non_exhaustive]` variants under the
+crate's SemVer policy. Pin an exact version when the dependency graph or
+documented behavior must remain exact.

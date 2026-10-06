@@ -6,12 +6,12 @@ inside a dedicated module worker and exposes one sheet, tile, or print page at a
 time.
 
 The npm name is **`@rxls/render-worker`**, version **0.3.0**. This is not
-**`rxls-wasm`**, the separately distributed synchronous core adapter at 0.1.3.
+**`rxls-wasm`**, the separately distributed synchronous core adapter at 0.1.4.
 Worker and native-core releases are independent: the worker 0.3.0 methods below
 do not make `Workbook::evaluate_cells`,
 `Spreadsheet::set_formula_cached_values`, or `TextLimitExceeded` available in
-the registry `rxls` core 0.1.3 crate. Those native APIs are current-source
-additions; their signatures, shared budgets, and cache-write limits are covered
+the registry `rxls` core 0.1.3 crate. Those native APIs are available in core
+0.1.4; their signatures, shared budgets, and cache-write limits are covered
 in [Formula support](../../docs/formulas.md) and
 [Preservation and editing](../../docs/preservation.md). Use this README's
 JavaScript worker methods rather than assuming every Rust helper is exported.

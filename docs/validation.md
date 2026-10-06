@@ -37,9 +37,13 @@ pinned manifest and a valid SHA-256.
 
 ## Release contract
 
-Version `0.1.3` is accepted only when the crate, tagged source, GitHub Release
-bundle, SBOM, checksums, and provenance are bound by the release manifest to one
-revision. The immutable `v0.1.3` tag identifies source commit
+Every core release is accepted only when the crate, tagged source, GitHub
+Release bundle, SBOM, checksums, and provenance are bound by the release
+manifest to one revision. This checkout prepares `0.1.4`; its hosted candidates
+and publication must establish fresh evidence for the final release revision.
+
+The existing `0.1.3` evidence below remains bound to its published source.
+The immutable `v0.1.3` tag identifies source commit
 `e1390e5aa349fbf933c39bccda400a4a2ee1d814`. Later `main` revisions may contain
 documentation and unreleased work.
 
@@ -77,7 +81,8 @@ cargo test --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 python3 -m unittest discover -s scripts -p "test_*.py"
 cargo package --locked
-python3 scripts/check_core_package.py target/package/rxls-0.1.3.crate
+version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
+python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"
 cargo publish --dry-run --locked
 ```
 
@@ -85,7 +90,7 @@ Test the exact packaged crate as an external dependency and installed CLI:
 
 ```bash
 python3 scripts/smoke_crate_distribution.py \
-  --crate target/package/rxls-0.1.3.crate \
+  --crate "target/package/rxls-${version}.crate" \
   --fixture tests/fixtures/xlsx/reader-structural.xlsx
 ```
 

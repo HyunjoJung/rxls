@@ -14,6 +14,28 @@ bytes never enter JSON messages and no network listener is opened.
 cargo build --manifest-path bindings/mcp/Cargo.toml --locked --release
 ```
 
+The adapter's tests, release build, and packaged-source verification use Rust
+1.88.0. Before a new core version reaches crates.io, ordinary single-package
+`cargo package` cannot resolve the normalized registry dependency. CI instead
+uses Cargo 1.96.1's interdependent-package overlay in an isolated, bounded copy
+of the exact Git revision, with `RUSTC` and `RUSTDOC` explicitly pinned to
+1.88.0. Both the core and intentionally `publish = false` MCP archives are
+packaged and compiled; neither is published, patched, or verified with
+`--no-verify`. Source manifests and the MCP locked graph stay unchanged.
+
+On a clean checkout, reproduce that verification with:
+
+```console
+rustup toolchain install 1.88.0 1.96.1 --profile minimal --no-self-update
+python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'
+python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$(git rev-parse HEAD)"
+```
+
+`bindings/mcp/target/package-candidate/` contains both verified archives and
+`mcp-package-candidate.json`, binding their inventory and SHA-256 digests to the
+source revision, snapshot, locked graph, and actual compiler versions. This
+verification-only core archive is not the canonical release artifact.
+
 ## Configure
 
 Run the binary with one or more explicit roots. Relative workbook paths are

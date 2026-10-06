@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import tomllib
 import unittest
 
 
@@ -79,6 +80,37 @@ class PackageIdentityTests(unittest.TestCase):
         path.write_text(json.dumps(document), encoding="utf-8")
 
     def test_current_independently_versioned_packages_pass(self) -> None:
+        self.assertEqual(IDENTITY.validate(self.root), [])
+
+    def test_core_and_wasm_can_advance_without_changing_independent_packages(self) -> None:
+        version = tomllib.loads(
+            (self.root / "Cargo.toml").read_text(encoding="utf-8")
+        )["package"]["version"]
+        for relative in (
+            "Cargo.toml", "Cargo.lock", "bindings/wasm/Cargo.lock",
+            "bindings/mcp/Cargo.lock", "render/Cargo.lock",
+            "bindings/render-wasm/Cargo.lock",
+        ):
+            self.change_cargo_version(relative, "rxls")
+        for relative in ("bindings/wasm/Cargo.toml", "bindings/wasm/Cargo.lock"):
+            self.change_cargo_version(relative, "rxls-wasm")
+        for relative in (
+            "bindings/wasm/Cargo.toml", "bindings/mcp/Cargo.toml",
+            "render/Cargo.toml", "bindings/render-wasm/Cargo.toml",
+        ):
+            self.change_dependency_version(relative, "rxls")
+        self.change_json_version("bindings/wasm/npm/package.json")
+        self.replace("CHANGELOG.md", f"## [{version}]", "## [9.9.9]")
+        self.replace(
+            "CHANGELOG.md",
+            f"[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v{version}...HEAD",
+            "[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v9.9.9...HEAD",
+        )
+        self.replace(
+            "CHANGELOG.md",
+            f"[{version}]: https://github.com/HyunjoJung/rxls/releases/tag/v{version}",
+            "[9.9.9]: https://github.com/HyunjoJung/rxls/releases/tag/v9.9.9",
+        )
         self.assertEqual(IDENTITY.validate(self.root), [])
 
     def test_renderer_manifest_and_local_lock_must_agree(self) -> None:

@@ -25,6 +25,7 @@ cargo add rxls@0.1.3 --features full
 
 Want to help? Start with a [good first issue](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)
 and the [first-contribution guide](CONTRIBUTING.md#your-first-contribution).
+See the [roadmap](ROADMAP.md) for project direction and focused contribution priorities.
 
 ## Why rxls
 
@@ -282,7 +283,11 @@ bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 See the [MCP server guide](bindings/mcp/README.md) for its nine tools, client
 configuration, filesystem boundary, and resource limits.
 
-Version `0.1.3` is the current published core release. The renderer,
+This checkout prepares core `0.1.4`; `0.1.3` remains the current published
+release until the hosted publication and installed-consumer checks succeed.
+The installation examples and validation evidence above refer to `0.1.3`.
+Changes for `0.1.4` are recorded in the [changelog](CHANGELOG.md#014---2026-09-28).
+The renderer,
 `@rxls/render-worker`, local MCP server, and VS Code preview are separately
 gated workspace surfaces and are not part of the published core crate contract.
 

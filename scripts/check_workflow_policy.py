@@ -24,7 +24,7 @@ RELEASE_VERSIONS = {
     "CARGO_FUZZ_VERSION": "0.13.2",
 }
 SEMVER_CHECKS_VERSION = "0.49.0"
-SEMVER_BASELINE_VERSION = "0.1.2"
+SEMVER_BASELINE_VERSION = "0.1.3"
 SEMVER_RELEASE_TYPE = "patch"
 CORE_RELEASE_TAG_PATTERN = "v[0-9]*.[0-9]*.[0-9]*"
 # The shared handoff executes in both read-only and privileged jobs. Changes to
@@ -52,7 +52,9 @@ MCP_CI_COMMANDS = (
     "cargo test --manifest-path bindings/mcp/Cargo.toml --locked",
     "cargo doc --manifest-path bindings/mcp/Cargo.toml --no-deps --locked",
     "cargo build --manifest-path bindings/mcp/Cargo.toml --release --locked",
-    "cargo package --manifest-path bindings/mcp/Cargo.toml --locked",
+    "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
+    "python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'",
+    'python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"',
 )
 RENDER_ORACLE_PYTHON_VERSION = "3.13.14"
 RENDER_ORACLE_FULL_CASES = "800"
@@ -68,6 +70,18 @@ REVIEWED_ACTION_ALLOWLIST = {
     "actions/setup-node": (
         "820762786026740c76f36085b0efc47a31fe5020",
         "v7.0.0",
+    ),
+    "github/codeql-action/init": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "github/codeql-action/analyze": (
+        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
+        "v4.38.1",
+    ),
+    "actions/deploy-pages": (
+        "368f82528645a54fb793d4d04e342629a3f51346",
+        "v5.0.1",
     ),
 }
 ORACLE_BUILDX_VERSION = "v0.35.0"
@@ -127,19 +141,30 @@ ORACLE_SETUP_PYTHON_ACTION = (
 ORACLE_UPLOAD_ARTIFACT_ACTION = (
     "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 )
+ORACLE_BUILD_STORAGE_HELPER_SHA256 = (
+    "cdea6bf846ecd4be1829ecd70afa789c198a70f23b2e54eb3791d6689798bf48"
+)
+# Only these two complete reviewed lifecycle scripts may invoke the pinned
+# privileged helper. Any edit falls back to the unchanged shell scanner.
+ORACLE_BUILD_STORAGE_RUN_SHA256 = frozenset({
+    "15e01fa180ca49943a59b732fa3a3ab8fb892175749186716fc690731dea2649",
+    "f64fe403ea0abcacb9fd3c8ea2f84ded6ca2c058e6d093c1fa39b29521e24282",
+})
 ORACLE_RENDER_STEP_SHA256 = (
     "042c5a9253170bd88c6496aeb307b42cb6a0ef855bdafa8e50c3eee8a3b4ba4d",
     "bb2ff7258a91fd630b1cb20e19c8276a625f295c6f52b38fe37fc4e2424e9933",
     "1266e4280f579884aef9895f70988b7a58ac80f791e5b1dae6d63bfa1b001ede",
     "f14b7dfb812098fb6d42a40b09a3eeae8fc9f8be29182170c2ae3db46477c6bb",
+    "99f88a9fbc95afee85f30034fee7787fc9330d942ffdffaae37e481342cf1f81",
     "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
-    "736adb4fbe36521a6ca77d28b07fa4a62106b89cca089c048893a00b712ef2ab",
-    "4ec3ef9024cf7eb628ff1c524024eab211d981f4e9af9b2be97d3a3f8b454951",
+    "d7309145407cf422dfc95d5fce782e01278fd42a8a878c31f14405033fdd833f",
+    "450afbeb424f03bb000719f015ac895f147f98bad6f4f00c76dc019f0297bf99",
     "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
     "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
     "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
     "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
     "054c41f51299ec5331abca90af10c81e7538c3588255d358461e23dc26825b48",
+    "8cccee4bac68dd280966abd02de29d9c09dea1dff1bc433b1d197768bc2c50c7",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
     "dd06bf10233cf70a9dc797223cf5c3a76ebe561124a1d9db06f112983e0321b8",
     "a045ad7115eaf2b15ce19e33ff630c3716b62ab1e615dfbeb8a9a9dfac65b1ea",
@@ -155,16 +180,18 @@ ORACLE_RENDER_STEP_SHA256 = (
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "1474c388488c7cc317f8dc2b1948415ebbc06415499cde15213b8e7369b6b2d9",
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
+    "99f88a9fbc95afee85f30034fee7787fc9330d942ffdffaae37e481342cf1f81",
     "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
-    "5eb296aeb7a081fef5622668a2658e484191f93958a318518d4253a22f92d2bc",
+    "1ab03670dc5df291c6ba673e8ab8590a0670cc67952adde980d3e11a87be41f5",
     "5a0bee8f4f21bda04cd5f69c10d0e9504293a691b4bd112b27ab7d5ebdfc432f",
+    "8cccee4bac68dd280966abd02de29d9c09dea1dff1bc433b1d197768bc2c50c7",
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "948975307e04cbca76b7c3007cdc4b74e5940c60d400678b550f9e7f6a969998"
+    "802ea7d98349d84fb02478e9b97d284563e396e997c7a58fec999dc33f6c8816"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "b52b8bde803f6cfc2ffb40f533febf6b5d75dcb17326943546497c921e0c60cc"
+    "d7a82aae13ec0231abefd30a3d954c2fbd2034083f04872c60da6af153510c7f"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
     "8e89442f1843fdf417b87424b1c4c79875b78384e62a1d5d6d128ffdbf73f311"
@@ -1104,11 +1131,15 @@ def _without_heredoc_bodies(script: str) -> str:
     return "\n".join(active_lines)
 
 
-def _direct_docker_build_commands(text: str) -> list[str]:
+def _direct_docker_build_commands(
+    text: str, *, allowed_run_sha256: frozenset[str] = frozenset()
+) -> list[str]:
     """Find active or unprovable commands bypassing the reviewed wrapper."""
 
     commands: list[str] = []
     for script in _workflow_run_scripts(text):
+        if hashlib.sha256(script.encode("utf-8")).hexdigest() in allowed_run_sha256:
+            continue
         assignments: dict[str, str | None] = {}
         if "\0" in script:
             commands.append("<unreadable run scalar>")
@@ -1210,10 +1241,108 @@ def _audit_oracle_buildx_setup(path: Path, text: str, errors: list[str]) -> None
             f"{path}: oracle builds must pin Buildx, BuildKit, linux/amd64, "
             "native snapshotting, and disabled GitHub provenance"
         )
-    if _direct_docker_build_commands(text):
+    if _direct_docker_build_commands(
+        text, allowed_run_sha256=ORACLE_BUILD_STORAGE_RUN_SHA256
+    ):
         errors.append(
             f"{path}: oracle workflows must build only through the reviewed wrapper"
         )
+
+
+def _audit_oracle_build_storage(
+    path: Path, text: str, errors: list[str], *, image_only: bool = False
+) -> None:
+    """Keep deterministic storage bounded to the isolated oracle image build."""
+    prepare_header = "- name: Prepare deterministic oracle build storage"
+    restore_header = "- name: Restore original Docker build storage"
+    prepare = _single_yaml_block(
+        path, text, prepare_header, 6, "oracle build storage preparation", errors
+    )
+    restore = _single_yaml_block(
+        path, text, restore_header, 6, "oracle build storage restoration", errors
+    )
+    environment = (
+        "sudo --preserve-env=RUNNER_TEMP,RUNNER_OS,RUNNER_ENVIRONMENT,"
+        "GITHUB_ACTIONS,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,GITHUB_JOB"
+    )
+    helper_type = (
+        "test -f scripts/render-oracle-build-storage.sh && "
+        "test ! -L scripts/render-oracle-build-storage.sh"
+    )
+    helper_hash = (
+        "printf '%s  %s\\n' " + ORACLE_BUILD_STORAGE_HELPER_SHA256
+        + " scripts/render-oracle-build-storage.sh | sha256sum --check --status"
+    )
+    prepare_required = (
+        "id: oracle_build_storage",
+        "set -euo pipefail",
+        'test -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}"',
+        'test "$(timeout 30 docker context show)" = default',
+        "test \"$(timeout 30 docker context inspect default --format '{{.Endpoints.docker.Host}}')\" = unix:///var/run/docker.sock",
+        "builder_names=\"$(timeout 30 docker buildx ls --format '{{.Name}}')\"",
+        "[[ \"$builder_name\" != rxls-oracle-client && \"$builder_name\" != 'rxls-oracle-client*' ]]",
+        helper_type,
+        helper_hash,
+        environment,
+        "bash scripts/render-oracle-build-storage.sh prepare",
+        "printf '%s\\n' 'active=true' >> \"$GITHUB_OUTPUT\"",
+    )
+    restore_required = (
+        "if: ${{ always() && steps.oracle_build_storage.outcome != 'skipped' }}",
+        "ORACLE_BUILD_STORAGE_ACTIVE: ${{ steps.oracle_build_storage.outputs.active }}",
+        "set -euo pipefail",
+        "restore_status=0",
+        "client_present() {",
+        "builder_names=\"$(timeout 30 docker buildx ls --format '{{.Name}}')\" || return 2",
+        "if [[ \"$builder_name\" == rxls-oracle-client || \"$builder_name\" == 'rxls-oracle-client*' ]]; then",
+        'if [[ "$ORACLE_BUILD_STORAGE_ACTIVE" == "true" ]]; then',
+        "timeout 120 docker buildx rm --force rxls-oracle-client || restore_status=$?",
+        helper_type,
+        helper_hash,
+        environment,
+        "bash scripts/render-oracle-build-storage.sh restore || restore_status=$?",
+        'exit "$restore_status"',
+    )
+    if (
+        any(prepare.count(item) != 1 for item in prepare_required)
+        or any(restore.count(item) != 1 for item in restore_required)
+        or restore.count("timeout 30 docker buildx inspect rxls-oracle-client") != 1
+        or restore.count("if client_present; then") != 2
+        or restore.count('if [[ "$inventory_status" != 1 ]]; then restore_status="$inventory_status"; fi') != 2
+        or any(
+            step.find(helper_type) > step.find(helper_hash)
+            or step.find(helper_hash) > step.find(environment)
+            for step in (prepare, restore)
+        )
+        or "continue-on-error:" in prepare + restore
+    ):
+        errors.append(f"{path}: oracle build storage must be owned, bounded and fail closed")
+    headers = [
+        prepare_header,
+        "- name: Set up the pinned Buildx client",
+        (
+            "- name: Build and verify the locked oracle image"
+            if image_only else "- name: Build and inspect the locked oracle image"
+        ),
+        restore_header,
+    ]
+    headers.extend(
+        ["- name: Upload oracle image identity evidence"] if image_only else [
+            "- name: Smoke the locked oracle runtime",
+            "- name: Run the bounded four-format campaign through the container adapter",
+        ]
+    )
+    positions = [text.find(header) for header in headers]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        errors.append(f"{path}: restore oracle storage after image building and before rendering")
+    for required in (
+        '- "scripts/render-oracle-build-storage.sh"',
+        '- "scripts/test_render_oracle_build_storage.py"',
+        "python3 scripts/test_render_oracle_build_storage.py",
+        "bash -n scripts/render-oracle-build-storage.sh",
+    ):
+        if text.count(required) != 1:
+            errors.append(f"{path}: oracle build storage must retain triggers and regression checks")
 
 
 def _audit_exact_wasm_bindgen_install(
@@ -1700,6 +1829,8 @@ def _audit_snapshot_apt_block(
     label: str,
     scopes: tuple[str, ...],
     errors: list[str],
+    *,
+    require_restorations: bool = False,
 ) -> None:
     """Require one isolated, immutable Ubuntu snapshot acquisition."""
 
@@ -1745,20 +1876,74 @@ def _audit_snapshot_apt_block(
             )
 
     commands = _normalized_active_commands(block)
+    if require_restorations:
+        restoration_root = 'RESTORATION_ROOT="$APT_ROOT/restored"'
+        fetch = (
+            "python3 scripts/render-oracle-host-tools.py fetch-apt-restorations "
+            '--output-dir "$RESTORATION_ROOT"'
+        )
+        restored_specs = [
+            "python3 scripts/render-oracle-host-tools.py apt-specs "
+            f'--scope {scope} --restoration-dir "$RESTORATION_ROOT"'
+            for scope in scopes
+        ]
+        ordered_commands = [
+            'APT_ROOT="$PWD/target/render-oracle-apt"',
+            'mkdir -p "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"',
+            restoration_root,
+            fetch,
+            "python3 scripts/render-oracle-host-tools.py apt-sources "
+            '> "$APT_ROOT/ubuntu.sources"',
+            *restored_specs,
+            'mapfile -t SYSTEM_PACKAGES <<<"$SYSTEM_PACKAGE_TEXT"',
+            '[[ "${#SYSTEM_PACKAGES[@]}" -gt 0 ]]',
+            'sudo apt-get "${APT_OPTIONS[@]}" update',
+        ]
+        positions = [
+            commands.index(command)
+            for command in ordered_commands
+            if commands.count(command) == 1
+        ]
+        if (
+            [command for command in commands if "fetch-apt-restorations" in command]
+            != [fetch]
+            or [
+                command
+                for command in commands
+                if command.startswith("RESTORATION_ROOT=")
+            ] != [restoration_root]
+            or [
+                command
+                for command in commands
+                if command.startswith(
+                    "python3 scripts/render-oracle-host-tools.py apt-specs "
+                )
+            ] != restored_specs
+            or len(positions) != len(ordered_commands)
+            or positions != sorted(positions)
+        ):
+            errors.append(
+                f"{path}: {label} restoration must use the exact job-local root, "
+                "verified fetch, and restored package specs in the reviewed order"
+            )
+
     apt_commands = [
         command for command in commands if command.startswith("sudo apt-get ")
     ]
+    removal_guard = "--no-remove " if require_restorations else ""
     if apt_commands != [
         'sudo apt-get "${APT_OPTIONS[@]}" update',
         (
             'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
             "--no-install-recommends --allow-downgrades "
+            f"{removal_guard}"
             '"${SYSTEM_PACKAGES[@]}"'
         ),
     ]:
         errors.append(
             f"{path}: {label} must update and install only through the isolated "
             "snapshot options"
+            + (" without package removals" if require_restorations else "")
         )
     forbidden = (
         "archive.ubuntu.com",
@@ -3134,6 +3319,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         errors,
     )
     _audit_oracle_buildx_setup(path, active, errors)
+    _audit_oracle_build_storage(path, active, errors)
     oracle_image_build = _single_yaml_block(
         path,
         active,
@@ -3328,6 +3514,7 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "host comparison acquisition",
         ("bootstrap", "all"),
         errors,
+        require_restorations=True,
     )
     required = {
         '      - "scripts/render_parity_geometry_gate.py"': (
@@ -4357,12 +4544,15 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     )
     strict_commands = _normalized_active_commands(strict_host)
     for command, message in {
-        "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler": (
+        (
+            "python3 scripts/render-oracle-host-tools.py apt-specs --scope poppler "
+            '--restoration-dir "$RESTORATION_ROOT"'
+        ): (
             "strict PDF gate must install the pinned Poppler closure"
         ),
         (
             'sudo apt-get "${APT_OPTIONS[@]}" install --yes '
-            "--no-install-recommends --allow-downgrades "
+            "--no-install-recommends --allow-downgrades --no-remove "
             '"${SYSTEM_PACKAGES[@]}"'
         ): ("strict PDF gate must install only exact locked package specs"),
         (
@@ -4378,6 +4568,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "strict Poppler verification",
         ("poppler",),
         errors,
+        require_restorations=True,
     )
     bootstrap_index = pdf_job.find("Capture an unpinned host identity and fail closed")
     strict_index = pdf_job.find("Verify the pinned Poppler PDF gate")
@@ -4444,6 +4635,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
     if "    name: locked LibreOffice oracle image" not in image_job.splitlines():
         errors.append(f"{path}: oracle-image job must retain its reviewed identity")
     _audit_oracle_buildx_setup(path, image_job, errors)
+    _audit_oracle_build_storage(path, active, errors, image_only=True)
     image_policy_step = _single_yaml_block(
         path,
         image_job,
@@ -4452,7 +4644,7 @@ def audit_render_hardening_workflow(path: Path, text: str) -> list[str]:
         "oracle-image policy step",
         errors,
     )
-    if "run: python3 scripts/check_workflow_policy.py" not in image_policy_step:
+    if "python3 scripts/check_workflow_policy.py" not in image_policy_step:
         errors.append(
             f"{path}: oracle-image job must actively enforce hosted workflow policy"
         )
@@ -4673,12 +4865,26 @@ def audit_ci_feature_matrix(path: Path, text: str) -> list[str]:
         "--manifest-path bindings/mcp/Cargo.toml "
         "--output target/rxls-sbom.cdx.json",
         "bindings/mcp/Cargo.lock",
+        "name: Verify independently packaged MCP source",
+        "name: mcp-package-candidate-${{ github.run_attempt }}",
+        "path: bindings/mcp/target/package-candidate/*",
     )
     errors.extend(
         f"{path}: CI MCP gate is missing `{fragment}`"
         for fragment in required_mcp_fragments
         if fragment not in normalized
     )
+    if "cargo package --manifest-path bindings/mcp/Cargo.toml" in normalized:
+        errors.append(f"{path}: MCP packaging must use the verified unpublished-core overlay")
+    mcp = re.search(r"(?ms)^  mcp:\n(.*?)(?=^  [a-z][a-z0-9_-]*:|\Z)", normalized)
+    if mcp is None:
+        errors.append(f"{path}: exactly one bounded MCP job is required")
+    else:
+        required = ("timeout-minutes: 45", "toolchain: 1.88.0",
+                    f"EXPECTED_SHA: {PR_HEAD_EXPRESSION}", *MCP_CI_COMMANDS)
+        for fragment in required:
+            if fragment not in mcp.group(1):
+                errors.append(f"{path}: MCP job is missing `{fragment}`")
     return errors
 
 
@@ -6745,13 +6951,23 @@ def audit_viewer_release_boundary(path: Path, text: str) -> list[str]:
     return errors
 
 
+def _audit_oracle_build_storage_helper(root: Path) -> list[str]:
+    relative = Path("scripts/render-oracle-build-storage.sh")
+    helper = root / relative
+    if helper.is_symlink() or not helper.is_file():
+        return [f"{relative}: missing or non-regular reviewed oracle storage helper"]
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != ORACLE_BUILD_STORAGE_HELPER_SHA256:
+        return [f"{relative}: oracle storage helper must match its reviewed SHA256"]
+    return []
+
+
 def audit_repository(root: Path) -> list[str]:
     workflow_root = root / ".github" / "workflows"
     workflows = sorted((*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml")))
     if not workflows:
         return [f"{workflow_root}: no workflows found"]
 
-    errors: list[str] = []
+    errors: list[str] = _audit_oracle_build_storage_helper(root)
     for path in workflows:
         text = path.read_text(encoding="utf-8")
         relative = path.relative_to(root)

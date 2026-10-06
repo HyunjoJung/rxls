@@ -9,13 +9,12 @@ package can be saved without silently discarding unknown content.
 
 ## Version scope
 
-Keep the released `rxls` core **0.1.3** separate from the current checkout.
-The formula-cache batch API below, `Spreadsheet::set_formula_cached_values`,
-is a **current-source addition absent from registry core 0.1.3**, as are
-`Workbook::evaluate_cells` and `FormulaUnsupportedReason::TextLimitExceeded`.
-Use a path dependency or a pinned source revision containing these APIs for the
-current-source example; the package version string alone is not sufficient.
-The npm `rxls-wasm` core adapter (0.1.3) and `@rxls/render-worker` (0.3.0)
+The released `rxls` core **0.1.4** includes the formula-cache batch API below,
+`Spreadsheet::set_formula_cached_values`, along with `Workbook::evaluate_cells`
+and `FormulaUnsupportedReason::TextLimitExceeded`. These APIs are absent from
+registry core 0.1.3. Use `rxls = "=0.1.4"` or a reviewed source checkout for
+the batch example.
+The npm `rxls-wasm` core adapter (0.1.4) and `@rxls/render-worker` (0.3.0)
 have separate public interfaces and release boundaries. See
 [Compatibility](compatibility.md) and [Formula support](formulas.md).
 
@@ -54,7 +53,7 @@ unannounced package rewrite.
 
 Individual operations that touch several parts use clone-and-swap mutation.
 `Spreadsheet::transaction` exposes the same rule for caller-defined batches.
-The following example works with core 0.1.3 and current source; it requires an
+The following example works with core 0.1.3 and 0.1.4; it requires an
 editable `book.xlsx` containing a worksheet named `Data`:
 
 ```rust
@@ -78,7 +77,7 @@ serialization fails, the workbook, retained package bytes, and edited-part list
 remain unchanged. The transaction is in memory; the caller chooses how to
 persist the committed bytes.
 
-## Formula-cache updates (current source; not core 0.1.3)
+## Formula-cache updates (core 0.1.4)
 
 This API writes caller-supplied cached results; it does not evaluate formulas:
 
@@ -120,7 +119,7 @@ edits. **Save and reopen before evaluating after input edits**, and reopen the
 final saved bytes to inspect refreshed caches. `save()` does not update the
 existing parsed snapshot or write a filesystem path by itself.
 
-This self-contained current-source example evaluates fresh edited input, writes
+This self-contained core 0.1.4 example evaluates fresh edited input, writes
 only a computed result, verifies the reopened cache, and checks duplicate-target
 rollback. In a mixed batch, callers can omit `Fallback` results to retain those
 caches; an outer evaluation `Err` provides no partial batch to save.
@@ -177,7 +176,7 @@ fn main() -> rxls::Result<()> {
 The current package-preserving surface covers:
 
 - cell values, formulas with cached values, and rectangular range updates;
-- cache-only formula batches in the current source, as described above;
+- cache-only formula batches in core 0.1.4, as described above;
 - document properties, defined names, active sheet, and calculation metadata;
 - sheet add, rename, delete, visibility, active-sheet, and tab-color operations;
 - row heights, column widths and visibility, panes, view state, page setup, and
@@ -193,7 +192,7 @@ coordinates, relationships, or unsupported package state.
 ## Browser edit boundary
 
 This is the separately versioned **`@rxls/render-worker` 0.3.0** surface, not a
-claim about native core 0.1.3 or the synchronous `rxls-wasm` package. Its
+claim about the synchronous `rxls-wasm` package. Its
 recalculating edits combine evaluation and cache refresh into one undoable
 operation. Unsupported formulas retain their caches; a resource-limit or
 cache-write failure rejects the entire edit. See the

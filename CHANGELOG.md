@@ -6,10 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Native-core API additions below are not part of registry `rxls` 0.1.3.
-The npm `rxls-wasm` 0.1.3 and `@rxls/render-worker` 0.3.0 distributions have
-separate interfaces and version histories; worker features do not imply a
-native-core release.
+### Changed
+
+- Documented core 0.1.4 formula/cache APIs, shared evaluation budgets, and
+  the independently versioned npm packages in the formula, preservation,
+  compatibility, and worker guides.
+
+### Fixed
+
+- Preserved multiline text and formula cached values in viewer Cell Options,
+  with production-browser download/reopen, reload-cancellation, and XLSM
+  preservation coverage.
+
+## [0.1.4] - 2026-09-28
 
 ### Added
 
@@ -21,12 +30,12 @@ native-core release.
   external `openpyxl` reopen.
 - Added single-click in-cell editing and a live formula bar to the viewer,
   backed by bounded cell geometry from the same renderer layout as the SVG.
-- Added current-source `Workbook::evaluate_cells` for ordered, non-mutating
+- Added `Workbook::evaluate_cells` for ordered, non-mutating
   batch evaluation and `Spreadsheet::set_formula_cached_values` for atomic
   cache updates that preserve formula XML. Each accepts at most 10,000 targets;
   cache updates require distinct existing formula cells and separate edit-value
   validation. Reopen saved bytes to refresh the parsed workbook view.
-- Added current-source `FormulaUnsupportedReason::TextLimitExceeded`
+- Added `FormulaUnsupportedReason::TextLimitExceeded`
   (`text_limit_exceeded`): 1 MiB per produced/copied text value and a shared
   8 MiB UTF-8 generation/copy allowance, including intermediates and memo copies.
   Batch evaluation returns an outer error on resource exhaustion, rather than
@@ -37,9 +46,6 @@ native-core release.
 
 ### Changed
 
-- Documented released core 0.1.3 versus current-source formula/cache APIs,
-  shared evaluation budgets, and the independently versioned npm packages in
-  the formula, preservation, compatibility, and worker guides.
 - Split renderer layout responsibilities and viewer controllers into focused
   modules, and refreshed the viewer ribbon, sheet navigation, and edit controls.
 - Made manual Pages verification non-deploying by default and checked exact
@@ -50,9 +56,16 @@ native-core release.
   regression coverage.
 - Separated read-only core release verification from protected publication,
   binding the publishing job to the exact verified artifact and package bytes.
+- Updated `cfb` to 0.15.0 and `flate2` to 1.1.10 across the affected dependency
+  locks, with regenerated notices for the WASM and MCP distributions.
+- Synchronized reviewed CodeQL init/analysis pins and refreshed the Pages
+  deployment action. VS Code builds use renderer 0.3.0 and TypeScript 7, with
+  manifest and lockfile checks for the bundled renderer.
 
 ### Fixed
 
+- Fixed fill-only conditional formatting failing automatic row layout when a
+  solid fill has a resolved foreground and an unused automatic background color.
 - Fixed default-style columns collapsing to zero width in Excel after
   `Workbook::open` followed by `to_xlsx` (#94). Column records now include
   their inherited width while retaining explicit widths, hidden/grouped
@@ -65,6 +78,11 @@ native-core release.
   while retaining a failed edit's draft and keyboard focus for correction.
 - Released pending document-property controls even when the workbook changes
   before a request finishes.
+- Pinned `encoding_rs` to 0.8.35 so fresh core consumers retain the promised
+  Rust 1.85 minimum instead of resolving a release that requires Rust 1.88.
+- Kept the general WASM adapter within its existing 2 MiB per-target budget
+  with a package-local optimized release profile, without removing exports or
+  supported formats or changing native and render-worker build profiles.
 
 ## [0.1.3] - 2026-08-22
 
@@ -435,7 +453,8 @@ Apache POI, or runtime subprocess dependency.
   comments, metadata, charts, drawings, and editable package parts after the
   `quick-xml` migration.
 
-[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4
 [0.1.3]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.3
 [0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2
 [0.1.1]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.1

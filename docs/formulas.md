@@ -9,17 +9,15 @@ is not a complete Excel calculation engine.
 
 ## Version scope
 
-The released native core is `rxls` **0.1.3** (`v0.1.3`). It provides
-`Workbook::evaluate_cell`; the single-cell example below works with that release.
-**Current source additions, not present in core 0.1.3**, are
-`Workbook::evaluate_cells`, `Spreadsheet::set_formula_cached_values`, and
+The released native core is `rxls` **0.1.4** (`v0.1.4`). It provides
+`Workbook::evaluate_cell`, `Workbook::evaluate_cells`,
+`Spreadsheet::set_formula_cached_values`, and
 `FormulaUnsupportedReason::TextLimitExceeded`, including the shared UTF-8 text
-budgets described below. A source checkout may still declare version `0.1.3`
-in `Cargo.toml`; that does not put these additions in the registry artifact.
-Use a path dependency on the reviewed checkout, or pin a revision containing
-them, for examples marked current source. `rxls = "=0.1.3"` does not provide them.
+budgets described below. Use `rxls = "=0.1.4"` or a reviewed source checkout
+for the batch examples. Core 0.1.3 supports single-cell evaluation but does not
+provide these batch APIs or the text-limit variant.
 
-The npm packages `rxls-wasm` (core adapter, 0.1.3) and
+The npm packages `rxls-wasm` (core adapter, 0.1.4) and
 `@rxls/render-worker` (render/edit worker, 0.3.0) are separate distributions.
 Worker 0.3.0 recalculating edits do not imply a new native-core release or expose
 every Rust method as JavaScript. See [Compatibility](compatibility.md).
@@ -73,7 +71,7 @@ AND OR NOT ISNA ISERROR ISNUMBER ISTEXT ISBLANK
 Invalid argument counts produce Excel-compatible value errors where the
 supported function contract defines them.
 
-## Batch evaluation (current source; not core 0.1.3)
+## Batch evaluation (core 0.1.4)
 
 The source API has this signature (`Result` here is `std::result::Result`):
 
@@ -105,7 +103,7 @@ Even copying a fallback's cached text can exhaust a shared budget. By contrast,
 `evaluate_cell` returns `FormulaEvaluation::Fallback` for evaluation limits as
 well as unsupported semantics; it has no outer batch `Result`.
 
-This example uses the current source API and deliberately stores stale caches:
+This example uses the core 0.1.4 API and deliberately stores stale caches:
 
 ```rust
 use rxls::{Cell, FormulaEvaluation, FormulaUnsupportedReason, Workbook};
@@ -142,8 +140,8 @@ To persist selected computed results, use the separately validated
 ## Typed fallback reasons
 
 `FormulaUnsupportedReason::code()` provides a stable machine-readable code.
-This table describes the current source; `TextLimitExceeded` is the addition
-not present in core 0.1.3. Both enums are `#[non_exhaustive]`, so consumers
+This table describes core 0.1.4; `TextLimitExceeded` was added after core
+0.1.3. Both enums are `#[non_exhaustive]`, so consumers
 should retain a catch-all arm when matching them.
 
 | Reason | Code | Meaning |
@@ -160,7 +158,7 @@ should retain a catch-all arm when matching them.
 | `ExpressionTooComplex` | `expression_too_complex` | Parser nesting exceeds its recursion bound |
 | `OperationLimitExceeded` | `operation_limit_exceeded` | Evaluation exceeds the semantic work budget |
 | `DependencyDepthExceeded` | `dependency_depth_exceeded` | Referenced formulas exceed the dependency-depth bound |
-| `TextLimitExceeded` (current source) | `text_limit_exceeded` | Text production exceeded 1 MiB per value or the shared 8 MiB UTF-8 budget. |
+| `TextLimitExceeded` (core 0.1.4) | `text_limit_exceeded` | Text production exceeded 1 MiB per value or the shared 8 MiB UTF-8 budget. |
 
 The result never substitutes a guessed value for unsupported semantics.
 Callers can use the cached value, surface the reason, or require a computed
@@ -197,14 +195,14 @@ value returned by the single-cell fallback path. The non-formula fast path in
 `evaluate_cell` clones the existing scalar directly, without these evaluator
 text counters; batch targets go through the shared accounting instead.
 
-The two text limits and the shared batch behavior are current-source additions.
+The two text limits and the shared batch behavior were released in core 0.1.4.
 Do not infer these safeguards from a dependency on registry core 0.1.3. That
 release documents 10,000 range cells, 10,000 semantic operations, dependency
 depth 64, and expression depth 128 for its single-cell evaluation; it has no
 batch API or `TextLimitExceeded` variant. Current range counters are cumulative,
 not a fresh 10,000-cell allowance for every range in a formula.
 
-The current-source example below checks a target-count error and a text limit.
+The core 0.1.4 example below checks a target-count error and a text limit.
 The initial Korean string is small enough for an Excel text cell; successive
 formulas double its UTF-8 content without writing the computed strings back:
 
