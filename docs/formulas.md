@@ -135,7 +135,7 @@ match workbook.sheets[0].cell(0, 0) {
 ```
 
 To persist selected computed results, use the separately validated
-[formula-cache update API](preservation.md#formula-cache-updates-current-source-not-core-013).
+[formula-cache update API](preservation.md#formula-cache-updates-core-014).
 
 ## Typed fallback reasons
 
@@ -239,7 +239,7 @@ assert_eq!(FormulaUnsupportedReason::TextLimitExceeded.code(), "text_limit_excee
 ```
 
 A computed value is not automatically a valid edit value. Cache updates enforce
-[separate cell-text and XML limits](preservation.md#formula-cache-updates-current-source-not-core-013),
+[separate cell-text and XML limits](preservation.md#formula-cache-updates-core-014),
 including 32,767 UTF-16 units for `Cell::Text`, before changing a package.
 
 ## Current boundaries
