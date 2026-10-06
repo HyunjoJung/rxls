@@ -74,6 +74,23 @@ separately from authoring merges so reading never changes write output.
 - The `chrono` feature converts Excel date/time and duration serials to
   `chrono` types while retaining raw serial access.
 
+Run the self-contained [typed-row example](../examples/typed_rows.rs) from a
+source checkout:
+
+```sh
+cargo +1.85.0 run --locked --features serde --example typed_rows
+```
+
+It writes and reopens an XLSX in memory, maps the header to a named Serde
+struct, and propagates both header and row conversion errors. `serde` is
+opt-in; `xlsx` is enabled by default. With defaults disabled, use
+`--no-default-features --features xlsx,serde`. Expected stdout:
+
+```text
+Road: price=125.5, awarded=true
+Bridge: price=88, awarded=false
+```
+
 Formula re-evaluation is a bounded deterministic subset, not a full Excel
 calculation engine. See [Formula support](formulas.md).
 
