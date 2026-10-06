@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved SpreadsheetML ST_Xstring cell text across shared/inline/rich reads,
+  authoring, edits and text formula-cache updates (#131). Literal escape-shaped
+  strings, carriage returns, encodable controls and cache whitespace retain
+  their exact values;
+  string length limits and XML output budgets still apply.
 - Kept shared and array formulas intact when replacing or clearing cells (#129).
   Single-cell and range edits now share the whole-group replacement rule;
   incomplete group metadata rejects the edit without changing package bytes.

@@ -189,12 +189,21 @@ Coordinate limits follow XLSX: rows are zero-based through 1,048,575 and columns
 through 16,383. Public methods return typed errors for invalid sheets,
 coordinates, relationships, or unsupported package state.
 
+The following formula-group and cell-text fixes are currently in the source
+checkout and will ship in a subsequent core release.
+
 Cell replacement and clearing must cover an entire shared or array formula
 group. Use `set_cell_range_values` or `clear_range` for a group spanning several
 cells; a single-cell replacement is accepted only for a one-cell group.
 Malformed, incomplete, ambiguous, or namespace-prefixed group metadata is
 rejected before package mutation. Unknown namespace children are preserved.
 Cache-only updates preserve formula nodes and may refresh individual members.
+
+Cell text and text formula caches use SpreadsheetML ST_Xstring encoding.
+Literal `_xHHHH_` text, carriage returns and control characters retain their
+values through save/reopen. The 32,767 UTF-16-unit cell-string limit applies to
+the semantic value before encoding. Formula source, errors, attributes and
+other XML metadata retain their existing validation and escaping rules.
 
 ## Browser edit boundary
 

@@ -372,16 +372,11 @@ fn cell_input_validation_rejects_without_mutating_the_package() {
     let invalid_values = vec![
         Cell::Number(f64::NAN),
         Cell::Date(f64::INFINITY),
-        Cell::Text("illegal\u{1}text".to_string()),
         Cell::Error("#BAD\u{1}!".to_string()),
         Cell::Text("😀".repeat(16_384)),
         Cell::Formula {
             formula: "SUM(\u{1})".to_string(),
             cached: Box::new(Cell::Number(1.0)),
-        },
-        Cell::Formula {
-            formula: "TEXT()".to_string(),
-            cached: Box::new(Cell::Text("illegal\u{1}cache".to_string())),
         },
         Cell::Formula {
             formula: "ERROR()".to_string(),
@@ -520,7 +515,7 @@ fn cell_update_batch_preserves_shared_and_array_formula_nodes_and_cell_metadata(
         "<f t=\"shared\" si=\"0\"/>",
         "<f t=\"array\" ref=\"C1:C1\">2+2</f>",
         "<c r=\"A1\" s=\"3\" cm=\"1\">",
-        "<v>two</v>",
+        r#"<v xml:space="preserve">two</v>"#,
     ] {
         assert!(xml.contains(expected), "missing {expected} in {xml}");
     }
@@ -576,7 +571,7 @@ fn rectangular_cell_values_reject_invalid_batches_without_partial_mutation() {
         vec![vec![Some(Cell::Number(4.0)), Some(Cell::Number(f64::NAN))]],
         vec![vec![
             Some(Cell::Number(4.0)),
-            Some(Cell::Text("bad\0xml".into())),
+            Some(Cell::Error("#BAD\0!".into())),
         ]],
         vec![vec![None; 101]; 100],
         vec![vec![Some(Cell::Text("x".repeat(32767))); 33]],
