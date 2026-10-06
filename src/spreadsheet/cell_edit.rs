@@ -419,9 +419,7 @@ impl Spreadsheet {
 
 fn validate_formula_cached_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "formula cached text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => validate_xml_value(
             error,
             "formula cached error contains invalid XML characters",
@@ -847,9 +845,7 @@ fn range_node_plan(
 
 fn validate_edit_cell_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "cell text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => {
             validate_xml_value(error, "cell error contains invalid XML characters")
         }
@@ -1022,7 +1018,10 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         // SST index preservation becomes necessary.
         Cell::Text(t) => (
             CellTypeAttr::Set(b"inlineStr"),
-            format!(r#"<is><t xml:space="preserve">{}</t></is>"#, esc_text(t)),
+            format!(
+                r#"<is><t xml:space="preserve">{}</t></is>"#,
+                crate::xstring::escape_xml(t)
+            ),
         ),
         Cell::Number(n) | Cell::Date(n) => {
             (CellTypeAttr::Remove, format!("<v>{}</v>", num_str(*n)))
@@ -1034,7 +1033,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         Cell::Error(e) => (CellTypeAttr::Set(b"e"), format!("<v>{}</v>", esc_text(e))),
         Cell::Formula { formula, cached } => {
             let (t_attr, v): (Option<&'static [u8]>, String) = match cached.as_ref() {
-                Cell::Text(t) => (Some(b"str"), esc_text(t)),
+                Cell::Text(t) => (Some(b"str"), crate::xstring::escape_xml(t)),
                 Cell::Bool(b) => (Some(b"b"), if *b { "1" } else { "0" }.to_string()),
                 Cell::Error(e) => (Some(b"e"), esc_text(e)),
                 Cell::Number(n) | Cell::Date(n) => (None, num_str(*n)),
@@ -1044,7 +1043,15 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
                 Some(t) => CellTypeAttr::Set(t),
                 None => CellTypeAttr::Remove,
             };
-            (type_attr, format!("<f>{}</f><v>{v}</v>", esc_text(formula)))
+            let v_space = if matches!(cached.as_ref(), Cell::Text(_)) {
+                r#" xml:space="preserve""#
+            } else {
+                ""
+            };
+            (
+                type_attr,
+                format!("<f>{}</f><v{v_space}>{v}</v>", esc_text(formula)),
+            )
         }
     };
 
@@ -1053,7 +1060,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
 
 fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) -> Result<()> {
     let (type_attr, encoded) = match value {
-        Cell::Text(text) => (CellTypeAttr::Set(b"str"), esc_text(text)),
+        Cell::Text(text) => (CellTypeAttr::Set(b"str"), crate::xstring::escape_xml(text)),
         Cell::Number(number) | Cell::Date(number) => (CellTypeAttr::Remove, num_str(*number)),
         Cell::Bool(value) => (
             CellTypeAttr::Set(b"b"),
@@ -1064,7 +1071,18 @@ fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) 
             return Err(Error::Zip("formula cache must be a scalar cell value"))
         }
     };
-    sml_replace_cell_value(tree, cell, type_attr, &format!("<v>{encoded}</v>"), false)
+    let v_space = if matches!(value, Cell::Text(_)) {
+        r#" xml:space="preserve""#
+    } else {
+        ""
+    };
+    sml_replace_cell_value(
+        tree,
+        cell,
+        type_attr,
+        &format!("<v{v_space}>{encoded}</v>"),
+        false,
+    )
 }
 
 fn sml_replace_cell_value(

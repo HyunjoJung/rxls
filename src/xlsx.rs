@@ -906,6 +906,7 @@ fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Ve
     let mut in_si = false;
     let mut in_t = false;
     let mut in_rph = false;
+    let mut text_element = String::new();
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) => match local(e.name().as_ref()) {
@@ -915,7 +916,10 @@ fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Ve
                 }
                 b"r" if in_si && !in_rph => run = Some(crate::TextRun::default()),
                 b"rPh" => in_rph = true,
-                b"t" => in_t = true,
+                b"t" => {
+                    in_t = true;
+                    text_element.clear();
+                }
                 b"rFont" if run.is_some() => {
                     run.as_mut().expect("run").font.name = attr(&e, b"val");
                 }
@@ -983,31 +987,28 @@ fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Ve
                     }
                 }
                 b"rPh" => in_rph = false,
-                b"t" => in_t = false,
+                b"t" => {
+                    if in_si && in_t && !in_rph {
+                        let text = crate::xstring::decode(&text_element);
+                        cur.text.push_str(&text);
+                        if let Some(run) = run.as_mut() {
+                            run.text.push_str(&text);
+                        }
+                    }
+                    in_t = false;
+                }
                 _ => {}
             },
             Ok(Event::Text(t)) if in_si && in_t && !in_rph => {
-                let text = text_of(&t);
-                cur.text.push_str(&text);
-                if let Some(run) = run.as_mut() {
-                    run.text.push_str(&text);
-                }
+                // XML 1.0 normalizes raw CR/CRLF before ST_Xstring decoding.
+                // Numeric character references are appended separately below.
+                text_element.push_str(&t.xml10_content().unwrap_or_default());
             }
             Ok(Event::GeneralRef(reference)) if in_si && in_t && !in_rph => {
-                with_general_ref_text(&reference, |text| {
-                    cur.text.push_str(text);
-                    if let Some(run) = run.as_mut() {
-                        run.text.push_str(text);
-                    }
-                });
+                append_general_ref(&mut text_element, &reference);
             }
             Ok(Event::CData(t)) if in_si && in_t && !in_rph => {
-                let bytes = t.into_inner();
-                let text = String::from_utf8_lossy(bytes.as_ref());
-                cur.text.push_str(&text);
-                if let Some(run) = run.as_mut() {
-                    run.text.push_str(&text);
-                }
+                text_element.push_str(&t.xml10_content().unwrap_or_default());
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}

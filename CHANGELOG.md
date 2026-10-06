@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved SpreadsheetML ST_Xstring cell text across shared/inline/rich reads,
+  authoring, edits and text formula-cache updates (#131). Literal escape-shaped
+  strings, carriage returns, encodable controls and cache whitespace retain
+  their exact values;
+  string length limits and XML output budgets still apply.
 - Restored Ctrl/Meta+Shift+Z after the sole edit is undone in the viewer (#137).
   The shortcut checks redo availability while preserving draft/input guards,
   Ctrl/Meta+Y and toolbar history behavior.

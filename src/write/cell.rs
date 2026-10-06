@@ -50,16 +50,41 @@ pub(super) fn write_cell(
         ),
         Cell::Error(e) => format!(r#"<c r="{ref_}"{s} t="e"><v>{}</v></c>"#, esc_text(e)),
         Cell::Formula { formula, cached } => {
+            let (cache_type, cache_len) = match cached.as_ref() {
+                Cell::Text(text) => (r#" t="str""#, crate::xstring::escaped_xml_len(text)),
+                Cell::Bool(_) => (r#" t="b""#, 1),
+                Cell::Error(error) => (r#" t="e""#, escaped_text_len(error)),
+                Cell::Number(number) | Cell::Date(number) => ("", num_str(*number).len()),
+                Cell::Formula { .. } => ("", 1),
+            };
+            let v_space = if matches!(cached.as_ref(), Cell::Text(_)) {
+                r#" xml:space="preserve""#
+            } else {
+                ""
+            };
+            let prefix = format!(r#"<c r="{ref_}"{s}{cache_type}><f>"#);
+            let cost = prefix
+                .len()
+                .saturating_add(escaped_text_len(formula))
+                .saturating_add("</f><v".len())
+                .saturating_add(v_space.len())
+                .saturating_add(1)
+                .saturating_add(cache_len)
+                .saturating_add("</v></c>".len());
+            if cost > *ctx.budget {
+                *ctx.budget = 0;
+                return false;
+            }
             // <f> carries the formula; the cached value determines t= and <v>.
             let (t_attr, v) = match cached.as_ref() {
-                Cell::Text(t) => (r#" t="str""#, esc_text(t)),
+                Cell::Text(t) => (r#" t="str""#, crate::xstring::escape_xml(t)),
                 Cell::Bool(b) => (r#" t="b""#, if *b { "1" } else { "0" }.to_string()),
                 Cell::Error(e) => (r#" t="e""#, esc_text(e)),
                 Cell::Number(n) | Cell::Date(n) => ("", num_str(*n)),
                 Cell::Formula { .. } => ("", "0".to_string()),
             };
             format!(
-                r#"<c r="{ref_}"{s}{t_attr}><f>{}</f><v>{v}</v></c>"#,
+                r#"<c r="{ref_}"{s}{t_attr}><f>{}</f><v{v_space}>{v}</v></c>"#,
                 esc_text(formula)
             )
         }
@@ -87,21 +112,23 @@ fn consume_budget(budget: &mut usize, cost: usize) -> bool {
 }
 
 fn shared_string_entry_len(s: &str) -> usize {
-    r#"<si><t xml:space="preserve">"#.len() + escaped_text_len(s) + "</t></si>".len()
+    r#"<si><t xml:space="preserve">"#
+        .len()
+        .saturating_add(crate::xstring::escaped_xml_len(s))
+        .saturating_add("</t></si>".len())
 }
 
-fn escaped_text_len(s: &str) -> usize {
-    let mut len = 0usize;
-    for c in s.chars() {
-        len += match c {
+// Generic XML escaping remains appropriate for formula source and error text.
+fn escaped_text_len(text: &str) -> usize {
+    text.chars().fold(0_usize, |length, character| {
+        length.saturating_add(match character {
             '&' => 5,
             '<' | '>' => 4,
             c if (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r') => 0,
-            c if matches!(c as u32, 0xFFFE | 0xFFFF) => 0,
+            '\u{FFFE}' | '\u{FFFF}' => 0,
             c => c.len_utf8(),
-        };
-    }
-    len
+        })
+    })
 }
 
 /// Emit a rich (mixed-format) cell as an inline string: `<is>` with one `<r>` per
@@ -176,9 +203,23 @@ pub(super) fn write_rich_cell(
             }
             rx.push_str("</rPr>");
         }
+        let used = out.len().saturating_sub(start);
+        let text_cost = rx
+            .len()
+            .saturating_add(r#"<t xml:space="preserve">"#.len())
+            .saturating_add(crate::xstring::escaped_xml_len(&run.text))
+            .saturating_add("</t></r>".len())
+            .saturating_add(suffix.len());
+        if used.saturating_add(text_cost) > max_bytes {
+            if used == prefix.len() {
+                out.truncate(start);
+                return false;
+            }
+            break;
+        }
         rx.push_str(&format!(
             r#"<t xml:space="preserve">{}</t>"#,
-            esc_text(&run.text)
+            crate::xstring::escape_xml(&run.text)
         ));
         rx.push_str("</r>");
         let used = out.len().saturating_sub(start);
@@ -216,9 +257,78 @@ pub(super) fn shared_strings_xml(sst: &[String], total_count: usize) -> String {
     ));
     for v in sst {
         s.push_str(r#"<si><t xml:space="preserve">"#);
-        s.push_str(&esc_text(v));
+        s.push_str(&crate::xstring::escape_xml(v));
         s.push_str("</t></si>");
     }
     s.push_str("</sst>");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{write_cell, write_rich_cell, CellWriteContext};
+    use crate::{Cell, Font, TextRun};
+    use std::collections::HashMap;
+
+    #[test]
+    fn escaped_shared_and_cached_text_do_not_exceed_or_mutate_a_small_budget() {
+        for value in [
+            Cell::Text("\u{1}".repeat(100)),
+            Cell::Formula {
+                formula: "\"text\"".into(),
+                cached: Box::new(Cell::Text("\u{1}".repeat(100))),
+            },
+        ] {
+            let mut out = "prior output".to_owned();
+            let mut sst = Vec::new();
+            let mut sst_idx = HashMap::new();
+            let mut sst_count = 0;
+            let mut budget = 200;
+            let mut context = CellWriteContext {
+                sst: &mut sst,
+                sst_idx: &mut sst_idx,
+                sst_count: &mut sst_count,
+                budget: &mut budget,
+            };
+            assert!(!write_cell(&mut out, 0, 0, &value, 0, &mut context));
+            assert_eq!(out, "prior output");
+            assert!(sst.is_empty());
+            assert!(sst_idx.is_empty());
+            assert_eq!(sst_count, 0);
+            assert_eq!(budget, 0);
+        }
+    }
+
+    #[test]
+    fn escaped_rich_text_rolls_back_an_over_budget_first_run() {
+        let mut out = "prior output".to_owned();
+        let runs = [TextRun::new("\u{1}".repeat(100), Font::default())];
+        assert!(!write_rich_cell(&mut out, 0, 0, &runs, 0, 200));
+        assert_eq!(out, "prior output");
+    }
+
+    #[test]
+    fn encoded_cache_accepts_an_exact_budget_and_rejects_one_byte_less() {
+        let expected = r#"<c r="A1" t="str"><f>"text"</f><v xml:space="preserve">_x005F_x0041__x000D_</v></c>"#;
+        for short in [false, true] {
+            let mut out = String::new();
+            let mut sst = Vec::new();
+            let mut sst_idx = HashMap::new();
+            let mut sst_count = 0;
+            let mut budget = expected.len() - usize::from(short);
+            let mut context = CellWriteContext {
+                sst: &mut sst,
+                sst_idx: &mut sst_idx,
+                sst_count: &mut sst_count,
+                budget: &mut budget,
+            };
+            let value = Cell::Formula {
+                formula: "\"text\"".into(),
+                cached: Box::new(Cell::Text("_x0041_\r".into())),
+            };
+            assert_eq!(write_cell(&mut out, 0, 0, &value, 0, &mut context), !short);
+            assert_eq!(out, if short { "" } else { expected });
+            assert_eq!(budget, 0);
+        }
+    }
 }
