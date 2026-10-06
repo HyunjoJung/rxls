@@ -1165,7 +1165,11 @@ function onKeyDown(event) {
     void openCellEditor();
     return;
   }
-  if (!editingText && key === "z" && state.editState?.canUndo) {
+  if (
+    !editingText &&
+    key === "z" &&
+    (event.shiftKey ? state.editState?.canRedo : state.editState?.canUndo)
+  ) {
     event.preventDefault();
     void applyHistoryEdit(event.shiftKey ? "redo" : "undo");
     return;
