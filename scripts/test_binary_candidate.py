@@ -18,6 +18,7 @@ import check_workflow_policy as policy
 
 REVISION = "a" * 40
 LOCK_HASH = "b" * 64
+ROOT_LOCK_HASH = "e" * 64
 
 
 def binary(selected):
@@ -42,15 +43,16 @@ def data_set(selected="windows-x64"):
     payloads.update({name: binary(selected) for name in candidate.binary_paths(selected)})
     payloads["README.txt"] = b"Verification candidate\n"
     payloads["THIRD_PARTY_NOTICES.txt"] = f"RXLS MCP THIRD-PARTY NOTICES\n- Cargo lock SHA-256: {LOCK_HASH}\n".encode()
+    payloads["CLI-THIRD-PARTY-NOTICES.txt"] = f"RXLS CLI THIRD-PARTY NOTICES\n- Cargo lock SHA-256: {ROOT_LOCK_HASH}\n".encode()
     manifest = {
         "schema": candidate.SCHEMA, "stage": "prepared",
         "source_revision": REVISION, "source_tree": "c" * 40,
         "source_archive_sha256": "d" * 64,
-        "source_files": {name: LOCK_HASH for name in candidate.SOURCE_FILES},
+        "source_files": {name: ROOT_LOCK_HASH if name == "Cargo.lock" else LOCK_HASH for name in candidate.SOURCE_FILES},
         "versions": {"cli": "0.1.4", "mcp": "0.1.0"},
         "platform": selected, "target": target,
         "planned_runner": candidate.PLATFORMS[selected]["runner"],
-        "notice_cli_subset": True, "host": {"system": candidate.PLATFORMS[selected]["system"]},
+        "notice_cli_generated": True, "host": {"system": candidate.PLATFORMS[selected]["system"]},
         "compilers": {name: {"toolchain": version, "rustc_verbose": f"rustc {version} (test)\nhost: {target}\n", "cargo_version": f"cargo {version} (test)"} for name, version in (("cli", "1.85.0"), ("mcp", "1.88.0"))},
         "files": {name: {"bytes": len(data), "sha256": candidate.digest(data), "mode": 0o755 if name in candidate.binary_paths(selected) else 0o644} for name, data in payloads.items()},
     }
@@ -124,7 +126,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_manifest_shapes_versions_targets_and_compilers_are_rejected(self):
         original, payloads = data_set()
-        changes = [lambda value: [], lambda value: value | {"versions": {"cli": "0.1.4", "mcp": True}}, lambda value: value | {"source_tree": "short"}, lambda value: value | {"source_files": {}}, lambda value: value | {"target": "aarch64-pc-windows-msvc"}, lambda value: value | {"planned_runner": "windows-latest"}, lambda value: value | {"notice_cli_subset": False}, lambda value: value | {"compilers": {}}]
+        changes = [lambda value: [], lambda value: value | {"versions": {"cli": "0.1.4", "mcp": True}}, lambda value: value | {"source_tree": "short"}, lambda value: value | {"source_files": {}}, lambda value: value | {"target": "aarch64-pc-windows-msvc"}, lambda value: value | {"planned_runner": "windows-latest"}, lambda value: value | {"notice_cli_generated": False}, lambda value: value | {"compilers": {}}]
         for change in changes:
             with self.subTest(change=changes.index(change)), self.assertRaises(ValueError):
                 self.verify(write_archive(self.directory, change(copy.deepcopy(original)), payloads))
@@ -143,6 +145,25 @@ class ArchiveTests(unittest.TestCase):
         path.rename(renamed)
         with self.assertRaisesRegex(ValueError, "filename"):
             self.verify(renamed)
+
+    def test_cli_notice_is_required_even_when_mcp_notice_remains_valid(self):
+        manifest, payloads = data_set()
+        payloads.pop("CLI-THIRD-PARTY-NOTICES.txt", None)
+        manifest["files"].pop("CLI-THIRD-PARTY-NOTICES.txt", None)
+        with self.assertRaisesRegex(ValueError, "inventory"):
+            self.verify(write_archive(self.directory, manifest, payloads))
+
+    def test_each_notice_is_bound_to_its_distinct_lock_and_title(self):
+        original, payloads = data_set()
+        self.verify(write_archive(self.directory, original, payloads))
+        changes = (("CLI-THIRD-PARTY-NOTICES.txt", f"RXLS CLI THIRD-PARTY NOTICES\n- Cargo lock SHA-256: {LOCK_HASH}\n".encode()), ("THIRD_PARTY_NOTICES.txt", f"RXLS MCP THIRD-PARTY NOTICES\n- Cargo lock SHA-256: {ROOT_LOCK_HASH}\n".encode()), ("CLI-THIRD-PARTY-NOTICES.txt", f"RXLS MCP THIRD-PARTY NOTICES\n- Cargo lock SHA-256: {ROOT_LOCK_HASH}\n".encode()))
+        for name, text in changes:
+            with self.subTest(name=name, text=text):
+                manifest = copy.deepcopy(original)
+                files = payloads | {name: text}
+                manifest["files"][name].update(bytes=len(text), sha256=candidate.digest(text))
+                with self.assertRaisesRegex(ValueError, "notice/locked"):
+                    self.verify(write_archive(self.directory, manifest, files))
 
     def test_unsafe_link_and_case_collision_are_rejected(self):
         manifest, payloads = data_set()

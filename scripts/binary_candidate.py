@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import threading
+import tomllib
 import zipfile
 
 from release_manifest import SEMVER, sha256_file
@@ -38,6 +39,7 @@ MAX_METADATA = 32 * 1024
 MAX_MEMBERS = 16
 MAX_COMMAND_OUTPUT = 16 * 1024 * 1024
 SOURCE_FILES = ("Cargo.toml", "Cargo.lock", "bindings/mcp/Cargo.toml", "bindings/mcp/Cargo.lock")
+CLI_NOTICE = "CLI-THIRD-PARTY-NOTICES.txt"
 LEGAL_FILES = {"LICENSE": "LICENSE", "MCP-LICENSE": "bindings/mcp/LICENSE", "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md", "THIRD_PARTY_NOTICES.txt": "bindings/mcp/THIRD_PARTY_NOTICES.txt"}
 
 
@@ -180,7 +182,7 @@ def archive_envelope(path: Path) -> None:
 
 
 def validate_manifest(manifest: object, revision: str, selected: str) -> dict:
-    if not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA or manifest.get("stage") != "prepared" or manifest.get("source_revision") != revision or manifest.get("platform") != selected or manifest.get("target") != PLATFORMS[selected]["target"] or manifest.get("planned_runner") != PLATFORMS[selected]["runner"] or manifest.get("notice_cli_subset") is not True:
+    if not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA or manifest.get("stage") != "prepared" or manifest.get("source_revision") != revision or manifest.get("platform") != selected or manifest.get("target") != PLATFORMS[selected]["target"] or manifest.get("planned_runner") != PLATFORMS[selected]["runner"] or manifest.get("notice_cli_generated") is not True:
         raise ValueError("candidate metadata source/platform identity mismatch")
     for name, length in (("source_tree", 40), ("source_archive_sha256", 64)):
         if not isinstance(manifest.get(name), str) or re.fullmatch(rf"[0-9a-f]{{{length}}}", manifest[name]) is None:
@@ -237,7 +239,7 @@ def read_archive(path: Path, expected_revision: str, selected: str, expected_has
     stem = candidate_name(manifest["versions"]["cli"], manifest["versions"]["mcp"], expected_revision, selected)
     if path.name != stem + ".zip" or manifest.get("candidate") != stem or manifests[0] != stem + "/candidate.json":
         raise ValueError("candidate archive/root filename identity mismatch")
-    expected = set(binary_paths(selected)) | set(LEGAL_FILES) | {"README.txt"}
+    expected = set(binary_paths(selected)) | set(LEGAL_FILES) | {"README.txt", CLI_NOTICE}
     records = manifest.get("files")
     if not isinstance(records, dict) or set(records) != expected or set(payloads) != {f"{stem}/{name}" for name in expected | {"candidate.json"}}:
         raise ValueError("candidate inventory mismatch")
@@ -256,6 +258,9 @@ def read_archive(path: Path, expected_revision: str, selected: str, expected_has
     notice = selected_payloads["THIRD_PARTY_NOTICES.txt"].decode("utf-8")
     if not notice.startswith("RXLS MCP THIRD-PARTY NOTICES\n") or f"- Cargo lock SHA-256: {manifest['source_files']['bindings/mcp/Cargo.lock']}\n" not in notice:
         raise ValueError("notice/locked source identity mismatch")
+    cli_notice = selected_payloads[CLI_NOTICE].decode("utf-8")
+    if not cli_notice.startswith("RXLS CLI THIRD-PARTY NOTICES\n") or f"- Cargo lock SHA-256: {manifest['source_files']['Cargo.lock']}\n" not in cli_notice:
+        raise ValueError("CLI notice/locked source identity mismatch")
     return manifest, selected_payloads
 
 
@@ -299,20 +304,22 @@ def build(root: Path, revision: str, selected: str, out: Path) -> dict:
     notice_env = dict(os.environ, RUSTUP_TOOLCHAIN="1.88.0")
     run([sys.executable, "scripts/render_supply_chain.py", "notice", "--profile", "mcp", "--check", "bindings/mcp/THIRD_PARTY_NOTICES.txt"], source, logs / "notice-check.log", timeout=300, env=notice_env)
     supply = load_helper(source / "scripts/render_supply_chain.py", "native_supply_chain")
-    closures = {}
+    metadata_by_binary = {}
     for name, version, path in (("cli", "1.85.0", "Cargo.toml"), ("mcp", "1.88.0", "bindings/mcp/Cargo.toml")):
         command = ["cargo", f"+{version}", "metadata", "--format-version", "1", "--locked", "--filter-platform", target, "--manifest-path", path]
         if name == "cli":
             command += ["--features", "full"]
         metadata = json.loads(run(command, source, logs / f"{name}-metadata.log"))
-        _, closure, _ = supply.production_closure(metadata, crate_name="rxls" if name == "cli" else "rxls-mcp")
-        closures[name] = {(item["name"], item["version"], item.get("source")) for item in closure.values() if item.get("source")}
-    if not closures["cli"] <= closures["mcp"]:
-        raise ValueError("full CLI third-party closure not covered by native MCP notice")
+        metadata_by_binary[name] = metadata
+    cli_notice, _ = supply.render_notice(metadata_by_binary["cli"], tomllib.loads((source / "Cargo.lock").read_text(encoding="utf-8")), source_hashes["Cargo.lock"], crate_name="rxls", manifest_label=Path("Cargo.toml"), notice_title="RXLS CLI THIRD-PARTY NOTICES", target_label=target)
+    cli_notice_bytes = cli_notice.encode("utf-8")
+    if len(cli_notice_bytes) > MAX_NOTICE:
+        raise ValueError("CLI notice byte limit")
     if source_hashes != {name: sha256_file(source / name) for name in SOURCE_FILES}:
         raise ValueError("build/notice metadata changed source manifest or lock")
     stem = candidate_name(versions["cli"], versions["mcp"], revision, selected)
     payloads = {name: (source / original).read_bytes() for name, original in LEGAL_FILES.items()}
+    payloads[CLI_NOTICE] = cli_notice_bytes
     for name, relative in zip(("cli", "mcp"), binary_paths(selected)):
         artifact = out / f"work/target-{name}" / target / "release" / Path(relative).name
         if not artifact.is_file() or artifact.stat().st_size > MAX_BINARY:
@@ -320,7 +327,7 @@ def build(root: Path, revision: str, selected: str, out: Path) -> dict:
         payloads[relative] = artifact.read_bytes()
         verify_header(payloads[relative], selected)
     payloads["README.txt"] = f"rxls CLI {versions['cli']} and MCP {versions['mcp']}\nCandidate source {revision}; not the published v{versions['cli']} artifact.\nTarget {target}.\nRun bin/rxls{PLATFORMS[selected]['suffix']} --help for CLI commands.\nRun bin/rxls-mcp{PLATFORMS[selected]['suffix']} --root <owned workbook directory> for newline-delimited MCP.\nKeep the included licenses and notices with both binaries.\nUnsigned verification candidate; hosted verification and maintainer publication are separate.\n".encode("utf-8")
-    manifest = {"schema": SCHEMA, "stage": "prepared", "candidate": stem, "source_revision": revision, "source_tree": tree, "source_archive_sha256": source_archive_hash, "source_files": source_hashes, "versions": versions, "platform": selected, "target": target, "planned_runner": PLATFORMS[selected]["runner"], "compilers": compilers, "host": host, "notice_cli_subset": True, "files": {name: {"bytes": len(data), "sha256": digest(data), "mode": 0o755 if name in binary_paths(selected) else 0o644} for name, data in sorted(payloads.items())}}
+    manifest = {"schema": SCHEMA, "stage": "prepared", "candidate": stem, "source_revision": revision, "source_tree": tree, "source_archive_sha256": source_archive_hash, "source_files": source_hashes, "versions": versions, "platform": selected, "target": target, "planned_runner": PLATFORMS[selected]["runner"], "compilers": compilers, "host": host, "notice_cli_generated": True, "files": {name: {"bytes": len(data), "sha256": digest(data), "mode": 0o755 if name in binary_paths(selected) else 0o644} for name, data in sorted(payloads.items())}}
     if len(encoded(manifest)) > MAX_METADATA:
         raise ValueError("candidate metadata limit")
     distribution = out / "dist"

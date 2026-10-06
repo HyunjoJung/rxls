@@ -18,10 +18,12 @@ a receipt's hosted context as CI evidence.
 
 Each archive contains `bin/rxls` and `bin/rxls-mcp` (with `.exe` on Windows),
 usage instructions, both project licenses, the third-party license summary,
-the complete MCP third-party notice and candidate metadata. Keep the notices
-with the binaries. CLI dependencies are checked against the conservative
-locked MCP notice using the existing production dependency graph. No runtime
-Rust toolchain is required to run these unpacked binaries.
+the complete MCP third-party notice, a generated CLI third-party notice and
+candidate metadata. Keep both notices with the binaries. The CLI notice covers
+its full-feature production dependency graph at the native target and root
+lock; the MCP notice retains its own locked native coverage. Distinct locked
+versions are covered separately. No runtime Rust toolchain is required to run
+these unpacked binaries.
 
 The CLI is compiled with Rust 1.85.0 and `full` plus its default CLI feature;
 MCP is compiled with Rust 1.88.0. Both use release mode, locked dependencies,
@@ -38,7 +40,7 @@ checksum before extraction. It rejects traversal, unsafe Windows paths,
 links, encryption, duplicate/case-colliding paths, unexpected inventory or
 modes, mismatched native executable headers and member hashes. Limits are
 64 MiB compressed, 96 MiB expanded, 32 MiB per binary, 512 KiB per legal file,
-32 KiB metadata and 16 indexed members; the expected inventory is eight files.
+32 KiB metadata and 16 indexed members; the expected inventory is nine files.
 Extraction uses a fresh owned directory.
 
 The unpacked smoke verifies exact product versions, help, CLI CSV output and
