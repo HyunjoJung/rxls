@@ -1059,6 +1059,54 @@ mod tests {
     }
 
     #[test]
+    fn worksheet_budget_fits_the_emitted_full_grid_column_run() {
+        let mut sheet = Sheet::new("compact");
+        for col in 0..=super::MAX_COL {
+            sheet.set_col_width(col, 20.0);
+        }
+        let expected = r#"<cols><col min="1" max="16384" width="20" customWidth="1"/></cols>"#;
+        for available in [expected.len(), expected.len() - 1, 0] {
+            let mut styles = super::StyleTable::new();
+            let mut budget = available;
+            let (xml, links) = worksheet_xml_with_budget(&sheet, &mut styles, &mut budget);
+            assert!(links.is_empty());
+            assert_eq!(budget, 0);
+            if available == expected.len() {
+                assert!(xml.contains(expected), "{xml}");
+                assert_eq!(xml.matches("<col ").count(), 1);
+            } else {
+                assert!(!xml.contains("<cols>"), "{xml}");
+                assert!(!xml.contains("<col "), "{xml}");
+            }
+            assert!(xml.ends_with("<sheetData></sheetData></worksheet>"));
+        }
+    }
+
+    #[test]
+    fn worksheet_budget_coalesces_equal_resolved_styles_and_default_gaps() {
+        let style = CellStyle::new().bold();
+        let format = crate::Format::from_cell_style(style.clone());
+        let mut sheet = Sheet::new("default-gaps");
+        sheet.set_default_format(&format);
+        sheet.set_col_format(1, &format);
+        sheet.set_col_format(3, &format);
+        let mut styles = super::StyleTable::new();
+        let mut setup_budget = usize::MAX;
+        let xf = styles
+            .intern_with_budget(Some(&style), false, &mut setup_budget)
+            .unwrap();
+        assert!(xf > 0);
+        let expected =
+            format!(r#"<cols><col min="1" max="16384" width="9.140625" style="{xf}"/></cols>"#);
+        let mut budget = expected.len();
+        let (xml, links) = worksheet_xml_with_budget(&sheet, &mut styles, &mut budget);
+        assert!(links.is_empty());
+        assert_eq!(budget, 0);
+        assert!(xml.contains(&expected), "{xml}");
+        assert_eq!(xml.matches("<col ").count(), 1);
+    }
+
+    #[test]
     fn worksheet_budget_counts_data_validation_payload() {
         let mut sheet = Sheet::new("dv");
         sheet.add_data_validation(crate::DataValidation {
@@ -2687,6 +2735,34 @@ print('READ_DV_OK')
         columns
     }
 
+    fn written_column_intervals(
+        columns: &[std::collections::BTreeMap<String, String>],
+    ) -> Vec<(u16, u16)> {
+        columns
+            .iter()
+            .map(|column| {
+                (
+                    column["min"].parse().unwrap(),
+                    column["max"].parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn written_column_at(
+        columns: &[std::collections::BTreeMap<String, String>],
+        index: u16,
+    ) -> &std::collections::BTreeMap<String, String> {
+        let mut matches = columns.iter().filter(|column| {
+            let first: u16 = column["min"].parse().unwrap();
+            let last: u16 = column["max"].parse().unwrap();
+            first <= index && index <= last
+        });
+        let column = matches.next().expect("column interval");
+        assert!(matches.next().is_none(), "overlapping column intervals");
+        column
+    }
+
     #[test]
     fn issue94_open_to_write_keeps_columns_visible() {
         for populated in [false, true] {
@@ -2743,7 +2819,10 @@ print('READ_DV_OK')
 
         let bytes = workbook.to_xlsx();
         let columns = written_columns(&bytes);
-        assert_eq!(columns.len(), 8);
+        assert_eq!(
+            written_column_intervals(&columns),
+            vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 6), (7, 7), (8, 16384)]
+        );
         for column in &columns {
             let first: u16 = column["min"].parse().unwrap();
             let expected = match first {
@@ -2757,15 +2836,31 @@ print('READ_DV_OK')
                 "{column:?}"
             );
         }
-        assert_eq!(columns[3].get("hidden").map(String::as_str), Some("1"));
         assert_eq!(
-            columns[4].get("outlineLevel").map(String::as_str),
+            written_column_at(&columns, 4)
+                .get("hidden")
+                .map(String::as_str),
             Some("1")
         );
-        assert_eq!(
-            columns[5].get("outlineLevel").map(String::as_str),
-            Some("1")
-        );
+        for index in [5, 6] {
+            assert_eq!(
+                written_column_at(&columns, index)
+                    .get("outlineLevel")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
+        for index in [2, 7] {
+            assert_eq!(
+                written_column_at(&columns, index)
+                    .get("customWidth")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
+        for index in [1, 3, 4, 5, 6, 8, 16384] {
+            assert!(!written_column_at(&columns, index).contains_key("customWidth"));
+        }
         let script = "import sys\nfrom openpyxl import load_workbook\nw=load_workbook(sys.argv[1]); s=w.active\nassert s['A1'].font.bold\nassert s['A2'].font.bold and s['A2'].number_format == '0.00'\nassert s['B1'].font.bold and s['B1'].font.italic\nassert s['C1'].font.bold and s['C1'].font.italic\nassert s.column_dimensions['A'].width == 12\nassert s.column_dimensions['B'].width == 22\nassert s.column_dimensions['D'].hidden\nprint('ISSUE94_FORMATS_OK')\n";
         assert_opens_in_openpyxl(&bytes, script, "ISSUE94_FORMATS_OK");
     }
@@ -2779,7 +2874,25 @@ print('READ_DV_OK')
         sheet.hide_column(1);
         sheet.group_cols(2, 3, 1);
         let columns = written_columns(&workbook.to_xlsx());
-        assert_eq!(columns.len(), 4);
+        assert_eq!(
+            written_column_intervals(&columns),
+            vec![(1, 1), (2, 2), (3, 4)]
+        );
+        assert!(written_column_at(&columns, 1).contains_key("style"));
+        assert_eq!(
+            written_column_at(&columns, 2)
+                .get("hidden")
+                .map(String::as_str),
+            Some("1")
+        );
+        for index in [3, 4] {
+            assert_eq!(
+                written_column_at(&columns, index)
+                    .get("outlineLevel")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
         for column in columns {
             assert_eq!(
                 column.get("width").map(String::as_str),
@@ -2812,11 +2925,13 @@ print('READ_DV_OK')
         );
 
         let bytes = wb.to_xlsx();
-        let sheet1 = part(&bytes, "xl/worksheets/sheet1.xml");
-        assert!(
-            sheet1.contains(r#"<cols><col min="1" max="16384" style=""#),
-            "worksheet default format should emit a whole-sheet column style: {sheet1}"
+        let columns = written_columns(&bytes);
+        assert_eq!(written_column_intervals(&columns), vec![(1, 16384)]);
+        assert_eq!(
+            columns[0].get("width").map(String::as_str),
+            Some("9.140625")
         );
+        assert!(columns[0]["style"].parse::<u32>().unwrap() > 0);
 
         let script = "import sys\nfrom openpyxl import load_workbook\nwb=load_workbook(sys.argv[1])\nws=wb.active\nassert ws['A1'].font.bold is True, ws['A1'].font\nassert str(ws['A1'].fill.fgColor.rgb).endswith('DDEBF7'), ws['A1'].fill.fgColor.rgb\nassert ws['A2'].font.bold is True, ws['A2'].font\nassert str(ws['A2'].fill.fgColor.rgb).endswith('DDEBF7'), ws['A2'].fill.fgColor.rgb\nassert ws['A2'].number_format == '0.00', ws['A2'].number_format\nassert ws['B1'].font.bold is True and ws['B1'].font.italic is True, ws['B1'].font\nassert str(ws['B1'].fill.fgColor.rgb).endswith('DDEBF7'), ws['B1'].fill.fgColor.rgb\nassert ws['A3'].value is None, ws['A3'].value\nassert ws['A3'].font.bold is True, ws['A3'].font\nassert str(ws['A3'].fill.fgColor.rgb).endswith('DDEBF7'), ws['A3'].fill.fgColor.rgb\nassert ws['A3'].border.left.style == 'thin', ws['A3'].border\nprint('DEFAULT_FORMAT_OK')\n";
         assert_opens_in_openpyxl(&bytes, script, "DEFAULT_FORMAT_OK");

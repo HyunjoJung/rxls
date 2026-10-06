@@ -8,10 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Coalesced adjacent columns with identical resolved layout into compact XLSX
+  intervals (#127), avoiding expansion of a full-width format into 16,384
+  singleton records. Width flags, styles, visibility, outline boundaries and
+  output budgets retain their existing semantics.
 - Kept shared and array formulas intact when replacing or clearing cells (#129).
   Single-cell and range edits now share the whole-group replacement rule;
   incomplete group metadata rejects the edit without changing package bytes.
   Cache-only formula updates still preserve the original formula nodes.
+
 ## [0.1.4] - 2026-09-28
 
 ### Added
