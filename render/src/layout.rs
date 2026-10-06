@@ -522,11 +522,11 @@ pub struct RenderReport {
     pub sheet_name: String,
     /// Inclusive source rectangle.
     pub range: RenderRange,
-    /// Source rows before hidden-row filtering.
+    /// Source rows before hidden-row filtering; sparse viewport reports count admitted tracks.
     pub rows_considered: u64,
-    /// Source columns before hidden-column filtering.
+    /// Source columns before hidden-column filtering; sparse viewport reports count admitted tracks.
     pub columns_considered: u64,
-    /// Rectangular source cells before hidden-axis filtering.
+    /// Rectangular source cells before filtering; sparse viewport reports count the visible grid product.
     pub cells_considered: u64,
     /// Visible (or explicitly included hidden) rows.
     pub visible_rows: u64,
@@ -937,7 +937,13 @@ pub(crate) fn visit_viewport_baseline_runs<E: From<RenderError>>(
                     first: cursor,
                     last: range.last_row,
                     size: if default_included {
-                        row_height(sheet, cursor, options, &mut context.warnings)
+                        viewport_default_row_height(
+                            sheet,
+                            cursor,
+                            range.last_row,
+                            options,
+                            &mut context.warnings,
+                        )
                     } else {
                         Fixed::ZERO
                     },
@@ -953,7 +959,13 @@ pub(crate) fn visit_viewport_baseline_runs<E: From<RenderError>>(
                 first: cursor,
                 last: exception - 1,
                 size: if default_included {
-                    row_height(sheet, cursor, options, &mut context.warnings)
+                    viewport_default_row_height(
+                        sheet,
+                        cursor,
+                        exception - 1,
+                        options,
+                        &mut context.warnings,
+                    )
                 } else {
                     Fixed::ZERO
                 },
@@ -1739,23 +1751,6 @@ pub(crate) fn build_sheet_scene_with_geometry(
     )
 }
 
-pub(crate) fn build_sheet_scene_for_viewport_envelope(
-    sheet: &Sheet,
-    sheet_index: usize,
-    options: &RenderOptions,
-    geometry: SheetGeometryOverride<'_>,
-) -> Result<SceneBuild, RenderError> {
-    build_sheet_scene_inner(
-        sheet,
-        sheet_index,
-        options,
-        Some(geometry),
-        UsedDrawingTerminalColumnPolicy::Indexed,
-        AxisEndpointPolicy::PerTrackFixed,
-        GridlinePolicy::WorksheetView,
-    )
-}
-
 pub(crate) fn build_sheet_scene_with_geometry_for_print(
     sheet: &Sheet,
     sheet_index: usize,
@@ -2017,8 +2012,8 @@ fn build_sheet_scene_inner_with_interaction(
         apply_axis_geometry(&mut col_slots, geometry.columns)?;
     }
     let maximum_digit_width = measured.maximum_digit_width;
-    let mut typography_stats = measured.typography;
-    let mut conditional_evaluations = measured.conditional_evaluations;
+    let typography_stats = measured.typography;
+    let conditional_evaluations = measured.conditional_evaluations;
     let hidden_rows_skipped = rows_considered.saturating_sub(row_slots.len() as u64);
     let hidden_columns_skipped = columns_considered.saturating_sub(col_slots.len() as u64);
     let mut y = axis_slots_end(&row_slots)?;
@@ -2405,9 +2400,74 @@ fn build_sheet_scene_inner_with_interaction(
         }
     }
 
+    paint_sheet_regions(
+        sheet,
+        sheet_index,
+        options,
+        range,
+        rows_considered,
+        columns_considered,
+        cells_considered,
+        hidden_rows_skipped,
+        hidden_columns_skipped,
+        &row_slots,
+        &col_slots,
+        visual_col_slots,
+        drawing_row_slots.as_deref(),
+        drawing_col_slots.as_deref(),
+        metafile_grid_row_slots.as_deref(),
+        visual_metafile_grid_col_slots,
+        geometry,
+        viewport,
+        canvas_width,
+        canvas_height,
+        sheet_right_to_left,
+        gridline_policy,
+        merge_layouts.len() as u64,
+        &display_cells,
+        regions,
+        warnings,
+        typography_stats,
+        conditional_evaluations,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_sheet_regions(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    range: RenderRange,
+    rows_considered: u64,
+    columns_considered: u64,
+    cells_considered: u64,
+    hidden_rows_skipped: u64,
+    hidden_columns_skipped: u64,
+    row_slots: &[AxisSlot<u32>],
+    col_slots: &[AxisSlot<u16>],
+    visual_col_slots: &[AxisSlot<u16>],
+    drawing_row_slots: Option<&[AxisSlot<u32>]>,
+    drawing_col_slots: Option<&[AxisSlot<u16>]>,
+    metafile_grid_row_slots: Option<&[AxisSlot<u32>]>,
+    visual_metafile_grid_col_slots: Option<&[AxisSlot<u16>]>,
+    geometry: Option<SheetGeometryOverride<'_>>,
+    viewport: DrawingLayoutViewport,
+    canvas_width: Fixed,
+    canvas_height: Fixed,
+    sheet_right_to_left: bool,
+    gridline_policy: GridlinePolicy,
+    merged_regions: u64,
+    display_cells: &BTreeMap<CellCoordinate, DisplayCell<'_>>,
+    mut regions: Vec<Region>,
+    mut warnings: Warnings,
+    mut typography_stats: TypographyStats,
+    mut conditional_evaluations: u64,
+    sparse: Option<SparsePaintBounds<'_>>,
+) -> Result<SceneBuild, RenderError> {
     apply_numeric_overflow(
         &mut regions,
-        &display_cells,
+        display_cells,
         options,
         sheet.sheet_view().right_to_left,
         &mut typography_stats,
@@ -2439,7 +2499,7 @@ fn build_sheet_scene_inner_with_interaction(
         && (gridline_policy != GridlinePolicy::WorksheetView || !sheet.sheet_view().hide_gridlines);
     let _ = resolve_conditional_paints(
         sheet,
-        &display_cells,
+        display_cells,
         &mut regions,
         options,
         &mut warnings,
@@ -2484,15 +2544,12 @@ fn build_sheet_scene_inner_with_interaction(
             )
         })
         .transpose()?;
-    let metafile_grid_edges = match (
-        metafile_grid_row_slots.as_deref(),
-        visual_metafile_grid_col_slots,
-    ) {
+    let metafile_grid_edges = match (metafile_grid_row_slots, visual_metafile_grid_col_slots) {
         (Some(grid_rows), Some(grid_columns)) => Some(remap_calc_metafile_grid_edges(
             calc_metafile_grid_composed_edges
                 .as_deref()
                 .unwrap_or(&composed_edges),
-            &row_slots,
+            row_slots,
             visual_col_slots,
             grid_rows,
             grid_columns,
@@ -2500,24 +2557,30 @@ fn build_sheet_scene_inner_with_interaction(
         (None, None) => None,
         _ => return Err(RenderError::CoordinateOverflow),
     };
-    let scene_bounds = Rect {
-        x: Fixed::ZERO,
-        y: Fixed::ZERO,
-        width: canvas_width,
-        height: canvas_height,
-    };
+    let scene_bounds = sparse.as_ref().map_or(
+        Rect {
+            x: Fixed::ZERO,
+            y: Fixed::ZERO,
+            width: canvas_width,
+            height: canvas_height,
+        },
+        |input| input.scene,
+    );
     let cell_output_left = col_slots
         .first()
         .map_or(viewport.cell.x, |slot| slot.offset);
-    let cell_output_right = axis_slots_end(&col_slots)?;
-    let cell_output_bounds = Rect {
-        x: cell_output_left,
-        y: viewport.cell.y,
-        width: cell_output_right
-            .checked_sub(cell_output_left)
-            .ok_or(RenderError::CoordinateOverflow)?,
-        height: viewport.cell.height,
-    };
+    let cell_output_right = axis_slots_end(col_slots)?;
+    let cell_output_bounds = sparse.as_ref().map_or(
+        Rect {
+            x: cell_output_left,
+            y: viewport.cell.y,
+            width: cell_output_right
+                .checked_sub(cell_output_left)
+                .ok_or(RenderError::CoordinateOverflow)?,
+            height: viewport.cell.height,
+        },
+        |input| input.cell,
+    );
     if gridline_policy == GridlinePolicy::WorksheetView {
         push_composed_edges(
             &mut nodes,
@@ -2540,8 +2603,11 @@ fn build_sheet_scene_inner_with_interaction(
             continue;
         }
         let style = text_style(region, options);
-        let clip_bounds =
-            text_clip_bounds(region_index, &regions, &row_regions, &style, scene_bounds)?;
+        let clip_bounds = if let Some(input) = sparse.as_ref() {
+            sparse_text_clip_bounds(region, &style, input)?
+        } else {
+            text_clip_bounds(region_index, &regions, &row_regions, &style, scene_bounds)?
+        };
         let layout_bounds =
             calc_cell_text_layout_bounds(region.rect, style.baseline, region.vertical_margin)?;
         let node = match options.font_pack.as_ref() {
@@ -2606,8 +2672,8 @@ fn build_sheet_scene_inner_with_interaction(
     push_drawing_placeholders(
         &mut nodes,
         sheet,
-        drawing_row_slots.as_deref().unwrap_or(&row_slots),
-        drawing_col_slots.as_deref().unwrap_or(&col_slots),
+        drawing_row_slots.unwrap_or(row_slots),
+        drawing_col_slots.unwrap_or(col_slots),
         geometry,
         viewport.cell,
         viewport.sheet,
@@ -2638,7 +2704,7 @@ fn build_sheet_scene_inner_with_interaction(
         rendered_regions: regions.len() as u64,
         hidden_rows_skipped,
         hidden_columns_skipped,
-        merged_regions: merge_layouts.len() as u64,
+        merged_regions,
         text_bytes,
         glyphs,
         scene_nodes: scene_node_count(&nodes)?,
@@ -8369,4 +8435,448 @@ mod automatic_row_adapter_parity {
             value.path_commands,
         )
     }
+}
+
+/// Coordinates supplied by a bounded sparse viewport constructor. They remain
+/// in complete prepared-sheet coordinates until the final tile translation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SparseCellGeometry {
+    pub(crate) source: CellCoordinate,
+    pub(crate) rect: Rect,
+    pub(crate) is_merged: bool,
+    pub(crate) has_adjustable_row: bool,
+    pub(crate) first_column: u16,
+    pub(crate) last_column: u16,
+    pub(crate) overflow_left: Fixed,
+    pub(crate) overflow_right: Fixed,
+    pub(crate) anchor_outside: bool,
+}
+
+/// Input is sorted and unique by source coordinate before any style capture.
+pub(crate) struct SparseSceneGeometry<'a> {
+    pub(crate) rows: &'a [MeasuredAxisSlot<u32>],
+    pub(crate) columns: &'a [MeasuredAxisSlot<u16>],
+    pub(crate) cells: &'a [SparseCellGeometry],
+    pub(crate) window: Rect,
+    pub(crate) complete_bounds: Rect,
+    pub(crate) digit_width: Fixed,
+    pub(crate) range: RenderRange,
+}
+
+struct SparsePaintBounds<'a> {
+    scene: Rect,
+    cell: Rect,
+    cells: &'a [SparseCellGeometry],
+}
+
+pub(crate) fn build_sheet_scene_sparse_viewport(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    input: SparseSceneGeometry<'_>,
+) -> Result<SceneBuild, RenderError> {
+    enforce(
+        LimitKind::Rows,
+        options.limits.max_rows,
+        input.rows.len() as u64,
+    )?;
+    enforce(
+        LimitKind::Columns,
+        options.limits.max_columns,
+        input.columns.len() as u64,
+    )?;
+    enforce(
+        LimitKind::Cells,
+        options.limits.max_cells,
+        input.cells.len() as u64,
+    )?;
+    enforce(
+        LimitKind::ConditionalRules,
+        options.limits.max_conditional_rules,
+        sheet.conditional_formats().len() as u64,
+    )?;
+    enforce_dimension(input.window.width, options)?;
+    enforce_dimension(input.window.height, options)?;
+    let mut style_snapshot = RenderStyleSnapshot::new(sheet);
+    let mut display_cells = BTreeMap::new();
+    let mut source_text_bytes = 0_u64;
+    for geometry in input.cells {
+        style_snapshot.capture_coordinate(sheet, geometry.source);
+        for cell in sheet.display_cells_in_range(
+            geometry.source.row,
+            geometry.source.col,
+            geometry.source.row,
+            geometry.source.col,
+        ) {
+            // Sanitation can expand one invalid scalar to a three-byte U+FFFD.
+            // Bound both source scanning and the exact sanitized text before cloning.
+            enforce(
+                LimitKind::TextBytes,
+                options.limits.max_text_bytes,
+                cell.formatted.len() as u64,
+            )?;
+            let mut sanitized_bytes = 0_u64;
+            for ch in cell.formatted.chars() {
+                sanitized_bytes = sanitized_bytes
+                    .checked_add(if is_valid_xml_char(ch) {
+                        ch.len_utf8() as u64
+                    } else {
+                        3
+                    })
+                    .ok_or(RenderError::CoordinateOverflow)?;
+            }
+            source_text_bytes = source_text_bytes
+                .checked_add(sanitized_bytes)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            enforce(
+                LimitKind::TextBytes,
+                options.limits.max_text_bytes,
+                source_text_bytes,
+            )?;
+            if let Some(runs) = cell.rich_text {
+                let bytes = runs.iter().try_fold(0_u64, |sum, run| {
+                    sum.checked_add(run.text.len() as u64)
+                        .ok_or(RenderError::CoordinateOverflow)
+                })?;
+                enforce(LimitKind::TextBytes, options.limits.max_text_bytes, bytes)?;
+                enforce(
+                    LimitKind::Glyphs,
+                    options.limits.max_glyphs,
+                    runs.len() as u64,
+                )?;
+            }
+            display_cells.insert(geometry.source, cell);
+        }
+    }
+    let mut warnings = Warnings::default();
+    match sheet.style_fidelity() {
+        StyleFidelity::Partial => warnings.add(WarningCode::SourceStylesPartial, None),
+        StyleFidelity::Unavailable => warnings.add(WarningCode::SourceStylesUnavailable, None),
+        _ => {}
+    }
+    let calc_line_layout_available = calc_line_layout_available(sheet, options);
+    let vertical_margin = calc_cell_vertical_margin(sheet);
+    let ods_native_sheet = matches!(
+        sheet.imported_default_row_axis_measure(),
+        Some(ImportedAxisMeasure::MillimeterHundredths(_))
+    );
+    let print_vertical_overflow_available = false;
+    let maximum_digit_width = input.digit_width;
+    let mut regions = Vec::new();
+    regions
+        .try_reserve_exact(input.cells.len())
+        .map_err(|_| RenderError::CoordinateOverflow)?;
+    for geometry in input.cells {
+        let source = geometry.source;
+        let rect = geometry.rect;
+        let is_merged = geometry.is_merged;
+        let has_adjustable_row = geometry.has_adjustable_row;
+        if geometry.anchor_outside {
+            warnings.add(WarningCode::MergeAnchorOutsideVisibleRange, Some(source));
+        }
+        let calc_wrap_space = if calc_line_layout_available {
+            if is_merged {
+                calc_ooxml_merge_wrap_space(
+                    sheet,
+                    geometry.first_column,
+                    geometry.last_column,
+                    maximum_digit_width,
+                    options,
+                )?
+            } else {
+                calc_ooxml_cell_wrap_space(sheet, source.col, maximum_digit_width, options)?
+            }
+        } else {
+            None
+        };
+        let display_cell = display_cells.get(&source);
+        let raw_text = display_cell.map_or("", |cell| cell.formatted);
+        let (text, replaced) = sanitize_xml_text(raw_text);
+        warnings.add_count(
+            WarningCode::InvalidXmlCharacterReplaced,
+            replaced,
+            Some(source),
+        );
+        let source_rich_text = display_cell.and_then(|cell| cell.rich_text);
+        let rich_text = source_rich_text.and_then(|runs| {
+            let sanitized = sanitize_rich_text(runs);
+            let matches_display = sanitized
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+                == text;
+            if options.font_pack.is_some() && matches_display {
+                Some(sanitized)
+            } else {
+                warnings.add(WarningCode::RichTextFlattened, Some(source));
+                None
+            }
+        });
+        if display_cell.is_some_and(|cell| matches!(cell.value, Cell::Formula { .. })) {
+            warnings.add(WarningCode::CachedFormulaDisplay, Some(source));
+        }
+        let style = style_snapshot.owned_style(source);
+        collect_style_warnings(
+            style.as_ref(),
+            source,
+            options.font_pack.is_none(),
+            &mut warnings,
+        );
+        let numeric_default =
+            display_cell.is_some_and(|cell| cell_defaults_to_right_alignment(cell.value));
+        let text_can_overflow =
+            display_cell.is_some_and(|cell| cell_allows_horizontal_overflow(cell.value));
+        let hyperlink = display_cell
+            .and_then(|cell| cell.hyperlink)
+            .and_then(|target| {
+                if is_safe_hyperlink(target) {
+                    Some(target.to_string())
+                } else {
+                    warnings.add(WarningCode::UnsafeHyperlinkDropped, Some(source));
+                    None
+                }
+            });
+        let is_plain_text = display_cell.is_some_and(|cell| matches!(cell.value, Cell::Text(_)));
+        let line_layout_policy = cell_line_layout_policy(
+            sheet,
+            source,
+            style.as_ref(),
+            rich_text.as_deref(),
+            CalcLineLayoutEvidence {
+                is_plain_text,
+                has_adjustable_row,
+                wrap_space_available: calc_line_layout_available && calc_wrap_space.is_some(),
+            },
+            options,
+        );
+        let line_placement_policy = calc_line_placement_policy(
+            sheet,
+            source,
+            style.as_ref(),
+            rich_text.as_deref(),
+            is_plain_text,
+            options,
+        );
+        regions.push(Region {
+            source,
+            rect,
+            is_merged,
+            line_layout_policy,
+            line_placement_policy,
+            calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
+                .then_some(calc_wrap_space)
+                .flatten(),
+            style,
+            conditional: ConditionalPaint::default(),
+            text,
+            rich_text,
+            hyperlink,
+            numeric_default,
+            text_can_overflow,
+            fixed_height_row: !has_adjustable_row,
+            ods_fixed_height_row: ods_native_sheet && !has_adjustable_row,
+            print_vertical_overflow: print_vertical_overflow_available && has_adjustable_row,
+            vertical_margin,
+        });
+    }
+    regions.sort_unstable_by_key(|region| {
+        (
+            region.rect.y,
+            region.rect.x,
+            region.rect.width > Fixed::ZERO,
+            region.source,
+        )
+    });
+    let merged_regions = input.cells.iter().filter(|cell| cell.is_merged).count() as u64;
+    let cells_considered = (input.rows.len() as u64)
+        .checked_mul(input.columns.len() as u64)
+        .ok_or(RenderError::CoordinateOverflow)?;
+    let viewport = DrawingLayoutViewport {
+        sheet: input.window,
+        cell: input.complete_bounds,
+    };
+    paint_sheet_regions(
+        sheet,
+        sheet_index,
+        options,
+        input.range,
+        input.rows.len() as u64,
+        input.columns.len() as u64,
+        cells_considered,
+        0,
+        0,
+        input.rows,
+        input.columns,
+        input.columns,
+        None,
+        None,
+        None,
+        None,
+        None,
+        viewport,
+        input.window.width,
+        input.window.height,
+        sheet.sheet_view().right_to_left,
+        GridlinePolicy::WorksheetView,
+        merged_regions,
+        &display_cells,
+        regions,
+        warnings,
+        TypographyStats::default(),
+        0,
+        Some(SparsePaintBounds {
+            scene: input.window,
+            cell: input.complete_bounds,
+            cells: input.cells,
+        }),
+    )
+}
+
+fn sparse_text_clip_bounds(
+    region: &Region,
+    style: &TextStyle,
+    geometry: &SparsePaintBounds<'_>,
+) -> Result<Rect, RenderError> {
+    let alignment = region.style.as_ref().and_then(|style| style.align.as_ref());
+    if !region.text_can_overflow
+        || region.is_merged
+        || alignment.is_some_and(|alignment| {
+            alignment.wrap || alignment.shrink_to_fit || alignment.rotation != 0
+        })
+    {
+        return Ok(region.rect);
+    }
+    let index = geometry
+        .cells
+        .binary_search_by_key(&region.source, |cell| cell.source)
+        .map_err(|_| RenderError::Typography {
+            reason: "missing_sparse_clip_source",
+        })?;
+    let cell = &geometry.cells[index];
+    let left = if matches!(style.anchor, TextAnchor::End | TextAnchor::Middle) {
+        cell.overflow_left
+    } else {
+        region.rect.x
+    };
+    let right = if matches!(style.anchor, TextAnchor::Start | TextAnchor::Middle) {
+        cell.overflow_right
+    } else {
+        region
+            .rect
+            .x
+            .checked_add(region.rect.width)
+            .ok_or(RenderError::CoordinateOverflow)?
+    };
+    Ok(Rect {
+        x: left,
+        y: region.rect.y,
+        width: right
+            .checked_sub(left)
+            .ok_or(RenderError::CoordinateOverflow)?,
+        height: region.rect.height,
+    })
+}
+
+/// Resolve whether a blank coordinate extends display Used selection. Axis,
+/// table and direct layers use exactly the same style resolution as legacy.
+pub(crate) fn viewport_blank_has_visible_paint(sheet: &Sheet, row: u32, col: u16) -> bool {
+    sheet
+        .resolved_cell_style(row, col)
+        .as_ref()
+        .is_some_and(cell_style_has_visible_blank_paint)
+}
+
+pub(crate) fn viewport_row_is_manual(sheet: &Sheet, row: u32) -> bool {
+    effective_row_height_is_manual(sheet, row)
+}
+
+pub(crate) fn viewport_text_overflows(cell: &Cell) -> bool {
+    cell_allows_horizontal_overflow(cell)
+}
+
+/// Cumulative work and diagnostics performed once while preparing geometry.
+/// Tile reports separately describe the work and output of each scene.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportPreparationReport {
+    /// Charged source, metadata, axis and candidate visits.
+    pub coordinate_visits: u64,
+    /// Raw cell records preflighted before any index/style lookup.
+    pub source_raw_cells: u64,
+    /// Read-side hyperlink records included in the source-index ceiling.
+    pub source_hyperlinks: u64,
+    /// Accounted one-time index construction/compaction peak; retained cache is source-owned.
+    pub source_index_build_peak_bytes: u64,
+    /// Accounted retained axis/merge vector capacity bytes.
+    pub geometry_bytes: u64,
+    /// Text bytes admitted by the global typography measurement.
+    pub text_bytes: u64,
+    /// Glyphs shaped during preparation.
+    pub shaped_glyphs: u64,
+    /// Cumulative bounded typography work.
+    pub text_work: u64,
+    /// Shaped text runs.
+    pub shaped_runs: u64,
+    /// Measured text lines.
+    pub text_lines: u64,
+    /// Glyph outline commands generated during measurement.
+    pub path_commands: u64,
+    /// Conditional-rule evaluations for automatic text geometry.
+    pub conditional_evaluations: u64,
+    /// Verified selected font-pack identity, if any.
+    pub font_pack_sha256: Option<String>,
+    /// Verified faces selected during preparation.
+    pub font_faces: Vec<RenderedFontFace>,
+    /// Deterministic global warnings with logical source multiplicities.
+    pub warnings: Vec<RenderWarning>,
+}
+
+impl ViewportMeasurementContext {
+    pub(crate) fn merge_warning(&mut self, code: WarningCode, row: u32, col: u16) {
+        self.warnings.add(code, Some(CellCoordinate { row, col }));
+    }
+    pub(crate) fn finish(self, options: &RenderOptions) -> (Fixed, ViewportPreparationReport) {
+        let stats = self.typography;
+        let report = ViewportPreparationReport {
+            coordinate_visits: 0,
+            geometry_bytes: 0,
+            source_raw_cells: 0,
+            source_hyperlinks: 0,
+            source_index_build_peak_bytes: 0,
+            text_bytes: stats.text_bytes,
+            shaped_glyphs: stats.shaped_glyphs,
+            text_work: stats.text_work,
+            shaped_runs: stats.shaped_runs,
+            text_lines: stats.text_lines,
+            path_commands: stats.path_commands,
+            conditional_evaluations: self.conditional_evaluations,
+            font_pack_sha256: options
+                .font_pack
+                .as_ref()
+                .map(|pack| pack.pack_sha256().to_string()),
+            font_faces: stats.finish_font_faces(),
+            warnings: self.warnings.finish(),
+        };
+        (self.digit_width, report)
+    }
+}
+
+fn viewport_default_row_height(
+    sheet: &Sheet,
+    first: u32,
+    last: u32,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+) -> Fixed {
+    let mut span_warnings = Warnings::default();
+    let size = row_height(sheet, first, options, &mut span_warnings);
+    let count = u64::from(last) - u64::from(first) + 1;
+    for (code, (occurrences, coordinate)) in span_warnings.0 {
+        warnings.add_count(code, occurrences.saturating_mul(count), coordinate);
+    }
+    size
+}
+
+/// Maximum supported border stroke/offset outset plus endpoint tolerance.
+pub(crate) fn viewport_border_paint_outset() -> Fixed {
+    edges::viewport_border_paint_outset()
 }
