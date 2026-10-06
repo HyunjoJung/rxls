@@ -1715,34 +1715,74 @@ fn eval_round(
         Ok(digits) => digits,
         Err(error) => return Ok(error),
     };
-    let precision = digits.trunc() as i32;
-    let factor = 10_f64.powi(precision);
-    let rounded = match kind {
-        RoundKind::Standard => (number * factor).round() / factor,
-        RoundKind::AwayFromZero => {
-            if number >= 0.0 {
-                (number * factor).ceil() / factor
-            } else {
-                (number * factor).floor() / factor
-            }
-        }
-        RoundKind::TowardZero => {
-            if number >= 0.0 {
-                (number * factor).floor() / factor
-            } else {
-                (number * factor).ceil() / factor
-            }
-        }
-    };
-    // A very negative precision underflows `factor` to exactly 0.0 (still
-    // finite), which turns the division above into 0.0/0.0 == NaN. Checking
-    // the *final* result (rather than just `factor.is_finite()`) catches
-    // that case -- and any other path to a non-finite result -- uniformly.
-    if rounded.is_finite() {
-        Ok(Value::Number(rounded))
-    } else {
-        Ok(Value::Error("#NUM!".to_string()))
+    Ok(decimal_round_value(number, digits, kind))
+}
+
+fn decimal_round_value(number: f64, digits: f64, kind: RoundKind) -> Value {
+    let rounded = digits
+        .is_finite()
+        .then(|| round_decimal(number, digits.trunc() as i32, kind))
+        .flatten();
+    match rounded {
+        Some(number) => Value::Number(number),
+        None => Value::Error("#NUM!".to_string()),
     }
+}
+
+fn round_decimal(number: f64, precision: i32, kind: RoundKind) -> Option<f64> {
+    // Keep the existing finite/nonzero decimal-scale boundary (e.g. +/-400).
+    // Do not multiply the input by this scale: a finite result can otherwise
+    // overflow, or binary noise can incorrectly cross a decimal step (#134).
+    let factor = 10_f64.powi(precision);
+    if !number.is_finite() || !factor.is_finite() || factor == 0.0 {
+        return None;
+    }
+    if number == 0.0 {
+        return Some(number);
+    }
+
+    // Installed Excel reference/neighbor/residue probes support 15 significant
+    // decimal digits here. This is a rounding-function policy, not a change to
+    // literal parsing or general arithmetic. ROUND's tie is then away from zero:
+    // https://support.microsoft.com/en-us/excel/functions/round-function
+    // Fixed precision and binary64's exponent range bound this string to 22 bytes.
+    let scientific = format!("{:.14e}", number.abs());
+    let (mantissa, exponent) = scientific.split_once('e')?;
+    let mut coefficient = 0_u64;
+    for byte in mantissa.bytes().filter(|&byte| byte != b'.') {
+        let digit = byte.checked_sub(b'0').filter(|&digit| digit <= 9)?;
+        coefficient = coefficient.checked_mul(10)?.checked_add(u64::from(digit))?;
+    }
+    let shift = i64::from(exponent.parse::<i32>().ok()?) - 14 + i64::from(precision);
+    if shift >= 0 {
+        // Returning the original binary value would retain arithmetic residue
+        // even though no digits of the normalized coefficient are discarded.
+        let canonical = scientific.parse::<f64>().ok()?;
+        return canonical.is_finite().then(|| canonical.copysign(number));
+    }
+
+    let discarded = -shift;
+    let rounded = if discarded > 15 {
+        // The coefficient is smaller than half this step. Avoid constructing a
+        // power whose size is selected by the formula's precision argument.
+        u64::from(matches!(kind, RoundKind::AwayFromZero))
+    } else {
+        let divisor = 10_u64.checked_pow(u32::try_from(discarded).ok()?)?;
+        let quotient = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        let increment = match kind {
+            RoundKind::Standard => remainder >= divisor / 2,
+            RoundKind::AwayFromZero => remainder != 0,
+            RoundKind::TowardZero => false,
+        };
+        quotient.checked_add(u64::from(increment))?
+    };
+    // Parse one bounded decimal result instead of multiplying/dividing by an
+    // approximate binary power of ten and reintroducing a rounding error.
+    let result = format!("{rounded}e{}", -i64::from(precision))
+        .parse::<f64>()
+        .ok()?;
+    result.is_finite().then(|| result.copysign(number))
 }
 
 fn eval_unary_numeric(
@@ -1763,21 +1803,12 @@ fn eval_trunc(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedRe
     };
     let digits = match args.get(1) {
         Some(value) => match value.as_number() {
-            Ok(value) => value.trunc() as i32,
+            Ok(value) => value,
             Err(error) => return Ok(error),
         },
-        None => 0,
+        None => 0.0,
     };
-    let factor = 10_f64.powi(digits);
-    let result = (number * factor).trunc() / factor;
-    // See eval_round: check the final result's finiteness, not just the
-    // factor's, so an underflowed factor (very negative `digits`) can't
-    // sneak a NaN into a Cell::Number.
-    if result.is_finite() {
-        Ok(Value::Number(result))
-    } else {
-        Ok(Value::Error("#NUM!".to_string()))
-    }
+    Ok(decimal_round_value(number, digits, RoundKind::TowardZero))
 }
 
 fn eval_sqrt(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReason> {
