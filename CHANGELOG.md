@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   complete text/merge layout on both axes under existing scene/output limits.
   `OwnedPreparedViewport` retains immutable workbook/options snapshots and lends
   tile geometry without repeated preparation; SVG clip IDs use caller namespaces.
+- Added separate current-source worker viewport contracts for preparation,
+  bounded tile rendering and release, with strict identity/revision validation
+  and staged replacement. Existing v2 response shapes remain unchanged;
+  matching WASM artifacts are required.
 - Added opt-in `workbook_set_cells` MCP recalculation. Supported formula caches
   refresh in one bounded evaluation batch with computed/unchanged/unsupported
   counts and stable reasons; source edits and cache updates commit atomically.

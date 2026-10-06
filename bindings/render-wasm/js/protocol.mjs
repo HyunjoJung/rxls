@@ -43,6 +43,10 @@ const SAFE_SVG_ELEMENTS = new Set([
   "text"
 ]);
 const OPERATIONS = new Set([
+  "viewport-capabilities",
+  "prepare-viewport",
+  "render-viewport-tile",
+  "release-viewport",
   "capabilities",
   "open",
   "close",
@@ -177,6 +181,11 @@ export function parseWorkerMessage(message) {
 
 export function preflightRequest({ operation, payload }) {
   switch (operation) {
+    case "viewport-capabilities":
+    case "prepare-viewport":
+    case "render-viewport-tile":
+    case "release-viewport":
+      return validateViewportRequest(operation, payload);
     case "capabilities":
       assertExactKeys(payload, [], "payload");
       return 0;
@@ -1136,4 +1145,319 @@ function sanitizeMessage(value) {
   message = message.replace(/file:\/\/\S+/gi, "[path]");
   message = message.replace(/(?:[A-Za-z]:\\|\/(?:Users|home|tmp|private|var)\/)[^\s,;)]*/g, "[path]");
   return message || "render worker request failed";
+}
+
+// Additive viewport contracts; legacy worker schemas and caps remain unchanged.
+export const VIEWPORT_LIMITS = Object.freeze({
+  maxOptionsBytes: 65_536,
+  maxCoordinateVisits: 2_000_000,
+  maxAxisRuns: 65_536,
+  maxGeometryBytes: 8_388_608,
+  maxLogicalDimensionRaw: 16_384_000_000,
+  maxSourceRecords: 250_000,
+  maxTileDimensionRaw: 8_388_608,
+  maxTileSvgBytes: 2_097_152,
+  maxTileSceneNodes: 100_000,
+  maxMetadataBytes: 65_536
+});
+export const VIEWPORT_RESOURCE_POLICY = Object.freeze({
+  maxPreparedPerDocument: 1,
+  maxPreparedTotal: 4,
+  maxProvisionalTotal: 1,
+  geometryReservationBytes: 8_388_608,
+  sourceIndexReservationBytes: 8_388_608,
+  maxOpenResourceBytes: 134_217_728
+});
+
+/** Validate canonical decimal transport without rounding through Number. */
+export function validateViewportU64(value, location = "viewport.u64") {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,19})$/.test(value) ||
+      (value.length === 20 && value > "18446744073709551615")) {
+    throw invalidViewport(`invalid canonical u64 at ${location}`);
+  }
+  return value;
+}
+
+/** Worker-owned UUID plus globally monotonic checked preparation attempt. */
+export function validateViewportGeometryId(value) {
+  if (typeof value !== "string" || value.length > 60 ||
+      !/^vp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-[1-9][0-9]{0,19}$/.test(value)) {
+    throw invalidViewport("invalid viewport geometry identity");
+  }
+  validateViewportU64(value.slice(40), "geometryId.counter");
+  return value;
+}
+
+/** Fixed-point sheet-space request; a browser pixel rectangle is not accepted. */
+export function validateViewportRect(value) {
+  viewportRecord(value, ["xRaw", "yRaw", "widthRaw", "heightRaw"]);
+  const { xRaw, yRaw, widthRaw, heightRaw } = value;
+  viewportCount(xRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  viewportCount(yRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  viewportCount(widthRaw, VIEWPORT_LIMITS.maxTileDimensionRaw, true);
+  viewportCount(heightRaw, VIEWPORT_LIMITS.maxTileDimensionRaw, true);
+  viewportCount(xRaw + widthRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  viewportCount(yRaw + heightRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  return value;
+}
+
+/** A Used-only viewport request reuses existing bounded render options. */
+export function viewportOptionsJson(value = {}) {
+  if (value === undefined) value = {};
+  viewportOptionalRecord(value, [], ["gridlines", "includeHidden", "limits"]);
+  for (const key of ["gridlines", "includeHidden"]) {
+    if (Object.hasOwn(value, key) && typeof value[key] !== "boolean") throw invalidViewport("invalid viewport boolean option");
+  }
+  if (Object.hasOwn(value, "limits")) {
+    const allowed = ["maxRows", "maxColumns", "maxCells", "maxConditionalRules", "maxConditionalEvaluations",
+      "maxDrawingObjects", "maxMediaBytes", "maxImageDimension", "maxImagePixels", "maxDecodedMediaBytes",
+      "maxChartSeries", "maxChartPoints", "maxTextBytes", "maxGlyphs", "maxTextRuns", "maxTextLines",
+      "maxPathCommands", "maxSceneNodes", "maxDimensionRaw", "maxOutputBytes", "maxLogicalPages", "maxPages",
+      "maxTotalSceneNodes", "maxBackendCommands", "maxRasterDimension", "maxRasterPixels", "maxPngBytes",
+      "maxImageBytes", "maxImages", "maxFontBytes"];
+    viewportOptionalRecord(value.limits, [], allowed);
+    for (const key of Object.keys(value.limits)) viewportCount(value.limits[key], Number.MAX_SAFE_INTEGER);
+  }
+  return optionsJson(value);
+}
+
+/** Validate new payload data before property reads, JSON, or structured cloning. */
+export function validateViewportRequest(operation, payload) {
+  if (operation === "viewport-capabilities") {
+    viewportRecord(payload, []);
+    return 0;
+  }
+  const identity = ["documentId", "sheetIndex"];
+  if (operation === "prepare-viewport") {
+    viewportOptionalRecord(payload, identity, ["options"]);
+  } else if (operation === "render-viewport-tile") {
+    viewportRecord(payload, [...identity, "geometryId", "revision", "rect", "namespace"]);
+  } else if (operation === "release-viewport") {
+    viewportRecord(payload, [...identity, "geometryId", "revision"]);
+  } else throw invalidViewport("unknown viewport operation");
+  validateDocumentId(payload.documentId);
+  boundedIndex(payload.sheetIndex, "payload.sheetIndex", MAX_SHEETS, "sheets");
+  if (operation === "prepare-viewport") viewportOptionsJson(payload.options);
+  else {
+    validateViewportGeometryId(payload.geometryId);
+    validateViewportU64(payload.revision, "revision");
+    if (operation === "render-viewport-tile") {
+      validateViewportRect(payload.rect);
+      validateViewportU64(payload.namespace, "namespace");
+    }
+  }
+  // Options have their own 64 KiB ceiling; count the bounded envelope too.
+  return new TextEncoder().encode(JSON.stringify(payload)).byteLength;
+}
+
+/** Reject wrong protocol generations and raised new-path capabilities. */
+export function validateViewportCapabilities(value, workerResult = false) {
+  viewportRecord(value, workerResult ? ["schemaVersion", "unitsPerPixel", "limits", "resourcePolicy"] :
+    ["schemaVersion", "unitsPerPixel", "limits"]);
+  if (value.schemaVersion !== 1 || value.unitsPerPixel !== 1024) throw invalidViewport("invalid viewport capabilities");
+  viewportRecord(value.limits, Object.keys(VIEWPORT_LIMITS));
+  for (const key of Object.keys(VIEWPORT_LIMITS)) {
+    if (value.limits[key] !== VIEWPORT_LIMITS[key]) throw invalidViewport("viewport capabilities differ from the fixed contract");
+  }
+  if (workerResult) {
+    viewportRecord(value.resourcePolicy, Object.keys(VIEWPORT_RESOURCE_POLICY));
+    for (const key of Object.keys(VIEWPORT_RESOURCE_POLICY)) {
+      if (value.resourcePolicy[key] !== VIEWPORT_RESOURCE_POLICY[key]) throw invalidViewport("invalid viewport resource policy");
+    }
+  }
+  viewportMetadataBytes(value);
+  return value;
+}
+
+const VIEWPORT_DESCRIPTOR_KEYS = ["schemaVersion", "sheetIndex", "geometryId", "revision", "sourceRange",
+  "widthRaw", "heightRaw", "sheetVisibility", "preparationReport"];
+
+/** Validate a provisional native descriptor before it can become published. */
+export function validateViewportDescriptor(value, expected) {
+  viewportRecord(value, VIEWPORT_DESCRIPTOR_KEYS);
+  if (value.schemaVersion !== 1 || value.sheetIndex !== expected.sheetIndex ||
+      (expected.geometryId !== undefined && value.geometryId !== expected.geometryId)) throw invalidViewport("viewport descriptor identity mismatch");
+  validateViewportGeometryId(value.geometryId);
+  validateViewportU64(value.revision, "revision");
+  viewportCount(value.widthRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  viewportCount(value.heightRaw, VIEWPORT_LIMITS.maxLogicalDimensionRaw);
+  if (!["visible", "hidden", "veryHidden"].includes(value.sheetVisibility)) throw invalidViewport("invalid worksheet visibility");
+  if (value.sourceRange === null) {
+    if (value.widthRaw !== 0 || value.heightRaw !== 0 || value.preparationReport !== null) throw invalidViewport("empty source must have zero geometry and no fabricated preparation report");
+  } else {
+    viewportRange(value.sourceRange);
+    viewportPreparationReport(value.preparationReport);
+  }
+  viewportMetadataBytes(value);
+  return value;
+}
+
+/** Worker descriptors add document identity and conservative reserved resources. */
+export function validateViewportPrepareResult(value, expected) {
+  viewportRecord(value, ["documentId", ...VIEWPORT_DESCRIPTOR_KEYS, "resources"]);
+  if (value.documentId !== expected.documentId) throw invalidViewport("viewport document identity mismatch");
+  validateViewportDescriptor(Object.fromEntries(VIEWPORT_DESCRIPTOR_KEYS.map((key) => [key, value[key]])), expected);
+  viewportRecord(value.resources, ["geometryReservationBytes", "sourceIndexReservationBytes"]);
+  for (const key of ["geometryReservationBytes", "sourceIndexReservationBytes"]) {
+    if (value.resources[key] !== VIEWPORT_RESOURCE_POLICY[key]) throw invalidViewport("viewport reservation mismatch");
+  }
+  viewportMetadataBytes(value);
+  return value;
+}
+
+/** Tile responses carry logical geometry even when outside/empty paint is null. */
+export function validateViewportTileResult(value, expected, workerResult = true) {
+  const keys = ["schemaVersion", "sheetIndex", "geometryId", "revision", "namespace", "requestedRect",
+    "mimeType", "logicalRect", "sourceRange", "svg", "report", "metrics"];
+  viewportRecord(value, workerResult ? ["documentId", ...keys] : keys);
+  if (value.schemaVersion !== 1 || value.sheetIndex !== expected.sheetIndex ||
+      value.geometryId !== expected.geometryId || value.revision !== expected.revision ||
+      value.namespace !== expected.namespace || value.mimeType !== "image/svg+xml" ||
+      (workerResult && value.documentId !== expected.documentId)) throw invalidViewport("viewport tile identity mismatch");
+  validateViewportGeometryId(value.geometryId);
+  validateViewportU64(value.revision, "revision");
+  validateViewportU64(value.namespace, "namespace");
+  validateViewportRect(value.requestedRect);
+  for (const key of ["xRaw", "yRaw", "widthRaw", "heightRaw"]) {
+    if (value.requestedRect[key] !== expected.rect[key]) throw invalidViewport("viewport requested rectangle mismatch");
+  }
+  if (value.logicalRect === null) {
+    if ([value.sourceRange, value.svg, value.report, value.metrics].some((entry) => entry !== null)) throw invalidViewport("mixed empty viewport output");
+  } else {
+    validateViewportRect(value.logicalRect);
+    if (value.logicalRect.xRaw !== expected.rect.xRaw || value.logicalRect.yRaw !== expected.rect.yRaw ||
+        value.logicalRect.widthRaw > expected.rect.widthRaw || value.logicalRect.heightRaw > expected.rect.heightRaw) throw invalidViewport("invalid clipped viewport output");
+    viewportRange(value.sourceRange);
+    if (typeof value.svg !== "string" || value.svg.length > VIEWPORT_LIMITS.maxTileSvgBytes) throw invalidViewport("invalid viewport SVG size");
+    const svgBytes = validateSvgOutput(value.svg, VIEWPORT_LIMITS.maxTileSvgBytes);
+    viewportTileReport(value.report, expected.sheetIndex, value.sourceRange, svgBytes);
+    viewportRecord(value.metrics, ["coordinateVisits", "geometryBytes", "haloRows", "haloColumns", "haloCells"]);
+    for (const [key, limit] of Object.entries({ coordinateVisits: 2_000_000, geometryBytes: 8_388_608,
+      haloRows: 4096, haloColumns: 512, haloCells: 250_000 })) viewportCount(value.metrics[key], limit);
+    const totalRows = value.report.visible_rows + value.metrics.haloRows;
+    const totalColumns = value.report.visible_columns + value.metrics.haloColumns;
+    viewportCount(totalRows, 4096);
+    viewportCount(totalColumns, 512);
+    const totalGrid = totalRows * totalColumns;
+    viewportCount(totalGrid, 250_000);
+    const visibleGrid = value.report.visible_rows * value.report.visible_columns;
+    viewportCount(visibleGrid, 250_000);
+    if (value.metrics.haloCells !== totalGrid - visibleGrid) throw invalidViewport("invalid viewport halo count");
+  }
+  const metadata = Object.fromEntries((workerResult ? ["documentId", ...keys] : keys).filter((key) => key !== "svg").map((key) => [key, value[key]]));
+  viewportMetadataBytes(metadata);
+  return value;
+}
+
+/** Release acknowledgements cannot acknowledge another source revision. */
+export function validateViewportReleaseResult(value, expected) {
+  viewportRecord(value, ["schemaVersion", "documentId", "sheetIndex", "geometryId", "revision", "released"]);
+  if (value.schemaVersion !== 1 || typeof value.released !== "boolean") throw invalidViewport("invalid viewport release acknowledgement");
+  for (const key of ["documentId", "sheetIndex", "geometryId", "revision"]) {
+    if (value[key] !== expected[key]) throw invalidViewport("viewport release identity mismatch");
+  }
+  validateViewportGeometryId(value.geometryId);
+  validateViewportU64(value.revision);
+  return value;
+}
+
+function viewportPreparationReport(value) {
+  const bounds = { coordinateVisits: 2_000_000, sourceRawCells: 250_000, sourceHyperlinks: 250_000,
+    sourceIndexBuildPeakBytes: 8_388_608, geometryBytes: 8_388_608, textBytes: 8_388_608,
+    shapedGlyphs: 1_000_000, textWork: Number.MAX_SAFE_INTEGER, shapedRuns: 500_000,
+    textLines: 250_000, pathCommands: 4_000_000, conditionalEvaluations: 500_000 };
+  viewportRecord(value, [...Object.keys(bounds), "fontPackSha256", "fontFaces", "warnings"]);
+  for (const key of Object.keys(bounds)) viewportCount(value[key], bounds[key]);
+  if (value.sourceRawCells + value.sourceHyperlinks > 250_000) throw invalidViewport("source-index entry ceiling exceeded");
+  viewportFontWarnings(value.fontPackSha256, value.fontFaces, value.warnings);
+}
+
+function viewportTileReport(value, sheetIndex, range, svgBytes) {
+  const countKeys = ["rows_considered", "columns_considered", "cells_considered", "visible_rows", "visible_columns",
+    "rendered_regions", "hidden_rows_skipped", "hidden_columns_skipped", "merged_regions", "text_bytes", "glyphs", "scene_nodes", "svg_bytes"];
+  viewportRecord(value, ["schema_version", "sheet_index", "sheet_name", "range", ...countKeys, "font_pack_sha256", "font_faces", "warnings"]);
+  if (value.schema_version !== 2 || value.sheet_index !== sheetIndex) throw invalidViewport("tile report identity mismatch");
+  viewportText(value.sheet_name, 4096);
+  for (const key of countKeys) viewportCount(value[key], Number.MAX_SAFE_INTEGER);
+  viewportCount(value.visible_rows, 4096);
+  viewportCount(value.visible_columns, 512);
+  viewportCount(value.cells_considered, 250_000);
+  viewportCount(value.text_bytes, 8_388_608);
+  viewportCount(value.glyphs, 1_000_000);
+  viewportCount(value.scene_nodes, 100_000);
+  if (value.svg_bytes !== svgBytes) throw invalidViewport("tile SVG byte count mismatch");
+  viewportRecord(value.range, ["first_row", "first_col", "last_row", "last_col"]);
+  const actualRange = { firstRow: value.range.first_row, firstCol: value.range.first_col,
+    lastRow: value.range.last_row, lastCol: value.range.last_col };
+  viewportRange(actualRange);
+  for (const key of Object.keys(actualRange)) if (actualRange[key] !== range[key]) throw invalidViewport("tile source range mismatch");
+  viewportFontWarnings(value.font_pack_sha256, value.font_faces, value.warnings);
+}
+
+function viewportFontWarnings(hash, faces, warnings) {
+  const digest = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  if (hash !== null && !digest(hash)) throw invalidViewport("invalid viewport font digest");
+  viewportArray(faces, 512);
+  for (const face of faces) {
+    viewportRecord(face, ["source_pack_sha256", "face_sha256", "family", "weight", "italic", "substituted"]);
+    if (!digest(face.source_pack_sha256) || !digest(face.face_sha256) ||
+        typeof face.italic !== "boolean" || typeof face.substituted !== "boolean") throw invalidViewport("invalid viewport font face");
+    viewportText(face.family, 4096);
+    viewportCount(face.weight, 1000, true);
+  }
+  viewportArray(warnings, 512);
+  for (const warning of warnings) {
+    viewportRecord(warning, ["code", "occurrences", "first_cell"]);
+    viewportText(warning.code, 128);
+    viewportCount(warning.occurrences, Number.MAX_SAFE_INTEGER, true);
+    if (warning.first_cell !== null) {
+      viewportRecord(warning.first_cell, ["row", "col"]);
+      viewportCount(warning.first_cell.row, 1_048_575);
+      viewportCount(warning.first_cell.col, 16_383);
+    }
+  }
+}
+
+function viewportRange(value) {
+  viewportRecord(value, ["firstRow", "firstCol", "lastRow", "lastCol"]);
+  validateRange(value);
+  viewportCount(value.lastRow, 1_048_575);
+  viewportCount(value.lastCol, 16_383);
+}
+
+function viewportRecord(value, keys) {
+  try { interactionRecord(value, keys); } catch { throw invalidViewport("viewport record must contain exact data properties"); }
+}
+
+function viewportOptionalRecord(value, required, optional) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalidViewport("invalid viewport record");
+  const present = Reflect.ownKeys(value);
+  if (present.some((key) => ![...required, ...optional].includes(key)) ||
+      required.some((key) => !present.includes(key))) throw invalidViewport("invalid viewport fields");
+  viewportRecord(value, present);
+}
+
+function viewportArray(value, max) {
+  if (!Array.isArray(value) || value.length > max) throw invalidViewport("viewport array exceeds its bound");
+  try { interactionArray(value, value.length); } catch { throw invalidViewport("viewport array must be dense data elements"); }
+}
+
+function viewportText(value, max) {
+  if (typeof value !== "string" || value.length > max) throw invalidViewport("invalid viewport text");
+}
+
+function viewportCount(value, max, positive = false) {
+  if (!Number.isSafeInteger(value) || value < (positive ? 1 : 0) || value > max) throw invalidViewport("viewport count exceeds its bound");
+}
+
+function viewportMetadataBytes(value) {
+  const json = JSON.stringify(value);
+  if (json.length > VIEWPORT_LIMITS.maxMetadataBytes) throw limitError("viewportMetadataBytes", VIEWPORT_LIMITS.maxMetadataBytes, json.length, "viewport");
+  const bytes = new TextEncoder().encode(json).byteLength;
+  if (bytes > VIEWPORT_LIMITS.maxMetadataBytes) throw limitError("viewportMetadataBytes", VIEWPORT_LIMITS.maxMetadataBytes, bytes, "viewport");
+  return bytes;
+}
+
+function invalidViewport(message) {
+  return new RenderProtocolError("invalid_viewport", message, "viewport");
 }

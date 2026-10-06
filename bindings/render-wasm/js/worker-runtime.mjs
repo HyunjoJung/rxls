@@ -1,4 +1,12 @@
 import {
+  VIEWPORT_LIMITS,
+  VIEWPORT_RESOURCE_POLICY,
+  validateViewportCapabilities,
+  validateViewportDescriptor,
+  validateViewportGeometryId,
+  validateViewportPrepareResult,
+  validateViewportTileResult,
+  viewportOptionsJson,
   MAX_DPI,
   MAX_EDIT_HISTORY_BYTES,
   MAX_EDIT_HISTORY_ENTRIES,
@@ -35,6 +43,7 @@ import {
 } from "./protocol.mjs";
 
 const NON_CANCELLABLE_ACTIVE_OPERATIONS = new Set([
+  "release-viewport",
   "close",
   "set-cell",
   "set-cell-recalculate",
@@ -48,6 +57,9 @@ export class RenderWorkerRuntime {
   #wasm;
   #send;
   #documents = new Map();
+  #viewportTransaction = null;
+  #viewportUuid = null;
+  #nextViewport = 0n;
   #resourceBytes = 0;
   #cancelled = new Set();
   #queue = [];
@@ -185,9 +197,11 @@ export class RenderWorkerRuntime {
       this.#cancelled.add(this.#activeRequestId);
     }
     for (const document of this.#documents.values()) {
+      document.closed = true;
       document.session.free?.();
     }
     this.#documents.clear();
+    this.#viewportTransaction = null;
     this.#resourceBytes = 0;
   }
 
@@ -242,6 +256,7 @@ export class RenderWorkerRuntime {
   async #run(message) {
     const { requestId, operation, payload } = message;
     let openTransaction = null;
+    let viewportTransaction = null;
     try {
       this.#throwIfCancelled(requestId);
       this.#progress(requestId, 0, 3, "accepted");
@@ -250,13 +265,15 @@ export class RenderWorkerRuntime {
       this.#progress(requestId, 1, 3, operationStage(operation));
       const result = await this.#execute(operation, payload);
       openTransaction = result?.openTransaction ?? null;
-      if (openTransaction) {
+      viewportTransaction = result?.viewportTransaction ?? null;
+      if (openTransaction || viewportTransaction) {
         // Synchronous WASM work cannot receive its already-posted cancellation
         // until control returns to the worker event loop. Keep the session
         // provisional across one bounded message turn.
         await yieldToWorkerMessages();
       }
       this.#throwIfCancelled(requestId);
+      if (viewportTransaction) this.#commitViewport(viewportTransaction);
       this.#progress(requestId, 2, 3, "finalizing");
       this.#progress(requestId, 3, 3, "complete");
       if (openTransaction) {
@@ -268,6 +285,9 @@ export class RenderWorkerRuntime {
       if (openTransaction) {
         this.#rollbackOpen(openTransaction);
       }
+      if (viewportTransaction) {
+        try { this.#rollbackViewport(viewportTransaction); } catch (cleanupError) { error = cleanupError; }
+      }
       this.#sendResult(requestId, false, null, normalizeError(error));
     } finally {
       this.#cancelled.delete(requestId);
@@ -276,6 +296,14 @@ export class RenderWorkerRuntime {
 
   async #execute(operation, payload) {
     switch (operation) {
+      case "viewport-capabilities":
+        return this.#viewportCapabilities();
+      case "prepare-viewport":
+        return this.#prepareViewport(payload);
+      case "render-viewport-tile":
+        return this.#renderViewportTile(payload);
+      case "release-viewport":
+        return this.#releasePreparedViewport(payload);
       case "capabilities":
         return this.#capabilities;
       case "open":
@@ -387,7 +415,7 @@ export class RenderWorkerRuntime {
         value: { documentId, workbook, editState },
         openTransaction: {
           documentId,
-          document: { session, resourceBytes },
+          document: { session, resourceBytes, closed: false, viewport: null, viewportGeometryBytes: 0, viewportIndexBytes: 0 },
           total,
           committed: false
         }
@@ -404,7 +432,9 @@ export class RenderWorkerRuntime {
     if (!document) {
       return { documentId, closed: false };
     }
+    document.closed = true;
     document.session.free?.();
+    if (this.#viewportTransaction?.document === document) this.#viewportTransaction = null;
     this.#documents.delete(documentId);
     this.#resourceBytes -= document.resourceBytes;
     return { documentId, closed: true };
@@ -556,6 +586,181 @@ export class RenderWorkerRuntime {
     };
   }
 
+
+  async #viewportCapabilities() {
+    if (typeof this.#wasm.viewportCapabilitiesJson !== "function") {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM does not support prepared viewport rendering", "wasm");
+    }
+    const native = validateViewportCapabilities(parseViewportMetadataJson(
+      this.#wasm.viewportCapabilitiesJson(), "viewport capabilities", VIEWPORT_LIMITS.maxMetadataBytes));
+    return { ...native, resourcePolicy: { ...VIEWPORT_RESOURCE_POLICY } };
+  }
+
+  #nextGeometryId() {
+    if (this.#nextViewport >= 18446744073709551615n) {
+      throw new RenderProtocolError("viewport_counter_overflow", "viewport identity counter is exhausted", "viewport");
+    }
+    if (this.#viewportUuid === null) {
+      if (typeof globalThis.crypto?.randomUUID !== "function") {
+        throw new RenderProtocolError("viewport_unavailable", "secure viewport identity generation is unavailable", "viewport");
+      }
+      this.#viewportUuid = globalThis.crypto.randomUUID();
+    }
+    this.#nextViewport += 1n;
+    return validateViewportGeometryId(`vp-${this.#viewportUuid}-${this.#nextViewport}`);
+  }
+
+  #liveViewportDocument(transaction) {
+    return !transaction.document.closed &&
+      this.#documents.get(transaction.documentId) === transaction.document;
+  }
+
+  #reserveViewport(document, bytes) {
+    const total = this.#resourceBytes + bytes;
+    if (total > MAX_OPEN_RESOURCE_BYTES) {
+      throw limitError("openResourceBytes", MAX_OPEN_RESOURCE_BYTES, total, "documents");
+    }
+    const pending = total + this.#queuedResourceBytes + this.#activeResourceBytes;
+    if (pending > MAX_PENDING_RESOURCE_BYTES) {
+      throw limitError("pendingResourceBytes", MAX_PENDING_RESOURCE_BYTES, pending, "worker");
+    }
+    this.#resourceBytes = total;
+    document.resourceBytes += bytes;
+  }
+
+  #releaseViewportBytes(document, bytes) {
+    if (document.closed) return;
+    this.#resourceBytes -= bytes;
+    document.resourceBytes -= bytes;
+  }
+
+  async #prepareViewport(payload) {
+    await this.#viewportCapabilities();
+    const { documentId, session, document } = this.#document(payload);
+    for (const name of ["stageViewportJson", "commitViewport", "abortViewport", "renderViewportTileJson", "releaseViewport"]) {
+      if (typeof session[name] !== "function") throw new RenderProtocolError("wasm_api_mismatch", "WASM viewport session methods are incomplete", "wasm");
+    }
+    if (this.#viewportTransaction !== null) throw new RenderProtocolError("viewport_stage_exists", "a viewport preparation is already staged", "viewport");
+    const geometryId = this.#nextGeometryId();
+    const geometryBytes = VIEWPORT_RESOURCE_POLICY.geometryReservationBytes;
+    const indexBytes = document.viewportIndexBytes === 0 ? VIEWPORT_RESOURCE_POLICY.sourceIndexReservationBytes : 0;
+    this.#reserveViewport(document, geometryBytes + indexBytes);
+    // Index storage is source-owned and can survive a later preparation failure.
+    document.viewportIndexBytes += indexBytes;
+    const transaction = { documentId, document, geometryId, geometryBytes, phase: "reserved", descriptor: null };
+    this.#viewportTransaction = transaction;
+    try {
+      transaction.phase = "staging";
+      const json = await session.stageViewportJson(payload.sheetIndex, geometryId, viewportOptionsJson(payload.options));
+      if (!this.#liveViewportDocument(transaction)) throw cancelledError();
+      const descriptor = validateViewportDescriptor(parseViewportMetadataJson(json, "viewport descriptor", VIEWPORT_LIMITS.maxMetadataBytes),
+        { sheetIndex: payload.sheetIndex, geometryId });
+      transaction.descriptor = descriptor;
+      transaction.phase = "staged";
+      const value = { documentId, ...descriptor, resources: {
+        geometryReservationBytes: geometryBytes,
+        sourceIndexReservationBytes: VIEWPORT_RESOURCE_POLICY.sourceIndexReservationBytes
+      } };
+      validateViewportPrepareResult(value, { documentId, sheetIndex: payload.sheetIndex, geometryId });
+      return { value, viewportTransaction: transaction };
+    } catch (error) {
+      this.#rollbackViewport(transaction);
+      throw error;
+    }
+  }
+
+  #commitViewport(transaction) {
+    if (transaction.phase !== "staged" || !this.#liveViewportDocument(transaction) ||
+        this.#viewportTransaction !== transaction) throw cancelledError();
+    const { document, descriptor } = transaction;
+    // Native commit is synchronous: no cancellation/close turn after this check.
+    if (document.session.commitViewport(transaction.geometryId, descriptor.revision) !== true) {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM viewport commit did not acknowledge publication", "wasm");
+    }
+    transaction.phase = "committed";
+    this.#releaseViewportBytes(document, document.viewportGeometryBytes);
+    document.viewportGeometryBytes = transaction.geometryBytes;
+    document.viewport = descriptor;
+    this.#viewportTransaction = null;
+  }
+
+  #rollbackViewport(transaction) {
+    if (["committed", "aborted", "poisoned"].includes(transaction.phase)) return;
+    const live = this.#liveViewportDocument(transaction);
+    try {
+      if (live && typeof transaction.document.session.abortViewport(transaction.geometryId) !== "boolean") {
+        throw new RenderProtocolError("wasm_api_mismatch", "WASM viewport abort did not acknowledge cleanup", "wasm");
+      }
+    } catch (error) {
+      // A broken adapter must not turn unconfirmed native storage into credit.
+      // Keep this reservation and block another stage until mutation or close.
+      transaction.phase = "poisoned";
+      throw error;
+    }
+    transaction.phase = "aborted";
+    if (this.#viewportTransaction === transaction) this.#viewportTransaction = null;
+    if (live) this.#releaseViewportBytes(transaction.document, transaction.geometryBytes);
+  }
+
+  #viewportOwner(payload) {
+    const identity = this.#document(payload);
+    const owner = identity.document.viewport;
+    if (!owner || owner.geometryId !== payload.geometryId || owner.sheetIndex !== payload.sheetIndex ||
+        owner.revision !== payload.revision) {
+      throw new RenderProtocolError("viewport_not_prepared", "viewport identity does not name this document's current source", "viewport");
+    }
+    return { ...identity, owner };
+  }
+
+  async #renderViewportTile(payload) {
+    const { documentId, session, owner, document } = this.#viewportOwner(payload);
+    const json = await session.renderViewportTileJson(payload.sheetIndex, payload.geometryId, payload.revision,
+      JSON.stringify(payload.rect), payload.namespace);
+    if (document.closed || this.#documents.get(documentId) !== document || document.viewport !== owner) throw cancelledError();
+    const native = validateViewportTileResult(parseInteractiveJson(json, this.#maxOutputBytes), payload, false);
+    const outside = payload.rect.xRaw >= owner.widthRaw || payload.rect.yRaw >= owner.heightRaw;
+    if (outside !== (native.logicalRect === null)) throw new RenderProtocolError("wasm_api_mismatch", "WASM viewport empty coverage does not match prepared geometry", "wasm");
+    if (!outside && (native.logicalRect.widthRaw !== Math.min(payload.rect.widthRaw, owner.widthRaw - payload.rect.xRaw) ||
+        native.logicalRect.heightRaw !== Math.min(payload.rect.heightRaw, owner.heightRaw - payload.rect.yRaw))) {
+      throw new RenderProtocolError("wasm_api_mismatch", "WASM viewport did not cover the prepared clipped rectangle", "wasm");
+    }
+    return { documentId, ...native };
+  }
+
+  #releasePreparedViewport(payload) {
+    const { documentId, session, document } = this.#document(payload);
+    const owner = document.viewport;
+    let released = false;
+    if (owner?.geometryId === payload.geometryId) {
+      if (owner.sheetIndex !== payload.sheetIndex || owner.revision !== payload.revision) {
+        throw new RenderProtocolError("viewport_not_prepared", "live viewport release identity does not match", "viewport");
+      }
+      const answer = session.releaseViewport(payload.sheetIndex, payload.geometryId, payload.revision);
+      if (typeof answer !== "boolean" || answer !== true) throw new RenderProtocolError("wasm_api_mismatch", "WASM did not release its current viewport", "wasm");
+      released = true;
+      this.#releaseViewportBytes(document, document.viewportGeometryBytes);
+      document.viewportGeometryBytes = 0;
+      document.viewport = null;
+    }
+    return { schemaVersion: 1, documentId, sheetIndex: payload.sheetIndex, geometryId: payload.geometryId,
+      revision: payload.revision, released };
+  }
+
+  #invalidateViewport(documentId, session) {
+    const document = this.#documents.get(documentId);
+    if (!document || document.closed || document.session !== session) return;
+    const transaction = this.#viewportTransaction;
+    const stagedBytes = transaction?.document === document && transaction.phase === "poisoned" ? transaction.geometryBytes : 0;
+    if (stagedBytes) {
+      transaction.phase = "aborted";
+      this.#viewportTransaction = null;
+    }
+    this.#releaseViewportBytes(document, document.viewportGeometryBytes + document.viewportIndexBytes + stagedBytes);
+    document.viewportGeometryBytes = 0;
+    document.viewportIndexBytes = 0;
+    document.viewport = null;
+  }
+
   async #editStatus(payload) {
     const { documentId, session } = this.#document(payload);
     const editState = validateEditState(
@@ -602,12 +807,14 @@ export class RenderWorkerRuntime {
         value: payload.value
       })
     );
+    this.#invalidateViewport(documentId, session);
     return { documentId, ...this.#mutationResult(result, recalculate) };
   }
 
   async #setDocumentProperties(payload) {
     const { documentId, session } = this.#document(payload);
     const result = await session.setDocumentPropertiesJson(JSON.stringify(payload.properties));
+    this.#invalidateViewport(documentId, session);
     return { documentId, ...this.#mutationResult(result) };
   }
 
@@ -620,6 +827,7 @@ export class RenderWorkerRuntime {
       sheetIndex: payload.sheetIndex, startRow: payload.startRow,
       startCol: payload.startCol, values: payload.values
     }));
+    this.#invalidateViewport(documentId, session);
     return { documentId, ...this.#mutationResult(result, true) };
   }
 
@@ -627,6 +835,7 @@ export class RenderWorkerRuntime {
     const { documentId, session } = this.#document(payload);
     const result =
       direction === "undo" ? await session.undoEditJson() : await session.redoEditJson();
+    this.#invalidateViewport(documentId, session);
     return { documentId, ...this.#mutationResult(result) };
   }
 
@@ -690,7 +899,7 @@ export class RenderWorkerRuntime {
         "documentId"
       );
     }
-    return { documentId, session: document.session };
+    return { documentId, session: document.session, document };
   }
 
   #checkSvg(svg) {
@@ -737,6 +946,15 @@ export function installRenderWorker({ wasm, scope = globalThis }) {
     capabilities: runtime.capabilities()
   });
   return runtime;
+}
+
+function parseViewportMetadataJson(json, description, maxBytes) {
+  // Reject before an encoded copy or JSON object/array allocation. Legacy
+  // parsing remains unchanged; this guard is exclusive to new metadata.
+  if (typeof json === "string" && json.length > maxBytes) {
+    throw limitError("outputBytes", maxBytes, json.length, "output");
+  }
+  return parseBoundedJson(json, description, maxBytes);
 }
 
 function parseBoundedJson(json, description, maxBytes) {

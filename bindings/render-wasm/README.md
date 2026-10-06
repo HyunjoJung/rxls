@@ -100,6 +100,47 @@ the browser URL constructor does not apply package exports or import-map
 resolution to its first argument. A bundler or static server must expose the
 package assets at the URL from `getRenderWorkerUrl()`.
 
+## Prepared viewport APIs (current source)
+
+The current source adds `viewportCapabilities()`, `prepareViewport()`,
+`renderViewportTile()` and `releaseViewport()` as separate viewport schema 1
+operations. Build matching client, worker and WASM artifacts before using them;
+the published 0.3.0 package does not provide these APIs. Existing v2 ready,
+capabilities, sheet, tile, page and editing result shapes remain unchanged.
+
+```js
+await client.viewportCapabilities();
+const viewport = await client.prepareViewport(opened.documentId, 0, {
+  gridlines: true
+});
+try {
+  const tile = await client.renderViewportTile(
+    opened.documentId, 0, viewport.geometryId, viewport.revision,
+    { xRaw: 0, yRaw: 0, widthRaw: 256 * 1024, heightRaw: 256 * 1024 },
+    "1"
+  );
+  if (tile.svg !== null) viewer.replaceChildren(svgElement(tile.svg));
+} finally {
+  await client.releaseViewport(
+    opened.documentId, 0, viewport.geometryId, viewport.revision
+  );
+}
+```
+
+Rectangles use 1,024 fixed units per pixel. Revisions and SVG namespaces are
+canonical decimal `u64` strings; use distinct namespaces for simultaneously
+embedded tiles. Empty Used selections have zero dimensions, null source range
+and null preparation report; outside/empty tiles have jointly null paint fields.
+Successful edits and undo/redo invalidate prepared identities. Rejected edits,
+reads and save-copy preserve them.
+
+Preparation reserves 8 MiB for geometry and 8 MiB for the source index within
+the existing aggregate resource budget. Replacement counts old and provisional
+geometry until commit; failures preserve the prior owner. Tiles cap SVG at
+2 MiB, scene nodes at 100,000 and each dimension at 8,192 pixels. These charged
+budgets do not measure total browser/WASM memory. Options accept only
+`gridlines`, `includeHidden` and existing lowerable `limits`.
+
 Font packs use the existing `rxls.render-font-pack.v1` manifest. The client
 accepts `{ manifest, members: [{ name, bytes }] }`, copies transferable buffers,
 and the worker builds a bounded `rxls.font-bundle.v1` envelope. Rust validates
@@ -109,7 +150,8 @@ verified pack; SVG remains available without one.
 
 Cancellation uses `AbortSignal` or `client.cancel(requestId)`. Queued work is
 removed before entering WASM. After dispatch, state-changing operations
-(`close`, cell/property edits, undo, and redo) are deliberately non-cancellable:
+(`close`, cell/property edits, undo, redo, viewport preparation and release) are
+deliberately non-cancellable:
 their promise remains pending until the worker returns the authoritative state.
 Rendering inside WASM is synchronous and is not cooperatively cancellable; a
 soft-cancel rejects the local render promise and discards eventual output but
