@@ -14,11 +14,13 @@ mod recalculation;
 use rxls::{Cell, DocProperties, EditCapability, EditReadOnlyReason, Spreadsheet, Workbook};
 use rxls_render::{
     build_print_page, prepare_print_document, render_print_page_png, render_scene_svg,
-    render_sheet_interactive_svg, render_sheet_svg, FontPack, FontPackError, FontPackLimits,
-    FontPackMember, LimitKind, PreparedPrintDocument, PrintDocument, PrintLimits, PrintOptions,
-    RenderError, RenderLimits, RenderOptions, RenderRange, RenderSelection,
+    render_sheet_interactive_svg, render_sheet_svg, render_viewport_tile, FontPack, FontPackError,
+    FontPackLimits, FontPackMember, LimitKind, OwnedPreparedViewport, PreparedPrintDocument,
+    PrintDocument, PrintLimits, PrintOptions, RenderError, RenderLimits, RenderOptions,
+    RenderRange, RenderSelection, ViewportError, ViewportLimits,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 /// Maximum workbook input copied into WebAssembly linear memory.
@@ -116,7 +118,7 @@ impl FacadeError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RangeRequest {
     first_row: u32,
@@ -508,7 +510,10 @@ pub fn capabilities_json() -> String {
 #[wasm_bindgen]
 pub struct RenderSession {
     spreadsheet: Spreadsheet,
-    workbook: Workbook,
+    workbook: Arc<Workbook>,
+    viewport_revision: u64,
+    published_viewport: Option<SessionViewport>,
+    provisional_viewport: Option<SessionViewport>,
     font_pack: Option<FontPack>,
     font_pack_bytes: u64,
     undo: Vec<EditSnapshot>,
@@ -677,6 +682,62 @@ impl RenderSession {
         self.render_print_page_png_core(sheet_index, page_index, dpi, options_json)
             .map_err(js_error)
     }
+    /// Stage bounded immutable Used geometry without replacing a published viewport.
+    #[wasm_bindgen(js_name = stageViewportJson)]
+    pub fn stage_viewport_json(
+        &mut self,
+        sheet_index: usize,
+        geometry_id: &str,
+        options_json: &str,
+    ) -> Result<String, JsValue> {
+        self.stage_viewport_json_core(sheet_index, geometry_id, options_json)
+            .map_err(js_error)
+    }
+
+    /// Atomically publish a matching staged viewport for the current source revision.
+    #[wasm_bindgen(js_name = commitViewport)]
+    pub fn commit_viewport(&mut self, geometry_id: &str, revision: &str) -> Result<bool, JsValue> {
+        self.commit_viewport_core(geometry_id, revision)
+            .map_err(js_error)
+    }
+
+    /// Drop only the matching private stage; published geometry is untouched.
+    #[wasm_bindgen(js_name = abortViewport)]
+    pub fn abort_viewport(&mut self, geometry_id: &str) -> bool {
+        self.abort_viewport_core(geometry_id)
+    }
+
+    /// Render a raw pixel rectangle against an exact published source/geometry revision.
+    #[wasm_bindgen(js_name = renderViewportTileJson)]
+    pub fn render_viewport_tile_json(
+        &self,
+        sheet_index: usize,
+        geometry_id: &str,
+        revision: &str,
+        rect_json: &str,
+        namespace: &str,
+    ) -> Result<String, JsValue> {
+        self.render_viewport_tile_json_core(
+            sheet_index,
+            geometry_id,
+            revision,
+            rect_json,
+            namespace,
+        )
+        .map_err(js_error)
+    }
+
+    /// Release matching published geometry, retaining the source-owned display index.
+    #[wasm_bindgen(js_name = releaseViewport)]
+    pub fn release_viewport(
+        &mut self,
+        sheet_index: usize,
+        geometry_id: &str,
+        revision: &str,
+    ) -> Result<bool, JsValue> {
+        self.release_viewport_core(sheet_index, geometry_id, revision)
+            .map_err(js_error)
+    }
 }
 
 /// Parse workbook bytes and return bounded sheet metadata as JSON.
@@ -819,11 +880,14 @@ impl RenderSession {
         check_input(bytes)?;
         let (font_pack, font_pack_bytes) = load_font_bundle(font_bundle)?;
         let spreadsheet = parse_spreadsheet(bytes)?;
-        let workbook = spreadsheet.workbook().clone();
+        let workbook = Arc::new(spreadsheet.workbook().clone());
         validate_session_workbook(&workbook)?;
         Ok(Self {
             spreadsheet,
             workbook,
+            viewport_revision: 0,
+            published_viewport: None,
+            provisional_viewport: None,
             font_pack,
             font_pack_bytes,
             undo: Vec::new(),
@@ -1063,7 +1127,7 @@ impl RenderSession {
         // the target in a temporary clone; last-write-wins lookup ensures both
         // direct and transitive cycles see the candidate formula, not old data.
         // The temporary fallback value is never accepted or persisted.
-        let mut candidate = self.workbook.clone();
+        let mut candidate = self.workbook.as_ref().clone();
         candidate.sheets[sheet_index].write_formula(
             row,
             col,
@@ -1117,6 +1181,7 @@ impl RenderSession {
         required_formulas: &std::collections::BTreeSet<(usize, u32, u16)>,
     ) -> Result<String, FacadeError> {
         ensure_editable(&self.spreadsheet)?;
+        let next_revision = self.next_viewport_revision()?;
         let previous = self.snapshot()?;
         let mut candidate = self.spreadsheet.clone();
         edit(&mut candidate).map_err(map_edit_error)?;
@@ -1171,11 +1236,15 @@ impl RenderSession {
         } else {
             output
         };
+        let workbook = Arc::new(workbook);
         self.undo.push(previous);
         self.redo.clear();
         apply_history_projection(&mut self.undo, &mut self.redo, &projection);
         self.spreadsheet = candidate;
         self.workbook = workbook;
+        self.viewport_revision = next_revision;
+        self.published_viewport = None;
+        self.provisional_viewport = None;
         self.dirty = true;
         self.edited_parts = edited_parts;
         Ok(output)
@@ -1186,6 +1255,7 @@ impl RenderSession {
         let target = self.undo.last().ok_or_else(|| {
             FacadeError::simple("history_empty", "there is no edit to undo", "history")
         })?;
+        let next_revision = self.next_viewport_revision()?;
         let current = self.snapshot()?;
         let spreadsheet = parse_spreadsheet(&target.bytes)?;
         let workbook = spreadsheet.workbook().clone();
@@ -1215,11 +1285,15 @@ impl RenderSession {
                 edited_parts: &edited_parts,
             },
         )?;
+        let workbook = Arc::new(workbook);
         self.undo.pop();
         self.redo.push(current);
         apply_history_projection(&mut self.undo, &mut self.redo, &projection);
         self.spreadsheet = spreadsheet;
         self.workbook = workbook;
+        self.viewport_revision = next_revision;
+        self.published_viewport = None;
+        self.provisional_viewport = None;
         self.dirty = dirty;
         self.edited_parts = edited_parts;
         Ok(output)
@@ -1230,6 +1304,7 @@ impl RenderSession {
         let target = self.redo.last().ok_or_else(|| {
             FacadeError::simple("history_empty", "there is no edit to redo", "history")
         })?;
+        let next_revision = self.next_viewport_revision()?;
         let current = self.snapshot()?;
         let spreadsheet = parse_spreadsheet(&target.bytes)?;
         let workbook = spreadsheet.workbook().clone();
@@ -1259,11 +1334,15 @@ impl RenderSession {
                 edited_parts: &edited_parts,
             },
         )?;
+        let workbook = Arc::new(workbook);
         self.redo.pop();
         self.undo.push(current);
         apply_history_projection(&mut self.undo, &mut self.redo, &projection);
         self.spreadsheet = spreadsheet;
         self.workbook = workbook;
+        self.viewport_revision = next_revision;
+        self.published_viewport = None;
+        self.provisional_viewport = None;
         self.dirty = dirty;
         self.edited_parts = edited_parts;
         Ok(output)
@@ -2069,6 +2148,1573 @@ fn set_property(object: &JsValue, name: &str, value: &JsValue) {
     let _ = js_sys::Reflect::set(object, &JsValue::from_str(name), value);
 }
 
+const VIEWPORT_METADATA_BYTES: u64 = 65_536;
+const VIEWPORT_SVG_BYTES: u64 = 2_097_152;
+const VIEWPORT_SCENE_NODES: u64 = 100_000;
+const VIEWPORT_TILE_DIMENSION_RAW: u64 = 8_388_608;
+const VIEWPORT_LOGICAL_DIMENSION_RAW: u64 = 16_384_000_000;
+const VIEWPORT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const VIEWPORT_DIAGNOSTICS: usize = 512;
+
+/// Fixed bounded viewport preparation and tile capabilities, separate from legacy JSON.
+#[wasm_bindgen(js_name = viewportCapabilitiesJson)]
+pub fn viewport_capabilities_json() -> String {
+    serde_json::json!({
+        "schemaVersion": 1, "unitsPerPixel": 1024,
+        "limits": {
+            "maxOptionsBytes": 65_536, "maxCoordinateVisits": 2_000_000,
+            "maxAxisRuns": 65_536, "maxGeometryBytes": 8_388_608,
+            "maxLogicalDimensionRaw": VIEWPORT_LOGICAL_DIMENSION_RAW,
+            "maxSourceRecords": MAX_CELLS, "maxTileDimensionRaw": VIEWPORT_TILE_DIMENSION_RAW,
+            "maxTileSvgBytes": VIEWPORT_SVG_BYTES, "maxTileSceneNodes": VIEWPORT_SCENE_NODES,
+            "maxMetadataBytes": VIEWPORT_METADATA_BYTES,
+        }
+    })
+    .to_string()
+}
+
+#[derive(Debug)]
+struct SessionViewport {
+    geometry_id: String,
+    revision: u64,
+    sheet_index: usize,
+    source: Arc<Workbook>,
+    owner: Option<OwnedPreparedViewport>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+struct ViewportOptions {
+    gridlines: Option<bool>,
+    include_hidden: Option<bool>,
+    limits: RequestedLimits,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ViewportRect {
+    x_raw: u64,
+    y_raw: u64,
+    width_raw: u64,
+    height_raw: u64,
+}
+
+impl ViewportRect {
+    fn validate(self) -> Result<Self, FacadeError> {
+        if self.width_raw == 0
+            || self.height_raw == 0
+            || self.width_raw > VIEWPORT_TILE_DIMENSION_RAW
+            || self.height_raw > VIEWPORT_TILE_DIMENSION_RAW
+            || self.x_raw > VIEWPORT_LOGICAL_DIMENSION_RAW
+            || self.y_raw > VIEWPORT_LOGICAL_DIMENSION_RAW
+            || self
+                .x_raw
+                .checked_add(self.width_raw)
+                .is_none_or(|n| n > VIEWPORT_LOGICAL_DIMENSION_RAW)
+            || self
+                .y_raw
+                .checked_add(self.height_raw)
+                .is_none_or(|n| n > VIEWPORT_LOGICAL_DIMENSION_RAW)
+        {
+            return Err(viewport_failure(
+                "invalid_viewport_rectangle",
+                "viewport rectangle exceeds its bounds",
+                "viewport.rect",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn fixed(self) -> rxls_render::Rect {
+        // validate bounds every field below 2^34, safely inside signed Fixed.
+        rxls_render::Rect {
+            x: rxls_render::Fixed::from_raw(self.x_raw as i64),
+            y: rxls_render::Fixed::from_raw(self.y_raw as i64),
+            width: rxls_render::Fixed::from_raw(self.width_raw as i64),
+            height: rxls_render::Fixed::from_raw(self.height_raw as i64),
+        }
+    }
+
+    fn from_fixed(rect: rxls_render::Rect) -> Result<Self, FacadeError> {
+        let nonnegative = |n: rxls_render::Fixed| {
+            u64::try_from(n.raw()).map_err(|_| {
+                viewport_failure(
+                    "invalid_viewport_metadata",
+                    "renderer returned negative viewport geometry",
+                    "viewport.output",
+                )
+            })
+        };
+        Self {
+            x_raw: nonnegative(rect.x)?,
+            y_raw: nonnegative(rect.y)?,
+            width_raw: nonnegative(rect.width)?,
+            height_raw: nonnegative(rect.height)?,
+        }
+        .validate()
+    }
+}
+
+impl RenderSession {
+    fn next_viewport_revision(&self) -> Result<u64, FacadeError> {
+        self.viewport_revision.checked_add(1).ok_or_else(|| {
+            viewport_failure(
+                "viewport_revision_overflow",
+                "source revision cannot advance beyond u64",
+                "viewport.revision",
+            )
+        })
+    }
+
+    fn stage_viewport_json_core(
+        &mut self,
+        sheet_index: usize,
+        geometry_id: &str,
+        options_json: &str,
+    ) -> Result<String, FacadeError> {
+        // At most one private stage; any new staging error leaves none behind.
+        // Published geometry and its source identity remain unchanged on failure.
+        self.provisional_viewport = None;
+        viewport_geometry_id(geometry_id)?;
+        if self
+            .published_viewport
+            .as_ref()
+            .is_some_and(|p| p.geometry_id == geometry_id)
+        {
+            return Err(viewport_failure(
+                "viewport_identity_in_use",
+                "published geometry identity cannot be reused",
+                "viewport.geometryId",
+            ));
+        }
+        let request = viewport_options(options_json)?;
+        let mut effective = effective_options(&request, self.font_pack.as_ref())?;
+        effective.render.limits.max_output_bytes = effective
+            .render
+            .limits
+            .max_output_bytes
+            .min(VIEWPORT_SVG_BYTES);
+        effective.render.limits.max_scene_nodes = effective
+            .render
+            .limits
+            .max_scene_nodes
+            .min(VIEWPORT_SCENE_NODES);
+        check_font_bytes(self.font_pack_bytes, effective.resources.font_bytes)?;
+        check_embedded_images(&self.workbook, effective.resources)?;
+        let sheet = self
+            .workbook
+            .sheets
+            .get(sheet_index)
+            .ok_or(RenderError::SheetIndexOutOfRange {
+                requested: sheet_index,
+                sheet_count: self.workbook.sheets.len(),
+            })
+            .map_err(map_render_error)?;
+        let visibility = match sheet.visible() {
+            rxls::SheetVisible::Visible => "visible",
+            rxls::SheetVisible::Hidden => "hidden",
+            rxls::SheetVisible::VeryHidden => "veryHidden",
+        };
+        let source = Arc::clone(&self.workbook);
+        let options = Arc::new(effective.render);
+        // Empty Used still runs the same native source preflight and cap checks.
+        let owner = OwnedPreparedViewport::prepare_used(
+            Arc::clone(&source),
+            sheet_index,
+            options,
+            ViewportLimits::default(),
+        )
+        .map_err(map_viewport_error)?;
+        let (range, width, height, report) = if let Some(owner) = owner.as_ref() {
+            let report = owner.preparation_report();
+            viewport_validate_preparation(report)?;
+            let width = viewport_extent(owner.columns().extent())?;
+            let height = viewport_extent(owner.rows().extent())?;
+            (
+                Some(viewport_range(owner.source_range())),
+                width,
+                height,
+                Some(ViewportPreparationWire::from(report)),
+            )
+        } else {
+            (None, 0, 0, None)
+        };
+        let revision = self.viewport_revision.to_string();
+        let descriptor = ViewportDescriptor {
+            schema_version: 1,
+            sheet_index,
+            geometry_id,
+            revision: &revision,
+            source_range: range,
+            width_raw: width,
+            height_raw: height,
+            sheet_visibility: visibility,
+            preparation_report: report,
+        };
+        let output = viewport_serialize(&descriptor, VIEWPORT_METADATA_BYTES)?;
+        let mut retained_id = String::new();
+        retained_id
+            .try_reserve_exact(geometry_id.len())
+            .map_err(|_| viewport_allocation())?;
+        retained_id.push_str(geometry_id);
+        // No validation/serialization remains after retaining the complete stage.
+        self.provisional_viewport = Some(SessionViewport {
+            geometry_id: retained_id,
+            revision: self.viewport_revision,
+            sheet_index,
+            source,
+            owner,
+        });
+        Ok(output)
+    }
+
+    fn commit_viewport_core(
+        &mut self,
+        geometry_id: &str,
+        revision: &str,
+    ) -> Result<bool, FacadeError> {
+        viewport_geometry_id(geometry_id)?;
+        let revision = viewport_u64(revision, false, "viewport.revision")?;
+        let staged = self
+            .provisional_viewport
+            .as_ref()
+            .filter(|p| p.geometry_id == geometry_id)
+            .ok_or_else(|| {
+                viewport_failure(
+                    "viewport_not_staged",
+                    "matching viewport stage is absent",
+                    "viewport.geometryId",
+                )
+            })?;
+        self.viewport_matches(staged, staged.sheet_index, revision)?;
+        let Some(staged) = self.provisional_viewport.take() else {
+            return Err(viewport_failure(
+                "viewport_not_staged",
+                "viewport stage is absent",
+                "viewport.geometryId",
+            ));
+        };
+        // Synchronous atomic replacement; no fallible work after publication.
+        self.published_viewport = Some(staged);
+        Ok(true)
+    }
+
+    fn abort_viewport_core(&mut self, geometry_id: &str) -> bool {
+        if self
+            .provisional_viewport
+            .as_ref()
+            .is_some_and(|p| p.geometry_id == geometry_id)
+        {
+            self.provisional_viewport = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_viewport_core(
+        &mut self,
+        sheet_index: usize,
+        geometry_id: &str,
+        revision: &str,
+    ) -> Result<bool, FacadeError> {
+        viewport_geometry_id(geometry_id)?;
+        let revision = viewport_u64(revision, false, "viewport.revision")?;
+        let Some(published) = self
+            .published_viewport
+            .as_ref()
+            .filter(|p| p.geometry_id == geometry_id)
+        else {
+            return Ok(false);
+        };
+        self.viewport_matches(published, sheet_index, revision)?;
+        self.published_viewport = None;
+        Ok(true)
+    }
+
+    fn viewport_matches(
+        &self,
+        record: &SessionViewport,
+        sheet_index: usize,
+        revision: u64,
+    ) -> Result<(), FacadeError> {
+        if record.sheet_index != sheet_index {
+            return Err(viewport_failure(
+                "viewport_sheet_mismatch",
+                "viewport belongs to a different sheet",
+                "sheetIndex",
+            ));
+        }
+        if record.revision != revision || record.revision != self.viewport_revision {
+            return Err(viewport_failure(
+                "viewport_revision_mismatch",
+                "viewport source revision is stale or different",
+                "viewport.revision",
+            ));
+        }
+        if !Arc::ptr_eq(&record.source, &self.workbook)
+            || record.owner.as_ref().is_some_and(|p| {
+                !Arc::ptr_eq(p.workbook(), &record.source) || p.sheet_index() != record.sheet_index
+            })
+        {
+            return Err(viewport_failure(
+                "viewport_source_mismatch",
+                "viewport belongs to a different source snapshot",
+                "viewport.geometryId",
+            ));
+        }
+        Ok(())
+    }
+
+    fn render_viewport_tile_json_core(
+        &self,
+        sheet_index: usize,
+        geometry_id: &str,
+        revision: &str,
+        rect_json: &str,
+        namespace: &str,
+    ) -> Result<String, FacadeError> {
+        viewport_geometry_id(geometry_id)?;
+        let parsed_revision = viewport_u64(revision, false, "viewport.revision")?;
+        let parsed_namespace = viewport_u64(namespace, false, "viewport.namespace")?;
+        let requested = viewport_rect(rect_json)?;
+        let published = self
+            .published_viewport
+            .as_ref()
+            .filter(|p| p.geometry_id == geometry_id)
+            .ok_or_else(|| {
+                viewport_failure(
+                    "viewport_not_prepared",
+                    "published viewport is absent",
+                    "viewport.geometryId",
+                )
+            })?;
+        self.viewport_matches(published, sheet_index, parsed_revision)?;
+        let tile = if let Some(owner) = published.owner.as_ref() {
+            let facade = owner.as_prepared().map_err(map_viewport_error)?;
+            render_viewport_tile(&facade, requested.fixed(), parsed_namespace)
+                .map_err(map_viewport_error)?
+        } else {
+            None
+        };
+        let (logical_rect, source_range, report, metrics) = if let Some(tile) = tile.as_ref() {
+            viewport_validate_tile(tile)?;
+            (
+                Some(ViewportRect::from_fixed(tile.logical_rect)?),
+                Some(viewport_range(tile.source_range)),
+                Some(ViewportRenderReportWire(&tile.report)),
+                Some(ViewportMetrics {
+                    coordinate_visits: tile.coordinate_visits,
+                    geometry_bytes: tile.geometry_bytes,
+                    halo_rows: tile.halo_rows,
+                    halo_columns: tile.halo_columns,
+                    halo_cells: tile.halo_cells,
+                }),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let metadata = ViewportTileWire {
+            schema_version: 1,
+            sheet_index,
+            geometry_id,
+            revision,
+            namespace,
+            requested_rect: requested,
+            mime_type: "image/svg+xml",
+            logical_rect,
+            source_range,
+            report,
+            metrics,
+        };
+        viewport_serialize(&metadata, VIEWPORT_METADATA_BYTES)?;
+        // Both passes borrow report/SVG strings, with no scene/vector clones.
+        // Metadata excludes SVG; escaped JSON retains the old facade16MiB bound.
+        viewport_serialize(
+            &ViewportCompleteTileWire {
+                metadata,
+                svg: tile.as_ref().map(|tile| tile.svg.as_str()),
+            },
+            MAX_OUTPUT_BYTES,
+        )
+    }
+}
+
+fn viewport_failure(
+    code: &'static str,
+    message: &'static str,
+    location: &'static str,
+) -> FacadeError {
+    FacadeError::simple(code, message, location)
+}
+
+fn map_viewport_error(error: ViewportError) -> FacadeError {
+    match error {
+        ViewportError::Render(error) => map_render_error(error),
+        ViewportError::Limit {
+            resource,
+            limit,
+            actual,
+        } => FacadeError::limit(resource, limit, actual),
+        ViewportError::Unsupported { reason } => FacadeError::simple(
+            "viewport_unsupported",
+            format!("viewport preparation or query is unsupported: {reason}"),
+            "viewport",
+        ),
+    }
+}
+
+fn viewport_u64(text: &str, positive: bool, location: &'static str) -> Result<u64, FacadeError> {
+    let invalid = || {
+        viewport_failure(
+            "invalid_viewport_request",
+            "viewport counter is not a canonical u64 string",
+            location,
+        )
+    };
+    if text.is_empty() || text.len() > 20 || (text.len() > 1 && text.starts_with('0')) {
+        return Err(invalid());
+    }
+    let mut value = 0_u64;
+    for digit in text.bytes() {
+        if !digit.is_ascii_digit() {
+            return Err(invalid());
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(digit - b'0')))
+            .ok_or_else(invalid)?;
+    }
+    if positive && value == 0 {
+        return Err(invalid());
+    }
+    Ok(value)
+}
+
+fn viewport_geometry_id(text: &str) -> Result<(), FacadeError> {
+    let invalid = || {
+        viewport_failure(
+            "invalid_viewport_request",
+            "viewport geometry identity is invalid",
+            "viewport.geometryId",
+        )
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() < 41
+        || bytes.len() > 60
+        || bytes.get(..3) != Some(b"vp-")
+        || bytes.get(39) != Some(&b'-')
+    {
+        return Err(invalid());
+    }
+    let uuid = bytes.get(3..39).ok_or_else(invalid)?;
+    for (index, &byte) in uuid.iter().enumerate() {
+        if [8, 13, 18, 23].contains(&index) {
+            if byte != b'-' {
+                return Err(invalid());
+            }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte) {
+            return Err(invalid());
+        }
+    }
+    if uuid.get(14) != Some(&b'4')
+        || !uuid
+            .get(19)
+            .is_some_and(|b| [b'8', b'9', b'a', b'b'].contains(b))
+    {
+        return Err(invalid());
+    }
+    let counter = text.get(40..).ok_or_else(invalid)?;
+    viewport_u64(counter, true, "viewport.geometryId")?;
+    Ok(())
+}
+
+fn viewport_options(text: &str) -> Result<RequestOptions, FacadeError> {
+    if text.len() as u64 > VIEWPORT_METADATA_BYTES {
+        return Err(FacadeError::limit(
+            "options_bytes",
+            VIEWPORT_METADATA_BYTES,
+            text.len() as u64,
+        ));
+    }
+    let parsed: ViewportOptions = if text.trim().is_empty() {
+        ViewportOptions::default()
+    } else {
+        serde_json::from_str(text).map_err(|_| {
+            viewport_failure(
+                "invalid_options",
+                "viewport options contain an invalid or unsupported field",
+                "options",
+            )
+        })?
+    };
+    Ok(RequestOptions {
+        gridlines: parsed.gridlines,
+        include_hidden: parsed.include_hidden,
+        limits: parsed.limits,
+        ..RequestOptions::default()
+    })
+}
+
+fn viewport_rect(text: &str) -> Result<ViewportRect, FacadeError> {
+    if text.len() as u64 > VIEWPORT_METADATA_BYTES {
+        return Err(FacadeError::limit(
+            "viewportMetadataBytes",
+            VIEWPORT_METADATA_BYTES,
+            text.len() as u64,
+        ));
+    }
+    serde_json::from_str::<ViewportRect>(text)
+        .map_err(|_| {
+            viewport_failure(
+                "invalid_viewport_rectangle",
+                "viewport rectangle JSON is invalid",
+                "viewport.rect",
+            )
+        })?
+        .validate()
+}
+
+fn viewport_extent(value: rxls_render::Fixed) -> Result<u64, FacadeError> {
+    let raw = u64::try_from(value.raw()).map_err(|_| viewport_serialization())?;
+    if raw > VIEWPORT_LOGICAL_DIMENSION_RAW {
+        return Err(viewport_serialization());
+    }
+    Ok(raw)
+}
+
+fn viewport_range(range: RenderRange) -> RangeRequest {
+    RangeRequest {
+        first_row: range.first_row,
+        first_col: range.first_col,
+        last_row: range.last_row,
+        last_col: range.last_col,
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewportDescriptor<'a> {
+    schema_version: u32,
+    sheet_index: usize,
+    geometry_id: &'a str,
+    revision: &'a str,
+    source_range: Option<RangeRequest>,
+    width_raw: u64,
+    height_raw: u64,
+    sheet_visibility: &'static str,
+    preparation_report: Option<ViewportPreparationWire<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewportPreparationWire<'a> {
+    coordinate_visits: u64,
+    source_raw_cells: u64,
+    source_hyperlinks: u64,
+    source_index_build_peak_bytes: u64,
+    geometry_bytes: u64,
+    text_bytes: u64,
+    shaped_glyphs: u64,
+    text_work: u64,
+    shaped_runs: u64,
+    text_lines: u64,
+    path_commands: u64,
+    conditional_evaluations: u64,
+    font_pack_sha256: Option<&'a str>,
+    font_faces: ViewportFaces<'a>,
+    warnings: ViewportWarnings<'a>,
+}
+
+impl<'a> From<&'a rxls_render::ViewportPreparationReport> for ViewportPreparationWire<'a> {
+    fn from(report: &'a rxls_render::ViewportPreparationReport) -> Self {
+        Self {
+            coordinate_visits: report.coordinate_visits,
+            source_raw_cells: report.source_raw_cells,
+            source_hyperlinks: report.source_hyperlinks,
+            source_index_build_peak_bytes: report.source_index_build_peak_bytes,
+            geometry_bytes: report.geometry_bytes,
+            text_bytes: report.text_bytes,
+            shaped_glyphs: report.shaped_glyphs,
+            text_work: report.text_work,
+            shaped_runs: report.shaped_runs,
+            text_lines: report.text_lines,
+            path_commands: report.path_commands,
+            conditional_evaluations: report.conditional_evaluations,
+            font_pack_sha256: report.font_pack_sha256.as_deref(),
+            font_faces: ViewportFaces(&report.font_faces),
+            warnings: ViewportWarnings(&report.warnings),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewportTileWire<'a> {
+    schema_version: u32,
+    sheet_index: usize,
+    geometry_id: &'a str,
+    revision: &'a str,
+    namespace: &'a str,
+    requested_rect: ViewportRect,
+    mime_type: &'static str,
+    logical_rect: Option<ViewportRect>,
+    source_range: Option<RangeRequest>,
+    report: Option<ViewportRenderReportWire<'a>>,
+    metrics: Option<ViewportMetrics>,
+}
+
+#[derive(Serialize)]
+struct ViewportCompleteTileWire<'a> {
+    #[serde(flatten)]
+    metadata: ViewportTileWire<'a>,
+    svg: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewportMetrics {
+    coordinate_visits: u64,
+    geometry_bytes: u64,
+    halo_rows: u64,
+    halo_columns: u64,
+    halo_cells: u64,
+}
+
+struct ViewportRenderReportWire<'a>(&'a rxls_render::RenderReport);
+
+impl Serialize for ViewportRenderReportWire<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        #[derive(Serialize)]
+        struct SnakeRange {
+            first_row: u32,
+            first_col: u16,
+            last_row: u32,
+            last_col: u16,
+        }
+        let r = self.0;
+        let mut map = serializer.serialize_struct("RenderReport", 20)?;
+        map.serialize_field("schema_version", &r.schema_version)?;
+        map.serialize_field("sheet_index", &r.sheet_index)?;
+        map.serialize_field("sheet_name", &r.sheet_name)?;
+        map.serialize_field(
+            "range",
+            &SnakeRange {
+                first_row: r.range.first_row,
+                first_col: r.range.first_col,
+                last_row: r.range.last_row,
+                last_col: r.range.last_col,
+            },
+        )?;
+        map.serialize_field("rows_considered", &r.rows_considered)?;
+        map.serialize_field("columns_considered", &r.columns_considered)?;
+        map.serialize_field("cells_considered", &r.cells_considered)?;
+        map.serialize_field("visible_rows", &r.visible_rows)?;
+        map.serialize_field("visible_columns", &r.visible_columns)?;
+        map.serialize_field("rendered_regions", &r.rendered_regions)?;
+        map.serialize_field("hidden_rows_skipped", &r.hidden_rows_skipped)?;
+        map.serialize_field("hidden_columns_skipped", &r.hidden_columns_skipped)?;
+        map.serialize_field("merged_regions", &r.merged_regions)?;
+        map.serialize_field("text_bytes", &r.text_bytes)?;
+        map.serialize_field("glyphs", &r.glyphs)?;
+        map.serialize_field("scene_nodes", &r.scene_nodes)?;
+        map.serialize_field("svg_bytes", &r.svg_bytes)?;
+        map.serialize_field("font_pack_sha256", &r.font_pack_sha256)?;
+        map.serialize_field("font_faces", &ViewportFaces(&r.font_faces))?;
+        map.serialize_field("warnings", &ViewportWarnings(&r.warnings))?;
+        map.end()
+    }
+}
+
+struct ViewportFaces<'a>(&'a [rxls_render::RenderedFontFace]);
+impl Serialize for ViewportFaces<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(Serialize)]
+        struct Face<'a> {
+            source_pack_sha256: &'a str,
+            face_sha256: &'a str,
+            family: &'a str,
+            weight: u16,
+            italic: bool,
+            substituted: bool,
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for face in self.0 {
+            sequence.serialize_element(&Face {
+                source_pack_sha256: &face.source_pack_sha256,
+                face_sha256: &face.face_sha256,
+                family: &face.family,
+                weight: face.weight,
+                italic: face.italic,
+                substituted: face.substituted,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct ViewportWarnings<'a>(&'a [rxls_render::RenderWarning]);
+impl Serialize for ViewportWarnings<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(Serialize)]
+        struct Coordinate {
+            row: u32,
+            col: u16,
+        }
+        #[derive(Serialize)]
+        struct Warning {
+            code: &'static str,
+            occurrences: u64,
+            first_cell: Option<Coordinate>,
+        }
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for warning in self.0 {
+            sequence.serialize_element(&Warning {
+                code: warning.code.code(),
+                occurrences: warning.occurrences,
+                first_cell: warning.first_cell.map(|c| Coordinate {
+                    row: c.row,
+                    col: c.col,
+                }),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+fn viewport_validate_count(value: u64, limit: u64) -> Result<(), FacadeError> {
+    if value > limit {
+        Err(viewport_serialization())
+    } else {
+        Ok(())
+    }
+}
+
+fn viewport_validate_diagnostics(
+    hash: Option<&str>,
+    faces: &[rxls_render::RenderedFontFace],
+    warnings: &[rxls_render::RenderWarning],
+) -> Result<(), FacadeError> {
+    let digest = |text: &str| {
+        text.len() == 64
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if hash.is_some_and(|hash| !digest(hash))
+        || faces.len() > VIEWPORT_DIAGNOSTICS
+        || warnings.len() > VIEWPORT_DIAGNOSTICS
+    {
+        return Err(viewport_serialization());
+    }
+    for face in faces {
+        if !digest(&face.source_pack_sha256)
+            || !digest(&face.face_sha256)
+            || face.family.len() > 4096
+            || face.weight == 0
+            || face.weight > 1000
+        {
+            return Err(viewport_serialization());
+        }
+    }
+    for warning in warnings {
+        if warning.occurrences == 0
+            || warning.occurrences > VIEWPORT_SAFE_INTEGER
+            || warning.code.code().len() > 128
+            || warning
+                .first_cell
+                .is_some_and(|c| c.row > 1_048_575 || c.col > 16_383)
+        {
+            return Err(viewport_serialization());
+        }
+    }
+    Ok(())
+}
+
+fn viewport_validate_preparation(
+    report: &rxls_render::ViewportPreparationReport,
+) -> Result<(), FacadeError> {
+    for (value, limit) in [
+        (report.coordinate_visits, 2_000_000),
+        (report.source_raw_cells, MAX_CELLS),
+        (report.source_hyperlinks, MAX_CELLS),
+        (report.source_index_build_peak_bytes, 8_388_608),
+        (report.geometry_bytes, 8_388_608),
+        (report.text_bytes, MAX_TEXT_BYTES),
+        (report.shaped_glyphs, MAX_GLYPHS),
+        (report.text_work, VIEWPORT_SAFE_INTEGER),
+        (report.shaped_runs, MAX_TEXT_RUNS),
+        (report.text_lines, MAX_TEXT_LINES),
+        (report.path_commands, MAX_PATH_COMMANDS),
+        (report.conditional_evaluations, MAX_CONDITIONAL_EVALUATIONS),
+    ] {
+        viewport_validate_count(value, limit)?;
+    }
+    if report
+        .source_raw_cells
+        .checked_add(report.source_hyperlinks)
+        .is_none_or(|n| n > MAX_CELLS)
+    {
+        return Err(viewport_serialization());
+    }
+    viewport_validate_diagnostics(
+        report.font_pack_sha256.as_deref(),
+        &report.font_faces,
+        &report.warnings,
+    )
+}
+
+fn viewport_validate_tile(tile: &rxls_render::ViewportTile) -> Result<(), FacadeError> {
+    let r = &tile.report;
+    for count in [
+        r.rows_considered,
+        r.columns_considered,
+        r.cells_considered,
+        r.visible_rows,
+        r.visible_columns,
+        r.rendered_regions,
+        r.hidden_rows_skipped,
+        r.hidden_columns_skipped,
+        r.merged_regions,
+        r.text_bytes,
+        r.glyphs,
+        r.scene_nodes,
+        r.svg_bytes,
+    ] {
+        viewport_validate_count(count, VIEWPORT_SAFE_INTEGER)?;
+    }
+    for (value, limit) in [
+        (r.visible_rows, MAX_ROWS),
+        (r.visible_columns, MAX_COLUMNS),
+        (r.cells_considered, MAX_CELLS),
+        (r.text_bytes, MAX_TEXT_BYTES),
+        (r.glyphs, MAX_GLYPHS),
+        (r.scene_nodes, VIEWPORT_SCENE_NODES),
+        (r.svg_bytes, VIEWPORT_SVG_BYTES),
+        (tile.coordinate_visits, 2_000_000),
+        (tile.geometry_bytes, 8_388_608),
+        (tile.halo_rows, MAX_ROWS),
+        (tile.halo_columns, MAX_COLUMNS),
+        (tile.halo_cells, MAX_CELLS),
+    ] {
+        viewport_validate_count(value, limit)?;
+    }
+    let total_rows = r
+        .visible_rows
+        .checked_add(tile.halo_rows)
+        .ok_or_else(viewport_serialization)?;
+    let total_cols = r
+        .visible_columns
+        .checked_add(tile.halo_columns)
+        .ok_or_else(viewport_serialization)?;
+    let total = total_rows
+        .checked_mul(total_cols)
+        .ok_or_else(viewport_serialization)?;
+    let visible = r
+        .visible_rows
+        .checked_mul(r.visible_columns)
+        .ok_or_else(viewport_serialization)?;
+    if total_rows > MAX_ROWS
+        || total_cols > MAX_COLUMNS
+        || total > MAX_CELLS
+        || total.checked_sub(visible) != Some(tile.halo_cells)
+        || r.schema_version != 2
+        || r.range != tile.source_range
+        || r.svg_bytes != tile.svg.len() as u64
+        || r.sheet_name.len() > 4096
+    {
+        return Err(viewport_serialization());
+    }
+    viewport_validate_diagnostics(r.font_pack_sha256.as_deref(), &r.font_faces, &r.warnings)
+}
+
+fn viewport_allocation() -> FacadeError {
+    viewport_failure(
+        "allocation_failed",
+        "bounded viewport output allocation failed",
+        "viewport.output",
+    )
+}
+
+fn viewport_serialization() -> FacadeError {
+    viewport_failure(
+        "invalid_viewport_metadata",
+        "viewport metadata could not be represented within its contract",
+        "viewport.output",
+    )
+}
+
+struct ViewportWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: Option<u64>,
+    allocation_failed: bool,
+}
+
+impl std::io::Write for ViewportWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let actual = self.bytes.len().checked_add(bytes.len());
+        let Some(actual) = actual.filter(|&n| n <= self.limit) else {
+            self.exceeded = Some((self.bytes.len() as u64).saturating_add(bytes.len() as u64));
+            return Err(std::io::Error::other("viewport output exceeds byte cap"));
+        };
+        if actual > self.bytes.capacity() {
+            // Geometric growth avoids one reallocation per JSON token. The
+            // reservation request never exceeds the same inclusive byte cap.
+            let capacity = self
+                .bytes
+                .capacity()
+                .max(256)
+                .saturating_mul(2)
+                .max(actual)
+                .min(self.limit);
+            if self
+                .bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .is_err()
+            {
+                self.allocation_failed = true;
+                return Err(std::io::Error::other("viewport output allocation failed"));
+            }
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn viewport_serialize<T: Serialize>(value: &T, limit: u64) -> Result<String, FacadeError> {
+    let mut writer = ViewportWriter {
+        bytes: Vec::new(),
+        limit: usize::try_from(limit).map_err(|_| viewport_serialization())?,
+        exceeded: None,
+        allocation_failed: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        if let Some(actual) = writer.exceeded {
+            let resource = if limit == VIEWPORT_METADATA_BYTES {
+                "viewportMetadataBytes"
+            } else {
+                "outputBytes"
+            };
+            return Err(FacadeError::limit(resource, limit, actual));
+        }
+        return Err(if writer.allocation_failed {
+            viewport_allocation()
+        } else {
+            viewport_serialization()
+        });
+    }
+    String::from_utf8(writer.bytes).map_err(|_| viewport_serialization())
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+
+    const ID: &str = "vp-12345678-1234-4234-8234-123456789abc-1";
+    const NEXT: &str = "vp-12345678-1234-4234-9234-123456789abc-2";
+    const LAST: &str = "vp-12345678-1234-4234-a234-123456789abc-18446744073709551615";
+    const RECT: &str = r#"{"xRaw":0,"yRaw":0,"widthRaw":65536,"heightRaw":40960}"#;
+    const PROPERTIES: &str = r#"{"title":"changed","subject":null,"creator":null,"keywords":null,"description":null,"lastModifiedBy":null,"company":null,"created":null}"#;
+
+    fn source() -> Vec<u8> {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Viewport 한국어");
+        sheet.set_default_row_height(15.0);
+        sheet.write_number(0, 0, 1);
+        sheet.write_number(1, 0, 2);
+        workbook.to_xlsx()
+    }
+
+    fn session() -> RenderSession {
+        RenderSession::new_core(&source(), &[]).unwrap()
+    }
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+    fn publish(session: &mut RenderSession, id: &str) -> serde_json::Value {
+        let descriptor = json(&session.stage_viewport_json_core(0, id, "{}").unwrap());
+        assert!(session
+            .commit_viewport_core(id, descriptor["revision"].as_str().unwrap())
+            .unwrap());
+        descriptor
+    }
+
+    #[test]
+    fn native_capabilities_and_canonical_u64_tokens_match_worker_transport() {
+        let caps = json(&viewport_capabilities_json());
+        assert_eq!(caps.as_object().unwrap().len(), 3);
+        assert_eq!(caps["schemaVersion"], 1);
+        assert_eq!(caps["unitsPerPixel"], 1024);
+        assert_eq!(caps["limits"].as_object().unwrap().len(), 10);
+        assert_eq!(caps["limits"]["maxLogicalDimensionRaw"], 16_384_000_000_u64);
+        assert_eq!(caps["limits"]["maxTileSvgBytes"], 2_097_152);
+        assert_eq!(
+            viewport_u64("18446744073709551615", false, "test").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(viewport_u64("0", false, "test").unwrap(), 0);
+        for bad in [
+            "",
+            "00",
+            "01",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "1e3",
+            "１",
+            "18446744073709551616",
+        ] {
+            assert!(viewport_u64(bad, false, "test").is_err(), "{bad}");
+        }
+        assert!(viewport_u64("0", true, "test").is_err());
+        for good in [ID, NEXT, LAST] {
+            viewport_geometry_id(good).unwrap();
+        }
+        for bad in [
+            ID.replace("-1", "-0"),
+            ID.replace("-1", "-01"),
+            ID.replace("4234", "5234"),
+            ID.replace("8234", "7234"),
+            ID.replace("abc", "ABC"),
+            format!("{ID}x"),
+            LAST.replace("18446744073709551615", "18446744073709551616"),
+        ] {
+            assert!(viewport_geometry_id(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn explicit_stage_commit_reuses_source_geometry_and_keeps_legacy_json_exact() {
+        let mut session = session();
+        let before_legacy = session.render_sheet_svg_core(0, "{}").unwrap();
+        let source = Arc::clone(&session.workbook);
+        let descriptor = json(&session.stage_viewport_json_core(0, ID, "{}").unwrap());
+        assert_eq!(descriptor.as_object().unwrap().len(), 9);
+        assert_eq!(descriptor["revision"], "0");
+        assert_eq!(descriptor["sheetVisibility"], "visible");
+        assert_eq!(
+            descriptor["sourceRange"],
+            serde_json::json!({"firstRow":0,"firstCol":0,"lastRow":1,"lastCol":0})
+        );
+        assert_eq!(
+            descriptor["preparationReport"].as_object().unwrap().len(),
+            15
+        );
+        assert_eq!(descriptor["preparationReport"]["sourceRawCells"], 2);
+        assert!(session.published_viewport.is_none());
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, ID, "0", RECT, "0")
+                .unwrap_err()
+                .code,
+            "viewport_not_prepared"
+        );
+        session.commit_viewport_core(ID, "0").unwrap();
+        let owner = session
+            .published_viewport
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap();
+        let geometry = owner.rows() as *const _;
+        let preparation = viewport_serialize(
+            &ViewportPreparationWire::from(owner.preparation_report()),
+            VIEWPORT_METADATA_BYTES,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(owner.workbook(), &source));
+        let first = session
+            .render_viewport_tile_json_core(0, ID, "0", RECT, "18446744073709551615")
+            .unwrap();
+        assert_eq!(
+            first,
+            session
+                .render_viewport_tile_json_core(0, ID, "0", RECT, "18446744073709551615")
+                .unwrap()
+        );
+        let wire = json(&first);
+        assert_eq!(wire.as_object().unwrap().len(), 12);
+        assert_eq!(wire["namespace"], "18446744073709551615");
+        let facade = owner.as_prepared().unwrap();
+        let native = render_viewport_tile(&facade, viewport_rect(RECT).unwrap().fixed(), u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire["report"], json(&native.report.to_json()));
+        assert_eq!(wire["svg"], native.svg);
+        assert_eq!(
+            wire["metrics"]["coordinateVisits"],
+            native.coordinate_visits
+        );
+        assert_eq!(wire["metrics"]["haloCells"], native.halo_cells);
+        assert_eq!(owner.rows() as *const _, geometry);
+        assert_eq!(
+            viewport_serialize(
+                &ViewportPreparationWire::from(owner.preparation_report()),
+                VIEWPORT_METADATA_BYTES
+            )
+            .unwrap(),
+            preparation
+        );
+        assert!(Arc::ptr_eq(&session.workbook, &source));
+        assert_eq!(
+            session.render_sheet_svg_core(0, "{}").unwrap(),
+            before_legacy
+        );
+        assert!(!session
+            .edit_state_value()
+            .as_object()
+            .unwrap()
+            .contains_key("revision"));
+    }
+
+    #[test]
+    fn failed_stage_preserves_publication_and_removes_only_provisional_state() {
+        let mut session = session();
+        publish(&mut session, ID);
+        let before = session
+            .render_viewport_tile_json_core(0, ID, "0", RECT, "1")
+            .unwrap();
+        session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        assert_eq!(
+            session
+                .stage_viewport_json_core(0, LAST, r#"{"limits":{"maxCells":1}}"#)
+                .unwrap_err()
+                .code,
+            "limit_exceeded"
+        );
+        assert!(session.provisional_viewport.is_none());
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, ID, "0", RECT, "1")
+                .unwrap(),
+            before
+        );
+        assert!(!session.abort_viewport_core(NEXT));
+        assert_eq!(
+            session
+                .stage_viewport_json_core(0, ID, "{}")
+                .unwrap_err()
+                .code,
+            "viewport_identity_in_use"
+        );
+        assert!(session.provisional_viewport.is_none());
+        assert!(session
+            .stage_viewport_json_core(usize::MAX, NEXT, "{}")
+            .is_err());
+        assert!(session.provisional_viewport.is_none());
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, ID, "0", RECT, "1")
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn live_identity_requires_exact_sheet_revision_and_source_for_commit_render_release() {
+        let mut session = session();
+        session.stage_viewport_json_core(0, ID, "{}").unwrap();
+        assert_eq!(
+            session.commit_viewport_core(ID, "1").unwrap_err().code,
+            "viewport_revision_mismatch"
+        );
+        assert!(session.provisional_viewport.is_some());
+        session.commit_viewport_core(ID, "0").unwrap();
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(1, ID, "0", RECT, "0")
+                .unwrap_err()
+                .code,
+            "viewport_sheet_mismatch"
+        );
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, ID, "1", RECT, "0")
+                .unwrap_err()
+                .code,
+            "viewport_revision_mismatch"
+        );
+        assert_eq!(
+            session.release_viewport_core(1, ID, "0").unwrap_err().code,
+            "viewport_sheet_mismatch"
+        );
+        assert_eq!(
+            session.release_viewport_core(0, ID, "1").unwrap_err().code,
+            "viewport_revision_mismatch"
+        );
+        assert!(!session.release_viewport_core(0, NEXT, "0").unwrap());
+        let mut other = self::session();
+        other.published_viewport = session.published_viewport.take();
+        assert_eq!(
+            other
+                .render_viewport_tile_json_core(0, ID, "0", RECT, "0")
+                .unwrap_err()
+                .code,
+            "viewport_source_mismatch"
+        );
+        assert_eq!(
+            other.release_viewport_core(0, ID, "0").unwrap_err().code,
+            "viewport_source_mismatch"
+        );
+        let mut third = self::session();
+        other.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        third.provisional_viewport = other.provisional_viewport.take();
+        assert_eq!(
+            third.commit_viewport_core(NEXT, "0").unwrap_err().code,
+            "viewport_source_mismatch"
+        );
+    }
+
+    #[test]
+    fn abort_and_release_have_disjoint_exact_identity_cleanup() {
+        let mut session = session();
+        publish(&mut session, ID);
+        session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        assert!(!session.abort_viewport_core(ID));
+        assert!(session.abort_viewport_core(NEXT));
+        assert!(!session.abort_viewport_core(NEXT));
+        assert!(session.published_viewport.is_some());
+        session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        assert!(session.release_viewport_core(0, ID, "0").unwrap());
+        assert!(!session.release_viewport_core(0, ID, "0").unwrap());
+        assert!(session.provisional_viewport.is_some());
+        session.commit_viewport_core(NEXT, "0").unwrap();
+        assert!(session.release_viewport_core(0, NEXT, "0").unwrap());
+    }
+
+    #[test]
+    fn empty_used_and_all_hidden_source_are_distinct_without_fabricated_report() {
+        for hidden in [false, true] {
+            let mut workbook = Workbook::new();
+            let sheet = workbook.add_sheet("Empty or hidden");
+            sheet.set_default_row_height(15.0);
+            if hidden {
+                sheet.write_number(0, 0, 1);
+                sheet.hide_row(0);
+                sheet.hide_column(0);
+            }
+            let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+            let descriptor = publish(&mut session, ID);
+            assert_eq!(descriptor["widthRaw"], 0);
+            assert_eq!(descriptor["heightRaw"], 0);
+            assert_eq!(descriptor["sourceRange"].is_null(), !hidden);
+            assert_eq!(descriptor["preparationReport"].is_null(), !hidden);
+            let tile = json(
+                &session
+                    .render_viewport_tile_json_core(0, ID, "0", RECT, "0")
+                    .unwrap(),
+            );
+            for key in ["logicalRect", "sourceRange", "svg", "report", "metrics"] {
+                assert!(tile[key].is_null());
+            }
+            assert_eq!(
+                session
+                    .stage_viewport_json_core(0, NEXT, r#"{"limits":{"maxFontBytes":67108865}}"#)
+                    .unwrap_err()
+                    .code,
+                "limit_exceeded"
+            );
+            assert!(session.provisional_viewport.is_none());
+            assert!(session.published_viewport.is_some());
+        }
+    }
+
+    #[test]
+    fn successful_cell_range_property_and_history_changes_invalidate_atomically() {
+        let mut session = session();
+        for change in 0..5 {
+            let descriptor = publish(&mut session, ID);
+            assert_eq!(descriptor["revision"], change.to_string());
+            session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+            let output = match change {
+                0 => session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":5}}"#),
+                1 => session.set_range_recalculate_json_core(r#"{"sheetIndex":0,"startRow":0,"startCol":1,"values":[[{"kind":"number","value":9},{"kind":"formula-auto","formula":"=A1+B1"}]]}"#),
+                2 => session.set_document_properties_json_core(PROPERTIES),
+                3 => session.undo_edit_core(),
+                _ => session.redo_edit_core(),
+            }.unwrap();
+            assert!(!json(&output).as_object().unwrap().contains_key("revision"));
+            assert_eq!(session.viewport_revision, change + 1);
+            assert!(session.published_viewport.is_none());
+            assert!(session.provisional_viewport.is_none());
+            assert!(!session
+                .release_viewport_core(0, ID, &change.to_string())
+                .unwrap());
+            assert_eq!(
+                session
+                    .render_viewport_tile_json_core(0, ID, &change.to_string(), RECT, "0")
+                    .unwrap_err()
+                    .code,
+                "viewport_not_prepared"
+            );
+        }
+        assert!(
+            matches!(session.workbook.sheets[0].cell(0,2),Some(Cell::Formula { cached,.. }) if **cached==Cell::Number(14.0))
+        );
+    }
+
+    #[test]
+    fn rejected_edits_and_save_read_preserve_source_revision_and_both_handles() {
+        let mut session = session();
+        publish(&mut session, ID);
+        session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        let source = Arc::clone(&session.workbook);
+        let state = session.edit_state_value();
+        let before = session.save_document_bytes_core().unwrap();
+        session.read_cell_json_core(0, 0, 0).unwrap();
+        session
+            .inspection_json_core(&RequestOptions::default())
+            .unwrap();
+        assert!(session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula-auto","formula":"=NOW()"}}"#).is_err());
+        assert!(session
+            .set_range_recalculate_json_core(
+                r#"{"sheetIndex":0,"startRow":0,"startCol":0,"values":[]}"#
+            )
+            .is_err());
+        assert!(session
+            .set_document_properties_json_core(r#"{"unknown":"x"}"#)
+            .is_err());
+        assert!(session.undo_edit_core().is_err());
+        assert_eq!(session.viewport_revision, 0);
+        assert!(Arc::ptr_eq(&source, &session.workbook));
+        assert_eq!(session.edit_state_value(), state);
+        assert_eq!(session.save_document_bytes_core().unwrap(), before);
+        assert!(session.published_viewport.is_some());
+        assert!(session.provisional_viewport.is_some());
+        session.commit_viewport_core(NEXT, "0").unwrap();
+    }
+
+    #[test]
+    fn revision_overflow_rejects_edits_undo_redo_before_source_or_history_mutation() {
+        let mut session = session();
+        session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":3}}"#,
+            )
+            .unwrap();
+        session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":4}}"#,
+            )
+            .unwrap();
+        session.undo_edit_core().unwrap();
+        session.viewport_revision = u64::MAX;
+        publish(&mut session, ID);
+        session.stage_viewport_json_core(0, NEXT, "{}").unwrap();
+        let source = Arc::clone(&session.workbook);
+        let state = session.edit_state_value();
+        let before = session.save_document_bytes_core().unwrap();
+        for action in 0..5 {
+            let error = match action {
+                0 => session.set_cell_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":6}}"#),
+                1 => session.set_range_recalculate_json_core(r#"{"sheetIndex":0,"startRow":0,"startCol":0,"values":[[{"kind":"number","value":6}]]}"#),
+                2 => session.set_document_properties_json_core(PROPERTIES),
+                3 => session.undo_edit_core(), _ => session.redo_edit_core(),
+            }.unwrap_err();
+            assert_eq!(error.code, "viewport_revision_overflow");
+            assert!(Arc::ptr_eq(&source, &session.workbook));
+            assert_eq!(session.viewport_revision, u64::MAX);
+            assert_eq!(session.edit_state_value(), state);
+            assert_eq!(session.save_document_bytes_core().unwrap(), before);
+            assert!(session.published_viewport.is_some());
+            assert!(session.provisional_viewport.is_some());
+        }
+        session
+            .commit_viewport_core(NEXT, "18446744073709551615")
+            .unwrap();
+        let result = json(
+            &session
+                .render_viewport_tile_json_core(
+                    0,
+                    NEXT,
+                    "18446744073709551615",
+                    RECT,
+                    "18446744073709551615",
+                )
+                .unwrap(),
+        );
+        assert_eq!(result["revision"], "18446744073709551615");
+    }
+
+    #[test]
+    fn high_raw_coordinates_and_u64_namespace_render_without_number_truncation() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Tall sparse");
+        sheet.set_default_row_height(15.0);
+        sheet.write_number(0, 0, 1);
+        sheet.write_number(500_000, 0, 9);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let descriptor = publish(&mut session, LAST);
+        assert!(descriptor["heightRaw"].as_u64().unwrap() > u64::from(u32::MAX));
+        let owner = session
+            .published_viewport
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap();
+        let (y, height) = owner.rows().track(500_000).unwrap();
+        let (_, width) = owner.columns().track(0).unwrap();
+        let rect = ViewportRect {
+            x_raw: 0,
+            y_raw: y.raw() as u64,
+            width_raw: width.raw() as u64,
+            height_raw: height.raw() as u64,
+        };
+        let request = viewport_serialize(&rect, VIEWPORT_METADATA_BYTES).unwrap();
+        let tile = json(
+            &session
+                .render_viewport_tile_json_core(0, LAST, "0", &request, "18446744073709551615")
+                .unwrap(),
+        );
+        assert_eq!(tile["requestedRect"]["yRaw"], rect.y_raw);
+        assert_eq!(tile["logicalRect"]["yRaw"], rect.y_raw);
+        assert_eq!(tile["sourceRange"]["firstRow"], 500_000);
+        assert_eq!(tile["namespace"], "18446744073709551615");
+        assert!(tile["svg"]
+            .as_str()
+            .unwrap()
+            .contains("18446744073709551615"));
+        let outside = format!(
+            r#"{{"xRaw":0,"yRaw":{},"widthRaw":1,"heightRaw":1}}"#,
+            descriptor["heightRaw"].as_u64().unwrap()
+        );
+        let empty = json(
+            &session
+                .render_viewport_tile_json_core(0, LAST, "0", &outside, "0")
+                .unwrap(),
+        );
+        assert!(empty["svg"].is_null());
+    }
+
+    #[test]
+    fn viewport_options_reuse_all_thirty_limits_and_forbid_other_top_level_fields() {
+        let all = r#"{"gridlines":false,"includeHidden":true,"limits":{"maxRows":4096,"maxColumns":512,"maxCells":250000,"maxConditionalRules":2048,"maxConditionalEvaluations":500000,"maxDrawingObjects":2048,"maxMediaBytes":16777216,"maxImageDimension":8192,"maxImagePixels":16777216,"maxDecodedMediaBytes":67108864,"maxChartSeries":128,"maxChartPoints":250000,"maxTextBytes":8388608,"maxGlyphs":1000000,"maxTextRuns":500000,"maxTextLines":250000,"maxPathCommands":4000000,"maxSceneNodes":1000000,"maxDimensionRaw":2048000000,"maxOutputBytes":16777216,"maxLogicalPages":2048,"maxPages":512,"maxTotalSceneNodes":2000000,"maxBackendCommands":4000000,"maxRasterDimension":8192,"maxRasterPixels":33554432,"maxPngBytes":16777216,"maxImageBytes":0,"maxImages":0,"maxFontBytes":0}}"#;
+        assert_eq!(json(all)["limits"].as_object().unwrap().len(), 30);
+        let request = viewport_options(all).unwrap();
+        let effective = effective_options(&request, None).unwrap();
+        assert!(!effective.render.gridlines);
+        assert!(effective.render.include_hidden);
+        assert_eq!(effective.resources.font_bytes, 0);
+        assert_eq!(effective.resources.images, 0);
+        let mut session = session();
+        session.stage_viewport_json_core(0, ID, all).unwrap();
+        let options = session
+            .provisional_viewport
+            .as_ref()
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap()
+            .options();
+        assert_eq!(options.limits.max_output_bytes, VIEWPORT_SVG_BYTES);
+        assert_eq!(options.limits.max_scene_nodes, VIEWPORT_SCENE_NODES);
+        for key in ["range", "omitSparsePages", "singlePageSheets", "unknown"] {
+            let bad = format!(r#"{{"{key}":null}}"#);
+            assert_eq!(viewport_options(&bad).unwrap_err().code, "invalid_options");
+        }
+        assert!(viewport_options(r#"{"limits":{"unknown":1}}"#).is_err());
+        assert!(viewport_options(&" ".repeat(65_537)).is_err());
+        assert!(effective_options(
+            &viewport_options(r#"{"limits":{"maxFontBytes":67108865}}"#).unwrap(),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn caller_lowered_tile_caps_remain_native_authoritative() {
+        let mut session = session();
+        let baseline = publish(&mut session, ID);
+        assert!(!baseline["preparationReport"].is_null());
+        let original = session
+            .render_viewport_tile_json_core(0, ID, "0", RECT, "0")
+            .unwrap();
+        session
+            .stage_viewport_json_core(
+                0,
+                NEXT,
+                r#"{"limits":{"maxOutputBytes":1,"maxSceneNodes":100000}}"#,
+            )
+            .unwrap();
+        session.commit_viewport_core(NEXT, "0").unwrap();
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, NEXT, "0", RECT, "0")
+                .unwrap_err()
+                .code,
+            "limit_exceeded"
+        );
+        session
+            .stage_viewport_json_core(0, LAST, r#"{"limits":{"maxSceneNodes":1}}"#)
+            .unwrap();
+        session.commit_viewport_core(LAST, "0").unwrap();
+        assert_eq!(
+            session
+                .render_viewport_tile_json_core(0, LAST, "0", RECT, "0")
+                .unwrap_err()
+                .code,
+            "limit_exceeded"
+        );
+        assert!(!original.is_empty());
+    }
+
+    #[test]
+    fn rectangles_reject_overflow_fraction_and_unknown_fields_before_rendering() {
+        for rect in [
+            r#"{"xRaw":0,"yRaw":0,"widthRaw":0,"heightRaw":1}"#,
+            r#"{"xRaw":16384000000,"yRaw":0,"widthRaw":1,"heightRaw":1}"#,
+            r#"{"xRaw":18446744073709551615,"yRaw":0,"widthRaw":1,"heightRaw":1}"#,
+            r#"{"xRaw":0.5,"yRaw":0,"widthRaw":1,"heightRaw":1}"#,
+            r#"{"xRaw":-1,"yRaw":0,"widthRaw":1,"heightRaw":1}"#,
+            r#"{"xRaw":0,"yRaw":0,"widthRaw":8388609,"heightRaw":1}"#,
+            r#"{"xRaw":0,"yRaw":0,"widthRaw":1,"heightRaw":1,"extra":null}"#,
+        ] {
+            assert!(viewport_rect(rect).is_err(), "{rect}");
+        }
+        assert!(viewport_rect(&" ".repeat(65_537)).is_err());
+    }
+
+    #[test]
+    fn metadata_serialization_has_independent_exact_byte_cap_before_growth() {
+        use std::io::Write;
+        let mut writer = ViewportWriter {
+            bytes: Vec::new(),
+            limit: 3,
+            exceeded: None,
+            allocation_failed: false,
+        };
+        writer.write_all(b"abc").unwrap();
+        assert!(writer.write_all(b"d").is_err());
+        assert_eq!(writer.bytes, b"abc");
+        assert_eq!(writer.exceeded, Some(4));
+        let huge = "\\".repeat(32_768);
+        assert_eq!(
+            viewport_serialize(&huge, VIEWPORT_METADATA_BYTES)
+                .unwrap_err()
+                .resource,
+            Some("viewportMetadataBytes")
+        );
+        let ordinary = serde_json::json!({"unicode":"한국어\n\"","count":9007199254740991_u64});
+        let expected = serde_json::to_string(&ordinary).unwrap();
+        assert_eq!(
+            viewport_serialize(&ordinary, expected.len() as u64).unwrap(),
+            expected
+        );
+        assert!(viewport_serialize(&ordinary, expected.len() as u64 - 1).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2704,6 +4350,17 @@ mod tests {
             .save_document_bytes_core()
             .expect("save before failure");
         let before_state = session.edit_state_value();
+        let source = Arc::clone(&session.workbook);
+        let revision = session.viewport_revision;
+        let geometry = "vp-12345678-1234-4234-8234-123456789abc-104";
+        let provisional = "vp-12345678-1234-4234-8234-123456789abc-105";
+        session.stage_viewport_json_core(0, geometry, "{}").unwrap();
+        session
+            .commit_viewport_core(geometry, &revision.to_string())
+            .unwrap();
+        session
+            .stage_viewport_json_core(0, provisional, "{}")
+            .unwrap();
         let error = session
             .set_document_properties_json_core(r#"{"title":"incomplete replacement"}"#)
             .expect_err("missing property fields must fail");
@@ -2722,17 +4379,54 @@ mod tests {
 
         let error = session
             .set_cell_json_core(
-                "{\"sheetIndex\":0,\"row\":0,\"col\":0,\"value\":{\"kind\":\"text\",\"value\":\"bad\\u0001text\"}}",
+                "{\"sheetIndex\":0,\"row\":0,\"col\":0,\"value\":{\"kind\":\"error\",\"value\":\"#BAD\\u0001!\"}}",
             )
             .expect_err("invalid XML text must fail");
         assert_eq!(error.code, "edit_failed");
         assert_eq!(session.edit_state_value(), before_state);
+        assert_eq!(session.viewport_revision, revision);
+        assert!(Arc::ptr_eq(&source, &session.workbook));
+        assert!(session.published_viewport.is_some());
+        assert!(session.provisional_viewport.is_some());
         assert_eq!(
             session
                 .save_document_bytes_core()
                 .expect("save after failure"),
             before
         );
+    }
+
+    #[test]
+    fn encodable_c0_cell_text_survives_source_history_and_invalidates_viewport() {
+        let mut session = RenderSession::new_core(&authored_workbook(), &[]).unwrap();
+        let original = session.save_document_bytes_core().unwrap();
+        let geometry = "vp-12345678-1234-4234-8234-123456789abc-106";
+        let provisional = "vp-12345678-1234-4234-8234-123456789abc-107";
+        session.stage_viewport_json_core(0, geometry, "{}").unwrap();
+        session.commit_viewport_core(geometry, "0").unwrap();
+        session
+            .stage_viewport_json_core(0, provisional, "{}")
+            .unwrap();
+        let text = "zero\0unit\u{1}text";
+        let request = serde_json::json!({"sheetIndex":0,"row":0,"col":0,"value":{"kind":"text","value":text}});
+        session.set_cell_json_core(&request.to_string()).unwrap();
+        assert_eq!(session.viewport_revision, 1);
+        assert!(session.published_viewport.is_none());
+        assert!(session.provisional_viewport.is_none());
+        let saved = session.save_document_bytes_core().unwrap();
+        let reopened = Workbook::open(&saved).unwrap();
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Text(text.to_owned()))
+        );
+        assert_eq!(session.edit_state_value()["undoDepth"], 1);
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.viewport_revision, 2);
+        assert_eq!(session.save_document_bytes_core().unwrap(), original);
+        assert_eq!(session.edit_state_value()["redoDepth"], 1);
+        session.redo_edit_core().unwrap();
+        assert_eq!(session.viewport_revision, 3);
+        assert_eq!(session.save_document_bytes_core().unwrap(), saved);
     }
 
     #[test]
