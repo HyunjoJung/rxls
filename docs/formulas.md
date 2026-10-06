@@ -83,6 +83,13 @@ storage spelling as an IFNA call. This alias applies only to function calls;
 text, defined names and sheet names retain their original meaning. Other
 qualified future functions remain outside the supported subset.
 
+The next-release source makes `ISNUMBER` inspect numeric type without converting
+text: `ISNUMBER("3")` is false. `ISBLANK` is true for an absent referenced cell,
+and false for empty text, including a formula returning `""`. `ISNA`, `ISERROR`,
+`ISNUMBER`, `ISTEXT` and `ISBLANK` inspect actual one-cell ranges without
+coercion; multi-cell and whole-axis arrays return `ArraySemantics` regardless
+of the number of stored values. Wrong arity returns `#VALUE!` first.
+
 The source checkout includes aggregate coercion fixes for the next core
 release. `SUM`, `AVERAGE`, `MIN`, `MAX` and `PRODUCT` ignore referenced text,
 booleans and blanks, including single-cell ranges and defined references.

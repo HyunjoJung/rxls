@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Corrected scalar type checks: `ISNUMBER` no longer converts numeric text,
+  and `ISBLANK` distinguishes absent cells from present empty text or formula
+  results. Five IS predicates inspect actual one-cell ranges without coercion;
+  real arrays retain `ArraySemantics` even with one stored value.
 - Preserved punctuation and doubled quotes inside formula text literals (#135),
   including email, bracket and brace strings. OpenFormula separators/references
   normalize outside quoted text and sheet names; real external/array syntax

@@ -1462,41 +1462,11 @@ fn evaluate_function(
         "AND" => eval_and_or_or(args, false),
         "OR" => eval_and_or_or(args, true),
         "NOT" => eval_not(args),
-        "ISNA" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_error_check(args, "#N/A"))
-            }
-        }
-        "ISERROR" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_any_error(args))
-            }
-        }
-        "ISNUMBER" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_number(args))
-            }
-        }
-        "ISTEXT" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_text(args))
-            }
-        }
-        "ISBLANK" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_blank(args))
-            }
-        }
+        "ISNA" => evaluate_scalar_function(args, |scalar| eval_error_check(scalar, "#N/A")),
+        "ISERROR" => evaluate_scalar_function(args, eval_any_error),
+        "ISNUMBER" => evaluate_scalar_function(args, eval_is_number),
+        "ISTEXT" => evaluate_scalar_function(args, eval_is_text),
+        "ISBLANK" => evaluate_scalar_function(args, eval_is_blank),
         "EXACT" => eval_exact(args),
         "VALUE" => eval_value(args),
         _ => Err(FormulaUnsupportedReason::UnsupportedFunction),
@@ -2081,6 +2051,21 @@ fn eval_not(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReas
     Ok(Value::Bool(!value))
 }
 
+/// Inspect borrowed scalar type without coercion; actual arrays stay unsupported.
+fn evaluate_scalar_function(
+    args: &[Value],
+    inspect: impl FnOnce(&[Value]) -> Value,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    let [value] = args else {
+        return Ok(Value::Error("#VALUE!".to_string()));
+    };
+    let scalar = value.function_scalar();
+    if matches!(scalar, Value::Range(_)) {
+        return Err(FormulaUnsupportedReason::ArraySemantics);
+    }
+    Ok(inspect(std::slice::from_ref(scalar)))
+}
+
 fn eval_error_check(args: &[Value], target: &str) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
@@ -2103,12 +2088,7 @@ fn eval_is_number(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    let numeric = match value.scalar() {
-        Value::Number(_) => true,
-        Value::Text(text) => text.parse::<f64>().is_ok(),
-        _ => false,
-    };
-    Value::Bool(numeric)
+    Value::Bool(matches!(value.scalar(), Value::Number(_)))
 }
 
 fn eval_is_text(args: &[Value]) -> Value {
@@ -2122,11 +2102,7 @@ fn eval_is_blank(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    match value.scalar() {
-        Value::Blank => Value::Bool(true),
-        Value::Text(text) => Value::Bool(text.is_empty()),
-        _ => Value::Bool(false),
-    }
+    Value::Bool(matches!(value.scalar(), Value::Blank))
 }
 
 fn eval_exact(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReason> {
@@ -3044,7 +3020,7 @@ mod tests {
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 7),
-            FormulaEvaluation::Computed(Cell::Bool(true))
+            FormulaEvaluation::Computed(Cell::Bool(false))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 8),
@@ -3052,7 +3028,7 @@ mod tests {
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 9),
-            FormulaEvaluation::Computed(Cell::Bool(true))
+            FormulaEvaluation::Computed(Cell::Bool(false))
         );
     }
 
@@ -3085,6 +3061,22 @@ mod tests {
             wb.evaluate_cell("Data", 1, 1),
             FormulaEvaluation::Computed(Cell::Error("#VALUE!".into()))
         );
+    }
+
+    #[test]
+    fn predicate_arity_precedes_copy_budget_and_array_classification() {
+        let args = [
+            super::Value::Range(vec![super::Value::Text("over-budget".into())]),
+            super::Value::Number(1.0),
+        ];
+        for function in ["ISNA", "ISERROR", "ISNUMBER", "ISTEXT", "ISBLANK"] {
+            let budget = small_text_budget(0, 0);
+            assert_eq!(
+                super::evaluate_function(function, &args, &budget),
+                Ok(super::Value::Error("#VALUE!".into()))
+            );
+            assert_eq!(budget.text_used.get(), 0);
+        }
     }
 
     #[test]
