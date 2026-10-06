@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved `.svg` and `.png` suffixes when VS Code export filenames exceed
+  120 characters (#136). Export status now reflects accepted bytes, completed
+  saves, cancellation and failures; invalid matching API responses reject promptly.
 - Restored Ctrl/Meta+Shift+Z after the sole edit is undone in the viewer (#137).
   The shortcut checks redo availability while preserving draft/input guards,
   Ctrl/Meta+Y and toolbar history behavior.

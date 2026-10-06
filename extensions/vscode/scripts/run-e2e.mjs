@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { downloadAndUnzipVSCode, runVSCodeCommand } from "@vscode/test-electron";
+import { createExportFilenameFixture } from "./export-fixture.mjs";
 
 const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = path.resolve(extensionRoot, "../..");
@@ -32,6 +33,8 @@ await mkdir(workspace, { recursive: true });
 for (const [format, fileName] of Object.entries(fixtures)) {
   await copyFile(sources[format], path.join(workspace, fileName));
 }
+const longExport = createExportFilenameFixture();
+await writeFile(path.join(workspace, longExport.fileName), longExport.bytes);
 const invalidFile = "untrusted-input.xlsx";
 const oversizedFile = "oversized.xlsx";
 await writeFile(path.join(workspace, invalidFile), "not an OOXML package\n", "utf8");
@@ -157,7 +160,7 @@ for (const mode of modes) {
   }
   const representativeOnly = mode === "virtual" || mode === "installed";
   await runVSCode(executable, launchArgs, {
-    RXLS_E2E_FIXTURES: JSON.stringify({ ...fixtures, invalidFile, oversizedFile }),
+    RXLS_E2E_FIXTURES: JSON.stringify({ ...fixtures, invalidFile, oversizedFile, longExportFile: longExport.fileName }),
     RXLS_E2E_FORMATS: JSON.stringify(
       representativeOnly ? ["xlsx"] : ["xls", "xlsx", "xlsm", "xlsb", "ods"]
     ),

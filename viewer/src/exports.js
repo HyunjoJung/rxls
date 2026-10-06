@@ -22,6 +22,7 @@ export function createExportController({
     }
     const fileName = `${exportBaseName()}.svg`;
     if (host) {
+      elements["status-message"].textContent = "SVG export requested";
       postHostMessage({
         type: "export",
         requestId,
@@ -31,8 +32,8 @@ export function createExportController({
       });
     } else {
       download(new Blob([state.svgText], { type: "image/svg+xml;charset=utf-8" }), fileName);
+      elements["status-message"].textContent = "SVG exported";
     }
-    elements["status-message"].textContent = "SVG exported";
     elements["export-menu"].removeAttribute("open");
   }
 
@@ -68,17 +69,19 @@ export function createExportController({
         });
         const fileName = `${exportBaseName()}.png`;
         if (host) {
+          const bytes = new Uint8Array(await png.arrayBuffer());
+          elements["status-message"].textContent = "PNG export requested";
           postHostMessage({
             type: "export",
             requestId,
             kind: "png",
             fileName,
-            bytes: new Uint8Array(await png.arrayBuffer())
+            bytes
           });
         } else {
           download(png, fileName);
+          elements["status-message"].textContent = "PNG exported";
         }
-        elements["status-message"].textContent = "PNG exported";
       } finally {
         browser.URL.revokeObjectURL(sourceUrl);
       }
