@@ -20,6 +20,7 @@ mod print;
 mod scene;
 mod svg;
 mod typography;
+mod viewport;
 
 pub use error::{LimitKind, RenderError};
 pub use font::{FontFaceIdentity, FontPack, FontPackError, FontPackLimits, FontPackMember};
@@ -46,6 +47,10 @@ pub use scene::{
     FIXED_UNITS_PER_PIXEL,
 };
 pub use svg::render_scene_svg;
+pub use viewport::{
+    prepare_sheet_viewport, prepare_viewport, render_viewport_tile, PreparedViewport, ViewportAxis,
+    ViewportAxisRun, ViewportError, ViewportLimits, ViewportTile,
+};
 
 use rxls::Workbook;
 

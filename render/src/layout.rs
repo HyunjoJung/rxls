@@ -174,7 +174,7 @@ impl RenderRange {
         }
     }
 
-    fn validate(self) -> Result<Self, RenderError> {
+    pub(crate) fn validate(self) -> Result<Self, RenderError> {
         if self.first_row > self.last_row || self.first_col > self.last_col {
             return Err(RenderError::InvalidRange {
                 first_row: self.first_row,
@@ -874,6 +874,144 @@ impl RenderStyleSnapshot {
     fn default_style(&self) -> Option<&CellStyle> {
         self.default_style.as_deref()
     }
+}
+
+// Reuse per-track worksheet conversion; source-native print projection has
+// separate cumulative endpoint semantics.
+
+#[derive(Debug)]
+pub(crate) enum ViewportBaselineRun {
+    Work(u64),
+    Row {
+        first: u32,
+        last: u32,
+        size: Fixed,
+        included: bool,
+        manual: bool,
+    },
+    Column {
+        index: u16,
+        size: Fixed,
+        included: bool,
+    },
+}
+
+pub(crate) fn visit_viewport_baseline_runs<E: From<RenderError>>(
+    sheet: &Sheet,
+    range: RenderRange,
+    options: &RenderOptions,
+    context: &mut ViewportMeasurementContext,
+    mut visitor: impl FnMut(ViewportBaselineRun) -> Result<(), E>,
+) -> Result<(), E> {
+    let range = range.validate().map_err(E::from)?;
+    let digit_width = context.digit_width;
+    let mut heights = sheet
+        .row_heights()
+        .range(range.first_row..=range.last_row)
+        .peekable();
+    let mut hidden = sheet
+        .hidden_rows()
+        .range(range.first_row..=range.last_row)
+        .peekable();
+    let empty = BTreeSet::new();
+    let mut visible = sheet
+        .default_hidden_row_exceptions()
+        .unwrap_or(&empty)
+        .range(range.first_row..=range.last_row)
+        .peekable();
+    let default_included =
+        options.include_hidden || sheet.default_hidden_row_exceptions().is_none();
+    let mut cursor = range.first_row;
+    loop {
+        let exception = heights
+            .peek()
+            .map(|(row, _)| **row)
+            .into_iter()
+            .chain(hidden.peek().map(|row| **row))
+            .chain(visible.peek().map(|row| **row))
+            .min();
+        let Some(exception) = exception else {
+            if cursor <= range.last_row {
+                visitor(ViewportBaselineRun::Work(1))?;
+                visitor(ViewportBaselineRun::Row {
+                    first: cursor,
+                    last: range.last_row,
+                    size: if default_included {
+                        row_height(sheet, cursor, options, &mut context.warnings)
+                    } else {
+                        Fixed::ZERO
+                    },
+                    included: default_included,
+                    manual: sheet.default_row_height_is_manual(),
+                })?;
+            }
+            break;
+        };
+        if cursor < exception {
+            visitor(ViewportBaselineRun::Work(1))?;
+            visitor(ViewportBaselineRun::Row {
+                first: cursor,
+                last: exception - 1,
+                size: if default_included {
+                    row_height(sheet, cursor, options, &mut context.warnings)
+                } else {
+                    Fixed::ZERO
+                },
+                included: default_included,
+                manual: sheet.default_row_height_is_manual(),
+            })?;
+        }
+        // Count each actually consumed metadata record, including overlapping
+        // height/hidden/visible exceptions, before doing conversion or emission.
+        if heights.peek().is_some_and(|(row, _)| **row == exception) {
+            visitor(ViewportBaselineRun::Work(1))?;
+            heights.next();
+        }
+        if hidden.peek().is_some_and(|row| **row == exception) {
+            visitor(ViewportBaselineRun::Work(1))?;
+            hidden.next();
+        }
+        if visible.peek().is_some_and(|row| **row == exception) {
+            visitor(ViewportBaselineRun::Work(1))?;
+            visible.next();
+        }
+        visitor(ViewportBaselineRun::Work(1))?;
+        let included = options.include_hidden || !row_is_hidden(sheet, exception);
+        visitor(ViewportBaselineRun::Row {
+            first: exception,
+            last: exception,
+            size: if included {
+                row_height(sheet, exception, options, &mut context.warnings)
+            } else {
+                Fixed::ZERO
+            },
+            included,
+            manual: effective_row_height_is_manual(sheet, exception),
+        })?;
+        cursor = exception
+            .checked_add(1)
+            .ok_or(RenderError::CoordinateOverflow)
+            .map_err(E::from)?;
+        if cursor > range.last_row {
+            break;
+        }
+    }
+    // Columns have a schema ceiling of 16,384; retaining the exact existing
+    // precedence conversion per column is a small, explicitly counted sweep.
+    for column in range.first_col..=range.last_col {
+        visitor(ViewportBaselineRun::Work(1))?;
+        let included = options.include_hidden || !sheet.hidden_columns().contains(&column);
+        visitor(ViewportBaselineRun::Column {
+            index: column,
+            size: if included {
+                column_width(sheet, column, digit_width, options, &mut context.warnings)
+            } else {
+                Fixed::ZERO
+            },
+            included,
+        })?;
+    }
+    Ok(())
 }
 
 /// Measure row and column geometry with exactly the same conversion rules used
@@ -1585,6 +1723,23 @@ pub(crate) fn build_single_page_sheet_scene_for_print(
 
 #[cfg(test)]
 pub(crate) fn build_sheet_scene_with_geometry(
+    sheet: &Sheet,
+    sheet_index: usize,
+    options: &RenderOptions,
+    geometry: SheetGeometryOverride<'_>,
+) -> Result<SceneBuild, RenderError> {
+    build_sheet_scene_inner(
+        sheet,
+        sheet_index,
+        options,
+        Some(geometry),
+        UsedDrawingTerminalColumnPolicy::Indexed,
+        AxisEndpointPolicy::PerTrackFixed,
+        GridlinePolicy::WorksheetView,
+    )
+}
+
+pub(crate) fn build_sheet_scene_for_viewport_envelope(
     sheet: &Sheet,
     sheet_index: usize,
     options: &RenderOptions,
@@ -3851,42 +4006,203 @@ fn effective_row_height_is_manual(sheet: &Sheet, row: u32) -> bool {
     }
 }
 
-fn automatic_candidate_adjustable_row(
+/// Storage seam shared by dense legacy geometry and sparse viewport preparation.
+/// The error conversion keeps the dense wrapper's RenderError identity intact.
+pub(crate) trait AutomaticRows {
+    type Error: From<RenderError>;
+    fn charge(&mut self, count: u64) -> Result<(), Self::Error>;
+    fn height(&mut self, row: u32) -> Result<Option<Fixed>, Self::Error>;
+    fn first_adjustable(
+        &mut self,
+        sheet: &Sheet,
+        first: u32,
+        last: u32,
+    ) -> Result<Option<u32>, Self::Error>;
+    fn sum(&mut self, first: u32, last: u32) -> Result<Fixed, Self::Error>;
+    fn grow_to(&mut self, row: u32, required: Fixed) -> Result<(), Self::Error>;
+    fn add_deficit(&mut self, row: u32, deficit: Fixed) -> Result<(), Self::Error>;
+}
+
+struct DenseAutomaticRows<'a>(&'a mut BTreeMap<u32, Fixed>);
+
+impl AutomaticRows for DenseAutomaticRows<'_> {
+    type Error = RenderError;
+    fn charge(&mut self, _count: u64) -> Result<(), RenderError> {
+        Ok(())
+    }
+    fn height(&mut self, row: u32) -> Result<Option<Fixed>, RenderError> {
+        Ok(self.0.get(&row).copied())
+    }
+    fn first_adjustable(
+        &mut self,
+        sheet: &Sheet,
+        first: u32,
+        last: u32,
+    ) -> Result<Option<u32>, RenderError> {
+        Ok(self
+            .0
+            .range(first..=last)
+            .map(|(&row, _)| row)
+            .find(|&row| !effective_row_height_is_manual(sheet, row)))
+    }
+    fn sum(&mut self, first: u32, last: u32) -> Result<Fixed, RenderError> {
+        sum_fixed(self.0.range(first..=last).map(|(_, &height)| height))
+    }
+    fn grow_to(&mut self, row: u32, required: Fixed) -> Result<(), RenderError> {
+        if let Some(height) = self.0.get_mut(&row) {
+            *height = (*height).max(required);
+        }
+        Ok(())
+    }
+    fn add_deficit(&mut self, row: u32, deficit: Fixed) -> Result<(), RenderError> {
+        let height = self
+            .0
+            .get_mut(&row)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        *height = height
+            .checked_add(deficit)
+            .ok_or(RenderError::CoordinateOverflow)?;
+        Ok(())
+    }
+}
+
+fn automatic_candidate_adjustable_row<R: AutomaticRows>(
     sheet: &Sheet,
     range: RenderRange,
-    row_sizes: &BTreeMap<u32, Fixed>,
+    row_sizes: &mut R,
     merge_anchors: &BTreeMap<CellCoordinate, (u32, u16, u32, u16)>,
     source: CellCoordinate,
     options: &RenderOptions,
-) -> Option<u32> {
+) -> Result<Option<u32>, R::Error> {
     if let Some(&(r0, c0, r1, c1)) = merge_anchors.get(&source) {
         let last_col = c1.min(MAX_WORKSHEET_COLUMN);
-        let span = usize::from(last_col.checked_sub(c0)?) + 1;
+        let Some(distance) = last_col.checked_sub(c0) else {
+            return Ok(None);
+        };
+        let span = usize::from(distance) + 1;
+        // A reservation for the bounded hidden-column traversal, not a row scan.
+        row_sizes.charge(span as u64)?;
         if !options.include_hidden && sheet.hidden_columns().range(c0..=last_col).count() >= span {
-            return None;
+            return Ok(None);
         }
         let first_row = r0.max(range.first_row);
         let last_row = r1.min(range.last_row);
         if first_row > last_row {
-            return None;
+            return Ok(None);
         }
-        row_sizes
-            .range(first_row..=last_row)
-            .map(|(&row, _)| row)
-            .find(|row| !effective_row_height_is_manual(sheet, *row))
+        row_sizes.first_adjustable(sheet, first_row, last_row)
     } else {
-        (row_sizes.contains_key(&source.row)
+        Ok((row_sizes.height(source.row)?.is_some()
             && !effective_row_height_is_manual(sheet, source.row)
             && (options.include_hidden || !sheet.hidden_columns().contains(&source.col)))
-        .then_some(source.row)
+        .then_some(source.row))
     }
 }
 
 #[derive(Debug)]
 struct AutoMergeHeight {
-    rows: Vec<u32>,
+    first_row: u32,
+    last_row: u32,
     adjustable_row: u32,
     required: Fixed,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_automatic_row_heights(
+    sheet: &Sheet,
+    range: RenderRange,
+    style_snapshot: &RenderStyleSnapshot,
+    maximum_digit_width: Fixed,
+    options: &RenderOptions,
+    warnings: &mut Warnings,
+    column_widths: &mut BTreeMap<u16, Fixed>,
+    row_sizes: &mut BTreeMap<u32, Fixed>,
+    typography: &mut TypographyStats,
+    conditional_evaluations: &mut u64,
+    automatic_candidates: Option<&[DisplayCell<'_>]>,
+) -> Result<(), RenderError> {
+    expand_automatic_row_heights_with_geometry(
+        sheet,
+        range,
+        style_snapshot,
+        maximum_digit_width,
+        options,
+        warnings,
+        column_widths,
+        &mut DenseAutomaticRows(row_sizes),
+        typography,
+        conditional_evaluations,
+        automatic_candidates,
+    )
+}
+
+/// Exactly one context for baseline digit metrics and global automatic height.
+pub(crate) struct ViewportMeasurementContext {
+    digit_width: Fixed,
+    warnings: Warnings,
+    typography: TypographyStats,
+    conditional_evaluations: u64,
+}
+
+impl ViewportMeasurementContext {
+    pub(crate) fn new(sheet: &Sheet, options: &RenderOptions) -> Result<Self, RenderError> {
+        let snapshot = RenderStyleSnapshot::new(sheet);
+        let mut warnings = Warnings::default();
+        let mut typography = TypographyStats::default();
+        let digit_width = maximum_digit_width(&snapshot, options, &mut warnings, &mut typography)?;
+        Ok(Self {
+            digit_width,
+            warnings,
+            typography,
+            conditional_evaluations: 0,
+        })
+    }
+}
+
+pub(crate) fn measure_viewport_sparse_automatic_rows<R: AutomaticRows>(
+    sheet: &Sheet,
+    range: RenderRange,
+    options: &RenderOptions,
+    candidates: &[DisplayCell<'_>],
+    row_sizes: &mut R,
+    context: &mut ViewportMeasurementContext,
+) -> Result<(), R::Error> {
+    let range = range.validate()?;
+    enforce(
+        LimitKind::Cells,
+        options.limits.max_cells,
+        candidates.len() as u64,
+    )?;
+    enforce(
+        LimitKind::ConditionalRules,
+        options.limits.max_conditional_rules,
+        sheet.conditional_formats().len() as u64,
+    )?;
+    let mut snapshot = RenderStyleSnapshot::new(sheet);
+    for cell in candidates {
+        row_sizes.charge(1)?;
+        snapshot.capture_coordinate(
+            sheet,
+            CellCoordinate {
+                row: cell.row,
+                col: cell.col,
+            },
+        );
+    }
+    let mut column_widths = BTreeMap::new();
+    expand_automatic_row_heights_with_geometry(
+        sheet,
+        range,
+        &snapshot,
+        context.digit_width,
+        options,
+        &mut context.warnings,
+        &mut column_widths,
+        row_sizes,
+        &mut context.typography,
+        &mut context.conditional_evaluations,
+        Some(candidates),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3931,7 +4247,7 @@ fn calc_automatic_metric_source(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expand_automatic_row_heights(
+fn expand_automatic_row_heights_with_geometry<R: AutomaticRows>(
     sheet: &Sheet,
     range: RenderRange,
     style_snapshot: &RenderStyleSnapshot,
@@ -3939,11 +4255,11 @@ fn expand_automatic_row_heights(
     options: &RenderOptions,
     warnings: &mut Warnings,
     column_widths: &mut BTreeMap<u16, Fixed>,
-    row_sizes: &mut BTreeMap<u32, Fixed>,
+    row_sizes: &mut R,
     typography: &mut TypographyStats,
     conditional_evaluations: &mut u64,
     automatic_candidates: Option<&[DisplayCell<'_>]>,
-) -> Result<(), RenderError> {
+) -> Result<(), R::Error> {
     let Some(pack) = options.font_pack.as_ref() else {
         return Ok(());
     };
@@ -3961,6 +4277,7 @@ fn expand_automatic_row_heights(
     // Values in merged cells belong to the top-left anchor. Indexing anchors,
     // rather than every covered coordinate, keeps even whole-sheet merges
     // sparse and bounded.
+    row_sizes.charge(sheet.merged_ranges().len() as u64)?;
     let merge_anchors = sheet
         .merged_ranges()
         .iter()
@@ -4017,6 +4334,7 @@ fn expand_automatic_row_heights(
     let mut automatic_candidate_rows = BTreeMap::new();
     let mut layout_candidates = Vec::new();
     for &cell in candidates {
+        row_sizes.charge(1)?;
         if cell.formatted.is_empty()
             || cell.row > MAX_WORKSHEET_ROW
             || cell.col > MAX_WORKSHEET_COLUMN
@@ -4034,7 +4352,8 @@ fn expand_automatic_row_heights(
             &merge_anchors,
             source,
             options,
-        ) else {
+        )?
+        else {
             continue;
         };
         automatic_candidate_rows.insert(source, adjustable_row);
@@ -4051,6 +4370,7 @@ fn expand_automatic_row_heights(
     let mut cell_script_classes = BTreeMap::<CellCoordinate, CalcCellScriptAnalysis>::new();
     if calc_line_layout_available {
         for &cell in &layout_candidates {
+            row_sizes.charge(1)?;
             let source = CellCoordinate {
                 row: cell.row,
                 col: cell.col,
@@ -4072,6 +4392,7 @@ fn expand_automatic_row_heights(
         }
     }
     for &cell in candidates {
+        row_sizes.charge(1)?;
         if cell.formatted.is_empty()
             || cell.row > MAX_WORKSHEET_ROW
             || cell.col > MAX_WORKSHEET_COLUMN
@@ -4086,19 +4407,22 @@ fn expand_automatic_row_heights(
         if merged.is_none() && (cell.row < range.first_row || cell.row > range.last_row) {
             continue;
         }
-        let (visible_rows, adjustable_row, width, is_merged, calc_wrap_space) =
+        let (row_span, adjustable_row, width, is_merged, calc_wrap_space) =
             if let Some((r0, c0, r1, c1)) = merged {
-                let visible_rows = row_sizes
-                    .range(r0.max(range.first_row)..=r1.min(range.last_row))
-                    .map(|(&row, _)| row)
-                    .collect::<Vec<_>>();
-                let Some(adjustable_row) = visible_rows
-                    .iter()
-                    .copied()
-                    .find(|row| !effective_row_height_is_manual(sheet, *row))
+                let first_row = r0.max(range.first_row);
+                let last_row = r1.min(range.last_row);
+                if first_row > last_row {
+                    continue;
+                }
+                let Some(adjustable_row) =
+                    row_sizes.first_adjustable(sheet, first_row, last_row)?
                 else {
                     continue;
                 };
+                // Reserve every source column visited by visible width and,
+                // when enabled, Calc's full raw wrapping-width traversal.
+                let columns = u64::from(c1.min(MAX_WORKSHEET_COLUMN) - c0) + 1;
+                row_sizes.charge(columns * (if calc_line_layout_available { 2 } else { 1 }))?;
                 let Some(width) = visible_column_span_width(
                     sheet,
                     c0,
@@ -4116,14 +4440,21 @@ fn expand_automatic_row_heights(
                 } else {
                     None
                 };
-                (visible_rows, adjustable_row, width, true, calc_wrap_space)
+                (
+                    (first_row, last_row),
+                    adjustable_row,
+                    width,
+                    true,
+                    calc_wrap_space,
+                )
             } else {
-                if !row_sizes.contains_key(&cell.row)
+                if row_sizes.height(cell.row)?.is_none()
                     || effective_row_height_is_manual(sheet, cell.row)
                     || (!options.include_hidden && sheet.hidden_columns().contains(&cell.col))
                 {
                     continue;
                 }
+                row_sizes.charge(if calc_line_layout_available { 2 } else { 1 })?;
                 let width = cached_column_width(
                     sheet,
                     cell.col,
@@ -4133,7 +4464,7 @@ fn expand_automatic_row_heights(
                     column_widths,
                 );
                 (
-                    vec![cell.row],
+                    (cell.row, cell.row),
                     cell.row,
                     width,
                     false,
@@ -4331,7 +4662,8 @@ fn expand_automatic_row_heights(
         };
         if is_merged {
             merged_requirements.push(AutoMergeHeight {
-                rows: visible_rows,
+                first_row: row_span.0,
+                last_row: row_span.1,
                 adjustable_row,
                 required,
             });
@@ -4346,17 +4678,10 @@ fn expand_automatic_row_heights(
     // Resolve ordinary cells before merged constraints so a merged block only
     // receives the remaining deficit after its constituent rows have grown.
     for (row, required) in single_row_requirements {
-        if let Some(height) = row_sizes.get_mut(&row) {
-            *height = (*height).max(required);
-        }
+        row_sizes.grow_to(row, required)?;
     }
     for constraint in merged_requirements {
-        let total = sum_fixed(
-            constraint
-                .rows
-                .iter()
-                .filter_map(|row| row_sizes.get(row).copied()),
-        )?;
+        let total = row_sizes.sum(constraint.first_row, constraint.last_row)?;
         if constraint.required <= total {
             continue;
         }
@@ -4364,12 +4689,7 @@ fn expand_automatic_row_heights(
             .required
             .checked_sub(total)
             .ok_or(RenderError::CoordinateOverflow)?;
-        let height = row_sizes
-            .get_mut(&constraint.adjustable_row)
-            .ok_or(RenderError::CoordinateOverflow)?;
-        *height = height
-            .checked_add(deficit)
-            .ok_or(RenderError::CoordinateOverflow)?;
+        row_sizes.add_deficit(constraint.adjustable_row, deficit)?;
     }
     Ok(())
 }
@@ -7435,3 +7755,618 @@ pub(crate) fn push_json_escaped(out: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod automatic_row_adapter_parity {
+    use super::*;
+    use rxls::Workbook;
+
+    fn automatic_candidate_adjustable_row_before_adapter(
+        sheet: &Sheet,
+        range: RenderRange,
+        row_sizes: &BTreeMap<u32, Fixed>,
+        merge_anchors: &BTreeMap<CellCoordinate, (u32, u16, u32, u16)>,
+        source: CellCoordinate,
+        options: &RenderOptions,
+    ) -> Option<u32> {
+        if let Some(&(r0, c0, r1, c1)) = merge_anchors.get(&source) {
+            let last_col = c1.min(MAX_WORKSHEET_COLUMN);
+            let span = usize::from(last_col.checked_sub(c0)?) + 1;
+            if !options.include_hidden
+                && sheet.hidden_columns().range(c0..=last_col).count() >= span
+            {
+                return None;
+            }
+            let first_row = r0.max(range.first_row);
+            let last_row = r1.min(range.last_row);
+            if first_row > last_row {
+                return None;
+            }
+            row_sizes
+                .range(first_row..=last_row)
+                .map(|(&row, _)| row)
+                .find(|row| !effective_row_height_is_manual(sheet, *row))
+        } else {
+            (row_sizes.contains_key(&source.row)
+                && !effective_row_height_is_manual(sheet, source.row)
+                && (options.include_hidden || !sheet.hidden_columns().contains(&source.col)))
+            .then_some(source.row)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BeforeAutoMergeHeight {
+        rows: Vec<u32>,
+        adjustable_row: u32,
+        required: Fixed,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_automatic_row_heights_before_adapter(
+        sheet: &Sheet,
+        range: RenderRange,
+        style_snapshot: &RenderStyleSnapshot,
+        maximum_digit_width: Fixed,
+        options: &RenderOptions,
+        warnings: &mut Warnings,
+        column_widths: &mut BTreeMap<u16, Fixed>,
+        row_sizes: &mut BTreeMap<u32, Fixed>,
+        typography: &mut TypographyStats,
+        conditional_evaluations: &mut u64,
+        automatic_candidates: Option<&[DisplayCell<'_>]>,
+    ) -> Result<(), RenderError> {
+        let Some(pack) = options.font_pack.as_ref() else {
+            return Ok(());
+        };
+        let verified_normal_font = verified_ooxml_normal_font_size(sheet, options)
+            .and_then(|_| sheet.default_cell_style()?.font.as_ref());
+        let verified_implicit_ooxml =
+            sheet.has_implicit_ooxml_row_height() && verified_normal_font.is_some();
+        // Painting conservatively disables Calc's wrapper whenever retained
+        // conditional metadata can change text geometry. Automatic-row
+        // measurement must make the same decision even when the affected rule is
+        // outside the rendered subset; otherwise the row is measured with Calc's
+        // paper and painted with the native wrapper.
+        let calc_line_layout_available = calc_line_layout_available(sheet, options);
+
+        // Values in merged cells belong to the top-left anchor. Indexing anchors,
+        // rather than every covered coordinate, keeps even whole-sheet merges
+        // sparse and bounded.
+        let merge_anchors = sheet
+            .merged_ranges()
+            .iter()
+            .filter_map(|&(r0, c0, r1, c1)| {
+                (r0 <= r1
+                    && c0 <= c1
+                    && r0 <= MAX_WORKSHEET_ROW
+                    && c0 <= MAX_WORKSHEET_COLUMN
+                    && r0 <= range.last_row
+                    && r1 >= range.first_row)
+                    .then_some((CellCoordinate { row: r0, col: c0 }, (r0, c0, r1, c1)))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut single_row_requirements = BTreeMap::<u32, Fixed>::new();
+        let mut merged_requirements = Vec::<BeforeAutoMergeHeight>::new();
+        let mut automatic_cells = 0_u64;
+
+        let local_candidates = if automatic_candidates.is_none() {
+            let display_cell_index = SparseDisplayCellIndex::new(sheet);
+            let mut candidates = BTreeMap::new();
+            for cell in
+                display_cell_index.range((range.first_row, 0, range.last_row, MAX_WORKSHEET_COLUMN))
+            {
+                candidates.insert((cell.row, cell.col), cell);
+                enforce(
+                    LimitKind::Cells,
+                    options.limits.max_cells,
+                    candidates.len() as u64,
+                )?;
+            }
+            for coordinate in merge_anchors.keys() {
+                for cell in display_cell_index.range((
+                    coordinate.row,
+                    coordinate.col,
+                    coordinate.row,
+                    coordinate.col,
+                )) {
+                    candidates.insert((cell.row, cell.col), cell);
+                    enforce(
+                        LimitKind::Cells,
+                        options.limits.max_cells,
+                        candidates.len() as u64,
+                    )?;
+                }
+            }
+            Some(candidates.into_values().collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let candidates = automatic_candidates
+            .or(local_candidates.as_deref())
+            .unwrap_or(&[]);
+        let mut automatic_candidate_rows = BTreeMap::new();
+        let mut layout_candidates = Vec::new();
+        for &cell in candidates {
+            if cell.formatted.is_empty()
+                || cell.row > MAX_WORKSHEET_ROW
+                || cell.col > MAX_WORKSHEET_COLUMN
+            {
+                continue;
+            }
+            let source = CellCoordinate {
+                row: cell.row,
+                col: cell.col,
+            };
+            let Some(adjustable_row) = automatic_candidate_adjustable_row_before_adapter(
+                sheet,
+                range,
+                row_sizes,
+                &merge_anchors,
+                source,
+                options,
+            ) else {
+                continue;
+            };
+            automatic_candidate_rows.insert(source, adjustable_row);
+            layout_candidates.push(cell);
+        }
+        let conditional_layout_cells = resolve_conditional_layout_cells(
+            sheet,
+            &layout_candidates,
+            style_snapshot,
+            options,
+            conditional_evaluations,
+        )?;
+        let mut row_script_classes = BTreeMap::<u32, CalcScriptClassSummary>::new();
+        let mut cell_script_classes = BTreeMap::<CellCoordinate, CalcCellScriptAnalysis>::new();
+        if calc_line_layout_available {
+            for &cell in &layout_candidates {
+                let source = CellCoordinate {
+                    row: cell.row,
+                    col: cell.col,
+                };
+                let adjustable_row = automatic_candidate_rows[&source];
+                let summary =
+                    calc_script_class_summary_bounded(cell.formatted, options, typography)?;
+                let edit_engine_uses_only_complex_role =
+                    calc_edit_engine_uses_only_complex_role(cell.formatted, summary, options)?;
+                cell_script_classes.insert(
+                    source,
+                    CalcCellScriptAnalysis {
+                        edit_engine_uses_only_complex_role,
+                    },
+                );
+                row_script_classes
+                    .entry(adjustable_row)
+                    .and_modify(|row| row.merge(summary))
+                    .or_insert(summary);
+            }
+        }
+        for &cell in candidates {
+            if cell.formatted.is_empty()
+                || cell.row > MAX_WORKSHEET_ROW
+                || cell.col > MAX_WORKSHEET_COLUMN
+            {
+                continue;
+            }
+            let source = CellCoordinate {
+                row: cell.row,
+                col: cell.col,
+            };
+            let merged = merge_anchors.get(&source).copied();
+            if merged.is_none() && (cell.row < range.first_row || cell.row > range.last_row) {
+                continue;
+            }
+            let (visible_rows, adjustable_row, width, is_merged, calc_wrap_space) =
+                if let Some((r0, c0, r1, c1)) = merged {
+                    let visible_rows = row_sizes
+                        .range(r0.max(range.first_row)..=r1.min(range.last_row))
+                        .map(|(&row, _)| row)
+                        .collect::<Vec<_>>();
+                    let Some(adjustable_row) = visible_rows
+                        .iter()
+                        .copied()
+                        .find(|row| !effective_row_height_is_manual(sheet, *row))
+                    else {
+                        continue;
+                    };
+                    let Some(width) = visible_column_span_width(
+                        sheet,
+                        c0,
+                        c1,
+                        maximum_digit_width,
+                        options,
+                        warnings,
+                        column_widths,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let calc_wrap_space = if calc_line_layout_available {
+                        calc_ooxml_merge_wrap_space(sheet, c0, c1, maximum_digit_width, options)?
+                    } else {
+                        None
+                    };
+                    (visible_rows, adjustable_row, width, true, calc_wrap_space)
+                } else {
+                    if !row_sizes.contains_key(&cell.row)
+                        || effective_row_height_is_manual(sheet, cell.row)
+                        || (!options.include_hidden && sheet.hidden_columns().contains(&cell.col))
+                    {
+                        continue;
+                    }
+                    let width = cached_column_width(
+                        sheet,
+                        cell.col,
+                        maximum_digit_width,
+                        options,
+                        warnings,
+                        column_widths,
+                    );
+                    (
+                        vec![cell.row],
+                        cell.row,
+                        width,
+                        false,
+                        if calc_line_layout_available {
+                            calc_ooxml_cell_wrap_space(
+                                sheet,
+                                cell.col,
+                                maximum_digit_width,
+                                options,
+                            )?
+                        } else {
+                            None
+                        },
+                    )
+                };
+
+            let conditional_layout = conditional_layout_cells.get(&source);
+            let style = conditional_layout
+                .and_then(|cell| cell.effective_style.clone())
+                .or_else(|| style_snapshot.owned_style(source))
+                .or_else(|| sheet.resolved_cell_style(source.row, source.col));
+            let active_conditional_style =
+                conditional_layout.and_then(|cell| cell.active_style.as_ref());
+            let active_color_only = active_conditional_style
+                .is_some_and(|style| conditional_style_is_geometry_safe_color_only(style, false));
+            let active_layout_style = active_conditional_style
+                .is_some_and(|style| conditional_style_affects_text_layout(style, false));
+            let alignment = style.as_ref().and_then(|style| style.align.as_ref());
+            let font_size = style
+                .as_ref()
+                .and_then(|style| style.font.as_ref())
+                .and_then(|font| font.size_pt)
+                .and_then(|points| points_to_fixed(points as f32))
+                .unwrap_or(options.default_font_size);
+            let rich_text = cell.rich_text.filter(|runs| !runs.is_empty());
+            let default_plain_font = verified_normal_font.is_some_and(|normal_font| {
+                style
+                    .as_ref()
+                    .and_then(|style| style.font.as_ref())
+                    .is_some_and(|font| same_row_height_font(font, normal_font))
+            });
+            automatic_cells = automatic_cells
+                .checked_add(1)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            enforce(LimitKind::Cells, options.limits.max_cells, automatic_cells)?;
+            charge_automatic_text_bytes(cell.formatted, options, typography)?;
+            let plain_single_line = alignment
+                .is_none_or(|alignment| !alignment.wrap && alignment.rotation == 0)
+                && !contains_mandatory_line_break(cell.formatted)
+                && rich_text.is_none();
+            let effective_script = style
+                .as_ref()
+                .and_then(|style| style.font.as_ref())
+                .map_or(FormatScript::None, |font| font.script);
+            let ordinary_implicit_plain = verified_implicit_ooxml
+                && plain_single_line
+                && effective_script == FormatScript::None;
+            if !verified_implicit_ooxml
+                && plain_single_line
+                && !active_layout_style
+                && (default_plain_font
+                    || (verified_normal_font.is_none() && font_size <= options.default_font_size))
+            {
+                continue;
+            }
+
+            let effective_font = style.as_ref().and_then(|style| style.font.as_ref());
+            let retained_font = cell.explicit_style.and_then(|style| style.font.as_ref());
+            let declared_points = ordinary_implicit_plain
+                .then(|| verified_ooxml_cell_font_size_pt(sheet, cell.row, cell.col))
+                .flatten()
+                .filter(|points| {
+                    effective_font.and_then(|font| font.size_pt) == Some(*points)
+                        && match sheet.implicit_ooxml_row_height_source() {
+                            Some(OoxmlImplicitRowHeight::XlsxApplicationDefault) => {
+                                effective_font == retained_font
+                            }
+                            Some(OoxmlImplicitRowHeight::XlsbApplicationDefault) => true,
+                            Some(OoxmlImplicitRowHeight::None) | None => false,
+                        }
+                });
+            let verified_calc_points = ordinary_implicit_plain
+                .then(|| {
+                    style.as_ref().and_then(|style| {
+                        verified_calc_cell_font_size_pt(sheet, source, style, options)
+                    })
+                })
+                .flatten();
+            let row_script_summary = row_script_classes.get(&adjustable_row);
+            let cell_script_analysis = cell_script_classes.get(&source);
+            let row_is_mixed = row_script_summary.is_some_and(|summary| summary.mixed);
+            let requires_individual_plain = ordinary_implicit_plain
+                && calc_line_layout_available
+                && !cell_has_auto_filter_button(sheet, source)
+                && (row_is_mixed || active_color_only || active_layout_style);
+            let calc_metric_source = calc_automatic_metric_source(
+                sheet.implicit_ooxml_row_height_source(),
+                requires_individual_plain,
+                verified_calc_points.is_some(),
+                row_script_summary,
+                cell_script_analysis,
+            );
+            // Calc sizes an automatic row from the *pattern* font height
+            // (`lcl_GetAttribHeight`: 118% of the pattern font's integer-twip
+            // height plus the standard margin/row adjustments) rather than from the
+            // shaped run's own face metrics. The two only diverge when the cell
+            // genuinely forces Calc off the pattern: text that mixes script classes
+            // inside one cell selects a taller face for part of the run, and an
+            // active conditional format re-resolves the cell's own appearance.
+            // A row that is "mixed" only because *different* cells carry different
+            // scripts does not qualify -- each of those cells is internally uniform,
+            // so Calc keeps every one of them on the pattern height, which is why a
+            // western/Asian or western/complex heading row stays exactly as tall as
+            // the same sheet without it.
+            let calc_pattern_points = verified_calc_points.filter(|_| {
+                !active_color_only
+                    && !active_layout_style
+                    && !has_mixed_calc_script_classes(cell.formatted)
+            });
+            let declared_plain_height = if requires_individual_plain {
+                None
+            } else if let Some(points) = declared_points {
+                calc_ooxml_row_height_from_points(points)
+            } else {
+                None
+            };
+
+            let required = if let Some(required) = declared_plain_height {
+                required
+            } else {
+                let (text, _) = sanitize_xml_text(cell.formatted);
+                let rich_text = rich_text.and_then(|runs| {
+                    let sanitized = sanitize_rich_text(runs);
+                    (sanitized
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>()
+                        == text)
+                        .then_some(sanitized)
+                });
+                let line_layout_policy =
+                    if calc_metric_source.is_some() && calc_wrap_space.is_some() {
+                        CellLineLayoutPolicy::CalcEditEngine
+                    } else {
+                        cell_line_layout_policy(
+                            sheet,
+                            source,
+                            style.as_ref(),
+                            rich_text.as_deref(),
+                            CalcLineLayoutEvidence {
+                                is_plain_text: matches!(cell.value, Cell::Text(_)),
+                                has_adjustable_row: true,
+                                wrap_space_available: calc_line_layout_available
+                                    && calc_wrap_space.is_some(),
+                            },
+                            options,
+                        )
+                    };
+                let line_placement_policy = calc_line_placement_policy(
+                    sheet,
+                    source,
+                    style.as_ref(),
+                    rich_text.as_deref(),
+                    matches!(cell.value, Cell::Text(_)),
+                    options,
+                );
+                let region = Region {
+                    source,
+                    rect: Rect {
+                        x: Fixed::ZERO,
+                        y: Fixed::ZERO,
+                        width,
+                        height: Fixed::from_raw(1),
+                    },
+                    is_merged,
+                    line_layout_policy,
+                    line_placement_policy,
+                    calc_wrap_space: (line_layout_policy == CellLineLayoutPolicy::CalcEditEngine)
+                        .then_some(calc_wrap_space)
+                        .flatten(),
+                    style,
+                    conditional: ConditionalPaint::default(),
+                    text,
+                    rich_text,
+                    hyperlink: None,
+                    numeric_default: false,
+                    text_can_overflow: false,
+                    fixed_height_row: false,
+                    ods_fixed_height_row: false,
+                    print_vertical_overflow: false,
+                    vertical_margin: calc_cell_vertical_margin(sheet),
+                };
+                measure_automatic_cell_height(
+                    pack,
+                    &region,
+                    sheet.sheet_view().right_to_left,
+                    options,
+                    typography,
+                    calc_metric_source,
+                    calc_pattern_points,
+                )?
+            };
+            if is_merged {
+                merged_requirements.push(BeforeAutoMergeHeight {
+                    rows: visible_rows,
+                    adjustable_row,
+                    required,
+                });
+            } else {
+                single_row_requirements
+                    .entry(adjustable_row)
+                    .and_modify(|height| *height = (*height).max(required))
+                    .or_insert(required);
+            }
+        }
+
+        // Resolve ordinary cells before merged constraints so a merged block only
+        // receives the remaining deficit after its constituent rows have grown.
+        for (row, required) in single_row_requirements {
+            if let Some(height) = row_sizes.get_mut(&row) {
+                *height = (*height).max(required);
+            }
+        }
+        for constraint in merged_requirements {
+            let total = sum_fixed(
+                constraint
+                    .rows
+                    .iter()
+                    .filter_map(|row| row_sizes.get(row).copied()),
+            )?;
+            if constraint.required <= total {
+                continue;
+            }
+            let deficit = constraint
+                .required
+                .checked_sub(total)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            let height = row_sizes
+                .get_mut(&constraint.adjustable_row)
+                .ok_or(RenderError::CoordinateOverflow)?;
+            *height = height
+                .checked_add(deficit)
+                .ok_or(RenderError::CoordinateOverflow)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mechanical_dense_adapter_matches_the_before_extraction_algorithm() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("dense-parity");
+        sheet.set_col_width(0, 2.0);
+        sheet.set_col_width(1, 4.0);
+        sheet.set_col_width(2, 2.0);
+        sheet.set_row_height(1, 9.0);
+        sheet.hide_row(2);
+        sheet.hide_column(2);
+        sheet.merge(0, 0, 4, 0);
+        sheet.write_styled(
+            0,
+            0,
+            "wide merged words wide merged words",
+            &rxls::CellStyle::new().wrap(),
+        );
+        sheet.write_styled(
+            3,
+            1,
+            "ordinary words ordinary words",
+            &rxls::CellStyle::new().wrap(),
+        );
+        sheet.merge(0, 2, 3, 2);
+        sheet.write_styled(0, 2, "hidden merge", &rxls::CellStyle::new().wrap());
+        let sheet = &workbook.sheets[0];
+        let range = RenderRange::new(0, 0, 4, 2);
+        for include_hidden in [false, true] {
+            for text_cap in [u64::MAX, 3] {
+                let pack = crate::font::synthetic_test_pack();
+                let mut options = RenderOptions {
+                    include_hidden,
+                    default_font_family: pack.default_family().to_owned(),
+                    font_pack: Some(pack),
+                    ..RenderOptions::default()
+                };
+                options.limits.max_text_bytes = text_cap;
+                let mut snapshot = RenderStyleSnapshot::new(sheet);
+                snapshot.capture_range(sheet, range, &options).unwrap();
+                let mut metric_warnings = Warnings::default();
+                let mut metric_typography = TypographyStats::default();
+                let digit = maximum_digit_width(
+                    &snapshot,
+                    &options,
+                    &mut metric_warnings,
+                    &mut metric_typography,
+                )
+                .unwrap();
+                let baseline = (0..=4)
+                    .filter(|&row| include_hidden || !row_is_hidden(sheet, row))
+                    .map(|row| {
+                        (
+                            row,
+                            row_height(sheet, row, &options, &mut Warnings::default()),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut before_rows = baseline.clone();
+                let mut after_rows = baseline;
+                let mut before_columns = BTreeMap::new();
+                let mut after_columns = BTreeMap::new();
+                let mut before_warnings = metric_warnings.clone();
+                let mut after_warnings = metric_warnings;
+                let mut before_typography = metric_typography.clone();
+                let mut after_typography = metric_typography;
+                let mut before_conditional = 0;
+                let mut after_conditional = 0;
+                // None exercises the unchanged local sparse candidate capture,
+                // rather than supplying an oracle list produced by the adapter.
+                let before = expand_automatic_row_heights_before_adapter(
+                    sheet,
+                    range,
+                    &snapshot,
+                    digit,
+                    &options,
+                    &mut before_warnings,
+                    &mut before_columns,
+                    &mut before_rows,
+                    &mut before_typography,
+                    &mut before_conditional,
+                    None,
+                );
+                let after = expand_automatic_row_heights(
+                    sheet,
+                    range,
+                    &snapshot,
+                    digit,
+                    &options,
+                    &mut after_warnings,
+                    &mut after_columns,
+                    &mut after_rows,
+                    &mut after_typography,
+                    &mut after_conditional,
+                    None,
+                );
+                assert_eq!(before, after);
+                assert_eq!(before_rows, after_rows);
+                assert_eq!(before_columns, after_columns);
+                assert_eq!(before_warnings.0, after_warnings.0);
+                assert_eq!(before_conditional, after_conditional);
+                assert_eq!(stats(&before_typography), stats(&after_typography));
+                assert_eq!(before_typography.font_faces, after_typography.font_faces);
+            }
+        }
+    }
+
+    fn stats(value: &TypographyStats) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            value.text_bytes,
+            value.shaped_glyphs,
+            value.text_work,
+            value.shaped_runs,
+            value.text_lines,
+            value.path_commands,
+        )
+    }
+}

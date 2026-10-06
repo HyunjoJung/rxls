@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added bounded renderer viewport preparation for explicit source ranges, with
+  compressed hidden/default axis runs and sparse automatic row-height updates.
+  Small tile envelopes retain existing layout limits and use distinct SVG clip IDs.
 - Added opt-in `workbook_set_cells` MCP recalculation. Supported formula caches
   refresh in one bounded evaluation batch with computed/unchanged/unsupported
   counts and stable reasons; source edits and cache updates commit atomically.
