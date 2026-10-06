@@ -12,6 +12,9 @@ import {
 import { createStoredZip, readZipEntries } from "../scripts/zip.mjs";
 import { exerciseRangePaste, exerciseLargeRangePaste } from "./range-paste.mjs";
 import { exerciseEditingGuards } from "./editing-guards.mjs";
+import { assertViewerReopens, exerciseMacroRoundtrip, exerciseMultilineCellOptions } from "./reopen-journey.mjs";
+import { exerciseCdpComposition } from "./ime-composition.mjs";
+import { recordJourney, retainDownload, sha256 } from "./journey-evidence.mjs";
 
 const execFileAsync = promisify(execFile);
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
@@ -30,6 +33,11 @@ if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
 
 const browser = await chromium.launch(launchOptions);
 try {
+  await recordJourney("browser-runtime", {
+    browserVersion: browser.version(), nodeVersion: process.version,
+    basePath, headless: launchOptions.headless,
+    executable: launchOptions.executablePath ?? launchOptions.channel,
+  });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 900 },
   });
@@ -174,12 +182,17 @@ try {
   );
 
   await exerciseInlineEditing(page);
+  await exerciseCdpComposition(page, { waitForCondition, waitForViewerState, downloadWorkbook });
+  await exerciseMultilineCellOptions(page, {
+    waitForCondition, waitForViewerState, downloadWorkbook, assertOpenpyxlReopens,
+  });
   await exerciseEditingGuards(page, { waitForCondition, waitForViewerState });
   await exerciseRangePaste(page, {
     waitForCondition,
     waitForViewerState,
     downloadWorkbook,
     assertOpenpyxlReopens,
+    assertViewerReopens,
   });
   await exerciseLargeRangePaste(page, {
     waitForCondition,
@@ -475,6 +488,13 @@ try {
     expected: "Browser edited XLSX",
     expectedTitle: "rxls browser preservation proof",
   });
+  await assertViewerReopens(page, xlsxDownload, {
+    format: "xlsx", label: "XLSX scalar-properties download reopened clean",
+    cells: {
+      A1: { kind: "text", value: "Browser edited XLSX" },
+      C4: { kind: "number", value: "420000" },
+    },
+  }, { waitForCondition, waitForViewerState });
 
   await Promise.all([
     page.waitForEvent("dialog").then(async (prompt) => {
@@ -608,6 +628,10 @@ try {
     (snapshot) => !snapshot.dirty && snapshot.canRedo && !snapshot.busy,
     "XLSM undo to clean source",
   );
+  await exerciseMacroRoundtrip(page, xlsmSource, {
+    waitForCondition, waitForViewerState, downloadWorkbook,
+    assertOpenpyxlReopens, assertZipPartsEqual, assertZipPartChanged,
+  });
 
   await page
     .locator("#file-input")
@@ -727,7 +751,15 @@ try {
       `viewer returned failed responses: ${JSON.stringify(failedResponses)}`,
     );
   }
+  await recordJourney("production-browser", {
+    status: "passed", pageErrors: pageErrors.length,
+    consoleErrors: consoleErrors.length, failedResponses: failedResponses.length,
+    syntheticKoreanComposition: "passed", nativeOsKoreanIme: "not_verified",
+  });
   console.log("viewer browser smoke passed");
+} catch (error) {
+  await recordJourney("production-browser", { status: "failed", error: String(error) });
+  throw error;
 } finally {
   await browser.close();
   await new Promise((resolve) => server.httpServer.close(resolve));
@@ -914,7 +946,7 @@ async function exerciseInlineEditing(page) {
     false,
   );
 
-  // Browser composition events keep IME Enter from prematurely mutating the workbook.
+  // Synthetic composition/keyCode 229 coverage; this does not exercise an OS IME.
   await input.focus();
   await input.dispatchEvent("compositionstart", { data: "" });
   await input.fill("한글 편집");
@@ -952,6 +984,10 @@ async function exerciseInlineEditing(page) {
   );
   await select("C4", "한글 편집");
   await undo();
+  await recordJourney("synthetic Korean composition", {
+    status: "passed", input: "dispatchEvent compositionstart/compositionend and keyCode 229",
+    nativeOsKoreanIme: "not_verified",
+  });
 
   await select("C4", "420000");
   await input.press("F2");
@@ -1006,7 +1042,7 @@ async function exerciseInlineEditing(page) {
   const downloadPromise = page.waitForEvent("download");
   await page.locator("#quick-save").click();
   const download = await downloadPromise;
-  const savePath = await download.path();
+  const savePath = await retainDownload(download, download.suggestedFilename());
   assert.ok(savePath);
   await assertOpenpyxlReopens(savePath, { expected: "00123" });
   await waitForViewerState(page, (value) => !value.busy, "inline draft saved");
@@ -1265,10 +1301,8 @@ async function downloadWorkbook(page, extension) {
     throw new Error(`unexpected workbook download name: ${fileName}`);
   }
   const failure = await download.failure();
-  const path = await download.path();
-  if (failure || !path) {
-    throw new Error(`workbook download failed: ${failure ?? "missing path"}`);
-  }
+  if (failure) throw new Error(`workbook download failed: ${failure}`);
+  const path = await retainDownload(download, fileName);
   const bytes = await readFile(path);
   if (bytes.length < 100) {
     throw new Error("workbook download is empty");
@@ -1278,6 +1312,9 @@ async function downloadWorkbook(page, extension) {
     (snapshot) => !snapshot.busy,
     "workbook download completion",
   );
+  await recordJourney("workbook download", {
+    fileName, path, bytes: bytes.length, sha256: sha256(bytes),
+  });
   return { fileName, bytes, path };
 }
 
@@ -1285,6 +1322,7 @@ async function assertOpenpyxlReopens(
   workbookPath,
   {
     expected,
+    cell = "A1",
     expectedTitle = null,
     requireVba = false,
     cacheCell,
@@ -1297,7 +1335,7 @@ async function assertOpenpyxlReopens(
   const script = fileURLToPath(
     new URL("../scripts/verify-openpyxl-workbook.py", import.meta.url),
   );
-  const args = [script, workbookPath, "--cell", "A1", "--expected", expected];
+  const args = [script, workbookPath, "--cell", cell, "--expected", expected];
   if (expectedTitle !== null) {
     args.push("--expected-title", expectedTitle);
   }
@@ -1325,6 +1363,7 @@ async function assertOpenpyxlReopens(
   } else {
     assert.equal(report.vba_bytes, null);
   }
+  await recordJourney("openpyxl reopen", { status: "passed", path: workbookPath, ...report });
 }
 
 function assertZipPartsEqual(sourceBytes, savedBytes, partNames) {
