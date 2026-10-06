@@ -15,8 +15,11 @@ import { exerciseEditingGuards } from "./editing-guards.mjs";
 import { assertViewerReopens, exerciseMacroRoundtrip, exerciseMultilineCellOptions } from "./reopen-journey.mjs";
 import { exerciseCdpComposition } from "./ime-composition.mjs";
 import { recordJourney, retainDownload, sha256 } from "./journey-evidence.mjs";
+import { exerciseKeyboardRedo } from "./keyboard-redo.mjs";
 
 const execFileAsync = promisify(execFile);
+const selectedJourney = process.env.RXLS_VIEWER_JOURNEY || "production";
+assert.ok(["production", "keyboard-redo"].includes(selectedJourney), "unknown viewer journey");
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
 const basePath = await builtBasePath();
 const server = await preview({
@@ -32,7 +35,7 @@ if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
 }
 
 const browser = await chromium.launch(launchOptions);
-try {
+async function runBrowserJourney() {
   await recordJourney("browser-runtime", {
     browserVersion: browser.version(), nodeVersion: process.version,
     basePath, headless: launchOptions.headless,
@@ -74,6 +77,16 @@ try {
     throw new Error(`viewer did not render: ${JSON.stringify(diagnostics)}`, {
       cause: error,
     });
+  }
+
+  await exerciseKeyboardRedo(page, { waitForCondition, waitForViewerState });
+  if (selectedJourney === "keyboard-redo") {
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+    assert.deepEqual(failedResponses, []);
+    await recordJourney("keyboard-redo-browser", { status: "passed", selectedJourney });
+    console.log("viewer keyboard redo journey passed");
+    return;
   }
 
   // The workbench uses real controls and external CSS under the strict CSP.
@@ -757,8 +770,11 @@ try {
     syntheticKoreanComposition: "passed", nativeOsKoreanIme: "not_verified",
   });
   console.log("viewer browser smoke passed");
+}
+try {
+  await runBrowserJourney();
 } catch (error) {
-  await recordJourney("production-browser", { status: "failed", error: String(error) });
+  await recordJourney(selectedJourney === "keyboard-redo" ? "keyboard-redo-browser" : "production-browser", { status: "failed", error: String(error) });
   throw error;
 } finally {
   await browser.close();

@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Restored Ctrl/Meta+Shift+Z after the sole edit is undone in the viewer (#137).
+  The shortcut checks redo availability while preserving draft/input guards,
+  Ctrl/Meta+Y and toolbar history behavior.
 - Corrected scalar type checks: `ISNUMBER` no longer converts numeric text,
   and `ISBLANK` distinguishes absent cells from present empty text or formula
   results. Five IS predicates inspect actual one-cell ranges without coercion;
