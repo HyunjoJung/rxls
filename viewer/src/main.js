@@ -1161,7 +1161,7 @@ function updateViewportState(value) {
   }
   elements["status-message"].textContent = "Tiled view · read-only display";
   elements["render-detail"].textContent = state.viewportInitialFit
-    ? "Tiled view · fitted to viewport surface limit" : "Tiled view";
+    ? "Tiled view · fitted to viewport" : "Tiled view";
 }
 
 function failViewport(error) {

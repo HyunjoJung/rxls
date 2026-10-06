@@ -26,6 +26,7 @@ export function createWorkbench({
     "ribbon-home",
     "ribbon-view",
     "workbook-mode",
+    "editing-hint",
     "panel-open",
     "quick-save",
     "view-workbook-panel",
@@ -217,6 +218,7 @@ export function createWorkbench({
     );
     ui["reset-zoom"].disabled = !available;
     const editable = state.editState?.capability === "read-write" && !readOnly;
+    ui["editing-hint"].hidden = !state.workbook || !editable || state.displayKind === "tiled";
     ui["workbook-mode"].textContent = !state.workbook
       ? "No workbook"
       : state.displayKind === "tiled"

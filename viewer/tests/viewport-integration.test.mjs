@@ -299,7 +299,7 @@ test("initial fit includes the CSS surface ceiling; later excessive zoom preserv
   await env.runFrames();
   assert.equal((await opening).status, "ready");
   assert.equal(env.state.zoom, 0.5);
-  assert.match(env.sandbox.elements["render-detail"].textContent, /surface limit/);
+  assert.match(env.sandbox.elements["render-detail"].textContent, /fitted to viewport/);
   const originalSvg = env.state.viewportSvg;
   env.sandbox.setZoom(1);
   assert.equal(env.state.zoom, 0.5);
