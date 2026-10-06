@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Distinguished literal arguments from single-cell, range and named references
+  in formula aggregates (#133). Referenced text/booleans are omitted by numeric
+  reducers, invalid direct text returns `#VALUE!`, and `COUNT` ignores errors.
+  Conditional and unary results retain their Excel argument-coercion behavior.
 - Omitted existing worksheet dimensions after package-preserving value/formula,
   range and nonempty appended-row writes (#132), allowing streaming readers to
   discover added cells. Absent dimensions stay absent; cache-only/clear edits

@@ -71,6 +71,21 @@ AND OR NOT ISNA ISERROR ISNUMBER ISTEXT ISBLANK
 Invalid argument counts produce Excel-compatible value errors where the
 supported function contract defines them.
 
+The source checkout includes aggregate coercion fixes for the next core
+release. `SUM`, `AVERAGE`, `MIN`, `MAX` and `PRODUCT` ignore referenced text,
+booleans and blanks, including single-cell ranges and defined references.
+Direct numeric text and booleans contribute; invalid direct text returns
+`#VALUE!`. `COUNT` ignores errors, and `COUNTA` distinguishes a missing cell
+from empty text. `IF` retains a selected reference's origin; `IFERROR`, `IFNA`
+and unary `+` produce values, converting a selected missing cell to zero.
+`AND`/`OR` ignore referenced text and accept direct `TRUE`/`FALSE` strings,
+omitting other text. They return `#VALUE!` when no logical/numeric input remains.
+A formula returning a missing reference produces zero; directly evaluating a
+missing target retains the empty-text result described below.
+These scalar conditional and unary paths accept actual one-cell ranges;
+selected multi-cell or whole-axis arrays return `ArraySemantics`, even when
+only one value is stored. Direct bounded range aggregates remain supported.
+
 ## Batch evaluation (core 0.1.4)
 
 The source API has this signature (`Result` here is `std::result::Result`):

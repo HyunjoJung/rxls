@@ -330,6 +330,9 @@ impl OperationBudget {
     ) -> std::result::Result<(), FormulaUnsupportedReason> {
         match value {
             Value::Text(text) | Value::Error(text) => self.grow_text(0, text.len()),
+            Value::Reference(value) | Value::SingleCellRange(value) => {
+                self.reserve_value_copy(value)
+            }
             Value::Range(values) => values
                 .iter()
                 .try_for_each(|value| self.reserve_value_copy(value)),
@@ -383,12 +386,21 @@ fn evaluate_formula_in_context(
     formula: &str,
     state: &mut EvalState,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    evaluate_formula_value_in_context(workbook, sheet_name, formula, state).map(Value::into_cell)
+}
+
+fn evaluate_formula_value_in_context(
+    workbook: &Workbook,
+    sheet_name: &str,
+    formula: &str,
+    state: &mut EvalState,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
     if state.formula_dependency_depth >= MAX_FORMULA_DEPENDENCY_DEPTH {
         return Err(FormulaUnsupportedReason::DependencyDepthExceeded);
     }
     state.formula_dependency_depth += 1;
     let operation_budget = state.operation_budget.clone();
-    let result = evaluate_formula_with_refs(formula, operation_budget, |request| {
+    let result = evaluate_formula_value_with_refs(formula, operation_budget, |request| {
         resolve_reference(workbook, sheet_name, state, request)
     });
     state.formula_dependency_depth -= 1;
@@ -442,8 +454,8 @@ fn resolve_reference(
             if !state.visiting_names.insert(key.clone()) {
                 return Err(FormulaUnsupportedReason::CircularReference);
             }
-            let result = evaluate_formula_in_context(workbook, current_sheet, refers_to, state)
-                .map(cell_to_value);
+            let result =
+                evaluate_formula_value_in_context(workbook, current_sheet, refers_to, state);
             state.visiting_names.remove(&key);
             result
         }
@@ -469,7 +481,9 @@ fn resolve_reference(
                 values.push(value);
             }
             if values.len() == 1 {
-                Ok(values.pop().unwrap_or(Value::Blank))
+                Ok(Value::Reference(Box::new(
+                    values.pop().unwrap_or(Value::Blank),
+                )))
             } else {
                 Ok(Value::Range(values))
             }
@@ -478,6 +492,10 @@ fn resolve_reference(
             let target_names = target_sheet_names(workbook, current_sheet, sheet.as_deref())?;
             let range = parse_reference_range(&start, &end)
                 .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+            let single_cell = target_names.len() == 1
+                && matches!(range,
+                ReferenceRange::Cells { start_row, start_col, end_row, end_col }
+                    if start_row == end_row && start_col == end_col);
             let mut values = Vec::new();
             for target_name in target_names {
                 let target = workbook
@@ -537,7 +555,13 @@ fn resolve_reference(
                     }
                 }
             }
-            Ok(Value::Range(values))
+            if single_cell {
+                Ok(Value::SingleCellRange(Box::new(
+                    values.pop().unwrap_or(Value::Blank),
+                )))
+            } else {
+                Ok(Value::Range(values))
+            }
         }
     }
 }
@@ -611,11 +635,20 @@ fn target_sheet_names<'a>(
         .collect())
 }
 
+#[cfg(test)]
 fn evaluate_formula_with_refs(
     formula: &str,
     operation_budget: OperationBudget,
-    mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
+    resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    evaluate_formula_value_with_refs(formula, operation_budget, resolve_ref).map(Value::into_cell)
+}
+
+fn evaluate_formula_value_with_refs(
+    formula: &str,
+    operation_budget: OperationBudget,
+    mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
     let formula = formula.trim().strip_prefix('=').unwrap_or(formula.trim());
     operation_budget.charge_text_storage(formula.len())?;
     let normalized = normalize_formula_syntax(formula)?;
@@ -630,7 +663,7 @@ fn evaluate_formula_with_refs(
     let value = parser.parse_comparison()?;
     parser.skip_ws();
     if parser.eof() {
-        Ok(value.into_cell())
+        Ok(value)
     } else {
         Err(FormulaUnsupportedReason::UnparsableExpression)
     }
@@ -653,15 +686,65 @@ enum Value {
     Bool(bool),
     Error(String),
     Blank,
+    // A single-cell reference carries one scalar, never another Reference.
+    // Aggregates distinguish this origin; scalar consumers inspect its value.
+    Reference(Box<Value>),
+    // Actual 1x1 geometry, distinct from a sparse range with one stored cell.
+    SingleCellRange(Box<Value>),
     Range(Vec<Value>),
 }
 
 impl Value {
-    fn into_number(self) -> std::result::Result<f64, Value> {
-        if matches!(self, Value::Error(_)) {
-            return Err(self);
+    fn scalar(&self) -> &Self {
+        let mut value = self;
+        while let Self::Reference(inner) = value {
+            value = inner;
         }
-        self.as_number()
+        value
+    }
+
+    fn into_scalar(mut self) -> Self {
+        while let Self::Reference(inner) = self {
+            self = *inner;
+        }
+        self
+    }
+
+    // IF keeps the selected reference's origin, including a one-cell range.
+    fn into_selected_reference(self) -> std::result::Result<Self, FormulaUnsupportedReason> {
+        match self {
+            Self::SingleCellRange(value) => Ok(Self::Reference(value)),
+            Self::Range(_) => Err(FormulaUnsupportedReason::ArraySemantics),
+            value => Ok(value),
+        }
+    }
+
+    // IFERROR/IFNA and unary '+' return values. A selected missing cell is 0.
+    fn function_scalar(&self) -> &Self {
+        match self.scalar() {
+            Self::SingleCellRange(value) => value.scalar(),
+            value => value,
+        }
+    }
+
+    fn into_function_value(self) -> std::result::Result<Self, FormulaUnsupportedReason> {
+        let value = match self.into_scalar() {
+            Self::SingleCellRange(value) => *value,
+            value => value,
+        };
+        match value {
+            Self::Range(_) => Err(FormulaUnsupportedReason::ArraySemantics),
+            Self::Blank => Ok(Self::Number(0.0)),
+            value => Ok(value),
+        }
+    }
+
+    fn into_number(self) -> std::result::Result<f64, Value> {
+        let value = self.into_scalar();
+        if matches!(value, Value::Error(_)) {
+            return Err(value);
+        }
+        value.as_number()
     }
 
     fn into_cell(self) -> Cell {
@@ -671,7 +754,11 @@ impl Value {
             Value::Bool(b) => Cell::Bool(b),
             Value::Error(e) => Cell::Error(e),
             Value::Blank => Cell::Text(String::new()),
-            Value::Range(_) => Cell::Error("#VALUE!".to_string()),
+            Value::Reference(value) => match *value {
+                Value::Blank => Cell::Number(0.0),
+                value => value.into_cell(),
+            },
+            Value::Range(_) | Value::SingleCellRange(_) => Cell::Error("#VALUE!".to_string()),
         }
     }
 
@@ -685,7 +772,8 @@ impl Value {
                 .parse::<f64>()
                 .map_err(|_| Value::Error("#VALUE!".to_string())),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_number(),
         }
     }
 
@@ -696,7 +784,8 @@ impl Value {
             Value::Blank => Ok(Cow::Borrowed("")),
             Value::Bool(b) => Ok(Cow::Borrowed(if *b { "TRUE" } else { "FALSE" })),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_text(),
         }
     }
 
@@ -726,7 +815,8 @@ impl Value {
             }
             Value::Blank => Ok(false),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_bool(),
         }
     }
 }
@@ -913,7 +1003,7 @@ impl<'a, 'r> Parser<'a, 'r> {
         self.skip_ws();
         if self.consume_char('+') {
             self.charge_operation()?;
-            return self.parse_unary();
+            return self.parse_unary().and_then(Value::into_function_value);
         }
         if self.consume_char('-') {
             self.charge_operation()?;
@@ -1439,9 +1529,12 @@ fn for_each_value<'a>(
     in_range: bool,
     visit: &mut impl FnMut(&'a Value, bool) -> std::result::Result<(), Value>,
 ) -> std::result::Result<(), Value> {
+    // Excel aggregates distinguish literal values from cell/range inputs.
+    // https://learn.microsoft.com/en-us/office/vba/api/excel.worksheetfunction.sum
     for value in values {
         match value {
             Value::Range(values) => for_each_value(values, true, visit)?,
+            Value::Reference(value) | Value::SingleCellRange(value) => visit(value.scalar(), true)?,
             value => visit(value, in_range)?,
         }
     }
@@ -1458,28 +1551,33 @@ fn aggregate_number(value: &Value, in_range: bool) -> std::result::Result<Option
                 return Ok(None);
             }
             let text = text.trim();
-            if text.is_empty() {
-                Ok(None)
-            } else {
-                Ok(text.parse::<f64>().ok())
+            match text.parse::<f64>() {
+                Ok(number) if number.is_finite() => Ok(Some(number)),
+                _ => Err(Value::Error("#VALUE!".to_string())),
             }
         }
         Value::Blank => Ok(None),
         Value::Error(error) => Err(Value::Error(error.clone())),
-        Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+        Value::Range(_) | Value::Reference(_) | Value::SingleCellRange(_) => {
+            Err(Value::Error("#VALUE!".to_string()))
+        }
     }
 }
 
 fn count_if_number_like(value: &Value, in_range: bool) -> std::result::Result<bool, Value> {
+    // COUNT ignores errors even when passed directly.
+    // https://support.microsoft.com/en-us/excel/functions/count-function
     match value {
         Value::Number(_) => Ok(true),
-        Value::Text(text) if !in_range => {
-            Ok(!text.trim().is_empty() && text.parse::<f64>().is_ok())
-        }
+        Value::Text(text) if !in_range => Ok(text.trim().parse::<f64>().is_ok_and(f64::is_finite)),
         Value::Bool(_) if !in_range => Ok(true),
         Value::Blank => Ok(false),
-        Value::Error(error) if !in_range => Err(Value::Error(error.clone())),
-        Value::Text(_) | Value::Bool(_) | Value::Error(_) | Value::Range(_) => Ok(false),
+        Value::Text(_)
+        | Value::Bool(_)
+        | Value::Error(_)
+        | Value::Range(_)
+        | Value::Reference(_)
+        | Value::SingleCellRange(_) => Ok(false),
     }
 }
 
@@ -1585,19 +1683,24 @@ fn eval_if(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReaso
     };
     let true_value = args.get(1).cloned().unwrap_or(Value::Bool(false));
     let false_value = args.get(2).cloned().unwrap_or(Value::Bool(false));
-    Ok(if condition { true_value } else { false_value })
+    if condition { true_value } else { false_value }.into_selected_reference()
 }
 
 fn eval_iferror(
     args: &[Value],
     only_na: bool,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
-    let replace = matches!(&args[0], Value::Error(error) if !only_na || error == "#N/A");
-    Ok(if replace {
+    if matches!(args[0], Value::Range(_)) {
+        return Err(FormulaUnsupportedReason::ArraySemantics);
+    }
+    let replace =
+        matches!(args[0].function_scalar(), Value::Error(error) if !only_na || error == "#N/A");
+    if replace {
         args[1].clone()
     } else {
         args[0].clone()
-    })
+    }
+    .into_function_value()
 }
 
 fn eval_round(
@@ -1909,6 +2012,12 @@ fn eval_and_or_or(
     let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
         match (value, in_range) {
             (Value::Text(_) | Value::Blank, true) => Ok(()),
+            (Value::Text(text), false)
+                if !text.trim().eq_ignore_ascii_case("TRUE")
+                    && !text.trim().eq_ignore_ascii_case("FALSE") =>
+            {
+                Ok(())
+            }
             (Value::Error(error), _) => Err(Value::Error(error.clone())),
             _ => {
                 truth_values.push(value.as_bool()?);
@@ -1943,7 +2052,7 @@ fn eval_error_check(args: &[Value], target: &str) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    if let Value::Error(error) = value {
+    if let Value::Error(error) = value.scalar() {
         Value::Bool(error == target)
     } else {
         Value::Bool(false)
@@ -1954,14 +2063,14 @@ fn eval_any_error(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    Value::Bool(matches!(value, Value::Error(_)))
+    Value::Bool(matches!(value.scalar(), Value::Error(_)))
 }
 
 fn eval_is_number(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    let numeric = match value {
+    let numeric = match value.scalar() {
         Value::Number(_) => true,
         Value::Text(text) => text.parse::<f64>().is_ok(),
         _ => false,
@@ -1973,14 +2082,14 @@ fn eval_is_text(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    Value::Bool(matches!(value, Value::Text(_)))
+    Value::Bool(matches!(value.scalar(), Value::Text(_)))
 }
 
 fn eval_is_blank(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    match value {
+    match value.scalar() {
         Value::Blank => Value::Bool(true),
         Value::Text(text) => Value::Bool(text.is_empty()),
         _ => Value::Bool(false),
@@ -2028,6 +2137,8 @@ fn binary_text(
     right: Value,
     budget: &OperationBudget,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    let left = left.into_scalar();
+    let right = right.into_scalar();
     if matches!(left, Value::Error(_)) {
         return Ok(left);
     }
@@ -2105,11 +2216,14 @@ fn compare_rank(value: &Value) -> u8 {
         // Errors are propagated before ranking is consulted; Range never
         // reaches a scalar comparison. Rank is irrelevant for either, so
         // give them a stable (unreachable in practice) rank.
-        Value::Error(_) | Value::Range(_) => 3,
+        Value::Error(_) | Value::Range(_) | Value::SingleCellRange(_) => 3,
+        Value::Reference(value) => compare_rank(value),
     }
 }
 
 fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
+    let left = left.into_scalar();
+    let right = right.into_scalar();
     if matches!(left, Value::Error(_)) {
         return left;
     }
@@ -2120,7 +2234,9 @@ fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
     // operand -- both `as_number` and `as_text` already rejected it with
     // #VALUE! before this rewrite. Keep that behavior explicitly instead of
     // letting it fall through to rank-based ordering.
-    if matches!(left, Value::Range(_)) || matches!(right, Value::Range(_)) {
+    if matches!(left, Value::Range(_) | Value::SingleCellRange(_))
+        || matches!(right, Value::Range(_) | Value::SingleCellRange(_))
+    {
         return Value::Error("#VALUE!".to_string());
     }
     let ordering = if compare_rank(&left) == compare_rank(&right) {
@@ -3421,11 +3537,14 @@ mod tests {
             "MIN(1/0)",
             "MAX(1/0)",
             "AVERAGE(1/0)",
-            "COUNT(1/0)",
             "PRODUCT(1/0)",
         ] {
             assert_div0(formula);
         }
+        assert_eq!(
+            eval("COUNT(1/0)"),
+            FormulaEvaluation::Computed(Cell::Number(0.0))
+        );
         assert_eq!(
             eval("COUNTA(1/0)"),
             FormulaEvaluation::Computed(Cell::Number(1.0)),
@@ -3987,10 +4106,11 @@ mod tests {
     fn reference_max_coordinate_xfd1048576_resolves() {
         // XFD1048576 is Excel's actual maximum cell (column 16384, row
         // 1,048,576); it must parse and resolve (to blank, since nothing is
-        // written there), not be rejected as out of range.
+        // written there), not be rejected as out of range. A blank reference
+        // used as the formula result produces numeric zero in Excel.
         assert_eq!(
             eval_ref_against((1.0, 2.0), (3.0, 4.0), "XFD1048576"),
-            FormulaEvaluation::Computed(Cell::Text(String::new()))
+            FormulaEvaluation::Computed(Cell::Number(0.0))
         );
     }
 
