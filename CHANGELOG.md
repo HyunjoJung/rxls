@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `workbook_set_cells` MCP recalculation. Supported formula caches
+  refresh in one bounded evaluation batch with computed/unchanged/unsupported
+  counts and stable reasons; source edits and cache updates commit atomically.
+
 ### Changed
 
 - Documented core 0.1.4 formula/cache APIs, shared evaluation budgets, and

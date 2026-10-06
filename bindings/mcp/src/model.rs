@@ -75,6 +75,9 @@ pub(crate) struct SetCellsParams {
     pub(crate) sheet: String,
     /// Atomic cell changes. The whole call rolls back if any edit fails.
     pub(crate) edits: Vec<CellEdit>,
+    /// Refresh supported formula caches across the edited workbook. Default: false.
+    #[serde(default)]
+    pub(crate) recalculate: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -282,6 +285,21 @@ pub(crate) struct SetCellsResult {
     pub(crate) current_bytes: usize,
     pub(crate) current_sha256: String,
     pub(crate) edited_parts: Vec<String>,
+    /// Present only when workbook_set_cells explicitly requests recalculation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recalculation: Option<RecalculationSummary>,
+}
+
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub(crate) struct RecalculationSummary {
+    /// Computed formula cells, including unchanged caches.
+    pub(crate) computed_cells: usize,
+    /// Computed formula cells whose existing typed cache was retained.
+    pub(crate) unchanged_cells: usize,
+    /// Formula cells whose original or caller-provided cache was retained.
+    pub(crate) unsupported_cells: usize,
+    /// Distinct, sorted FormulaUnsupportedReason::code values.
+    pub(crate) reasons: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

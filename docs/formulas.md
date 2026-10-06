@@ -184,6 +184,33 @@ match workbook.sheets[0].cell(0, 0) {
 To persist selected computed results, use the separately validated
 [formula-cache update API](preservation.md#formula-cache-updates-core-014).
 
+## MCP edit recalculation (source checkout)
+
+The [MCP adapter](../bindings/mcp/README.md#opt-in-formula-recalculation) accepts
+`recalculate: true` in `workbook_set_cells`. After opening a session, pass these
+tool arguments to edit a dependency and refresh supported workbook formulas:
+
+```json
+{
+  "session_id": "<opened-session-id>",
+  "sheet": "Data",
+  "edits": [{"kind": "set", "cell": "A1", "value": {"type": "number", "value": 9}}],
+  "recalculate": true
+}
+```
+
+The result adds `recalculation` counts for computed, unchanged and unsupported
+formula cells, plus distinct sorted reason codes. Computed includes unchanged
+caches and supported scalar errors. Unsupported formulas and their dependents
+retain their original or caller-provided cache. Omitted or false preserves the
+existing edit behavior and result fields. Formula source stays unchanged.
+
+Evaluation uses one reopened edited candidate and one shared batch budget.
+Collection, evaluation, cache-write, output or memory failure leaves the entire
+session unchanged. The adapter also bounds collection and diagnostic output;
+see its guide for exact limits. Save-copy remains a separate operation. This
+adapter addition is available in the source checkout.
+
 ## Typed fallback reasons
 
 `FormulaUnsupportedReason::code()` provides a stable machine-readable code.
