@@ -189,8 +189,8 @@ Coordinate limits follow XLSX: rows are zero-based through 1,048,575 and columns
 through 16,383. Public methods return typed errors for invalid sheets,
 coordinates, relationships, or unsupported package state.
 
-The following formula-group, cell-text and dimension fixes are currently in the source
-checkout and will ship in a subsequent core release.
+The following formula-group, cell-text, dimension and sheet-title fixes are
+currently in the source checkout and will ship in a subsequent core release.
 
 Cell replacement and clearing must cover an entire shared or array formula
 group. Use `set_cell_range_values` or `clear_range` for a group spanning several
@@ -211,6 +211,15 @@ then discover all saved cells from `sheetData`. No dimension is added when
 absent. Cache-only, clear-only and empty operations retain it. Foreign or nested
 dimension-like content is preserved; duplicate recognized dimensions reject
 value-writing operations atomically.
+
+Sheet add, rename and delete keep recognized `docProps/app.xml` worksheet
+counts and title slices consistent with worksheet relationships. Chart/dialog
+tabs do not contribute to the worksheet count. Unrelated groups and properties,
+including comments and processing instructions inside changed scalars, remain
+present. Absent or unrecognized title metadata is retained byte-for-byte; no
+metadata is synthesized. Malformed recognized vectors, counts, titles or
+ambiguous relationships reject the operation atomically. A no-op rename leaves
+the original part bytes and edit tracking unchanged.
 
 ## Browser edit boundary
 

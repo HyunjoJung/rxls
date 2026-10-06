@@ -1259,6 +1259,88 @@ fn delete_sheet_dependency_repair_rolls_back_after_an_earlier_rewrite() {
 }
 
 #[test]
+fn sheet_title_lifecycle_rolls_back_late_failures_after_prior_edits() {
+    let input = sheet_delete_dependency_fixture();
+    for promoted in [false, true] {
+        for operation in 0..3 {
+            let mut rejected = 0;
+            let mut committed = 0;
+            for fail_after in 0..16 {
+                let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+                spreadsheet
+                    .set_cell_value("Keep", 3, 1, Cell::Number(9.0))
+                    .unwrap();
+                if promoted {
+                    spreadsheet.add_sheet("Earlier").unwrap();
+                }
+                let before = spreadsheet.save().unwrap();
+                let edited = spreadsheet.edited_parts().to_vec();
+                set_test_fail_commit_after(fail_after);
+                let result = match operation {
+                    0 => spreadsheet.add_sheet("New"),
+                    1 => spreadsheet.rename_sheet("Delete", "Renamed"),
+                    2 => spreadsheet.delete_sheet("Delete"),
+                    _ => unreachable!(),
+                };
+                reset_test_fail_commit();
+                if result.is_err() {
+                    rejected += 1;
+                    assert_eq!(
+                        spreadsheet.save().unwrap(),
+                        before,
+                        "op {operation}, failure {fail_after}, promoted {promoted}"
+                    );
+                    assert_eq!(spreadsheet.edited_parts(), edited);
+                } else {
+                    committed += 1;
+                    let saved = spreadsheet.save().unwrap();
+                    let reopened = Workbook::open(&saved).unwrap();
+                    let app = String::from_utf8(zip_member(&saved, "docProps/app.xml")).unwrap();
+                    let expected = match operation {
+                        0 => "New",
+                        1 => "Renamed",
+                        _ => "Keep",
+                    };
+                    assert!(reopened.sheet_names().contains(&expected));
+                    assert!(app.contains(&format!("<vt:lpstr>{expected}</vt:lpstr>")));
+                    assert_eq!(
+                        reopened.sheet_by_name("Keep").unwrap().cell(3, 1),
+                        Some(&Cell::Number(9.0))
+                    );
+                }
+            }
+            assert!(rejected >= 2, "late failure path must be exercised");
+            assert!(
+                committed > 0,
+                "bounded seam must also admit a successful operation"
+            );
+        }
+    }
+}
+
+#[test]
+fn sheet_title_insertion_respects_node_budget_and_preserves_prior_edits() {
+    let input = sheet_delete_dependency_fixture();
+    let mut spreadsheet = Spreadsheet::open(&input).unwrap();
+    spreadsheet
+        .set_cell_value("Keep", 3, 1, Cell::Number(9.0))
+        .unwrap();
+    let before = spreadsheet.save().unwrap();
+    let edited = spreadsheet.edited_parts().to_vec();
+    let app = zip_member(&before, "docProps/app.xml");
+    let nodes = XmlTree::parse(&app).unwrap().node_count();
+    // One new title element and its text need two nodes. Every earlier tree
+    // write may commit in the candidate, but the failed app insertion must
+    // leave the publicly retained package and prior edit history unchanged.
+    set_test_node_budget(nodes + 1);
+    let result = spreadsheet.add_sheet("New");
+    reset_test_node_budget();
+    assert!(result.is_err());
+    assert_eq!(spreadsheet.save().unwrap(), before);
+    assert_eq!(spreadsheet.edited_parts(), edited);
+}
+
+#[test]
 fn delete_sheet_rejects_ambiguous_and_unsafe_dependency_graphs() {
     let mut workbook = Workbook::new();
     workbook.add_sheet("First");

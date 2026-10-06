@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Kept extended worksheet-title properties coherent across package-preserving
+  sheet addition, renaming and deletion (#130). Worksheet counts and title
+  groups update together, unrelated properties and scalar comments are retained,
+  and malformed metadata rejects atomically without an empty-variant panic.
 - Corrected decimal steps in `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC` (#134),
   including `1.1`, `1.15`, halfway `1.005`, signs and negative precision.
   A bounded 15-significant-digit decimal policy avoids binary scale noise and
