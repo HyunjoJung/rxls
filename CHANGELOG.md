@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Corrected decimal steps in `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC` (#134),
+  including `1.1`, `1.15`, halfway `1.005`, signs and negative precision.
+  A bounded 15-significant-digit decimal policy avoids binary scale noise and
+  intermediate overflow; unsupported extreme precision still returns `#NUM!`.
 - Distinguished literal arguments from single-cell, range and named references
   in formula aggregates (#133). Referenced text/booleans are omitted by numeric
   reducers, invalid direct text returns `#VALUE!`, and `COUNT` ignores errors.

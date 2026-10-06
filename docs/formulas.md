@@ -86,6 +86,19 @@ These scalar conditional and unary paths accept actual one-cell ranges;
 selected multi-cell or whole-axis arrays return `ArraySemantics`, even when
 only one value is stored. Direct bounded range aggregates remain supported.
 
+The next-release source also rounds `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC`
+using a bounded 15-significant-digit decimal coefficient before applying the
+requested decimal step. Nearest ties round away from zero; `ROUNDUP` moves away
+and `ROUNDDOWN`/`TRUNC` move toward zero. This removes binary scaling noise while
+retaining genuine 15-digit offsets. Fractional precision truncates toward zero;
+`TRUNC` defaults to zero digits. Precisions whose binary `10^digits` is infinite
+or zero (including `+/-400`) return `#NUM!`, retaining the existing engine bound.
+Decimal normalization or final-result overflow also returns `#NUM!` (including
+rounding `f64::MAX` at zero digits); no nonfinite result is emitted.
+This policy applies to rounding functions; general arithmetic and literal
+parsing still use binary64, and full Excel arithmetic compensation is outside
+the subset.
+
 ## Batch evaluation (core 0.1.4)
 
 The source API has this signature (`Result` here is `std::result::Result`):
