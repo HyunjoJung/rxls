@@ -189,6 +189,13 @@ Coordinate limits follow XLSX: rows are zero-based through 1,048,575 and columns
 through 16,383. Public methods return typed errors for invalid sheets,
 coordinates, relationships, or unsupported package state.
 
+Cell replacement and clearing must cover an entire shared or array formula
+group. Use `set_cell_range_values` or `clear_range` for a group spanning several
+cells; a single-cell replacement is accepted only for a one-cell group.
+Malformed, incomplete, ambiguous, or namespace-prefixed group metadata is
+rejected before package mutation. Unknown namespace children are preserved.
+Cache-only updates preserve formula nodes and may refresh individual members.
+
 ## Browser edit boundary
 
 This is the separately versioned **`@rxls/render-worker` 0.3.0** surface, not a
