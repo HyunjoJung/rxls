@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use rxls::{DisplayCell, Sheet, Workbook};
 
@@ -195,18 +196,17 @@ impl ViewportAxis {
     }
 }
 
-/// Geometry bound by immutable borrows to its exact source and render options.
-///
-/// Sparse baseline runs and one global automatic measurement avoid source-row
-/// expansion. Complete intersecting automatic-height merge row spans are required.
-/// Explicit and display Used source selections share the same geometry; tiles
-/// materialize only their visible axes and bounded nonlocal text/merge owners.
-/// Worker revision/owned-handle storage remains separate.
+#[derive(Debug, Clone, Copy)]
+struct PreparedSourceIndexStats {
+    raw_cells: u64,
+    hyperlinks: u64,
+    build_peak_bytes: u64,
+}
+
+// Nonborrowing geometry is private: only preparation and its exact immutable
+// owner can attach this state to a source. Its vectors are moved, never cloned.
 #[derive(Debug)]
-pub struct PreparedViewport<'a> {
-    sheet: &'a Sheet,
-    sheet_index: usize,
-    options: &'a RenderOptions,
+struct PreparedViewportState {
     limits: ViewportLimits,
     source_range: RenderRange,
     rows: ViewportAxis,
@@ -217,37 +217,199 @@ pub struct PreparedViewport<'a> {
     digit_width: Fixed,
     preparation_report: ViewportPreparationReport,
     paint_merges: Vec<PreparedPaintMerge>,
+    index_stats: PreparedSourceIndexStats,
+}
+
+// Keeping the owning variant inline preserves existing preparation allocation
+// accounting. The borrowed variant creates no per-query geometry allocation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum PreparedStateStorage<'a> {
+    Owned(PreparedViewportState),
+    Borrowed(&'a PreparedViewportState),
+}
+
+/// Geometry bound by immutable borrows to its exact source and render options.
+///
+/// Sparse baseline runs and one global automatic measurement avoid source-row
+/// expansion. Complete intersecting automatic-height merge row spans are required.
+/// Explicit and display Used source selections share the same geometry; tiles
+/// materialize only their visible axes and bounded nonlocal text/merge owners.
+/// An owned preparation can lend this same facade without repeating preparation.
+#[derive(Debug)]
+pub struct PreparedViewport<'a> {
+    sheet: &'a Sheet,
+    sheet_index: usize,
+    options: &'a RenderOptions,
+    storage: PreparedStateStorage<'a>,
     source_index: PreparedSourceIndex<'a>,
 }
 
 impl PreparedViewport<'_> {
+    fn state(&self) -> &PreparedViewportState {
+        match &self.storage {
+            PreparedStateStorage::Owned(state) => state,
+            PreparedStateStorage::Borrowed(state) => state,
+        }
+    }
+
+    fn owned_state_mut(&mut self) -> Result<&mut PreparedViewportState, ViewportError> {
+        match &mut self.storage {
+            PreparedStateStorage::Owned(state) => Ok(state),
+            PreparedStateStorage::Borrowed(_) => unsupported("borrowed_preparation_is_immutable"),
+        }
+    }
+
+    fn into_owned_state(self) -> Result<PreparedViewportState, ViewportError> {
+        match self.storage {
+            PreparedStateStorage::Owned(state) => Ok(state),
+            PreparedStateStorage::Borrowed(_) => unsupported("borrowed_preparation_is_immutable"),
+        }
+    }
+
     /// Work and diagnostics performed once, separately from each tile's report.
     pub fn preparation_report(&self) -> &ViewportPreparationReport {
-        &self.preparation_report
+        &self.state().preparation_report
     }
     /// Complete prepared source range.
     pub fn source_range(&self) -> RenderRange {
-        self.source_range
+        self.state().source_range
     }
     /// Compressed row prefixes and heights.
     pub fn rows(&self) -> &ViewportAxis {
-        &self.rows
+        &self.state().rows
     }
     /// Compressed logical-order column prefixes and widths.
     pub fn columns(&self) -> &ViewportAxis {
-        &self.columns
+        &self.state().columns
     }
     /// Accounted retained vector capacity bytes.
     pub fn geometry_bytes(&self) -> u64 {
-        self.geometry_bytes
+        self.state().geometry_bytes
     }
     /// Charged geometry, metadata, candidate and reserved span work during preparation.
     pub fn coordinate_visits(&self) -> u64 {
-        self.coordinate_visits
+        self.state().coordinate_visits
     }
     /// Whether global sparse automatic-height measurement was required.
     pub fn automatic_measurement(&self) -> bool {
-        self.automatic_measurement
+        self.state().automatic_measurement
+    }
+}
+
+/// Immutable preparation that retains its exact workbook and rendering options.
+///
+/// Factories use the borrowed preparation builders and move their private geometry
+/// into this owner. Tiles borrow that geometry and the retained source; no workbook,
+/// axis or merge vectors are cloned and no self-referential lifetime is needed.
+/// Changes to a caller's workbook/options require a fresh preparation.
+#[derive(Debug)]
+pub struct OwnedPreparedViewport {
+    workbook: Arc<Workbook>,
+    sheet_index: usize,
+    options: Arc<RenderOptions>,
+    state: PreparedViewportState,
+}
+
+impl OwnedPreparedViewport {
+    /// Prepare an explicit source range against retained immutable handles.
+    /// Failed preparation publishes no owner and preserves caller-held snapshots.
+    pub fn prepare(
+        workbook: Arc<Workbook>,
+        sheet_index: usize,
+        source_range: RenderRange,
+        options: Arc<RenderOptions>,
+        limits: ViewportLimits,
+    ) -> Result<Self, ViewportError> {
+        let state = prepare_viewport(&workbook, sheet_index, source_range, &options, limits)?
+            .into_owned_state()?;
+        Ok(Self {
+            workbook,
+            sheet_index,
+            options,
+            state,
+        })
+    }
+
+    /// Prepare the sparse display Used selection against retained immutable handles.
+    /// Empty Used returns None without retaining an owner; errors remain typed.
+    pub fn prepare_used(
+        workbook: Arc<Workbook>,
+        sheet_index: usize,
+        options: Arc<RenderOptions>,
+        limits: ViewportLimits,
+    ) -> Result<Option<Self>, ViewportError> {
+        let prepared = prepare_used_viewport(&workbook, sheet_index, &options, limits)?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        let state = prepared.into_owned_state()?;
+        Ok(Some(Self {
+            workbook,
+            sheet_index,
+            options,
+            state,
+        }))
+    }
+
+    /// Exact workbook snapshot retained by this preparation.
+    pub fn workbook(&self) -> &Arc<Workbook> {
+        &self.workbook
+    }
+
+    /// Index of the prepared sheet within the retained workbook.
+    pub fn sheet_index(&self) -> usize {
+        self.sheet_index
+    }
+
+    /// Exact rendering options, including the verified font pack, retained here.
+    pub fn options(&self) -> &Arc<RenderOptions> {
+        &self.options
+    }
+
+    /// Cumulative diagnostics/work performed once, separately from tile reports.
+    pub fn preparation_report(&self) -> &ViewportPreparationReport {
+        &self.state.preparation_report
+    }
+
+    /// Complete prepared source range.
+    pub fn source_range(&self) -> RenderRange {
+        self.state.source_range
+    }
+
+    /// Compressed row prefixes and heights, without cloning their runs.
+    pub fn rows(&self) -> &ViewportAxis {
+        &self.state.rows
+    }
+
+    /// Compressed logical-order column prefixes and widths, without cloning runs.
+    pub fn columns(&self) -> &ViewportAxis {
+        &self.state.columns
+    }
+
+    /// Lend the existing viewport API bound only to this owner's source/options.
+    /// This performs no preparation, allocation, source reindexing or vector clone.
+    /// The fallible signature retains checked sheet access at the ownership seam.
+    pub fn as_prepared(&self) -> Result<PreparedViewport<'_>, ViewportError> {
+        let sheet = self.workbook.sheets.get(self.sheet_index).ok_or(
+            RenderError::SheetIndexOutOfRange {
+                requested: self.sheet_index,
+                sheet_count: self.workbook.sheets.len(),
+            },
+        )?;
+        let stats = self.state.index_stats;
+        Ok(PreparedViewport {
+            sheet,
+            sheet_index: self.sheet_index,
+            options: &self.options,
+            storage: PreparedStateStorage::Borrowed(&self.state),
+            source_index: PreparedSourceIndex {
+                sheet,
+                raw_cells: stats.raw_cells,
+                hyperlinks: stats.hyperlinks,
+                build_peak_bytes: stats.build_peak_bytes,
+            },
+        })
     }
 }
 
@@ -455,20 +617,28 @@ fn prepare_sheet_viewport_inner<'a>(
     preparation_report.source_raw_cells = source_index.raw_cells;
     preparation_report.source_hyperlinks = source_index.hyperlinks;
     preparation_report.source_index_build_peak_bytes = source_index.build_peak_bytes;
+    let index_stats = PreparedSourceIndexStats {
+        raw_cells: source_index.raw_cells,
+        hyperlinks: source_index.hyperlinks,
+        build_peak_bytes: source_index.build_peak_bytes,
+    };
     Ok(PreparedViewport {
         sheet,
         sheet_index,
         options,
-        limits,
-        source_range,
-        rows,
-        columns,
-        geometry_bytes: budget.geometry_bytes,
-        coordinate_visits: budget.visits,
-        automatic_measurement: automatic,
-        digit_width,
-        preparation_report,
-        paint_merges,
+        storage: PreparedStateStorage::Owned(PreparedViewportState {
+            limits,
+            source_range,
+            rows,
+            columns,
+            geometry_bytes: budget.geometry_bytes,
+            coordinate_visits: budget.visits,
+            automatic_measurement: automatic,
+            digit_width,
+            preparation_report,
+            paint_merges,
+            index_stats,
+        }),
         source_index,
     })
 }
@@ -493,12 +663,12 @@ pub fn render_viewport_tile(
         .x
         .checked_add(requested.width)
         .ok_or(RenderError::CoordinateOverflow)?
-        .min(prepared.columns.extent);
+        .min(prepared.state().columns.extent);
     let bottom = requested
         .y
         .checked_add(requested.height)
         .ok_or(RenderError::CoordinateOverflow)?
-        .min(prepared.rows.extent);
+        .min(prepared.state().rows.extent);
     if right <= requested.x || bottom <= requested.y {
         return Ok(None);
     }
@@ -1527,7 +1697,10 @@ mod tests {
         .unwrap();
         assert_eq!(tile.report.merged_regions, 1);
         assert_eq!(tile.report.visible_rows, 1);
-        assert_eq!(prepared.paint_merges[0].rect.height, prepared.rows.extent);
+        assert_eq!(
+            prepared.state().paint_merges[0].rect.height,
+            prepared.state().rows.extent
+        );
     }
 
     #[test]
@@ -1750,11 +1923,12 @@ pub fn prepare_sheet_used_viewport<'a>(
         budget,
         source_index,
     )?;
-    prepared.geometry_bytes = prepared
+    let state = prepared.owned_state_mut()?;
+    state.geometry_bytes = state
         .geometry_bytes
         .checked_sub(active_bytes)
         .ok_or(RenderError::CoordinateOverflow)?;
-    prepared.preparation_report.geometry_bytes = prepared.geometry_bytes;
+    state.preparation_report.geometry_bytes = state.geometry_bytes;
     Ok(Some(prepared))
 }
 
@@ -1973,7 +2147,7 @@ fn merge_at<'a>(
     col: u16,
     budget: &mut Budget,
 ) -> Result<Option<&'a PreparedPaintMerge>, ViewportError> {
-    for merge in &prepared.paint_merges {
+    for merge in &prepared.state().paint_merges {
         budget.visit()?;
         if row >= merge.range.first_row
             && row <= merge.range.last_row
@@ -2009,8 +2183,8 @@ fn ordinary_geometry(
     col: u16,
 ) -> Result<SparseCellGeometry, ViewportError> {
     let rect = source_rect(
-        &prepared.rows,
-        &prepared.columns,
+        &prepared.state().rows,
+        &prepared.state().columns,
         RenderRange::new(row, col, row, col),
         prepared.sheet.sheet_view().right_to_left,
     )?;
@@ -2042,7 +2216,7 @@ fn set_spill_bounds(
     }
     let row = geometry.source.row;
     let mut left = Fixed::ZERO;
-    let mut right = prepared.columns.extent;
+    let mut right = prepared.state().columns.extent;
     let owner_left = geometry.rect.x;
     let owner_right = owner_left
         .checked_add(geometry.rect.width)
@@ -2055,7 +2229,7 @@ fn set_spill_bounds(
         }
         if cell.col == geometry.source.col
             || cell.formatted.is_empty()
-            || !prepared.columns.run(u32::from(cell.col))?.included
+            || !prepared.state().columns.run(u32::from(cell.col))?.included
         {
             continue;
         }
@@ -2083,7 +2257,7 @@ fn set_spill_bounds(
             right = right.min(rect.x);
         }
     }
-    for merge in &prepared.paint_merges {
+    for merge in &prepared.state().paint_merges {
         budget.visit()?;
         if row < merge.range.first_row || row > merge.range.last_row {
             continue;
@@ -2133,7 +2307,7 @@ fn sparse_tile_build(
     window: Rect,
 ) -> Result<SparseTileBuild, ViewportError> {
     let options = prepared.options;
-    let mut budget = Budget::new(prepared.limits);
+    let mut budget = Budget::new(prepared.state().limits);
     let right = window
         .x
         .checked_add(window.width)
@@ -2143,7 +2317,7 @@ fn sparse_tile_build(
         .checked_add(window.height)
         .ok_or(RenderError::CoordinateOverflow)?;
     let rows = materialize_window::<u32>(
-        &prepared.rows,
+        &prepared.state().rows,
         window.y,
         bottom,
         options.limits.max_rows,
@@ -2153,11 +2327,13 @@ fn sparse_tile_build(
     let (first_x, end_x) = if rtl {
         (
             prepared
+                .state()
                 .columns
                 .extent
                 .checked_sub(right)
                 .ok_or(RenderError::CoordinateOverflow)?,
             prepared
+                .state()
                 .columns
                 .extent
                 .checked_sub(window.x)
@@ -2167,7 +2343,7 @@ fn sparse_tile_build(
         (window.x, right)
     };
     let mut columns = materialize_window::<u16>(
-        &prepared.columns,
+        &prepared.state().columns,
         first_x,
         end_x,
         options.limits.max_columns,
@@ -2191,17 +2367,17 @@ fn sparse_tile_build(
     // Expand by the shared maximum border paint outset, not a track count.
     // Multiple narrow positive tracks may fit inside this bounded margin;
     // prefix queries still jump omitted zero gaps and preserve the final clip.
-    let (halo_y, halo_bottom) = halo_interval(window.y, bottom, prepared.rows.extent)?;
-    let (halo_x, halo_right) = halo_interval(first_x, end_x, prepared.columns.extent)?;
+    let (halo_y, halo_bottom) = halo_interval(window.y, bottom, prepared.state().rows.extent)?;
+    let (halo_x, halo_right) = halo_interval(first_x, end_x, prepared.state().columns.extent)?;
     let halo_row_slots = materialize_window::<u32>(
-        &prepared.rows,
+        &prepared.state().rows,
         halo_y,
         halo_bottom,
         options.limits.max_rows,
         &mut budget,
     )?;
     let halo_column_slots = materialize_window::<u16>(
-        &prepared.columns,
+        &prepared.state().columns,
         halo_x,
         halo_right,
         options.limits.max_columns,
@@ -2231,11 +2407,17 @@ fn sparse_tile_build(
             .index,
         halo_last_col,
     );
-    let paint_bounds = source_rect(&prepared.rows, &prepared.columns, halo_range, rtl)?;
+    let paint_bounds = source_rect(
+        &prepared.state().rows,
+        &prepared.state().columns,
+        halo_range,
+        rtl,
+    )?;
     if rtl {
         for column in &mut columns {
             budget.visit()?;
             column.offset = prepared
+                .state()
                 .columns
                 .extent
                 .checked_sub(column.offset)
@@ -2248,8 +2430,8 @@ fn sparse_tile_build(
     let candidates = collect_prepared_tile_candidates(
         &prepared.source_index,
         &rows,
-        prepared.source_range.first_col,
-        prepared.source_range.last_col,
+        prepared.state().source_range.first_col,
+        prepared.state().source_range.last_col,
         options,
         &mut budget,
     )?;
@@ -2268,14 +2450,14 @@ fn sparse_tile_build(
             )?;
         }
     }
-    for merge in &prepared.paint_merges {
+    for merge in &prepared.state().paint_merges {
         budget.visit()?;
         if !positive_intersection(merge.rect, paint_bounds)? {
             continue;
         }
         let anchor_rect = source_rect(
-            &prepared.rows,
-            &prepared.columns,
+            &prepared.state().rows,
+            &prepared.state().columns,
             RenderRange::new(
                 merge.range.first_row,
                 merge.range.first_col,
@@ -2311,8 +2493,8 @@ fn sparse_tile_build(
     for cell in &candidates {
         budget.visit()?;
         if !viewport_text_overflows(cell.value)
-            || !prepared.rows.run(cell.row)?.included
-            || !prepared.columns.run(u32::from(cell.col))?.included
+            || !prepared.state().rows.run(cell.row)?.included
+            || !prepared.state().columns.run(u32::from(cell.col))?.included
             || merge_at(prepared, cell.row, cell.col, &mut budget)?.is_some()
         {
             continue;
@@ -2368,8 +2550,8 @@ fn sparse_tile_build(
     let complete_bounds = Rect {
         x: Fixed::ZERO,
         y: Fixed::ZERO,
-        width: prepared.columns.extent,
-        height: prepared.rows.extent,
+        width: prepared.state().columns.extent,
+        height: prepared.state().rows.extent,
     };
     let build = build_sheet_scene_sparse_viewport(
         prepared.sheet,
@@ -2381,7 +2563,7 @@ fn sparse_tile_build(
             cells: &geometry,
             window,
             complete_bounds,
-            digit_width: prepared.digit_width,
+            digit_width: prepared.state().digit_width,
             range,
         },
     )?;
@@ -2443,8 +2625,8 @@ mod sparse_scene_tests {
         assert!(report.text_work > 0);
         assert!(!report.font_faces.is_empty());
         assert!(report.conditional_evaluations > 0);
-        let (y, height) = prepared.rows.track(6_000).unwrap();
-        let width = prepared.columns.extent;
+        let (y, height) = prepared.state().rows.track(6_000).unwrap();
+        let width = prepared.state().columns.extent;
         let tile = render_viewport_tile(
             &prepared,
             Rect {
@@ -2488,8 +2670,8 @@ mod sparse_scene_tests {
             ViewportLimits::default(),
         )
         .unwrap();
-        assert_eq!(prepared.paint_merges.len(), 1);
-        let (x, width) = prepared.columns.track(4).unwrap();
+        assert_eq!(prepared.state().paint_merges.len(), 1);
+        let (x, width) = prepared.state().columns.track(4).unwrap();
         let tile = render_viewport_tile(
             &prepared,
             Rect {
@@ -2529,7 +2711,11 @@ mod sparse_scene_tests {
             ViewportLimits::default(),
         )
         .unwrap();
-        prepared.limits.max_coordinate_visits = 1;
+        prepared
+            .owned_state_mut()
+            .unwrap()
+            .limits
+            .max_coordinate_visits = 1;
         let error = render_viewport_tile(
             &prepared,
             Rect {
@@ -2653,5 +2839,161 @@ mod prepared_index_tests {
         assert_eq!(budget.visits, 1);
         assert_eq!(budget.geometry_bytes, 0);
         assert!(std::ptr::eq(index.sheet, &workbook.sheets[0]));
+    }
+}
+
+#[cfg(test)]
+mod owned_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn state_move_and_ephemeral_facade_keep_vectors_and_exact_source_proof() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("move-state");
+        sheet.set_default_row_height(15.0);
+        sheet.write(0, 0, "merged");
+        sheet.merge(0, 0, 3, 4);
+        let workbook = Arc::new(workbook);
+        let options = Arc::new(RenderOptions::default());
+        let borrowed = prepare_viewport(
+            &workbook,
+            0,
+            RenderRange::new(0, 0, 10, 10),
+            &options,
+            ViewportLimits::default(),
+        )
+        .unwrap();
+        let row_pointer = borrowed.rows().runs().as_ptr();
+        let column_pointer = borrowed.columns().runs().as_ptr();
+        let merge_pointer = borrowed.state().paint_merges.as_ptr();
+        let report_pointer = borrowed.preparation_report().warnings.as_ptr();
+        let state = borrowed.into_owned_state().unwrap();
+        let owner = OwnedPreparedViewport {
+            workbook,
+            sheet_index: 0,
+            options,
+            state,
+        };
+        assert_eq!(owner.rows().runs().as_ptr(), row_pointer);
+        assert_eq!(owner.columns().runs().as_ptr(), column_pointer);
+        assert_eq!(owner.state.paint_merges.as_ptr(), merge_pointer);
+        assert_eq!(owner.preparation_report().warnings.as_ptr(), report_pointer);
+        let report = owner.preparation_report().clone();
+        for _ in 0..3 {
+            let facade = owner.as_prepared().unwrap();
+            assert!(std::ptr::eq(facade.state(), &owner.state));
+            assert!(std::ptr::eq(facade.sheet, &owner.workbook.sheets[0]));
+            assert!(std::ptr::eq(facade.source_index.sheet, facade.sheet));
+            assert!(std::ptr::eq(facade.options, owner.options.as_ref()));
+            assert_eq!(
+                facade.source_index.raw_cells,
+                owner.state.index_stats.raw_cells
+            );
+            assert_eq!(
+                facade.source_index.build_peak_bytes,
+                owner.state.index_stats.build_peak_bytes
+            );
+            assert_eq!(facade.rows().runs().as_ptr(), row_pointer);
+            assert_eq!(facade.state().paint_merges.as_ptr(), merge_pointer);
+            render_viewport_tile(
+                &facade,
+                Rect {
+                    x: Fixed::ZERO,
+                    y: Fixed::ZERO,
+                    width: Fixed::from_pixels(64),
+                    height: Fixed::from_pixels(20),
+                },
+                305,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(owner.preparation_report(), &report);
+    }
+
+    #[test]
+    fn owned_font_pack_and_options_are_identical_across_borrowed_tile_facades() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("automatic-owned");
+        sheet.set_col_width(0, 2.0);
+        sheet.write_styled(
+            6_000,
+            0,
+            "long long wrapped words",
+            &rxls::CellStyle::new().wrap(),
+        );
+        let workbook = Arc::new(workbook);
+        let pack = crate::font::synthetic_test_pack();
+        let options = Arc::new(RenderOptions {
+            default_font_family: pack.default_family().to_owned(),
+            font_pack: Some(pack),
+            ..RenderOptions::default()
+        });
+        let owner = OwnedPreparedViewport::prepare(
+            Arc::clone(&workbook),
+            0,
+            RenderRange::new(0, 0, 6_000, 0),
+            Arc::clone(&options),
+            ViewportLimits::default(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(owner.workbook(), &workbook));
+        assert!(Arc::ptr_eq(owner.options(), &options));
+        let font = options.font_pack.as_ref().unwrap();
+        let report = owner.preparation_report().clone();
+        assert!(report.shaped_runs > 0 && report.text_work > 0);
+        assert!(report.source_index_build_peak_bytes > 0);
+        let row_pointer = owner.rows().runs().as_ptr();
+        let (y, height) = owner.rows().track(6_000).unwrap();
+        let rectangle = Rect {
+            x: Fixed::ZERO,
+            y,
+            width: owner.columns().extent(),
+            height,
+        };
+        let first = render_viewport_tile(&owner.as_prepared().unwrap(), rectangle, 306)
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            let facade = owner.as_prepared().unwrap();
+            assert!(std::ptr::eq(
+                facade.options.font_pack.as_ref().unwrap(),
+                font
+            ));
+            assert_eq!(facade.rows().runs().as_ptr(), row_pointer);
+            assert_eq!(facade.preparation_report(), &report);
+            assert_eq!(
+                render_viewport_tile(&facade, rectangle, 306)
+                    .unwrap()
+                    .unwrap(),
+                first
+            );
+        }
+        assert_eq!(owner.preparation_report(), &report);
+        assert_eq!(Arc::strong_count(&workbook), 2);
+        assert_eq!(Arc::strong_count(&options), 2);
+    }
+
+    #[test]
+    fn owned_facade_checks_sheet_index_instead_of_unchecked_access() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("checked").set_default_row_height(15.0);
+        let mut owner = OwnedPreparedViewport::prepare(
+            Arc::new(workbook),
+            0,
+            RenderRange::new(0, 0, 0, 0),
+            Arc::new(RenderOptions::default()),
+            ViewportLimits::default(),
+        )
+        .unwrap();
+        // Only this private test can violate the immutable owner's factory invariant.
+        owner.sheet_index = usize::MAX;
+        assert!(matches!(
+            owner.as_prepared(),
+            Err(ViewportError::Render(RenderError::SheetIndexOutOfRange {
+                requested: usize::MAX,
+                sheet_count: 1
+            }))
+        ));
     }
 }

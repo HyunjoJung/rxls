@@ -134,6 +134,31 @@ mapping used by the exact outlines and colors replayed by SVG and PNG. PNG outpu
 requires a verified font pack whenever a scene contains text, and each page is
 preflighted and rasterized independently at the requested DPI.
 
+## Viewport navigation
+
+Use `prepare_viewport` for an explicit source range or `prepare_used_viewport`
+for the sparse display Used selection. Used geometry includes retained cells,
+visible blank-cell paint and intersecting merges; it does not trust the authored
+worksheet dimension. An empty Used selection returns `None`.
+
+Call `render_viewport_tile` with a sheet-space `Rect` to render a clipped SVG.
+Coordinates use `Fixed` units (1,024 units per pixel). Give simultaneously
+embedded tiles distinct `u64` namespaces for their SVG clip IDs. Preparation
+retains compressed axes and performs global automatic-height measurement once;
+tile queries reuse the source index and preserve complete text and merge layout
+before clipping. Preparation diagnostics and each tile's report remain separate.
+
+For sessions that retain preparation between requests, use
+`OwnedPreparedViewport::prepare` or `::prepare_used` with `Arc<Workbook>` and
+`Arc<RenderOptions>`. Its `as_prepared()` facade borrows the same immutable
+snapshot and geometry without cloning the workbook or rebuilding the index.
+Prepare a new owner after changing source data, options or fonts.
+
+`ViewportLimits` bounds preparation work, axis runs, geometry bytes and logical
+dimensions; ordinary rendering limits still bound each tile's scene and output.
+Outside or fully hidden rectangles return `None`. Drawings and unsupported
+merge geometry return typed `ViewportError` values.
+
 The nested crate enables the `rxls` XLSX, XLSB, and ODS readers without the core
 CLI, so the renderer accepts every spreadsheet format supported by `rxls` while
 remaining isolated from the main crate's default dependency surface.

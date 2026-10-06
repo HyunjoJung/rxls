@@ -49,8 +49,8 @@ pub use scene::{
 pub use svg::render_scene_svg;
 pub use viewport::{
     prepare_sheet_used_viewport, prepare_sheet_viewport, prepare_used_viewport, prepare_viewport,
-    render_viewport_tile, PreparedViewport, ViewportAxis, ViewportAxisRun, ViewportError,
-    ViewportLimits, ViewportTile,
+    render_viewport_tile, OwnedPreparedViewport, PreparedViewport, ViewportAxis, ViewportAxisRun,
+    ViewportError, ViewportLimits, ViewportTile,
 };
 
 use rxls::Workbook;

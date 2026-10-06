@@ -1,12 +1,13 @@
 //! Public contracts for bounded compressed worksheet viewport geometry.
 
 use std::io::Write as _;
+use std::sync::Arc;
 
 use rxls::{CellStyle, HAlign, Image, ImageFmt, VAlign, Workbook};
 use rxls_render::{
-    prepare_viewport, render_sheet_svg, render_viewport_tile, Fixed, LimitKind, Rect, RenderError,
-    RenderOptions, RenderRange, RenderSelection, SceneNode, TextNode, ViewportError,
-    ViewportLimits,
+    prepare_viewport, render_sheet_svg, render_viewport_tile, Fixed, LimitKind,
+    OwnedPreparedViewport, Rect, RenderError, RenderOptions, RenderRange, RenderSelection,
+    SceneNode, TextNode, ViewportError, ViewportLimits,
 };
 use zip::write::SimpleFileOptions;
 
@@ -1251,4 +1252,241 @@ fn thick_and_double_border_outset_reaches_beyond_one_narrow_imported_track() {
             }
         }
     }
+}
+
+#[test]
+fn owned_preparation_survives_caller_handles_and_reuses_exact_geometry() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("retained");
+    sheet.set_default_row_height(15.0);
+    sheet.write(0, 0, "retained label");
+    sheet.write_number(5_000, 10, 22);
+    let workbook = Arc::new(workbook);
+    let range = RenderRange::new(0, 0, 5_000, 10);
+    let options = Arc::new(options(range));
+    let expected = {
+        let borrowed =
+            prepare_viewport(&workbook, 0, range, &options, ViewportLimits::default()).unwrap();
+        render_viewport_tile(&borrowed, rect(0, 0, 128, 40), 301)
+            .unwrap()
+            .unwrap()
+    };
+    let owner = OwnedPreparedViewport::prepare(
+        Arc::clone(&workbook),
+        0,
+        range,
+        Arc::clone(&options),
+        ViewportLimits::default(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(owner.workbook(), &workbook));
+    assert!(Arc::ptr_eq(owner.options(), &options));
+    assert_eq!(owner.sheet_index(), 0);
+    assert_eq!(Arc::strong_count(&workbook), 2);
+    assert_eq!(Arc::strong_count(&options), 2);
+    let workbook_weak = Arc::downgrade(&workbook);
+    let options_weak = Arc::downgrade(&options);
+    let report = owner.preparation_report().clone();
+    let rows_pointer = owner.rows().runs().as_ptr();
+    let columns_pointer = owner.columns().runs().as_ptr();
+    drop(workbook);
+    drop(options);
+    assert_eq!(workbook_weak.strong_count(), 1);
+    assert_eq!(options_weak.strong_count(), 1);
+    for _ in 0..3 {
+        let facade = owner.as_prepared().unwrap();
+        assert_eq!(facade.rows().runs().as_ptr(), rows_pointer);
+        assert_eq!(facade.columns().runs().as_ptr(), columns_pointer);
+        assert_eq!(facade.preparation_report(), &report);
+        assert_eq!(
+            render_viewport_tile(&facade, rect(0, 0, 128, 40), 301)
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(workbook_weak.strong_count(), 1);
+        assert_eq!(options_weak.strong_count(), 1);
+    }
+    assert_eq!(owner.preparation_report(), &report);
+    drop(owner);
+    assert!(workbook_weak.upgrade().is_none());
+    assert!(options_weak.upgrade().is_none());
+}
+
+#[test]
+fn owned_preparation_keeps_its_original_snapshot_after_caller_edits() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("snapshot").set_default_row_height(15.0);
+    workbook.sheets[0].write(0, 0, "original");
+    let mut workbook = Arc::new(workbook);
+    let range = RenderRange::new(0, 0, 0, 1);
+    let mut options = Arc::new(options(range));
+    let owner = OwnedPreparedViewport::prepare(
+        Arc::clone(&workbook),
+        0,
+        range,
+        Arc::clone(&options),
+        ViewportLimits::default(),
+    )
+    .unwrap();
+    let before = render_viewport_tile(&owner.as_prepared().unwrap(), rect(0, 0, 128, 20), 302)
+        .unwrap()
+        .unwrap();
+    Arc::make_mut(&mut workbook).sheets[0].write(0, 0, "replacement");
+    Arc::make_mut(&mut options).horizontal_padding = Fixed::from_pixels(10);
+    assert!(!Arc::ptr_eq(owner.workbook(), &workbook));
+    assert!(!Arc::ptr_eq(owner.options(), &options));
+    assert_eq!(
+        render_viewport_tile(&owner.as_prepared().unwrap(), rect(0, 0, 128, 20), 302)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let replacement =
+        OwnedPreparedViewport::prepare(workbook, 0, range, options, ViewportLimits::default())
+            .unwrap();
+    let after = render_viewport_tile(
+        &replacement.as_prepared().unwrap(),
+        rect(0, 0, 128, 20),
+        302,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(text(&before.scene.nodes, "original").is_some());
+    assert!(text(&after.scene.nodes, "replacement").is_some());
+    assert_ne!(before.svg, after.svg);
+}
+
+#[test]
+fn owned_used_empty_and_invalid_sheet_publish_no_retained_owner() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("empty").set_default_row_height(15.0);
+    workbook.sheets[0].write_blank_styled(9, 9, &CellStyle::new().bold());
+    let workbook = Arc::new(workbook);
+    let options = Arc::new(RenderOptions::default());
+    assert!(OwnedPreparedViewport::prepare_used(
+        Arc::clone(&workbook),
+        0,
+        Arc::clone(&options),
+        ViewportLimits::default(),
+    )
+    .unwrap()
+    .is_none());
+    let expected = ViewportError::Render(RenderError::SheetIndexOutOfRange {
+        requested: 1,
+        sheet_count: 1,
+    });
+    assert_eq!(
+        OwnedPreparedViewport::prepare(
+            Arc::clone(&workbook),
+            1,
+            RenderRange::new(0, 0, 0, 0),
+            Arc::clone(&options),
+            ViewportLimits::default(),
+        )
+        .unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        OwnedPreparedViewport::prepare_used(
+            Arc::clone(&workbook),
+            1,
+            Arc::clone(&options),
+            ViewportLimits::default(),
+        )
+        .unwrap_err(),
+        expected
+    );
+    assert_eq!(Arc::strong_count(&workbook), 1);
+    assert_eq!(Arc::strong_count(&options), 1);
+}
+
+#[test]
+fn failed_owned_factory_preserves_prior_owner_and_input_arc_counts() {
+    let mut workbook = Workbook::new();
+    workbook.add_sheet("atomic").set_default_row_height(15.0);
+    workbook.sheets[0].write_number(0, 0, 77);
+    let workbook = Arc::new(workbook);
+    let range = RenderRange::new(0, 0, 0, 0);
+    let options = Arc::new(options(range));
+    let owner = OwnedPreparedViewport::prepare(
+        Arc::clone(&workbook),
+        0,
+        range,
+        Arc::clone(&options),
+        ViewportLimits::default(),
+    )
+    .unwrap();
+    let before = render_viewport_tile(&owner.as_prepared().unwrap(), rect(0, 0, 64, 20), 303)
+        .unwrap()
+        .unwrap();
+    let report = owner.preparation_report().clone();
+    let limits = ViewportLimits {
+        max_coordinate_visits: 0,
+        ..ViewportLimits::default()
+    };
+    let expected = prepare_viewport(&workbook, 0, range, &options, limits).unwrap_err();
+    assert_eq!(
+        OwnedPreparedViewport::prepare(
+            Arc::clone(&workbook),
+            0,
+            range,
+            Arc::clone(&options),
+            limits,
+        )
+        .unwrap_err(),
+        expected
+    );
+    assert_eq!(OwnedPreparedViewport::prepare_used(
+        Arc::clone(&workbook), 0, Arc::clone(&options), limits,
+    ).unwrap_err(), expected);
+    assert_eq!(Arc::strong_count(&workbook), 2);
+    assert_eq!(Arc::strong_count(&options), 2);
+    assert_eq!(owner.preparation_report(), &report);
+    assert_eq!(
+        render_viewport_tile(&owner.as_prepared().unwrap(), rect(0, 0, 64, 20), 303)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn owned_used_factory_matches_borrowed_extent_report_and_tile() {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_sheet("used-owner");
+    sheet.set_default_row_height(15.0);
+    sheet.write(2, 3, "merge anchor");
+    sheet.merge(2, 3, 4, 5);
+    sheet.write_blank_styled(7, 8, &CellStyle::new().fill(rxls::Color::rgb(7, 8, 9)));
+    sheet.hide_row(7);
+    let workbook = Arc::new(workbook);
+    let options = Arc::new(RenderOptions {
+        selection: RenderSelection::Used,
+        ..RenderOptions::default()
+    });
+    let borrowed =
+        rxls_render::prepare_used_viewport(&workbook, 0, &options, ViewportLimits::default())
+            .unwrap()
+            .unwrap();
+    let owner = OwnedPreparedViewport::prepare_used(
+        Arc::clone(&workbook),
+        0,
+        Arc::clone(&options),
+        ViewportLimits::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(owner.source_range(), borrowed.source_range());
+    assert_eq!(owner.preparation_report(), borrowed.preparation_report());
+    assert_eq!(owner.rows(), borrowed.rows());
+    assert_eq!(owner.columns(), borrowed.columns());
+    assert_eq!(
+        render_viewport_tile(&owner.as_prepared().unwrap(), rect(0, 0, 128, 60), 304)
+            .unwrap()
+            .unwrap(),
+        render_viewport_tile(&borrowed, rect(0, 0, 128, 60), 304)
+            .unwrap()
+            .unwrap()
+    );
 }
