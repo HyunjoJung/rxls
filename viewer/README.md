@@ -36,6 +36,23 @@ a visible warning; this is not full Excel recalculation. Save downloads a new
 XLSX/XLSM copy and never overwrites the local source file. XLS, XLSB, ODS, and
 the embedded VS Code preview remain read-only.
 
+## Navigating large sheets
+
+The current source build can display supported sparse sheets in tiles when
+whole-sheet rendering exceeds a row, column, cell, dimension, or output limit.
+Scrolling and zooming reuse prepared layout and a bounded tile cache. The first
+covering tile must finish before the sheet is reported ready; generated SVG
+still passes through the normal sanitizer.
+
+Tiled sheets are view-only. Switch to a smaller editable sheet for cell,
+property, paste, and history actions. Saving an editable XLSX/XLSM workbook copy
+remains available, including edits already made on other sheets. SVG and PNG
+exports require a complete rendered sheet and are disabled in tiled view.
+Zoom requests that exceed the browser surface limit retain the current view.
+
+This path requires the matching current-source worker and WASM build. Published
+worker versions without viewport support keep their existing rendering limits.
+
 ## Development
 
 Build the render worker first, then prepare the static inputs and start Vite:

@@ -1,6 +1,8 @@
 import { safeBaseName } from "./core.js";
 import { downloadBlob, loadImage } from "./browser-files.js";
 
+export const TILED_EXPORT_ERROR = "Full-sheet SVG/PNG export is unavailable in tiled view. Use a bounded page view or save the workbook.";
+
 const MAX_PNG_PIXELS = 16 * 1024 * 1024;
 
 /** Export the displayed sheet/page through browser downloads or the host bridge. */
@@ -17,6 +19,7 @@ export function createExportController({
   return { exportSvg, exportPng };
 
   function exportSvg(requestId = null) {
+    if (rejectTiledExport("svg", requestId)) return;
     if (!state.svgText) {
       return;
     }
@@ -38,6 +41,7 @@ export function createExportController({
   }
 
   async function exportPng(requestId = null) {
+    if (rejectTiledExport("png", requestId)) return;
     if (!state.svgElement) {
       return;
     }
@@ -91,6 +95,23 @@ export function createExportController({
       setBusy(false);
       elements["export-menu"].removeAttribute("open");
     }
+  }
+
+  function rejectTiledExport(kind, requestId) {
+    if (state.displayKind !== "tiled") return false;
+    const error = new Error(TILED_EXPORT_ERROR);
+    error.code = "tiled_export_unavailable";
+    showError(error);
+    elements["status-message"].textContent = TILED_EXPORT_ERROR;
+    // Existing bounded known-kind identity routing rejects this negative
+    // envelope before any encoder, Blob, image, canvas or save dialog runs.
+    if (host && (requestId === null ||
+        (typeof requestId === "string" && requestId.length > 0 && requestId.length <= 64))) {
+      postHostMessage({ type: "export", requestId, kind,
+        fileName: `export.${kind}`, bytes: new Uint8Array(0) });
+    }
+    elements["export-menu"].removeAttribute("open");
+    return true;
   }
 
   function exportBaseName() {

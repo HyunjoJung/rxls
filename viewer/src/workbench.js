@@ -157,6 +157,7 @@ export function createWorkbench({
       state.workbook &&
         state.editState?.capability === "read-write" &&
         !readOnly &&
+        state.displayKind !== "tiled" &&
         !state.busy &&
         !pending,
     );
@@ -209,17 +210,27 @@ export function createWorkbench({
     ui["inspector-reference"].disabled = !available;
     ui["inspector-edit"].disabled =
       !canEdit() || !loaded || !sameContext(loaded, currentContext());
-    ui["quick-save"].disabled = !canEdit();
+    ui["quick-save"].disabled = !Boolean(
+      state.workbook && state.client && !state.busy && !readOnly &&
+      state.editState?.capability === "read-write" &&
+      !editing.hasPendingMutation?.(),
+    );
     ui["reset-zoom"].disabled = !available;
     const editable = state.editState?.capability === "read-write" && !readOnly;
     ui["workbook-mode"].textContent = !state.workbook
       ? "No workbook"
+      : state.displayKind === "tiled"
+        ? state.editState?.dirty
+          ? "Tiled view · unsaved changes · save a copy"
+          : "Tiled view · read-only display"
       : !editable
         ? "Read-only"
         : state.editState.dirty
           ? "Unsaved changes · save a copy"
           : "Editing · local file";
-    ui["inspector-edit"].title = editable
+    ui["inspector-edit"].title = state.displayKind === "tiled"
+      ? "Cell editing is unavailable in tiled view"
+      : editable
       ? "Edit inspected cell"
       : "This workbook is read-only";
   }

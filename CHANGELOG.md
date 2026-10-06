@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added current-source viewer navigation for supported sparse large sheets with
+  prepared viewport tiles, bounded caching, and readiness after visible coverage.
+  Tiled view retains workbook-copy saves while restricting edits and whole-sheet
+  image exports to complete sheet view.
 - Added bounded renderer viewport preparation for explicit ranges and sparse
   display Used selections, with compressed hidden/default axes and shared
   automatic-height measurement. Tile queries reuse the source index and clip

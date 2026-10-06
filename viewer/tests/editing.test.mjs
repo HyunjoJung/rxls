@@ -118,6 +118,57 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 const readNumber = async () => ({ value: { kind: "number", value: 4 } });
 
+test("tiled display blocks every mutation while dirty XLSM save retains source bytes and dirty history", async () => {
+  let writes = 0;
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  const env = setup({ client: {
+    readCell: readNumber,
+    setCell() { writes += 1; }, setRangeAndRecalculate() { writes += 1; },
+    setDocumentProperties() { writes += 1; }, undoEdit() { writes += 1; }, redoEdit() { writes += 1; },
+    saveDocument: async () => ({ bytes }),
+  } });
+  env.state.displayKind = "tiled";
+  env.state.editState.dirty = true;
+  env.controller.updateEditUi();
+  assert.equal(env.controller.canMutateDisplayedSheet(), false);
+  assert.equal(env.controller.canPreserveWorkbook(), true);
+  for (const id of ["edit-cell", "document-properties", "undo-edit", "redo-edit"])
+    assert.equal(env.elements[id].disabled, true, id);
+  assert.equal(env.elements["save-document"].disabled, false);
+  await env.controller.openCellEditor();
+  await env.controller.openPropertiesEditor();
+  await env.controller.applyHistoryEdit("undo");
+  await env.controller.applyHistoryEdit("redo");
+  const target = { client: env.state.client, documentId: env.state.documentId, sheetIndex: 0, row: 0, col: 0 };
+  await assert.rejects(env.controller.commitCellEdit(target, { kind: "blank" }), /unavailable/);
+  await assert.rejects(env.controller.commitRangeEdit(target, [[{ kind: "blank" }]]), /unavailable/);
+  assert.equal(writes, 0);
+  await env.controller.saveWorkbookCopy();
+  assert.equal(env.calls.downloads.length, 1);
+  assert.equal(env.calls.downloads[0].name, "Quarter-edited.xlsm");
+  assert.deepEqual(new Uint8Array(await env.calls.downloads[0].blob.arrayBuffer()), bytes);
+  assert.equal(env.state.editState.dirty, true);
+  assert.equal(env.state.editState.canUndo, true);
+  env.state.displayKind = "full";
+  assert.equal(env.controller.canMutateDisplayedSheet(), true);
+});
+
+test("history and cell dialogs recheck tiled mode after an awaited draft gate", async () => {
+  for (const command of ["openCellEditor", "openPropertiesEditor", "applyHistoryEdit"]) {
+    const gate = deferred();
+    let writes = 0;
+    const env = setup({ beforeCommand: () => gate.promise,
+      client: { readCell() { writes += 1; }, undoEdit() { writes += 1; } } });
+    const pending = env.controller[command]("undo");
+    env.state.displayKind = "tiled";
+    gate.resolve(true);
+    await pending;
+    assert.equal(writes, 0, command);
+    assert.equal(env.elements["cell-dialog"].open, false);
+    assert.equal(env.elements["properties-dialog"].open, false);
+  }
+});
+
 test("every unapplied dialog field participates in discard checks without counting untouched dialogs", async () => {
   for (const [dialog, fields] of [
     [

@@ -55,6 +55,18 @@ test("Ctrl and Meta Shift+Z redo the sole undone edit at the selected grid input
   }
 });
 
+test("Ctrl and Meta history shortcuts cannot mutate a tiled read-only display", async () => {
+  for (const modifier of ["ctrlKey", "metaKey"]) {
+    for (const [key, shiftKey] of [["z", false], ["z", true], ["y", false]]) {
+      const env = await fixture(true, true);
+      env.state.displayKind = "tiled";
+      const event = await dispatch(env, { key, shiftKey, [modifier]: true });
+      assert.deepEqual(env.calls, []);
+      assert.equal(event.prevented, false);
+    }
+  }
+});
+
 test("Z history shortcuts use availability of the requested direction", async () => {
   for (const modifier of ["ctrlKey", "metaKey"]) {
     for (const canUndo of [false, true]) {

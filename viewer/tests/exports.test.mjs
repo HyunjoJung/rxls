@@ -1,7 +1,54 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createExportController } from "../src/exports.js";
+import { createExportController, TILED_EXPORT_ERROR } from "../src/exports.js";
 import { downloadBlob } from "../src/browser-files.js";
+
+test("tiled SVG and PNG fail before encoders or browser output and retain no tile bytes", async () => {
+  for (const kind of ["svg", "png"]) {
+    const { state, elements, calls } = setup();
+    state.displayKind = "tiled";
+    state.svgText = "private previous full sheet";
+    const browser = new Proxy({}, { get() { throw new Error("Browser encoder was used"); } });
+    const controller = createExportController({ state, elements, browser,
+      setBusy: () => { throw new Error("PNG busy path was entered"); },
+      showError: (error) => calls.errors.push(error),
+      postHostMessage: (message) => calls.messages.push(message),
+      download: () => { throw new Error("Download was used"); } });
+    await (kind === "svg" ? controller.exportSvg() : controller.exportPng());
+    assert.equal(calls.errors.length, 1);
+    assert.equal(calls.errors[0].message, TILED_EXPORT_ERROR);
+    assert.equal(calls.errors[0].code, "tiled_export_unavailable");
+    assert.equal(elements["status-message"].textContent, TILED_EXPORT_ERROR);
+    assert.deepEqual(calls.messages, []);
+  }
+});
+
+test("host tiled requests send only bounded negative envelopes and preserve synchronous failure status", async () => {
+  for (const kind of ["svg", "png"]) {
+    for (const requestId of [null, "pending-identity", undefined, "", "A".repeat(65), 1]) {
+      const { state, elements, calls } = setup({ host: true });
+      state.displayKind = "tiled";
+      const controller = createExportController({ state, elements, host: true,
+        browser: new Proxy({}, { get() { throw new Error("PNG path reached"); } }),
+        showError: (error) => calls.errors.push(error), setBusy() { throw new Error("Busy path reached"); },
+        postHostMessage(message) {
+          calls.messages.push(message);
+          elements["status-message"].textContent = `${kind.toUpperCase()} export failed`;
+        } });
+      // Explicit undefined invokes the public default null toolbar identity.
+      await (kind === "svg" ? controller.exportSvg(requestId) : controller.exportPng(requestId));
+      const bounded = requestId == null || requestId === "pending-identity";
+      assert.equal(calls.messages.length, bounded ? 1 : 0);
+      if (bounded) {
+        assert.equal(calls.messages[0].bytes.byteLength, 0);
+        assert.equal(calls.messages[0].fileName, `export.${kind}`);
+        assert.equal(calls.messages[0].requestId, requestId ?? null);
+        assert.equal(elements["status-message"].textContent, `${kind.toUpperCase()} export failed`);
+      }
+      assert.equal(calls.errors[0].message, TILED_EXPORT_ERROR);
+    }
+  }
+});
 
 function setup({ host = false, imageFails = false, encodingFails = false } = {}) {
   const calls = { downloads: [], messages: [], busy: [], errors: [], revoked: [], draws: [] };

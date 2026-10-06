@@ -57,6 +57,9 @@ export function createEditingController({
     hasDraftChanges,
     hasPendingMutation,
     confirmDiscardChanges,
+    canPreserveWorkbook,
+    canMutateDisplayedSheet,
+    readyForViewChange,
   };
 
   function bindEvents() {
@@ -123,13 +126,17 @@ export function createEditingController({
     const editState = state.editState;
     const editable = editState?.capability === "read-write";
     const hostReadOnly = Boolean(state.workbook && readOnly);
-    const available = Boolean(
-      state.workbook && editable && !state.busy && !readOnly,
-    );
+    const available = canMutateDisplayedSheet();
+    const preservation = canPreserveWorkbook();
     const sourceReadOnly = Boolean(
       state.workbook && !editable && !hostReadOnly,
     );
-    const reason = sourceReadOnly ? editReasonLabel(editState?.reason) : null;
+    const sourceReason = sourceReadOnly ? editReasonLabel(editState?.reason) : null;
+    const reason = state.displayKind === "tiled"
+      ? editable && !hostReadOnly
+        ? "Tiled view is read-only. Save a copy to preserve workbook edits."
+        : `Tiled view is read-only.${sourceReason ? ` ${sourceReason}` : ""}`
+      : sourceReason;
     const status = hostReadOnly
       ? "Read-only"
       : editable
@@ -151,7 +158,7 @@ export function createEditingController({
     elements["document-properties"].disabled = !available;
     elements["undo-edit"].disabled = !available || !editState.canUndo;
     elements["redo-edit"].disabled = !available || !editState.canRedo;
-    elements["save-document"].disabled = !available;
+    elements["save-document"].disabled = !preservation;
     for (const control of [
       elements["edit-cell"],
       elements["document-properties"],
@@ -182,7 +189,7 @@ export function createEditingController({
     if (state.busy || hasPendingMutation()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     if (elements["cell-dialog"].open) return;
@@ -225,7 +232,7 @@ export function createEditingController({
   }
 
   async function loadCellIntoEditor() {
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     if (
@@ -345,7 +352,7 @@ export function createEditingController({
     const dialogOpen = elements["cell-dialog"].open;
     const loaded = sameCellTarget(editing.cellReadTarget, currentCellTarget());
     const ready =
-      dialogOpen && canEditWorkbook() && loaded && !editing.cellReadPending;
+      dialogOpen && canMutateDisplayedSheet() && loaded && !editing.cellReadPending;
     const valuesDisabled = !ready || editing.cellEditPending;
     for (const control of [
       elements["cell-kind"],
@@ -359,7 +366,7 @@ export function createEditingController({
     elements["cell-reference"].disabled = editing.cellEditPending;
     elements["read-cell"].disabled =
       !dialogOpen ||
-      !canEditWorkbook() ||
+      !canMutateDisplayedSheet() ||
       editing.cellReadPending ||
       editing.cellEditPending;
     elements["apply-cell-edit"].disabled = !ready || editing.cellEditPending;
@@ -379,7 +386,7 @@ export function createEditingController({
 
   async function submitCellEdit(event) {
     event.preventDefault();
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     const target = currentTarget();
@@ -426,7 +433,7 @@ export function createEditingController({
     if (state.busy || hasPendingMutation()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     if (elements["properties-dialog"].open) return;
@@ -454,7 +461,7 @@ export function createEditingController({
 
   async function submitPropertiesEdit(event) {
     event.preventDefault();
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     const target = currentTarget();
@@ -493,7 +500,7 @@ export function createEditingController({
     if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     mutationPending = target;
@@ -678,7 +685,7 @@ export function createEditingController({
   }
 
   async function commitMutation(target, apply, message) {
-    if (!canEditWorkbook() || hasPendingMutation()) {
+    if (!canMutateDisplayedSheet() || hasPendingMutation()) {
       throw new Error(
         "Cell editing is unavailable while the workbook is read-only or busy.",
       );
@@ -754,7 +761,7 @@ export function createEditingController({
     if (beforeCommand && !(await beforeCommand())) return;
     if (
       !isCurrentTarget(target) ||
-      !canEditWorkbook() ||
+      !canPreserveWorkbook() ||
       rejectUnappliedDrafts()
     ) {
       return;
@@ -784,7 +791,15 @@ export function createEditingController({
     }
   }
 
-  function canEditWorkbook() {
+  function canMutateDisplayedSheet() {
+    return canPreserveWorkbook() && state.displayKind !== "tiled";
+  }
+
+  function readyForViewChange() {
+    return !hasPendingMutation() && !rejectUnappliedDrafts();
+  }
+
+  function canPreserveWorkbook() {
     return Boolean(
       !readOnly &&
         !hasPendingMutation() &&
