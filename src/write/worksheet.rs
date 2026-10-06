@@ -216,6 +216,85 @@ fn push_col_record(body: &mut String, budget: &mut usize, emitted: &mut bool, xm
     true
 }
 
+struct ColumnRun {
+    first: u16,
+    last: u16,
+    attributes: String,
+}
+
+/// Coalesce adjacent resolved column records while retaining only one run.
+/// ISO/IEC 29500-1 §18.3.1.13: min/max select the inclusive column interval.
+/// All other serialized attributes must match exactly, including presence.
+struct ColumnRuns<'a> {
+    body: String,
+    budget: &'a mut usize,
+    emitted: bool,
+    pending: Option<ColumnRun>,
+    failed: bool,
+}
+
+impl<'a> ColumnRuns<'a> {
+    fn new(budget: &'a mut usize) -> Self {
+        Self {
+            body: String::new(),
+            budget,
+            emitted: false,
+            pending: None,
+            failed: false,
+        }
+    }
+
+    fn push(&mut self, first: u16, last: u16, attributes: String) -> bool {
+        if self.failed {
+            return false;
+        }
+        if let Some(run) = self.pending.as_mut() {
+            if run.last.checked_add(1) == Some(first) && run.attributes == attributes {
+                run.last = last;
+                return true;
+            }
+        }
+        if !self.flush() {
+            return false;
+        }
+        self.pending = Some(ColumnRun {
+            first,
+            last,
+            attributes,
+        });
+        true
+    }
+
+    fn flush(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        let Some(run) = self.pending.take() else {
+            return true;
+        };
+        let xml = format!(
+            r#"<col min="{}" max="{}"{}/>"#,
+            run.first, run.last, run.attributes
+        );
+        if !push_col_record(&mut self.body, self.budget, &mut self.emitted, xml) {
+            self.failed = true;
+            return false;
+        }
+        true
+    }
+
+    fn finish(mut self) -> String {
+        self.flush();
+        if !self.emitted {
+            return String::new();
+        }
+        let mut xml = String::from("<cols>");
+        xml.push_str(&self.body);
+        xml.push_str("</cols>");
+        xml
+    }
+}
+
 fn intern_conditional_dxf(
     styles: &mut StyleTable,
     fill: Color,
@@ -595,63 +674,51 @@ pub(super) fn worksheet_xml(
         // <col>. Excel treats a style-only <col> without width as zero (#94).
         // Keep explicit sheet/column widths, including an intentional zero.
         let default_col_width = sheet.default_col_width.unwrap_or(9.140625);
-        let mut cols_body = String::new();
-        let mut emitted_cols = false;
+        let mut runs = ColumnRuns::new(budget);
         let mut next_default_col = 0u16;
         for col in col_keys {
             if let Some(xf) = default_style_xf {
-                if next_default_col < col {
-                    let xml = format!(
-                        r#"<col min="{}" max="{}" style="{xf}" width="{default_col_width}"/>"#,
+                if next_default_col < col
+                    && !runs.push(
                         next_default_col + 1,
-                        col
-                    );
-                    if !push_col_record(&mut cols_body, budget, &mut emitted_cols, xml) {
-                        break;
-                    }
+                        col,
+                        format!(r#" width="{default_col_width}" style="{xf}""#),
+                    )
+                {
+                    break;
                 }
             }
-            let mut attrs = format!(r#" min="{0}" max="{0}""#, col + 1);
-            if let Some(w) = widths.get(&col) {
-                attrs.push_str(&format!(r#" width="{w}" customWidth="1""#));
+            let mut attributes = if let Some(w) = widths.get(&col) {
+                format!(r#" width="{w}" customWidth="1""#)
             } else {
-                attrs.push_str(&format!(r#" width="{default_col_width}""#));
-            }
+                format!(r#" width="{default_col_width}""#)
+            };
             if let Some(&lvl) = sheet.col_outline.get(&col) {
-                attrs.push_str(&format!(r#" outlineLevel="{lvl}""#));
+                attributes.push_str(&format!(r#" outlineLevel="{lvl}""#));
             }
             if sheet.hidden_cols.contains(&col) {
-                attrs.push_str(r#" hidden="1""#);
+                attributes.push_str(r#" hidden="1""#);
             }
             if let Some(xf) = col_style_xfs.get(&col).copied().or(default_style_xf) {
-                attrs.push_str(&format!(r#" style="{xf}""#));
+                attributes.push_str(&format!(r#" style="{xf}""#));
             }
-            if !push_col_record(
-                &mut cols_body,
-                budget,
-                &mut emitted_cols,
-                format!("<col{attrs}/>"),
-            ) {
+            if !runs.push(col + 1, col + 1, attributes) {
                 break;
             }
             next_default_col = col.saturating_add(1);
         }
-        if let Some(xf) = default_style_xf {
-            if next_default_col <= MAX_COL {
-                let xml = format!(
-                    r#"<col min="{}" max="{}" style="{xf}" width="{default_col_width}"/>"#,
-                    next_default_col + 1,
-                    MAX_COL + 1
-                );
-                push_col_record(&mut cols_body, budget, &mut emitted_cols, xml);
+        if !runs.failed {
+            if let Some(xf) = default_style_xf {
+                if next_default_col <= MAX_COL {
+                    runs.push(
+                        next_default_col + 1,
+                        MAX_COL + 1,
+                        format!(r#" width="{default_col_width}" style="{xf}""#),
+                    );
+                }
             }
         }
-        if emitted_cols {
-            let mut cols_xml = String::from("<cols>");
-            cols_xml.push_str(&cols_body);
-            cols_xml.push_str("</cols>");
-            sx.push_str(&cols_xml);
-        }
+        sx.push_str(&runs.finish());
     }
     sx.push_str("<sheetData>");
     let mut rows: BTreeSet<u32> = grid.keys().map(|(row, _)| *row).collect();
@@ -1226,4 +1293,51 @@ pub(super) fn worksheet_xml(
             table_count: emitted_table_count,
         },
     )
+}
+
+#[cfg(test)]
+mod column_run_tests {
+    use super::ColumnRuns;
+
+    #[test]
+    fn column_runs_charge_the_wrapper_once() {
+        let expected = r#"<cols><col min="1" max="2" width="20" customWidth="1"/><col min="3" max="3" width="30" customWidth="1"/></cols>"#;
+        let mut budget = expected.len();
+        let mut runs = ColumnRuns::new(&mut budget);
+        assert!(runs.push(1, 1, r#" width="20" customWidth="1""#.into()));
+        assert!(runs.push(2, 2, r#" width="20" customWidth="1""#.into()));
+        assert!(runs.push(3, 3, r#" width="30" customWidth="1""#.into()));
+        assert_eq!(runs.finish(), expected);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn column_runs_first_failure_cannot_emit_a_later_or_retried_run() {
+        let mut budget = 0;
+        let mut runs = ColumnRuns::new(&mut budget);
+        assert!(runs.push(1, 1, r#" width="20""#.into()));
+        assert!(!runs.push(2, 2, r#" width="30""#.into()));
+        // Refill only as a test seam: a terminal failure must not be retried,
+        // even if a future caller supplies budget before appending a tail.
+        *runs.budget = 1024;
+        assert!(!runs.push(3, 16384, r#" width="40""#.into()));
+        assert_eq!(runs.finish(), "");
+        assert_eq!(budget, 1024);
+    }
+
+    #[test]
+    fn column_runs_later_failure_retains_only_the_charged_prefix() {
+        let expected = r#"<cols><col min="1" max="1" width="20"/></cols>"#;
+        let omitted = r#"<col min="2" max="2" width="30"/>"#;
+        let mut budget = expected.len() + omitted.len() - 1;
+        let mut runs = ColumnRuns::new(&mut budget);
+        assert!(runs.push(1, 1, r#" width="20""#.into()));
+        assert!(runs.push(2, 2, r#" width="30""#.into()));
+        assert!(!runs.push(3, 3, r#" width="40""#.into()));
+        assert_eq!(*runs.budget, 0);
+        *runs.budget = 1024;
+        assert!(!runs.push(4, 16384, r#" width="50""#.into()));
+        assert_eq!(runs.finish(), expected);
+        assert_eq!(budget, 1024);
+    }
 }

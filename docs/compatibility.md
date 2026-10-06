@@ -114,6 +114,11 @@ Styles are interned into deduplicated OOXML resource tables. Writer features
 are checked by in-tree `openpyxl` gates. Pivot tables, threaded comments, macro
 creation, and authoring formats other than XLSX are outside the current scope.
 
+In the source checkout, equal adjacent column layouts are written as compact
+ranges, including imported full-width formats. Unspecified gaps remain
+distinct. This authoring optimization does not rewrite the retained column
+intervals of package-preserving `Spreadsheet` edits.
+
 ## Export, diagnostics, CLI, WASM, MCP, and VS Code
 
 A sheet or workbook can be exported to CSV, HTML, or Markdown. CSV export has
