@@ -14,6 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Omitted existing worksheet dimensions after package-preserving value/formula,
+  range and nonempty appended-row writes (#132), allowing streaming readers to
+  discover added cells. Absent dimensions stay absent; cache-only/clear edits
+  and foreign dimension-like XML retain their metadata.
 - Normalized XLSX ISO date cells and date formula caches to the workbook's date
   system (#128), preserving calendar values in 1904 rewrites and before March
   1900. Time-only values retain their day fractions in either system.

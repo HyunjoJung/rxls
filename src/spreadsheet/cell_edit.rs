@@ -76,7 +76,13 @@ impl Spreadsheet {
             let package = candidate.package.as_mut().ok_or(Error::MissingWorkbook)?;
             let before = package.touched_parts();
             let tree = package.part_tree_mut(&path)?;
+            let dimension = if values.iter().flatten().any(Option::is_some) {
+                sml_dimension_to_omit(tree)?
+            } else {
+                None
+            };
             sml_edit_cell_range(tree, start_row, start_col, values)?;
+            sml_omit_dimension(tree, dimension)?;
             for part in newly_touched(&before, package) {
                 remember_edited_part(&mut candidate.edited_parts, part);
             }
@@ -218,7 +224,9 @@ impl Spreadsheet {
         })?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = sml_dimension_to_omit(tree)?;
         sml_edit_cell(tree, row, col, value)?;
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -343,9 +351,15 @@ impl Spreadsheet {
         }
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = if values.is_empty() {
+            None
+        } else {
+            sml_dimension_to_omit(tree)?
+        };
         for (col, value) in values.iter().enumerate() {
             sml_edit_cell(tree, row, col as u16, value)?;
         }
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -415,6 +429,80 @@ impl Spreadsheet {
         }
         Ok(())
     }
+}
+
+/// Plan omission once per value-writing operation, rather than per cell.
+/// ECMA-376 18.3.1.35: the optional dimension includes styled/blank cells too,
+/// so rebuilding it from parsed values could understate the used range.
+/// https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.sheetdimension
+fn sml_dimension_to_omit(tree: &XmlTree) -> Result<Option<(NodeId, NodeId)>> {
+    const MAIN: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const STRICT: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    // Borrow only root namespace declarations. Lookup remains bounded even
+    // when many foreign dimension aliases share a root with many attributes.
+    let mut namespaces = BTreeMap::<&[u8], &[u8]>::new();
+    if let Some(attrs) = tree.attributes(root) {
+        for (name, value) in attrs {
+            let prefix = if name == b"xmlns" {
+                b"".as_slice()
+            } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            namespaces.entry(prefix).or_insert(value);
+        }
+    }
+    // Preserve the editor's existing bare-worksheet compatibility. An empty
+    // namespace reset beneath a namespaced worksheet is foreign content.
+    let bare_root = tree.element_name(root) == Some(b"worksheet")
+        && namespaces
+            .get(b"".as_slice())
+            .is_none_or(|uri| uri.is_empty());
+    let mut dimension = None;
+    for &child in tree.children_of(root) {
+        let Some(name) = tree.element_name(child) else {
+            continue;
+        };
+        let (prefix, local) = match name.iter().position(|&byte| byte == b':') {
+            Some(colon) => (&name[..colon], &name[colon + 1..]),
+            None => (b"".as_slice(), name),
+        };
+        if local != b"dimension" {
+            continue;
+        }
+        let namespace = tree
+            .attributes(child)
+            .and_then(|attrs| {
+                attrs.iter().find_map(|(key, value)| {
+                    let declares_prefix = if prefix.is_empty() {
+                        key == b"xmlns"
+                    } else {
+                        key.strip_prefix(b"xmlns:") == Some(prefix)
+                    };
+                    declares_prefix.then_some(value.as_slice())
+                })
+            })
+            .or_else(|| namespaces.get(prefix).copied());
+        let recognized = matches!(namespace, Some(MAIN | STRICT))
+            || (prefix.is_empty() && bare_root && namespace.is_none_or(|uri| uri.is_empty()));
+        if recognized {
+            if dimension.is_some() {
+                return Err(Error::Zip("worksheet contains duplicate dimensions"));
+            }
+            dimension = Some((root, child));
+        }
+    }
+    Ok(dimension)
+}
+
+fn sml_omit_dimension(tree: &mut XmlTree, dimension: Option<(NodeId, NodeId)>) -> Result<()> {
+    if let Some((root, child)) = dimension {
+        tree.remove_child(root, child)?;
+    }
+    Ok(())
 }
 
 fn validate_formula_cached_value(value: &Cell) -> Result<()> {
