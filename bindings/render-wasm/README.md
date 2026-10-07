@@ -220,9 +220,14 @@ request; Fetch interception stops it before transport, Network must report the
 same request identity with `net::ERR_INTERNET_DISCONNECTED`, no response may
 arrive, and a bounded local sink must receive zero requests. The hard-stop
 control binds a random nonce to a unique worker URL and request, pauses the
-active worker on a confirmed WebAssembly frame, and requires
-`Target.targetDestroyed` plus absence from `Target.getTargets` within two
-seconds. Detachment, natural completion, ambiguous or wrong-nonce targets, and
+active worker on a confirmed WebAssembly frame, and requires pending-request
+rejection within 2,000 ms of `client.terminate()`. Native teardown separately
+requires `Target.targetDestroyed` plus absence from `Target.getTargets` within
+2,500 ms of the same call. The pinned Chromium 150 implementation schedules
+its forcible worker termination after two seconds; the extra 500 ms bounds
+browser teardown and CDP delivery, and does not extend the request-rejection
+deadline. See Chromium's [worker termination implementation](https://chromium.googlesource.com/chromium/src/+/refs/tags/150.0.7871.115/third_party/blink/renderer/core/workers/worker_thread.cc).
+Detachment, natural completion, ambiguous or wrong-nonce targets, and
 JavaScript-only pauses cannot satisfy the proof. The post-GC retained-heap gate
 covers the surviving page and every live render worker, so the terminated
 worker cannot retain workbook, font, image, or output buffers. Fixture

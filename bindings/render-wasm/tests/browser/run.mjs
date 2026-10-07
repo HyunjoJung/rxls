@@ -397,7 +397,9 @@ console.log(
     `peak-growth=${browserResult.processMemory.peakGrowthBytes} ` +
     `retained=${browserResult.processMemory.retained.rssBytes} ` +
     `retained-growth=${browserResult.processMemory.retainedGrowthBytes} bytes; ` +
-    `hard-stop target=${browserResult.hardStop.elapsedMs}/${browserResult.hardStop.deadlineMs}ms ` +
+    `hard-stop pending-rejection=${browserResult.hardStop.clientElapsedMs}/${browserResult.hardStop.clientDeadlineMs}ms ` +
+    `target=${browserResult.hardStop.elapsedMs}/${browserResult.hardStop.deadlineMs}ms ` +
+    `absence=${browserResult.hardStop.absenceElapsedMs}/${browserResult.hardStop.deadlineMs}ms ` +
     `wasm=${browserResult.hardStop.wasmFrame.url}; ` +
     `CSP Network=${browserResult.csp.networkControl.errorText}`
 );
@@ -1548,10 +1550,7 @@ async function driveHardStop({
   if (completedProof.phase === "failed") {
     throw new Error(completedProof.failure ?? "hard-stop page proof failed");
   }
-  const observationDeadline = hardStopObservationDeadlineEpochMs(
-    completedProof,
-    500
-  );
+  const observationDeadline = hardStopObservationDeadlineEpochMs(completedProof);
   while (true) {
     const observation = decideHardStopObservation({
       destructionRecorded: destroyedTargets.has(target.targetInfo.targetId),
@@ -1566,7 +1565,8 @@ async function driveHardStop({
         destroyedTargets,
         currentTargets: inventory.targetInfos,
         pauseEvidence,
-        proof: completedProof
+        proof: completedProof,
+        inventoryObservedAtEpochMs: Date.now()
       });
       if (evidence !== null) {
         return evidence;

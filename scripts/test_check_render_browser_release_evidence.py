@@ -96,7 +96,11 @@ class BrowserEvidenceTests(unittest.TestCase):
         rss_peak: int = 500_000_000,
         rss_retained: int = 200_000_000,
         elapsed: int = 550,
-        deadline: int = MODULE.HARD_STOP_DEADLINE_MS,
+        deadline: int = MODULE.NATIVE_HARD_STOP_DEADLINE_MS,
+        client_elapsed: int = 1,
+        client_deadline: int = MODULE.HARD_STOP_DEADLINE_MS,
+        absence_elapsed: int | None = None,
+        absence_deadline: int = MODULE.NATIVE_HARD_STOP_DEADLINE_MS,
         wasm_url: str | None = None,
         network_error: str = MODULE.EXPECTED_NETWORK_ERROR,
         behavior: dict[str, object] | None = None,
@@ -116,6 +120,8 @@ class BrowserEvidenceTests(unittest.TestCase):
         network_requests: int = MODULE.NETWORK_PROOF_REQUESTS,
         pre_navigation: str = "true",
     ) -> str:
+        if absence_elapsed is None:
+            absence_elapsed = elapsed
         growth = max(0, retained - baseline)
         rss_peak_growth = max(0, rss_peak - rss_baseline)
         rss_retained_growth = max(0, rss_retained - rss_baseline)
@@ -156,7 +162,9 @@ class BrowserEvidenceTests(unittest.TestCase):
             f"rss baseline={rss_baseline} peak={rss_peak} "
             f"peak-growth={rss_peak_growth} retained={rss_retained} "
             f"retained-growth={rss_retained_growth} bytes; "
-            f"hard-stop target={elapsed}/{deadline}ms wasm={wasm_url}; "
+            f"hard-stop pending-rejection={client_elapsed}/{client_deadline}ms "
+            f"target={elapsed}/{deadline}ms "
+            f"absence={absence_elapsed}/{absence_deadline}ms wasm={wasm_url}; "
             f"CSP Network={network_error}"
         )
 
@@ -311,7 +319,7 @@ class BrowserEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["modes"]["source"]["hard_stop"]["deadline_ms"],
-            MODULE.HARD_STOP_DEADLINE_MS,
+            MODULE.NATIVE_HARD_STOP_DEADLINE_MS,
         )
         self.assertTrue(
             summary["modes"]["source"]["hard_stop"]["wasm_frame_confirmed"]
@@ -743,12 +751,73 @@ class BrowserEvidenceTests(unittest.TestCase):
                 baseline=2_000_000,
                 peak=3_000_000,
                 retained=2_100_000,
-                elapsed=MODULE.HARD_STOP_DEADLINE_MS + 1,
+                elapsed=MODULE.NATIVE_HARD_STOP_DEADLINE_MS + 1,
             )
             + "\n",
             encoding="utf-8",
         )
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_hard_stop"):
+            self._summary()
+
+    def test_independent_client_and_native_boundaries(self) -> None:
+        for client_elapsed in (0, 2000):
+            self.source.write_text(self._pass_line(
+                "source", baseline=2_000_000, peak=3_000_000, retained=2_100_000,
+                client_elapsed=client_elapsed, elapsed=2500, absence_elapsed=2500,
+            ) + "\n", encoding="utf-8")
+            summary = self._summary()
+            proof = summary["modes"]["source"]["hard_stop"]
+            self.assertEqual(proof["client_elapsed_ms"], client_elapsed)
+            self.assertEqual(proof["client_deadline_ms"], 2000)
+            self.assertEqual(proof["elapsed_ms"], 2500)
+            self.assertEqual(proof["absence_elapsed_ms"], 2500)
+            MODULE.validate_summary(summary, head_sha=HEAD_SHA, platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY, workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT)
+        for changes in ({"client_elapsed": 2001}, {"client_deadline": 2500},
+                        {"elapsed": 2501}, {"deadline": 2000},
+                        {"absence_elapsed": 2501}, {"absence_deadline": 3000},
+                        {"elapsed": 600, "absence_elapsed": 599}):
+            with self.subTest(changes=changes):
+                self.source.write_text(self._pass_line(
+                    "source", baseline=2_000_000, peak=3_000_000, retained=2_100_000,
+                    **changes,
+                ) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_hard_stop"):
+                    self._summary()
+
+    def test_authenticated_summary_revalidates_both_clocks_and_absence(self) -> None:
+        summary = self._summary()
+        for field, value in (("client_elapsed_ms", 2001), ("client_elapsed_ms", True),
+                             ("client_deadline_ms", 2500), ("client_deadline_ms", 2000.0),
+                             ("deadline_ms", 2500.0), ("elapsed_ms", 2501),
+                             ("absence_elapsed_ms", 2501), ("absence_elapsed_ms", 549),
+                             ("target_absent", False), ("target_absent", 1)):
+            with self.subTest(field=field, value=value):
+                edited = copy.deepcopy(summary)
+                edited["modes"]["source"]["hard_stop"][field] = value
+                with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "summary_source_hard_stop"):
+                    MODULE.validate_summary(edited, head_sha=HEAD_SHA, platform="linux",
+                        repository=MODULE.EXPECTED_REPOSITORY, workflow_run_id=RUN_ID,
+                        workflow_run_attempt=RUN_ATTEMPT)
+        edited = copy.deepcopy(summary)
+        del edited["modes"]["source"]["hard_stop"]["absence_elapsed_ms"]
+        with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "summary_source_hard_stop"):
+            MODULE.validate_summary(edited, head_sha=HEAD_SHA, platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY, workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT)
+
+    def test_old_single_deadline_schema_and_log_are_rejected(self) -> None:
+        summary = self._summary()
+        summary["schema"] = "rxls.render-browser-evidence.v5"
+        with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "summary_binding"):
+            MODULE.validate_summary(summary, head_sha=HEAD_SHA, platform="linux",
+                repository=MODULE.EXPECTED_REPOSITORY, workflow_run_id=RUN_ID,
+                workflow_run_attempt=RUN_ATTEMPT)
+        line = self._pass_line("source", baseline=2_000_000, peak=3_000_000, retained=2_100_000)
+        line = line.replace("hard-stop pending-rejection=1/2000ms target=550/2500ms absence=550/2500ms", "hard-stop target=550/2000ms")
+        self.source.write_text(line + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_pass_line"):
             self._summary()
 
     def test_process_tree_rss_identity_and_bounds_fail_closed(self) -> None:
