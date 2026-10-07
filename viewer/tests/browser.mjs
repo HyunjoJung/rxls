@@ -16,16 +16,15 @@ import { assertViewerReopens, exerciseMacroRoundtrip, exerciseMultilineCellOptio
 import { exerciseCdpComposition } from "./ime-composition.mjs";
 import { recordJourney, retainDownload, sha256 } from "./journey-evidence.mjs";
 import { exerciseKeyboardRedo } from "./keyboard-redo.mjs";
+import { exerciseScrolling, installScrollingProbe } from "./scrolling.mjs";
+import { sampleExistingWorker } from "./wasm-memory.mjs";
 
 const execFileAsync = promisify(execFile);
 const selectedJourney = process.env.RXLS_VIEWER_JOURNEY || "production";
-assert.ok(["production", "keyboard-redo"].includes(selectedJourney), "unknown viewer journey");
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
-const basePath = await builtBasePath();
-const server = await preview({
-  base: basePath,
-  preview: { host: "127.0.0.1", port, strictPort: true },
-});
+let basePath;
+let server;
+let browser;
 
 const launchOptions = { headless: true };
 if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
@@ -34,7 +33,7 @@ if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
   launchOptions.channel = "chrome";
 }
 
-const browser = await chromium.launch(launchOptions);
+
 async function runBrowserJourney() {
   await recordJourney("browser-runtime", {
     browserVersion: browser.version(), nodeVersion: process.version,
@@ -58,6 +57,7 @@ async function runBrowserJourney() {
       failedResponses.push({ status: response.status(), url: response.url() });
     }
   });
+  if (selectedJourney === "scrolling") await installScrollingProbe(page);
   await page.goto(`http://127.0.0.1:${port}${basePath}`, {
     waitUntil: "domcontentloaded",
   });
@@ -77,6 +77,17 @@ async function runBrowserJourney() {
     throw new Error(`viewer did not render: ${JSON.stringify(diagnostics)}`, {
       cause: error,
     });
+  }
+
+  if (selectedJourney === "scrolling") {
+    await exerciseScrolling(page, { waitForCondition, waitForViewerState,
+      downloadWorkbook, assertOpenpyxlReopens, sampleWasmMemory: sampleExistingWorker });
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+    assert.deepEqual(failedResponses, []);
+    await recordJourney("scrolling-browser", { status: "passed", selectedJourney });
+    console.log("viewer W04 scrolling journey passed");
+    return;
   }
 
   await exerciseKeyboardRedo(page, { waitForCondition, waitForViewerState });
@@ -771,15 +782,72 @@ async function runBrowserJourney() {
   });
   console.log("viewer browser smoke passed");
 }
-try {
-  await runBrowserJourney();
-} catch (error) {
-  await recordJourney(selectedJourney === "keyboard-redo" ? "keyboard-redo-browser" : "production-browser", { status: "failed", error: String(error) });
-  throw error;
-} finally {
-  await browser.close();
-  await new Promise((resolve) => server.httpServer.close(resolve));
+// BEGIN owned-runtime-guard: executed unchanged by the isolated helper models.
+async function runOwnedBrowser({ startServer, startBrowser, run, record, cleanupMs = 10_000 }) {
+  let ownedServer = null, ownedBrowser = null, primary = null, stage = "start-server";
+  let cleanup;
+  const errorText = (error) => String(error).slice(0, 2048);
+  async function closeBounded(name, resource, close) {
+    if (!resource) return { name, status: "not-created", attempted: false };
+    const startedAt = Date.now();
+    let timer;
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(close).then(() => ({ status: "closed" }),
+          (error) => ({ status: "failed", error: errorText(error) })),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ status: "timed-out" }), cleanupMs); }),
+      ]);
+      return { name, attempted: true, elapsedMs: Date.now() - startedAt, ...result };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  try {
+    ownedServer = await startServer();
+    stage = "start-browser";
+    ownedBrowser = await startBrowser();
+    stage = "journey";
+    await run();
+  } catch (error) {
+    primary = error;
+  } finally {
+    // Start both independent close attempts even if either throws or times out.
+    // A timed-out close is not an exit proof; the owned outer job remains required.
+    cleanup = await Promise.all([
+      closeBounded("browser", ownedBrowser, () => ownedBrowser.close()),
+      closeBounded("preview", ownedServer, () => new Promise((resolve, reject) => {
+        ownedServer.httpServer.close((error) => error ? reject(error) : resolve());
+      })),
+    ]);
+  }
+  const cleanupFailed = cleanup.some((item) => ["failed", "timed-out"].includes(item.status));
+  let receiptError = null;
+  try {
+    await record({ status: primary || cleanupFailed ? "failed" : "passed", primaryStage: stage,
+      primaryError: primary ? errorText(primary) : null, cleanup,
+      processExitProof: "owned outer supervisor receipt; close completion alone is not PID absence" });
+  } catch (error) {
+    receiptError = error;
+  }
+  if (primary) throw primary;
+  if (cleanupFailed) throw new AggregateError(cleanup.filter((item) => ["failed", "timed-out"].includes(item.status))
+    .map((item) => new Error(`${item.name} cleanup ${item.status}: ${item.error ?? "deadline"}`)), "Owned browser cleanup failed.");
+  if (receiptError) throw receiptError;
 }
+// END owned-runtime-guard
+
+await runOwnedBrowser({
+  startServer: async () => {
+    assert.ok(["production", "keyboard-redo", "scrolling"].includes(selectedJourney), "unknown viewer journey");
+    basePath = await builtBasePath();
+    server = await preview({ base: basePath,
+      preview: { host: "127.0.0.1", port, strictPort: true } });
+    return server;
+  },
+  startBrowser: async () => { browser = await chromium.launch(launchOptions); return browser; },
+  run: runBrowserJourney,
+  record: (receipt) => recordJourney(`${selectedJourney}-browser-lifecycle`, receipt),
+});
 
 async function exerciseInlineEditing(page) {
   assert.equal(
@@ -1351,7 +1419,8 @@ async function assertOpenpyxlReopens(
   const script = fileURLToPath(
     new URL("../scripts/verify-openpyxl-workbook.py", import.meta.url),
   );
-  const args = [script, workbookPath, "--cell", cell, "--expected", expected];
+  const args = [script, workbookPath, "--cell", cell,
+    typeof expected === "number" ? "--expected-number" : "--expected", String(expected)];
   if (expectedTitle !== null) {
     args.push("--expected-title", expectedTitle);
   }
