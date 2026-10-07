@@ -61,7 +61,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 )
             mutations = {
                 "version": original.replace(
-                    'CARGO_SEMVER_CHECKS_VERSION: "0.49.0"',
+                    'CARGO_SEMVER_CHECKS_VERSION: "0.51.0"',
                     'CARGO_SEMVER_CHECKS_VERSION: "latest"',
                     1,
                 ),

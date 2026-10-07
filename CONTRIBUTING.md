@@ -142,7 +142,7 @@ hosted checks. It is a reference for broader validation, not a prerequisite
 for opening a focused or draft PR.
 
 Install the pinned registry-compatibility checker with
-`cargo install cargo-semver-checks --version 0.49.0 --locked`, ensure the
+`cargo install cargo-semver-checks --version 0.51.0 --locked` (Rust 1.93+), ensure the
 `wasm32-unknown-unknown` Rust target is installed, and install the oracle
 dependencies described in [Validation and reproducibility](docs/validation.md).
 Run the full local gate; all applicable checks must pass clean:
