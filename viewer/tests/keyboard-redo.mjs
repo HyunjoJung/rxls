@@ -50,6 +50,10 @@ export async function exerciseKeyboardRedo(originalPage, helpers) {
         await page.locator("#inspector-reference").fill("A1");
         await page.locator("#inspector-reference").press("Enter");
         await helpers.waitForCondition(async () => (await page.locator("#grid-selection").getAttribute("data-reference")) === "A1" && !(await input.isDisabled()), `${modifier} A1 ready`);
+        await helpers.waitForCondition(() => page.evaluate(() =>
+          document.getElementById("inspector-status").textContent.startsWith("A1:") &&
+          !document.getElementById("inspector-edit").disabled
+        ), `${modifier} A1 inspection settled`);
         if (expected !== undefined) await helpers.waitForCondition(async () => (await page.locator("#inspector-value").inputValue()) === expected, `${modifier} A1 inspected`);
         await input.focus();
       };
