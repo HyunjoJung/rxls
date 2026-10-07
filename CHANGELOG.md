@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added a private editor-embed development package with independent iframe
+  instances, bounded load/save/dispose calls, and the viewer's existing editing,
+  history and workbook-copy behavior. Builds include matching runtime assets
+  and an asset manifest for versioned consumer hosting.
 - Added current-source viewer navigation for supported sparse large sheets with
   prepared viewport tiles, bounded caching, and readiness after visible coverage.
   Tiled view retains workbook-copy saves while restricting edits and whole-sheet

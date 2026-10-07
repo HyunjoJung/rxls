@@ -43,6 +43,8 @@ import { createExportController } from "./exports.js";
 import { createWorkbench } from "./workbench.js";
 import { createGridEditor } from "./grid-editor.js";
 import { createRangePasteController } from "./range-paste.js";
+import { createEmbedHost } from "./embed/frame-host.mjs";
+import { EditorEmbedError } from "./embed/protocol.mjs";
 import {
   VIEWPORT_POLICY, createViewportScheduler, viewportCover,
   viewportFallbackError, viewportSurfaceSize, viewportContains,
@@ -53,6 +55,9 @@ const ZOOM_STEP = 0.15;
 const BLOCKED_SVG_ELEMENTS = "script, foreignObject, iframe, object, embed";
 const hostKind =
   document.querySelector('meta[name="rxls-host-kind"]')?.content ?? "browser";
+const embedMode = hostKind === "embed";
+let embedHost = null;
+let disposed = false;
 const hostResourceBase = document.querySelector(
   'meta[name="rxls-resource-base"]',
 )?.content;
@@ -222,7 +227,7 @@ const state = {
 
 const baseUrl = hostResourceBase
   ? new URL(hostResourceBase)
-  : new URL(import.meta.env.BASE_URL, window.location.origin);
+  : new URL(import.meta.env.BASE_URL, document.baseURI);
 const openRequests = createLatestRequestGate();
 let samples = [];
 let grid = null;
@@ -255,6 +260,7 @@ const editing = createEditingController({
   updateWorkbookUi,
   renderCurrent,
   beforeCommand: commitGridDraft,
+  onChange: () => embedHost?.publishState(),
 });
 const {
   updateEditUi,
@@ -300,12 +306,15 @@ grid = createGridEditor({
   onSelection: (selection) => {
     void workbench.selectCell(selection);
   },
-  onDraft: (draft) => workbench.setDraft(draft),
+  onDraft: (draft) => {
+    workbench.setDraft(draft);
+    embedHost?.publishState();
+  },
   focusOutsideGrid,
   showError,
 });
 
-rangePaste = createRangePasteController({ grid, elements, showError });
+rangePaste = createRangePasteController({ grid, elements, showError, onChange: () => embedHost?.publishState() });
 
 async function commitGridDraft() {
   if (rangePaste && !rangePaste.ready()) return false;
@@ -352,7 +361,21 @@ async function initialize() {
     const runtime = await import(
       /* @vite-ignore */ new URL("runtime/js/client.mjs", baseUrl).href
     );
+    if (disposed) return;
     state.runtime = runtime;
+    if (embedMode) {
+      const identity = await fetchJson(new URL("embed-manifest.json", baseUrl));
+      if (disposed) return;
+      setBusy(false);
+      showEmpty();
+      elements["document-detail"].textContent = "Waiting for parent workbook";
+      for (const id of ["open-button", "empty-open-button", "file-input", "sample-select", "reload-document"]) {
+        elements[id].hidden = true;
+      }
+      embedHost = createEmbedHost({ window, runtime: identity.runtime, getState: embedState,
+        load: loadEmbeddedWorkbook, save: () => editing.prepareWorkbookCopy(), dispose: disposeEmbeddedViewer });
+      return;
+    }
     if (vscodeHost) {
       setBusy(false);
       showEmpty();
@@ -425,7 +448,7 @@ function bindEvents() {
 
   if (vscodeHost) {
     window.addEventListener("message", onHostMessage);
-  } else {
+  } else if (!embedMode) {
     const viewport = elements["viewer-viewport"];
     viewport.addEventListener("dragenter", onDragEnter);
     viewport.addEventListener("dragover", onDragOver);
@@ -435,10 +458,12 @@ function bindEvents() {
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("beforeunload", (event) => {
     if (
-      state.editState?.dirty ||
-      grid.hasChanges() ||
-      editing.hasDraftChanges() ||
-      rangePaste.hasPending()
+      !embedMode && (
+        state.editState?.dirty ||
+        grid.hasChanges() ||
+        editing.hasDraftChanges() ||
+        rangePaste.hasPending()
+      )
     ) {
       event.preventDefault();
       event.returnValue = "";
@@ -458,6 +483,7 @@ function bindEvents() {
 }
 
 function chooseFile() {
+  if (embedMode || disposed) return;
   elements["file-input"].click();
 }
 
@@ -551,12 +577,15 @@ function canReplaceWorkbook() {
 }
 
 function beginOpenRequest(label) {
+  const initialOwner = Object.freeze({ client: state.client, hostWorker: state.hostWorker,
+    documentId: state.documentId });
   rangePaste.cancel();
   state.openGeneration += 1;
   state.openRequest?.abortController.abort();
   state.openRequest?.client?.terminate();
   const request = {
     token: openRequests.begin(),
+    generation: state.openGeneration, initialOwner, adoptedOwner: null, outcome: null,
     abortController: new AbortController(),
     client: null,
   };
@@ -572,10 +601,12 @@ function beginOpenRequest(label) {
 }
 
 function isCurrentOpenRequest(request) {
-  return state.openRequest === request && openRequests.isCurrent(request.token);
+  return !state.viewportDisposed && state.openRequest === request &&
+    request.generation === state.openGeneration && openRequests.isCurrent(request.token);
 }
 
 function failOpenRequest(request, error) {
+  request.error = error;
   request.client?.terminate();
   request.client = null;
   if (!isCurrentOpenRequest(request)) {
@@ -616,6 +647,7 @@ async function openWorkbook(bytes, file, request) {
     state.client = client;
     state.hostWorker = workerTarget instanceof Worker ? workerTarget : null;
     state.documentId = documentId;
+    request.adoptedOwner = Object.freeze({ client, hostWorker: state.hostWorker, documentId });
     state.workbook = opened.workbook;
     state.editState = opened.editState;
     state.file = file;
@@ -626,6 +658,11 @@ async function openWorkbook(bytes, file, request) {
     previousClient?.terminate();
     updateWorkbookUi();
     const outcome = await renderCurrent({ fit: true });
+    request.outcome = outcome;
+    if (outcome.status === "failed") {
+      request.error = outcome.error;
+      request.errorReported = true;
+    }
     if (isCurrentOpenRequest(request)) {
       state.openRequest = null;
       closeSidebar();
@@ -634,6 +671,15 @@ async function openWorkbook(bytes, file, request) {
       (outcome.status === "ready" || outcome.status === "empty") &&
       state.client === client && state.documentId === documentId;
   } catch (error) {
+    if (embedMode) {
+      request.error = error;
+      request.outcome = { status: isCurrentOpenRequest(request) ? "failed" : "stale", error };
+      // This field owns only an unpublished opening client. Published geometry is reset by the adapter.
+      request.client?.terminate();
+      request.client = null;
+      if (isCurrentOpenRequest(request)) state.openRequest = null;
+      return false;
+    }
     client?.terminate();
     if (state.client === client) {
       state.client = null;
@@ -1339,6 +1385,7 @@ function updateWorkbookUi() {
   updateSheetSelection();
   updateModeUi();
   updateEditUi();
+  embedHost?.publishState();
 }
 
 function updateSheetSelection() {
@@ -1384,6 +1431,7 @@ function populateSamples() {
 }
 
 function setBusy(busy, label = "") {
+  if (disposed) return;
   state.busy = busy;
   elements["loading-state"].hidden = !busy;
   if (label) {
@@ -1407,6 +1455,7 @@ function setBusy(busy, label = "") {
   updateEditUi();
   workbench.update();
   grid?.update();
+  embedHost?.publishState();
 }
 
 function showEmpty() {
@@ -1423,6 +1472,8 @@ function showEmpty() {
 }
 
 function showError(error, reportToHost = true) {
+  if (disposed) return;
+  embedHost?.diagnostic(error);
   const message = describeError(error);
   elements["error-message"].textContent = message;
   elements["error-banner"].hidden = false;
@@ -1615,3 +1666,111 @@ export function viewerSetZoomForTest(value) {
 
 globalThis.__rxlsViewerState = viewerStateForTest;
 globalThis.__rxlsViewerSetZoomForTest = viewerSetZoomForTest;
+
+function embedState() {
+  return {
+    loaded: Boolean(state.workbook),
+    busy: state.busy,
+    dirty: Boolean(state.editState?.dirty),
+    draft: Boolean(grid?.hasDraft() || editing.hasDraftChanges() || rangePaste?.hasPending()),
+    pendingMutation: editing.hasPendingMutation(),
+    canUndo: Boolean(state.editState?.canUndo),
+    canRedo: Boolean(state.editState?.canRedo),
+    fileName: state.file?.name ?? null,
+    format: state.file ? extensionOf(state.file.name) : null,
+    sheetCount: state.workbook?.sheetCount ?? 0,
+    sheetIndex: state.sheetIndex,
+    capability: state.editState?.capability ?? null,
+    reason: state.editState?.reason ?? null,
+  };
+}
+
+function ownsEmbeddedOpenRequest(request) {
+  if (disposed || request.generation !== state.openGeneration || !openRequests.isCurrent(request.token)) return false;
+  const owner = request.adoptedOwner ?? request.initialOwner;
+  return Boolean(owner && owner.client === state.client && owner.documentId === state.documentId &&
+    owner.hostWorker === state.hostWorker);
+}
+
+function clearFailedEmbeddedOpen(request) {
+  if (!ownsEmbeddedOpenRequest(request)) return false;
+  const owner = request.adoptedOwner ?? request.initialOwner;
+  // Reset geometry while its exact client is alive; this is a recoverable iframe, not final disposal.
+  resetViewport();
+  if (owner.client) owner.client.terminate();
+  else owner.hostWorker?.terminate();
+  state.client = null;
+  state.hostWorker = null;
+  state.documentId = null;
+  state.workbook = null;
+  state.editState = null;
+  state.file = null;
+  state.sheetIndex = 0;
+  state.svgElement = null;
+  state.svgText = "";
+  elements["document-surface"].replaceChildren();
+  state.manifests.clear();
+  grid.cancel();
+  setBusy(false);
+  showEmpty();
+  embedHost?.publishState();
+  return true;
+}
+
+async function loadEmbeddedWorkbook(bytes, { fileName, replace }) {
+  if (disposed) throw new EditorEmbedError("disposed", "The editor has been disposed.");
+  if (state.busy || editing.hasPendingMutation()) throw new EditorEmbedError("busy", "The editor is busy.");
+  const snapshot = embedState();
+  if (replace !== "discard" && (snapshot.dirty || snapshot.draft)) {
+    throw new EditorEmbedError("dirty_replacement", "The current workbook has unapplied or unsaved changes.");
+  }
+  if (replace === "discard") {
+    if (grid.cancel() === false || rangePaste.cancel() === false) throw new EditorEmbedError("busy", "The editor is busy.");
+  }
+  const request = beginOpenRequest(`Opening ${fileName}`);
+  const opened = await openWorkbook(bytes, { name: fileName, size: bytes.byteLength, source: "Embedded workbook" }, request);
+  if (disposed) throw new EditorEmbedError("disposed", "The editor has been disposed.");
+  if (!ownsEmbeddedOpenRequest(request) || request.outcome?.status === "stale") {
+    throw new EditorEmbedError("stale_operation", "The workbook changed during loading.");
+  }
+  if (!opened) {
+    if (!clearFailedEmbeddedOpen(request)) throw new EditorEmbedError("stale_operation", "The workbook changed during loading.");
+    const error = request.error ?? new EditorEmbedError("open_failed", "The workbook could not be opened.");
+    if (!request.errorReported) showError(error);
+    throw error;
+  }
+}
+
+function disposeEmbeddedViewer() {
+  if (disposed) return;
+  disposed = true;
+  state.openGeneration += 1;
+  state.renderEpoch += 1;
+  openRequests.invalidate();
+  state.openRequest?.abortController.abort();
+  // No awaited release RPC: settle/reset all viewport work before terminating an owned worker.
+  disposeViewport();
+  const openingClient = state.openRequest?.client;
+  if (openingClient && openingClient !== state.client) openingClient.terminate();
+  state.openRequest = null;
+  if (state.client) state.client.terminate();
+  else state.hostWorker?.terminate();
+  state.client = null;
+  state.hostWorker = null;
+  state.documentId = null;
+  state.workbook = null;
+  state.editState = null;
+  state.file = null;
+  state.svgElement = null;
+  state.svgText = "";
+  state.busy = false;
+  state.manifests.clear();
+  rangePaste.cancel();
+  grid.cancel();
+  grid.invalidate();
+  closeCellEditor();
+  closePropertiesEditor();
+  workbench.setDraft(null);
+  window.removeEventListener("keydown", onKeyDown);
+  // Remaining DOM-scoped listeners disappear with this owned iframe; late work is generation-invalidated.
+}

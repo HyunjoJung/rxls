@@ -21,6 +21,7 @@ exclude = [
     "extensions/",
     "fuzz/",
     "oss-fuzz/",
+    "packages/",
     "render/",
     "scripts/check_cargo_publish_dry_run.py",
     "scripts/check_npm_registry_evidence.py",

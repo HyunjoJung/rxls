@@ -45,6 +45,7 @@ FORBIDDEN_TOP_LEVEL = {
     "fuzz",
     "local",
     "oss-fuzz",
+    "packages",
     "render",
     "target",
 }

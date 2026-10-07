@@ -1,0 +1,25 @@
+{
+  "name": "@rxls/editor-embed",
+  "version": "0.0.0-dev",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Embed the rxls spreadsheet editor with an isolated iframe lifecycle.",
+  "files": [
+    "client/",
+    "assets/",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.txt",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./client/client.d.mts",
+      "import": "./client/client.mjs"
+    },
+    "./manifest": "./assets/embed-manifest.json"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

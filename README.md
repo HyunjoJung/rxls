@@ -212,6 +212,13 @@ for compatible clients such as VSCodium. The
 remains the canonical byte-level artifact: it includes the verified VSIX,
 matching SHA-256 file, exact source commit, and cross-platform CI evidence.
 
+### Editor embedding (development)
+
+Build the private [editor embed package](packages/editor-embed/README.md) from
+current source to place the spreadsheet editor in an application. Each iframe
+owns its workbook, drafts, history and worker. The parent API returns XLSX/XLSM
+copies for the host application to save.
+
 ### Video demos
 
 | English demo | Korean demo |

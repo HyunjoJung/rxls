@@ -156,6 +156,20 @@ class CorePackageGateTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(report["dependencies"], sorted(MODULE.ALLOWED_DEPENDENCIES))
 
+    def test_excludes_and_rejects_editor_package_subtree(self) -> None:
+        with self.subTest(gate="manifest"):
+            manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn("packages/", manifest["package"]["exclude"])
+        with self.subTest(gate="archive"), tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            write_crate(
+                crate,
+                {"packages/editor-embed/dist/editor.js": b"private editor runtime"},
+            )
+            errors, report = MODULE.validate(crate)
+            self.assertIn("forbidden package subtree: packages", errors)
+            self.assertFalse(report["passed"])
+
     def test_rejects_render_tree_and_internal_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             crate = Path(directory) / "rxls.crate"

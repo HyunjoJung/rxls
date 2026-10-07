@@ -10,6 +10,7 @@ import {
   savedWorkbookName,
 } from "./core.js";
 import { downloadBlob } from "./browser-files.js";
+import { EditorEmbedError, MAX_WORKBOOK_BYTES } from "./embed/protocol.mjs";
 
 /** Own the editing dialogs and commands without owning workbook loading or rendering. */
 export function createEditingController({
@@ -21,6 +22,7 @@ export function createEditingController({
   updateWorkbookUi,
   renderCurrent,
   beforeCommand,
+  onChange = () => {},
   download = downloadBlob,
   confirm = (message) => globalThis.confirm(message),
 }) {
@@ -52,6 +54,7 @@ export function createEditingController({
     closePropertiesEditor,
     applyHistoryEdit,
     saveWorkbookCopy,
+    prepareWorkbookCopy,
     commitCellEdit,
     commitRangeEdit,
     hasDraftChanges,
@@ -63,6 +66,8 @@ export function createEditingController({
   };
 
   function bindEvents() {
+    elements["cell-form"].addEventListener("input", onChange);
+    elements["properties-form"].addEventListener("input", onChange);
     elements["edit-cell"].addEventListener(
       "click",
       () => void openCellEditor(),
@@ -183,6 +188,7 @@ export function createEditingController({
         }`;
     }
     updateCellEditorControls();
+    onChange();
   }
 
   async function openCellEditor() {
@@ -219,6 +225,7 @@ export function createEditingController({
     }
     resetCellEditorFields();
     updateCellEditorControls();
+    onChange();
   }
 
   function invalidateCellRead() {
@@ -229,6 +236,7 @@ export function createEditingController({
         "Load this cell before editing it";
     }
     updateCellEditorControls();
+    onChange();
   }
 
   async function loadCellIntoEditor() {
@@ -453,6 +461,7 @@ export function createEditingController({
   function closePropertiesEditor() {
     propertiesDialogGeneration++;
     propertiesBaseline = null;
+    onChange();
     setFormPending(elements["properties-form"], false);
     if (elements["properties-dialog"].open) {
       elements["properties-dialog"].close();
@@ -755,39 +764,48 @@ export function createEditingController({
     return `${letters}${row + 1}`;
   }
 
+  async function prepareWorkbookCopy() {
+    if (state.busy || hasPendingMutation()) throw new EditorEmbedError("busy", "The workbook is busy.");
+    if (!state.workbook) throw new EditorEmbedError("no_workbook", "No workbook is open.");
+    if (rejectUnappliedDrafts()) throw new EditorEmbedError("draft_pending", "Apply or cancel unapplied dialog changes.");
+    const target = currentTarget();
+    if (beforeCommand && !(await beforeCommand())) throw new EditorEmbedError("draft_not_committed", "The cell draft was not committed.");
+    if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+    if (!canPreserveWorkbook()) throw new EditorEmbedError("read_only", "This workbook is read-only.");
+    if (rejectUnappliedDrafts()) throw new EditorEmbedError("draft_pending", "Apply or cancel unapplied dialog changes.");
+    const fileName = state.file.name;
+    setBusy(true, "Preparing preserved workbook");
+    try {
+      const saved = await target.client.saveDocument(target.documentId);
+      if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+      if (!(saved.bytes instanceof Uint8Array) || saved.bytes.byteLength === 0 || saved.bytes.byteLength > MAX_WORKBOOK_BYTES) {
+        throw new EditorEmbedError("invalid_bytes", "The saved workbook exceeds its byte contract.");
+      }
+      const format = extensionOf(fileName);
+      return { bytes: saved.bytes, fileName: savedWorkbookName(fileName), format,
+        mimeType: format === "xlsm" ? "application/vnd.ms-excel.sheet.macroEnabled.12"
+          : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
+    } catch (error) {
+      if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+      throw error;
+    } finally {
+      if (isCurrentTarget(target)) setBusy(false);
+    }
+  }
+
   async function saveWorkbookCopy() {
+    // Retain existing toolbar no-op guards and UI messages; API preparation reports typed failures.
     if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
     const target = currentTarget();
-    if (beforeCommand && !(await beforeCommand())) return;
-    if (
-      !isCurrentTarget(target) ||
-      !canPreserveWorkbook() ||
-      rejectUnappliedDrafts()
-    ) {
-      return;
-    }
-    const fileName = state.file.name;
     try {
-      setBusy(true, "Preparing preserved workbook");
-      const saved = await target.client.saveDocument(target.documentId);
+      const saved = await prepareWorkbookCopy();
       if (!isCurrentTarget(target)) return;
-      const extension = extensionOf(fileName);
-      const mimeType =
-        extension === "xlsm"
-          ? "application/vnd.ms-excel.sheet.macroEnabled.12"
-          : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-      download(
-        new Blob([saved.bytes], { type: mimeType }),
-        savedWorkbookName(fileName),
-      );
+      download(new Blob([saved.bytes], { type: saved.mimeType }), saved.fileName);
       elements["status-message"].textContent = "Preserved workbook downloaded";
     } catch (error) {
-      if (isCurrentTarget(target)) showError(error);
+      if (isCurrentTarget(target) && !["stale_operation", "draft_not_committed", "read_only", "no_workbook"].includes(error.code)) showError(error);
     } finally {
-      if (isCurrentTarget(target)) {
-        setBusy(false);
-        elements["export-menu"].removeAttribute("open");
-      }
+      if (isCurrentTarget(target)) elements["export-menu"].removeAttribute("open");
     }
   }
 
