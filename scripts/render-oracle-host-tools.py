@@ -51,6 +51,7 @@ MAX_APT_INSTALLED_RECORDS = 20_000
 APT_COMPANION_SOURCES = {
     "bzip2": "libbz2-1.0",
     "libc6-i386": "libc6",
+    "libexpat1-dev": "libexpat1",
     "libssl-dev": "libssl3t64",
     "p11-kit": "libp11-kit0",
     "p11-kit-modules": "libp11-kit0",
