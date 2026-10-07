@@ -8,6 +8,10 @@ way rxls `extract --typed-values` does (cells in row/col order; dates as ISO;
 literal-aware percent ×100; numbers whole->int) and compares them with a
 whitespace-insensitive ratio. It mirrors `scripts/xls-xlrd-parity.py` closely,
 swapping xlrd→openpyxl, so the two harnesses apply identical rendering rules.
+Cell strings use the original XML shared/inline/rich text or cached string,
+decoding ST_Xstring exactly once per text element. openpyxl 3.1.5 incompletely
+decodes these tokens; its uncorrected result is also reported for the same
+cohort. Numeric/date/error projections and comparison/skip budgets are unchanged.
 
 Usage:
     python scripts/xlsx-openpyxl-parity.py \
@@ -618,7 +622,222 @@ def _worksheet_cell_rows(ws, max_worksheet_cells):
     return ws.iter_rows()
 
 
-def openpyxl_text(path, max_worksheet_cells):
+_SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_RELATIONSHIP_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XSTRING_TOKEN = re.compile(
+    r"_x([dD][89aAbB][0-9a-fA-F]{2})__x([dD][c-fC-F][0-9a-fA-F]{2})_"
+    r"|_x([0-9a-fA-F]{4})_"
+)
+
+
+def _decode_st_xstring(text):
+    """Decode original XML text once, never a value transformed by openpyxl.
+
+    MS-OI29500 ST_Xstring: seven-character tokens are consumed from the
+    original source. Generated underscores are not rescanned. Malformed lone
+    surrogates stay literal; paired UTF-16 tokens form one scalar.
+    https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/d34ae755-c53f-4a44-a363-c6dd3ee018a4
+    """
+    def replace(match):
+        high, low, unit = match.groups()
+        if high is not None:
+            return chr(0x10000 + ((int(high, 16) - 0xD800) << 10) + int(low, 16) - 0xDC00)
+        value = int(unit, 16)
+        return match.group(0) if 0xD800 <= value <= 0xDFFF else chr(value)
+
+    return _XSTRING_TOKEN.sub(replace, text)
+
+
+def _stored_string_text(element):
+    """Join plain/rich strings after decoding each original t element.
+
+    Phonetic rPh runs and formatting properties are not cell display text.
+    ElementTree has already normalized lexical CR and decoded XML entities.
+    """
+    parts = []
+    for child in element:
+        if child.tag == f"{{{_SPREADSHEET_NS}}}t":
+            parts.append(_decode_st_xstring("".join(child.itertext())))
+        elif child.tag == f"{{{_SPREADSHEET_NS}}}r":
+            for text in child:
+                if text.tag == f"{{{_SPREADSHEET_NS}}}t":
+                    parts.append(_decode_st_xstring("".join(text.itertext())))
+    return "".join(parts)
+
+
+def _original_string_parts(package):
+    """Resolve the same workbook part/type priority as openpyxl, then its rels."""
+    from openpyxl.xml.constants import SHARED_STRINGS, XLTM, XLTX, XLSM, XLSX
+
+    types = ET.fromstring(package.read("[Content_Types].xml"))
+    workbook_part = None
+    for content_type in (XLTM, XLTX, XLSM, XLSX):
+        workbook_part = next(
+            (node.attrib["PartName"].lstrip("/") for node in types
+             if _local_name(node.tag) == "Override"
+             and node.attrib.get("ContentType") == content_type), None
+        )
+        if workbook_part is not None:
+            break
+    if workbook_part is None:
+        defaults = {node.attrib.get("ContentType") for node in types
+                    if _local_name(node.tag) == "Default"}
+        if defaults.intersection((XLTM, XLTX, XLSM, XLSX)):
+            workbook_part = "xl/workbook.xml"
+    if workbook_part is None:
+        raise ValueError("original string projection has no workbook part")
+    base, filename = posixpath.split(workbook_part)
+    rels_part = posixpath.join(base, "_rels", filename + ".rels")
+    relationships = {}
+    shared_part = next(
+        (node.attrib["PartName"].lstrip("/") for node in types
+         if _local_name(node.tag) == "Override"
+         and node.attrib.get("ContentType") == SHARED_STRINGS), None
+    )
+    for rel in ET.fromstring(package.read(rels_part)):
+        if _local_name(rel.tag) != "Relationship" or rel.attrib.get("TargetMode") == "External":
+            continue
+        kind = rel.attrib.get("Type", "")
+        if not kind.startswith(_RELATIONSHIP_NS + "/"):
+            continue
+        target = _package_join(base, rel.attrib.get("Target", ""))
+        relationships[rel.attrib.get("Id")] = (kind.rsplit("/", 1)[-1], target)
+    parts = {}
+    root = ET.fromstring(package.read(workbook_part))
+    for sheet in root.iter(f"{{{_SPREADSHEET_NS}}}sheet"):
+        relation = relationships.get(sheet.attrib.get(f"{{{_RELATIONSHIP_NS}}}id"))
+        if relation is not None and relation[0] == "worksheet":
+            parts[sheet.attrib["name"]] = relation[1]
+    return parts, shared_part
+
+
+def _original_string_cells(package, parts, book, worksheet_titles):
+    """Stream original storage at coordinates of existing openpyxl text cells."""
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    for ws in book.worksheets:
+        if worksheet_titles is not None and ws.title not in worksheet_titles:
+            continue
+        if not any(cell.data_type == "s" and isinstance(cell.value, str)
+                   for cell in ws._cells.values()):
+            continue
+        part = parts.get(ws.title)
+        if part is None:
+            raise ValueError(f"original string projection cannot map worksheet {ws.title}")
+        row_number, column_number, data = 0, 0, None
+        with package.open(part) as stream:
+            for event, element in ET.iterparse(stream, events=("start", "end")):
+                if event == "start":
+                    if element.tag == f"{{{_SPREADSHEET_NS}}}sheetData":
+                        data = element
+                    elif element.tag == f"{{{_SPREADSHEET_NS}}}row":
+                        row = element.attrib.get("r")
+                        if row is None:
+                            row_number += 1
+                        else:
+                            try:
+                                row_number = int(row)
+                            except ValueError:
+                                number = float(row)
+                                if not number.is_integer():
+                                    raise ValueError("original string projection has an invalid row number")
+                                row_number = int(number)
+                        column_number = 0
+                    continue
+                if element.tag == f"{{{_SPREADSHEET_NS}}}c":
+                    coordinate = element.attrib.get("r")
+                    if coordinate:
+                        row, column_number = coordinate_to_tuple(coordinate)
+                    else:
+                        column_number += 1
+                        row = row_number
+                    cell = ws._cells.get((row, column_number))
+                    if cell is not None and cell.data_type == "s" and isinstance(cell.value, str):
+                        yield (ws.title, row, column_number), element, cell.value
+                    element.clear()
+                elif element.tag == f"{{{_SPREADSHEET_NS}}}row" and data is not None:
+                    data.clear()
+
+
+def _original_string_overrides(path, book):
+    """Keep only changed original strings, without changing openpyxl's model.
+
+    The first worksheet pass collects referenced shared-string indices, not
+    one extra record per cell. The shared-string pass decodes only referenced
+    entries, then a second worksheet pass resolves changed values to cells.
+    The existing raw-text and shared-expansion budgets bound these projections.
+    """
+    worksheet_titles = _worksheet_titles(path)
+    if not any(cell.data_type == "s" and isinstance(cell.value, str)
+               for ws in book.worksheets
+               if worksheet_titles is None or ws.title in worksheet_titles
+               for cell in ws._cells.values()):
+        return {}
+    overrides, needed = {}, set()
+    with zipfile.ZipFile(path) as package:
+        parts, shared_part = _original_string_parts(package)
+        for key, element, old_value in _original_string_cells(package, parts, book, worksheet_titles):
+            kind = element.attrib.get("t")
+            value = element.find(f"{{{_SPREADSHEET_NS}}}v")
+            corrected = old_value
+            if kind == "s" and value is not None:
+                needed.add(int(value.text))
+            elif kind == "inlineStr":
+                inline = element.find(f"{{{_SPREADSHEET_NS}}}is")
+                if inline is not None:
+                    corrected = _stored_string_text(inline)
+            elif kind == "str" and value is not None:
+                corrected = _decode_st_xstring("".join(value.itertext()))
+            if corrected != old_value:
+                overrides[key] = corrected
+        if needed:
+            if shared_part is None:
+                raise ValueError("original string projection has no sharedStrings relationship")
+            strings, index = {}, 0
+            with package.open(shared_part) as stream:
+                root = None
+                for event, element in ET.iterparse(stream, events=("start", "end")):
+                    if event == "start":
+                        if root is None:
+                            root = element
+                        continue
+                    if element.tag == f"{{{_SPREADSHEET_NS}}}si":
+                        if index in needed:
+                            strings[index] = _stored_string_text(element)
+                        index += 1
+                        root.clear()
+            if needed.difference(strings):
+                raise ValueError("original string projection has an invalid shared-string index")
+            for key, element, old_value in _original_string_cells(package, parts, book, worksheet_titles):
+                if element.attrib.get("t") != "s":
+                    continue
+                value = element.find(f"{{{_SPREADSHEET_NS}}}v")
+                if value is not None:
+                    corrected = strings[int(value.text)]
+                    if corrected != old_value:
+                        overrides[key] = corrected
+    return overrides
+
+
+def _project_openpyxl_text(book, worksheet_titles, max_worksheet_cells, overrides):
+    parts = []
+    for ws in book.worksheets:
+        if worksheet_titles is not None and ws.title not in worksheet_titles:
+            continue
+        parts.append("# " + ws.title)
+        for row in _worksheet_cell_rows(ws, max_worksheet_cells):
+            out = []
+            for cell in row:
+                key = (ws.title, cell.row, cell.column)
+                text = overrides[key] if key in overrides else _cell_text(cell)
+                if text is not None and text != "":
+                    out.append(text)
+            if out:
+                parts.append("\t".join(out))
+    return "\n".join(parts)
+
+
+def _openpyxl_text_projections(path, max_worksheet_cells, max_hash_chars):
     try:
         import openpyxl
     except ImportError:
@@ -655,22 +874,22 @@ def openpyxl_text(path, max_worksheet_cells):
     book = openpyxl.load_workbook(path, read_only=False, data_only=True)
     try:
         worksheet_titles = _worksheet_titles(path)
-        parts = []
-        for ws in book.worksheets:
-            if worksheet_titles is not None and ws.title not in worksheet_titles:
-                continue
-            parts.append("# " + ws.title)
-            for row in _worksheet_cell_rows(ws, max_worksheet_cells):
-                out = []
-                for cell in row:
-                    s = _cell_text(cell)
-                    if s is not None and s != "":
-                        out.append(s)
-                if out:
-                    parts.append("\t".join(out))
-        return "\n".join(parts)
+        raw = _project_openpyxl_text(book, worksheet_titles, max_worksheet_cells, {})
+        # The existing comparison gate necessarily rejects this output. Do not
+        # allocate a second projection for inputs already beyond its hash cap.
+        if len(raw) > max_hash_chars:
+            return raw, raw
+        overrides = _original_string_overrides(path, book)
+        if not overrides:
+            return raw, raw
+        corrected = _project_openpyxl_text(book, worksheet_titles, max_worksheet_cells, overrides)
+        return corrected, raw
     finally:
         book.close()
+
+
+def openpyxl_text(path, max_worksheet_cells):
+    return _openpyxl_text_projections(path, max_worksheet_cells, 5_000_000)[0]
 
 
 def norm(s):
@@ -844,6 +1063,8 @@ def main():
         args.manifest, oracle_reader="openpyxl", package_distribution="openpyxl"
     )
 
+    print("provenance: oracle_cell_strings=original_xml_st_xstring_v1")
+
     binary = resolve_binary(args.bin)
     source_root = report_source_root(args.manifest, args.corpus)
     corpus_failures = parse_corpus_report(args.corpus_report) if args.corpus_report else []
@@ -854,7 +1075,7 @@ def main():
     else:
         files = corpus_files(args.corpus, {".xlsx", ".xlsm"}, args.limit)
 
-    sims, comparisons, skips = [], [], []
+    sims, raw_sims, comparisons, skips = [], [], [], []
     by_skip_decision, by_skip_evidence, by_skip_corpus_kind = {}, {}, {}
     rxls_ok, opx_failed, oversized, oversized_worksheets, hash_exact = 0, 0, 0, 0, 0
     bounded_shared_strings = 0
@@ -883,7 +1104,7 @@ def main():
             )
             continue
         try:
-            gold = openpyxl_text(f, args.max_worksheet_cells)
+            gold, raw_gold = _openpyxl_text_projections(f, args.max_worksheet_cells, args.max_hash_chars)
         except OversizedWorksheet as exc:
             oversized_worksheets += 1
             skips.append(("oversized-worksheet", f, str(exc)))
@@ -892,7 +1113,7 @@ def main():
             opx_failed += 1
             skips.append(("openpyxl-unreadable", f, f"{type(exc).__name__}: {exc}"))
             continue
-        combined_text_len = len(gold) + len(rt)
+        combined_text_len = max(len(gold), len(raw_gold)) + len(rt)
         if combined_text_len > args.max_compare_chars:
             if combined_text_len > args.max_hash_chars:
                 oversized += 1
@@ -905,10 +1126,12 @@ def main():
                 )
                 continue
             gold_norm = norm(gold)
+            raw_norm = gold_norm if raw_gold == gold else norm(raw_gold)
             rxls_norm = norm(rt)
-            if gold_norm and hash_exact_match(gold_norm, rxls_norm):
+            if gold_norm and hash_exact_match(gold_norm, rxls_norm) and hash_exact_match(raw_norm, rxls_norm):
                 hash_exact += 1
                 sims.append(1.0)
+                raw_sims.append(1.0)
                 comparisons.append((1.0, f))
                 continue
             oversized += 1
@@ -921,8 +1144,9 @@ def main():
             )
             continue
         gold_norm = norm(gold)
+        raw_norm = gold_norm if raw_gold == gold else norm(raw_gold)
         rxls_norm = norm(rt)
-        combined_norm_len = len(gold_norm) + len(rxls_norm)
+        combined_norm_len = max(len(gold_norm), len(raw_norm)) + len(rxls_norm)
         if combined_norm_len > args.max_compare_chars:
             if combined_norm_len > args.max_hash_chars:
                 oversized += 1
@@ -934,9 +1158,10 @@ def main():
                     )
                 )
                 continue
-            if gold_norm and hash_exact_match(gold_norm, rxls_norm):
+            if gold_norm and hash_exact_match(gold_norm, rxls_norm) and hash_exact_match(raw_norm, rxls_norm):
                 hash_exact += 1
                 sims.append(1.0)
+                raw_sims.append(1.0)
                 comparisons.append((1.0, f))
                 continue
             oversized += 1
@@ -955,6 +1180,7 @@ def main():
             continue
         ratio = difflib.SequenceMatcher(None, gold_norm, rxls_norm).ratio()
         sims.append(ratio)
+        raw_sims.append(ratio if raw_norm == gold_norm else difflib.SequenceMatcher(None, raw_norm, rxls_norm).ratio())
         comparisons.append((ratio, f))
 
     if not sims:
@@ -977,6 +1203,12 @@ def main():
             by_skip_corpus_kind[corpus_kind] = by_skip_corpus_kind.get(corpus_kind, 0) + 1
 
     print(f"rxls vs openpyxl: mean parity {mean*100:.3f}%   >=99%: {sum(v>=0.99 for v in sims)}/{len(sims)}")
+    assert len(raw_sims) == len(sims)
+    print(
+        "rxls vs openpyxl raw (before XML ST_Xstring correction): "
+        f"mean parity {sum(raw_sims) / len(raw_sims) * 100:.3f}%   "
+        f">=99%: {sum(v >= 0.99 for v in raw_sims)}/{len(raw_sims)}"
+    )
     for decision, count in sorted(by_skip_decision.items()):
         print(f"by_skip_decision: {decision} skipped={count}")
     for evidence, count in sorted(by_skip_evidence.items()):
