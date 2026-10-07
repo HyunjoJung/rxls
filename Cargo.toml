@@ -57,6 +57,7 @@ exclude = [
     "scripts/run-render-oracle-container.py",
     "scripts/smoke-render-oracle-runtime.py",
     "scripts/summarize-render-oracle-failure.py",
+    "scripts/test_*.py",
     "scripts/test_check_render_parity_baseline.py",
     "scripts/test_check_authored_print_parity.py",
     "scripts/test_check_ooxml_row_oracle.py",

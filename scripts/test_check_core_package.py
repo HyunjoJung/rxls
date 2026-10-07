@@ -170,6 +170,30 @@ class CorePackageGateTests(unittest.TestCase):
             self.assertIn("forbidden package subtree: packages", errors)
             self.assertFalse(report["passed"])
 
+    def test_excludes_python_tooling_tests_and_preserves_validators(self) -> None:
+        with self.subTest(gate="manifest"):
+            manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn("scripts/test_*.py", manifest["package"]["exclude"])
+        for name in ("test_future_tooling.py", "test_support.py"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                crate = Path(directory) / "rxls.crate"
+                write_crate(crate, {f"scripts/{name}": b"tooling test or support"})
+                errors, report = MODULE.validate(crate)
+                self.assertIn(
+                    f"Python tooling-test/support script entered the core package: {name}",
+                    errors,
+                )
+                self.assertFalse(report["passed"])
+        with (
+            self.subTest(gate="production-validator"),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            crate = Path(directory) / "rxls.crate"
+            write_crate(crate, {"scripts/check_core_package.py": b"production validator"})
+            errors, report = MODULE.validate(crate)
+            self.assertEqual(errors, [])
+            self.assertTrue(report["passed"])
+
     def test_rejects_render_tree_and_internal_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             crate = Path(directory) / "rxls.crate"
