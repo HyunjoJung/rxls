@@ -107,6 +107,11 @@ cargo +1.85.0 run --locked --features serde --example typed_rows
 
 ### Create a styled XLSX
 
+`Workbook::to_xlsx_checked` creates a new XLSX package from the common model,
+including models read with `Workbook::open`. For supported edits to an existing
+XLSX/XLSM template, use `Spreadsheet` to retain its existing styles, theme, and
+column records.
+
 ```rust
 use rxls::{CellStyle, HAlign, Workbook};
 

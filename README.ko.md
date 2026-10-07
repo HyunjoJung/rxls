@@ -107,6 +107,10 @@ cargo +1.85.0 run --locked --features serde --example typed_rows
 
 ### 서식이 있는 XLSX 만들기
 
+`Workbook::to_xlsx_checked`는 `Workbook::open`으로 읽은 모델을 포함해 공통
+모델로 새 XLSX 패키지를 생성합니다. 기존 XLSX/XLSM 템플릿의 스타일, 테마,
+열 레코드를 유지하며 지원 범위 안에서 편집할 때는 `Spreadsheet`를 사용합니다.
+
 ```rust
 use rxls::{CellStyle, HAlign, Workbook};
 
