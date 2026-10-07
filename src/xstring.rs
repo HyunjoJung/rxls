@@ -3,7 +3,7 @@
 //! Use after XML decoding and once per text element, never for formula syntax
 //! or arbitrary XML. Office's interoperability notes require CR escaping and
 //! protection of literal `_xHHHH_` underscores:
-//! https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/d34ae755-c53f-4a44-a363-c6dd3ee018a4
+//! <https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/d34ae755-c53f-4a44-a363-c6dd3ee018a4>
 
 use std::borrow::Cow;
 
