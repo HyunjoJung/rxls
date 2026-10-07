@@ -31,6 +31,84 @@ SCRIPT = ROOT / "scripts" / "xlsx-openpyxl-parity.py"
 
 @unittest.skipIf(openpyxl is None, "openpyxl is not installed")
 class XlsxOpenpyxlParityTests(unittest.TestCase):
+    def test_original_xml_xstring_projection_preserves_storage_boundaries_and_types(self) -> None:
+        module = _load_xlsx_openpyxl_parity()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "strings.xlsx"
+            _write_original_xstring_workbook(path)
+            value = module.openpyxl_text(path, 1000)
+            self.assertEqual(value, _original_xstring_expected_text())
+            # Formula syntax, numeric/date caches and error text stay untouched.
+            self.assertIn("\n2\n2026-10-07\n_x0041_", value)
+
+    def test_original_xml_projection_maps_relationships_and_implicit_coordinates(self) -> None:
+        module = _load_xlsx_openpyxl_parity()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "implicit.xlsx"
+            _write_original_xstring_workbook(path, implicit=True)
+            value = module.openpyxl_text(path, 1000)
+            self.assertEqual(value, _original_xstring_expected_text())
+            book = openpyxl.load_workbook(path, data_only=True)
+            before = {(ws.title, cell.coordinate): (cell.value, cell.data_type)
+                      for ws in book.worksheets for cell in ws._cells.values()}
+            overrides = module._original_string_overrides(path, book)
+            after = {(ws.title, cell.coordinate): (cell.value, cell.data_type)
+                     for ws in book.worksheets for cell in ws._cells.values()}
+            self.assertEqual(before, after)
+            self.assertEqual(overrides[("Other", 1, 1)], "Other\rcell")
+            book.close()
+
+    def test_xstring_decoder_preserves_protected_overlaps_and_utf16_boundaries(self) -> None:
+        module = _load_xlsx_openpyxl_parity()
+        for stored, expected in [
+            ("_x005F_x0041_", "_x0041_"),
+            ("_x005F_x005F_x0041_", "_x005FA"),
+            ("_x0041_x0042_", "Ax0042_"),
+            ("_x0041__x0042_", "AB"),
+            ("_xD83D__xDE00_", "😀"),
+            ("_x005F_xD83D__xDE00_", "_xD83D__xDE00_"),
+            ("_xD800_ _xDC00_", "_xD800_ _xDC00_"),
+            ("_xZZZZ_ _x123_ _X0041_", "_xZZZZ_ _x123_ _X0041_"),
+            ("a_x0000__x0001_b", "a\0\x01b"),
+        ]:
+            with self.subTest(stored=stored):
+                self.assertEqual(module._decode_st_xstring(stored), expected)
+
+    def test_original_xml_overlay_does_not_run_above_existing_text_budget(self) -> None:
+        from unittest.mock import patch
+        module = _load_xlsx_openpyxl_parity()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "strings.xlsx"
+            _write_original_xstring_workbook(path)
+            with patch.object(module, "_original_string_overrides", side_effect=AssertionError("over-budget overlay")):
+                corrected, raw = module._openpyxl_text_projections(path, 1000, 1)
+            self.assertEqual(corrected, raw)
+
+    def test_cli_retains_raw_metrics_with_corrected_same_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / "strings.xlsx"
+            _write_original_xstring_workbook(path)
+            fake = base / "fake-extract"
+            fake.write_text("#!/usr/bin/env python3\nprint(" + repr(_original_xstring_expected_text()) + ")\n", encoding="utf-8")
+            fake = make_python_stub_executable(fake)
+            output = subprocess.run(
+                [sys.executable, str(SCRIPT), "--corpus", str(base), "--bin", str(fake), "--min", "1.0"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+            self.assertIn("comparable: 1", output.stdout)
+            self.assertIn("rxls vs openpyxl: mean parity 100.000%   >=99%: 1/1", output.stdout)
+            self.assertRegex(output.stdout, r"rxls vs openpyxl raw \(before XML ST_Xstring correction\): mean parity (?!100\.000)\d+\.\d+%   >=99%: 0/1")
+            self.assertIn("provenance: oracle_cell_strings=original_xml_st_xstring_v1", output.stdout)
+
+    def test_shared_string_projection_follows_content_types_without_extra_relationship(self) -> None:
+        module = _load_xlsx_openpyxl_parity()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest-shared-strings.xlsx"
+            _write_original_xstring_workbook(path, shared_relationship=False)
+            self.assertEqual(module.openpyxl_text(path, 1000), _original_xstring_expected_text())
+
     def test_number_formats_select_sign_zero_and_conditional_sections(self) -> None:
         module = _load_xlsx_openpyxl_parity()
         workbook = openpyxl.Workbook()
@@ -2351,6 +2429,78 @@ def _write_shared_string_amplification_workbook(
 </sst>
 """,
         )
+
+
+def _original_xstring_expected_text():
+    return "\n".join([
+        "# Data", "_x0041_", "_x005FA", "a\0\x01b", "a\r\n& inline",
+        "_x0041_\r한글", "_x0041_", " cache _x0041_\r ", "2", "2026-10-07", "_x0041_",
+        "literal x005F_tail", "# Other", "Other\rcell",
+    ])
+
+
+def _write_original_xstring_workbook(path, *, implicit=False, shared_relationship=True):
+    # Author a valid package with openpyxl, then supply original cell storage
+    # explicitly. Expectations are semantic constants, independent of rxls.
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A9"] = datetime.datetime(2026, 10, 7)
+    sheet["A9"].number_format = "yyyy-mm-dd"
+    workbook.create_sheet("Other")
+    workbook.save(path)
+    with ZipFile(path) as package:
+        payloads = {info.filename: package.read(info) for info in package.infolist()}
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    shared = (
+        '<si><t>_x005F_x0041_</t></si>'
+        '<si><t>_x005F_x005F_x0041_</t></si>'
+        '<si><t>a_x0000__x0001_b</t></si>'
+        '<si><r><t>_x005F_x0041_</t></r><r><t>_x000D_한글</t></r>'
+        '<rPh sb="0" eb="1"><t>phonetic excluded</t></rPh></si>'
+        '<si><r><t>_x00</t></r><r><t>41_</t></r></si>'
+        '<si><t>literal x005F_tail</t></si>'
+    )
+    rows = [
+        '<c r="A1" t="s"><v>0</v></c>',
+        '<c r="A2" t="s"><v>1</v></c>',
+        '<c r="A3" t="s"><v>2</v></c>',
+        '<c r="A4" t="inlineStr"><is><t>a_x000D_\n&amp; inline</t></is></c>',
+        '<c r="A5" t="s"><v>3</v></c>',
+        '<c r="A6" t="s"><v>4</v></c>',
+        '<c r="A7" t="str"><f>"_x0041_"</f><v xml:space="preserve"> cache _x005F_x0041__x000D_ </v></c>',
+        '<c r="A8"><f>1+1</f><v>2</v></c>',
+        '<c r="A9" s="1"><v>' + str(openpyxl.utils.datetime.to_excel(datetime.datetime(2026, 10, 7))) + '</v></c>',
+        '<c r="A10" t="e"><v>_x0041_</v></c>',
+        '<c r="A11" t="s"><v>5</v></c>',
+    ]
+    if implicit:
+        rows = [row.replace(f' r="A{index}"', "") for index, row in enumerate(rows, 1)]
+    payloads["xl/worksheets/original-data.xml"] = (
+        f'<worksheet xmlns="{namespace}"><sheetData>' +
+        "".join(("<row>" if implicit else f'<row r="{index}">') + row + "</row>" for index, row in enumerate(rows, 1)) +
+        '</sheetData></worksheet>'
+    ).encode()
+    payloads["xl/worksheets/original-other.xml"] = (
+        f'<worksheet xmlns="{namespace}"><sheetData><row r="1">'
+        '<c r="A1" t="inlineStr"><is><t>Other_x000d_cell</t></is></c>'
+        '</row></sheetData></worksheet>'
+    ).encode()
+    payloads.pop("xl/worksheets/sheet1.xml")
+    payloads.pop("xl/worksheets/sheet2.xml")
+    payloads["xl/sharedStrings.xml"] = f'<sst xmlns="{namespace}" count="6" uniqueCount="6">{shared}</sst>'.encode()
+    relations = payloads["xl/_rels/workbook.xml.rels"].decode()
+    relations = relations.replace('/xl/worksheets/sheet1.xml', 'worksheets/original-data.xml')
+    relations = relations.replace('/xl/worksheets/sheet2.xml', 'worksheets/original-other.xml')
+    if shared_relationship:
+        relations = relations.replace('</Relationships>', '<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml" Id="strings"/></Relationships>')
+    payloads["xl/_rels/workbook.xml.rels"] = relations.encode()
+    content_types = payloads["[Content_Types].xml"].decode().replace('/xl/worksheets/sheet1.xml', '/xl/worksheets/original-data.xml').replace('/xl/worksheets/sheet2.xml', '/xl/worksheets/original-other.xml')
+    content_types = content_types.replace('</Types>', '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>')
+    payloads["[Content_Types].xml"] = content_types.encode()
+    with ZipFile(path, "w", ZIP_DEFLATED) as package:
+        for name, payload in payloads.items():
+            package.writestr(name, payload)
 
 
 def _load_xlsx_openpyxl_parity():
