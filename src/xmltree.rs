@@ -548,6 +548,67 @@ impl XmlTree {
         Ok(())
     }
 
+    /// Replace scalar text while retaining its raw comments and processing
+    /// instructions in order. The first text/CDATA carrier keeps its position;
+    /// later text carriers are removed. An empty scalar gains one carrier at
+    /// the start. Element children are rejected before mutation.
+    pub(crate) fn set_scalar_text_preserving_markup(
+        &mut self,
+        id: NodeId,
+        text: &str,
+    ) -> Result<()> {
+        if !matches!(self.nodes[id.0 as usize].node, Node::Element { .. }) {
+            return Err(Error::Xml("scalar text target is not an element"));
+        }
+        let children = &self.nodes[id.0 as usize].children;
+        let capacity = children
+            .len()
+            .checked_add(1)
+            .ok_or(Error::Xml("scalar child list is too large"))?;
+        let mut retained = Vec::new();
+        retained
+            .try_reserve(capacity)
+            .map_err(|_| Error::Xml("xml: out of memory retaining scalar markup"))?;
+        let mut carrier = None;
+        for &child in children {
+            let text_carrier = match &self.nodes[child.0 as usize].node {
+                Node::Text(_) => true,
+                Node::Raw(raw) => raw.starts_with(b"<![CDATA["),
+                Node::Element { .. } => return Err(Error::Xml("scalar text has element children")),
+            };
+            if text_carrier {
+                if carrier.is_none() {
+                    carrier = Some(child);
+                    retained.push(child);
+                }
+            } else {
+                retained.push(child);
+            }
+        }
+        // The generic setter reuses the carrier or appends exactly one node.
+        // Preflight that new node here: its generic no-carrier path reserves
+        // fallibly, but the arena node ceiling is enforced by this wrapper.
+        let new_carrier = if carrier.is_none() {
+            if self.nodes.len() >= node_budget() {
+                return Err(Error::Xml("edit would exceed the node budget"));
+            }
+            Some(NodeId(
+                u32::try_from(self.nodes.len())
+                    .map_err(|_| Error::Xml("xml node index is too large"))?,
+            ))
+        } else {
+            None
+        };
+        self.set_element_text(id, text)?;
+        // No fallible work remains. Capacity includes the possible new node,
+        // and set_element_text has already committed/reused its sole carrier.
+        if let Some(child) = new_carrier {
+            retained.insert(0, child);
+        }
+        self.nodes[id.0 as usize].children = retained;
+        Ok(())
+    }
+
     /// Set (or add) an attribute on an element, preserving the order of
     /// existing attributes. No-op on non-elements. **Errors** when *adding* a
     /// new attribute would exceed [`max_attrs`] (replacing an existing one
@@ -1425,6 +1486,129 @@ mod tests {
         let id = t.root_element().unwrap();
         assert_eq!(t.attr_value(id, b"foo"), Some(&b"1"[..]));
         assert!(t.children_of(id).is_empty());
+    }
+
+    #[test]
+    fn scalar_text_preserves_split_comments_pi_and_cdata_without_arena_growth() {
+        let mut tree = XmlTree::parse(br#"<r><t keep="yes"><!--leading-->old<!--between--><![CDATA[more]]><?keep value?>tail<!--last--></t><unrelated/></r>"#).unwrap();
+        let root = tree.root_element().unwrap();
+        let scalar = tree.child_by_name(root, b"t").unwrap();
+        let before_count = tree.node_count();
+        let original_children = tree.children_of(scalar).to_vec();
+        tree.set_scalar_text_preserving_markup(scalar, "new&value")
+            .unwrap();
+        assert_eq!(
+            s(&tree),
+            r#"<r><t keep="yes"><!--leading-->new&amp;value<!--between--><?keep value?><!--last--></t><unrelated/></r>"#
+        );
+        assert_eq!(
+            tree.children_of(scalar),
+            &[
+                original_children[0],
+                original_children[1],
+                original_children[2],
+                original_children[4],
+                original_children[6]
+            ]
+        );
+        assert_eq!(tree.text_of(scalar), "new&value");
+        assert_eq!(tree.node_count(), before_count);
+        for value in ["", "again", "<final>"] {
+            tree.set_scalar_text_preserving_markup(scalar, value)
+                .unwrap();
+            assert_eq!(tree.text_of(scalar), value);
+            assert_eq!(tree.node_count(), before_count);
+        }
+        assert_eq!(
+            s(&tree),
+            r#"<r><t keep="yes"><!--leading-->&lt;final&gt;<!--between--><?keep value?><!--last--></t><unrelated/></r>"#
+        );
+    }
+
+    #[test]
+    fn scalar_text_reuses_first_cdata_carrier_and_preserves_preceding_markup() {
+        let mut tree =
+            XmlTree::parse(b"<t><!--leading--><![CDATA[old]]><?keep value?>more</t>").unwrap();
+        let scalar = tree.root_element().unwrap();
+        let carrier = tree.children_of(scalar)[1];
+        let before_count = tree.node_count();
+        tree.set_scalar_text_preserving_markup(scalar, "<&")
+            .unwrap();
+        assert_eq!(s(&tree), "<t><!--leading-->&lt;&amp;<?keep value?></t>");
+        assert_eq!(tree.children_of(scalar)[1], carrier);
+        assert_eq!(tree.node_count(), before_count);
+    }
+
+    #[test]
+    fn scalar_text_without_carrier_adds_one_before_markup_and_reuses_it() {
+        let mut tree = XmlTree::parse(b"<t><!--keep--><?keep value?></t>").unwrap();
+        let scalar = tree.root_element().unwrap();
+        let before_count = tree.node_count();
+        tree.set_scalar_text_preserving_markup(scalar, "first")
+            .unwrap();
+        assert_eq!(s(&tree), "<t>first<!--keep--><?keep value?></t>");
+        assert_eq!(tree.node_count(), before_count + 1);
+        tree.set_scalar_text_preserving_markup(scalar, "second")
+            .unwrap();
+        assert_eq!(s(&tree), "<t>second<!--keep--><?keep value?></t>");
+        assert_eq!(tree.node_count(), before_count + 1);
+    }
+
+    #[test]
+    fn scalar_text_no_carrier_budget_rejection_is_atomic() {
+        let mut tree = XmlTree::parse(b"<t><!--keep--><?keep value?></t>").unwrap();
+        let scalar = tree.root_element().unwrap();
+        let before = tree.serialize();
+        let before_count = tree.node_count();
+        let before_children = tree.children_of(scalar).to_vec();
+        set_test_node_budget(before_count);
+        let rejected = tree.set_scalar_text_preserving_markup(scalar, "new");
+        reset_test_node_budget();
+        assert!(rejected.is_err());
+        assert_eq!(tree.serialize(), before);
+        assert_eq!(tree.node_count(), before_count);
+        assert_eq!(tree.children_of(scalar), before_children);
+        set_test_node_budget(before_count + 1);
+        let accepted = tree.set_scalar_text_preserving_markup(scalar, "new");
+        reset_test_node_budget();
+        assert!(accepted.is_ok());
+        assert_eq!(tree.node_count(), before_count + 1);
+    }
+
+    #[test]
+    fn scalar_text_rejects_element_children_without_mutation() {
+        let mut tree = XmlTree::parse(b"<t>old<!--keep--><unsupported/>tail</t>").unwrap();
+        let scalar = tree.root_element().unwrap();
+        let before = tree.serialize();
+        let before_count = tree.node_count();
+        assert!(tree
+            .set_scalar_text_preserving_markup(scalar, "new")
+            .is_err());
+        assert_eq!(tree.serialize(), before);
+        assert_eq!(tree.node_count(), before_count);
+    }
+
+    #[test]
+    fn scalar_text_commit_failures_preserve_markup_and_node_count() {
+        for (xml, failures) in [
+            (b"<t><!--keep-->old<?keep value?>tail</t>".as_slice(), 1),
+            (b"<t><!--keep--><?keep value?></t>".as_slice(), 2),
+        ] {
+            for fail_after in 0..failures {
+                let mut tree = XmlTree::parse(xml).unwrap();
+                let scalar = tree.root_element().unwrap();
+                let before = tree.serialize();
+                let before_count = tree.node_count();
+                let before_children = tree.children_of(scalar).to_vec();
+                set_test_fail_commit_after(fail_after);
+                let result = tree.set_scalar_text_preserving_markup(scalar, "new");
+                reset_test_fail_commit();
+                assert!(result.is_err());
+                assert_eq!(tree.serialize(), before);
+                assert_eq!(tree.node_count(), before_count);
+                assert_eq!(tree.children_of(scalar), before_children);
+            }
+        }
     }
 
     // --- Commit-failure test seam ---

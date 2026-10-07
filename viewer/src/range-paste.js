@@ -2,7 +2,7 @@ import { MAX_PASTE_BYTES, rangePasteRequest } from "./clipboard.js";
 import { describeError } from "./core.js";
 
 /** Preview native clipboard events before submitting one atomic worker transaction. */
-export function createRangePasteController({ grid, elements, showError }) {
+export function createRangePasteController({ grid, elements, showError, onChange = () => {} }) {
   const dialog = elements["paste-dialog"];
   const status = elements["paste-status"];
   const summary = elements["paste-summary"];
@@ -47,6 +47,7 @@ export function createRangePasteController({ grid, elements, showError }) {
     pending = null;
     preview.replaceChildren();
     if (dialog.open) dialog.close();
+    onChange();
   }
 
   function cancel() {
@@ -79,6 +80,7 @@ export function createRangePasteController({ grid, elements, showError }) {
       parseError = error;
     }
     pending = { target, text, request };
+    onChange();
     applying = false;
     applyButton.disabled = !request;
     textButton.disabled = false;

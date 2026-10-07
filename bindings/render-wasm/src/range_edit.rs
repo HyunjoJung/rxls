@@ -190,6 +190,17 @@ mod tests {
         session.undo_edit_core().unwrap();
         let before = session.save_document_bytes_core().unwrap();
         let history = session.edit_state_json();
+        let source = Arc::clone(&session.workbook);
+        let revision = session.viewport_revision;
+        let geometry = "vp-12345678-1234-4234-8234-123456789abc-101";
+        let provisional = "vp-12345678-1234-4234-8234-123456789abc-102";
+        session.stage_viewport_json_core(0, geometry, "{}").unwrap();
+        session
+            .commit_viewport_core(geometry, &revision.to_string())
+            .unwrap();
+        session
+            .stage_viewport_json_core(0, provisional, "{}")
+            .unwrap();
         for values in [
             json!([]),
             json!([[]]),
@@ -197,7 +208,7 @@ mod tests {
             json!([[{"kind":"number","value":4},{"kind":"formula-auto","formula":"=UNKNOWNFUNCTION()"}]]),
             json!([[{"kind":"formula-auto","formula":"=B1"},{"kind":"formula-auto","formula":"=A1"}]]),
             json!([[{"kind":"formula-auto","formula":"="}]]),
-            json!([[{"kind":"text","value":"bad\u{0}xml"}]]),
+            json!([[{"kind":"formula","formula":"=1+1","cached":{"kind":"error","value":"#BAD\u{0}!"}}]]),
             json!([[{"kind":"formula","formula":"x".repeat(128*1024),"cached":{"kind":"number","value":0}}]]),
             json!([[{"kind":"text","value":"x".repeat(32768)}]]),
         ] {
@@ -207,7 +218,45 @@ mod tests {
                 .is_err());
             assert_eq!(session.save_document_bytes_core().unwrap(), before);
             assert_eq!(session.edit_state_json(), history);
+            assert_eq!(session.viewport_revision, revision);
+            assert!(Arc::ptr_eq(&session.workbook, &source));
+            assert!(session.published_viewport.is_some());
+            assert!(session.provisional_viewport.is_some());
         }
+    }
+
+    #[test]
+    fn rectangular_c0_text_round_trips_and_invalidates_only_on_accepted_edit() {
+        let mut session = session();
+        let original = session.save_document_bytes_core().unwrap();
+        let geometry = "vp-12345678-1234-4234-8234-123456789abc-103";
+        session.stage_viewport_json_core(0, geometry, "{}").unwrap();
+        session.commit_viewport_core(geometry, "0").unwrap();
+        let text = ["range\0control", "range\u{1}control"];
+        let request = json!({"sheetIndex":0,"startRow":0,"startCol":0,"values":[[
+            {"kind":"text","value":text[0]}, {"kind":"text","value":text[1]}
+        ]]});
+        session
+            .set_range_recalculate_json_core(&request.to_string())
+            .unwrap();
+        assert_eq!(session.viewport_revision, 1);
+        assert!(session.published_viewport.is_none());
+        let saved = session.save_document_bytes_core().unwrap();
+        let reopened = Workbook::open(&saved).unwrap();
+        for (col, text) in text.iter().enumerate() {
+            assert_eq!(
+                reopened.sheets[0].cell(0, col as u16),
+                Some(&Cell::Text((*text).to_owned()))
+            );
+        }
+        assert_eq!(session.edit_state_value()["undoDepth"], 1);
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.viewport_revision, 2);
+        assert_eq!(session.save_document_bytes_core().unwrap(), original);
+        assert_eq!(session.edit_state_value()["redoDepth"], 1);
+        session.redo_edit_core().unwrap();
+        assert_eq!(session.viewport_revision, 3);
+        assert_eq!(session.save_document_bytes_core().unwrap(), saved);
     }
 
     #[test]

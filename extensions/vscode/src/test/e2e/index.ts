@@ -33,6 +33,8 @@ export async function run(): Promise<void> {
       const uri = vscode.Uri.file(path.join(seedDirectory, fixtures[format]));
       seeded.set(fixtures[format], await vscode.workspace.fs.readFile(uri));
     }
+    const longExportUri = vscode.Uri.file(path.join(seedDirectory, fixtures.longExportFile));
+    seeded.set(fixtures.longExportFile, await vscode.workspace.fs.readFile(longExportUri));
     const provider = new MemoryFileSystemProvider(workspace.uri, seeded);
     disposables.push(
       provider,
@@ -105,6 +107,10 @@ export async function run(): Promise<void> {
     await delay(100);
   }
 
+  if (formats.includes("xlsx") && expectedTrust) {
+    await exerciseLongExport(api, workspace.uri, fixtures.longExportFile);
+  }
+
   if (failureBoundaries) {
     assert.equal(expectedTrust, true, "failure-boundary tests require a trusted workspace");
     await exerciseFailureBoundaries(api, workspace.uri, fixtures);
@@ -123,6 +129,29 @@ export async function run(): Promise<void> {
       formats
     })}`
   );
+}
+
+async function exerciseLongExport(api: RxlsPreviewApi, workspace: vscode.Uri, fileName: string): Promise<void> {
+  const uri = vscode.Uri.joinPath(workspace, fileName);
+  const loadedPromise = waitForPreview(api, uri, 0);
+  await vscode.commands.executeCommand("vscode.openWith", uri, VIEW_TYPE);
+  const loaded = await loadedPromise;
+  assert.equal(loaded.preview?.rendered, true);
+  const prefix = "W".repeat(80) + "-" + "S".repeat(31);
+  for (const kind of ["svg", "png"] as const) {
+    const result = await api.requestExport(uri, kind);
+    assert.equal(result.kind, kind);
+    assert.equal(result.fileName.length, 120);
+    assert.ok(result.fileName.startsWith(prefix));
+    assert.ok(result.fileName.endsWith(`.${kind}`));
+    if (kind === "svg") assert.match(new TextDecoder().decode(result.bytes.subarray(0, 512)), /<svg(?:\s|>)/i);
+    else assert.deepEqual([...result.bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+    const destination = vscode.Uri.joinPath(workspace, result.fileName);
+    await vscode.workspace.fs.writeFile(destination, result.bytes);
+    assert.deepEqual(Uint8Array.from(await vscode.workspace.fs.readFile(destination)), result.bytes);
+  }
+  await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+  await delay(100);
 }
 
 async function exerciseFailureBoundaries(
@@ -215,6 +244,7 @@ function waitForError(
 type FixtureMap = Record<"xls" | "xlsx" | "xlsm" | "xlsb" | "ods", string> & {
   invalidFile: string;
   oversizedFile: string;
+  longExportFile: string;
 };
 
 function parseFixtures(value: string | undefined): FixtureMap {
@@ -229,7 +259,8 @@ function parseFixtures(value: string | undefined): FixtureMap {
     "xlsb",
     "ods",
     "invalidFile",
-    "oversizedFile"
+    "oversizedFile",
+    "longExportFile"
   ]) {
     if (typeof parsed[format] !== "string" || !parsed[format]) {
       throw new Error(`missing ${format} E2E fixture`);

@@ -463,6 +463,10 @@ export interface SaveDocumentResult {
 }
 
 export type RenderOperation =
+  | "viewport-capabilities"
+  | "prepare-viewport"
+  | "render-viewport-tile"
+  | "release-viewport"
   | "capabilities"
   | "open"
   | "close"
@@ -483,6 +487,10 @@ export type RenderOperation =
   | "save-document";
 
 export interface RenderOperationPayloads {
+  readonly "viewport-capabilities": Readonly<Record<string, never>>;
+  readonly "prepare-viewport": { readonly documentId: string; readonly sheetIndex: number; readonly options?: ViewportOptions };
+  readonly "render-viewport-tile": ViewportTileIdentity;
+  readonly "release-viewport": ViewportIdentity;
   readonly capabilities: Readonly<Record<string, never>>;
   readonly open: {
     readonly documentId: string;
@@ -556,6 +564,10 @@ export interface RenderOperationPayloads {
 }
 
 export interface RenderOperationResults {
+  readonly "viewport-capabilities": ViewportCapabilities;
+  readonly "prepare-viewport": ViewportPrepareResult;
+  readonly "render-viewport-tile": ViewportTileResult;
+  readonly "release-viewport": ViewportReleaseResult;
   readonly capabilities: RenderCapabilities;
   readonly open: OpenDocumentResult;
   readonly close: CloseDocumentResult;
@@ -692,3 +704,123 @@ export declare function limitError(
   actual: number,
   location?: string,
 ): RenderProtocolError;
+
+/** Canonical decimal u64 strings are validated at runtime, never coerced to Number. */
+export interface ViewportRect {
+  readonly xRaw: number;
+  readonly yRaw: number;
+  readonly widthRaw: number;
+  readonly heightRaw: number;
+}
+export interface ViewportOptions {
+  readonly gridlines?: boolean;
+  readonly includeHidden?: boolean;
+  readonly limits?: RenderLimits;
+}
+export interface ViewportIdentity {
+  readonly documentId: string;
+  readonly sheetIndex: number;
+  readonly geometryId: string;
+  readonly revision: string;
+}
+export interface ViewportTileIdentity extends ViewportIdentity {
+  readonly rect: ViewportRect;
+  readonly namespace: string;
+}
+export interface ViewportPreparationReport {
+  readonly coordinateVisits: number;
+  readonly sourceRawCells: number;
+  readonly sourceHyperlinks: number;
+  readonly sourceIndexBuildPeakBytes: number;
+  readonly geometryBytes: number;
+  readonly textBytes: number;
+  readonly shapedGlyphs: number;
+  readonly textWork: number;
+  readonly shapedRuns: number;
+  readonly textLines: number;
+  readonly pathCommands: number;
+  readonly conditionalEvaluations: number;
+  readonly fontPackSha256: string | null;
+  readonly fontFaces: readonly RenderedFontFace[];
+  readonly warnings: readonly RenderWarning[];
+}
+export interface ViewportDescriptor {
+  readonly schemaVersion: 1;
+  readonly sheetIndex: number;
+  readonly geometryId: string;
+  readonly revision: string;
+  readonly sourceRange: RenderRange | null;
+  readonly widthRaw: number;
+  readonly heightRaw: number;
+  readonly sheetVisibility: "visible" | "hidden" | "veryHidden";
+  /** Null exactly for empty Used; a non-null source includes the actual report. */
+  readonly preparationReport: ViewportPreparationReport | null;
+}
+export interface ViewportPrepareResult extends ViewportDescriptor {
+  readonly documentId: string;
+  readonly resources: {
+    readonly geometryReservationBytes: 8388608;
+    readonly sourceIndexReservationBytes: 8388608;
+  };
+}
+export interface ViewportTileResult extends ViewportIdentity {
+  readonly schemaVersion: 1;
+  readonly namespace: string;
+  readonly requestedRect: ViewportRect;
+  readonly mimeType: "image/svg+xml";
+  readonly logicalRect: ViewportRect | null;
+  readonly sourceRange: RenderRange | null;
+  readonly svg: string | null;
+  readonly report: RenderReport | null;
+  readonly metrics: {
+    readonly coordinateVisits: number;
+    readonly geometryBytes: number;
+    readonly haloRows: number;
+    readonly haloColumns: number;
+    readonly haloCells: number;
+  } | null;
+}
+export interface ViewportReleaseResult extends ViewportIdentity {
+  readonly schemaVersion: 1;
+  readonly released: boolean;
+}
+export declare const VIEWPORT_LIMITS: Readonly<{
+  maxOptionsBytes: 65536;
+  maxCoordinateVisits: 2000000;
+  maxAxisRuns: 65536;
+  maxGeometryBytes: 8388608;
+  maxLogicalDimensionRaw: 16384000000;
+  maxSourceRecords: 250000;
+  maxTileDimensionRaw: 8388608;
+  maxTileSvgBytes: 2097152;
+  maxTileSceneNodes: 100000;
+  maxMetadataBytes: 65536;
+}>;
+export declare const VIEWPORT_RESOURCE_POLICY: Readonly<{
+  maxPreparedPerDocument: 1;
+  maxPreparedTotal: 4;
+  maxProvisionalTotal: 1;
+  geometryReservationBytes: 8388608;
+  sourceIndexReservationBytes: 8388608;
+  maxOpenResourceBytes: 134217728;
+}>;
+export interface ViewportNativeCapabilities {
+  readonly schemaVersion: 1;
+  readonly unitsPerPixel: 1024;
+  readonly limits: typeof VIEWPORT_LIMITS;
+}
+export interface ViewportCapabilities extends ViewportNativeCapabilities {
+  readonly resourcePolicy: typeof VIEWPORT_RESOURCE_POLICY;
+}
+export declare function validateViewportU64(value: unknown, location?: string): string;
+export declare function validateViewportGeometryId(value: unknown): string;
+export declare function validateViewportRect(value: unknown): ViewportRect;
+export declare function viewportOptionsJson(value?: unknown): string;
+export declare function validateViewportRequest(operation: string, payload: unknown): number;
+export declare function validateViewportCapabilities(value: unknown, workerResult?: false): ViewportNativeCapabilities;
+export declare function validateViewportCapabilities(value: unknown, workerResult: true): ViewportCapabilities;
+export declare function validateViewportDescriptor(value: unknown, expected: { readonly sheetIndex: number; readonly geometryId?: string }): ViewportDescriptor;
+export declare function validateViewportPrepareResult(value: unknown, expected: { readonly documentId: string; readonly sheetIndex: number; readonly geometryId?: string }): ViewportPrepareResult;
+export declare function validateViewportTileResult(value: unknown, expected: ViewportTileIdentity, workerResult?: true): ViewportTileResult;
+export declare function validateViewportTileResult(value: unknown, expected: ViewportTileIdentity, workerResult: false): Omit<ViewportTileResult, "documentId">;
+export declare function validateViewportReleaseResult(value: unknown, expected: ViewportIdentity): ViewportReleaseResult;

@@ -6,6 +6,92 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added a private editor-embed development package with independent iframe
+  instances, bounded load/save/dispose calls, and the viewer's existing editing,
+  history and workbook-copy behavior. Builds include matching runtime assets
+  and an asset manifest for versioned consumer hosting.
+- Added current-source viewer navigation for supported sparse large sheets with
+  prepared viewport tiles, bounded caching, and readiness after visible coverage.
+  Tiled view retains workbook-copy saves while restricting edits and whole-sheet
+  image exports to complete sheet view.
+- Added bounded renderer viewport preparation for explicit ranges and sparse
+  display Used selections, with compressed hidden/default axes and shared
+  automatic-height measurement. Tile queries reuse the source index and clip
+  complete text/merge layout on both axes under existing scene/output limits.
+  `OwnedPreparedViewport` retains immutable workbook/options snapshots and lends
+  tile geometry without repeated preparation; SVG clip IDs use caller namespaces.
+- Added separate current-source worker viewport contracts for preparation,
+  bounded tile rendering and release, with strict identity/revision validation
+  and staged replacement. WASM sessions retain immutable prepared geometry
+  and invalidate it atomically after accepted edits or history changes. Existing
+  v2 response shapes remain unchanged; matching WASM artifacts are required.
+- Added opt-in `workbook_set_cells` MCP recalculation. Supported formula caches
+  refresh in one bounded evaluation batch with computed/unchanged/unsupported
+  counts and stable reasons; source edits and cache updates commit atomically.
+
+### Changed
+
+- Documented core 0.1.4 formula/cache APIs, shared evaluation budgets, and
+  the independently versioned npm packages in the formula, preservation,
+  compatibility, and worker guides.
+
+### Fixed
+
+- Preserved `.svg` and `.png` suffixes when VS Code export filenames exceed
+  120 characters (#136). Export status now reflects accepted bytes, completed
+  saves, cancellation and failures; invalid matching API responses reject promptly.
+- Restored Ctrl/Meta+Shift+Z after the sole edit is undone in the viewer (#137).
+  The shortcut checks redo availability while preserving draft/input guards,
+  Ctrl/Meta+Y and toolbar history behavior.
+- Corrected scalar type checks: `ISNUMBER` no longer converts numeric text,
+  and `ISBLANK` distinguishes absent cells from present empty text or formula
+  results. Five IS predicates inspect actual one-cell ranges without coercion;
+  real arrays retain `ArraySemantics` even with one stored value.
+- Preserved punctuation and doubled quotes inside formula text literals (#135),
+  including email, bracket and brace strings. OpenFormula separators/references
+  normalize outside quoted text and sheet names; real external/array syntax
+  retains its typed fallback and stored cache.
+- Recognized the exact case-insensitive `_xlfn.IFNA` function-call spelling
+  stored by Excel, using existing IFNA semantics without changing formula source,
+  literals, defined names or other future-function support.
+- Coalesced adjacent columns with identical resolved layout into compact XLSX
+  intervals (#127), avoiding expansion of a full-width format into 16,384
+  singleton records. Width flags, styles, visibility, outline boundaries and
+  output budgets retain their existing semantics.
+- Kept extended worksheet-title properties coherent across package-preserving
+  sheet addition, renaming and deletion (#130). Worksheet counts and title
+  groups update together, unrelated properties and scalar comments are retained,
+  and malformed metadata rejects atomically without an empty-variant panic.
+- Corrected decimal steps in `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC` (#134),
+  including `1.1`, `1.15`, halfway `1.005`, signs and negative precision.
+  A bounded 15-significant-digit decimal policy avoids binary scale noise and
+  intermediate overflow; unsupported extreme precision still returns `#NUM!`.
+- Distinguished literal arguments from single-cell, range and named references
+  in formula aggregates (#133). Referenced text/booleans are omitted by numeric
+  reducers, invalid direct text returns `#VALUE!`, and `COUNT` ignores errors.
+  Conditional and unary results retain their Excel argument-coercion behavior.
+- Omitted existing worksheet dimensions after package-preserving value/formula,
+  range and nonempty appended-row writes (#132), allowing streaming readers to
+  discover added cells. Absent dimensions stay absent; cache-only/clear edits
+  and foreign dimension-like XML retain their metadata.
+- Normalized XLSX ISO date cells and date formula caches to the workbook's date
+  system (#128), preserving calendar values in 1904 rewrites and before March
+  1900. Time-only values retain their day fractions in either system.
+- Preserved SpreadsheetML ST_Xstring cell text across shared/inline/rich reads,
+  authoring, edits and text formula-cache updates (#131). Literal escape-shaped
+  strings, carriage returns, encodable controls and cache whitespace retain
+  their exact values;
+  string length limits and XML output budgets still apply.
+- Kept shared and array formulas intact when replacing or clearing cells (#129).
+  Single-cell and range edits now share the whole-group replacement rule;
+  incomplete group metadata rejects the edit without changing package bytes.
+  Cache-only formula updates still preserve the original formula nodes.
+- Preserved multiline text and formula cached values in viewer Cell Options,
+  with production-browser download/reopen, reload-cancellation, and XLSM
+  preservation coverage.
+
 ## [0.1.4] - 2026-09-28
 
 ### Added
@@ -18,11 +104,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   external `openpyxl` reopen.
 - Added single-click in-cell editing and a live formula bar to the viewer,
   backed by bounded cell geometry from the same renderer layout as the SVG.
-- Added `Workbook::evaluate_cells` for shared-budget batch evaluation and
-  `Spreadsheet::set_formula_cached_values` for transactional cache updates
-  that preserve formula XML. Worker edits can refresh supported formulas as
-  one undoable change; unsupported formulas retain their cached values with
-  explicit diagnostics.
+- Added `Workbook::evaluate_cells` for ordered, non-mutating
+  batch evaluation and `Spreadsheet::set_formula_cached_values` for atomic
+  cache updates that preserve formula XML. Each accepts at most 10,000 targets;
+  cache updates require distinct existing formula cells and separate edit-value
+  validation. Reopen saved bytes to refresh the parsed workbook view.
+- Added `FormulaUnsupportedReason::TextLimitExceeded`
+  (`text_limit_exceeded`): 1 MiB per produced/copied text value and a shared
+  8 MiB UTF-8 generation/copy allowance, including intermediates and memo copies.
+  Batch evaluation returns an outer error on resource exhaustion, rather than
+  partial results. Worker 0.3.0 recalculating edits remain one undoable change;
+  unsupported formulas retain their cached values with explicit diagnostics.
 - Added a verification-only release pipeline command with exact-main identity
   checks and locally persisted run identities for safe resumption.
 

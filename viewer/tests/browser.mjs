@@ -12,14 +12,19 @@ import {
 import { createStoredZip, readZipEntries } from "../scripts/zip.mjs";
 import { exerciseRangePaste, exerciseLargeRangePaste } from "./range-paste.mjs";
 import { exerciseEditingGuards } from "./editing-guards.mjs";
+import { assertViewerReopens, exerciseMacroRoundtrip, exerciseMultilineCellOptions } from "./reopen-journey.mjs";
+import { exerciseCdpComposition } from "./ime-composition.mjs";
+import { recordJourney, retainDownload, sha256 } from "./journey-evidence.mjs";
+import { exerciseKeyboardRedo } from "./keyboard-redo.mjs";
+import { exerciseScrolling, installScrollingProbe } from "./scrolling.mjs";
+import { sampleExistingWorker } from "./wasm-memory.mjs";
 
 const execFileAsync = promisify(execFile);
+const selectedJourney = process.env.RXLS_VIEWER_JOURNEY || "production";
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
-const basePath = await builtBasePath();
-const server = await preview({
-  base: basePath,
-  preview: { host: "127.0.0.1", port, strictPort: true },
-});
+let basePath;
+let server;
+let browser;
 
 const launchOptions = { headless: true };
 if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
@@ -28,8 +33,13 @@ if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
   launchOptions.channel = "chrome";
 }
 
-const browser = await chromium.launch(launchOptions);
-try {
+
+async function runBrowserJourney() {
+  await recordJourney("browser-runtime", {
+    browserVersion: browser.version(), nodeVersion: process.version,
+    basePath, headless: launchOptions.headless,
+    executable: launchOptions.executablePath ?? launchOptions.channel,
+  });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 900 },
   });
@@ -47,6 +57,7 @@ try {
       failedResponses.push({ status: response.status(), url: response.url() });
     }
   });
+  if (selectedJourney === "scrolling") await installScrollingProbe(page);
   await page.goto(`http://127.0.0.1:${port}${basePath}`, {
     waitUntil: "domcontentloaded",
   });
@@ -66,6 +77,27 @@ try {
     throw new Error(`viewer did not render: ${JSON.stringify(diagnostics)}`, {
       cause: error,
     });
+  }
+
+  if (selectedJourney === "scrolling") {
+    await exerciseScrolling(page, { waitForCondition, waitForViewerState,
+      downloadWorkbook, assertOpenpyxlReopens, sampleWasmMemory: sampleExistingWorker });
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+    assert.deepEqual(failedResponses, []);
+    await recordJourney("scrolling-browser", { status: "passed", selectedJourney });
+    console.log("viewer W04 scrolling journey passed");
+    return;
+  }
+
+  await exerciseKeyboardRedo(page, { waitForCondition, waitForViewerState });
+  if (selectedJourney === "keyboard-redo") {
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+    assert.deepEqual(failedResponses, []);
+    await recordJourney("keyboard-redo-browser", { status: "passed", selectedJourney });
+    console.log("viewer keyboard redo journey passed");
+    return;
   }
 
   // The workbench uses real controls and external CSS under the strict CSP.
@@ -174,12 +206,17 @@ try {
   );
 
   await exerciseInlineEditing(page);
+  await exerciseCdpComposition(page, { waitForCondition, waitForViewerState, downloadWorkbook });
+  await exerciseMultilineCellOptions(page, {
+    waitForCondition, waitForViewerState, downloadWorkbook, assertOpenpyxlReopens,
+  });
   await exerciseEditingGuards(page, { waitForCondition, waitForViewerState });
   await exerciseRangePaste(page, {
     waitForCondition,
     waitForViewerState,
     downloadWorkbook,
     assertOpenpyxlReopens,
+    assertViewerReopens,
   });
   await exerciseLargeRangePaste(page, {
     waitForCondition,
@@ -475,6 +512,13 @@ try {
     expected: "Browser edited XLSX",
     expectedTitle: "rxls browser preservation proof",
   });
+  await assertViewerReopens(page, xlsxDownload, {
+    format: "xlsx", label: "XLSX scalar-properties download reopened clean",
+    cells: {
+      A1: { kind: "text", value: "Browser edited XLSX" },
+      C4: { kind: "number", value: "420000" },
+    },
+  }, { waitForCondition, waitForViewerState });
 
   await Promise.all([
     page.waitForEvent("dialog").then(async (prompt) => {
@@ -608,6 +652,10 @@ try {
     (snapshot) => !snapshot.dirty && snapshot.canRedo && !snapshot.busy,
     "XLSM undo to clean source",
   );
+  await exerciseMacroRoundtrip(page, xlsmSource, {
+    waitForCondition, waitForViewerState, downloadWorkbook,
+    assertOpenpyxlReopens, assertZipPartsEqual, assertZipPartChanged,
+  });
 
   await page
     .locator("#file-input")
@@ -727,11 +775,79 @@ try {
       `viewer returned failed responses: ${JSON.stringify(failedResponses)}`,
     );
   }
+  await recordJourney("production-browser", {
+    status: "passed", pageErrors: pageErrors.length,
+    consoleErrors: consoleErrors.length, failedResponses: failedResponses.length,
+    syntheticKoreanComposition: "passed", nativeOsKoreanIme: "not_verified",
+  });
   console.log("viewer browser smoke passed");
-} finally {
-  await browser.close();
-  await new Promise((resolve) => server.httpServer.close(resolve));
 }
+// BEGIN owned-runtime-guard: executed unchanged by the isolated helper models.
+async function runOwnedBrowser({ startServer, startBrowser, run, record, cleanupMs = 10_000 }) {
+  let ownedServer = null, ownedBrowser = null, primary = null, stage = "start-server";
+  let cleanup;
+  const errorText = (error) => String(error).slice(0, 2048);
+  async function closeBounded(name, resource, close) {
+    if (!resource) return { name, status: "not-created", attempted: false };
+    const startedAt = Date.now();
+    let timer;
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(close).then(() => ({ status: "closed" }),
+          (error) => ({ status: "failed", error: errorText(error) })),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ status: "timed-out" }), cleanupMs); }),
+      ]);
+      return { name, attempted: true, elapsedMs: Date.now() - startedAt, ...result };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  try {
+    ownedServer = await startServer();
+    stage = "start-browser";
+    ownedBrowser = await startBrowser();
+    stage = "journey";
+    await run();
+  } catch (error) {
+    primary = error;
+  } finally {
+    // Start both independent close attempts even if either throws or times out.
+    // A timed-out close is not an exit proof; the owned outer job remains required.
+    cleanup = await Promise.all([
+      closeBounded("browser", ownedBrowser, () => ownedBrowser.close()),
+      closeBounded("preview", ownedServer, () => new Promise((resolve, reject) => {
+        ownedServer.httpServer.close((error) => error ? reject(error) : resolve());
+      })),
+    ]);
+  }
+  const cleanupFailed = cleanup.some((item) => ["failed", "timed-out"].includes(item.status));
+  let receiptError = null;
+  try {
+    await record({ status: primary || cleanupFailed ? "failed" : "passed", primaryStage: stage,
+      primaryError: primary ? errorText(primary) : null, cleanup,
+      processExitProof: "owned outer supervisor receipt; close completion alone is not PID absence" });
+  } catch (error) {
+    receiptError = error;
+  }
+  if (primary) throw primary;
+  if (cleanupFailed) throw new AggregateError(cleanup.filter((item) => ["failed", "timed-out"].includes(item.status))
+    .map((item) => new Error(`${item.name} cleanup ${item.status}: ${item.error ?? "deadline"}`)), "Owned browser cleanup failed.");
+  if (receiptError) throw receiptError;
+}
+// END owned-runtime-guard
+
+await runOwnedBrowser({
+  startServer: async () => {
+    assert.ok(["production", "keyboard-redo", "scrolling"].includes(selectedJourney), "unknown viewer journey");
+    basePath = await builtBasePath();
+    server = await preview({ base: basePath,
+      preview: { host: "127.0.0.1", port, strictPort: true } });
+    return server;
+  },
+  startBrowser: async () => { browser = await chromium.launch(launchOptions); return browser; },
+  run: runBrowserJourney,
+  record: (receipt) => recordJourney(`${selectedJourney}-browser-lifecycle`, receipt),
+});
 
 async function exerciseInlineEditing(page) {
   assert.equal(
@@ -914,7 +1030,7 @@ async function exerciseInlineEditing(page) {
     false,
   );
 
-  // Browser composition events keep IME Enter from prematurely mutating the workbook.
+  // Synthetic composition/keyCode 229 coverage; this does not exercise an OS IME.
   await input.focus();
   await input.dispatchEvent("compositionstart", { data: "" });
   await input.fill("한글 편집");
@@ -952,6 +1068,10 @@ async function exerciseInlineEditing(page) {
   );
   await select("C4", "한글 편집");
   await undo();
+  await recordJourney("synthetic Korean composition", {
+    status: "passed", input: "dispatchEvent compositionstart/compositionend and keyCode 229",
+    nativeOsKoreanIme: "not_verified",
+  });
 
   await select("C4", "420000");
   await input.press("F2");
@@ -1006,7 +1126,7 @@ async function exerciseInlineEditing(page) {
   const downloadPromise = page.waitForEvent("download");
   await page.locator("#quick-save").click();
   const download = await downloadPromise;
-  const savePath = await download.path();
+  const savePath = await retainDownload(download, download.suggestedFilename());
   assert.ok(savePath);
   await assertOpenpyxlReopens(savePath, { expected: "00123" });
   await waitForViewerState(page, (value) => !value.busy, "inline draft saved");
@@ -1265,10 +1385,8 @@ async function downloadWorkbook(page, extension) {
     throw new Error(`unexpected workbook download name: ${fileName}`);
   }
   const failure = await download.failure();
-  const path = await download.path();
-  if (failure || !path) {
-    throw new Error(`workbook download failed: ${failure ?? "missing path"}`);
-  }
+  if (failure) throw new Error(`workbook download failed: ${failure}`);
+  const path = await retainDownload(download, fileName);
   const bytes = await readFile(path);
   if (bytes.length < 100) {
     throw new Error("workbook download is empty");
@@ -1278,6 +1396,9 @@ async function downloadWorkbook(page, extension) {
     (snapshot) => !snapshot.busy,
     "workbook download completion",
   );
+  await recordJourney("workbook download", {
+    fileName, path, bytes: bytes.length, sha256: sha256(bytes),
+  });
   return { fileName, bytes, path };
 }
 
@@ -1285,6 +1406,7 @@ async function assertOpenpyxlReopens(
   workbookPath,
   {
     expected,
+    cell = "A1",
     expectedTitle = null,
     requireVba = false,
     cacheCell,
@@ -1297,7 +1419,8 @@ async function assertOpenpyxlReopens(
   const script = fileURLToPath(
     new URL("../scripts/verify-openpyxl-workbook.py", import.meta.url),
   );
-  const args = [script, workbookPath, "--cell", "A1", "--expected", expected];
+  const args = [script, workbookPath, "--cell", cell,
+    typeof expected === "number" ? "--expected-number" : "--expected", String(expected)];
   if (expectedTitle !== null) {
     args.push("--expected-title", expectedTitle);
   }
@@ -1325,6 +1448,7 @@ async function assertOpenpyxlReopens(
   } else {
     assert.equal(report.vba_bytes, null);
   }
+  await recordJourney("openpyxl reopen", { status: "passed", path: workbookPath, ...report });
 }
 
 function assertZipPartsEqual(sourceBytes, savedBytes, partNames) {

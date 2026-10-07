@@ -1,4 +1,8 @@
 import {
+  validateViewportCapabilities,
+  validateViewportPrepareResult,
+  validateViewportTileResult,
+  validateViewportReleaseResult,
   MAX_DPI,
   MAX_EDIT_HISTORY_BYTES,
   MAX_EDIT_HISTORY_ENTRIES,
@@ -26,6 +30,8 @@ import {
 } from "./protocol.mjs";
 
 const NON_CANCELLABLE_DISPATCHED_OPERATIONS = new Set([
+  "prepare-viewport",
+  "release-viewport",
   "close",
   "set-cell",
   "set-cell-recalculate",
@@ -146,6 +152,22 @@ export class RenderWorkerClient {
 
   saveDocument(documentId, options = {}) {
     return this.request("save-document", { documentId }, options);
+  }
+
+  viewportCapabilities(requestOptions = {}) {
+    return this.request("viewport-capabilities", {}, requestOptions);
+  }
+
+  prepareViewport(documentId, sheetIndex, renderOptions = {}, requestOptions = {}) {
+    return this.request("prepare-viewport", { documentId, sheetIndex, options: renderOptions }, requestOptions);
+  }
+
+  renderViewportTile(documentId, sheetIndex, geometryId, revision, rect, namespace, requestOptions = {}) {
+    return this.request("render-viewport-tile", { documentId, sheetIndex, geometryId, revision, rect, namespace }, requestOptions);
+  }
+
+  releaseViewport(documentId, sheetIndex, geometryId, revision, requestOptions = {}) {
+    return this.request("release-viewport", { documentId, sheetIndex, geometryId, revision }, requestOptions);
   }
 
   preparePages(documentId, sheetIndex, renderOptions = {}, requestOptions = {}) {
@@ -567,6 +589,17 @@ function cloneRequestPayload(operation, payload) {
 
 function responseIdentityFor(operation, payload) {
   switch (operation) {
+    case "viewport-capabilities":
+      return Object.freeze({});
+    case "prepare-viewport":
+      return Object.freeze({ documentId: payload.documentId, sheetIndex: payload.sheetIndex });
+    case "render-viewport-tile":
+      return Object.freeze({ documentId: payload.documentId, sheetIndex: payload.sheetIndex,
+        geometryId: payload.geometryId, revision: payload.revision, namespace: payload.namespace,
+        rect: Object.freeze({ ...payload.rect }) });
+    case "release-viewport":
+      return Object.freeze({ documentId: payload.documentId, sheetIndex: payload.sheetIndex,
+        geometryId: payload.geometryId, revision: payload.revision });
     case "capabilities":
       return Object.freeze({});
     case "open":
@@ -854,6 +887,18 @@ function validateErrorPayload(error) {
 
 function validateOperationResult(operation, payload, result, capabilityLimits) {
   switch (operation) {
+    case "viewport-capabilities":
+      validateViewportCapabilities(result, true);
+      return;
+    case "prepare-viewport":
+      validateViewportPrepareResult(result, payload);
+      return;
+    case "render-viewport-tile":
+      validateViewportTileResult(result, payload);
+      return;
+    case "release-viewport":
+      validateViewportReleaseResult(result, payload);
+      return;
     case "capabilities":
       validateCapabilities(result);
       return;

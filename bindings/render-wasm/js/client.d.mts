@@ -1,4 +1,10 @@
 import type {
+  ViewportCapabilities,
+  ViewportOptions,
+  ViewportPrepareResult,
+  ViewportRect,
+  ViewportTileResult,
+  ViewportReleaseResult,
   CloseDocumentResult,
   DocumentPropertiesInspection,
   EditableCell,
@@ -26,6 +32,16 @@ import type {
 } from "./protocol.mjs";
 
 export type {
+  ViewportCapabilities,
+  ViewportOptions,
+  ViewportPrepareResult,
+  ViewportRect,
+  ViewportTileResult,
+  ViewportReleaseResult,
+  ViewportDescriptor,
+  ViewportPreparationReport,
+  ViewportIdentity,
+  ViewportTileIdentity,
   CloseDocumentResult,
   DocumentPropertiesInspection,
   EditableCachedCell,
@@ -140,6 +156,10 @@ export declare class RenderWorkerClient {
     options?: RenderWorkerClientOptions,
   );
   capabilities(options?: RenderRequestOptions): RenderRequest<RenderCapabilities>;
+  viewportCapabilities(options?: RenderRequestOptions): RenderRequest<ViewportCapabilities>;
+  prepareViewport(documentId: string, sheetIndex: number, renderOptions?: ViewportOptions, requestOptions?: RenderRequestOptions): RenderRequest<ViewportPrepareResult>;
+  renderViewportTile(documentId: string, sheetIndex: number, geometryId: string, revision: string, rect: ViewportRect, namespace: string, requestOptions?: RenderRequestOptions): RenderRequest<ViewportTileResult>;
+  releaseViewport(documentId: string, sheetIndex: number, geometryId: string, revision: string, requestOptions?: RenderRequestOptions): RenderRequest<ViewportReleaseResult>;
   open(bytes: RenderBinary, options?: RenderOpenOptions): RenderRequest<OpenDocumentResult>;
   closeDocument(
     documentId: string,

@@ -17,7 +17,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workbook", type=Path)
     parser.add_argument("--cell", default="A1")
-    parser.add_argument("--expected", required=True)
+    expected_group = parser.add_mutually_exclusive_group(required=True)
+    expected_group.add_argument("--expected")
+    expected_group.add_argument("--expected-number", type=float)
     parser.add_argument("--expected-title")
     parser.add_argument("--require-vba", action="store_true")
     parser.add_argument("--cache-cell")
@@ -33,8 +35,10 @@ def main(argv: list[str] | None = None) -> int:
             data_only=False,
         )
         value = workbook.active[args.cell].value
-        if value != args.expected:
-            raise ValueError(f"{args.cell} is {value!r}, expected {args.expected!r}")
+        expected = args.expected if args.expected_number is None else args.expected_number
+        numeric = args.expected_number is not None
+        if value != expected or (numeric and (isinstance(value, bool) or not isinstance(value, (int, float)))):
+            raise ValueError(f"{args.cell} is {value!r}, expected {expected!r}")
         title = workbook.properties.title
         if args.expected_title is not None and title != args.expected_title:
             raise ValueError(f"document title is {title!r}, expected {args.expected_title!r}")

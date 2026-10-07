@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -109,7 +110,11 @@ class CrateDistributionSmokeTests(unittest.TestCase):
 
                     if args[0] == "generate-lockfile":
                         manifest = Path(args[args.index("--manifest-path") + 1])
-                        manifest.with_name("Cargo.lock").write_text("# fake lock\\n", encoding="utf-8")
+                        text = manifest.read_text(encoding="utf-8")
+                        assert 'edition = "2021"' in text
+                        assert 'rust-version = "1.85"' in text
+                        assert 'resolver = "3"' in text
+                        manifest.with_name("Cargo.lock").write_text('version = 4\\n\\n[[package]]\\nname = "rxls"\\nversion = "0.1.2"\\n', encoding="utf-8", newline="\\n")
                     elif args[0] == "run":
                         print("rxls external consumer ok: sheets=1")
                     elif args[0] == "install":
@@ -168,6 +173,13 @@ class CrateDistributionSmokeTests(unittest.TestCase):
             self.assertEqual(evidence["version"], "0.1.2")
             self.assertEqual(evidence["external_consumer"], "passed")
             self.assertEqual(evidence["cargo_install"], "passed")
+            resolution = evidence["consumer_resolution"]
+            self.assertEqual(resolution["rust_version"], "1.85")
+            self.assertEqual(resolution["resolver"], "3")
+            self.assertEqual(resolution["packages"], [{"name": "rxls", "version": "0.1.2", "source": None, "checksum": None}])
+            fake_lock = b'version = 4\n\n[[package]]\nname = "rxls"\nversion = "0.1.2"\n'
+            self.assertEqual(resolution["files"]["Cargo.lock"], {"bytes": len(fake_lock), "sha256": hashlib.sha256(fake_lock).hexdigest()})
+            self.assertEqual(json.loads(report.with_suffix(".consumer-resolution.json").read_text(encoding="utf-8")), resolution)
 
             calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([call[0] for call in calls], ["generate-lockfile", "run", "install"])

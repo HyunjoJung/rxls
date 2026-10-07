@@ -27,12 +27,31 @@ explicit single-text-cell option for intentional multiline text.
 
 Unapplied Cell Options and Properties fields are protected when opening another
 file or leaving the page. Apply or cancel those fields before saving a copy.
+Cell Options uses multiline fields for text values and text formula caches so
+viewing and applying them does not strip line breaks.
 
 Committed edits refresh formulas supported by the deterministic evaluator in
 the same undo step. Unsupported formulas keep their cached values and produce
 a visible warning; this is not full Excel recalculation. Save downloads a new
 XLSX/XLSM copy and never overwrites the local source file. XLS, XLSB, ODS, and
 the embedded VS Code preview remain read-only.
+
+## Navigating large sheets
+
+The current source build can display supported sparse sheets in tiles when
+whole-sheet rendering exceeds a row, column, cell, dimension, or output limit.
+Scrolling and zooming reuse prepared layout and a bounded tile cache. The first
+covering tile must finish before the sheet is reported ready; generated SVG
+still passes through the normal sanitizer.
+
+Tiled sheets are view-only. Switch to a smaller editable sheet for cell,
+property, paste, and history actions. Saving an editable XLSX/XLSM workbook copy
+remains available, including edits already made on other sheets. SVG and PNG
+exports require a complete rendered sheet and are disabled in tiled view.
+Zoom requests that exceed the browser surface limit retain the current view.
+
+This path requires the matching current-source worker and WASM build. Published
+worker versions without viewport support keep their existing rendering limits.
 
 ## Development
 
@@ -62,6 +81,27 @@ npm --prefix viewer run test:browser
 Set `RXLS_CHROMIUM_EXECUTABLE` when the browser test should use a specific
 Chrome or Chromium binary. Set `RXLS_VIEWER_SCREENSHOTS=1` to write desktop and
 mobile captures under `target/viewer-e2e/`.
+
+The production browser journey feeds saved XLSX/XLSM downloads back through the
+viewer file input and checks scalar values, formula source and cached values,
+and a clean session with no undo/redo history or edited parts. The XLSM case
+exercises formula and range edits, two undo/redo steps, save, reopen, and a
+no-op save; it byte-compares VBA and every declared untouched ZIP part.
+`RXLS_VIEWER_EVIDENCE_DIR` selects the directory for retained downloads and
+`journeys.json` (default: `target/viewer-e2e/`). The report includes browser
+version and per-boundary results; a partial report is not a passing journey.
+
+Draft checks dismiss a real browser reload's `beforeunload` dialog and compare
+the same document, workbook state, and unapplied Cell Options, Properties, and
+inline input. Korean composition/keyCode 229 tests dispatch synthetic events.
+A separate Chromium CDP case uses `Input.imeSetComposition` and `Input.insertText`,
+records each event's `isTrusted` (including an untrusted `compositionend` in the
+tested Chrome build), checks no early cell edit on Enter,
+and verifies one committed edit and one saved download reopened in the viewer.
+Neither route verifies a native OS Korean input method. Native IME composition,
+candidate selection, and commit/cancel behavior still require manual testing
+on the target OS/browser. A successful cancelled-reload check does not promise
+draft persistence after accepting reload, closing the tab, or a browser crash.
 
 For a repeatable local navigation diagnostic, run
 `node viewer/scripts/benchmark-grid.mjs` from the repository root. Add

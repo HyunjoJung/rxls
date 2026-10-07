@@ -156,6 +156,10 @@ function serveFile(response, filename, contentType) {
 
 const server = http.createServer((request, response) => {
   const pathname = new URL(request.url, "http://127.0.0.1").pathname;
+  if (pathname === "/favicon.ico") {
+    response.writeHead(204, { "cache-control": "no-store" }).end();
+    return;
+  }
   if (pathname === "/smoke/") {
     response.writeHead(200, {
       "cache-control": "no-store",

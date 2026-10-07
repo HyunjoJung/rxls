@@ -1208,3 +1208,21 @@ body.host-vscode .document-identity span {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Tiles are local SVGs placed within the immutable full logical surface. */
+.viewport-tile {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.viewport-svg {
+  display: block;
+  max-width: none;
+  transform-origin: 0 0;
+  pointer-events: none;
+}
+
+.document-surface.is-tiled {
+  user-select: none;
+}

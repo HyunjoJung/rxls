@@ -7,6 +7,17 @@ needed for preservation-aware XLSX/XLSM edits. Its contract is fail-closed:
 reading can be tolerant, but a mutation is accepted only when the retained
 package can be saved without silently discarding unknown content.
 
+## Version scope
+
+The released `rxls` core **0.1.4** includes the formula-cache batch API below,
+`Spreadsheet::set_formula_cached_values`, along with `Workbook::evaluate_cells`
+and `FormulaUnsupportedReason::TextLimitExceeded`. These APIs are absent from
+registry core 0.1.3. Use `rxls = "=0.1.4"` or a reviewed source checkout for
+the batch example.
+The npm `rxls-wasm` core adapter (0.1.4) and `@rxls/render-worker` (0.3.0)
+have separate public interfaces and release boundaries. See
+[Compatibility](compatibility.md) and [Formula support](formulas.md).
+
 ## Edit capability
 
 | Input | Capability |
@@ -41,7 +52,9 @@ unannounced package rewrite.
 ## Atomic updates
 
 Individual operations that touch several parts use clone-and-swap mutation.
-`Spreadsheet::transaction` exposes the same rule for caller-defined batches:
+`Spreadsheet::transaction` exposes the same rule for caller-defined batches.
+The following example works with core 0.1.3 and 0.1.4; it requires an
+editable `book.xlsx` containing a worksheet named `Data`:
 
 ```rust
 use rxls::{Cell, Spreadsheet};
@@ -64,11 +77,106 @@ serialization fails, the workbook, retained package bytes, and edited-part list
 remain unchanged. The transaction is in memory; the caller chooses how to
 persist the committed bytes.
 
+## Formula-cache updates (core 0.1.4)
+
+This API writes caller-supplied cached results; it does not evaluate formulas:
+
+```text
+Spreadsheet::set_formula_cached_values(
+    &mut self,
+    updates: &[(&str, u32, u16, Cell)],
+) -> rxls::Result<()>
+```
+
+A batch accepts at most **10,000 distinct existing formula cells**. Each tuple
+contains a sheet name, a zero-based row/column, and a scalar cache value. Before
+mutation it checks edit capability, the batch length, worksheet resolution,
+unambiguous workbook sheet names (ASCII case-insensitive duplicate names are
+rejected), coordinates, duplicate targets, and the original formula nodes.
+Rows must be at most 1,048,575 and columns at most 16,383. A missing cell or a
+cell without an existing `<f>` is rejected; this API does not create formulas.
+An empty slice is a no-op only after the editable-package gate succeeds.
+
+Caches may be `Cell::Text`, `Number`, `Date`, `Bool`, or `Error`, but not another
+`Cell::Formula`. Numbers and date serials must be finite. Text caches must
+contain valid XML characters and fit **32,767 UTF-16 units**; error strings are
+also XML-validated. Normal XML node/attribute, package, and final-serialization
+limits still apply. These checks return `rxls::Error`, not an evaluator
+`FormulaUnsupportedReason`. Passing the evaluator's 1 MiB/8 MiB UTF-8 budgets
+does not guarantee that a result is acceptable as an Excel cache value.
+
+Updates use one clone-and-swap transaction. They replace the cache value and its
+cell type encoding while preserving the original formula node, source text,
+and shared/array attributes. This is not permission to evaluate unsupported
+array semantics. The update also invalidates any existing calculation chain,
+including its required relationship/content-type wiring. Untouched unrelated
+parts remain byte-for-byte; the touched worksheet is reserialized. Any failed
+preflight, mutation, or final serialization leaves the original retained
+package and `edited_parts()` unchanged.
+
+`spreadsheet.workbook()` is the parsed snapshot, not a live view of package
+edits. **Save and reopen before evaluating after input edits**, and reopen the
+final saved bytes to inspect refreshed caches. `save()` does not update the
+existing parsed snapshot or write a filesystem path by itself.
+
+This self-contained core 0.1.4 example evaluates fresh edited input, writes
+only a computed result, verifies the reopened cache, and checks duplicate-target
+rollback. In a mixed batch, callers can omit `Fallback` results to retain those
+caches; an outer evaluation `Err` provides no partial batch to save.
+
+```rust
+use rxls::{Cell, FormulaEvaluation, Spreadsheet, Workbook};
+
+fn main() -> rxls::Result<()> {
+    let mut source = Workbook::new();
+    let sheet = source.add_sheet("Data");
+    sheet.write(0, 0, 2.0);
+    sheet.write_formula(0, 1, "A1*3", 0.0);
+    let mut spreadsheet = Spreadsheet::open(&source.to_xlsx())?;
+
+    spreadsheet.set_cell_value("Data", 0, 0, Cell::Number(7.0))?;
+    let edited_input = Workbook::open(&spreadsheet.save()?)?;
+    let results = edited_input
+        .evaluate_cells(&[("Data", 0, 1)])
+        .expect("small, bounded evaluation");
+    let value = match &results[0] {
+        FormulaEvaluation::Computed(value) => value.clone(),
+        other => panic!("expected computed result: {other:?}"),
+    };
+    spreadsheet.set_formula_cached_values(&[("Data", 0, 1, value)])?;
+
+    // The existing parsed snapshot still contains the original cache.
+    match spreadsheet.workbook().sheets[0].cell(0, 1) {
+        Some(Cell::Formula { cached, .. }) => assert_eq!(cached.as_ref(), &Cell::Number(0.0)),
+        other => panic!("unexpected original cell: {other:?}"),
+    }
+    let saved = spreadsheet.save()?;
+    let reopened = Workbook::open(&saved)?;
+    match reopened.sheets[0].cell(0, 1) {
+        Some(Cell::Formula { formula, cached }) => {
+            assert_eq!(formula, "A1*3");
+            assert_eq!(cached.as_ref(), &Cell::Number(21.0));
+        }
+        other => panic!("unexpected saved cell: {other:?}"),
+    }
+
+    let edited_before = spreadsheet.edited_parts().to_vec();
+    assert!(spreadsheet.set_formula_cached_values(&[
+        ("Data", 0, 1, Cell::Number(99.0)),
+        ("Data", 0, 1, Cell::Number(100.0)),
+    ]).is_err());
+    assert_eq!(spreadsheet.save()?, saved);
+    assert_eq!(spreadsheet.edited_parts(), edited_before.as_slice());
+    Ok(())
+}
+```
+
 ## Supported edits
 
 The current package-preserving surface covers:
 
 - cell values, formulas with cached values, and rectangular range updates;
+- cache-only formula batches in core 0.1.4, as described above;
 - document properties, defined names, active sheet, and calculation metadata;
 - sheet add, rename, delete, visibility, active-sheet, and tab-color operations;
 - row heights, column widths and visibility, panes, view state, page setup, and
@@ -81,12 +189,51 @@ Coordinate limits follow XLSX: rows are zero-based through 1,048,575 and columns
 through 16,383. Public methods return typed errors for invalid sheets,
 coordinates, relationships, or unsupported package state.
 
+The following formula-group, cell-text, dimension and sheet-title fixes are
+currently in the source checkout and will ship in a subsequent core release.
+
+Cell replacement and clearing must cover an entire shared or array formula
+group. Use `set_cell_range_values` or `clear_range` for a group spanning several
+cells; a single-cell replacement is accepted only for a one-cell group.
+Malformed, incomplete, ambiguous, or namespace-prefixed group metadata is
+rejected before package mutation. Unknown namespace children are preserved.
+Cache-only updates preserve formula nodes and may refresh individual members.
+
+Cell text and text formula caches use SpreadsheetML ST_Xstring encoding.
+Literal `_xHHHH_` text, carriage returns and control characters retain their
+values through save/reopen. The 32,767 UTF-16-unit cell-string limit applies to
+the semantic value before encoding. Formula source, errors, attributes and
+other XML metadata retain their existing validation and escaping rules.
+
+Value/formula writes, ranges containing a value, and nonempty appended rows
+omit an existing direct SpreadsheetML worksheet `dimension`. Streaming readers
+then discover all saved cells from `sheetData`. No dimension is added when
+absent. Cache-only, clear-only and empty operations retain it. Foreign or nested
+dimension-like content is preserved; duplicate recognized dimensions reject
+value-writing operations atomically.
+
+Sheet add, rename and delete keep recognized `docProps/app.xml` worksheet
+counts and title slices consistent with worksheet relationships. Chart/dialog
+tabs do not contribute to the worksheet count. Unrelated groups and properties,
+including comments and processing instructions inside changed scalars, remain
+present. Absent or unrecognized title metadata is retained byte-for-byte; no
+metadata is synthesized. Malformed recognized vectors, counts, titles or
+ambiguous relationships reject the operation atomically. A no-op rename leaves
+the original part bytes and edit tracking unchanged.
+
 ## Browser edit boundary
+
+This is the separately versioned **`@rxls/render-worker` 0.3.0** surface, not a
+claim about the synchronous `rxls-wasm` package. Its
+recalculating edits combine evaluation and cache refresh into one undoable
+operation. Unsupported formulas retain their caches; a resource-limit or
+cache-write failure rejects the entire edit. See the
+[worker README](../bindings/render-wasm/README.md) for the JavaScript methods.
 
 `@rxls/render-worker` owns the retained `Spreadsheet` and every edit snapshot
 inside one dedicated worker. The public protocol exposes cell inspection,
-typed cell/formula replacement, complete document-property replacement,
-undo/redo, and serialization only. Each mutation edits a clone, serializes and
+typed cell/formula replacement, recalculating cell/range edits, complete
+document-property replacement, undo/redo, and serialization. Each mutation edits a clone, serializes and
 reopens it, checks the same 32 MiB workbook limit, and commits the candidate
 only after every step succeeds. History is limited to 20 entries and 32 MiB in
 total; older snapshots are discarded deterministically.

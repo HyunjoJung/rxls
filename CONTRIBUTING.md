@@ -31,6 +31,9 @@ If none of the listed tasks fits, open a [contribution question] with the area
 you want to work on. For larger features, discuss the user need and scope in
 an issue before implementation. Please follow the [Code of Conduct].
 
+For a short runnable entry point before choosing a task, use
+[First successful file operation](docs/first-success.md).
+
 ## Set up only what you need
 
 For core Rust changes, install [Rust through rustup], then run from the
@@ -139,7 +142,7 @@ hosted checks. It is a reference for broader validation, not a prerequisite
 for opening a focused or draft PR.
 
 Install the pinned registry-compatibility checker with
-`cargo install cargo-semver-checks --version 0.49.0 --locked`, ensure the
+`cargo install cargo-semver-checks --version 0.51.0 --locked` (Rust 1.93+), ensure the
 `wasm32-unknown-unknown` Rust target is installed, and install the oracle
 dependencies described in [Validation and reproducibility](docs/validation.md).
 Run the full local gate; all applicable checks must pass clean:

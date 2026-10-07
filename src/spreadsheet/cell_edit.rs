@@ -11,6 +11,13 @@ use super::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_EDIT_RANGE_CELLS: u64 = 10_000;
+type EditRange = (u32, u16, u32, u16);
+
+#[derive(Default)]
+struct SharedFormulaGroup {
+    reference: Option<EditRange>,
+    members: Option<EditRange>,
+}
 
 impl Spreadsheet {
     /// Replace a nonempty rectangular cell range in one package transaction.
@@ -69,7 +76,13 @@ impl Spreadsheet {
             let package = candidate.package.as_mut().ok_or(Error::MissingWorkbook)?;
             let before = package.touched_parts();
             let tree = package.part_tree_mut(&path)?;
+            let dimension = if values.iter().flatten().any(Option::is_some) {
+                sml_dimension_to_omit(tree)?
+            } else {
+                None
+            };
             sml_edit_cell_range(tree, start_row, start_col, values)?;
+            sml_omit_dimension(tree, dimension)?;
             for part in newly_touched(&before, package) {
                 remember_edited_part(&mut candidate.edited_parts, part);
             }
@@ -83,7 +96,9 @@ impl Spreadsheet {
     /// Set a worksheet cell in the retained OOXML package.
     ///
     /// The parsed [`crate::Workbook`] view is intentionally not mutated; reopen the
-    /// saved bytes to observe edited values through read APIs.
+    /// saved bytes to observe edited values through read APIs. A cell within a
+    /// shared or array formula group can only be replaced if it is the entire
+    /// group; use [`Spreadsheet::set_cell_range_values`] for larger groups.
     pub fn set_cell_value(
         &mut self,
         sheet_name: &str,
@@ -204,9 +219,14 @@ impl Spreadsheet {
             "spreadsheet is read-only for package-preserving edit",
         ))?;
         let path = worksheet_path(package, sheet_name)?;
+        peek_part_tree(package, &path, Error::MissingWorkbook, |tree| {
+            validate_formula_group_replacement(tree, (row, col, row, col))
+        })?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = sml_dimension_to_omit(tree)?;
         sml_edit_cell(tree, row, col, value)?;
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -241,7 +261,8 @@ impl Spreadsheet {
     ///
     /// Unlike [`Spreadsheet::clear_range`], this keeps the existing `<c>` node
     /// and removes only its value representation. A missing or already blank
-    /// cell is left untouched.
+    /// cell is left untouched. A shared or array formula group may only be
+    /// cleared in its entirety.
     pub fn clear_cell_value(&mut self, sheet_name: &str, row: u32, col: u16) -> Result<()> {
         if row > 1_048_575 || col > 16_383 {
             return Err(Error::Zip("cell is outside the Excel grid"));
@@ -267,6 +288,9 @@ impl Spreadsheet {
         if !has_value {
             return Ok(());
         }
+        peek_part_tree(package, &path, Error::MissingWorkbook, |tree| {
+            validate_formula_group_replacement(tree, (row, col, row, col))
+        })?;
 
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
@@ -320,11 +344,22 @@ impl Spreadsheet {
         if row > 1_048_575 {
             return Err(Error::Zip("row is outside the Excel grid"));
         }
+        if !values.is_empty() {
+            peek_part_tree(package, &path, Error::MissingWorkbook, |tree| {
+                validate_formula_group_replacement(tree, (row, 0, row, values.len() as u16 - 1))
+            })?;
+        }
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = if values.is_empty() {
+            None
+        } else {
+            sml_dimension_to_omit(tree)?
+        };
         for (col, value) in values.iter().enumerate() {
             sml_edit_cell(tree, row, col as u16, value)?;
         }
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -334,7 +369,8 @@ impl Spreadsheet {
         Ok(row)
     }
 
-    /// Clear cells in an inclusive target range.
+    /// Clear cells in an inclusive target range. Shared and array formula groups
+    /// may only be cleared in their entirety.
     pub fn clear_range(
         &mut self,
         sheet_name: &str,
@@ -375,6 +411,9 @@ impl Spreadsheet {
             "spreadsheet is read-only for package-preserving edit",
         ))?;
         let path = worksheet_path(package, sheet_name)?;
+        peek_part_tree(package, &path, Error::MissingWorkbook, |tree| {
+            validate_formula_group_replacement(tree, (row0, col0, row1, col1))
+        })?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
         for row in row0..=row1 {
@@ -392,11 +431,83 @@ impl Spreadsheet {
     }
 }
 
+/// Plan omission once per value-writing operation, rather than per cell.
+/// ECMA-376 18.3.1.35: the optional dimension includes styled/blank cells too,
+/// so rebuilding it from parsed values could understate the used range.
+/// https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.sheetdimension
+fn sml_dimension_to_omit(tree: &XmlTree) -> Result<Option<(NodeId, NodeId)>> {
+    const MAIN: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const STRICT: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    // Borrow only root namespace declarations. Lookup remains bounded even
+    // when many foreign dimension aliases share a root with many attributes.
+    let mut namespaces = BTreeMap::<&[u8], &[u8]>::new();
+    if let Some(attrs) = tree.attributes(root) {
+        for (name, value) in attrs {
+            let prefix = if name == b"xmlns" {
+                b"".as_slice()
+            } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            namespaces.entry(prefix).or_insert(value);
+        }
+    }
+    // Preserve the editor's existing bare-worksheet compatibility. An empty
+    // namespace reset beneath a namespaced worksheet is foreign content.
+    let bare_root = tree.element_name(root) == Some(b"worksheet")
+        && namespaces
+            .get(b"".as_slice())
+            .is_none_or(|uri| uri.is_empty());
+    let mut dimension = None;
+    for &child in tree.children_of(root) {
+        let Some(name) = tree.element_name(child) else {
+            continue;
+        };
+        let (prefix, local) = match name.iter().position(|&byte| byte == b':') {
+            Some(colon) => (&name[..colon], &name[colon + 1..]),
+            None => (b"".as_slice(), name),
+        };
+        if local != b"dimension" {
+            continue;
+        }
+        let namespace = tree
+            .attributes(child)
+            .and_then(|attrs| {
+                attrs.iter().find_map(|(key, value)| {
+                    let declares_prefix = if prefix.is_empty() {
+                        key == b"xmlns"
+                    } else {
+                        key.strip_prefix(b"xmlns:") == Some(prefix)
+                    };
+                    declares_prefix.then_some(value.as_slice())
+                })
+            })
+            .or_else(|| namespaces.get(prefix).copied());
+        let recognized = matches!(namespace, Some(MAIN | STRICT))
+            || (prefix.is_empty() && bare_root && namespace.is_none_or(|uri| uri.is_empty()));
+        if recognized {
+            if dimension.is_some() {
+                return Err(Error::Zip("worksheet contains duplicate dimensions"));
+            }
+            dimension = Some((root, child));
+        }
+    }
+    Ok(dimension)
+}
+
+fn sml_omit_dimension(tree: &mut XmlTree, dimension: Option<(NodeId, NodeId)>) -> Result<()> {
+    if let Some((root, child)) = dimension {
+        tree.remove_child(root, child)?;
+    }
+    Ok(())
+}
+
 fn validate_formula_cached_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "formula cached text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => validate_xml_value(
             error,
             "formula cached error contains invalid XML characters",
@@ -444,54 +555,273 @@ fn validate_range_targets(tree: &XmlTree, range: (u32, u16, u32, u16)) -> Result
             }
         }
     }
+    validate_formula_group_replacement(tree, range)
+}
+
+fn validate_source_targets(tree: &XmlTree, data: NodeId, range: EditRange) -> Result<()> {
     let mut targets = BTreeSet::new();
     let mut target_rows = BTreeSet::new();
-    if let Some(data) = tree.child_by_name(root, b"sheetData") {
-        for &row in tree.children_of(data) {
-            let source_row = sml_row_ref(tree, row);
-            if let Some(index) = source_row.and_then(|row| row.checked_sub(1)) {
-                if index >= range.0 && index <= range.2 && !target_rows.insert(index) {
-                    return Err(Error::Zip("cell range contains an ambiguous source row"));
-                }
+    let mut next_row = 0;
+    for &row in tree.children_of(data) {
+        let source_row = sml_row_ref(tree, row);
+        let row_index = source_row.and_then(|row| row.checked_sub(1));
+        let inferred_row = row_index.or_else(|| {
+            (tree.element_name(row).map(super::local) == Some(b"row")).then_some(next_row)
+        });
+        if tree.element_name(row).map(super::local) == Some(b"row") {
+            next_row = inferred_row.unwrap_or(next_row).saturating_add(1);
+        }
+        let target_row = inferred_row.is_some_and(|index| index >= range.0 && index <= range.2);
+        // The reader can infer omitted references, but the editor locates
+        // explicit ones. Never approve a group edit that cannot reach its cells.
+        if target_row && row_index.is_none() {
+            return Err(Error::Zip("cell range contains an ambiguous source row"));
+        }
+        if let Some(index) = source_row.and_then(|row| row.checked_sub(1)) {
+            if index >= range.0 && index <= range.2 && !target_rows.insert(index) {
+                return Err(Error::Zip("cell range contains an ambiguous source row"));
             }
-            for &cell in tree.children_of(row) {
-                if let Some(coordinate) = tree
-                    .attr_value(cell, b"r")
-                    .and_then(|value| std::str::from_utf8(value).ok())
-                    .and_then(super::selection::parse_a1_cell)
+        }
+        for &cell in tree.children_of(row) {
+            let coordinate = tree
+                .attr_value(cell, b"r")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(super::selection::parse_a1_cell);
+            if target_row
+                && tree.element_name(cell).map(super::local) == Some(b"c")
+                && coordinate.is_none()
+            {
+                return Err(Error::Zip("cell range contains an ambiguous source target"));
+            }
+            if let Some(coordinate) = coordinate {
+                if coordinate.0 >= range.0
+                    && coordinate.0 <= range.2
+                    && coordinate.1 >= range.1
+                    && coordinate.1 <= range.3
+                    && (source_row != Some(coordinate.0 + 1)
+                        || tree.attr_value(cell, b"r")
+                            != Some(a1(coordinate.0, coordinate.1).as_bytes())
+                        || !targets.insert(coordinate))
                 {
-                    if coordinate.0 >= range.0
-                        && coordinate.0 <= range.2
-                        && coordinate.1 >= range.1
-                        && coordinate.1 <= range.3
-                        && (source_row != Some(coordinate.0 + 1) || !targets.insert(coordinate))
-                    {
-                        return Err(Error::Zip("cell range contains an ambiguous source target"));
-                    }
+                    return Err(Error::Zip("cell range contains an ambiguous source target"));
                 }
-                if let Some(formula) = tree.child_by_name(cell, b"f") {
-                    if matches!(tree.attr_value(formula, b"t"), Some(b"shared" | b"array")) {
-                        if let Some(reference) = tree.attr_value(formula, b"ref") {
-                            let grouped = std::str::from_utf8(reference)
-                                .ok()
-                                .and_then(super::selection::parse_a1_range)
-                                .ok_or(Error::Zip(
-                                    "cell range cannot edit malformed formula metadata",
-                                ))?;
-                            if super::selection::ranges_overlap(range, grouped)
-                                && !(range.0 <= grouped.0
-                                    && range.1 <= grouped.1
-                                    && range.2 >= grouped.2
-                                    && range.3 >= grouped.3)
-                            {
-                                return Err(Error::Zip(
-                                    "cell range cannot partially replace a shared or array formula",
-                                ));
-                            }
-                        }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn range_contains(outer: EditRange, inner: EditRange) -> bool {
+    outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
+}
+
+fn formula_nodes(tree: &XmlTree, data: NodeId) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+    tree.children_of(data)
+        .iter()
+        .flat_map(move |&row| tree.children_of(row))
+        .flat_map(move |&cell| {
+            tree.children_of(cell).iter().filter_map(move |&formula| {
+                (tree.element_name(formula).map(super::local) == Some(b"f"))
+                    .then_some((cell, formula))
+            })
+        })
+}
+
+fn formula_reference(tree: &XmlTree, formula: NodeId) -> Result<Option<EditRange>> {
+    tree.attr_value(formula, b"ref")
+        .map(|reference| {
+            std::str::from_utf8(reference)
+                .ok()
+                .and_then(super::selection::parse_a1_range)
+                .ok_or(Error::Zip(
+                    "cell edit cannot resolve formula group metadata",
+                ))
+        })
+        .transpose()
+}
+
+fn shared_formula_index(tree: &XmlTree, formula: NodeId) -> Option<u32> {
+    std::str::from_utf8(tree.attr_value(formula, b"si")?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// ECMA-376 §18.3.1.40: shared followers depend on the master's `si` and `ref`;
+/// array followers need not contain `<f>` at all. Replacing only part of either
+/// group would leave formula state that cannot be reconstructed on reopen.
+fn validate_formula_group_replacement(tree: &XmlTree, range: EditRange) -> Result<()> {
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    let mut data_nodes = tree
+        .children_of(root)
+        .iter()
+        .copied()
+        .filter(|&node| tree.element_name(node).map(super::local) == Some(b"sheetData"));
+    let Some(data) = data_nodes.next() else {
+        return Ok(());
+    };
+    if data_nodes.next().is_some() {
+        return Err(Error::Zip("cell edit requires unambiguous sheet data"));
+    }
+    validate_source_targets(tree, data, range)?;
+    // Index only groups intersecting the edit. The number of entries is bounded
+    // by the edit-cell limit even for adversarial, overlapping declarations.
+    let mut groups: BTreeMap<u32, SharedFormulaGroup> = BTreeMap::new();
+    let mut array_cells = BTreeSet::new();
+    let mut array_references = BTreeSet::new();
+    let mut array_followers = BTreeSet::new();
+    let mut array_follower_references = BTreeSet::new();
+    for (cell, formula) in formula_nodes(tree, data) {
+        let kind = tree.attr_value(formula, b"t");
+        if !matches!(kind, Some(b"shared" | b"array")) {
+            continue;
+        }
+        let reference = formula_reference(tree, formula)?;
+        let coordinate = tree
+            .attr_value(cell, b"r")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(super::selection::parse_a1_cell);
+        if !coordinate.is_some_and(|(row, col)| range_contains(range, (row, col, row, col)))
+            && !reference.is_some_and(|group| super::selection::ranges_overlap(range, group))
+        {
+            continue;
+        }
+        let coordinate = coordinate.ok_or(Error::Zip(
+            "cell edit cannot resolve formula group metadata",
+        ))?;
+        let point = (coordinate.0, coordinate.1, coordinate.0, coordinate.1);
+        if tree
+            .children_of(cell)
+            .iter()
+            .filter(|&&node| tree.element_name(node).map(super::local) == Some(b"f"))
+            .count()
+            != 1
+        {
+            return Err(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ));
+        }
+        // Value replacement currently edits unqualified SpreadsheetML names.
+        // Detect aliases for protection, but do not remove unknown namespace
+        // children by local name or leave an aliased formula behind on replace.
+        if tree.element_name(formula) != Some(b"f") || tree.element_name(data) != Some(b"sheetData")
+        {
+            return Err(Error::Zip(
+                "cell edit cannot resolve prefixed formula group metadata",
+            ));
+        }
+        if reference.is_some_and(|group| !range_contains(range, group)) {
+            return Err(Error::Zip(
+                "cell edit cannot partially replace a shared or array formula",
+            ));
+        }
+        if kind == Some(b"shared") {
+            let index = shared_formula_index(tree, formula).ok_or(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ))?;
+            if groups.len() >= MAX_EDIT_RANGE_CELLS as usize && !groups.contains_key(&index) {
+                return Err(Error::Zip("cell edit formula group limit exceeded"));
+            }
+            groups.entry(index).or_default();
+        } else if !tree.text_of(formula).trim().is_empty() {
+            let group = reference.ok_or(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ))?;
+            if !range_contains(group, point) {
+                return Err(Error::Zip(
+                    "cell edit cannot resolve formula group metadata",
+                ));
+            }
+            array_references.insert(group);
+            // Covered groups fit within the edit limit. Reject overlaps before
+            // scanning another rectangle, keeping work and allocation bounded.
+            for row in group.0..=group.2 {
+                for col in group.1..=group.3 {
+                    if !array_cells.insert((row, col)) {
+                        return Err(Error::Zip(
+                            "cell edit cannot resolve formula group metadata",
+                        ));
+                    }
+                    if array_cells.len() > MAX_EDIT_RANGE_CELLS as usize {
+                        return Err(Error::Zip("cell edit formula group limit exceeded"));
                     }
                 }
             }
+        } else {
+            if !array_followers.insert(coordinate)
+                || reference.is_some_and(|group| !range_contains(group, point))
+            {
+                return Err(Error::Zip(
+                    "cell edit cannot resolve formula group metadata",
+                ));
+            }
+            if array_followers.len() > MAX_EDIT_RANGE_CELLS as usize {
+                return Err(Error::Zip("cell edit formula group limit exceeded"));
+            }
+            if let Some(group) = reference {
+                array_follower_references.insert(group);
+            }
+        }
+    }
+    if !array_followers.is_subset(&array_cells)
+        || !array_follower_references.is_subset(&array_references)
+    {
+        return Err(Error::Zip(
+            "cell edit cannot resolve formula group metadata",
+        ));
+    }
+    // Locate each selected shared group's master and actual members. This also
+    // catches undeclared masters, orphan followers, and followers outside `ref`.
+    for (cell, formula) in formula_nodes(tree, data) {
+        if tree.attr_value(formula, b"t") != Some(b"shared") {
+            continue;
+        }
+        let Some(group) = shared_formula_index(tree, formula).and_then(|si| groups.get_mut(&si))
+        else {
+            continue;
+        };
+        let coordinate = tree
+            .attr_value(cell, b"r")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(super::selection::parse_a1_cell)
+            .ok_or(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ))?;
+        let point = (coordinate.0, coordinate.1, coordinate.0, coordinate.1);
+        group.members = Some(match group.members {
+            Some(bounds) => (
+                bounds.0.min(point.0),
+                bounds.1.min(point.1),
+                bounds.2.max(point.2),
+                bounds.3.max(point.3),
+            ),
+            None => point,
+        });
+        let reference = formula_reference(tree, formula)?;
+        if let Some(reference) = reference {
+            if group.reference.is_some() || tree.text_of(formula).trim().is_empty() {
+                return Err(Error::Zip(
+                    "cell edit cannot resolve formula group metadata",
+                ));
+            }
+            group.reference = Some(reference);
+        } else if !tree.text_of(formula).trim().is_empty() {
+            return Err(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ));
+        }
+    }
+    for group in groups.values() {
+        if !group
+            .reference
+            .zip(group.members)
+            .is_some_and(|(reference, members)| {
+                range_contains(reference, members) && range_contains(range, reference)
+            })
+        {
+            return Err(Error::Zip(
+                "cell edit cannot resolve formula group metadata",
+            ));
         }
     }
     Ok(())
@@ -603,9 +933,7 @@ fn range_node_plan(
 
 fn validate_edit_cell_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "cell text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => {
             validate_xml_value(error, "cell error contains invalid XML characters")
         }
@@ -778,7 +1106,10 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         // SST index preservation becomes necessary.
         Cell::Text(t) => (
             CellTypeAttr::Set(b"inlineStr"),
-            format!(r#"<is><t xml:space="preserve">{}</t></is>"#, esc_text(t)),
+            format!(
+                r#"<is><t xml:space="preserve">{}</t></is>"#,
+                crate::xstring::escape_xml(t)
+            ),
         ),
         Cell::Number(n) | Cell::Date(n) => {
             (CellTypeAttr::Remove, format!("<v>{}</v>", num_str(*n)))
@@ -790,7 +1121,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         Cell::Error(e) => (CellTypeAttr::Set(b"e"), format!("<v>{}</v>", esc_text(e))),
         Cell::Formula { formula, cached } => {
             let (t_attr, v): (Option<&'static [u8]>, String) = match cached.as_ref() {
-                Cell::Text(t) => (Some(b"str"), esc_text(t)),
+                Cell::Text(t) => (Some(b"str"), crate::xstring::escape_xml(t)),
                 Cell::Bool(b) => (Some(b"b"), if *b { "1" } else { "0" }.to_string()),
                 Cell::Error(e) => (Some(b"e"), esc_text(e)),
                 Cell::Number(n) | Cell::Date(n) => (None, num_str(*n)),
@@ -800,7 +1131,15 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
                 Some(t) => CellTypeAttr::Set(t),
                 None => CellTypeAttr::Remove,
             };
-            (type_attr, format!("<f>{}</f><v>{v}</v>", esc_text(formula)))
+            let v_space = if matches!(cached.as_ref(), Cell::Text(_)) {
+                r#" xml:space="preserve""#
+            } else {
+                ""
+            };
+            (
+                type_attr,
+                format!("<f>{}</f><v{v_space}>{v}</v>", esc_text(formula)),
+            )
         }
     };
 
@@ -809,7 +1148,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
 
 fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) -> Result<()> {
     let (type_attr, encoded) = match value {
-        Cell::Text(text) => (CellTypeAttr::Set(b"str"), esc_text(text)),
+        Cell::Text(text) => (CellTypeAttr::Set(b"str"), crate::xstring::escape_xml(text)),
         Cell::Number(number) | Cell::Date(number) => (CellTypeAttr::Remove, num_str(*number)),
         Cell::Bool(value) => (
             CellTypeAttr::Set(b"b"),
@@ -820,7 +1159,18 @@ fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) 
             return Err(Error::Zip("formula cache must be a scalar cell value"))
         }
     };
-    sml_replace_cell_value(tree, cell, type_attr, &format!("<v>{encoded}</v>"), false)
+    let v_space = if matches!(value, Cell::Text(_)) {
+        r#" xml:space="preserve""#
+    } else {
+        ""
+    };
+    sml_replace_cell_value(
+        tree,
+        cell,
+        type_attr,
+        &format!("<v{v_space}>{encoded}</v>"),
+        false,
+    )
 }
 
 fn sml_replace_cell_value(

@@ -151,6 +151,7 @@ pub(super) fn parse_sheet(
     let mut style_idx = 0usize;
     let mut value = String::new();
     let mut inline_value = String::new();
+    let mut inline_text_element = String::new();
     let mut inline_text_seen = false;
     let mut inline_run: Option<crate::TextRun> = None;
     let mut inline_runs = Vec::<crate::TextRun>::new();
@@ -517,6 +518,7 @@ pub(super) fn parse_sheet(
                     style_idx = attr(&e, b"s").and_then(|s| s.parse().ok()).unwrap_or(0);
                     value.clear();
                     inline_value.clear();
+                    inline_text_element.clear();
                     inline_text_seen = false;
                     inline_run = None;
                     inline_runs.clear();
@@ -584,6 +586,7 @@ pub(super) fn parse_sheet(
                 }
                 b"t" => {
                     in_is_t = true; // inline-string text (within <is>)
+                    inline_text_element.clear();
                     if !in_rph {
                         inline_text_seen = true;
                     }
@@ -839,13 +842,15 @@ pub(super) fn parse_sheet(
                 }
             }
             Ok(Event::Text(t)) if in_f => formula.push_str(&text_of(&t)),
-            Ok(Event::Text(t)) if in_v => value.push_str(&text_of(&t)),
-            Ok(Event::Text(t)) if in_is_t && !in_rph => {
-                let text = text_of(&t);
-                inline_value.push_str(&text);
-                if let Some(run) = inline_run.as_mut() {
-                    run.text.push_str(&text);
+            Ok(Event::Text(t)) if in_v => {
+                if matches!(ctype.as_str(), "str" | "inlineStr") {
+                    value.push_str(&t.xml10_content().unwrap_or_default());
+                } else {
+                    value.push_str(&text_of(&t));
                 }
+            }
+            Ok(Event::Text(t)) if in_is_t && !in_rph => {
+                inline_text_element.push_str(&t.xml10_content().unwrap_or_default());
             }
             Ok(Event::GeneralRef(reference)) => {
                 with_general_ref_text(&reference, |text| {
@@ -876,10 +881,7 @@ pub(super) fn parse_sheet(
                     } else if in_v {
                         value.push_str(text);
                     } else if in_is_t && !in_rph {
-                        inline_value.push_str(text);
-                        if let Some(run) = inline_run.as_mut() {
-                            run.text.push_str(text);
-                        }
+                        inline_text_element.push_str(text);
                     }
                 });
             }
@@ -916,22 +918,30 @@ pub(super) fn parse_sheet(
                 }
             }
             Ok(Event::CData(t)) if in_v => {
-                value.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                if matches!(ctype.as_str(), "str" | "inlineStr") {
+                    value.push_str(&t.xml10_content().unwrap_or_default());
+                } else {
+                    value.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                }
             }
             Ok(Event::CData(t)) if in_is_t && !in_rph => {
-                let bytes = t.into_inner();
-                let text = String::from_utf8_lossy(bytes.as_ref());
-                inline_value.push_str(&text);
-                if let Some(run) = inline_run.as_mut() {
-                    run.text.push_str(&text);
-                }
+                inline_text_element.push_str(&t.xml10_content().unwrap_or_default());
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
                 b"v" => in_v = false,
                 b"f" if in_sparkline_formula => in_sparkline_formula = false,
                 b"f" => in_f = false,
                 b"rPh" => in_rph = false,
-                b"t" => in_is_t = false,
+                b"t" => {
+                    if in_is_t && !in_rph {
+                        let text = crate::xstring::decode(&inline_text_element);
+                        inline_value.push_str(&text);
+                        if let Some(run) = inline_run.as_mut() {
+                            run.text.push_str(&text);
+                        }
+                    }
+                    in_is_t = false;
+                }
                 b"r" if inline_run.is_some() => {
                     let completed = inline_run.take().expect("run");
                     if !completed.text.is_empty() {
@@ -979,9 +989,11 @@ pub(super) fn parse_sheet(
                 b"c" => {
                     if let Some((row, col)) = rc.take() {
                         let cell_value = if ctype == "inlineStr" && inline_text_seen {
-                            inline_value.as_str()
+                            std::borrow::Cow::Borrowed(inline_value.as_str())
+                        } else if matches!(ctype.as_str(), "str" | "inlineStr") {
+                            crate::xstring::decode(&value)
                         } else {
-                            value.as_str()
+                            std::borrow::Cow::Borrowed(value.as_str())
                         };
                         // Resolve a shared formula: a master (`si` + formula text)
                         // registers itself; a follower (`si`, empty text) rebuilds the
@@ -1018,7 +1030,14 @@ pub(super) fn parse_sheet(
                             f_array_ref = None;
                         }
                         if let Some(entry) = build_cell(
-                            row, col, &ctype, style_idx, cell_value, &resolved, shared, styles,
+                            row,
+                            col,
+                            &ctype,
+                            style_idx,
+                            &cell_value,
+                            &resolved,
+                            shared,
+                            styles,
                             date1904,
                         ) {
                             // Account for the complete retained cell rather than

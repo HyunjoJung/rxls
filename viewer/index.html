@@ -260,7 +260,7 @@
                 </div>
                 <span class="group-label">Workbook</span>
               </div>
-              <p class="ribbon-hint">
+              <p id="editing-hint" class="ribbon-hint">
                 Click a cell and start typing.<span
                   >Enter to apply · Escape to cancel · Save a copy to keep
                   edits.</span
@@ -641,7 +641,7 @@
             for="cell-value"
           >
             <span>Value</span>
-            <input id="cell-value" name="value" maxlength="32767" />
+            <textarea id="cell-value" name="value" rows="2" maxlength="32767"></textarea>
           </label>
 
           <fieldset
@@ -670,11 +670,12 @@
             </label>
             <label class="form-field form-field-wide" for="cell-cached-value">
               <span>Cached value</span>
-              <input
+              <textarea
                 id="cell-cached-value"
                 name="cachedValue"
+                rows="2"
                 maxlength="32767"
-              />
+              ></textarea>
             </label>
           </fieldset>
         </div>

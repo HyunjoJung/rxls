@@ -74,6 +74,8 @@ mod xlsb;
 mod xlsx;
 #[cfg(feature = "xlsx")]
 mod xmltree;
+#[cfg(feature = "xlsx")]
+mod xstring;
 #[cfg(any(feature = "xlsx", feature = "ods"))]
 mod ziputil;
 

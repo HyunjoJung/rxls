@@ -330,6 +330,9 @@ impl OperationBudget {
     ) -> std::result::Result<(), FormulaUnsupportedReason> {
         match value {
             Value::Text(text) | Value::Error(text) => self.grow_text(0, text.len()),
+            Value::Reference(value) | Value::SingleCellRange(value) => {
+                self.reserve_value_copy(value)
+            }
             Value::Range(values) => values
                 .iter()
                 .try_for_each(|value| self.reserve_value_copy(value)),
@@ -383,12 +386,21 @@ fn evaluate_formula_in_context(
     formula: &str,
     state: &mut EvalState,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    evaluate_formula_value_in_context(workbook, sheet_name, formula, state).map(Value::into_cell)
+}
+
+fn evaluate_formula_value_in_context(
+    workbook: &Workbook,
+    sheet_name: &str,
+    formula: &str,
+    state: &mut EvalState,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
     if state.formula_dependency_depth >= MAX_FORMULA_DEPENDENCY_DEPTH {
         return Err(FormulaUnsupportedReason::DependencyDepthExceeded);
     }
     state.formula_dependency_depth += 1;
     let operation_budget = state.operation_budget.clone();
-    let result = evaluate_formula_with_refs(formula, operation_budget, |request| {
+    let result = evaluate_formula_value_with_refs(formula, operation_budget, |request| {
         resolve_reference(workbook, sheet_name, state, request)
     });
     state.formula_dependency_depth -= 1;
@@ -442,8 +454,8 @@ fn resolve_reference(
             if !state.visiting_names.insert(key.clone()) {
                 return Err(FormulaUnsupportedReason::CircularReference);
             }
-            let result = evaluate_formula_in_context(workbook, current_sheet, refers_to, state)
-                .map(cell_to_value);
+            let result =
+                evaluate_formula_value_in_context(workbook, current_sheet, refers_to, state);
             state.visiting_names.remove(&key);
             result
         }
@@ -469,7 +481,9 @@ fn resolve_reference(
                 values.push(value);
             }
             if values.len() == 1 {
-                Ok(values.pop().unwrap_or(Value::Blank))
+                Ok(Value::Reference(Box::new(
+                    values.pop().unwrap_or(Value::Blank),
+                )))
             } else {
                 Ok(Value::Range(values))
             }
@@ -478,6 +492,10 @@ fn resolve_reference(
             let target_names = target_sheet_names(workbook, current_sheet, sheet.as_deref())?;
             let range = parse_reference_range(&start, &end)
                 .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+            let single_cell = target_names.len() == 1
+                && matches!(range,
+                ReferenceRange::Cells { start_row, start_col, end_row, end_col }
+                    if start_row == end_row && start_col == end_col);
             let mut values = Vec::new();
             for target_name in target_names {
                 let target = workbook
@@ -537,7 +555,13 @@ fn resolve_reference(
                     }
                 }
             }
-            Ok(Value::Range(values))
+            if single_cell {
+                Ok(Value::SingleCellRange(Box::new(
+                    values.pop().unwrap_or(Value::Blank),
+                )))
+            } else {
+                Ok(Value::Range(values))
+            }
         }
     }
 }
@@ -611,26 +635,32 @@ fn target_sheet_names<'a>(
         .collect())
 }
 
+#[cfg(test)]
 fn evaluate_formula_with_refs(
     formula: &str,
     operation_budget: OperationBudget,
-    mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
+    resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
 ) -> std::result::Result<Cell, FormulaUnsupportedReason> {
+    evaluate_formula_value_with_refs(formula, operation_budget, resolve_ref).map(Value::into_cell)
+}
+
+fn evaluate_formula_value_with_refs(
+    formula: &str,
+    operation_budget: OperationBudget,
+    mut resolve_ref: impl FnMut(RefRequest) -> std::result::Result<Value, FormulaUnsupportedReason>,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
     let formula = formula.trim().strip_prefix('=').unwrap_or(formula.trim());
     operation_budget.charge_text_storage(formula.len())?;
     let normalized = normalize_formula_syntax(formula)?;
     let formula = normalized.as_str();
-    if formula.contains('[') {
-        return Err(FormulaUnsupportedReason::ExternalRef);
-    }
-    if formula.contains('{') || formula.contains('}') || formula.contains('@') {
-        return Err(FormulaUnsupportedReason::ArraySemantics);
+    if let Some(reason) = unsupported_formula_syntax(formula) {
+        return Err(reason);
     }
     let mut parser = Parser::new(formula, operation_budget, &mut resolve_ref);
     let value = parser.parse_comparison()?;
     parser.skip_ws();
     if parser.eof() {
-        Ok(value.into_cell())
+        Ok(value)
     } else {
         Err(FormulaUnsupportedReason::UnparsableExpression)
     }
@@ -653,15 +683,65 @@ enum Value {
     Bool(bool),
     Error(String),
     Blank,
+    // A single-cell reference carries one scalar, never another Reference.
+    // Aggregates distinguish this origin; scalar consumers inspect its value.
+    Reference(Box<Value>),
+    // Actual 1x1 geometry, distinct from a sparse range with one stored cell.
+    SingleCellRange(Box<Value>),
     Range(Vec<Value>),
 }
 
 impl Value {
-    fn into_number(self) -> std::result::Result<f64, Value> {
-        if matches!(self, Value::Error(_)) {
-            return Err(self);
+    fn scalar(&self) -> &Self {
+        let mut value = self;
+        while let Self::Reference(inner) = value {
+            value = inner;
         }
-        self.as_number()
+        value
+    }
+
+    fn into_scalar(mut self) -> Self {
+        while let Self::Reference(inner) = self {
+            self = *inner;
+        }
+        self
+    }
+
+    // IF keeps the selected reference's origin, including a one-cell range.
+    fn into_selected_reference(self) -> std::result::Result<Self, FormulaUnsupportedReason> {
+        match self {
+            Self::SingleCellRange(value) => Ok(Self::Reference(value)),
+            Self::Range(_) => Err(FormulaUnsupportedReason::ArraySemantics),
+            value => Ok(value),
+        }
+    }
+
+    // IFERROR/IFNA and unary '+' return values. A selected missing cell is 0.
+    fn function_scalar(&self) -> &Self {
+        match self.scalar() {
+            Self::SingleCellRange(value) => value.scalar(),
+            value => value,
+        }
+    }
+
+    fn into_function_value(self) -> std::result::Result<Self, FormulaUnsupportedReason> {
+        let value = match self.into_scalar() {
+            Self::SingleCellRange(value) => *value,
+            value => value,
+        };
+        match value {
+            Self::Range(_) => Err(FormulaUnsupportedReason::ArraySemantics),
+            Self::Blank => Ok(Self::Number(0.0)),
+            value => Ok(value),
+        }
+    }
+
+    fn into_number(self) -> std::result::Result<f64, Value> {
+        let value = self.into_scalar();
+        if matches!(value, Value::Error(_)) {
+            return Err(value);
+        }
+        value.as_number()
     }
 
     fn into_cell(self) -> Cell {
@@ -671,7 +751,11 @@ impl Value {
             Value::Bool(b) => Cell::Bool(b),
             Value::Error(e) => Cell::Error(e),
             Value::Blank => Cell::Text(String::new()),
-            Value::Range(_) => Cell::Error("#VALUE!".to_string()),
+            Value::Reference(value) => match *value {
+                Value::Blank => Cell::Number(0.0),
+                value => value.into_cell(),
+            },
+            Value::Range(_) | Value::SingleCellRange(_) => Cell::Error("#VALUE!".to_string()),
         }
     }
 
@@ -685,7 +769,8 @@ impl Value {
                 .parse::<f64>()
                 .map_err(|_| Value::Error("#VALUE!".to_string())),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_number(),
         }
     }
 
@@ -696,7 +781,8 @@ impl Value {
             Value::Blank => Ok(Cow::Borrowed("")),
             Value::Bool(b) => Ok(Cow::Borrowed(if *b { "TRUE" } else { "FALSE" })),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_text(),
         }
     }
 
@@ -726,7 +812,8 @@ impl Value {
             }
             Value::Blank => Ok(false),
             Value::Error(e) => Err(Value::Error(e.clone())),
-            Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Range(_) | Value::SingleCellRange(_) => Err(Value::Error("#VALUE!".to_string())),
+            Value::Reference(value) => value.as_bool(),
         }
     }
 }
@@ -913,7 +1000,7 @@ impl<'a, 'r> Parser<'a, 'r> {
         self.skip_ws();
         if self.consume_char('+') {
             self.charge_operation()?;
-            return self.parse_unary();
+            return self.parse_unary().and_then(Value::into_function_value);
         }
         if self.consume_char('-') {
             self.charge_operation()?;
@@ -993,27 +1080,32 @@ impl<'a, 'r> Parser<'a, 'r> {
             return self.parse_sheet_reference(ident);
         }
         if self.consume_char('(') {
-            if is_volatile(&ident_upper) {
+            // MS-XLSX §2.2.3 lists this exact future-function storage spelling.
+            let function = match ident_upper.as_str() {
+                "_XLFN.IFNA" => "IFNA",
+                name => name,
+            };
+            if is_volatile(function) {
                 return Err(FormulaUnsupportedReason::Volatile);
             }
-            if is_dynamic_array_function(&ident_upper) {
+            if is_dynamic_array_function(function) {
                 return Err(FormulaUnsupportedReason::ArraySemantics);
             }
-            if !is_deterministic_function(&ident_upper) {
+            if !is_deterministic_function(function) {
                 return Err(FormulaUnsupportedReason::UnsupportedFunction);
             };
             let mut args = Vec::new();
             self.skip_ws();
             if self.consume_char(')') {
                 self.charge_operation()?;
-                return evaluate_function(&ident_upper, &args, &self.operation_budget);
+                return evaluate_function(function, &args, &self.operation_budget);
             }
             loop {
                 args.push(self.parse_comparison()?);
                 self.skip_ws();
                 if self.consume_char(')') {
                     self.charge_operation()?;
-                    return evaluate_function(&ident_upper, &args, &self.operation_budget);
+                    return evaluate_function(function, &args, &self.operation_budget);
                 }
                 if self.consume_char(',') {
                     continue;
@@ -1370,41 +1462,11 @@ fn evaluate_function(
         "AND" => eval_and_or_or(args, false),
         "OR" => eval_and_or_or(args, true),
         "NOT" => eval_not(args),
-        "ISNA" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_error_check(args, "#N/A"))
-            }
-        }
-        "ISERROR" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_any_error(args))
-            }
-        }
-        "ISNUMBER" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_number(args))
-            }
-        }
-        "ISTEXT" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_text(args))
-            }
-        }
-        "ISBLANK" => {
-            if args.len() != 1 {
-                Ok(Value::Error("#VALUE!".to_string()))
-            } else {
-                Ok(eval_is_blank(args))
-            }
-        }
+        "ISNA" => evaluate_scalar_function(args, |scalar| eval_error_check(scalar, "#N/A")),
+        "ISERROR" => evaluate_scalar_function(args, eval_any_error),
+        "ISNUMBER" => evaluate_scalar_function(args, eval_is_number),
+        "ISTEXT" => evaluate_scalar_function(args, eval_is_text),
+        "ISBLANK" => evaluate_scalar_function(args, eval_is_blank),
         "EXACT" => eval_exact(args),
         "VALUE" => eval_value(args),
         _ => Err(FormulaUnsupportedReason::UnsupportedFunction),
@@ -1439,9 +1501,12 @@ fn for_each_value<'a>(
     in_range: bool,
     visit: &mut impl FnMut(&'a Value, bool) -> std::result::Result<(), Value>,
 ) -> std::result::Result<(), Value> {
+    // Excel aggregates distinguish literal values from cell/range inputs.
+    // https://learn.microsoft.com/en-us/office/vba/api/excel.worksheetfunction.sum
     for value in values {
         match value {
             Value::Range(values) => for_each_value(values, true, visit)?,
+            Value::Reference(value) | Value::SingleCellRange(value) => visit(value.scalar(), true)?,
             value => visit(value, in_range)?,
         }
     }
@@ -1458,28 +1523,33 @@ fn aggregate_number(value: &Value, in_range: bool) -> std::result::Result<Option
                 return Ok(None);
             }
             let text = text.trim();
-            if text.is_empty() {
-                Ok(None)
-            } else {
-                Ok(text.parse::<f64>().ok())
+            match text.parse::<f64>() {
+                Ok(number) if number.is_finite() => Ok(Some(number)),
+                _ => Err(Value::Error("#VALUE!".to_string())),
             }
         }
         Value::Blank => Ok(None),
         Value::Error(error) => Err(Value::Error(error.clone())),
-        Value::Range(_) => Err(Value::Error("#VALUE!".to_string())),
+        Value::Range(_) | Value::Reference(_) | Value::SingleCellRange(_) => {
+            Err(Value::Error("#VALUE!".to_string()))
+        }
     }
 }
 
 fn count_if_number_like(value: &Value, in_range: bool) -> std::result::Result<bool, Value> {
+    // COUNT ignores errors even when passed directly.
+    // https://support.microsoft.com/en-us/excel/functions/count-function
     match value {
         Value::Number(_) => Ok(true),
-        Value::Text(text) if !in_range => {
-            Ok(!text.trim().is_empty() && text.parse::<f64>().is_ok())
-        }
+        Value::Text(text) if !in_range => Ok(text.trim().parse::<f64>().is_ok_and(f64::is_finite)),
         Value::Bool(_) if !in_range => Ok(true),
         Value::Blank => Ok(false),
-        Value::Error(error) if !in_range => Err(Value::Error(error.clone())),
-        Value::Text(_) | Value::Bool(_) | Value::Error(_) | Value::Range(_) => Ok(false),
+        Value::Text(_)
+        | Value::Bool(_)
+        | Value::Error(_)
+        | Value::Range(_)
+        | Value::Reference(_)
+        | Value::SingleCellRange(_) => Ok(false),
     }
 }
 
@@ -1585,19 +1655,24 @@ fn eval_if(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReaso
     };
     let true_value = args.get(1).cloned().unwrap_or(Value::Bool(false));
     let false_value = args.get(2).cloned().unwrap_or(Value::Bool(false));
-    Ok(if condition { true_value } else { false_value })
+    if condition { true_value } else { false_value }.into_selected_reference()
 }
 
 fn eval_iferror(
     args: &[Value],
     only_na: bool,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
-    let replace = matches!(&args[0], Value::Error(error) if !only_na || error == "#N/A");
-    Ok(if replace {
+    if matches!(args[0], Value::Range(_)) {
+        return Err(FormulaUnsupportedReason::ArraySemantics);
+    }
+    let replace =
+        matches!(args[0].function_scalar(), Value::Error(error) if !only_na || error == "#N/A");
+    if replace {
         args[1].clone()
     } else {
         args[0].clone()
-    })
+    }
+    .into_function_value()
 }
 
 fn eval_round(
@@ -1612,34 +1687,74 @@ fn eval_round(
         Ok(digits) => digits,
         Err(error) => return Ok(error),
     };
-    let precision = digits.trunc() as i32;
-    let factor = 10_f64.powi(precision);
-    let rounded = match kind {
-        RoundKind::Standard => (number * factor).round() / factor,
-        RoundKind::AwayFromZero => {
-            if number >= 0.0 {
-                (number * factor).ceil() / factor
-            } else {
-                (number * factor).floor() / factor
-            }
-        }
-        RoundKind::TowardZero => {
-            if number >= 0.0 {
-                (number * factor).floor() / factor
-            } else {
-                (number * factor).ceil() / factor
-            }
-        }
-    };
-    // A very negative precision underflows `factor` to exactly 0.0 (still
-    // finite), which turns the division above into 0.0/0.0 == NaN. Checking
-    // the *final* result (rather than just `factor.is_finite()`) catches
-    // that case -- and any other path to a non-finite result -- uniformly.
-    if rounded.is_finite() {
-        Ok(Value::Number(rounded))
-    } else {
-        Ok(Value::Error("#NUM!".to_string()))
+    Ok(decimal_round_value(number, digits, kind))
+}
+
+fn decimal_round_value(number: f64, digits: f64, kind: RoundKind) -> Value {
+    let rounded = digits
+        .is_finite()
+        .then(|| round_decimal(number, digits.trunc() as i32, kind))
+        .flatten();
+    match rounded {
+        Some(number) => Value::Number(number),
+        None => Value::Error("#NUM!".to_string()),
     }
+}
+
+fn round_decimal(number: f64, precision: i32, kind: RoundKind) -> Option<f64> {
+    // Keep the existing finite/nonzero decimal-scale boundary (e.g. +/-400).
+    // Do not multiply the input by this scale: a finite result can otherwise
+    // overflow, or binary noise can incorrectly cross a decimal step (#134).
+    let factor = 10_f64.powi(precision);
+    if !number.is_finite() || !factor.is_finite() || factor == 0.0 {
+        return None;
+    }
+    if number == 0.0 {
+        return Some(number);
+    }
+
+    // Installed Excel reference/neighbor/residue probes support 15 significant
+    // decimal digits here. This is a rounding-function policy, not a change to
+    // literal parsing or general arithmetic. ROUND's tie is then away from zero:
+    // https://support.microsoft.com/en-us/excel/functions/round-function
+    // Fixed precision and binary64's exponent range bound this string to 22 bytes.
+    let scientific = format!("{:.14e}", number.abs());
+    let (mantissa, exponent) = scientific.split_once('e')?;
+    let mut coefficient = 0_u64;
+    for byte in mantissa.bytes().filter(|&byte| byte != b'.') {
+        let digit = byte.checked_sub(b'0').filter(|&digit| digit <= 9)?;
+        coefficient = coefficient.checked_mul(10)?.checked_add(u64::from(digit))?;
+    }
+    let shift = i64::from(exponent.parse::<i32>().ok()?) - 14 + i64::from(precision);
+    if shift >= 0 {
+        // Returning the original binary value would retain arithmetic residue
+        // even though no digits of the normalized coefficient are discarded.
+        let canonical = scientific.parse::<f64>().ok()?;
+        return canonical.is_finite().then(|| canonical.copysign(number));
+    }
+
+    let discarded = -shift;
+    let rounded = if discarded > 15 {
+        // The coefficient is smaller than half this step. Avoid constructing a
+        // power whose size is selected by the formula's precision argument.
+        u64::from(matches!(kind, RoundKind::AwayFromZero))
+    } else {
+        let divisor = 10_u64.checked_pow(u32::try_from(discarded).ok()?)?;
+        let quotient = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        let increment = match kind {
+            RoundKind::Standard => remainder >= divisor / 2,
+            RoundKind::AwayFromZero => remainder != 0,
+            RoundKind::TowardZero => false,
+        };
+        quotient.checked_add(u64::from(increment))?
+    };
+    // Parse one bounded decimal result instead of multiplying/dividing by an
+    // approximate binary power of ten and reintroducing a rounding error.
+    let result = format!("{rounded}e{}", -i64::from(precision))
+        .parse::<f64>()
+        .ok()?;
+    result.is_finite().then(|| result.copysign(number))
 }
 
 fn eval_unary_numeric(
@@ -1660,21 +1775,12 @@ fn eval_trunc(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedRe
     };
     let digits = match args.get(1) {
         Some(value) => match value.as_number() {
-            Ok(value) => value.trunc() as i32,
+            Ok(value) => value,
             Err(error) => return Ok(error),
         },
-        None => 0,
+        None => 0.0,
     };
-    let factor = 10_f64.powi(digits);
-    let result = (number * factor).trunc() / factor;
-    // See eval_round: check the final result's finiteness, not just the
-    // factor's, so an underflowed factor (very negative `digits`) can't
-    // sneak a NaN into a Cell::Number.
-    if result.is_finite() {
-        Ok(Value::Number(result))
-    } else {
-        Ok(Value::Error("#NUM!".to_string()))
-    }
+    Ok(decimal_round_value(number, digits, RoundKind::TowardZero))
 }
 
 fn eval_sqrt(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReason> {
@@ -1909,6 +2015,12 @@ fn eval_and_or_or(
     let mut visit = |value: &Value, in_range: bool| -> std::result::Result<(), Value> {
         match (value, in_range) {
             (Value::Text(_) | Value::Blank, true) => Ok(()),
+            (Value::Text(text), false)
+                if !text.trim().eq_ignore_ascii_case("TRUE")
+                    && !text.trim().eq_ignore_ascii_case("FALSE") =>
+            {
+                Ok(())
+            }
             (Value::Error(error), _) => Err(Value::Error(error.clone())),
             _ => {
                 truth_values.push(value.as_bool()?);
@@ -1939,11 +2051,26 @@ fn eval_not(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReas
     Ok(Value::Bool(!value))
 }
 
+/// Inspect borrowed scalar type without coercion; actual arrays stay unsupported.
+fn evaluate_scalar_function(
+    args: &[Value],
+    inspect: impl FnOnce(&[Value]) -> Value,
+) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    let [value] = args else {
+        return Ok(Value::Error("#VALUE!".to_string()));
+    };
+    let scalar = value.function_scalar();
+    if matches!(scalar, Value::Range(_)) {
+        return Err(FormulaUnsupportedReason::ArraySemantics);
+    }
+    Ok(inspect(std::slice::from_ref(scalar)))
+}
+
 fn eval_error_check(args: &[Value], target: &str) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    if let Value::Error(error) = value {
+    if let Value::Error(error) = value.scalar() {
         Value::Bool(error == target)
     } else {
         Value::Bool(false)
@@ -1954,37 +2081,28 @@ fn eval_any_error(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    Value::Bool(matches!(value, Value::Error(_)))
+    Value::Bool(matches!(value.scalar(), Value::Error(_)))
 }
 
 fn eval_is_number(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    let numeric = match value {
-        Value::Number(_) => true,
-        Value::Text(text) => text.parse::<f64>().is_ok(),
-        _ => false,
-    };
-    Value::Bool(numeric)
+    Value::Bool(matches!(value.scalar(), Value::Number(_)))
 }
 
 fn eval_is_text(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    Value::Bool(matches!(value, Value::Text(_)))
+    Value::Bool(matches!(value.scalar(), Value::Text(_)))
 }
 
 fn eval_is_blank(args: &[Value]) -> Value {
     let Some(value) = args.first() else {
         return Value::Error("#VALUE!".to_string());
     };
-    match value {
-        Value::Blank => Value::Bool(true),
-        Value::Text(text) => Value::Bool(text.is_empty()),
-        _ => Value::Bool(false),
-    }
+    Value::Bool(matches!(value.scalar(), Value::Blank))
 }
 
 fn eval_exact(args: &[Value]) -> std::result::Result<Value, FormulaUnsupportedReason> {
@@ -2028,6 +2146,8 @@ fn binary_text(
     right: Value,
     budget: &OperationBudget,
 ) -> std::result::Result<Value, FormulaUnsupportedReason> {
+    let left = left.into_scalar();
+    let right = right.into_scalar();
     if matches!(left, Value::Error(_)) {
         return Ok(left);
     }
@@ -2105,11 +2225,14 @@ fn compare_rank(value: &Value) -> u8 {
         // Errors are propagated before ranking is consulted; Range never
         // reaches a scalar comparison. Rank is irrelevant for either, so
         // give them a stable (unreachable in practice) rank.
-        Value::Error(_) | Value::Range(_) => 3,
+        Value::Error(_) | Value::Range(_) | Value::SingleCellRange(_) => 3,
+        Value::Reference(value) => compare_rank(value),
     }
 }
 
 fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
+    let left = left.into_scalar();
+    let right = right.into_scalar();
     if matches!(left, Value::Error(_)) {
         return left;
     }
@@ -2120,7 +2243,9 @@ fn compare_values(left: Value, right: Value, op: CompareOp) -> Value {
     // operand -- both `as_number` and `as_text` already rejected it with
     // #VALUE! before this rewrite. Keep that behavior explicitly instead of
     // letting it fall through to rank-based ordering.
-    if matches!(left, Value::Range(_)) || matches!(right, Value::Range(_)) {
+    if matches!(left, Value::Range(_) | Value::SingleCellRange(_))
+        || matches!(right, Value::Range(_) | Value::SingleCellRange(_))
+    {
         return Value::Error("#VALUE!".to_string());
     }
     let ordering = if compare_rank(&left) == compare_rank(&right) {
@@ -2240,6 +2365,56 @@ fn parse_whole_col_ref(reference: &str) -> Option<u16> {
     (1..=16_384).contains(&col).then(|| (col - 1) as u16)
 }
 
+/// Return the UTF-8 boundary after a quoted region, preserving doubled quotes.
+/// OpenFormula §5.4 strings and §5.8 quoted sheet names use doubled delimiters.
+fn formula_quote_end(formula: &str, start: usize, quote: char) -> Option<usize> {
+    let mut chars = formula.get(start..)?.char_indices().peekable();
+    if chars.next()?.1 != quote {
+        return None;
+    }
+    while let Some((index, ch)) = chars.next() {
+        if ch != quote {
+            continue;
+        }
+        if chars.peek().is_some_and(|(_, next)| *next == quote) {
+            chars.next();
+        } else {
+            return Some(start + index + ch.len_utf8());
+        }
+    }
+    None
+}
+
+/// Inspect syntax only outside text; brackets in sheet quotes remain external.
+fn unsupported_formula_syntax(formula: &str) -> Option<FormulaUnsupportedReason> {
+    let mut index = 0;
+    let mut external = false;
+    let mut array = false;
+    while let Some(ch) = formula.get(index..).and_then(|rest| rest.chars().next()) {
+        if matches!(ch, '"' | '\'') {
+            // Leave unterminated quotes to the parser's existing typed failure.
+            let Some(end) = formula_quote_end(formula, index, ch) else {
+                break;
+            };
+            if ch == '\'' && formula[index..end].contains('[') {
+                external = true;
+            }
+            index = end;
+            continue;
+        }
+        external |= ch == '[';
+        array |= matches!(ch, '{' | '}' | '@');
+        index += ch.len_utf8();
+    }
+    if external {
+        Some(FormulaUnsupportedReason::ExternalRef)
+    } else if array {
+        Some(FormulaUnsupportedReason::ArraySemantics)
+    } else {
+        None
+    }
+}
+
 /// Convert the bounded OpenFormula reference spelling surfaced by the ODS
 /// reader to the evaluator's Excel-like reference grammar. External workbook
 /// and array syntax remain typed fallbacks rather than being guessed.
@@ -2250,31 +2425,39 @@ fn normalize_formula_syntax(
         return Ok(formula.to_string());
     }
     let mut out = String::with_capacity(formula.len());
-    let mut chars = formula.char_indices().peekable();
-    let mut in_string = false;
-    while let Some((index, ch)) = chars.next() {
-        if ch == '"' {
-            in_string = !in_string;
-            out.push(ch);
+    let mut index = 0;
+    while let Some(ch) = formula.get(index..).and_then(|rest| rest.chars().next()) {
+        if matches!(ch, '"' | '\'') {
+            let end = formula_quote_end(formula, index, ch).unwrap_or(formula.len());
+            out.push_str(&formula[index..end]);
+            index = end;
             continue;
         }
-        if ch != '[' || in_string {
-            out.push(if ch == ';' && !in_string { ',' } else { ch });
+        if ch != '[' {
+            out.push(if ch == ';' { ',' } else { ch });
+            index += ch.len_utf8();
             continue;
         }
         let content_start = index + ch.len_utf8();
-        let mut content_end = None;
-        for (candidate, candidate_ch) in chars.by_ref() {
-            if candidate_ch == ']' {
-                content_end = Some(candidate);
-                break;
+        let mut content_end = content_start;
+        loop {
+            match formula
+                .get(content_end..)
+                .and_then(|rest| rest.chars().next())
+            {
+                Some(']') => break,
+                Some(quote @ ('"' | '\'')) => {
+                    content_end = formula_quote_end(formula, content_end, quote)
+                        .ok_or(FormulaUnsupportedReason::UnparsableExpression)?;
+                }
+                Some(next) => content_end += next.len_utf8(),
+                None => return Err(FormulaUnsupportedReason::UnparsableExpression),
             }
         }
-        let Some(content_end) = content_end else {
-            return Err(FormulaUnsupportedReason::UnparsableExpression);
-        };
-        let content = &formula[content_start..content_end];
-        out.push_str(&normalize_odf_reference(content)?);
+        out.push_str(&normalize_odf_reference(
+            &formula[content_start..content_end],
+        )?);
+        index = content_end + 1;
     }
     Ok(out)
 }
@@ -2354,6 +2537,33 @@ mod tests {
             max_text_value: value,
             max_text_total: total,
             ..super::OperationBudget::default()
+        }
+    }
+
+    #[test]
+    fn quoted_punctuation_utf8_and_escaped_quotes_obey_text_budgets() {
+        let formula = r#""한""@;[]""#;
+        let decoded = "한\"@;[]";
+        assert_eq!(decoded.len(), 8);
+        let exact = small_text_budget(8, formula.len() + decoded.len());
+        assert_eq!(
+            super::evaluate_formula_with_refs(formula, exact.clone(), |_| {
+                Err(FormulaUnsupportedReason::UnresolvedName)
+            }),
+            Ok(Cell::Text(decoded.into()))
+        );
+        assert_eq!(exact.text_used.get(), formula.len() + decoded.len());
+        for budget in [
+            small_text_budget(7, 128),
+            small_text_budget(8, formula.len() + decoded.len() - 1),
+        ] {
+            assert_eq!(
+                super::evaluate_formula_with_refs(formula, budget.clone(), |_| {
+                    Err(FormulaUnsupportedReason::UnresolvedName)
+                }),
+                Err(FormulaUnsupportedReason::TextLimitExceeded)
+            );
+            assert!(budget.text_used.get() <= budget.max_text_total);
         }
     }
 
@@ -2810,7 +3020,7 @@ mod tests {
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 7),
-            FormulaEvaluation::Computed(Cell::Bool(true))
+            FormulaEvaluation::Computed(Cell::Bool(false))
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 8),
@@ -2818,7 +3028,7 @@ mod tests {
         );
         assert_eq!(
             wb.evaluate_cell("Data", 1, 9),
-            FormulaEvaluation::Computed(Cell::Bool(true))
+            FormulaEvaluation::Computed(Cell::Bool(false))
         );
     }
 
@@ -2851,6 +3061,22 @@ mod tests {
             wb.evaluate_cell("Data", 1, 1),
             FormulaEvaluation::Computed(Cell::Error("#VALUE!".into()))
         );
+    }
+
+    #[test]
+    fn predicate_arity_precedes_copy_budget_and_array_classification() {
+        let args = [
+            super::Value::Range(vec![super::Value::Text("over-budget".into())]),
+            super::Value::Number(1.0),
+        ];
+        for function in ["ISNA", "ISERROR", "ISNUMBER", "ISTEXT", "ISBLANK"] {
+            let budget = small_text_budget(0, 0);
+            assert_eq!(
+                super::evaluate_function(function, &args, &budget),
+                Ok(super::Value::Error("#VALUE!".into()))
+            );
+            assert_eq!(budget.text_used.get(), 0);
+        }
     }
 
     #[test]
@@ -3421,11 +3647,14 @@ mod tests {
             "MIN(1/0)",
             "MAX(1/0)",
             "AVERAGE(1/0)",
-            "COUNT(1/0)",
             "PRODUCT(1/0)",
         ] {
             assert_div0(formula);
         }
+        assert_eq!(
+            eval("COUNT(1/0)"),
+            FormulaEvaluation::Computed(Cell::Number(0.0))
+        );
         assert_eq!(
             eval("COUNTA(1/0)"),
             FormulaEvaluation::Computed(Cell::Number(1.0)),
@@ -3987,10 +4216,11 @@ mod tests {
     fn reference_max_coordinate_xfd1048576_resolves() {
         // XFD1048576 is Excel's actual maximum cell (column 16384, row
         // 1,048,576); it must parse and resolve (to blank, since nothing is
-        // written there), not be rejected as out of range.
+        // written there), not be rejected as out of range. A blank reference
+        // used as the formula result produces numeric zero in Excel.
         assert_eq!(
             eval_ref_against((1.0, 2.0), (3.0, 4.0), "XFD1048576"),
-            FormulaEvaluation::Computed(Cell::Text(String::new()))
+            FormulaEvaluation::Computed(Cell::Number(0.0))
         );
     }
 
