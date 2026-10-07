@@ -1307,6 +1307,8 @@ class RenderParityBaselineTests(unittest.TestCase):
 
         self.assertEqual(create.returncode, 0, create.stderr)
         self.assertEqual(verify.returncode, 0, verify.stderr)
+        self.assertEqual(create.stderr, "")
+        self.assertEqual(verify.stderr, "")
         self.assertTrue(report["passed"])
         self.assertEqual(
             report["source_evidence"],
@@ -1316,6 +1318,148 @@ class RenderParityBaselineTests(unittest.TestCase):
             },
         )
         self.assertNotIn("private", baseline_text)
+
+    def test_cli_failed_report_logs_identity_code_without_changing_gate(self) -> None:
+        source = evidence()
+        baseline = MODULE.derive_baseline(source)
+        source["configuration"]["renderer_binary"]["sha256"] = "9" * 64
+        candidate = MODULE.derive_baseline(source)
+        expected = MODULE.compare(baseline, candidate)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            evidence_path = root / "private-evidence.json"
+            baseline_path = root / "private-baseline.json"
+            report_path = root / "private-report.json"
+            evidence_payload = MODULE.canonical_bytes(source)
+            evidence_path.write_bytes(evidence_payload)
+            baseline_path.write_bytes(MODULE.canonical_bytes(baseline))
+            expected["source_evidence"] = {
+                "bytes": len(evidence_payload),
+                "sha256": hashlib.sha256(evidence_payload).hexdigest(),
+            }
+            for with_report in (True, False):
+                with self.subTest(with_report=with_report):
+                    command = [
+                        sys.executable, str(SCRIPT), "--evidence",
+                        str(evidence_path), "--baseline", str(baseline_path),
+                    ]
+                    if with_report:
+                        command.extend(["--report", str(report_path)])
+                    result = subprocess.run(
+                        command, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    payload = (
+                        report_path.read_bytes() if with_report
+                        else result.stdout.encode("utf-8")
+                    )
+                    self.assertEqual(payload, MODULE.canonical_bytes(expected))
+                    self.assertEqual(result.stdout, "" if with_report else payload.decode())
+                    prefix = "check-render-parity-baseline: "
+                    self.assertTrue(result.stderr.startswith(prefix), result.stderr)
+                    diagnostics = json.loads(result.stderr.removeprefix(prefix))
+                    self.assertEqual(diagnostics["failure_count"], 1)
+                    self.assertEqual(diagnostics["schema"], MODULE.DIAGNOSTIC_SCHEMA)
+                    self.assertEqual(diagnostics["codes"], [{
+                        "code": "identity_mismatch:configuration_sha256", "count": 1,
+                    }])
+                    self.assertEqual(diagnostics["omitted_failure_count"], 0)
+                    self.assertNotIn("private", result.stderr)
+                    self.assertNotIn(str(root), result.stderr)
+                    self.assertNotIn("9" * 64, result.stderr)
+
+    def test_failure_diagnostics_keep_public_categories_and_redact_names(self) -> None:
+        baseline = MODULE.derive_baseline(evidence())
+        candidate = copy.deepcopy(baseline)
+        secret = "github_" + "pat_" + "z" * 20
+        candidate["warning_counts"][secret] = 1
+        candidate["classifications"][secret] = 1
+        candidate["cohorts"]["all"]["scores"][secret] = score(1)
+        candidate["cohorts"]["by_feature"]["private-project"] = cohort()
+        candidate["cohorts"]["all"]["scores"]["text_ink_f1_ppm"] = score(799_999)
+        candidate["cohorts"]["all"]["deltas"]["max_page_width_delta_pixels"] = delta(4)
+        report = MODULE.compare(baseline, candidate)
+        failures = copy.deepcopy(report["failures"])
+        diagnostics = MODULE._failure_diagnostics(failures)
+        codes = {row["code"]: row["count"] for row in diagnostics["codes"]}
+        self.assertFalse(report["passed"])
+        self.assertIn(secret, "\n".join(report["failures"]))
+        self.assertEqual(report["failures"], failures)
+        self.assertEqual(codes["warning:new"], 1)
+        self.assertEqual(codes["warning:unclassified"], 1)
+        self.assertEqual(codes["classification:new"], 1)
+        self.assertEqual(codes["all:new_score:unreviewed_metric"], 1)
+        self.assertEqual(codes["by_feature:new:unreviewed"], 1)
+        self.assertEqual(codes["all:score_regression:text_ink_f1_ppm:mean"], 1)
+        self.assertEqual(codes["all:delta_regression:max_page_width_delta_pixels:max"], 1)
+        self.assertEqual(diagnostics["failure_count"], len(failures))
+        self.assertEqual(diagnostics["omitted_failure_count"], 0)
+        self.assertNotIn(secret, json.dumps(diagnostics))
+        self.assertNotIn("private", json.dumps(diagnostics))
+
+    def test_failure_diagnostic_grammar_rejects_malformed_or_private_values(self) -> None:
+        rejected = (
+            None, True, 1, float("nan"), {"private": "text"}, ["private"],
+            "identity_mismatch:private", "identity_mismatch:configuration_sha256:extra",
+            "coverage:1->-2", "coverage:1->1000001", "coverage:True->1",
+            "status:new:private:1", "status:unclassified:compared:1",
+            "warning:new:/" + "home/" + "private/file:1", "warning:new:private:NaN",
+            "warning:new:private:1\nprivate", "warning:new:private:1\x1b[31m",
+            "warning:new:private:1:extra", "warning:new:\u79d8\u5bc6:1",
+            "classification:new:private:1.0", "by_feature:new:../private",
+            "by_format:xlsx:workbooks:1->1000001",
+            "all:score_regression:text_ink_f1_ppm:p50:1->2",
+            "all:score_regression:text_ink_f1_ppm:p10:1->1000001",
+            "all:delta_regression:max_page_width_delta_pixels:max:1->9223372036854775808",
+            "all:missing_score:private:extra", "unknown:private", "x" * 100_000,
+        )
+        for failure in rejected:
+            with self.subTest(failure_type=type(failure).__name__):
+                self.assertEqual(MODULE._failure_diagnostic_code(failure), "unreviewed_failure")
+        self.assertEqual(MODULE._failure_diagnostics(list(rejected))["codes"], [{
+            "code": "unreviewed_failure", "count": len(rejected),
+        }])
+        accepted = {
+            "coverage:2->1": "coverage",
+            "status:increased:error:0->1": "status:increased:error",
+            "warning:increased:private_token:1->2": "warning:increased",
+            "by_feature:unicode-text:coverage:2->1": "by_feature:unicode-text:coverage",
+            "by_format:unknown:new_delta:private_metric": "by_format:unreviewed:new_delta:unreviewed_metric",
+            "by_format:missing:xlsx": "by_format:missing:xlsx",
+            "all:delta_count:max_page_width_delta_pixels:1->2": "all:delta_count:max_page_width_delta_pixels",
+        }
+        for failure, expected in accepted.items():
+            with self.subTest(failure=failure):
+                self.assertEqual(MODULE._failure_diagnostic_code(failure), expected)
+
+    def test_failure_diagnostics_bound_codes_bytes_and_prioritize_identity(self) -> None:
+        failures = [
+            f"by_feature:{feature}:score_regression:{metric}:p10:2->1"
+            for feature in sorted(MODULE.HOSTED_FULL_FEATURE_COUNTS)
+            for metric in sorted(MODULE.EXPECTED_SCORE_METRICS)
+        ] * 2
+        failures.extend(["identity_mismatch:configuration_sha256"] * 3)
+        before = failures.copy()
+        diagnostics = MODULE._failure_diagnostics(failures)
+        self.assertEqual(failures, before)
+        self.assertEqual(diagnostics, MODULE._failure_diagnostics(list(reversed(failures))))
+        self.assertEqual(len(diagnostics["codes"]), MODULE.MAX_DIAGNOSTIC_CODES)
+        self.assertEqual(diagnostics["codes"][0], {
+            "code": "identity_mismatch:configuration_sha256", "count": 3,
+        })
+        self.assertGreater(diagnostics["omitted_failure_count"], 0)
+        self.assertEqual(
+            sum(row["count"] for row in diagnostics["codes"])
+            + diagnostics["omitted_failure_count"], len(failures),
+        )
+        with mock.patch.object(MODULE, "MAX_DIAGNOSTIC_BYTES", 512):
+            limited = MODULE._failure_diagnostics(failures)
+        self.assertLessEqual(len(("check-render-parity-baseline: " + json.dumps(
+            limited, sort_keys=True, separators=(",", ":"),
+        ) + "\n").encode("utf-8")), 512)
+        self.assertEqual(limited["codes"][0]["code"], "identity_mismatch:configuration_sha256")
+        self.assertEqual(sum(row["count"] for row in limited["codes"])
+                         + limited["omitted_failure_count"], len(failures))
 
     def test_distribution_domains_order_counts_and_bools_fail_closed(self) -> None:
         baseline = MODULE.derive_baseline(evidence())
