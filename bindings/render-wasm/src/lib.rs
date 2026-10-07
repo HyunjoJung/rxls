@@ -2617,11 +2617,7 @@ fn viewport_geometry_id(text: &str) -> Result<(), FacadeError> {
             return Err(invalid());
         }
     }
-    if uuid.get(14) != Some(&b'4')
-        || !uuid
-            .get(19)
-            .is_some_and(|b| [b'8', b'9', b'a', b'b'].contains(b))
-    {
+    if uuid.get(14) != Some(&b'4') || !uuid.get(19).is_some_and(|b| b"89ab".contains(b)) {
         return Err(invalid());
     }
     let counter = text.get(40..).ok_or_else(invalid)?;

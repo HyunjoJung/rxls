@@ -991,12 +991,7 @@ fn reserve_workspace<T>(
         return Ok(());
     }
     let max = usize::try_from(max_items).unwrap_or(usize::MAX);
-    let target = values
-        .capacity()
-        .checked_mul(2)
-        .unwrap_or(usize::MAX)
-        .max(8)
-        .min(max);
+    let target = values.capacity().saturating_mul(2).max(8).min(max);
     let additional = target
         .checked_sub(values.capacity())
         .ok_or(RenderError::CoordinateOverflow)?;
@@ -1209,12 +1204,7 @@ impl AxisBuilder {
             .ok_or(RenderError::CoordinateOverflow)?;
         viewport_limit("axis_runs", budget.limits.max_axis_runs, new_runs)?;
         if self.runs.len() == self.runs.capacity() {
-            let capacity = self
-                .runs
-                .capacity()
-                .checked_mul(2)
-                .unwrap_or(usize::MAX)
-                .max(8);
+            let capacity = self.runs.capacity().saturating_mul(2).max(8);
             let max_runs = usize::try_from(budget.limits.max_axis_runs).unwrap_or(usize::MAX);
             let target = capacity.min(max_runs);
             let additional = target
