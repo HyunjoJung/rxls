@@ -168,13 +168,14 @@ class RenderOracleHostToolsTests(unittest.TestCase):
     def test_installed_companion_specs_derive_exact_versions_from_locked_libraries(self) -> None:
         lock, _ = MODULE.load_lock()
         installed = {
-            "bzip2", "libc6-i386", "libssl-dev", "p11-kit",
+            "bzip2", "libc6-i386", "libexpat1-dev", "libssl-dev", "p11-kit",
             "p11-kit-modules", "zlib1g-dev",
         }
         with mock.patch.object(MODULE, "installed_apt_companions", return_value=installed):
             self.assertEqual(MODULE.companion_apt_specs(lock), [
                 "bzip2:amd64=1.0.8-5.1build0.1",
                 "libc6-i386:amd64=2.39-0ubuntu8.8",
+                "libexpat1-dev:amd64=2.6.1-2ubuntu0.4",
                 "libssl-dev:amd64=3.0.13-0ubuntu3.12",
                 "p11-kit-modules:amd64=0.25.3-4ubuntu2.1",
                 "p11-kit:amd64=0.25.3-4ubuntu2.1",
@@ -234,6 +235,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         original, _ = MODULE.load_lock()
         self.assertEqual(MODULE.APT_COMPANION_SOURCES, {
             "bzip2": "libbz2-1.0", "libc6-i386": "libc6",
+            "libexpat1-dev": "libexpat1",
             "libssl-dev": "libssl3t64", "p11-kit": "libp11-kit0",
             "p11-kit-modules": "libp11-kit0", "zlib1g-dev": "zlib1g",
         })
@@ -272,13 +274,19 @@ class RenderOracleHostToolsTests(unittest.TestCase):
 
     def test_companion_versions_are_derived_not_hardcoded(self) -> None:
         lock, _ = MODULE.load_lock()
+        versions = {"zlib1g": "2:1.3.fixture-1", "libexpat1": "2.6.1-fixture.9"}
         for section in ("poppler", "cairo", "python"):
             for row in lock["expected_identity"][section]["native_libraries"]:
-                name = row.get("package_name", row.get("provider", ""))
-                if name.split(":", 1)[0] == "zlib1g":
-                    row["provider_version" if section == "python" else "package_version"] = "2:1.3.fixture-1"
-        with mock.patch.object(MODULE, "installed_apt_companions", return_value={"zlib1g-dev"}):
-            self.assertEqual(MODULE.companion_apt_specs(lock), ["zlib1g-dev:amd64=2:1.3.fixture-1"])
+                name = row.get("package_name", row.get("provider", "")).split(":", 1)[0]
+                if name in versions:
+                    row["provider_version" if section == "python" else "package_version"] = versions[name]
+        with mock.patch.object(
+            MODULE, "installed_apt_companions", return_value={"zlib1g-dev", "libexpat1-dev"}
+        ):
+            self.assertEqual(MODULE.companion_apt_specs(lock), [
+                "libexpat1-dev:amd64=2.6.1-fixture.9",
+                "zlib1g-dev:amd64=2:1.3.fixture-1",
+            ])
 
     def test_companions_are_only_queried_for_pinned_opt_in_and_only_installed_are_added(self) -> None:
         lock, _ = MODULE.load_lock()
@@ -305,6 +313,51 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                     self.assertIn("bzip2:amd64=1.0.8-5.1build0.1", specs)
                     for absent in set(MODULE.APT_COMPANION_SOURCES) - {"bzip2"}:
                         self.assertFalse(any(spec.startswith(f"{absent}:amd64=") for spec in specs))
+
+    def test_observed_expat_python_development_chain_preserves_only_runtime_companion(self) -> None:
+        # Hosted pdf job 111745142542 planned these five removals. Only expat-dev
+        # has an exact-version coupling to our locked runtime; Python versions
+        # remain the runner's installed versions and must not become apt args.
+        lock, _ = MODULE.load_lock()
+        before = MODULE.canonical_json_bytes(lock)
+        python_dev = {"libpython3-dev", "libpython3.12-dev", "python3-dev", "python3.12-dev"}
+        installed = "".join(
+            f"{name}\tamd64\tinstalled\n"
+            for name in sorted(python_dev | {"libexpat1-dev"})
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                mock.patch.object(MODULE, "verify_apt_restoration", side_effect=lambda path, _: path),
+                mock.patch.object(MODULE, "run_text", return_value=installed) as query,
+            ):
+                for scope in ("poppler", "all"):
+                    with self.subTest(scope=scope):
+                        query.reset_mock()
+                        specs = MODULE.apt_specs(lock, scope, restoration_dir=Path(raw).resolve())
+                        self.assertEqual(query.call_count, 1)
+                        self.assertEqual(specs, sorted(set(specs)))
+                        self.assertIn("libexpat1:amd64=2.6.1-2ubuntu0.4", specs)
+                        self.assertIn("libexpat1-dev:amd64=2.6.1-2ubuntu0.4", specs)
+                        self.assertEqual(sum(s.startswith("libexpat1-dev:amd64=") for s in specs), 1)
+                        for name in python_dev:
+                            self.assertFalse(any(s.startswith(f"{name}:amd64=") for s in specs))
+        self.assertEqual(MODULE.canonical_json_bytes(lock), before)
+
+    def test_expat_companion_absence_and_invalid_installed_state_fail_closed(self) -> None:
+        lock, _ = MODULE.load_lock()
+        for status in ("not-installed", "config-files"):
+            with self.subTest(status=status):
+                with mock.patch.object(MODULE, "run_text", return_value=f"libexpat1-dev\tamd64\t{status}\n"):
+                    self.assertEqual(MODULE.companion_apt_specs(lock), [])
+        for output, error in (
+            ("libexpat1-dev\ti386\tinstalled\n", "apt_companion_architecture"),
+            ("libexpat1-dev\tamd64\thalf-installed\n", "apt_companion_status"),
+            ("libexpat1-dev\tamd64\tinstalled\n" * 2, "apt_companion_query"),
+        ):
+            with self.subTest(output=output):
+                with mock.patch.object(MODULE, "run_text", return_value=output):
+                    with self.assertRaisesRegex(MODULE.HostToolError, error):
+                        MODULE.companion_apt_specs(lock)
 
     def test_restoration_records_are_the_four_authenticated_exact_archives(self) -> None:
         records = MODULE.APT_RESTORATIONS
