@@ -373,7 +373,7 @@ jobs:
 
       - name: Upload release diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-${{ steps.release.outputs.version }}-diagnostics-${{ github.run_attempt }}
           path: |
@@ -495,7 +495,7 @@ jobs:
             --git-rev "$GITHUB_SHA"
 
       - name: Upload release evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-${{ steps.release.outputs.version }}-release-${{ github.run_attempt }}
           path: dist/*
@@ -607,7 +607,7 @@ jobs:
 
       - name: Upload reproducibility comparison
         if: always() && github.event_name == 'workflow_dispatch' && inputs.baseline_run_id != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-${{ steps.release.outputs.version }}-reproducibility-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -893,7 +893,7 @@ jobs:
       - name: Upload verified publication bundle
         id: publication_bundle
         if: github.event_name == 'push' || steps.release.outputs.rehearse == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-${{ steps.release.outputs.version }}-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*
@@ -957,7 +957,7 @@ jobs:
       - name: Rehearse publication handoff and package bytes
         run: python3 scripts/core_release_handoff.py verify
       - name: Upload successful rehearsal receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: core-handoff-rehearsal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/publication/handoff.json
@@ -1118,7 +1118,7 @@ jobs:
 
       - name: Upload published crates.io distribution evidence
         if: always() && github.event_name == 'push'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-${{ steps.release.outputs.version }}-crates-io-smoke-${{ github.run_attempt }}
           path: target/release-crates-io-distribution-smoke.json
