@@ -217,7 +217,7 @@ jobs:
           python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'
           python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"
       - name: Upload independently verified MCP package evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-package-candidate-${{ github.run_attempt }}
           path: bindings/mcp/target/package-candidate/*
@@ -345,7 +345,7 @@ jobs:
             --write-report target/wasm-package/wasm-size-report.json
           sha256sum "target/wasm-dist/$archive" > "target/wasm-dist/$archive.sha256"
       - name: Upload WASM release candidates
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-wasm-${{ github.run_attempt }}
           path: |
@@ -405,7 +405,7 @@ jobs:
           python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.99 --show-skips 20 | tee target/ci-ods-parity.txt
       - name: Upload parity diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: public-parity-diagnostics-${{ github.run_attempt }}
           path: target/ci-*.txt
