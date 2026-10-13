@@ -60,7 +60,7 @@ const MAX_ROUTE_LOG_BYTES = 64 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_CDP_EVENTS = 4_096;
 const MAX_CDP_HTTP_RESPONSE_BYTES = 256 * 1024;
-const EXPECTED_ROUTE_REQUESTS = 19;
+const EXPECTED_ROUTE_REQUESTS = 22;
 
 const packageRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const installedPackageRoot = process.env.RXLS_RENDER_INSTALLED_PACKAGE_ROOT
@@ -128,6 +128,7 @@ const allowedRoutePaths = new Set(
         "/tests/browser/scenario.mjs",
         "/js/client.mjs",
         "/js/protocol.mjs",
+        "/js/response-contracts.mjs",
         "/js/worker-runtime.mjs",
         "/js/worker.mjs",
         "/pkg/rxls_render_wasm.js",
@@ -143,6 +144,7 @@ const allowedRoutePaths = new Set(
         "/tests/browser/scenario.mjs",
         "/installed-package/js/client.mjs",
         "/installed-package/js/protocol.mjs",
+        "/installed-package/js/response-contracts.mjs",
         "/installed-package/js/worker-runtime.mjs",
         "/installed-package/js/worker.mjs",
         "/installed-package/pkg/rxls_render_wasm.js",

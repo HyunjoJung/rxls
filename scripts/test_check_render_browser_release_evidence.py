@@ -379,6 +379,45 @@ class BrowserEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.BrowserEvidenceError, "source_log_failure"):
             self._summary()
 
+    def test_network_counts_include_shared_contracts_in_all_three_contexts(self) -> None:
+        for mode, log in (("source", self.source), ("installed", self.installed)):
+            log.write_text(
+                self._pass_line(
+                    mode,
+                    baseline=2_000_000,
+                    peak=62_000_000,
+                    retained=8_000_000,
+                    network_requests=22,
+                ) + "\n",
+                encoding="utf-8",
+            )
+        summary = self._summary()
+        for mode in ("source", "installed"):
+            self.assertEqual(
+                summary["modes"][mode]["network_proof"]["request_count"], 22
+            )
+
+    def test_stale_or_incomplete_contract_route_counts_are_rejected(self) -> None:
+        for mode, log in (("source", self.source), ("installed", self.installed)):
+            original = log.read_text(encoding="utf-8")
+            for count in (19, 20, 21, 23):
+                with self.subTest(mode=mode, count=count):
+                    log.write_text(
+                        self._pass_line(
+                            mode,
+                            baseline=2_000_000,
+                            peak=62_000_000,
+                            retained=8_000_000,
+                            network_requests=count,
+                        ) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        MODULE.BrowserEvidenceError, f"{mode}_network_proof"
+                    ):
+                        self._summary()
+            log.write_text(original, encoding="utf-8")
+
     def test_source_and_installed_behavior_must_match_exactly(self) -> None:
         behavior = self._behavior_proof()
         behavior["capabilitiesSha256"] = "b" * 64
