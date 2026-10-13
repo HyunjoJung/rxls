@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: d4cbe98a7fac26d9f6467d019321ef654289cb10fb60fb455b6cb75ebc60edb1
+- Cargo lock SHA-256: 83206d813c387692576c2e187e2bf99154eeabbd50a314f9dfddf8991ca64ec0
 - Third-party packages: 44
 - Unique legal texts: 39
 
@@ -315,19 +315,19 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: thiserror 2.0.20
+PACKAGE: thiserror 2.0.21
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f
+Registry archive SHA-256: 09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: thiserror-impl 2.0.20
+PACKAGE: thiserror-impl 2.0.21
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af
+Registry archive SHA-256: fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
@@ -968,8 +968,8 @@ Referenced by:
 - serde_derive 1.0.229/LICENSE-MIT
 - syn 2.0.118/LICENSE-MIT
 - syn 3.0.3/LICENSE-MIT
-- thiserror 2.0.20/LICENSE-MIT
-- thiserror-impl 2.0.20/LICENSE-MIT
+- thiserror 2.0.21/LICENSE-MIT
+- thiserror-impl 2.0.21/LICENSE-MIT
 - unicode-ident 1.0.24/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Permission is hereby granted, free of charge, to any
@@ -1646,8 +1646,8 @@ Referenced by:
 - serde_derive 1.0.229/LICENSE-APACHE
 - syn 2.0.118/LICENSE-APACHE
 - syn 3.0.3/LICENSE-APACHE
-- thiserror 2.0.20/LICENSE-APACHE
-- thiserror-impl 2.0.20/LICENSE-APACHE
+- thiserror 2.0.21/LICENSE-APACHE
+- thiserror-impl 2.0.21/LICENSE-APACHE
 - unicode-ident 1.0.24/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
                               Apache License
