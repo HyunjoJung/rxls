@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Prepared render worker 0.4.0 with protocol v3. Calculation observations are
+  owned by the Rust session and its undo/redo snapshots, including unknown,
+  observed and stale states. The viewer displays that returned state instead
+  of maintaining another warning-history stack. Mixed v2/v3 components reject
+  explicitly; this development change does not establish registry availability.
+
 ### Fixed
 
 - Preserved punctuation and doubled quotes inside formula text literals (#135),

@@ -5,6 +5,10 @@ It keeps parsing, pagination, shaping, SVG serialization, and PNG rasterization
 inside a dedicated module worker and exposes one sheet, tile, or print page at a
 time.
 
+This checkout prepares worker 0.4.0; it is not a registry availability claim.
+The published worker 0.3.0 uses protocol v2. Keep each client's Worker and WASM
+from the same package; the development v3 contract rejects mixed versions.
+
 The worker protocol is `rxls.render-worker.v3`. An `open` request creates one
 `RenderSession`, so later virtual tile/page requests reuse the parsed workbook
 and a verified in-memory font pack. Input, font members, embedded images,
