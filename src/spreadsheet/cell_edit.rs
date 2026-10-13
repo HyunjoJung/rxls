@@ -76,7 +76,13 @@ impl Spreadsheet {
             let package = candidate.package.as_mut().ok_or(Error::MissingWorkbook)?;
             let before = package.touched_parts();
             let tree = package.part_tree_mut(&path)?;
+            let dimension = if values.iter().flatten().any(Option::is_some) {
+                sml_dimension_to_omit(tree)?
+            } else {
+                None
+            };
             sml_edit_cell_range(tree, start_row, start_col, values)?;
+            sml_omit_dimension(tree, dimension)?;
             for part in newly_touched(&before, package) {
                 remember_edited_part(&mut candidate.edited_parts, part);
             }
@@ -218,7 +224,9 @@ impl Spreadsheet {
         })?;
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = sml_dimension_to_omit(tree)?;
         sml_edit_cell(tree, row, col, value)?;
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -343,9 +351,15 @@ impl Spreadsheet {
         }
         let before = package.touched_parts();
         let tree = package.part_tree_mut(&path)?;
+        let dimension = if values.is_empty() {
+            None
+        } else {
+            sml_dimension_to_omit(tree)?
+        };
         for (col, value) in values.iter().enumerate() {
             sml_edit_cell(tree, row, col as u16, value)?;
         }
+        sml_omit_dimension(tree, dimension)?;
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
         }
@@ -417,11 +431,83 @@ impl Spreadsheet {
     }
 }
 
+/// Plan omission once per value-writing operation, rather than per cell.
+/// ECMA-376 18.3.1.35: the optional dimension includes styled/blank cells too,
+/// so rebuilding it from parsed values could understate the used range.
+/// https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.sheetdimension
+fn sml_dimension_to_omit(tree: &XmlTree) -> Result<Option<(NodeId, NodeId)>> {
+    const MAIN: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const STRICT: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    // Borrow only root namespace declarations. Lookup remains bounded even
+    // when many foreign dimension aliases share a root with many attributes.
+    let mut namespaces = BTreeMap::<&[u8], &[u8]>::new();
+    if let Some(attrs) = tree.attributes(root) {
+        for (name, value) in attrs {
+            let prefix = if name == b"xmlns" {
+                b"".as_slice()
+            } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            namespaces.entry(prefix).or_insert(value);
+        }
+    }
+    // Preserve the editor's existing bare-worksheet compatibility. An empty
+    // namespace reset beneath a namespaced worksheet is foreign content.
+    let bare_root = tree.element_name(root) == Some(b"worksheet")
+        && namespaces
+            .get(b"".as_slice())
+            .is_none_or(|uri| uri.is_empty());
+    let mut dimension = None;
+    for &child in tree.children_of(root) {
+        let Some(name) = tree.element_name(child) else {
+            continue;
+        };
+        let (prefix, local) = match name.iter().position(|&byte| byte == b':') {
+            Some(colon) => (&name[..colon], &name[colon + 1..]),
+            None => (b"".as_slice(), name),
+        };
+        if local != b"dimension" {
+            continue;
+        }
+        let namespace = tree
+            .attributes(child)
+            .and_then(|attrs| {
+                attrs.iter().find_map(|(key, value)| {
+                    let declares_prefix = if prefix.is_empty() {
+                        key == b"xmlns"
+                    } else {
+                        key.strip_prefix(b"xmlns:") == Some(prefix)
+                    };
+                    declares_prefix.then_some(value.as_slice())
+                })
+            })
+            .or_else(|| namespaces.get(prefix).copied());
+        let recognized = matches!(namespace, Some(MAIN | STRICT))
+            || (prefix.is_empty() && bare_root && namespace.is_none_or(|uri| uri.is_empty()));
+        if recognized {
+            if dimension.is_some() {
+                return Err(Error::Zip("worksheet contains duplicate dimensions"));
+            }
+            dimension = Some((root, child));
+        }
+    }
+    Ok(dimension)
+}
+
+fn sml_omit_dimension(tree: &mut XmlTree, dimension: Option<(NodeId, NodeId)>) -> Result<()> {
+    if let Some((root, child)) = dimension {
+        tree.remove_child(root, child)?;
+    }
+    Ok(())
+}
+
 fn validate_formula_cached_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "formula cached text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => validate_xml_value(
             error,
             "formula cached error contains invalid XML characters",
@@ -847,9 +933,7 @@ fn range_node_plan(
 
 fn validate_edit_cell_value(value: &Cell) -> Result<()> {
     match value {
-        Cell::Text(text) => {
-            validate_edit_cell_text(text, "cell text contains invalid XML characters")
-        }
+        Cell::Text(text) => validate_edit_cell_text(text),
         Cell::Error(error) => {
             validate_xml_value(error, "cell error contains invalid XML characters")
         }
@@ -1022,7 +1106,10 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         // SST index preservation becomes necessary.
         Cell::Text(t) => (
             CellTypeAttr::Set(b"inlineStr"),
-            format!(r#"<is><t xml:space="preserve">{}</t></is>"#, esc_text(t)),
+            format!(
+                r#"<is><t xml:space="preserve">{}</t></is>"#,
+                crate::xstring::escape_xml(t)
+            ),
         ),
         Cell::Number(n) | Cell::Date(n) => {
             (CellTypeAttr::Remove, format!("<v>{}</v>", num_str(*n)))
@@ -1034,7 +1121,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
         Cell::Error(e) => (CellTypeAttr::Set(b"e"), format!("<v>{}</v>", esc_text(e))),
         Cell::Formula { formula, cached } => {
             let (t_attr, v): (Option<&'static [u8]>, String) = match cached.as_ref() {
-                Cell::Text(t) => (Some(b"str"), esc_text(t)),
+                Cell::Text(t) => (Some(b"str"), crate::xstring::escape_xml(t)),
                 Cell::Bool(b) => (Some(b"b"), if *b { "1" } else { "0" }.to_string()),
                 Cell::Error(e) => (Some(b"e"), esc_text(e)),
                 Cell::Number(n) | Cell::Date(n) => (None, num_str(*n)),
@@ -1044,7 +1131,15 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
                 Some(t) => CellTypeAttr::Set(t),
                 None => CellTypeAttr::Remove,
             };
-            (type_attr, format!("<f>{}</f><v>{v}</v>", esc_text(formula)))
+            let v_space = if matches!(cached.as_ref(), Cell::Text(_)) {
+                r#" xml:space="preserve""#
+            } else {
+                ""
+            };
+            (
+                type_attr,
+                format!("<f>{}</f><v{v_space}>{v}</v>", esc_text(formula)),
+            )
         }
     };
 
@@ -1053,7 +1148,7 @@ pub(super) fn sml_set_cell_value(tree: &mut XmlTree, cell: NodeId, value: &Cell)
 
 fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) -> Result<()> {
     let (type_attr, encoded) = match value {
-        Cell::Text(text) => (CellTypeAttr::Set(b"str"), esc_text(text)),
+        Cell::Text(text) => (CellTypeAttr::Set(b"str"), crate::xstring::escape_xml(text)),
         Cell::Number(number) | Cell::Date(number) => (CellTypeAttr::Remove, num_str(*number)),
         Cell::Bool(value) => (
             CellTypeAttr::Set(b"b"),
@@ -1064,7 +1159,18 @@ fn sml_set_formula_cached_value(tree: &mut XmlTree, cell: NodeId, value: &Cell) 
             return Err(Error::Zip("formula cache must be a scalar cell value"))
         }
     };
-    sml_replace_cell_value(tree, cell, type_attr, &format!("<v>{encoded}</v>"), false)
+    let v_space = if matches!(value, Cell::Text(_)) {
+        r#" xml:space="preserve""#
+    } else {
+        ""
+    };
+    sml_replace_cell_value(
+        tree,
+        cell,
+        type_attr,
+        &format!("<v{v_space}>{encoded}</v>"),
+        false,
+    )
 }
 
 fn sml_replace_cell_value(
