@@ -616,10 +616,13 @@ fn push_double_edge(
     // Calc centers a shared double rule on the geometric boundary. Symmetric
     // placement makes equivalent A.right/B.left (and top/bottom) authorship
     // identical, including after RTL reflection.
-    for offset in [Fixed::from_pixels(-1), Fixed::from_pixels(1)] {
+    for offset in [
+        Fixed::from_raw(-DOUBLE_RULE_OFFSET.raw()),
+        DOUBLE_RULE_OFFSET,
+    ] {
         push_node(
             nodes,
-            SceneNode::Line(edge_line(key, offset, claim.color, Fixed::from_pixels(1))?),
+            SceneNode::Line(edge_line(key, offset, claim.color, DOUBLE_RULE_WIDTH)?),
             options,
         )?;
     }
@@ -661,6 +664,18 @@ fn border_width(style: BorderStyle) -> Option<Fixed> {
         BorderStyle::None => None,
         BorderStyle::Thin => Some(Fixed::from_pixels(1)),
         BorderStyle::Medium => Some(Fixed::from_pixels(2)),
-        BorderStyle::Thick | BorderStyle::Double => Some(Fixed::from_pixels(3)),
+        BorderStyle::Thick | BorderStyle::Double => Some(MAX_BORDER_WIDTH),
     }
+}
+
+// Keep the viewport paint envelope coupled to actual emitted border geometry.
+const MAX_BORDER_WIDTH: Fixed = Fixed::from_pixels(3);
+const DOUBLE_RULE_OFFSET: Fixed = Fixed::from_pixels(1);
+const DOUBLE_RULE_WIDTH: Fixed = Fixed::from_pixels(1);
+
+pub(super) fn viewport_border_paint_outset() -> Fixed {
+    let thick = MAX_BORDER_WIDTH.raw() / 2;
+    let double = DOUBLE_RULE_OFFSET.raw() + DOUBLE_RULE_WIDTH.raw() / 2;
+    // One raw unit includes a boundary endpoint despite half-open axis lookup.
+    Fixed::from_raw(thick.max(double) + 1)
 }

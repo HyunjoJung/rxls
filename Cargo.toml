@@ -21,6 +21,7 @@ exclude = [
     "extensions/",
     "fuzz/",
     "oss-fuzz/",
+    "packages/",
     "render/",
     "scripts/check_cargo_publish_dry_run.py",
     "scripts/check_npm_registry_evidence.py",
@@ -56,6 +57,7 @@ exclude = [
     "scripts/run-render-oracle-container.py",
     "scripts/smoke-render-oracle-runtime.py",
     "scripts/summarize-render-oracle-failure.py",
+    "scripts/test_*.py",
     "scripts/test_check_render_parity_baseline.py",
     "scripts/test_check_authored_print_parity.py",
     "scripts/test_check_ooxml_row_oracle.py",
@@ -161,3 +163,7 @@ required-features = ["xlsx"]
 [[example]]
 name = "edit_save_benchmark"
 required-features = ["xlsx"]
+
+[[example]]
+name = "typed_rows"
+required-features = ["serde", "xlsx"]

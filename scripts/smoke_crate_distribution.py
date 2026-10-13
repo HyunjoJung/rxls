@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -142,6 +143,8 @@ def _write_consumer(consumer: Path, dependency: str) -> None:
 name = "rxls-distribution-smoke"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.85"
+resolver = "3"
 publish = false
 
 [dependencies]
@@ -206,6 +209,32 @@ def _installed_binary(install_root: Path) -> Path:
     raise SmokeError("cargo install did not produce an rxls executable")
 
 
+def _consumer_resolution(consumer: Path) -> dict[str, object]:
+    identities: dict[str, object] = {}
+    parsed = {}
+    for name in ("Cargo.toml", "Cargo.lock"):
+        path = consumer / name
+        if not path.is_file() or path.stat().st_size > 1024 * 1024:
+            raise SmokeError(f"consumer resolution file is absent or exceeds 1 MiB: {name}")
+        with path.open("rb") as stream:
+            data = stream.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            raise SmokeError(f"consumer resolution file exceeds 1 MiB: {name}")
+        text = data.decode("utf-8")
+        parsed[name] = tomllib.loads(text)
+        identities[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    package = parsed["Cargo.toml"]["package"]
+    packages = parsed["Cargo.lock"].get("package", [])
+    if not packages or len(packages) > 4096:
+        raise SmokeError("consumer resolution must contain bounded nonempty packages")
+    return {
+        "rust_version": package["rust-version"],
+        "resolver": package["resolver"],
+        "files": identities,
+        "packages": [{"name": item["name"], "version": item["version"], "source": item.get("source"), "checksum": item.get("checksum")} for item in packages],
+    }
+
+
 def smoke(args: argparse.Namespace) -> dict[str, object]:
     fixture = args.fixture.resolve()
     if not fixture.is_file():
@@ -265,6 +294,12 @@ def smoke(args: argparse.Namespace) -> dict[str, object]:
             cwd=work,
             env=env,
         )
+        resolution = _consumer_resolution(consumer)
+        if args.write_report is not None:
+            args.write_report.parent.mkdir(parents=True, exist_ok=True)
+            args.write_report.with_suffix(".consumer-resolution.json").write_text(
+                json.dumps(resolution, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
         consumer_result = _run(
             [
                 args.cargo,
@@ -320,6 +355,7 @@ def smoke(args: argparse.Namespace) -> dict[str, object]:
         "version": version,
         "external_consumer": "passed",
         "cargo_install": "passed",
+        "consumer_resolution": resolution,
         "cli": {
             "version": "passed",
             "help_stdout": "passed",

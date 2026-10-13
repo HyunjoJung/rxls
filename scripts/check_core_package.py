@@ -45,6 +45,7 @@ FORBIDDEN_TOP_LEVEL = {
     "fuzz",
     "local",
     "oss-fuzz",
+    "packages",
     "render",
     "target",
 }
@@ -211,6 +212,16 @@ def validate(
                             continue
                         if relative[0] in FORBIDDEN_TOP_LEVEL:
                             errors.append(f"forbidden package subtree: {relative[0]}")
+                        if (
+                            len(relative) == 2
+                            and relative[0] == "scripts"
+                            and relative[1].startswith("test_")
+                            and relative[1].endswith(".py")
+                        ):
+                            errors.append(
+                                "Python tooling-test/support script entered the core package: "
+                                f"{relative[1]}"
+                            )
                         if (
                             len(relative) == 2
                             and relative[0] == "scripts"

@@ -208,6 +208,7 @@ export function createGridEditor({
         state.client &&
         state.workbook &&
         state.mode === "sheet" &&
+        state.displayKind !== "tiled" &&
         state.editState?.capability === "read-write" &&
         svg &&
         sameContext(context),
@@ -306,6 +307,7 @@ export function createGridEditor({
         sameContext(context) &&
         !readOnly &&
         state.mode === "sheet" &&
+        state.displayKind !== "tiled" &&
         state.editState?.capability === "read-write",
     );
     layer.hidden = !visible;

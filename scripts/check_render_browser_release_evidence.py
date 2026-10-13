@@ -38,13 +38,14 @@ from check_render_package import EXPECTED_FILES as EXPECTED_PACKAGE_FILES
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = ROOT / "bindings" / "render-wasm" / "toolchain-lock.json"
 DEFAULT_PACKAGE = ROOT / "bindings" / "render-wasm" / "package.json"
-SCHEMA = "rxls.render-browser-evidence.v5"
-PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v5"
+SCHEMA = "rxls.render-browser-evidence.v6"
+PREREQUISITE_SCHEMA = "rxls.render-browser-release-prerequisites.v6"
 BEHAVIOR_SCHEMA = "rxls.render-browser-behavior.v2"
 EXPECTED_REPOSITORY = "HyunjoJung/rxls"
 EXPECTED_RUNTIME_TEXT = b"PASS pinned Chromium runtime closure resolved\n"
 EXPECTED_NETWORK_ERROR = "net::ERR_INTERNET_DISCONNECTED"
 HARD_STOP_DEADLINE_MS = 2000
+NATIVE_HARD_STOP_DEADLINE_MS = 2500
 RSS_BOUNDARY_INTERVAL_MS = 10
 RSS_BOUNDARY_MAX_INTERVAL_MS = 25
 RSS_BOUNDARY_REQUIRED_SAMPLES = 5
@@ -91,7 +92,9 @@ PASS_RE = re.compile(
     r"peak-growth=(?P<rss_peak_growth>[0-9]+) "
     r"retained=(?P<rss_retained>[0-9]+) "
     r"retained-growth=(?P<rss_retained_growth>[0-9]+) bytes; "
-    r"hard-stop target=(?P<elapsed>[0-9]+)/(?P<deadline>[0-9]+)ms "
+    r"hard-stop pending-rejection=(?P<client_elapsed>[0-9]+)/(?P<client_deadline>[0-9]+)ms "
+    r"target=(?P<elapsed>[0-9]+)/(?P<deadline>[0-9]+)ms "
+    r"absence=(?P<absence_elapsed>[0-9]+)/(?P<absence_deadline>[0-9]+)ms "
     r"wasm=(?P<wasm>http://127\.0\.0\.1:[0-9]{1,5}/[A-Za-z0-9._/-]+); "
     r"CSP Network=(?P<network_error>[A-Za-z0-9:_-]+)$"
 )
@@ -741,6 +744,10 @@ def _parse_mode_log(
     rss_retained_growth = int(values["rss_retained_growth"])
     elapsed = int(values["elapsed"])
     deadline = int(values["deadline"])
+    client_elapsed = int(values["client_elapsed"])
+    client_deadline = int(values["client_deadline"])
+    absence_elapsed = int(values["absence_elapsed"])
+    absence_deadline = int(values["absence_deadline"])
     _require(
         all(
             _nonnegative_int(value)
@@ -803,7 +810,10 @@ def _parse_mode_log(
         f"{mode}_network",
     )
     _require(
-        deadline == HARD_STOP_DEADLINE_MS and 0 < elapsed <= deadline,
+        client_deadline == HARD_STOP_DEADLINE_MS
+        and 0 <= client_elapsed <= client_deadline
+        and deadline == absence_deadline == NATIVE_HARD_STOP_DEADLINE_MS
+        and 0 < elapsed <= absence_elapsed <= deadline,
         f"{mode}_hard_stop",
     )
     return {
@@ -811,6 +821,10 @@ def _parse_mode_log(
         "hard_stop": {
             "deadline_ms": deadline,
             "elapsed_ms": elapsed,
+            "client_deadline_ms": client_deadline,
+            "client_elapsed_ms": client_elapsed,
+            "absence_elapsed_ms": absence_elapsed,
+            "target_absent": True,
             "future_requests_rejected": True,
             "rejected_requests": 2,
             "target_destroyed": True,
@@ -1165,16 +1179,34 @@ def validate_summary(
             isinstance(hard_stop, dict)
             and hard_stop
             == {
-                "deadline_ms": HARD_STOP_DEADLINE_MS,
+                "deadline_ms": NATIVE_HARD_STOP_DEADLINE_MS,
                 "elapsed_ms": hard_stop.get("elapsed_ms"),
+                "client_deadline_ms": HARD_STOP_DEADLINE_MS,
+                "client_elapsed_ms": hard_stop.get("client_elapsed_ms"),
+                "absence_elapsed_ms": hard_stop.get("absence_elapsed_ms"),
+                "target_absent": True,
                 "future_requests_rejected": True,
                 "rejected_requests": 2,
                 "target_destroyed": True,
                 "wasm_frame_confirmed": True,
             }
             and _positive_int(
-                hard_stop.get("elapsed_ms"), maximum=HARD_STOP_DEADLINE_MS
-            ),
+                hard_stop.get("elapsed_ms"), maximum=NATIVE_HARD_STOP_DEADLINE_MS
+            )
+            and _nonnegative_int(
+                hard_stop.get("client_elapsed_ms"), maximum=HARD_STOP_DEADLINE_MS
+            )
+            and _positive_int(
+                hard_stop.get("absence_elapsed_ms"), maximum=NATIVE_HARD_STOP_DEADLINE_MS
+            )
+            and _positive_int(
+                hard_stop.get("deadline_ms"), maximum=NATIVE_HARD_STOP_DEADLINE_MS
+            )
+            and _positive_int(
+                hard_stop.get("client_deadline_ms"), maximum=HARD_STOP_DEADLINE_MS
+            )
+            and hard_stop.get("target_absent") is True
+            and hard_stop["elapsed_ms"] <= hard_stop["absence_elapsed_ms"],
             f"summary_{mode}_hard_stop",
         )
         _require(

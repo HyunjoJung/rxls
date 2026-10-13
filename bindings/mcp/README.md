@@ -69,6 +69,37 @@ With no `--root`, the current directory is the only allowed root.
 | `workbook_save_copy` | Publish a new same-format XLSX/XLSM copy without overwrite |
 | `workbook_close` | Close a session and release retained bytes |
 
+## Opt-in formula recalculation
+
+`workbook_set_cells` accepts `recalculate: true` to refresh supported current
+formula cells across the edited workbook, including dependencies on other
+sheets. Omitted or false retains the existing cached-value edit behavior and
+the existing result fields. Formula edits still require a caller-provided cache.
+
+Opt-in results add `recalculation` with `computed_cells` (including unchanged),
+`unchanged_cells`, `unsupported_cells`, and distinct sorted stable `reasons`.
+Supported scalar errors such as `#DIV/0!` are computed results. Unsupported
+formulas and their dependents retain their current cache and report the core
+reason code; a new unsupported formula retains its caller-provided cache.
+No formula source is rewritten by recalculation. See the source checkout's
+[formula subset and budgets](../../docs/formulas.md).
+
+The opt-in path caps formula targets at 10,000, sheets at 4,096, total sheet-name
+UTF-8 bytes at 64 KiB, and combined raw cell/read-hyperlink records at 1,000,000
+before building display indexes. One core evaluation batch shares all operation,
+range, text and dependency limits; the target ceiling does not guarantee that
+10,000 formulas fit that work budget. The summary permits at most 32 distinct
+reasons and 4 KiB of serialized JSON. Existing edit/input/session/output limits
+are unchanged. No truncated success is returned when a limit is exceeded.
+
+`RXLS_MCP_RECALC_FAILED` identifies evaluation, collection or diagnostic failure
+(with a stable core reason code for evaluation budgets).
+`RXLS_MCP_RECALC_CACHE_FAILED`, `RXLS_MCP_RECALC_SERIALIZE_FAILED` and
+`RXLS_MCP_RECALC_REOPEN_FAILED` identify the corresponding candidate stage.
+All failures, including the existing memory and output checks, leave the entire
+edit, session hash, retained-byte accounting and package untouched. Save-copy
+remains a separate explicit operation.
+
 ## Security boundaries
 
 - Existing paths and allowed roots are canonicalized before comparison.

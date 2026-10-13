@@ -488,7 +488,7 @@ jobs:
           package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v5"
+              != "rxls.render-browser-release-prerequisites.v6"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
               or not valid_browser_proofs(browser)
@@ -829,7 +829,7 @@ jobs:
           browser_package = browser.get("package", {})
           if (
               browser.get("schema")
-              != "rxls.render-browser-release-prerequisites.v5"
+              != "rxls.render-browser-release-prerequisites.v6"
               or browser.get("passed") is not True
               or browser.get("head_sha") != os.environ["GITHUB_SHA"]
               or not valid_browser_proofs(browser)

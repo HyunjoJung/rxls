@@ -568,7 +568,7 @@ impl RxlsMcpServer {
 
     /// Atomically apply a bounded batch of package-preserving XLSX/XLSM edits.
     #[tool(
-        description = "Atomically set values or write formulas to up to 100 XLSX/XLSM cells while preserving untouched package parts",
+        description = "Atomically set values or write formulas to up to 100 XLSX/XLSM cells while preserving untouched package parts; optionally recalculate supported formula caches",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -599,8 +599,8 @@ impl RxlsMcpServer {
         for (edit, address) in params.edits.iter().zip(parsed) {
             apply_edit(&mut candidate, &params.sheet, edit, address)?;
         }
-        let candidate_parts = candidate.edited_parts().to_vec();
-        let bytes = candidate.save().map_err(|source| {
+        let mut candidate_parts = candidate.edited_parts().to_vec();
+        let mut bytes = candidate.save().map_err(|source| {
             error(
                 "RXLS_MCP_EDIT_FAILED",
                 format!("edited package could not be serialized: {source}"),
@@ -613,7 +613,7 @@ impl RxlsMcpServer {
                 format!("open sessions may retain at most {MAX_SESSION_BYTES} current bytes"),
             ));
         }
-        let reopened = Spreadsheet::open(&bytes).map_err(|source| {
+        let mut reopened = Spreadsheet::open(&bytes).map_err(|source| {
             error(
                 "RXLS_MCP_EDIT_FAILED",
                 format!("edited package did not reopen cleanly: {source}"),
@@ -625,6 +625,36 @@ impl RxlsMcpServer {
                 "edited package lost preservation edit capability",
             ));
         }
+        let mut recalculation = None;
+        if params.recalculate {
+            // candidate.workbook() still describes the pre-edit source. The
+            // newly opened package is the only evaluation snapshot used here.
+            let summary = crate::recalculation::apply(&mut reopened)?;
+            if summary.computed_cells != summary.unchanged_cells {
+                candidate_parts.extend(reopened.edited_parts().iter().cloned());
+                bytes = reopened
+                    .save()
+                    .map_err(|source| error("RXLS_MCP_RECALC_SERIALIZE_FAILED", source))?;
+                enforce_workbook_size(bytes.len())?;
+                if other_bytes.saturating_add(bytes.len()) > MAX_SESSION_BYTES {
+                    return Err(error(
+                        "RXLS_MCP_MEMORY_LIMIT",
+                        format!(
+                            "open sessions may retain at most {MAX_SESSION_BYTES} current bytes"
+                        ),
+                    ));
+                }
+                reopened = Spreadsheet::open(&bytes)
+                    .map_err(|source| error("RXLS_MCP_RECALC_REOPEN_FAILED", source))?;
+                if reopened.edit_capability() != &EditCapability::ReadWrite {
+                    return Err(error(
+                        "RXLS_MCP_RECALC_REOPEN_FAILED",
+                        "recalculated package lost preservation edit capability",
+                    ));
+                }
+            }
+            recalculation = Some(summary);
+        }
         let mut edited_parts = session.edited_parts.clone();
         edited_parts.extend(candidate_parts);
         let current_sha256 = sha256(&bytes);
@@ -634,6 +664,7 @@ impl RxlsMcpServer {
             current_bytes: bytes.len(),
             current_sha256: current_sha256.clone(),
             edited_parts: edited_parts.iter().cloned().collect(),
+            recalculation,
         })?;
         session.edited_parts = edited_parts;
         session.spreadsheet = reopened;
@@ -1271,6 +1302,7 @@ mod tests {
 
         let edited = server
             .workbook_set_cells(Parameters(SetCellsParams {
+                recalculate: false,
                 session_id: opened.session.session_id.clone(),
                 sheet: "Data".to_string(),
                 edits: vec![
@@ -1348,6 +1380,7 @@ mod tests {
 
         server
             .workbook_set_cells(Parameters(SetCellsParams {
+                recalculate: false,
                 session_id: opened.session.session_id.clone(),
                 sheet: "Macro".to_string(),
                 edits: vec![CellEdit::Set {
@@ -1410,6 +1443,7 @@ mod tests {
         assert_eq!(opened.session.edit_capability, "read_only_legacy_biff");
         let error = server
             .workbook_set_cells(Parameters(SetCellsParams {
+                recalculate: false,
                 session_id: opened.session.session_id,
                 sheet: opened.sheets[0].name.clone(),
                 edits: vec![CellEdit::Set {
@@ -1819,5 +1853,422 @@ mod tests {
 
         client.cancel().await.expect("cancel client");
         server_task.await.expect("join server");
+    }
+    fn recalc_params(id: &str, recalculate: bool) -> SetCellsParams {
+        SetCellsParams {
+            session_id: id.to_string(),
+            sheet: "Data".to_string(),
+            recalculate,
+            edits: vec![CellEdit::Set {
+                cell: "A1".to_string(),
+                value: InputValue::Number(9.0),
+            }],
+        }
+    }
+
+    fn session_snapshot(
+        server: &RxlsMcpServer,
+        id: &str,
+    ) -> (Vec<u8>, String, usize, Vec<String>, usize) {
+        let state = server.state().unwrap();
+        let session = find_session(&state, id).unwrap();
+        (
+            session.spreadsheet.save().unwrap(),
+            session.current_sha256.clone(),
+            session.current_bytes,
+            session.edited_parts.iter().cloned().collect(),
+            state.retained_bytes,
+        )
+    }
+
+    fn cached_at(workbook: &rxls::Workbook, sheet: &str, row: u32, col: u16) -> Cell {
+        match workbook
+            .sheet_by_name(sheet)
+            .unwrap()
+            .cell(row, col)
+            .unwrap()
+        {
+            Cell::Formula { cached, .. } => cached.as_ref().clone(),
+            value => panic!("expected formula, got {value:?}"),
+        }
+    }
+
+    #[test]
+    fn recalculation_is_optional_in_input_and_default_result_schema() {
+        let base = json!({"session_id":"test","sheet":"Data","edits":[]});
+        let omitted: SetCellsParams = serde_json::from_value(base.clone()).unwrap();
+        assert!(!omitted.recalculate);
+        let mut explicit = base;
+        explicit["recalculate"] = json!(false);
+        assert!(
+            !serde_json::from_value::<SetCellsParams>(explicit)
+                .unwrap()
+                .recalculate
+        );
+        let input = serde_json::to_value(schemars::schema_for!(SetCellsParams)).unwrap();
+        assert!(input["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| key != "recalculate"));
+        assert_eq!(input["properties"]["recalculate"]["default"], false);
+        let output = serde_json::to_value(schemars::schema_for!(SetCellsResult)).unwrap();
+        assert!(output["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| key != "recalculation"));
+
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("defaults.xlsx");
+        let mut workbook = rxls::Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_number(0, 0, 7.0);
+        sheet.write_formula(0, 1, "A1*2", 14.0);
+        fs::write(&source, workbook.to_xlsx_checked().unwrap()).unwrap();
+        let server = server_for(&root);
+        for flag in [None, Some(false)] {
+            let opened = open_sample(&server, &source);
+            let id = opened.session.session_id;
+            let mut wire = json!({"session_id":id,"sheet":"Data","edits":[{"kind":"set","cell":"A1","value":{"type":"number","value":9}}]});
+            if let Some(flag) = flag {
+                wire["recalculate"] = json!(flag);
+            }
+            let params = serde_json::from_value(wire).unwrap();
+            let result = server.workbook_set_cells(Parameters(params)).unwrap().0;
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result.as_object().unwrap().len(), 5);
+            assert!(result.get("recalculation").is_none());
+            let state = server.state().unwrap();
+            assert_eq!(
+                cached_at(
+                    find_session(&state, &id).unwrap().spreadsheet.workbook(),
+                    "Data",
+                    0,
+                    1
+                ),
+                Cell::Number(14.0)
+            );
+        }
+    }
+
+    #[test]
+    fn recalculation_refreshes_cross_sheet_dependencies_and_preserves_fallback_parts() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("dependencies.xlsx");
+        let mut workbook = rxls::Workbook::new();
+        let data = workbook.add_sheet("Data");
+        data.write_number(0, 0, 7.0);
+        data.write_formula(0, 1, "A1*2", 14.0);
+        workbook
+            .add_sheet("Other")
+            .write_formula(0, 0, "Data!B1+1", 15.0);
+        workbook.add_sheet("Unchanged").write_formula_with_format(
+            0,
+            0,
+            "45000",
+            45_000.0,
+            &rxls::Format::new().set_num_format("yyyy-mm-dd"),
+        );
+        let unsupported = workbook.add_sheet("Unsupported");
+        unsupported.write_formula(0, 0, "NOW()", 42.0);
+        unsupported.write_formula(0, 1, "A1+1", 43.0);
+        unsupported.write_formula(0, 2, "NOTSUPPORTED(1)", "retained");
+        let before = workbook.to_xlsx_checked().unwrap();
+        fs::write(&source, &before).unwrap();
+        let server = server_for(&root);
+        let opened = open_sample(&server, &source);
+        let id = opened.session.session_id;
+        let edited = server
+            .workbook_set_cells(Parameters(recalc_params(&id, true)))
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(edited.recalculation).unwrap(),
+            json!({"computed_cells":3,"unchanged_cells":1,"unsupported_cells":3,"reasons":["unsupported_function","volatile"]})
+        );
+        assert_eq!(
+            edited.edited_parts,
+            ["xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"]
+        );
+        let (bytes, _, _, _, _) = session_snapshot(&server, &id);
+        let reopened = rxls::Workbook::open(&bytes).unwrap();
+        assert_eq!(cached_at(&reopened, "Data", 0, 1), Cell::Number(18.0));
+        assert_eq!(cached_at(&reopened, "Other", 0, 0), Cell::Number(19.0));
+        assert_eq!(
+            cached_at(&reopened, "Unsupported", 0, 2),
+            Cell::Text("retained".to_string())
+        );
+        for part in [
+            "xl/workbook.xml",
+            "xl/styles.xml",
+            "xl/worksheets/sheet3.xml",
+            "xl/worksheets/sheet4.xml",
+        ] {
+            assert_eq!(zip_part(&bytes, part), zip_part(&before, part), "{part}");
+        }
+        assert_eq!(fs::read(source).unwrap(), before);
+    }
+
+    #[test]
+    fn recalculation_saves_typed_values_and_keeps_new_unsupported_formula_cache() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("typed.xlsx");
+        let mut workbook = rxls::Workbook::new();
+        let data = workbook.add_sheet("Data");
+        data.write_number(0, 0, 7.0);
+        data.write_formula(0, 1, "A1=9", false);
+        data.write_formula(0, 2, "1/0", 0.0);
+        data.write_formula(0, 3, r#"IF(A1>0,"a;b[x]@{}",FALSE)"#, "stale");
+        data.write_formula(0, 5, "ROUND(1.005,2)", 99.0);
+        data.write_formula(0, 6, "SUM(A1:A1)", 99.0);
+        fs::write(&source, workbook.to_xlsx_checked().unwrap()).unwrap();
+        let server = server_for(&root);
+        let opened = open_sample(&server, &source);
+        let id = opened.session.session_id;
+        let mut params = recalc_params(&id, true);
+        params.edits.push(CellEdit::Formula {
+            cell: "E1".to_string(),
+            formula: "=NOW()".to_string(),
+            cached: InputValue::Text("caller cache".to_string()),
+        });
+        let result = server.workbook_set_cells(Parameters(params)).unwrap().0;
+        assert_eq!(
+            serde_json::to_value(result.recalculation).unwrap(),
+            json!({"computed_cells":5,"unchanged_cells":0,"unsupported_cells":1,"reasons":["volatile"]})
+        );
+        let destination = root.path().join("saved.xlsx");
+        server
+            .workbook_save_copy(Parameters(SaveCopyParams {
+                session_id: id,
+                path: destination.to_string_lossy().into_owned(),
+            }))
+            .unwrap();
+        let reopened = rxls::Workbook::open(&fs::read(destination).unwrap()).unwrap();
+        assert_eq!(cached_at(&reopened, "Data", 0, 1), Cell::Bool(true));
+        assert_eq!(
+            cached_at(&reopened, "Data", 0, 2),
+            Cell::Error("#DIV/0!".to_string())
+        );
+        assert_eq!(
+            cached_at(&reopened, "Data", 0, 3),
+            Cell::Text("a;b[x]@{}".to_string())
+        );
+        assert_eq!(
+            cached_at(&reopened, "Data", 0, 4),
+            Cell::Text("caller cache".to_string())
+        );
+        assert_eq!(cached_at(&reopened, "Data", 0, 5), Cell::Number(1.01));
+        assert_eq!(cached_at(&reopened, "Data", 0, 6), Cell::Number(9.0));
+        assert!(
+            matches!(reopened.sheets[0].cell(0,4), Some(Cell::Formula { formula, .. }) if formula == "NOW()")
+        );
+    }
+
+    #[test]
+    fn recalculation_budget_and_cache_write_errors_roll_back_the_entire_edit() {
+        for (label, formulas, text, code) in [
+            (
+                "shared operations",
+                vec![format!("{}1", "1+".repeat(2999)); 2],
+                None,
+                "operation_limit_exceeded",
+            ),
+            (
+                "range",
+                vec!["SUM(C1:C10001)".to_string()],
+                None,
+                "range_too_large",
+            ),
+            (
+                "text budget",
+                (0..21)
+                    .map(|index| {
+                        let reference = if index == 0 {
+                            "C1".to_string()
+                        } else {
+                            format!("B{index}")
+                        };
+                        format!("{reference}&{reference}")
+                    })
+                    .collect(),
+                Some("x".to_string()),
+                "text_limit_exceeded",
+            ),
+            (
+                "cache text",
+                vec!["C1&C1".to_string()],
+                Some("x".repeat(32767)),
+                "RXLS_MCP_RECALC_CACHE_FAILED:",
+            ),
+        ] {
+            let root = TempDir::new().unwrap();
+            let source = root.path().join("rollback.xlsx");
+            let mut workbook = rxls::Workbook::new();
+            let data = workbook.add_sheet("Data");
+            data.write_number(0, 0, 7.0);
+            for (index, formula) in formulas.iter().enumerate() {
+                data.write_formula(index as u32, 1, formula, 42.0);
+            }
+            if let Some(text) = text {
+                data.write_string(0, 2, text);
+            }
+            fs::write(&source, workbook.to_xlsx_checked().unwrap()).unwrap();
+            let server = server_for(&root);
+            let opened = open_sample(&server, &source);
+            let id = opened.session.session_id;
+            let before = session_snapshot(&server, &id);
+            let error = server
+                .workbook_set_cells(Parameters(recalc_params(&id, true)))
+                .err()
+                .expect("recalculation must fail");
+            assert!(error.contains(code), "{label}: {error}");
+            assert_eq!(session_snapshot(&server, &id), before, "{label}");
+            // The same edit remains valid under the original non-recalculation API.
+            server
+                .workbook_set_cells(Parameters(recalc_params(&id, false)))
+                .unwrap();
+            let state = server.state().unwrap();
+            assert_eq!(
+                find_session(&state, &id)
+                    .unwrap()
+                    .spreadsheet
+                    .workbook()
+                    .sheets[0]
+                    .cell(0, 0),
+                Some(&Cell::Number(9.0))
+            );
+        }
+    }
+
+    #[test]
+    fn recalculation_target_limit_and_late_output_error_preserve_session_accounting() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("targets.xlsx");
+        let mut workbook = rxls::Workbook::new();
+        let data = workbook.add_sheet("Data");
+        data.write_number(0, 0, 7.0);
+        for row in 0..10_001 {
+            data.write_formula(row, 1, "1+1", 42.0);
+        }
+        fs::write(&source, workbook.to_xlsx_checked().unwrap()).unwrap();
+        let server = server_for(&root);
+        let id = open_sample(&server, &source).session.session_id;
+        let before = session_snapshot(&server, &id);
+        assert!(server
+            .workbook_set_cells(Parameters(recalc_params(&id, true)))
+            .err()
+            .expect("target cap must fail")
+            .contains("formula_target_limit"));
+        assert_eq!(session_snapshot(&server, &id), before);
+
+        // Deterministic seam: a valid dependency update reaches final output checking,
+        // then accumulated session metadata exceeds the existing 1 MiB output cap.
+        let source = root.path().join("late-output.xlsx");
+        let mut workbook = rxls::Workbook::new();
+        let data = workbook.add_sheet("Data");
+        data.write_number(0, 0, 7.0);
+        data.write_formula(0, 1, "A1*2", 14.0);
+        fs::write(&source, workbook.to_xlsx_checked().unwrap()).unwrap();
+        let id = open_sample(&server, &source).session.session_id;
+        server
+            .state()
+            .unwrap()
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .edited_parts
+            .insert("x".repeat(MAX_OUTPUT_BYTES));
+        let before = session_snapshot(&server, &id);
+        assert!(server
+            .workbook_set_cells(Parameters(recalc_params(&id, true)))
+            .err()
+            .expect("output cap must fail")
+            .starts_with("RXLS_MCP_OUTPUT_TOO_LARGE:"));
+        assert_eq!(session_snapshot(&server, &id), before);
+        assert_eq!(
+            server
+                .workbook_read_range(Parameters(ReadRangeParams {
+                    session_id: id,
+                    sheet: "Data".to_string(),
+                    range: "A1:B1".to_string()
+                }))
+                .unwrap()
+                .0
+                .cell_count,
+            2
+        );
+    }
+
+    #[test]
+    fn recalculation_preserves_macro_payload_and_unchanged_package_parts() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("macros.xlsm");
+        let before = macro_fixture();
+        fs::write(&source, &before).unwrap();
+        let server = server_for(&root);
+        let id = open_sample(&server, &source).session.session_id;
+        let result = server
+            .workbook_set_cells(Parameters(SetCellsParams {
+                session_id: id.clone(),
+                sheet: "Macro".to_string(),
+                recalculate: true,
+                edits: vec![CellEdit::Formula {
+                    cell: "B1".to_string(),
+                    formula: "=1+1".to_string(),
+                    cached: InputValue::Number(99.0),
+                }],
+            }))
+            .unwrap()
+            .0;
+        assert_eq!(result.recalculation.unwrap().computed_cells, 1);
+        let (bytes, _, _, _, _) = session_snapshot(&server, &id);
+        for part in [
+            "[Content_Types].xml",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "xl/vbaProject.bin",
+        ] {
+            assert_eq!(zip_part(&bytes, part), zip_part(&before, part), "{part}");
+        }
+        assert_eq!(
+            cached_at(&rxls::Workbook::open(&bytes).unwrap(), "Macro", 0, 1),
+            Cell::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn recalculation_does_not_upgrade_read_only_sessions_and_reports_empty_workbooks() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("empty-formulas.xlsx");
+        write_sample_xlsx(&source);
+        let server = server_for(&root);
+        let id = open_sample(&server, &source).session.session_id;
+        let result = server
+            .workbook_set_cells(Parameters(recalc_params(&id, true)))
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(result.recalculation).unwrap(),
+            json!({"computed_cells":0,"unchanged_cells":0,"unsupported_cells":0,"reasons":[]})
+        );
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xls/korean-unicode-biff8.xls");
+        let source = root.path().join("read-only.xls");
+        fs::copy(fixture, &source).unwrap();
+        let opened = open_sample(&server, &source);
+        let id = opened.session.session_id;
+        let before = serde_json::to_value(server.workbook_list_sessions().unwrap().0).unwrap();
+        let mut params = recalc_params(&id, true);
+        params.sheet = opened.sheets[0].name.clone();
+        assert!(server
+            .workbook_set_cells(Parameters(params))
+            .err()
+            .expect("read-only edit must fail")
+            .starts_with("RXLS_MCP_READ_ONLY:"));
+        assert_eq!(
+            serde_json::to_value(server.workbook_list_sessions().unwrap().0).unwrap(),
+            before
+        );
     }
 }

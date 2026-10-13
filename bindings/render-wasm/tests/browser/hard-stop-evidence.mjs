@@ -1,3 +1,5 @@
+export const NATIVE_HARD_STOP_DEADLINE_MS = 2_500;
+
 export function findNonceBoundWorker({ attachedTargets, primaryTargetId, proof }) {
   validateNonceBinding(proof);
   const candidates = new Map();
@@ -23,12 +25,9 @@ export function findNonceBoundWorker({ attachedTargets, primaryTargetId, proof }
   return candidates.size === 0 ? null : candidates.values().next().value;
 }
 
-export function hardStopObservationDeadlineEpochMs(proof, graceMs) {
+export function hardStopObservationDeadlineEpochMs(proof) {
   validateCompletedProof(proof);
-  if (!Number.isSafeInteger(graceMs) || graceMs < 0) {
-    throw new Error("hard-stop observation grace must be a non-negative integer");
-  }
-  const deadlineEpochMs = proof.startedEpochMs + proof.deadlineMs + graceMs;
+  const deadlineEpochMs = proof.startedEpochMs + NATIVE_HARD_STOP_DEADLINE_MS;
   if (!Number.isSafeInteger(deadlineEpochMs)) {
     throw new Error("hard-stop observation deadline is outside the safe timestamp range");
   }
@@ -59,7 +58,8 @@ export function correlateHardStopTarget({
   destroyedTargets,
   currentTargets,
   pauseEvidence,
-  proof
+  proof,
+  inventoryObservedAtEpochMs
 }) {
   validateCompletedProof(proof);
   const attached = findNonceBoundWorker({ attachedTargets, primaryTargetId, proof });
@@ -89,9 +89,9 @@ export function correlateHardStopTarget({
     throw new Error("hard-stop page started termination before the controller command");
   }
   const elapsedMs = Math.ceil(destroyedAtEpochMs - proof.startedEpochMs);
-  if (elapsedMs > proof.deadlineMs) {
+  if (elapsedMs > NATIVE_HARD_STOP_DEADLINE_MS) {
     throw new Error(
-      `hard-stop worker target ended after ${elapsedMs}ms, deadline ${proof.deadlineMs}ms`
+      `hard-stop worker target ended after ${elapsedMs}ms, native deadline ${NATIVE_HARD_STOP_DEADLINE_MS}ms`
     );
   }
 
@@ -107,6 +107,18 @@ export function correlateHardStopTarget({
     throw new Error("nonce-bound hard-stop worker remains in Target.getTargets");
   }
   validateRejectedOutcomes(proof);
+  if (
+    !Number.isSafeInteger(inventoryObservedAtEpochMs) ||
+    inventoryObservedAtEpochMs < destroyedAtEpochMs
+  ) {
+    throw new Error("hard-stop target absence has no ordered inventory timestamp");
+  }
+  const absenceElapsedMs = Math.ceil(inventoryObservedAtEpochMs - proof.startedEpochMs);
+  if (absenceElapsedMs > NATIVE_HARD_STOP_DEADLINE_MS) {
+    throw new Error(
+      `hard-stop target absence observed after ${absenceElapsedMs}ms, native deadline ${NATIVE_HARD_STOP_DEADLINE_MS}ms`
+    );
+  }
 
   return {
     targetId,
@@ -116,7 +128,10 @@ export function correlateHardStopTarget({
     rejectedRequests: proof.rejectedRequests,
     wasmFrame: pauseEvidence.wasmFrame,
     elapsedMs,
-    deadlineMs: proof.deadlineMs,
+    deadlineMs: NATIVE_HARD_STOP_DEADLINE_MS,
+    clientElapsedMs: proof.elapsedMs,
+    clientDeadlineMs: proof.deadlineMs,
+    absenceElapsedMs,
     absentFromTargetInventory: true
   };
 }

@@ -206,7 +206,7 @@ fn authored_body_is_right_to_left(group: &crate::scene::ClipGroupNode) -> bool {
 
 /// Serialize a backend-neutral scene as deterministic SVG.
 pub fn render_scene_svg(scene: &Scene, max_output_bytes: u64) -> Result<String, RenderError> {
-    render_scene_svg_impl(scene, max_output_bytes, None)
+    render_scene_svg_impl(scene, max_output_bytes, None, "")
 }
 
 #[cfg(test)]
@@ -215,14 +215,39 @@ pub(crate) fn render_scene_svg_with_trace(
     max_output_bytes: u64,
 ) -> Result<(String, BackendGeometryTrace), RenderError> {
     let mut trace = BackendGeometryTrace::new(scene);
-    let svg = render_scene_svg_impl(scene, max_output_bytes, Some(&mut trace))?;
+    let svg = render_scene_svg_impl(scene, max_output_bytes, Some(&mut trace), "")?;
     Ok((svg, trace))
+}
+
+pub(crate) fn render_scene_svg_with_namespace(
+    scene: &Scene,
+    max_output_bytes: u64,
+    namespace: u64,
+) -> Result<String, RenderError> {
+    render_scene_svg_impl(scene, max_output_bytes, None, &format!("vp-{namespace}-"))
+}
+
+fn push_clip_id_prefix(
+    out: &mut BoundedString,
+    prefix: &str,
+    id_prefix: &str,
+) -> Result<(), RenderError> {
+    if id_prefix.is_empty() {
+        // Preserve legacy chunk boundaries and output-limit error accounting.
+        return out.push(prefix);
+    }
+    out.push(prefix.strip_suffix("clip-").ok_or(RenderError::Backend {
+        reason: "invalid_clip_prefix",
+    })?)?;
+    out.push(id_prefix)?;
+    out.push("clip-")
 }
 
 fn render_scene_svg_impl(
     scene: &Scene,
     max_output_bytes: u64,
     trace: Option<&mut BackendGeometryTrace>,
+    id_prefix: &str,
 ) -> Result<String, RenderError> {
     let mut out = BoundedString::new(max_output_bytes);
     out.push("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")?;
@@ -243,7 +268,7 @@ fn render_scene_svg_impl(
     if !clip_bounds.is_empty() {
         out.push("<defs>\n")?;
         for (clip_index, bounds) in clip_bounds.into_iter().enumerate() {
-            out.push("<clipPath id=\"clip-")?;
+            push_clip_id_prefix(&mut out, "<clipPath id=\"clip-", id_prefix)?;
             out.push(&clip_index.to_string())?;
             out.push("\"><rect")?;
             push_rect_geometry(&mut out, bounds)?;
@@ -271,6 +296,7 @@ fn render_scene_svg_impl(
         0,
         Some(page_bounds),
         SvgSemanticClipContext::new(page_bounds),
+        id_prefix,
     )?;
     out.push("</svg>\n")?;
     Ok(out.finish())
@@ -330,6 +356,7 @@ fn collect_clip_bounds(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_scene_nodes(
     out: &mut BoundedString,
     nodes: &[SceneNode],
@@ -338,6 +365,7 @@ fn push_scene_nodes(
     depth: usize,
     active_clip: Option<Rect>,
     semantic_clip: SvgSemanticClipContext,
+    id_prefix: &str,
 ) -> Result<(), RenderError> {
     for node in nodes {
         match node {
@@ -351,7 +379,7 @@ fn push_scene_nodes(
                 *clip_index = (*clip_index)
                     .checked_add(1)
                     .ok_or(RenderError::CoordinateOverflow)?;
-                out.push("<g clip-path=\"url(#clip-")?;
+                push_clip_id_prefix(out, "<g clip-path=\"url(#clip-", id_prefix)?;
                 out.push(&group_clip_index.to_string())?;
                 out.push(")\">\n")?;
                 if let Some(trace) = trace.as_deref_mut() {
@@ -370,6 +398,7 @@ fn push_scene_nodes(
                     depth + 1,
                     effective_group_clip,
                     nested_semantic_clip,
+                    id_prefix,
                 )?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::ClipEnd);
@@ -401,7 +430,7 @@ fn push_scene_nodes(
                 }
             }
             SceneNode::Text(text) => {
-                push_text(out, text, *clip_index)?;
+                push_text(out, text, *clip_index, id_prefix)?;
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(BackendNodeTrace::Text(backend_text_trace(
                         text,
@@ -414,8 +443,14 @@ fn push_scene_nodes(
             }
             SceneNode::GlyphRun(glyphs) => {
                 let glyph_clip = semantic_clip.glyph_clips(glyphs)?;
-                let glyph_trace =
-                    push_glyph_run(out, glyphs, *clip_index, trace.is_some(), glyph_clip)?;
+                let glyph_trace = push_glyph_run(
+                    out,
+                    glyphs,
+                    *clip_index,
+                    trace.is_some(),
+                    glyph_clip,
+                    id_prefix,
+                )?;
                 if let (Some(trace), Some(glyph_trace)) = (trace.as_deref_mut(), glyph_trace) {
                     trace.push(BackendNodeTrace::Glyph(glyph_trace));
                 }
@@ -577,6 +612,7 @@ fn push_glyph_run(
     clip_index: usize,
     tracing: bool,
     semantic_clip: SvgGlyphSemanticClip,
+    id_prefix: &str,
 ) -> Result<Option<BackendGlyphTrace>, RenderError> {
     if !node.metadata_is_valid() {
         return Err(RenderError::Backend {
@@ -601,7 +637,7 @@ fn push_glyph_run(
     push_xml_escaped(out, &visible_label, true)?;
     out.push("\" fill=\"")?;
     push_rgb(out, node.color)?;
-    out.push("\" clip-path=\"url(#clip-")?;
+    push_clip_id_prefix(out, "\" clip-path=\"url(#clip-", id_prefix)?;
     out.push(&clip_index.to_string())?;
     out.push(")\"")?;
     if let Some(trace) = trace.as_mut() {
@@ -1423,6 +1459,7 @@ fn push_text(
     out: &mut BoundedString,
     node: &TextNode,
     clip_index: usize,
+    id_prefix: &str,
 ) -> Result<(), RenderError> {
     let (x, anchor) = text_x(node)?;
     let (y, baseline) = text_y(node)?;
@@ -1474,7 +1511,7 @@ fn push_text(
         out.push(&format_fixed(y))?;
         out.push(")\"")?;
     }
-    out.push(" clip-path=\"url(#clip-")?;
+    push_clip_id_prefix(out, " clip-path=\"url(#clip-", id_prefix)?;
     out.push(&clip_index.to_string())?;
     out.push(")\" xml:space=\"preserve\">")?;
     push_xml_escaped(out, &node.text, false)?;

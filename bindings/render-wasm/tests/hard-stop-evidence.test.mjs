@@ -52,7 +52,8 @@ test("hard-stop lifecycle requires nonce, active WASM pause, destruction, and ab
       destroyedTargets: new Map([["hard-stop", 10_400]]),
       currentTargets: [{ targetId: "primary", url: primary.targetInfo.url }],
       pauseEvidence: wasmPause,
-      proof
+      proof,
+      inventoryObservedAtEpochMs: 10_400
     }),
     {
       targetId: "hard-stop",
@@ -62,7 +63,10 @@ test("hard-stop lifecycle requires nonce, active WASM pause, destruction, and ab
       rejectedRequests: 2,
       wasmFrame: wasmPause.wasmFrame,
       elapsedMs: 400,
-      deadlineMs: 1_000,
+      deadlineMs: 2_500,
+      clientElapsedMs: 1,
+      clientDeadlineMs: 1_000,
+      absenceElapsedMs: 400,
       absentFromTargetInventory: true
     }
   );
@@ -84,10 +88,11 @@ test("hard-stop deadline starts at the public termination call, not CDP delivery
     primaryTargetId: "primary",
     currentTargets: [],
     pauseEvidence: deliveredPause,
-    proof: deliveredProof
+    proof: deliveredProof,
+    inventoryObservedAtEpochMs: 12_600
   };
 
-  assert.equal(hardStopObservationDeadlineEpochMs(deliveredProof, 500), 13_100);
+  assert.equal(hardStopObservationDeadlineEpochMs(deliveredProof), 13_100);
   assert.equal(
     decideHardStopObservation({
       destructionRecorded: true,
@@ -115,9 +120,9 @@ test("hard-stop deadline starts at the public termination call, not CDP delivery
     () =>
       correlateHardStopTarget({
         ...base,
-        destroyedTargets: new Map([["hard-stop", 12_601]])
+        destroyedTargets: new Map([["hard-stop", 13_101]])
       }),
-    /ended after 2001ms/
+    /ended after 2501ms/
   );
   assert.throws(
     () =>
@@ -130,6 +135,51 @@ test("hard-stop deadline starts at the public termination call, not CDP delivery
   );
 });
 
+test("client rejection and native teardown have independent exact deadlines", () => {
+  const base = {
+    attachedTargets: [primary, hardStop],
+    primaryTargetId: "primary",
+    currentTargets: [],
+    pauseEvidence: wasmPause,
+    proof: { ...proof, deadlineMs: 2_000 },
+    inventoryObservedAtEpochMs: 12_500
+  };
+  const evidence = correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_500]])
+  });
+  assert.equal(evidence.elapsedMs, 2_500);
+  assert.equal(evidence.deadlineMs, 2_500);
+  assert.equal(evidence.clientElapsedMs, 1);
+  assert.equal(evidence.clientDeadlineMs, 2_000);
+  assert.equal(evidence.absenceElapsedMs, 2_500);
+  assert.equal(hardStopObservationDeadlineEpochMs(base.proof), 12_500);
+  assert.equal(correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_500]]),
+    proof: { ...base.proof, elapsedMs: 2_000, completedEpochMs: 12_000 }
+  }).clientElapsedMs, 2_000);
+  assert.throws(() => correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_501]])
+  }), /native deadline 2500ms/);
+  assert.throws(() => correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_000]]),
+    proof: { ...base.proof, elapsedMs: 2_001 }
+  }), /valid completed state/);
+  assert.throws(() => correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_000]]),
+    inventoryObservedAtEpochMs: 12_501
+  }), /absence observed after 2501ms/);
+  assert.throws(() => correlateHardStopTarget({
+    ...base,
+    destroyedTargets: new Map([["hard-stop", 12_000]]),
+    inventoryObservedAtEpochMs: 11_999
+  }), /ordered inventory timestamp/);
+});
+
 test("detach-only and natural completion cannot satisfy hard-stop evidence", () => {
   assert.equal(
     correlateHardStopTarget({
@@ -138,7 +188,8 @@ test("detach-only and natural completion cannot satisfy hard-stop evidence", () 
       destroyedTargets: new Map(),
       currentTargets: [],
       pauseEvidence: wasmPause,
-      proof
+      proof,
+      inventoryObservedAtEpochMs: 10_400
     }),
     null
   );
@@ -239,7 +290,7 @@ test("ambiguous targets, missing WASM frames, and retained targets fail closed",
       correlateHardStopTarget({
         attachedTargets: [primary, hardStop],
         primaryTargetId: "primary",
-        destroyedTargets: new Map([["hard-stop", 11_001]]),
+        destroyedTargets: new Map([["hard-stop", 12_501]]),
         currentTargets: [],
         pauseEvidence: wasmPause,
         proof

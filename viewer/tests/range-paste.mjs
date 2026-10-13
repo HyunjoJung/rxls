@@ -11,6 +11,7 @@ export async function exerciseRangePaste(
     waitForViewerState,
     downloadWorkbook,
     assertOpenpyxlReopens,
+    assertViewerReopens,
   },
 ) {
   const input = page.locator("#grid-input");
@@ -137,6 +138,16 @@ export async function exerciseRangePaste(
     cacheCell: "C10",
     expectedCache: 1094000,
   });
+  await assertViewerReopens(page, saved, {
+    format: "xlsx", label: "XLSX range download reopened clean",
+    cells: {
+      C4: { kind: "number", value: "125000" },
+      // D is the fixture's due-date column; paste must preserve its date format.
+      D4: { kind: "formula", formula: "C4*2", cachedKind: "date", cachedValue: "250000" },
+      C5: { kind: "number", value: "200000" },
+      D5: { kind: "text", value: "two\tparts\nnext line" },
+    },
+  }, { waitForCondition, waitForViewerState });
   await undo();
   await select("C4", "420000");
   await select("C5", "185000");

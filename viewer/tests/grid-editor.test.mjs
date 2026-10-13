@@ -10,6 +10,21 @@ import {
   interaction,
 } from "./support/grid-editor.mjs";
 
+test("tiled view hides a retained grid and rejects selection, edit and paste before any write", async () => {
+  const env = setup();
+  await flush();
+  const captured = env.grid.getPasteTarget();
+  env.state.displayKind = "tiled";
+  env.grid.update();
+  assert.equal(env.layer.hidden, true);
+  assert.equal(env.input.disabled, true);
+  assert.equal(env.grid.getPasteTarget(), null);
+  assert.equal(await env.grid.select(0, 2), false);
+  assert.equal(await env.grid.beginEdit("blocked"), false);
+  assert.equal(await env.grid.applyRange(captured, [[{ kind: "number", value: 5 }]]), false);
+  assert.equal(env.calls.commits.length + env.calls.ranges.length, 0);
+});
+
 test("range paste keeps the draft on failure and clears it only after one successful transaction", async () => {
   let fail = true;
   const env = setup({

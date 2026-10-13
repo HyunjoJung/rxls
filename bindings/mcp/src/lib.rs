@@ -10,6 +10,7 @@
 
 mod a1;
 mod model;
+mod recalculation;
 mod server;
 mod transport;
 

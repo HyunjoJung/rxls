@@ -31,6 +31,9 @@ If none of the listed tasks fits, open a [contribution question] with the area
 you want to work on. For larger features, discuss the user need and scope in
 an issue before implementation. Please follow the [Code of Conduct].
 
+For a short runnable entry point before choosing a task, use
+[First successful file operation](docs/first-success.md).
+
 ## Set up only what you need
 
 For core Rust changes, install [Rust through rustup], then run from the

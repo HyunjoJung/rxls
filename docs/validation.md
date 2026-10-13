@@ -39,8 +39,10 @@ pinned manifest and a valid SHA-256.
 
 Every core release is accepted only when the crate, tagged source, GitHub
 Release bundle, SBOM, checksums, and provenance are bound by the release
-manifest to one revision. This checkout prepares `0.1.4`; its hosted candidates
-and publication must establish fresh evidence for the final release revision.
+manifest to one revision. The [published 0.1.4 release](https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4)
+and [version-specific API documentation](https://docs.rs/rxls/0.1.4/rxls/) identify
+the current registry core. Subsequent source changes require fresh evidence
+for their exact candidate revision.
 
 The existing `0.1.3` evidence below remains bound to its published source.
 The immutable `v0.1.3` tag identifies source commit

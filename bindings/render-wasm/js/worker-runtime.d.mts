@@ -6,6 +6,11 @@ import type {
 export type RenderMaybePromise<Value> = Value | PromiseLike<Value>;
 
 export interface RenderWasmSession {
+  stageViewportJson?(sheetIndex: number, geometryId: string, optionsJson: string): RenderMaybePromise<string>;
+  commitViewport?(geometryId: string, revision: string): boolean;
+  abortViewport?(geometryId: string): boolean;
+  renderViewportTileJson?(sheetIndex: number, geometryId: string, revision: string, rectJson: string, namespace: string): RenderMaybePromise<string>;
+  releaseViewport?(sheetIndex: number, geometryId: string, revision: string): boolean;
   inspectionJson(): RenderMaybePromise<string>;
   editStateJson(): RenderMaybePromise<string>;
   readCellJson(
@@ -55,6 +60,7 @@ export interface RenderWasmSessionConstructor {
 export interface RenderWasmModule {
   readonly RenderSession: RenderWasmSessionConstructor;
   capabilitiesJson(): string;
+  viewportCapabilitiesJson?(): string;
 }
 
 export type RenderWorkerSend = (

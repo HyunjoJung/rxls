@@ -104,6 +104,22 @@ function setup({ readOnly = false, readCell, onInspect } = {}) {
   return { workbench, state, ui, calls, dom };
 }
 
+test("tiled source inspection remains available, editing is blocked, and dirty-copy save remains enabled", async () => {
+  const env = setup();
+  env.state.displayKind = "tiled";
+  env.state.editState.dirty = true;
+  env.workbench.update();
+  await env.workbench.inspect();
+  assert.equal(env.ui["inspector-value"].value, "Hello");
+  assert.equal(env.ui["inspector-edit"].disabled, true);
+  await env.ui["inspector-edit"].emit("click").result;
+  assert.deepEqual(env.calls.edits, []);
+  assert.equal(env.ui["quick-save"].disabled, false);
+  await env.ui["quick-save"].emit("click").result;
+  assert.equal(env.calls.saves, 1);
+  assert.match(env.ui["workbook-mode"].textContent, /Tiled view.*unsaved/);
+});
+
 test("inspector presentation preserves formulas, date serials, boolean meaning, and blanks", () => {
   const cases = [
     [{ kind: "blank" }, ""],

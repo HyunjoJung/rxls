@@ -72,6 +72,10 @@ import {
   type RenderSheetInteraction,
   type RenderCellGeometry,
   type RenderTileResult,
+  type ViewportCapabilities,
+  type ViewportPrepareResult,
+  type ViewportTileResult,
+  type ViewportReleaseResult,
   type RenderWorkerConstructor,
   type RenderWorkerLike,
   type ReadCellResult,
@@ -197,6 +201,22 @@ const interactive: RenderRequest<RenderSheetInteractiveResult> = client.renderSh
 const genericInteractive: RenderRequest<RenderSheetInteractiveResult> = client.request(
   "render-sheet-interactive", { documentId: "document-1", sheetIndex: 0 },
 );
+const viewportCapabilities: RenderRequest<ViewportCapabilities> = client.viewportCapabilities();
+const viewport: RenderRequest<ViewportPrepareResult> = client.prepareViewport("document-1", 0, {
+  limits: { maxFontBytes: 1000, maxOutputBytes: 2000 },
+});
+const viewportTile: RenderRequest<ViewportTileResult> = client.renderViewportTile(
+  "document-1", 0, "vp-00000000-0000-4000-8000-000000000001-1", "9007199254740993",
+  { xRaw: 5_000_000_000, yRaw: 0, widthRaw: 1024, heightRaw: 1024 }, "18446744073709551615",
+);
+const viewportRelease: RenderRequest<ViewportReleaseResult> = client.releaseViewport(
+  "document-1", 0, "vp-00000000-0000-4000-8000-000000000001-1", "9007199254740993",
+);
+// @ts-expect-error Revisions use decimal strings to preserve the full u64 range.
+client.releaseViewport("document-1", 0, "viewport", 9007199254740993);
+// @ts-expect-error Used viewport preparation does not accept an explicit range.
+client.prepareViewport("document-1", 0, { range: { firstRow: 0, firstCol: 0, lastRow: 1, lastCol: 1 } });
+void [viewportCapabilities, viewport, viewportTile, viewportRelease];
 const geometry: RenderCellGeometry = [0, 0, 0, 0, 100, 20];
 const interaction: RenderSheetInteraction = { schemaVersion: 1, width: 100, height: 20, cells: [geometry] };
 const interactiveBytes: number = validateInteractiveSheetOutput(

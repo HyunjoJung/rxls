@@ -118,6 +118,57 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 const readNumber = async () => ({ value: { kind: "number", value: 4 } });
 
+test("tiled display blocks every mutation while dirty XLSM save retains source bytes and dirty history", async () => {
+  let writes = 0;
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  const env = setup({ client: {
+    readCell: readNumber,
+    setCell() { writes += 1; }, setRangeAndRecalculate() { writes += 1; },
+    setDocumentProperties() { writes += 1; }, undoEdit() { writes += 1; }, redoEdit() { writes += 1; },
+    saveDocument: async () => ({ bytes }),
+  } });
+  env.state.displayKind = "tiled";
+  env.state.editState.dirty = true;
+  env.controller.updateEditUi();
+  assert.equal(env.controller.canMutateDisplayedSheet(), false);
+  assert.equal(env.controller.canPreserveWorkbook(), true);
+  for (const id of ["edit-cell", "document-properties", "undo-edit", "redo-edit"])
+    assert.equal(env.elements[id].disabled, true, id);
+  assert.equal(env.elements["save-document"].disabled, false);
+  await env.controller.openCellEditor();
+  await env.controller.openPropertiesEditor();
+  await env.controller.applyHistoryEdit("undo");
+  await env.controller.applyHistoryEdit("redo");
+  const target = { client: env.state.client, documentId: env.state.documentId, sheetIndex: 0, row: 0, col: 0 };
+  await assert.rejects(env.controller.commitCellEdit(target, { kind: "blank" }), /unavailable/);
+  await assert.rejects(env.controller.commitRangeEdit(target, [[{ kind: "blank" }]]), /unavailable/);
+  assert.equal(writes, 0);
+  await env.controller.saveWorkbookCopy();
+  assert.equal(env.calls.downloads.length, 1);
+  assert.equal(env.calls.downloads[0].name, "Quarter-edited.xlsm");
+  assert.deepEqual(new Uint8Array(await env.calls.downloads[0].blob.arrayBuffer()), bytes);
+  assert.equal(env.state.editState.dirty, true);
+  assert.equal(env.state.editState.canUndo, true);
+  env.state.displayKind = "full";
+  assert.equal(env.controller.canMutateDisplayedSheet(), true);
+});
+
+test("history and cell dialogs recheck tiled mode after an awaited draft gate", async () => {
+  for (const command of ["openCellEditor", "openPropertiesEditor", "applyHistoryEdit"]) {
+    const gate = deferred();
+    let writes = 0;
+    const env = setup({ beforeCommand: () => gate.promise,
+      client: { readCell() { writes += 1; }, undoEdit() { writes += 1; } } });
+    const pending = env.controller[command]("undo");
+    env.state.displayKind = "tiled";
+    gate.resolve(true);
+    await pending;
+    assert.equal(writes, 0, command);
+    assert.equal(env.elements["cell-dialog"].open, false);
+    assert.equal(env.elements["properties-dialog"].open, false);
+  }
+});
+
 test("every unapplied dialog field participates in discard checks without counting untouched dialogs", async () => {
   for (const [dialog, fields] of [
     [
@@ -1227,4 +1278,95 @@ test("a stale recalculation result cannot overwrite a new document or its visibl
     "Current document rendered",
   );
   assert.deepEqual(fixture.calls.renders, []);
+});
+
+test("prepared save returns same-format bytes through draft commit and leaves dirty state unchanged", async () => {
+  const order = [];
+  const bytes = new Uint8Array([80, 75, 3, 4]);
+  const { controller, state, calls } = setup({
+    beforeCommand: async () => { order.push("draft"); return true; },
+    client: { saveDocument: async (documentId) => { order.push(documentId); return { bytes }; } },
+  });
+  state.editState.dirty = true;
+  const saved = await controller.prepareWorkbookCopy();
+  assert.deepEqual(order, ["draft", "document-one"]);
+  assert.equal(saved.bytes, bytes);
+  assert.equal(saved.fileName, "Quarter-edited.xlsm");
+  assert.equal(saved.format, "xlsm");
+  assert.match(saved.mimeType, /macroEnabled/);
+  assert.equal(state.editState.dirty, true);
+  assert.deepEqual(calls.downloads, []);
+  assert.equal(state.busy, false);
+});
+
+test("prepared save rejects an unapplied dialog without worker submission or draft loss", async () => {
+  let saves = 0;
+  const { controller, elements } = setup({ client: {
+    readCell: readNumber,
+    saveDocument: async () => { saves++; return { bytes: new Uint8Array([1]) }; },
+  } });
+  await controller.openCellEditor();
+  elements["cell-value"].value = "invalid draft";
+  await assert.rejects(controller.prepareWorkbookCopy(), { code: "draft_pending" });
+  assert.equal(saves, 0);
+  assert.equal(elements["cell-value"].value, "invalid draft");
+});
+
+for (const outcome of ["resolve", "reject"]) {
+  test(`prepared save ${outcome} cannot succeed after disposal/replacement generation changes`, async () => {
+    const pending = deferred();
+    const { controller, state, calls, elements } = setup({ client: { saveDocument: () => pending.promise } });
+    const save = controller.prepareWorkbookCopy();
+    await flush();
+    state.openGeneration++;
+    state.client = null;
+    state.documentId = null;
+    state.busy = true;
+    elements["status-message"].textContent = "Opening another workbook";
+    if (outcome === "resolve") pending.resolve({ bytes: new Uint8Array([1]) });
+    else pending.reject(new Error("old worker terminated"));
+    await assert.rejects(save, { code: "stale_operation" });
+    assert.equal(state.busy, true);
+    assert.equal(elements["status-message"].textContent, "Opening another workbook");
+    assert.deepEqual(calls.errors, []);
+  });
+}
+
+test("prepared save remains available in tiled display while mutation and history remain disabled", async () => {
+  let saves = 0;
+  const bytes = Uint8Array.of(80, 75, 1);
+  const fixture = setup({ client: { saveDocument: async () => { saves++; return { bytes }; } } });
+  fixture.state.displayKind = "tiled";
+  fixture.state.editState.dirty = true;
+  assert.equal(fixture.controller.canPreserveWorkbook(), true);
+  assert.equal(fixture.controller.canMutateDisplayedSheet(), false);
+  const saved = await fixture.controller.prepareWorkbookCopy();
+  assert.equal(saved.bytes, bytes);
+  assert.equal(saves, 1);
+  assert.equal(fixture.state.editState.dirty, true);
+  assert.equal(fixture.controller.canMutateDisplayedSheet(), false);
+});
+
+test("prepared save checks source identity again after an awaited draft before any native save", async () => {
+  const draft = deferred();
+  let saves = 0;
+  const fixture = setup({ beforeCommand: () => draft.promise,
+    client: { saveDocument: async () => { saves++; return { bytes: Uint8Array.of(1) }; } } });
+  const pending = fixture.controller.prepareWorkbookCopy();
+  fixture.state.openGeneration++;
+  fixture.state.documentId = "replacement";
+  fixture.state.busy = true;
+  draft.resolve(true);
+  await assert.rejects(pending, { code: "stale_operation" });
+  assert.equal(saves, 0);
+  assert.equal(fixture.state.busy, true);
+});
+
+test("prepared save keeps native read-only policy even when the display is tiled", async () => {
+  let saves = 0;
+  const fixture = setup({ client: { saveDocument: async () => { saves++; } } });
+  fixture.state.displayKind = "tiled";
+  fixture.state.editState.capability = "read-only";
+  await assert.rejects(fixture.controller.prepareWorkbookCopy(), { code: "read_only" });
+  assert.equal(saves, 0);
 });

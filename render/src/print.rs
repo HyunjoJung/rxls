@@ -3908,7 +3908,7 @@ fn axis_slice_total<I>(slots: &[MeasuredAxisSlot<I>]) -> Result<Fixed, RenderErr
     })
 }
 
-fn transform_node(
+pub(crate) fn transform_node(
     node: SceneNode,
     x: Fixed,
     y: Fixed,

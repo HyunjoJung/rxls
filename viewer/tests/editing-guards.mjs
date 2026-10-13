@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { assertReloadCancellation } from "./reopen-journey.mjs";
 
 const samplePath = fileURLToPath(
   new URL("../samples/operations-report.xlsx", import.meta.url),
@@ -65,6 +66,11 @@ export async function exerciseEditingGuards(
       );
       const draftField = kind === "cell" ? "#cell-value" : "#property-title";
       const draftValue = await page.locator(draftField).inputValue();
+      await assertReloadCancellation(
+        page,
+        kind === "cell" ? [draftField] : [draftField, "#property-created"],
+        `${kind} draft survives real reload cancellation`,
+      );
       await Promise.all([
         page.waitForEvent("dialog").then(async (dialog) => {
           assert.equal(dialog.type(), "confirm");
@@ -88,6 +94,17 @@ export async function exerciseEditingGuards(
       if (await page.locator("#error-banner").isVisible())
         await page.locator("#dismiss-error").click();
     }
+
+    await page.locator("#inspector-reference").fill("C4");
+    await page.locator("#inspector-reference").press("Enter");
+    await waitForCondition(async () =>
+      (await page.locator("#grid-selection").getAttribute("data-reference")) === "C4" &&
+      !(await page.locator("#grid-input").isDisabled()), "inline reload target");
+    await page.locator("#grid-input").press("F2");
+    await page.locator("#grid-input").fill("한글 reload draft");
+    await assertReloadCancellation(page, ["#grid-input"], "inline draft survives real reload cancellation");
+    assert.match(await page.locator("#grid-layer").getAttribute("class"), /(?:^|\s)is-editing(?:\s|$)/);
+    await page.locator("#grid-input").press("Escape");
 
     // Accepted discard goes through the same real file-open event as a picker selection.
     await page.locator("#document-properties").click();

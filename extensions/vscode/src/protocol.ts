@@ -27,6 +27,11 @@ export interface PreviewErrorMessage {
   message: string;
 }
 
+export interface ExportIdentity {
+  requestId: string | null;
+  kind: ExportKind;
+}
+
 export interface ExportMessage {
   type: "export";
   requestId: string | null;
@@ -103,32 +108,43 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | undefined 
     };
   }
   if (value.type === "export") {
-    if (
-      (value.kind !== "svg" && value.kind !== "png") ||
-      (value.requestId !== null &&
-        (typeof value.requestId !== "string" ||
-          value.requestId.length === 0 ||
-          value.requestId.length > 64))
-    ) {
+    const identity = parseExportIdentity(value);
+    if (!identity) {
       return undefined;
     }
     const bytes = binaryBytes(value.bytes);
     if (!bytes || bytes.byteLength === 0 || bytes.byteLength > MAX_EXPORT_BYTES) {
       return undefined;
     }
-    const fileName = safeExportFileName(value.fileName, value.kind);
-    if (!fileName || !validExportSignature(bytes, value.kind)) {
+    const fileName = safeExportFileName(value.fileName, identity.kind);
+    if (!fileName || !validExportSignature(bytes, identity.kind)) {
       return undefined;
     }
     return {
       type: "export",
-      requestId: value.requestId,
-      kind: value.kind,
+      requestId: identity.requestId,
+      kind: identity.kind,
       fileName,
       bytes
     };
   }
   return undefined;
+}
+
+/** Identify a bounded export request for failure routing, without accepting its payload. */
+export function parseExportIdentity(value: unknown): ExportIdentity | undefined {
+  if (
+    !isRecord(value) ||
+    value.type !== "export" ||
+    (value.kind !== "svg" && value.kind !== "png") ||
+    (value.requestId !== null &&
+      (typeof value.requestId !== "string" ||
+        value.requestId.length === 0 ||
+        value.requestId.length > 64))
+  ) {
+    return undefined;
+  }
+  return { requestId: value.requestId, kind: value.kind };
 }
 
 export function safeExportFileName(value: unknown, kind: ExportKind): string | undefined {
@@ -139,13 +155,13 @@ export function safeExportFileName(value: unknown, kind: ExportKind): string | u
   const safe = leaf
     .normalize("NFKD")
     .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .replace(/^[._-]+|[._-]+$/g, "")
-    .slice(0, 120);
+    .replace(/^[._-]+|[._-]+$/g, "");
   const extension = `.${kind}`;
   if (!safe.toLowerCase().endsWith(extension)) {
     return undefined;
   }
-  return safe;
+  const suffix = safe.slice(-extension.length);
+  return safe.slice(0, -extension.length).slice(0, 120 - extension.length) + suffix;
 }
 
 export function parentUriPath(path: string): string {

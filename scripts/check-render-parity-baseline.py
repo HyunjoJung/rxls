@@ -22,6 +22,10 @@ OBSERVED_CANDIDATE_SCHEMA = "rxls.render-parity-observed-candidate.v1"
 RATCHET_ENVELOPE_SCHEMA = "rxls.render-parity-ratchet-envelope.v1"
 CAMPAIGN_SCHEMA = "rxls.render-parity-campaign.v1"
 REPORT_SCHEMA = "rxls.render-parity-baseline-check.v1"
+DIAGNOSTIC_SCHEMA = "rxls.render-parity-baseline-diagnostics.v1"
+MAX_DIAGNOSTIC_CODES = 64
+MAX_DIAGNOSTIC_BYTES = 16 * 1024
+MAX_DIAGNOSTIC_INPUT_CHARS = 512
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 CLASSIFICATION_RE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 FEATURE_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -2466,6 +2470,139 @@ def _validate_cli_paths(args: argparse.Namespace) -> None:
             raise BaselineError("input_output_path_alias")
 
 
+def _diagnostic_transition(value: str, maximum: int) -> bool:
+    if re.fullmatch(r"[0-9]{1,19}->[0-9]{1,19}", value) is None:
+        return False
+    return all(int(number) <= maximum for number in value.split("->"))
+
+
+def _failure_diagnostic_code(value: object) -> str:
+    """Keep only finite public labels; never echo arbitrary evidence names."""
+    unknown = "unreviewed_failure"
+    if not isinstance(value, str) or len(value) > MAX_DIAGNOSTIC_INPUT_CHARS:
+        return unknown
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0] == "identity_mismatch" and parts[1] in {
+        "schema", "configuration_sha256", "input_set_sha256", "input_files", "campaign",
+    }:
+        return value
+    if len(parts) == 2 and parts[0] == "coverage":
+        return "coverage" if _diagnostic_transition(parts[1], MAX_COUNT) else unknown
+    if len(parts) == 4 and parts[0] in {"status", "classification", "warning"}:
+        label, action, name, counts = parts
+        if action not in {"new", "increased", "unclassified"} or (
+            action == "unclassified" and label != "warning"
+        ):
+            return unknown
+        pattern = WARNING_RE if label == "warning" else CLASSIFICATION_RE
+        if pattern.fullmatch(name) is None:
+            return unknown
+        if action == "increased":
+            valid_counts = _diagnostic_transition(counts, MAX_COUNT)
+        else:
+            valid_counts = (
+                re.fullmatch(r"[0-9]{1,7}", counts) is not None
+                and int(counts) <= MAX_COUNT
+            )
+        if not valid_counts:
+            return unknown
+        if label == "status":
+            return f"{label}:{action}:{name}" if name in STATUS_VALUES else unknown
+        # Even valid snake_case names can contain private text or tokens.
+        return f"{label}:{action}"
+    if parts[0] == "all":
+        scope, tail = "all", parts[1:]
+    elif len(parts) >= 3 and parts[0] in {"by_format", "by_feature"}:
+        dimension, name = parts[:2]
+        if name in {"new", "missing"} and len(parts) == 3:
+            action, name = name, parts[2]
+            tail = []
+        else:
+            action, tail = None, parts[2:]
+        pattern = FORMAT_RE if dimension == "by_format" else FEATURE_RE
+        if pattern.fullmatch(name) is None:
+            return unknown
+        reviewed = (
+            name in HOSTED_FULL_FORMAT_COUNTS if dimension == "by_format"
+            else name in HOSTED_FULL_FEATURE_COUNTS
+        )
+        safe_name = name if reviewed else "unreviewed"
+        scope = f"{dimension}:{safe_name}"
+        if action is not None:
+            return f"{dimension}:{action}:{safe_name}"
+    else:
+        return unknown
+    if len(tail) == 2 and tail[0] in {"workbooks", "coverage"}:
+        return (
+            f"{scope}:{tail[0]}"
+            if _diagnostic_transition(tail[1], MAX_COUNT) else unknown
+        )
+    if len(tail) < 2:
+        return unknown
+    action, metric = tail[:2]
+    score_actions = {"missing_score", "new_score", "score_count", "score_regression"}
+    delta_actions = {"missing_delta", "new_delta", "delta_count", "delta_regression"}
+    if action not in score_actions | delta_actions or METRIC_RE.fullmatch(metric) is None:
+        return unknown
+    score = action in score_actions
+    reviewed_metrics = EXPECTED_SCORE_METRICS if score else EXPECTED_DELTA_METRICS
+    safe_metric = metric if metric in reviewed_metrics else "unreviewed_metric"
+    code = f"{scope}:{action}:{safe_metric}"
+    if action.startswith(("missing_", "new_")):
+        return code if len(tail) == 2 else unknown
+    if action.endswith("_count"):
+        return (
+            code if len(tail) == 3 and _diagnostic_transition(tail[2], MAX_COUNT)
+            else unknown
+        )
+    if (
+        len(tail) == 4
+        and tail[2] in (SCORE_RATCHETS if score else DELTA_RATCHETS)
+        and _diagnostic_transition(
+            tail[3], SCORE_MAX_PPM if score else MAX_DELTA_VALUE,
+        )
+    ):
+        return f"{code}:{tail[2]}"
+    return unknown
+
+
+def _failure_diagnostics(failures: list[object]) -> dict[str, Any]:
+    """Bound retained counts and bytes without changing the full gate report."""
+    counts: dict[str, int] = {}
+    omitted = 0
+
+    def priority(code: str) -> tuple[bool, str]:
+        return not code.startswith("identity_mismatch:"), code
+
+    for failure in failures:
+        code = _failure_diagnostic_code(failure)
+        if code in counts:
+            counts[code] += 1
+        elif len(counts) < MAX_DIAGNOSTIC_CODES:
+            counts[code] = 1
+        else:
+            last = max(counts, key=priority)
+            if priority(code) < priority(last):
+                omitted += counts.pop(last)
+                counts[code] = 1
+            else:
+                omitted += 1
+    result = {
+        "codes": [
+            {"code": code, "count": counts[code]}
+            for code in sorted(counts, key=priority)
+        ],
+        "failure_count": len(failures),
+        "omitted_failure_count": omitted,
+        "schema": DIAGNOSTIC_SCHEMA,
+    }
+    while result["codes"] and len(
+        json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ) + len("check-render-parity-baseline: \n") > MAX_DIAGNOSTIC_BYTES:
+        result["omitted_failure_count"] += result["codes"].pop()["count"]
+    return result
+
+
 def main() -> int:
     args = parse_args()
     candidate: dict[str, Any] | None = None
@@ -2511,6 +2648,14 @@ def main() -> int:
             write_atomic(args.report, rendered)
         else:
             sys.stdout.buffer.write(rendered)
+        if not report["passed"]:
+            print(
+                "check-render-parity-baseline: " + json.dumps(
+                    _failure_diagnostics(report["failures"]),
+                    sort_keys=True, separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
         return 0 if report["passed"] else 1
     except BaselineError as error:
         if args.report is not None and paths_valid:

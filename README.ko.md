@@ -21,7 +21,7 @@ XLS, XLSX, XLSB, ODS를 하나의 타입 모델로 읽습니다. XLSX를 새로 
 panic 대신 처리 범위가 제한된 타입 오류로 반환합니다.
 
 ```sh
-cargo add rxls@0.1.3 --features full
+cargo add rxls@0.1.4 --features full
 ```
 
 기여하고 싶다면 [첫 기여용 이슈](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)와
@@ -71,6 +71,8 @@ Cargo 기능, CLI, 내보내기, WASM, 로컬 MCP의 정확한 범위는
 
 ## 빠른 시작
 
+[첫 파일 작업 안내(English)](docs/first-success.md)에서 Rust, CLI, 브라우저, MCP별 시작 경로를 확인할 수 있습니다.
+
 ### XLS, XLSX, XLSB, ODS 읽기
 
 ```rust
@@ -96,7 +98,18 @@ for sheet in &workbook.sheets {
 `Workbook::open`은 확장자가 아니라 파일 바이트의 컨테이너를 판별합니다. 해당
 Cargo 기능이 켜져 있으면 네 가지 읽기 형식에 같은 호출을 사용합니다.
 
+소스 체크아웃에서는 입력 파일 없이 [타입 행 예제](examples/typed_rows.rs)를 실행할 수 있습니다.
+`serde` 기능이 필요하며 `xlsx`는 기본으로 켜져 있습니다.
+
+```sh
+cargo +1.85.0 run --locked --features serde --example typed_rows
+```
+
 ### 서식이 있는 XLSX 만들기
+
+`Workbook::to_xlsx_checked`는 `Workbook::open`으로 읽은 모델을 포함해 공통
+모델로 새 XLSX 패키지를 생성합니다. 기존 XLSX/XLSM 템플릿의 스타일, 테마,
+열 레코드를 유지하며 지원 범위 안에서 편집할 때는 `Spreadsheet`를 사용합니다.
 
 ```rust
 use rxls::{CellStyle, HAlign, Workbook};
@@ -203,6 +216,13 @@ rxls Spreadsheet Preview 0.1.0을 설치할 수 있습니다.
 바이트 단위 검증을 위한 기준 배포본입니다. 검증된 VSIX와 대응하는 SHA-256 파일,
 정확한 소스 커밋, 크로스 플랫폼 CI 근거를 함께 제공합니다.
 
+### 편집기 임베드 (개발용)
+
+현재 소스에서 비공개 [편집기 임베드 패키지(English)](packages/editor-embed/README.md)를
+빌드해 애플리케이션에 스프레드시트 편집기를 넣을 수 있습니다. 각 iframe은
+통합문서·입력 초안·변경 기록·worker를 독립적으로 관리합니다. 부모 API가 반환한
+XLSX/XLSM 복사본은 호스트 애플리케이션에서 저장합니다.
+
 ### 시연 영상
 
 | 한국어 시연 | 영어 시연 |
@@ -267,7 +287,7 @@ rxls Spreadsheet Preview 0.1.0을 설치할 수 있습니다.
   보존합니다. 워크북 바이트는 프로토콜 메시지나 네트워크로 나가지 않습니다.
 
 ```sh
-cargo install rxls --version =0.1.3 --locked
+cargo install rxls --version =0.1.4 --locked
 rxls info book.xlsx
 rxls diagnose book.xlsx
 rxls csv book.xlsx --sheet 0 --max-output-bytes 1048576
@@ -283,10 +303,11 @@ bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 9개 도구, 클라이언트 설정, 파일시스템 경계, 자원 제한은
 [MCP 서버 가이드(English)](bindings/mcp/README.md)에 정리되어 있습니다.
 
-현재 소스는 코어 `0.1.4` 릴리스를 준비합니다. 호스팅된 게시 및 설치 소비자
-검증이 성공하기 전까지 현재 게시된 버전은 `0.1.3`이며, 위 설치 예제와 검증
-근거도 `0.1.3`에 해당합니다. `0.1.4`의 변경 내용은
-[변경 기록](CHANGELOG.md#014---2026-09-28)에 정리했습니다. 렌더러,
+현재 게시된 코어는 [0.1.4](https://crates.io/crates/rxls/0.1.4)이며 위 설치 명령도
+이 버전을 선택합니다. 시연 영상과 과거 코퍼스·릴리스 증거는 원래의 `0.1.3`
+기록을 유지합니다. 이후 소스 변경은 해당 리비전에 맞춰 별도로 검증합니다.
+[버전 경계](docs/compatibility.md#release-and-source-boundaries)와
+[0.1.4 변경 기록](CHANGELOG.md#014---2026-09-28)을 확인하세요. 렌더러,
 `@rxls/render-worker`, 로컬 MCP 서버, VS Code 미리보기는 별도 게이트로 관리되는
 워크스페이스 인터페이스이며 게시된 코어 크레이트 계약에는 포함되지 않습니다.
 

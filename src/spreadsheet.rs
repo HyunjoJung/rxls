@@ -242,13 +242,14 @@ fn validate_nonempty_xml_value(value: &str, message: &'static str) -> Result<()>
     }
 }
 
-fn validate_edit_cell_text(value: &str, message: &'static str) -> Result<()> {
+fn validate_edit_cell_text(value: &str) -> Result<()> {
     if value.encode_utf16().count() > crate::write::MAX_CELL_STRING_UTF16_UNITS {
         return Err(Error::Zip(
             "cell text exceeds Excel's 32,767 UTF-16-unit limit",
         ));
     }
-    validate_xml_value(value, message)
+    // Cell strings use ST_Xstring to preserve XML-forbidden scalars.
+    Ok(())
 }
 
 fn worksheet_path(package: &Package, sheet_name: &str) -> Result<String> {

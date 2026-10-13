@@ -1,0 +1,92 @@
+name: Native binary candidates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/binary-candidate.yml"
+      - "scripts/binary_*.py"
+      - "scripts/test_binary_*.py"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "bindings/mcp/**"
+      - "LICENSE"
+      - "THIRD_PARTY_LICENSES.md"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  candidate:
+    name: Verify ${{ matrix.platform }} candidate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: windows-x64
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-22.04
+            platform: linux-x64
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+    env:
+      BINARY_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify exact source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Test archive/protocol contracts and workflow policy
+        shell: bash
+        run: |
+          python -m unittest discover -s scripts -p "test_binary_*.py"
+          python scripts/check_workflow_policy.py
+      - name: Build, archive and verify unpacked native binaries
+        shell: bash
+        run: python scripts/binary_candidate.py build --expected-sha "$EXPECTED_SHA" --platform "$BINARY_PLATFORM" --output-dir target/binary-candidate
+      - name: Retain verified candidate and receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-candidate-${{ env.EXPECTED_SHA }}-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: target/binary-candidate/dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain bounded diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-candidate-logs-${{ env.EXPECTED_SHA }}-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: |
+            target/binary-candidate/logs/*.log
+            target/binary-candidate/logs/*.exit.json
+            target/binary-candidate/runtime/*.json
+            target/binary-candidate/runtime/*.jsonl
+            target/binary-candidate/runtime/*.log
+          if-no-files-found: ignore
+          retention-days: 14

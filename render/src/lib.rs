@@ -20,6 +20,7 @@ mod print;
 mod scene;
 mod svg;
 mod typography;
+mod viewport;
 
 pub use error::{LimitKind, RenderError};
 pub use font::{FontFaceIdentity, FontPack, FontPackError, FontPackLimits, FontPackMember};
@@ -28,8 +29,8 @@ pub use interaction::{
 };
 pub use layout::{
     build_scene, build_sheet_scene, CellCoordinate, RenderLimits, RenderOptions, RenderRange,
-    RenderReport, RenderSelection, RenderWarning, RenderedFontFace, SceneBuild, WarningCode,
-    MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
+    RenderReport, RenderSelection, RenderWarning, RenderedFontFace, SceneBuild,
+    ViewportPreparationReport, WarningCode, MAX_WORKSHEET_COLUMN, MAX_WORKSHEET_ROW,
 };
 pub use pdf::{render_print_document_pdf, render_print_document_pdf_with_fonts};
 pub use png::{render_print_document_png_pages, render_print_page_png};
@@ -46,6 +47,11 @@ pub use scene::{
     FIXED_UNITS_PER_PIXEL,
 };
 pub use svg::render_scene_svg;
+pub use viewport::{
+    prepare_sheet_used_viewport, prepare_sheet_viewport, prepare_used_viewport, prepare_viewport,
+    render_viewport_tile, OwnedPreparedViewport, PreparedViewport, ViewportAxis, ViewportAxisRun,
+    ViewportError, ViewportLimits, ViewportTile,
+};
 
 use rxls::Workbook;
 

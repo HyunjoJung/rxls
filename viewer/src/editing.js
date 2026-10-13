@@ -10,6 +10,7 @@ import {
   savedWorkbookName,
 } from "./core.js";
 import { downloadBlob } from "./browser-files.js";
+import { EditorEmbedError, MAX_WORKBOOK_BYTES } from "./embed/protocol.mjs";
 
 /** Own the editing dialogs and commands without owning workbook loading or rendering. */
 export function createEditingController({
@@ -21,6 +22,7 @@ export function createEditingController({
   updateWorkbookUi,
   renderCurrent,
   beforeCommand,
+  onChange = () => {},
   download = downloadBlob,
   confirm = (message) => globalThis.confirm(message),
 }) {
@@ -52,14 +54,20 @@ export function createEditingController({
     closePropertiesEditor,
     applyHistoryEdit,
     saveWorkbookCopy,
+    prepareWorkbookCopy,
     commitCellEdit,
     commitRangeEdit,
     hasDraftChanges,
     hasPendingMutation,
     confirmDiscardChanges,
+    canPreserveWorkbook,
+    canMutateDisplayedSheet,
+    readyForViewChange,
   };
 
   function bindEvents() {
+    elements["cell-form"].addEventListener("input", onChange);
+    elements["properties-form"].addEventListener("input", onChange);
     elements["edit-cell"].addEventListener(
       "click",
       () => void openCellEditor(),
@@ -123,13 +131,17 @@ export function createEditingController({
     const editState = state.editState;
     const editable = editState?.capability === "read-write";
     const hostReadOnly = Boolean(state.workbook && readOnly);
-    const available = Boolean(
-      state.workbook && editable && !state.busy && !readOnly,
-    );
+    const available = canMutateDisplayedSheet();
+    const preservation = canPreserveWorkbook();
     const sourceReadOnly = Boolean(
       state.workbook && !editable && !hostReadOnly,
     );
-    const reason = sourceReadOnly ? editReasonLabel(editState?.reason) : null;
+    const sourceReason = sourceReadOnly ? editReasonLabel(editState?.reason) : null;
+    const reason = state.displayKind === "tiled"
+      ? editable && !hostReadOnly
+        ? "Tiled view is read-only. Save a copy to preserve workbook edits."
+        : `Tiled view is read-only.${sourceReason ? ` ${sourceReason}` : ""}`
+      : sourceReason;
     const status = hostReadOnly
       ? "Read-only"
       : editable
@@ -151,7 +163,7 @@ export function createEditingController({
     elements["document-properties"].disabled = !available;
     elements["undo-edit"].disabled = !available || !editState.canUndo;
     elements["redo-edit"].disabled = !available || !editState.canRedo;
-    elements["save-document"].disabled = !available;
+    elements["save-document"].disabled = !preservation;
     for (const control of [
       elements["edit-cell"],
       elements["document-properties"],
@@ -176,13 +188,14 @@ export function createEditingController({
         }`;
     }
     updateCellEditorControls();
+    onChange();
   }
 
   async function openCellEditor() {
     if (state.busy || hasPendingMutation()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     if (elements["cell-dialog"].open) return;
@@ -212,6 +225,7 @@ export function createEditingController({
     }
     resetCellEditorFields();
     updateCellEditorControls();
+    onChange();
   }
 
   function invalidateCellRead() {
@@ -222,10 +236,11 @@ export function createEditingController({
         "Load this cell before editing it";
     }
     updateCellEditorControls();
+    onChange();
   }
 
   async function loadCellIntoEditor() {
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     if (
@@ -345,7 +360,7 @@ export function createEditingController({
     const dialogOpen = elements["cell-dialog"].open;
     const loaded = sameCellTarget(editing.cellReadTarget, currentCellTarget());
     const ready =
-      dialogOpen && canEditWorkbook() && loaded && !editing.cellReadPending;
+      dialogOpen && canMutateDisplayedSheet() && loaded && !editing.cellReadPending;
     const valuesDisabled = !ready || editing.cellEditPending;
     for (const control of [
       elements["cell-kind"],
@@ -359,7 +374,7 @@ export function createEditingController({
     elements["cell-reference"].disabled = editing.cellEditPending;
     elements["read-cell"].disabled =
       !dialogOpen ||
-      !canEditWorkbook() ||
+      !canMutateDisplayedSheet() ||
       editing.cellReadPending ||
       editing.cellEditPending;
     elements["apply-cell-edit"].disabled = !ready || editing.cellEditPending;
@@ -379,7 +394,7 @@ export function createEditingController({
 
   async function submitCellEdit(event) {
     event.preventDefault();
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     const target = currentTarget();
@@ -426,7 +441,7 @@ export function createEditingController({
     if (state.busy || hasPendingMutation()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     if (elements["properties-dialog"].open) return;
@@ -446,6 +461,7 @@ export function createEditingController({
   function closePropertiesEditor() {
     propertiesDialogGeneration++;
     propertiesBaseline = null;
+    onChange();
     setFormPending(elements["properties-form"], false);
     if (elements["properties-dialog"].open) {
       elements["properties-dialog"].close();
@@ -454,7 +470,7 @@ export function createEditingController({
 
   async function submitPropertiesEdit(event) {
     event.preventDefault();
-    if (!canEditWorkbook()) {
+    if (!canMutateDisplayedSheet()) {
       return;
     }
     const target = currentTarget();
@@ -493,7 +509,7 @@ export function createEditingController({
     if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
     const target = currentTarget();
     if (beforeCommand && !(await beforeCommand())) return;
-    if (!isCurrentTarget(target) || !canEditWorkbook()) {
+    if (!isCurrentTarget(target) || !canMutateDisplayedSheet()) {
       return;
     }
     mutationPending = target;
@@ -678,7 +694,7 @@ export function createEditingController({
   }
 
   async function commitMutation(target, apply, message) {
-    if (!canEditWorkbook() || hasPendingMutation()) {
+    if (!canMutateDisplayedSheet() || hasPendingMutation()) {
       throw new Error(
         "Cell editing is unavailable while the workbook is read-only or busy.",
       );
@@ -748,43 +764,60 @@ export function createEditingController({
     return `${letters}${row + 1}`;
   }
 
-  async function saveWorkbookCopy() {
-    if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
+  async function prepareWorkbookCopy() {
+    if (state.busy || hasPendingMutation()) throw new EditorEmbedError("busy", "The workbook is busy.");
+    if (!state.workbook) throw new EditorEmbedError("no_workbook", "No workbook is open.");
+    if (rejectUnappliedDrafts()) throw new EditorEmbedError("draft_pending", "Apply or cancel unapplied dialog changes.");
     const target = currentTarget();
-    if (beforeCommand && !(await beforeCommand())) return;
-    if (
-      !isCurrentTarget(target) ||
-      !canEditWorkbook() ||
-      rejectUnappliedDrafts()
-    ) {
-      return;
-    }
+    if (beforeCommand && !(await beforeCommand())) throw new EditorEmbedError("draft_not_committed", "The cell draft was not committed.");
+    if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+    if (!canPreserveWorkbook()) throw new EditorEmbedError("read_only", "This workbook is read-only.");
+    if (rejectUnappliedDrafts()) throw new EditorEmbedError("draft_pending", "Apply or cancel unapplied dialog changes.");
     const fileName = state.file.name;
+    setBusy(true, "Preparing preserved workbook");
     try {
-      setBusy(true, "Preparing preserved workbook");
       const saved = await target.client.saveDocument(target.documentId);
-      if (!isCurrentTarget(target)) return;
-      const extension = extensionOf(fileName);
-      const mimeType =
-        extension === "xlsm"
-          ? "application/vnd.ms-excel.sheet.macroEnabled.12"
-          : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-      download(
-        new Blob([saved.bytes], { type: mimeType }),
-        savedWorkbookName(fileName),
-      );
-      elements["status-message"].textContent = "Preserved workbook downloaded";
-    } catch (error) {
-      if (isCurrentTarget(target)) showError(error);
-    } finally {
-      if (isCurrentTarget(target)) {
-        setBusy(false);
-        elements["export-menu"].removeAttribute("open");
+      if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+      if (!(saved.bytes instanceof Uint8Array) || saved.bytes.byteLength === 0 || saved.bytes.byteLength > MAX_WORKBOOK_BYTES) {
+        throw new EditorEmbedError("invalid_bytes", "The saved workbook exceeds its byte contract.");
       }
+      const format = extensionOf(fileName);
+      return { bytes: saved.bytes, fileName: savedWorkbookName(fileName), format,
+        mimeType: format === "xlsm" ? "application/vnd.ms-excel.sheet.macroEnabled.12"
+          : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
+    } catch (error) {
+      if (!isCurrentTarget(target)) throw new EditorEmbedError("stale_operation", "The workbook changed.");
+      throw error;
+    } finally {
+      if (isCurrentTarget(target)) setBusy(false);
     }
   }
 
-  function canEditWorkbook() {
+  async function saveWorkbookCopy() {
+    // Retain existing toolbar no-op guards and UI messages; API preparation reports typed failures.
+    if (state.busy || hasPendingMutation() || rejectUnappliedDrafts()) return;
+    const target = currentTarget();
+    try {
+      const saved = await prepareWorkbookCopy();
+      if (!isCurrentTarget(target)) return;
+      download(new Blob([saved.bytes], { type: saved.mimeType }), saved.fileName);
+      elements["status-message"].textContent = "Preserved workbook downloaded";
+    } catch (error) {
+      if (isCurrentTarget(target) && !["stale_operation", "draft_not_committed", "read_only", "no_workbook"].includes(error.code)) showError(error);
+    } finally {
+      if (isCurrentTarget(target)) elements["export-menu"].removeAttribute("open");
+    }
+  }
+
+  function canMutateDisplayedSheet() {
+    return canPreserveWorkbook() && state.displayKind !== "tiled";
+  }
+
+  function readyForViewChange() {
+    return !hasPendingMutation() && !rejectUnappliedDrafts();
+  }
+
+  function canPreserveWorkbook() {
     return Boolean(
       !readOnly &&
         !hasPendingMutation() &&
