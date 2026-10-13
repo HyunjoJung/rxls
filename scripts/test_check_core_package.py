@@ -52,6 +52,7 @@ rust-version = "1.88"
 # generated test cases.
 EXPECTED_CI_RELEASE_ONLY_SCRIPTS = {
     "build-wasm-package.sh",
+    "check_fresh_consumers.py",
     "check_wasm_package.py",
     "test_npm_dry_run.py",
     "test_response_contract_package.py",

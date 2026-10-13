@@ -542,7 +542,7 @@ class ReleaseToolTests(unittest.TestCase):
             text = re.sub(r'rust-version = "[^"]+"', 'rust-version = "1.84"', text, count=1)
             wasm.write_text(text, encoding="utf-8")
 
-            errors = module.validate(root)
+            errors = module.validate(root, allow_unreleased=True)
 
         self.assertEqual(len(errors), 5)
         self.assertTrue(any("Cargo.lock rxls" in error for error in errors))

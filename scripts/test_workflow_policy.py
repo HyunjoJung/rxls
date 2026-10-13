@@ -4924,6 +4924,32 @@ steps:
         )
         self.assertIn('installed="target/installed-product/bin/', workflow)
 
+    def test_publication_rejects_development_identity_bypass(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        changed = workflow.replace(
+            "run: python3 scripts/check_release_identity.py\n",
+            "run: python3 scripts/check_release_identity.py --allow-unreleased\n", 1,
+        )
+        self.assertNotEqual(changed, workflow)
+        self.assertTrue(self.policy.audit_core_release_evidence(Path("release.yml"), changed))
+
+    def test_ci_requires_unconditional_fresh_consumers_after_locked_builds(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        step = (
+            "      - name: Verify fresh MSRV consumers\n"
+            "        run: python3 scripts/check_fresh_consumers.py --output target/fresh-consumers/report.json\n"
+        )
+        self.assertEqual(workflow.count(step), 1)
+        for changed in (
+            workflow.replace(step, ""),
+            workflow.replace(step, step.replace("        run:", "        if: false\n        run:")),
+            workflow.replace(step, step.replace("        run:", "        continue-on-error: true\n        run:")),
+            workflow.replace(step, "").replace("      - name: Build (.xls-only)\n", step + "      - name: Build (.xls-only)\n"),
+        ):
+            with self.subTest(change=changed):
+                self.assertNotEqual(changed, workflow)
+                self.assertTrue(self.policy.audit_ci_package_versions(Path("ci.yml"), changed))
+
     def test_ci_package_lanes_use_the_source_release_identity(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 

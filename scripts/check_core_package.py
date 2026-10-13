@@ -110,6 +110,7 @@ FORBIDDEN_RENDER_SCRIPTS = {
 }
 FORBIDDEN_RELEASE_SCRIPTS = {
     "build-wasm-package.sh",
+    "check_fresh_consumers.py",
     "check_wasm_package.py",
     "test_npm_dry_run.py",
     "test_response_contract_package.py",

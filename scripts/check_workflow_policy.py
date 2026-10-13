@@ -2177,7 +2177,7 @@ def audit_ci_package_versions(path: Path, text: str) -> list[str]:
         step = _single_yaml_block(path, active, header, 6, header, errors)
         required = (
             "shell: bash", "set -euo pipefail",
-            "python3 scripts/check_release_identity.py", version_read,
+            "python3 scripts/check_release_identity.py --allow-unreleased", version_read,
             "cargo package --locked", package_check,
         )
         positions = [step.find(command) for command in required]
@@ -2190,6 +2190,19 @@ def audit_ci_package_versions(path: Path, text: str) -> list[str]:
             or 'echo "version=$version" >> "$GITHUB_OUTPUT"' not in step
         ):
             errors.append(f"{path}: installed product must export its validated package version")
+    msrv = _single_yaml_block(path, active, "msrv:", 2, "MSRV job", errors)
+    fresh = _single_yaml_block(
+        path, msrv, "- name: Verify fresh MSRV consumers", 6, "fresh MSRV consumer step", errors,
+    )
+    fresh_command = "python3 scripts/check_fresh_consumers.py --output target/fresh-consumers/report.json"
+    if _yaml_mapping_entries_at_indent(fresh, 8) != [("run", fresh_command)]:
+        errors.append(f"{path}: fresh MSRV consumers must run unconditionally with retained evidence")
+    positions = [msrv.find(command) for command in (
+        "cargo build --no-default-features --locked", "cargo build --locked",
+        "cargo build --all-features --locked", fresh_command,
+    )]
+    if not all(left >= 0 and left < right for left, right in zip(positions, positions[1:])):
+        errors.append(f"{path}: fresh MSRV consumers must follow all three locked core builds")
     install = _single_yaml_block(
         path, active, "- name: Install CLI from the exact packaged crate contents",
         6, "installed package consumer", errors,
@@ -2212,6 +2225,14 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
 
     active = _without_commented_lines(text)
     errors: list[str] = []
+    source_identity = _single_yaml_block(
+        path, active, "- name: Validate native/WASM release identity", 6,
+        "publishable source identity", errors,
+    )
+    if _yaml_mapping_entries_at_indent(source_identity, 8) != [
+        ("run", "python3 scripts/check_release_identity.py")
+    ]:
+        errors.append(f"{path}: publication must retain strict dated source identity validation")
     jobs = _single_yaml_block(path, active, "jobs:", 0, "core release jobs", errors)
     if _yaml_mapping_entries_at_indent(jobs, 2) != [("verify", ""), ("rehearse", ""), ("publish", "")]:
         errors.append(f"{path}: core release must separate verify and publish jobs")

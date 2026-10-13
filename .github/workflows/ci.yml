@@ -154,6 +154,8 @@ jobs:
         run: cargo build --locked
       - name: Build (all features)
         run: cargo build --all-features --locked
+      - name: Verify fresh MSRV consumers
+        run: python3 scripts/check_fresh_consumers.py --output target/fresh-consumers/report.json
       - name: Check standalone renderer
         run: cargo check --manifest-path render/Cargo.toml --all-targets --locked
       - name: Build WebAssembly binding
