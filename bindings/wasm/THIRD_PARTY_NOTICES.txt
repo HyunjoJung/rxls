@@ -5,9 +5,9 @@ Scope:
 - Manifest: bindings/wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 3b2341c54d28ae733932eef6a833124c154d5665b998e09d822cdb24ecb2f6db
-- Third-party packages: 44
-- Unique legal texts: 37
+- Cargo lock SHA-256: 2c11c1fe284e9d48a8411a929b6baeb958d19caa2e0b5bb3ac4911ce80299a07
+- Third-party packages: 45
+- Unique legal texts: 38
 
 The npm package has no npm runtime dependencies. This notice conservatively
 covers every third-party crate reachable through normal Cargo edges used to
@@ -215,6 +215,14 @@ Registry archive SHA-256: 8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
+
+===============================================================================
+PACKAGE: quick-xml 0.41.0
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: MIT
+Registry archive SHA-256: e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1
+Legal files:
+- LICENSE-MIT.md: 5b2c207dcf571267ebe0bbdd5bf321f561ddc22ff597e7b363e96f4539507a29
 
 ===============================================================================
 PACKAGE: quick-xml 0.42.0
@@ -1515,6 +1523,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
+LEGAL TEXT SHA-256: 5b2c207dcf571267ebe0bbdd5bf321f561ddc22ff597e7b363e96f4539507a29
+Referenced by:
+- quick-xml 0.41.0/LICENSE-MIT.md
+----- BEGIN LEGAL TEXT -----
+The MIT License (MIT)
+
+Copyright (c) 2016 Johann Tuffe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
