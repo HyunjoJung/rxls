@@ -65,3 +65,18 @@ This change does not move formula warning history into Rust (B), change Rust
 JSON assembly (C), or provide performance measurements (D). Those require
 separate changes. In particular, B must establish a versioned or negotiated
 response contract before new document-state fields can be added safely.
+
+## Internal JSON assembly
+
+Part C constructs a validated `WorkbookInspection` and a typed mutation envelope
+before encoding JSON. Recalculation joins the same envelope, so neither workbook
+inspection nor mutation results are encoded and then parsed back inside Rust.
+The final conversion to a canonical JSON value preserves the prior response
+bytes, including key order, nulls, and number representation. Public inspection
+responses retain their original struct field order.
+
+Inspection retains its own output ceiling: mutation assembly measures its
+serialized UTF-8 bytes with a counting writer before encoding the final result.
+The complete result also retains the existing output ceiling. Both checks occur
+before swapping the candidate workbook or changing undo/redo history. Snapshot,
+package save/reparse, evaluator, and preservation validation remain unchanged.
