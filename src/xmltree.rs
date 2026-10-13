@@ -282,7 +282,7 @@ impl XmlTree {
                             // Match the old quick-xml behavior: references outside the
                             // document element belonged to the raw prolog/epilog text.
                             let mut raw = Vec::new();
-                            raw.try_reserve(reference.as_ref().len() + 2)
+                            raw.try_reserve(reference.len() + 2)
                                 .map_err(|_| Error::Xml("xml: out of memory growing raw text"))?;
                             raw.push(b'&');
                             raw.extend_from_slice(reference.as_ref());
