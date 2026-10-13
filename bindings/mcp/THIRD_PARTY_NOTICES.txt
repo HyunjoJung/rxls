@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/mcp/Cargo.toml
 - Target: Linux, macOS, and Windows (x86_64/aarch64)
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: c3c7fea90ba3269764adcf96dd7488bf89e702f76cdf5941dca91ef6eacd555f
+- Cargo lock SHA-256: 9c49000ccd6c59d75dee09c746d7690ba2b82a4af82715ecac3bc0669beb6584
 - Third-party packages: 92
 - Unique legal texts: 72
 
@@ -756,10 +756,10 @@ Legal files:
 - LICENSE-UNICODE: f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1
 
 ===============================================================================
-PACKAGE: uuid 1.26.0
+PACKAGE: uuid 1.26.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: Apache-2.0 OR MIT
-Registry archive SHA-256: b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812
+Registry archive SHA-256: 2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce
 Legal files:
 - LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 - LICENSE-MIT: 436bc5a105d8e57dcd8778730f3754f7bf39c14d2f530e4cde4bd2d17a83ec3d
@@ -2285,7 +2285,7 @@ SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 436bc5a105d8e57dcd8778730f3754f7bf39c14d2f530e4cde4bd2d17a83ec3d
 Referenced by:
-- uuid 1.26.0/LICENSE-MIT
+- uuid 1.26.1/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2014 The Rust Project Developers
 Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
@@ -4378,7 +4378,7 @@ Referenced by:
 - once_cell 1.21.4/LICENSE-APACHE
 - scopeguard 1.2.0/LICENSE-APACHE
 - signal-hook-registry 1.4.8/LICENSE-APACHE
-- uuid 1.26.0/LICENSE-APACHE
+- uuid 1.26.1/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
                               Apache License
                         Version 2.0, January 2004

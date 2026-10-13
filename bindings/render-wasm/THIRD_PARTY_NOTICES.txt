@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 953b711067c2bf364f9e3e4f8ef570b169341d508fdfc58590087fa4c5bfcbd9
+- Cargo lock SHA-256: e2bcc801f46bc2c5ea4fce9cd86fc4990d05e00f08d64341e1254018d13c31e4
 - Third-party packages: 87
 - Unique legal texts: 80
 
@@ -712,10 +712,10 @@ Legal files:
 - LICENSE-MIT: 7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0
 
 ===============================================================================
-PACKAGE: uuid 1.24.0
+PACKAGE: uuid 1.26.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: Apache-2.0 OR MIT
-Registry archive SHA-256: bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239
+Registry archive SHA-256: 2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce
 Legal files:
 - LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 - LICENSE-MIT: 436bc5a105d8e57dcd8778730f3754f7bf39c14d2f530e4cde4bd2d17a83ec3d
@@ -2224,7 +2224,7 @@ SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 436bc5a105d8e57dcd8778730f3754f7bf39c14d2f530e4cde4bd2d17a83ec3d
 Referenced by:
-- uuid 1.24.0/LICENSE-MIT
+- uuid 1.26.1/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2014 The Rust Project Developers
 Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon
@@ -5006,7 +5006,7 @@ Referenced by:
 - unicode-ccc 0.4.0/LICENSE-APACHE
 - unicode-properties 0.1.4/LICENSE-APACHE
 - unicode-segmentation 1.13.3/LICENSE-APACHE
-- uuid 1.24.0/LICENSE-APACHE
+- uuid 1.26.1/LICENSE-APACHE
 - wasm-bindgen 0.2.129/LICENSE-APACHE
 - wasm-bindgen-macro 0.2.129/LICENSE-APACHE
 - wasm-bindgen-macro-support 0.2.129/LICENSE-APACHE
