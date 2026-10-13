@@ -651,7 +651,13 @@ try {
   // Escape is a mobile drawer shortcut; the desktop panel stays usable.
   await page.locator("#sidebar-toggle").focus();
   await page.keyboard.press("Enter");
+  // Keyboard dispatch can finish before the sidebar visibility transition.
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
   await page.locator("#panel-open").focus();
+  assert.equal(
+    await page.locator("#panel-open").evaluate((element) => document.activeElement === element),
+    true,
+  );
   await page.keyboard.press("Escape");
   assert.equal(
     await page.locator("#sidebar-toggle").getAttribute("aria-expanded"),
@@ -671,6 +677,7 @@ try {
   await panelToggle.focus();
   await page.keyboard.press("Enter");
   assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
   assert.equal(
     await page.locator("#sidebar").evaluate((element) => element.inert),
     false,
@@ -694,6 +701,7 @@ try {
 
   await page.keyboard.press("Space");
   assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
   // The panel can remain open behind a modal; the modal owns the first Escape.
   await page.keyboard.press("Control+e");
   await page.locator("#cell-dialog").waitFor({ state: "visible" });
