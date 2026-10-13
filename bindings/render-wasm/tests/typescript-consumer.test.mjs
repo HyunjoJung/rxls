@@ -455,6 +455,31 @@ const runtime = installRenderWorker({ wasm, scope });
 void [page, factory, range, ready, runtime];
 `;
 
+// Internal declarations are shipped for module-relative resolution, without a
+// public package subpath. Check their paired runtime surface in both modes too.
+const internalContractsConsumer = String.raw`
+import { createResponseValidators } from "./node_modules/@rxls/render-worker/js/response-contracts.mjs";
+import type { EditState, RecalculationSummary } from "@rxls/render-worker";
+
+const validators = createResponseValidators({
+  invalid: (message) => new Error(message),
+  maxSheets: 255,
+  maxOutputBytes: 16 * 1024 * 1024,
+  maxHistoryEntries: 20,
+  maxHistoryBytes: 32 * 1024 * 1024,
+});
+declare const editState: EditState;
+declare const summary: RecalculationSummary;
+const validation: void = validators.validateRecalculationMatch(editState, summary);
+// @ts-expect-error The operation summary is mandatory.
+validators.validateRecalculationMatch(editState);
+// @ts-expect-error The observation must use the versioned EditState contract.
+validators.validateRecalculationMatch({ schemaVersion: 1 }, summary);
+// @ts-expect-error Counts and reasons must use the recalculation summary contract.
+validators.validateRecalculationMatch(editState, { computedCells: "2" });
+void validation;
+`;
+
 function writeConsumer(consumerRoot) {
   fs.writeFileSync(
     path.join(consumerRoot, "package.json"),
@@ -462,6 +487,7 @@ function writeConsumer(consumerRoot) {
   );
   fs.writeFileSync(path.join(consumerRoot, "node-next-consumer.mts"), nodeNextConsumer);
   fs.writeFileSync(path.join(consumerRoot, "bundler-consumer.ts"), bundlerConsumer);
+  fs.writeFileSync(path.join(consumerRoot, "internal-contracts-consumer.mts"), internalContractsConsumer);
   const shared = {
     allowUnreachableCode: false,
     exactOptionalPropertyTypes: true,
@@ -483,7 +509,7 @@ function writeConsumer(consumerRoot) {
         module: "NodeNext",
         moduleResolution: "NodeNext",
       },
-      files: ["node-next-consumer.mts"],
+      files: ["node-next-consumer.mts", "internal-contracts-consumer.mts"],
     }, null, 2)}\n`,
   );
   fs.writeFileSync(
@@ -494,7 +520,7 @@ function writeConsumer(consumerRoot) {
         module: "ESNext",
         moduleResolution: "Bundler",
       },
-      files: ["bundler-consumer.ts"],
+      files: ["bundler-consumer.ts", "internal-contracts-consumer.mts"],
     }, null, 2)}\n`,
   );
 }
@@ -540,6 +566,7 @@ test("packed package type-checks in clean strict NodeNext and Bundler consumers"
       "js/protocol.d.mts",
       "js/worker-runtime.d.mts",
       "js/worker.d.mts",
+      "js/response-contracts.d.mts",
     ]) {
       assert.ok(
         fs.statSync(path.join(installedRoot, declaration)).isFile(),
