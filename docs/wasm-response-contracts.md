@@ -61,10 +61,10 @@ merging. This PR does not claim parsing, rendering or edit-latency improvements.
 
 ## Remaining issue scope
 
-This change does not move formula warning history into Rust (B), change Rust
-JSON assembly (C), or provide performance measurements (D). Those require
-separate changes. In particular, B must establish a versioned or negotiated
-response contract before new document-state fields can be added safely.
+Parts A, B, and C are implemented here: shared response rules, Rust-owned
+calculation observations under protocol v3, and internal JSON assembly as
+described below. Part D requires separately recorded before/after native and
+browser measurements; contract tests alone do not establish performance gains.
 
 ## Internal JSON assembly
 
