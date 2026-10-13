@@ -8,6 +8,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserved punctuation and doubled quotes inside formula text literals (#135),
+  including email, bracket and brace strings. OpenFormula separators/references
+  normalize outside quoted text and sheet names; real external/array syntax
+  retains its typed fallback and stored cache.
+- Recognized the exact case-insensitive `_xlfn.IFNA` function-call spelling
+  stored by Excel, using existing IFNA semantics without changing formula source,
+  literals, defined names or other future-function support.
+- Kept extended worksheet-title properties coherent across package-preserving
+  sheet addition, renaming and deletion (#130). Worksheet counts and title
+  groups update together, unrelated properties and scalar comments are retained,
+  and malformed metadata rejects atomically without an empty-variant panic.
+- Corrected decimal steps in `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC` (#134),
+  including `1.1`, `1.15`, halfway `1.005`, signs and negative precision.
+  A bounded 15-significant-digit decimal policy avoids binary scale noise and
+  intermediate overflow; unsupported extreme precision still returns `#NUM!`.
+- Distinguished literal arguments from single-cell, range and named references
+  in formula aggregates (#133). Referenced text/booleans are omitted by numeric
+  reducers, invalid direct text returns `#VALUE!`, and `COUNT` ignores errors.
+  Conditional and unary results retain their Excel argument-coercion behavior.
+- Omitted existing worksheet dimensions after package-preserving value/formula,
+  range and nonempty appended-row writes (#132), allowing streaming readers to
+  discover added cells. Absent dimensions stay absent; cache-only/clear edits
+  and foreign dimension-like XML retain their metadata.
+- Normalized XLSX ISO date cells and date formula caches to the workbook's date
+  system (#128), preserving calendar values in 1904 rewrites and before March
+  1900. Time-only values retain their day fractions in either system.
+- Preserved SpreadsheetML ST_Xstring cell text across shared/inline/rich reads,
+  authoring, edits and text formula-cache updates (#131). Literal escape-shaped
+  strings, carriage returns, encodable controls and cache whitespace retain
+  their exact values;
+  string length limits and XML output budgets still apply.
+- Restored Ctrl/Meta+Shift+Z after the sole edit is undone in the viewer (#137).
+  The shortcut checks redo availability while preserving draft/input guards,
+  Ctrl/Meta+Y and toolbar history behavior.
+- Preserved `.svg` and `.png` suffixes when VS Code export filenames exceed
+  120 characters (#136). Export status now reflects accepted bytes, completed
+  saves, cancellation and failures; invalid matching API responses reject promptly.
 - Coalesced adjacent columns with identical resolved layout into compact XLSX
   intervals (#127), avoiding expansion of a full-width format into 16,384
   singleton records. Width flags, styles, visibility, outline boundaries and
