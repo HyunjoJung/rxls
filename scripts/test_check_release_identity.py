@@ -174,8 +174,8 @@ class PackageIdentityTests(unittest.TestCase):
         self.assert_detected("bindings/render-wasm/Cargo.lock wasm-bindgen")
 
     def test_render_build_rust_matches_declared_floor(self) -> None:
-        self.replace("bindings/render-wasm/toolchain-lock.json", '"rust": "1.85.0"',
-                     '"rust": "1.88.0"')
+        self.replace("bindings/render-wasm/toolchain-lock.json", '"rust": "1.88.0"',
+                     '"rust": "1.85.0"')
         self.assert_detected("bindings/render-wasm/toolchain-lock.json rust")
 
     def test_native_renderer_can_advance_without_changing_other_package_versions(self) -> None:

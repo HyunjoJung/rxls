@@ -117,17 +117,17 @@ handlers, external paint resources, or non-embedded image data.
 Run focused gates from this directory:
 
 ```sh
-RUST_185_BIN="$(dirname "$(rustup which cargo --toolchain 1.85.0)")"
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" test --locked
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" clippy --locked --all-targets -- -D warnings
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" check \
+RUST_188_BIN="$(dirname "$(rustup which cargo --toolchain 1.88.0)")"
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" test --locked
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" clippy --locked --all-targets -- -D warnings
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" check \
   --target wasm32-unknown-unknown --locked
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 RUSTDOCFLAGS="-D warnings" \
-  "$RUST_185_BIN/cargo" doc --locked --no-deps
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 RUSTDOCFLAGS="-D warnings" \
+  "$RUST_188_BIN/cargo" doc --locked --no-deps
 npm test
 rustup toolchain install 1.88.0 --profile minimal
 WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.126.XXXXXX")"
@@ -139,8 +139,7 @@ PATH="$WASM_BINDGEN_TOOL_ROOT/bin:$PATH" npm run build:wasm
 npm run test:browser
 ```
 
-`toolchain-lock.json` pins the Rust 1.85 source MSRV, the separate Rust 1.88
-host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
+`toolchain-lock.json` pins the Rust 1.88 source MSRV and host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
 isolated tool root, wasm-pack/wasm-bindgen, the exact Chrome for Testing archive
 identity, and browser heap/retention ceilings. The release-runner Linux
 process-tree RSS ceiling remains 1 GiB. macOS uses a separate 2 GiB absolute

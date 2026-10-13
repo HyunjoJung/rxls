@@ -174,7 +174,8 @@ and verified independently from the core crate.
 
 Features are additive. Use `default-features = false` for an XLS-only library
 build or `features = ["full"]` for every reader and typed-data helper. The
-minimum supported Rust version is 1.85.
+minimum supported Rust version for this checkout is 1.88. The previously
+published Rust 1.85 artifacts retain their original compiler requirement.
 
 Version 0.1.3 defines the current published API and semantics; this checkout
 prepares the compatible 0.1.4 update. CI and release verification compare all,

@@ -40,7 +40,7 @@ MANIFEST = f"""
 [package]
 name = "rxls"
 version = "{VERSION}"
-rust-version = "1.85"
+rust-version = "1.88"
 {FEATURES}
 {DEPENDENCIES}
 """

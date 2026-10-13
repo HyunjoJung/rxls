@@ -160,9 +160,9 @@ ORACLE_RENDER_STEP_SHA256 = (
     "d7309145407cf422dfc95d5fce782e01278fd42a8a878c31f14405033fdd833f",
     "450afbeb424f03bb000719f015ac895f147f98bad6f4f00c76dc019f0297bf99",
     "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
-    "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
-    "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
-    "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
+    "d2493f20353947df340238b2261ee4a0651b5555a46e31a534b64e33a786a986",
+    "dd2704b751336e12caf395f7faeb6109b63b264051a296169a9bd0a693874129",
+    "429eda5bacd6487fae364911fa9147d2573ec36b55abf8e13b94eca23699fb15",
     "054c41f51299ec5331abca90af10c81e7538c3588255d358461e23dc26825b48",
     "8cccee4bac68dd280966abd02de29d9c09dea1dff1bc433b1d197768bc2c50c7",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
@@ -188,16 +188,16 @@ ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "802ea7d98349d84fb02478e9b97d284563e396e997c7a58fec999dc33f6c8816"
+    "82d4907dc84ab5ef8d1023da8ac4679c8151e429e3f17e278a970af465019c38"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "d7a82aae13ec0231abefd30a3d954c2fbd2034083f04872c60da6af153510c7f"
+    "a6969a92b177766ba77a37ed2d2e3b2c13a2e2b59ff473bf84b5cbe0473a777a"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "8e89442f1843fdf417b87424b1c4c79875b78384e62a1d5d6d128ffdbf73f311"
+    "0ffd7dddcedb2ed74f0bdafa0758d38adc0757c3695961efa58129368101e368"
 )
 WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "39a36f584d18859cb9ddcdbf0ee45cc2ef5712acb0448bfde575818b7ebfeac8"
+    "4537b09a60efbaae26273fe6e9f36c4d526aed9048b94f2b0a204817387fa663"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -2395,7 +2395,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
             errors.append(f"{path}: {message}")
 
     for name, value in (
-        ("WASM_MSRV", "1.85.0"),
+        ("WASM_MSRV", "1.88.0"),
         ("WASM_BINDGEN_BUILD_RUST", RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST),
         ("WASM_BINDGEN_VERSION", RENDER_PACKAGE_WASM_BINDGEN_VERSION),
         ("NODE_VERSION", RENDER_PACKAGE_NODE_VERSION),
@@ -3359,62 +3359,62 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "          command -v pdfinfo\n"
         "          command -v pdftoppm\n"
         "          command -v pdftotext\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
@@ -3447,26 +3447,26 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "          set -euo pipefail\n"
         '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]\n'
         '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
@@ -6460,7 +6460,7 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         "CARGO_DENY_SHA256": (
             "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
         ),
-        "WASM_MSRV": "1.85.0",
+        "WASM_MSRV": "1.88.0",
         "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
         "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
         "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,

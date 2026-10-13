@@ -108,6 +108,7 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_mcp_packaging_rejects_unbound_source_and_mutable_cargo(self) -> None:
         original = CI_WORKFLOW.read_text(encoding="utf-8")
+        mcp_job = self.policy._yaml_blocks(original, "mcp:", 2)[0]
         mutations = {
             "mutable cargo": original.replace(
                 "rustup toolchain install 1.96.1 --profile minimal --no-self-update",
@@ -118,7 +119,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             "bare package": original + "\n      - run: cargo package --manifest-path bindings/mcp/Cargo.toml --locked\n",
             "missing receipt": original.replace(
                 "path: bindings/mcp/target/package-candidate/*", "path: bindings/mcp/target/release/*", 1),
-            "wrong MCP compiler": original.replace("toolchain: 1.88.0", "toolchain: stable", 1),
+            "wrong MCP compiler": original.replace(
+                mcp_job, mcp_job.replace("toolchain: 1.88.0", "toolchain: stable", 1), 1),
             "unbounded MCP job": original.replace("    timeout-minutes: 45\n", "", 1),
         }
         for name, text in mutations.items():

@@ -270,8 +270,8 @@ def validate(
                                 errors.append(
                                     "package identity does not match source manifest"
                                 )
-                            if metadata.get("rust-version") != "1.85":
-                                errors.append("packaged core MSRV is not 1.85")
+                            if metadata.get("rust-version") != "1.88":
+                                errors.append("packaged core MSRV is not 1.88")
                             dependencies = sorted(manifest.get("dependencies", {}))
                             if set(dependencies) != ALLOWED_DEPENDENCIES:
                                 errors.append("core dependency profile changed")
