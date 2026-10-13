@@ -163,9 +163,7 @@ fn read_image_parts_with_limits(
         if size > remaining {
             continue;
         }
-        let Ok(name) = file.name() else {
-            continue;
-        };
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
         let Some(path) = normalize_package_path(&name) else {
             continue;
         };

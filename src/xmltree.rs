@@ -282,7 +282,7 @@ impl XmlTree {
                             // Match the old quick-xml behavior: references outside the
                             // document element belonged to the raw prolog/epilog text.
                             let mut raw = Vec::new();
-                            raw.try_reserve(reference.as_ref().len() + 2)
+                            raw.try_reserve(reference.len() + 2)
                                 .map_err(|_| Error::Xml("xml: out of memory growing raw text"))?;
                             raw.push(b'&');
                             raw.extend_from_slice(reference.as_ref());
@@ -884,8 +884,8 @@ fn element_node(e: &quick_xml_raw::events::BytesStart<'_>, self_closing: bool) -
 /// `XmlTree` at all rather than becoming silently corruptible once promoted.
 fn unescape_bytes(raw: &[u8]) -> Result<Vec<u8>> {
     let s = std::str::from_utf8(raw).map_err(|_| Error::Xml("xml text is not valid utf-8"))?;
-    let c =
-        quick_xml_raw::escape::unescape(s).map_err(|_| Error::Xml("malformed xml entity reference"))?;
+    let c = quick_xml_raw::escape::unescape(s)
+        .map_err(|_| Error::Xml("malformed xml entity reference"))?;
     if has_xml_illegal_char(&c) {
         return Err(Error::Xml("xml text contains an xml 1.0 illegal character"));
     }

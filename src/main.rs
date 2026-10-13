@@ -8,6 +8,9 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[cfg(any(feature = "xlsx", feature = "ods"))]
+mod zipname;
+
 use rxls::{
     export_csv, Cell, CsvFormulaPolicy, CsvNewline, CsvOptions, DocProperties, Error, SheetType,
     SheetView, SheetVisible, Workbook, WorkbookReport,
@@ -3670,13 +3673,7 @@ fn inspect_package_bytes(
                 return Err(ExitCode::from(65));
             }
         };
-        let name = match file.name() {
-            Ok(name) => name.into_owned(),
-            Err(err) => {
-                eprintln!("{command} {label}: invalid ZIP entry name {index}: {err}");
-                return Err(ExitCode::from(65));
-            }
-        };
+        let name = zipname::entry_name(file.name_raw(), file.flags().as_u16()).into_owned();
         let compressed_bytes = file.compressed_size();
         let uncompressed_bytes = file.size();
         if name.ends_with(".rels") {
