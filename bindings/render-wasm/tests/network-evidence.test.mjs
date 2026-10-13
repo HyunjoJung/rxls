@@ -371,7 +371,7 @@ test("source route evidence is an exact same-origin multiset with one nonce quer
     contexts,
     routes
   });
-  assert.equal(result.requestCount, 19);
+  assert.equal(result.requestCount, 22);
   assert.match(result.routeSha256, /^[0-9a-f]{64}$/);
   assert.equal(
     result.routes.filter(({ routeKey }) =>
@@ -414,8 +414,8 @@ test("source route evidence is an exact same-origin multiset with one nonce quer
   );
 
   const misowned = sourceRouteEvidence();
-  misowned[10] = {
-    ...misowned[10],
+  misowned[11] = {
+    ...misowned[11],
     sessionId: instrumentation.pageSessionId
   };
   assert.throws(
@@ -497,7 +497,7 @@ test("installed route policy uses only installed package runtime paths", () => {
     contexts: normalizedInstalledContexts(installedPageUrl),
     routes: installedRouteEvidence()
   });
-  assert.equal(result.requestCount, 19);
+  assert.equal(result.requestCount, 22);
   assert.ok(
     result.routes.some(
       ({ routeKey }) => routeKey === "/installed-package/js/client.mjs"
@@ -510,6 +510,67 @@ test("installed route policy uses only installed package runtime paths", () => {
     )
   );
 });
+
+for (const mode of ["source", "installed"]) {
+  test(`${mode} response contracts load exactly once in the page and each worker`, () => {
+    const installed = mode === "installed";
+    const modePageUrl = installed
+      ? "http://127.0.0.1:4173/tests/browser/installed-package.html"
+      : pageUrl;
+    const contexts = installed
+      ? normalizedInstalledContexts(modePageUrl)
+      : normalizedSourceContexts();
+    const routes = installed ? installedRouteEvidence() : sourceRouteEvidence();
+    const validate = (evidence) => validateSameOriginRouteEvidence({
+      mode,
+      pageUrl: modePageUrl,
+      hardStopNonce: nonce,
+      instrumentation,
+      contexts,
+      routes: evidence
+    });
+    const contractRoutes = validate(routes).routes.filter(({ routeKey }) =>
+      routeKey.endsWith("/js/response-contracts.mjs")
+    );
+    assert.deepEqual(
+      contractRoutes.map(({ owner }) => owner),
+      ["page", "primary", "hard-stop"]
+    );
+
+    for (const { requestId, sessionId } of contractRoutes) {
+      assert.throws(
+        () => validate(routes.filter((route) => route.requestId !== requestId)),
+        /response-contracts\.mjs was observed 0 times instead of 1/
+      );
+      const original = routes.find((route) => route.requestId === requestId);
+      assert.throws(
+        () => validate([
+          ...routes,
+          {
+            ...original,
+            requestId: `duplicate-${sessionId}`,
+            sequence: routes.at(-1).sequence + 1
+          }
+        ]),
+        /response-contracts\.mjs was observed 2 times instead of 1/
+      );
+      assert.throws(
+        () => validate(routes.map((route) => route.requestId === requestId
+          ? { ...route, url: route.url.replace("response-contracts.mjs", "unknown.mjs") }
+          : route)),
+        /unknown .* route/
+      );
+      if (installed) {
+        assert.throws(
+          () => validate(routes.map((route) => route.requestId === requestId
+            ? { ...route, url: "/js/response-contracts.mjs" }
+            : route)),
+          /unknown .* route/
+        );
+      }
+    }
+  });
+}
 
 test("CSP page control cannot emit any Network or Fetch event", () => {
   const proof = {
@@ -718,14 +779,17 @@ function sourceRouteEvidence() {
     "/tests/browser/proof.mjs",
     "/js/client.mjs",
     "/js/protocol.mjs",
+    "/js/response-contracts.mjs",
     "/js/worker.mjs",
     "/js/worker-runtime.mjs",
     "/js/protocol.mjs",
+    "/js/response-contracts.mjs",
     "/pkg/rxls_render_wasm.js",
     "/pkg/rxls_render_wasm_bg.wasm",
     `/js/worker.mjs?rxls-hard-stop=${nonce}`,
     "/js/worker-runtime.mjs",
     "/js/protocol.mjs",
+    "/js/response-contracts.mjs",
     "/pkg/rxls_render_wasm.js",
     "/pkg/rxls_render_wasm_bg.wasm"
   ]);
@@ -765,14 +829,17 @@ function installedRouteEvidence() {
     "/tests/browser/proof.mjs",
     "/installed-package/js/client.mjs",
     "/installed-package/js/protocol.mjs",
+    "/installed-package/js/response-contracts.mjs",
     "/installed-package/js/worker.mjs",
     "/installed-package/js/worker-runtime.mjs",
     "/installed-package/js/protocol.mjs",
+    "/installed-package/js/response-contracts.mjs",
     "/installed-package/pkg/rxls_render_wasm.js",
     "/installed-package/pkg/rxls_render_wasm_bg.wasm",
     `/installed-package/js/worker.mjs?rxls-hard-stop=${nonce}`,
     "/installed-package/js/worker-runtime.mjs",
     "/installed-package/js/protocol.mjs",
+    "/installed-package/js/response-contracts.mjs",
     "/installed-package/pkg/rxls_render_wasm.js",
     "/installed-package/pkg/rxls_render_wasm_bg.wasm"
   ]);
@@ -783,9 +850,9 @@ function routeEvidence(paths) {
     sequence: index + 5,
     requestId: `route-${index}`,
     sessionId:
-      index <= 9 || index === 14
+      index <= 10 || index === 16
         ? instrumentation.pageSessionId
-        : index <= 13
+        : index <= 15
           ? "primary-session"
           : "hard-stop-session",
     method: "GET",

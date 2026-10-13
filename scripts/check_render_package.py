@@ -42,6 +42,7 @@ NOTICE_NAME = "THIRD_PARTY_NOTICES.txt"
 DECLARATION_MODULES = {
     "js/client.mjs": "js/client.d.mts",
     "js/protocol.mjs": "js/protocol.d.mts",
+    "js/response-contracts.mjs": "js/response-contracts.d.mts",
     "js/worker-runtime.mjs": "js/worker-runtime.d.mts",
     "js/worker.mjs": "js/worker.d.mts",
 }
@@ -54,6 +55,8 @@ EXPECTED_FILES = frozenset(
         "js/client.mjs",
         "js/protocol.d.mts",
         "js/protocol.mjs",
+        "js/response-contracts.d.mts",
+        "js/response-contracts.mjs",
         "js/worker-runtime.d.mts",
         "js/worker-runtime.mjs",
         "js/worker.d.mts",

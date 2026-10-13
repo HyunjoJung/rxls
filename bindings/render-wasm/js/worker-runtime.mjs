@@ -1,3 +1,4 @@
+import { createResponseValidators } from "./response-contracts.mjs";
 import {
   MAX_DPI,
   MAX_EDIT_HISTORY_BYTES,
@@ -62,6 +63,7 @@ export class RenderWorkerRuntime {
   #maxPngBytes;
   #maxEditHistoryEntries;
   #maxEditHistoryBytes;
+  #responses;
 
   constructor({ wasm, send }) {
     if (wasm === null || typeof wasm !== "object") {
@@ -97,6 +99,13 @@ export class RenderWorkerRuntime {
       MAX_EDIT_HISTORY_BYTES,
       "maxHistoryBytes"
     );
+    this.#responses = createResponseValidators({
+      invalid: (message) => new RenderProtocolError("wasm_api_mismatch", message, "wasm"),
+      maxSheets: MAX_SHEETS,
+      maxOutputBytes: this.#maxOutputBytes,
+      maxHistoryEntries: this.#maxEditHistoryEntries,
+      maxHistoryBytes: this.#maxEditHistoryBytes
+    });
   }
 
   receive(rawMessage) {
@@ -359,17 +368,15 @@ export class RenderWorkerRuntime {
     }
     const session = new Session(bytes, fontBundle);
     try {
-      const workbook = validateWorkbookInspection(
+      const workbook = this.#responses.validateWorkbookInspection(
         parseBoundedJson(
           await session.inspectionJson(),
           "inspection",
           this.#maxOutputBytes
         )
       );
-      const editState = validateEditState(
-        parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes),
-        this.#maxEditHistoryEntries,
-        this.#maxEditHistoryBytes
+      const editState = this.#responses.validateEditState(
+        parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes)
       );
       const historyReservationBytes =
         editState.capability === "read-write" ? this.#maxEditHistoryBytes : 0;
@@ -558,10 +565,8 @@ export class RenderWorkerRuntime {
 
   async #editStatus(payload) {
     const { documentId, session } = this.#document(payload);
-    const editState = validateEditState(
-      parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes),
-      this.#maxEditHistoryEntries,
-      this.#maxEditHistoryBytes
+    const editState = this.#responses.validateEditState(
+      parseBoundedJson(await session.editStateJson(), "edit state", this.#maxOutputBytes)
     );
     return { documentId, editState };
   }
@@ -584,7 +589,7 @@ export class RenderWorkerRuntime {
     ) {
       throw invalidCellInspection();
     }
-    validateInspectedCell(cell.value);
+    this.#responses.validateInspectedCell(cell.value);
     return { value: { documentId, ...cell } };
   }
 
@@ -669,12 +674,8 @@ export class RenderWorkerRuntime {
         "wasm"
       );
     }
-    const workbook = validateWorkbookInspection(result.workbook);
-    const editState = validateEditState(
-      result.editState,
-      this.#maxEditHistoryEntries,
-      this.#maxEditHistoryBytes
-    );
+    const workbook = this.#responses.validateWorkbookInspection(result.workbook);
+    const editState = this.#responses.validateEditState(result.editState);
     return recalculate
       ? { workbook, editState, recalculation: validateRecalculationSummary(result.recalculation) }
       : { workbook, editState };
@@ -1072,83 +1073,6 @@ function safeContractText(value, maxBytes) {
   return boundedText(value, maxBytes) && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function validateWorkbookInspection(value) {
-  if (
-    !plainRecord(value) ||
-    !hasExactKeys(value, [
-      "schemaVersion",
-      "sheetCount",
-      "sheets",
-      "embeddedImages",
-      "embeddedImageBytes",
-      "fontPackSha256",
-      "fontFaces",
-      "properties"
-    ]) ||
-    value.schemaVersion !== 1 ||
-    !Number.isSafeInteger(value.sheetCount) ||
-    value.sheetCount < 0 ||
-    value.sheetCount > MAX_SHEETS ||
-    !Array.isArray(value.sheets) ||
-    value.sheets.length !== value.sheetCount ||
-    !nonNegativeSafeInteger(value.embeddedImages) ||
-    !nonNegativeSafeInteger(value.embeddedImageBytes) ||
-    (value.fontPackSha256 !== null && !validSha256(value.fontPackSha256)) ||
-    !nonNegativeSafeInteger(value.fontFaces) ||
-    !validDocumentProperties(value.properties)
-  ) {
-    throw new RenderProtocolError(
-      "wasm_api_mismatch",
-      "workbook inspection does not satisfy the worker contract",
-      "wasm"
-    );
-  }
-  let embeddedImages = 0;
-  for (const [index, sheet] of value.sheets.entries()) {
-    if (
-      !plainRecord(sheet) ||
-      !hasExactKeys(sheet, ["index", "name", "embeddedImages"]) ||
-      sheet.index !== index ||
-      typeof sheet.name !== "string" ||
-      sheet.name.length === 0 ||
-      !nonNegativeSafeInteger(sheet.embeddedImages)
-    ) {
-      throw new RenderProtocolError(
-        "wasm_api_mismatch",
-        "workbook sheet inspection does not satisfy the worker contract",
-        "wasm"
-      );
-    }
-    embeddedImages += sheet.embeddedImages;
-  }
-  if (!Number.isSafeInteger(embeddedImages) || embeddedImages !== value.embeddedImages) {
-    throw new RenderProtocolError(
-      "wasm_api_mismatch",
-      "workbook image totals do not match its sheets",
-      "wasm"
-    );
-  }
-  return value;
-}
-
-function validDocumentProperties(value) {
-  const fields = [
-    "title",
-    "subject",
-    "creator",
-    "keywords",
-    "description",
-    "lastModifiedBy",
-    "company",
-    "created"
-  ];
-  return (
-    plainRecord(value) &&
-    hasExactKeys(value, fields) &&
-    fields.every((field) => value[field] === null || typeof value[field] === "string")
-  );
-}
-
 function nonNegativeSafeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
@@ -1167,108 +1091,6 @@ function hasZipLocalHeader(value) {
   );
 }
 
-function validateEditState(value, maxHistoryEntries, maxHistoryBytes) {
-  const reasons = new Set([
-    "legacy-biff",
-    "binary-package",
-    "open-document",
-    "package-metadata-loss"
-  ]);
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    value.schemaVersion !== 1 ||
-    !["read-write", "read-only"].includes(value.capability) ||
-    (value.reason !== null && !reasons.has(value.reason)) ||
-    typeof value.dirty !== "boolean" ||
-    typeof value.canUndo !== "boolean" ||
-    typeof value.canRedo !== "boolean" ||
-    !Number.isSafeInteger(value.undoDepth) ||
-    value.undoDepth < 0 ||
-    value.undoDepth > maxHistoryEntries ||
-    !Number.isSafeInteger(value.redoDepth) ||
-    value.redoDepth < 0 ||
-    value.redoDepth > maxHistoryEntries ||
-    value.undoDepth + value.redoDepth > maxHistoryEntries ||
-    !Number.isSafeInteger(value.historyBytes) ||
-    value.historyBytes < 0 ||
-    value.historyBytes > maxHistoryBytes ||
-    !Array.isArray(value.editedParts) ||
-    value.editedParts.length > MAX_SHEETS + 8 ||
-    value.editedParts.some((part) => !safeEditedPart(part))
-  ) {
-    throw new RenderProtocolError(
-      "wasm_api_mismatch",
-      "edit state does not satisfy the worker contract",
-      "wasm"
-    );
-  }
-  if (
-    (value.capability === "read-write" && value.reason !== null) ||
-    (value.capability === "read-only" && !reasons.has(value.reason)) ||
-    value.canUndo !== (value.undoDepth > 0) ||
-    value.canRedo !== (value.redoDepth > 0) ||
-    (value.undoDepth + value.redoDepth > 0) !== (value.historyBytes > 0) ||
-    (!value.dirty && value.editedParts.length > 0) ||
-    (value.capability === "read-only" &&
-      (value.dirty || value.undoDepth > 0 || value.redoDepth > 0)) ||
-    !strictlySortedUnique(value.editedParts)
-  ) {
-    throw new RenderProtocolError(
-      "wasm_api_mismatch",
-      "edit state contains contradictory capability or history metadata",
-      "wasm"
-    );
-  }
-  return value;
-}
-
-function validateInspectedCell(value, depth = 0) {
-  if (!plainRecord(value) || depth > 16 || typeof value.kind !== "string") {
-    throw invalidCellInspection();
-  }
-  switch (value.kind) {
-    case "blank":
-      if (!hasExactKeys(value, ["kind"])) {
-        throw invalidCellInspection();
-      }
-      return;
-    case "text":
-    case "error":
-      if (!hasExactKeys(value, ["kind", "value"]) || typeof value.value !== "string") {
-        throw invalidCellInspection();
-      }
-      return;
-    case "number":
-    case "date":
-      if (
-        !hasExactKeys(value, ["kind", "value"]) ||
-        typeof value.value !== "number" ||
-        !Number.isFinite(value.value)
-      ) {
-        throw invalidCellInspection();
-      }
-      return;
-    case "boolean":
-      if (!hasExactKeys(value, ["kind", "value"]) || typeof value.value !== "boolean") {
-        throw invalidCellInspection();
-      }
-      return;
-    case "formula":
-      if (
-        !hasExactKeys(value, ["kind", "formula", "cached"]) ||
-        typeof value.formula !== "string"
-      ) {
-        throw invalidCellInspection();
-      }
-      validateInspectedCell(value.cached, depth + 1);
-      return;
-    default:
-      throw invalidCellInspection();
-  }
-}
-
 function plainRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -1283,18 +1105,6 @@ function invalidCellInspection() {
     "wasm_api_mismatch",
     "cell inspection does not match the worker contract",
     "wasm"
-  );
-}
-
-function safeEditedPart(value) {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= 512 &&
-    !value.startsWith("/") &&
-    !value.includes("\\") &&
-    !value.split("/").some((segment) => segment === "" || segment === "." || segment === "..") &&
-    !/[\u0000-\u001f\u007f]/.test(value)
   );
 }
 
