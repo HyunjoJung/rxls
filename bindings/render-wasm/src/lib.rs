@@ -2722,9 +2722,9 @@ mod tests {
 
         let error = session
             .set_cell_json_core(
-                "{\"sheetIndex\":0,\"row\":0,\"col\":0,\"value\":{\"kind\":\"text\",\"value\":\"bad\\u0001text\"}}",
+                "{\"sheetIndex\":0,\"row\":0,\"col\":0,\"value\":{\"kind\":\"error\",\"value\":\"#BAD\\u0001!\"}}",
             )
-            .expect_err("invalid XML text must fail");
+            .expect_err("invalid XML error value must fail");
         assert_eq!(error.code, "edit_failed");
         assert_eq!(session.edit_state_value(), before_state);
         assert_eq!(
@@ -2733,6 +2733,33 @@ mod tests {
                 .expect("save after failure"),
             before
         );
+    }
+
+    #[test]
+    fn editable_session_control_text_and_formula_caches_round_trip() {
+        let text = "cell\0control\u{1}";
+        for value in [
+            serde_json::json!({"kind":"text","value":text}),
+            serde_json::json!({"kind":"formula","formula":"=A2","cached":{"kind":"text","value":text}}),
+        ] {
+            let mut session = RenderSession::new_core(&authored_workbook(), &[]).unwrap();
+            let original = session.save_document_bytes_core().unwrap();
+            let request = serde_json::json!({"sheetIndex":0,"row":0,"col":0,"value":value});
+            session.set_cell_json_core(&request.to_string()).unwrap();
+            let saved = session.save_document_bytes_core().unwrap();
+            let reopened = Workbook::open(&saved).unwrap();
+            let cell = reopened.sheets[0].cell(0, 0).unwrap();
+            let cached = match cell {
+                Cell::Formula { cached, .. } => cached.as_ref(),
+                value => value,
+            };
+            assert_eq!(cached, &Cell::Text(text.into()));
+            assert_eq!(session.edit_state_value()["undoDepth"], 1);
+            session.undo_edit_core().unwrap();
+            assert_eq!(session.save_document_bytes_core().unwrap(), original);
+            session.redo_edit_core().unwrap();
+            assert_eq!(session.save_document_bytes_core().unwrap(), saved);
+        }
     }
 
     #[test]
