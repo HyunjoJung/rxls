@@ -126,6 +126,45 @@ def fixture_identity(lock: dict) -> dict:
     }
 
 
+
+def pinned_dependency_lock() -> dict:
+    """Synthetic pinned closure for normal-mode companion/restoration tests.
+
+    The repository lock may intentionally be unpinned for authenticated
+    bootstrap. These unit inputs are neither captured evidence nor production
+    pins; no fixture is written back to the checked-in lock.
+    """
+    lock, _ = MODULE.load_lock()
+    lock["ubuntu_apt"]["bootstrap_packages"] = [
+        {"name": "libc6-dev:amd64", "version": "2.39-0ubuntu8.8"},
+        {"name": "libcairo2:amd64", "version": "1.18.0-3build1"},
+        {"name": "poppler-utils", "version": "24.02.0-1ubuntu9.9"},
+    ]
+    identity = json.loads(json.dumps(fixture_identity(lock)))
+    # Keep the selector inputs explicit: deriving these rows from the runtime's
+    # companion/restoration maps would hide missing-map regressions.
+    libraries = (
+        ("libbz2.so.1.0", "libbz2-1.0:amd64", "1.0.8-5.1build0.1"),
+        ("libexpat.so.1", "libexpat1:amd64", "2.6.1-2ubuntu0.4"),
+        ("libssl.so.3", "libssl3t64:amd64", "3.0.13-0ubuntu3.12"),
+        ("libp11-kit.so.0", "libp11-kit0:amd64", "0.25.3-4ubuntu2.1"),
+        ("libz.so.1", "zlib1g:amd64", "1:1.3.dfsg-3.1ubuntu2.1"),
+        ("libgssapi_krb5.so.2", "libgssapi-krb5-2:amd64", "1.20.1-6ubuntu2.8"),
+        ("libk5crypto.so.3", "libk5crypto3:amd64", "1.20.1-6ubuntu2.8"),
+        ("libkrb5.so.3", "libkrb5-3:amd64", "1.20.1-6ubuntu2.8"),
+        ("libkrb5support.so.0", "libkrb5support0:amd64", "1.20.1-6ubuntu2.8"),
+    )
+    identity["poppler"]["native_libraries"].extend(package_fact(*row) for row in libraries)
+    identity["poppler"]["native_libraries"].sort(key=lambda row: row["name"])
+    python_libc = package_fact("libc.so.6", "libc6:amd64", "2.39-0ubuntu8.8")
+    python_libc["provider"] = python_libc.pop("package_name")
+    python_libc["provider_version"] = python_libc.pop("package_version")
+    identity["python"]["native_libraries"].append(python_libc)
+    identity["python"]["native_libraries"].sort(key=lambda row: row["name"])
+    lock["expected_identity"] = identity
+    return MODULE.validate_lock(lock, MODULE.REQUIREMENTS.read_bytes())
+
+
 def restoration_fixture() -> tuple[dict, bytes]:
     payload = b"authenticated archive fixture"
     record = dict(MODULE.APT_RESTORATIONS[0])
@@ -166,7 +205,7 @@ class RestorationResponse(io.BytesIO):
 
 class RenderOracleHostToolsTests(unittest.TestCase):
     def test_installed_companion_specs_derive_exact_versions_from_locked_libraries(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         installed = {
             "bzip2", "libc6-i386", "libexpat1-dev", "libssl-dev", "p11-kit",
             "p11-kit-modules", "zlib1g-dev",
@@ -183,7 +222,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             ])
 
     def test_absent_companions_are_not_added_and_installed_query_is_bounded(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         output = (
             "bash\tamd64\tinstalled\n"
             "bzip2\tamd64\tconfig-files\n"
@@ -220,7 +259,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                     MODULE.installed_apt_companions()
 
     def test_companion_inventory_query_failure_is_not_treated_as_absence(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         with mock.patch.object(MODULE, "run_text", side_effect=MODULE.HostToolError("apt_companion_query")):
             with self.assertRaisesRegex(MODULE.HostToolError, "apt_companion_query"):
                 MODULE.companion_apt_specs(lock)
@@ -232,7 +271,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             self.assertFalse(query.call_args.kwargs.get("shell", False))
 
     def test_companion_sources_reject_missing_conflicting_foreign_or_unsafe_versions(self) -> None:
-        original, _ = MODULE.load_lock()
+        original = pinned_dependency_lock()
         self.assertEqual(MODULE.APT_COMPANION_SOURCES, {
             "bzip2": "libbz2-1.0", "libc6-i386": "libc6",
             "libexpat1-dev": "libexpat1",
@@ -273,7 +312,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                             MODULE.companion_apt_specs(lock)
 
     def test_companion_versions_are_derived_not_hardcoded(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         versions = {"zlib1g": "2:1.3.fixture-1", "libexpat1": "2.6.1-fixture.9"}
         for section in ("poppler", "cairo", "python"):
             for row in lock["expected_identity"][section]["native_libraries"]:
@@ -289,7 +328,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             ])
 
     def test_companions_are_only_queried_for_pinned_opt_in_and_only_installed_are_added(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         with mock.patch.object(MODULE, "installed_apt_companions") as query:
             for scope in ("all", "poppler", "bootstrap"):
                 self.assertEqual(MODULE.apt_specs(lock, scope), MODULE.default_apt_specs(lock, scope))
@@ -318,7 +357,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         # Hosted pdf job 111745142542 planned these five removals. Only expat-dev
         # has an exact-version coupling to our locked runtime; Python versions
         # remain the runner's installed versions and must not become apt args.
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         before = MODULE.canonical_json_bytes(lock)
         python_dev = {"libpython3-dev", "libpython3.12-dev", "python3-dev", "python3.12-dev"}
         installed = "".join(
@@ -344,7 +383,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         self.assertEqual(MODULE.canonical_json_bytes(lock), before)
 
     def test_expat_companion_absence_and_invalid_installed_state_fail_closed(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         for status in ("not-installed", "config-files"):
             with self.subTest(status=status):
                 with mock.patch.object(MODULE, "run_text", return_value=f"libexpat1-dev\tamd64\t{status}\n"):
@@ -387,7 +426,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             )
 
     def test_restoration_opt_in_pins_one_consistent_exact_libc_family(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         before = MODULE.canonical_json_bytes(lock)
         version = next(
             row["version"] for row in lock["ubuntu_apt"]["bootstrap_packages"]
@@ -647,7 +686,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                     MODULE.verify_apt_restoration(path, record)
 
     def test_restoration_fetch_publishes_verified_cache_and_rechecks_reuse(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         record, payload = restoration_fixture()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve() / "new"
@@ -669,7 +708,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                             MODULE.apt_specs(lock, "all", restoration_dir=root)
 
     def test_restoration_fetch_failure_never_publishes_unverified_archive(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         record, payload = restoration_fixture()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
@@ -686,7 +725,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                         self.assertEqual(list(root.iterdir()), [])
 
     def test_restoration_fetch_never_overwrites_an_existing_target(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         record, payload = restoration_fixture()
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
@@ -709,7 +748,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                     download.assert_not_called()
 
     def test_restoration_selection_is_exact_and_does_not_fetch_unrelated_versions(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         records = MODULE.relevant_apt_restorations(lock)
         self.assertEqual(records, list(MODULE.APT_RESTORATIONS))
         for row in lock["expected_identity"]["poppler"]["native_libraries"]:
@@ -722,7 +761,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
             download.assert_not_called()
 
     def test_restoration_libc_consistency_includes_every_identity_section(self) -> None:
-        original, _ = MODULE.load_lock()
+        original = pinned_dependency_lock()
         for section in ("poppler", "cairo", "python"):
             for mutation in ("version", "architecture"):
                 lock = json.loads(json.dumps(original))
@@ -787,6 +826,29 @@ class RenderOracleHostToolsTests(unittest.TestCase):
         for row in lock["python"]["distributions"]:
             self.assertRegex(row["wheel"]["sha256"], r"^[0-9a-f]{64}$")
             self.assertGreater(row["wheel"]["bytes"], 0)
+
+    def test_repository_identity_requires_explicit_bootstrap_when_unpinned(self) -> None:
+        lock, payload = MODULE.load_lock()
+        identity = lock["expected_identity"] or fixture_identity(lock)
+        with tempfile.TemporaryDirectory() as raw:
+            evidence_path = Path(raw) / "evidence.json"
+            for bootstrap in (False, True):
+                with self.subTest(bootstrap=bootstrap):
+                    if lock["expected_identity"] is None and not bootstrap:
+                        with self.assertRaisesRegex(MODULE.HostToolError, "host_identity_pin_required"):
+                            MODULE.verify_host(
+                                MODULE.DEFAULT_LOCK, evidence_path, scope="all",
+                                bootstrap_identities=bootstrap, capture=lambda *_: identity,
+                            )
+                    else:
+                        evidence = MODULE.verify_host(
+                            MODULE.DEFAULT_LOCK, evidence_path, scope="all",
+                            bootstrap_identities=bootstrap, capture=lambda *_: identity,
+                        )
+                        self.assertEqual(evidence["identity_status"],
+                                         "bootstrap_capture_required" if lock["expected_identity"] is None
+                                         else "pinned_match")
+        self.assertEqual(MODULE.DEFAULT_LOCK.read_bytes(), payload)
 
     def test_requirements_reject_unhashed_extra_and_duplicate_rows(self) -> None:
         valid = MODULE.REQUIREMENTS.read_bytes()
@@ -1132,13 +1194,13 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             self.assertEqual(set(evidence["identity"]), {"platform", "poppler"})
 
     def test_apt_specs_are_sorted_exact_versions_and_require_a_pin(self) -> None:
-        lock, _ = MODULE.load_lock()
+        lock = pinned_dependency_lock()
         # The bootstrap scope does not pin libc6, so pinning libc6-dev would
         # fail against any runner image carrying a newer libc6 through the dev
         # package's exact `libc6 (= version)` dependency. libc6-dev affects
         # neither rendering nor measurement, so it resolves freely while every
         # package that does affect the oracle stays exactly pinned.
-        # The shipped lock carries the reviewed oracle identity.
+        # This test explicitly supplies a synthetic pinned oracle identity.
         self.assertIsNotNone(lock["expected_identity"])
         # A first bootstrap has nothing attested, so only the snapshot-pinned
         # top-level tools can be named.
