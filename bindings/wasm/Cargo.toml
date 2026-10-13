@@ -12,9 +12,9 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-js-sys = "0.3.103"
+js-sys = "0.3.106"
 rxls = { version = "0.2.0", path = "../..", default-features = false, features = ["full"] }
-wasm-bindgen = "0.2.126"
+wasm-bindgen = "0.2.129"
 
 # Keep the portable Node/browser adapter within its existing 2 MiB ceiling.
 # This separate Cargo root leaves native and render-worker profiles unchanged.
