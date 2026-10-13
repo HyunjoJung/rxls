@@ -532,7 +532,7 @@ jobs:
           const protocol = await import("@rxls/render-worker/protocol");
           const runtime = await import("@rxls/render-worker/worker-runtime");
           if (typeof root.RenderWorkerClient !== "function" ||
-              protocol.PROTOCOL !== "rxls.render-worker.v2" ||
+              protocol.PROTOCOL !== "rxls.render-worker.v3" ||
               typeof runtime.RenderWorkerRuntime !== "function") {
             process.exit(1);
           }
@@ -1027,7 +1027,7 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --invocation-policy "$invocation_policy"
           node --input-type=module -e \
-            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v2") process.exit(1)'
+            'const p=await import("@rxls/render-worker/protocol"); if(p.PROTOCOL!=="rxls.render-worker.v3") process.exit(1)'
       - name: Upload registry evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
