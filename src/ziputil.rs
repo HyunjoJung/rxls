@@ -21,9 +21,7 @@ fn validate_limits<R: Read + Seek>(
         let file = zip
             .by_index_raw(index)
             .map_err(|_| Error::Zip("invalid ZIP central-directory entry"))?;
-        let name = file
-            .name()
-            .map_err(|_| Error::Zip("invalid ZIP entry name"))?;
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
         if name.len() > 4096 {
             return Err(Error::Zip("ZIP package entry name is too long"));
         }
@@ -45,9 +43,7 @@ fn validate_methods<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<()> 
         let file = zip
             .by_index_raw(index)
             .map_err(|_| Error::Zip("invalid ZIP central-directory entry"))?;
-        let name = file
-            .name()
-            .map_err(|_| Error::Zip("invalid ZIP entry name"))?;
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
         if name.ends_with('/') {
             continue;
         }
@@ -113,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_entry_names_are_rejected_before_reading() {
+    fn malformed_utf8_entry_names_keep_lossy_compatibility() {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         writer
             .start_file("a", SimpleFileOptions::default())
@@ -140,10 +136,12 @@ mod tests {
             bytes[header + name_offset] = 0xff;
         }
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        assert!(matches!(
-            validate_compression(&mut archive),
-            Err(Error::Zip("invalid ZIP entry name"))
-        ));
+        validate_compression(&mut archive).unwrap();
+        let file = archive.by_index_raw(0).unwrap();
+        assert_eq!(
+            crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()),
+            "�"
+        );
     }
 
     #[test]

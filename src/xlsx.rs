@@ -463,8 +463,21 @@ fn part_raw(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Op
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
-    if let Some(idx) = zip.index_for_name(name) {
-        return Some(idx);
+    if name.is_ascii() {
+        if let Some(idx) = zip.index_for_name(name) {
+            return Some(idx);
+        }
+    } else {
+        // ZIP 9 indexes raw bytes. Non-ASCII names must be compared after
+        // decoding, with the previous last-entry-wins exact-match behavior.
+        for idx in (0..zip.len()).rev() {
+            let Ok(file) = zip.by_index_data(idx) else {
+                continue;
+            };
+            if crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()) == name {
+                return Some(idx);
+            }
+        }
     }
     let wanted = canonical_part_name(name);
     if let Some(idx) = unique_part_index(zip, |candidate| canonical_part_name(candidate) == wanted)
@@ -488,9 +501,7 @@ fn unique_part_index(
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
-        let Ok(name) = file.name() else {
-            continue;
-        };
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
         if matches(&name) {
             if found.is_some() {
                 return None;

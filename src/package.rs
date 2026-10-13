@@ -302,10 +302,8 @@ impl Package {
                     continue;
                 }
             };
-            let name = file
-                .name()
-                .map_err(|_| Error::Zip("invalid ZIP entry name"))?
-                .into_owned();
+            let name =
+                crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()).into_owned();
             if name.len() > MAX_NAME_LEN {
                 return Err(Error::Zip("OOXML package entry name is too long"));
             }
@@ -348,9 +346,9 @@ impl Package {
             }
 
             if !seen.insert(name.clone()) {
-                // Exact duplicate name: keep the *last* entry's data (matching
-                // the `zip` crate's own last-entry-wins `by_name` lookup
-                // semantics) but don't add a second `order`/`parts` slot.
+                // Exact decoded-name duplicate: keep the *last* entry's data,
+                // matching the pre-migration decoded-name lookup semantics,
+                // but don't add a second `order`/`parts` slot.
                 parts.insert(name, Part::Raw(data));
                 continue;
             }
@@ -1595,6 +1593,28 @@ mod tests {
     }
 
     // --- Preserved public surface (spreadsheet.rs / report.rs call sites) ---
+
+    #[test]
+    fn editing_preserves_distinct_cp437_passthrough_parts() {
+        let input = crate::zipname::tests::cp437_collision_archive();
+        let mut package = Package::from_bytes(&input).unwrap();
+        assert!(package.is_complete());
+        assert!(!package.is_meta_lossy());
+        assert_eq!(package.part_bytes("xl/├⌐.xml"), Some(&b"first"[..]));
+        assert_eq!(package.part_bytes("xl/é.xml"), Some(&b"second"[..]));
+
+        let edited = b"<workbook><sheets/></workbook>";
+        package
+            .replace_part("xl/workbook.xml", edited.to_vec())
+            .unwrap();
+        let saved = package.to_bytes().unwrap();
+        let reopened = Package::from_bytes(&saved).unwrap();
+        assert!(reopened.is_complete());
+        assert!(!reopened.is_meta_lossy());
+        assert_eq!(reopened.part_bytes("xl/workbook.xml"), Some(&edited[..]));
+        assert_eq!(reopened.part_bytes("xl/├⌐.xml"), Some(&b"first"[..]));
+        assert_eq!(reopened.part_bytes("xl/é.xml"), Some(&b"second"[..]));
+    }
 
     #[test]
     fn raw_package_roundtrip_preserves_part_payloads() {
