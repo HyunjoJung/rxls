@@ -834,11 +834,13 @@ function expectedRouteSessionMultiset(mode, hardStopNonce) {
       : "/tests/browser/smoke.mjs",
     `${prefix}/js/client.mjs`,
     `${prefix}/js/protocol.mjs`,
+    `${prefix}/js/response-contracts.mjs`,
     `${prefix}/js/worker.mjs`,
     `${prefix}/js/worker.mjs?rxls-hard-stop=<nonce>`
   ];
   const workerEntries = [
     `${prefix}/js/protocol.mjs`,
+    `${prefix}/js/response-contracts.mjs`,
     `${prefix}/js/worker-runtime.mjs`,
     `${prefix}/pkg/rxls_render_wasm.js`,
     `${prefix}/pkg/rxls_render_wasm_bg.wasm`
