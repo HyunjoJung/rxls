@@ -111,7 +111,7 @@
     "implementation": "cpython",
     "requirements": {
       "bytes": 950,
-      "sha256": "4eb8429495faa06b40ba6eb6da3fca830f1ca02a00dbb2083cea3181079c8a57"
+      "sha256": "ceef1c688161cf56f0be419ed1a41afe531b354aa9ef29cea2b9da88df6ab2e4"
     },
     "version": "3.13.14"
   },

@@ -96,6 +96,6 @@
   "wrapper": {
     "bytes": 128589,
     "path": "scripts/run-render-oracle-container.py",
-    "sha256": "19ccfb9241821aa151dda3851fbd0a9d4156c7d748e44b8d7de58f7de6335c87"
+    "sha256": "e89fd82eeedb7de10e4d653dcf5d519c5abf9a597bbcd6834d150d03a8935ed9"
   }
 }
