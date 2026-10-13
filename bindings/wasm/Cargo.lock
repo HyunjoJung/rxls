@@ -245,7 +245,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rxls"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "cfb",
  "chrono",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "rxls-wasm"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "js-sys",
  "rxls",
