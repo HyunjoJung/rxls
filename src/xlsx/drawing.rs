@@ -101,10 +101,8 @@ fn append_bounded_drawing_ref(
     match reference.resolve_char_ref() {
         Ok(Some(ch)) => out.push(ch),
         Ok(None) => {
-            if let Ok(name) = reference.decode() {
-                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
-                    out.push_str(value);
-                }
+            if let Some(value) = quick_xml::escape::resolve_xml_entity(reference.as_ref()) {
+                out.push_str(value);
             }
         }
         Err(_) => {}
@@ -401,13 +399,13 @@ pub(super) fn parse_drawing_refs_bounded(
                 );
             }
             Ok(Event::CData(t)) if field.is_some() => {
-                field_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                field_text.push_str(t.as_ref());
                 if truncate_drawing_text(&mut field_text, MAX_XLSX_DRAWING_NUMBER_TEXT) {
                     add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
                 }
             }
             Ok(Event::CData(t)) if desc_depth > 0 => {
-                desc_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                desc_text.push_str(t.as_ref());
                 if truncate_drawing_text(&mut desc_text, MAX_XLSX_DRAWING_TEXT) {
                     add_drawing_loss(losses, StyleLossKind::LimitExceeded, 1);
                 }

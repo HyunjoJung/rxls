@@ -2713,7 +2713,7 @@ print('READ_DV_OK')
             match reader.read_event().unwrap() {
                 quick_xml::events::Event::Empty(element)
                 | quick_xml::events::Event::Start(element)
-                    if element.name().as_ref() == b"col" =>
+                    if element.name().as_ref() == "col" =>
                 {
                     columns.push(
                         element
@@ -2721,8 +2721,8 @@ print('READ_DV_OK')
                             .map(|attribute| {
                                 let attribute = attribute.unwrap();
                                 (
-                                    String::from_utf8(attribute.key.as_ref().to_vec()).unwrap(),
-                                    String::from_utf8(attribute.value.to_vec()).unwrap(),
+                                    attribute.key.as_ref().to_owned(),
+                                    attribute.value.into_owned(),
                                 )
                             })
                             .collect(),

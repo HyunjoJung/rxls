@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/mcp/Cargo.toml
 - Target: Linux, macOS, and Windows (x86_64/aarch64)
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 07c74d1e77f67a1a9ea4138acfe3417194d362c5cff0fd1f9a8b8713121e5aaf
+- Cargo lock SHA-256: 0d1abb562dd6967900718ac5b1d5d88d2c249e8f99296b2ffebf9aff9e6540ea
 - Third-party packages: 90
 - Unique legal texts: 75
 
@@ -464,12 +464,12 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: quick-xml 0.41.0
+PACKAGE: quick-xml 0.42.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1
+Registry archive SHA-256: 41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b
 Legal files:
-- LICENSE-MIT.md: 5b2c207dcf571267ebe0bbdd5bf321f561ddc22ff597e7b363e96f4539507a29
+- LICENSE-MIT.md: f0cf9b1c62bbe3bd3a69f5f79c7158f513f612b4940a0a812d1db39d605318bc
 
 ===============================================================================
 PACKAGE: quote 1.0.47
@@ -2956,36 +2956,6 @@ Referenced by:
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
------ END LEGAL TEXT -----
-
-===============================================================================
-LEGAL TEXT SHA-256: 5b2c207dcf571267ebe0bbdd5bf321f561ddc22ff597e7b363e96f4539507a29
-Referenced by:
-- quick-xml 0.41.0/LICENSE-MIT.md
------ BEGIN LEGAL TEXT -----
-The MIT License (MIT)
-
-Copyright (c) 2016 Johann Tuffe
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
@@ -6167,6 +6137,36 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
+LEGAL TEXT SHA-256: f0cf9b1c62bbe3bd3a69f5f79c7158f513f612b4940a0a812d1db39d605318bc
+Referenced by:
+- quick-xml 0.42.0/LICENSE-MIT.md
+----- BEGIN LEGAL TEXT -----
+The MIT License (MIT)
+
+Copyright (c) 2016 Johann Tuffe
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================

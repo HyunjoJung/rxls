@@ -1366,16 +1366,16 @@ fn source_part_of_rels_path(rels_path: &str) -> Option<String> {
 }
 
 /// Local (namespace-prefix-stripped) name of a qualified XML name.
-fn local_name(name: &[u8]) -> &[u8] {
+fn local_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     name.rsplit(|&b| b == b':').next().unwrap_or(name)
 }
 
 fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local_name(a.key.as_ref()) == key {
-            a.decoded_and_normalized_value_with(
+            a.normalized_value_with(
                 XmlVersion::Implicit1_0,
-                e.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )

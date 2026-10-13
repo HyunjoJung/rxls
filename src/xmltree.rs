@@ -256,14 +256,14 @@ impl XmlTree {
                     match stack.last().copied() {
                         // Element content: store unescaped (re-escaped on write).
                         Some(parent) => {
-                            tree.push_text_fragment(parent, &unescape_bytes(&raw)?)?;
+                            tree.push_text_fragment(parent, &unescape_bytes(raw.as_bytes())?)?;
                         }
                         // Prolog/epilog text (e.g. the `\r\n` between the XML
                         // declaration and the root element) is whitespace where
                         // character references are NOT allowed — keep it
                         // verbatim.
                         None => {
-                            tree.push(Node::Raw(raw.into_owned()), None)?;
+                            tree.push(Node::Raw(raw.into_owned().into_bytes()), None)?;
                         }
                     }
                 }
@@ -283,7 +283,7 @@ impl XmlTree {
                             raw.try_reserve(reference.as_ref().len() + 2)
                                 .map_err(|_| Error::Xml("xml: out of memory growing raw text"))?;
                             raw.push(b'&');
-                            raw.extend_from_slice(reference.as_ref());
+                            raw.extend_from_slice(reference.as_ref().as_bytes());
                             raw.push(b';');
                             tree.push(Node::Raw(raw), None)?;
                         }
@@ -291,19 +291,19 @@ impl XmlTree {
                 }
                 Event::CData(c) => {
                     let mut raw = b"<![CDATA[".to_vec();
-                    raw.extend_from_slice(&c.into_inner());
+                    raw.extend_from_slice(c.into_inner().as_bytes());
                     raw.extend_from_slice(b"]]>");
                     tree.push(Node::Raw(raw), stack.last().copied())?;
                 }
                 Event::Comment(c) => {
                     let mut raw = b"<!--".to_vec();
-                    raw.extend_from_slice(c.as_ref());
+                    raw.extend_from_slice(c.as_ref().as_bytes());
                     raw.extend_from_slice(b"-->");
                     tree.push(Node::Raw(raw), stack.last().copied())?;
                 }
                 Event::PI(p) => {
                     let mut raw = b"<?".to_vec();
-                    raw.extend_from_slice(p.as_ref());
+                    raw.extend_from_slice(p.as_ref().as_bytes());
                     raw.extend_from_slice(b"?>");
                     tree.push(Node::Raw(raw), stack.last().copied())?;
                 }
@@ -314,13 +314,13 @@ impl XmlTree {
                         ));
                     }
                     let mut raw = b"<?".to_vec();
-                    raw.extend_from_slice(d.as_ref());
+                    raw.extend_from_slice(d.as_ref().as_bytes());
                     raw.extend_from_slice(b"?>");
                     tree.push(Node::Raw(raw), stack.last().copied())?;
                 }
                 Event::DocType(d) => {
                     let mut raw = b"<!DOCTYPE ".to_vec();
-                    raw.extend_from_slice(d.as_ref());
+                    raw.extend_from_slice(d.as_ref().as_bytes());
                     raw.extend_from_slice(b">");
                     tree.push(Node::Raw(raw), stack.last().copied())?;
                 }
@@ -831,7 +831,7 @@ fn max_attrs() -> usize {
 /// Build a [`Node::Element`] from a quick-xml start/empty tag, capturing the
 /// raw qualified name and attributes (unescaped values) in source order.
 fn element_node(e: &quick_xml::events::BytesStart<'_>, self_closing: bool) -> Result<Node> {
-    let name = e.name().as_ref().to_vec();
+    let name = e.name().as_ref().as_bytes().to_vec();
     let mut attrs = Vec::new();
     let cap = max_attrs();
     for a in e.attributes() {
@@ -839,14 +839,13 @@ fn element_node(e: &quick_xml::events::BytesStart<'_>, self_closing: bool) -> Re
             return Err(Error::Xml("element has too many attributes"));
         }
         let a = a.map_err(|_| Error::Xml("malformed xml attribute"))?;
-        let key = a.key.as_ref().to_vec();
+        let key = a.key.as_ref().as_bytes().to_vec();
         // Propagate (not swallow) a malformed entity reference: otherwise the
         // raw `&` survives, then re-serialization canonicalizes it to `&amp;`
         // — silently rewriting malformed XML the edit never targeted.
         let val = a
-            .decoded_and_normalized_value_with(
+            .normalized_value_with(
                 XmlVersion::Implicit1_0,
-                e.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -904,10 +903,8 @@ fn push_resolved_general_ref(
             tree.push_text_fragment(parent, ch.encode_utf8(&mut encoded).as_bytes())?;
         }
         Ok(None) => {
-            let name = reference
-                .decode()
-                .map_err(|_| Error::Xml("xml entity reference is not valid utf-8"))?;
-            let resolved = quick_xml::escape::resolve_xml_entity(&name)
+            let name = reference.as_ref();
+            let resolved = quick_xml::escape::resolve_xml_entity(name)
                 .ok_or(Error::Xml("malformed xml entity reference"))?;
             tree.push_text_fragment(parent, resolved.as_bytes())?;
         }

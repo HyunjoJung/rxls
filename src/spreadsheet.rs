@@ -400,9 +400,8 @@ fn workbook_sheet_index(tree: &XmlTree, name: &str) -> Option<usize> {
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         (local(a.key.as_ref()) == key).then(|| {
-            a.decoded_and_normalized_value_with(
+            a.normalized_value_with(
                 XmlVersion::Implicit1_0,
-                e.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -413,7 +412,8 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     })
 }
 
-fn local(name: &[u8]) -> &[u8] {
+fn local<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     name.rsplit(|&b| b == b':').next().unwrap_or(name)
 }
 

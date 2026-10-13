@@ -56,7 +56,7 @@ fn columns(bytes: &[u8]) -> Vec<Column> {
     loop {
         match reader.read_event().unwrap() {
             quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element)
-                if element.name().as_ref() == b"col" =>
+                if element.name().as_ref() == "col" =>
             {
                 result.push(
                     element
@@ -64,12 +64,9 @@ fn columns(bytes: &[u8]) -> Vec<Column> {
                         .map(|attribute| {
                             let attribute = attribute.unwrap();
                             (
-                                String::from_utf8(attribute.key.as_ref().to_vec()).unwrap(),
+                                attribute.key.as_ref().to_owned(),
                                 attribute
-                                    .decoded_and_normalized_value(
-                                        quick_xml::XmlVersion::Implicit1_0,
-                                        reader.decoder(),
-                                    )
+                                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                     .unwrap()
                                     .into_owned(),
                             )

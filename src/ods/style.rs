@@ -2105,10 +2105,7 @@ pub(super) fn read_ods_style_definitions(xml: &str, definitions: &mut OdsStyleDe
                         .master_page_print_metadata
                         .entry(master.clone())
                         .or_default()
-                        .append_header_footer(
-                            kind,
-                            String::from_utf8_lossy(value.as_ref()).as_ref(),
-                        );
+                        .append_header_footer(kind, value.as_ref());
                 }
             }
             Ok(Event::End(e)) => {

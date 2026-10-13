@@ -885,42 +885,38 @@ pub(super) fn parse_sheet(
             }
             Ok(Event::CData(t)) if header_footer_capture.is_some() => {
                 if let Some(capture) = header_footer_capture {
-                    let bytes = t.into_inner();
-                    let text = String::from_utf8_lossy(bytes.as_ref());
+                    let text = t.into_inner();
                     append_header_footer_text(&mut parsed, capture, text.as_ref());
                 }
             }
             Ok(Event::CData(t)) if in_sparkline_formula => {
-                current_sparkline_range.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                current_sparkline_range.push_str(t.as_ref());
             }
             Ok(Event::CData(t)) if in_sparkline_sqref => {
-                current_sparkline_location
-                    .push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                current_sparkline_location.push_str(t.as_ref());
             }
             Ok(Event::CData(t)) if in_cf_formula => {
                 if let Some(formula) = current_cf.as_mut().and_then(|cf| cf.formulas.last_mut()) {
-                    formula.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                    formula.push_str(t.as_ref());
                 }
             }
             Ok(Event::CData(t)) if in_dv_formula1 => {
                 if let Some(dv) = current_dv.as_mut() {
-                    dv.formula1
-                        .push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                    dv.formula1.push_str(t.as_ref());
                 }
             }
             Ok(Event::CData(t)) if in_dv_formula2 => {
                 if let Some(dv) = current_dv.as_mut() {
                     if let Some(formula2) = dv.formula2.as_mut() {
-                        formula2.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                        formula2.push_str(t.as_ref());
                     }
                 }
             }
             Ok(Event::CData(t)) if in_v => {
-                value.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                value.push_str(t.as_ref());
             }
             Ok(Event::CData(t)) if in_is_t && !in_rph => {
-                let bytes = t.into_inner();
-                let text = String::from_utf8_lossy(bytes.as_ref());
+                let text = t.into_inner();
                 inline_value.push_str(&text);
                 if let Some(run) = inline_run.as_mut() {
                     run.text.push_str(&text);

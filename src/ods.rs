@@ -86,7 +86,8 @@ fn has_encrypted_manifest(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> 
     f.take(16 << 20).read_to_string(&mut manifest).is_ok() && manifest.contains("encryption-data")
 }
 
-fn local(name: &[u8]) -> &[u8] {
+fn local<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     match name.iter().rposition(|&b| b == b':') {
         Some(i) => &name[i + 1..],
         None => name,
@@ -96,9 +97,8 @@ fn local(name: &[u8]) -> &[u8] {
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local(a.key.as_ref()) == key {
-            a.decoded_and_normalized_value_with(
+            a.normalized_value_with(
                 XmlVersion::Implicit1_0,
-                e.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -322,18 +322,16 @@ fn read_cell_attrs(e: &quick_xml::events::BytesStart<'_>) -> CellAttrs {
 }
 
 fn text_of(e: &quick_xml::events::BytesText<'_>) -> String {
-    e.decode().map(|c| c.into_owned()).unwrap_or_default()
+    e.as_ref().to_owned()
 }
 
 fn append_general_ref(out: &mut String, reference: &BytesRef<'_>) {
     match reference.resolve_char_ref() {
         Ok(Some(ch)) if is_xml_10_char(ch) => out.push(ch),
         Ok(None) => {
-            if let Ok(name) = reference.decode() {
-                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
-                    out.push_str(value);
-                    return;
-                }
+            if let Some(value) = quick_xml::escape::resolve_xml_entity(reference.as_ref()) {
+                out.push_str(value);
+                return;
             }
             append_raw_general_ref(out, reference);
         }
@@ -342,11 +340,9 @@ fn append_general_ref(out: &mut String, reference: &BytesRef<'_>) {
 }
 
 fn append_raw_general_ref(out: &mut String, reference: &BytesRef<'_>) {
-    if let Ok(raw) = std::str::from_utf8(reference.as_ref()) {
-        out.push('&');
-        out.push_str(raw);
-        out.push(';');
-    }
+    out.push('&');
+    out.push_str(reference.as_ref());
+    out.push(';');
 }
 
 fn is_xml_10_char(ch: char) -> bool {
