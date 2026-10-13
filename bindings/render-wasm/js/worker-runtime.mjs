@@ -79,6 +79,13 @@ export class RenderWorkerRuntime {
       "capabilities",
       MAX_OPTIONS_BYTES
     );
+    if (this.#capabilities?.schemaVersion !== 1 || this.#capabilities?.protocol !== PROTOCOL) {
+      throw new RenderProtocolError(
+        "wasm_api_mismatch",
+        "WASM and worker must use the same v3 calculation-state contract",
+        "wasm"
+      );
+    }
     this.#maxOutputBytes = boundedCapability(
       this.#capabilities?.limits?.maxOutputBytes,
       MAX_OUTPUT_BYTES,
@@ -676,9 +683,12 @@ export class RenderWorkerRuntime {
     }
     const workbook = this.#responses.validateWorkbookInspection(result.workbook);
     const editState = this.#responses.validateEditState(result.editState);
-    return recalculate
-      ? { workbook, editState, recalculation: validateRecalculationSummary(result.recalculation) }
-      : { workbook, editState };
+    if (recalculate) {
+      const recalculation = validateRecalculationSummary(result.recalculation);
+      this.#responses.validateRecalculationMatch(editState, recalculation);
+      return { workbook, editState, recalculation };
+    }
+    return { workbook, editState };
   }
 
   #document(payload) {

@@ -26,7 +26,7 @@ import {
   validateSvgOutput
 } from "./protocol.mjs";
 
-const { validateWorkbookInspection, validateEditState, validateInspectedCell } =
+const { validateWorkbookInspection, validateEditState, validateInspectedCell, validateRecalculationMatch } =
   createResponseValidators({
     invalid: invalidWorkerMessage,
     maxSheets: MAX_SHEETS,
@@ -878,6 +878,7 @@ function validateOperationResult(operation, payload, result, capabilityLimits) {
       validateWorkbookInspection(result.workbook);
       validateEditState(result.editState);
       validateRecalculationSummary(result.recalculation);
+      validateRecalculationMatch(result.editState, result.recalculation);
       return;
     case "save-document":
       validateSaveResult(payload, result);

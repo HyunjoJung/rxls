@@ -1,4 +1,4 @@
-export const PROTOCOL = "rxls.render-worker.v2";
+export const PROTOCOL = "rxls.render-worker.v3";
 export const MAX_INPUT_BYTES = 32 * 1024 * 1024;
 export const MAX_FONT_BYTES = 64 * 1024 * 1024;
 export const MAX_FONT_MANIFEST_BYTES = 4 * 1024 * 1024;

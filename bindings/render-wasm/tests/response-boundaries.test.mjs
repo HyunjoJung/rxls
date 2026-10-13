@@ -20,7 +20,7 @@ function workbook() {
 
 function editState(overrides = {}) {
   return {
-    schemaVersion: 1, capability: "read-write", reason: null,
+    schemaVersion: 2, calculation: { status: "unknown", summary: null }, capability: "read-write", reason: null,
     dirty: false, canUndo: false, canRedo: false,
     undoDepth: 0, redoDepth: 0, historyBytes: 0, editedParts: [],
     ...overrides

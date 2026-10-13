@@ -114,6 +114,7 @@ impl RenderSession {
                 )
             },
             true,
+            true,
             &required,
         )
     }

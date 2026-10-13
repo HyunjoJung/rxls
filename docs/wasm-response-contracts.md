@@ -1,7 +1,7 @@
 # Shared render-worker response contracts
 
-Part A of #153. The wire protocol remains `rxls.render-worker.v2` and no
-package subpath, request, response field, or resource ceiling is added.
+Part A of #153 initially retained `rxls.render-worker.v2`; no
+package subpath, request, response field, or resource ceiling was added by that step.
 
 `bindings/render-wasm/js/response-contracts.mjs` owns the common workbook,
 document-property, edit-state, and inspected-cell rules. Both the client and
@@ -80,3 +80,35 @@ serialized UTF-8 bytes with a counting writer before encoding the final result.
 The complete result also retains the existing output ceiling. Both checks occur
 before swapping the candidate workbook or changing undo/redo history. Snapshot,
 package save/reparse, evaluator, and preservation validation remain unchanged.
+
+## Version 3 calculation observation
+
+Part B intentionally replaces `rxls.render-worker.v2` with
+`rxls.render-worker.v3`. The v2 exact-key response is not extended in place.
+Deploy the client, Worker, and WASM from the same package version. A v3 client
+rejects v2 Worker or WASM capability identities with `worker_message_error`;
+a v3 Worker rejects old client requests with `protocol_mismatch` and old or
+unversioned WASM modules with `wasm_api_mismatch` before opening a document.
+No permissive unknown-field fallback or mixed-version compatibility is offered.
+
+`EditState` schema 2 adds exactly one `calculation` object, containing `status`
+and `summary`. `unknown` requires a null summary: opening or reopening a saved
+workbook never establishes fresh evaluator evidence. `observed` contains the
+last successful whole-workbook supported-evaluator summary. `stale` preserves
+that same bounded summary after a cell edit without whole-workbook recalculation.
+The per-operation `recalculation` summary retains its original meaning and keys.
+Neither observation nor a zero warning count guarantees full Excel calculation
+compatibility. Unsupported formulas continue to retain their existing caches.
+
+Rust owns each observation with the corresponding workbook and undo/redo
+snapshot. Property edits preserve it, successful recalculation replaces it,
+cell edits without recalculation mark it stale, and failed edits leave it and
+all history unchanged. Undo/redo restores the observation from the restored
+snapshot; history eviction therefore cannot desynchronize the two. The fixed
+observation state and bounded static-reason vector allocation count against the
+existing history byte budget. No formula strings, cell text, or workbook copies
+are added to this metadata, and no observation is persisted into OOXML.
+
+The viewer formats the current Rust observation and each operation report. It
+has no warning undo/redo stacks, and labels both initial uncertainty and stale
+observations rather than treating missing recalculation as successful checking.

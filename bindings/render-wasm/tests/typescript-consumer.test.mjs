@@ -53,6 +53,7 @@ import {
   type CloseDocumentResult,
   type DocumentPropertiesInspection,
   type EditableCell,
+  type CalculationObservation,
   type EditMutationResult,
   type RecalculatedEditResult,
   type EditStatusResult,
@@ -207,7 +208,15 @@ client.setCell("document-1", 0, 0, 0, automatic);
 const recalculated: RenderRequest<RecalculatedEditResult> = client.setCellAndRecalculate("document-1", 0, 0, 0, automatic);
 const genericRecalculated: RenderRequest<RecalculatedEditResult> = client.request("set-cell-recalculate",
   { documentId: "document-1", sheetIndex: 0, row: 0, col: 0, value: automatic });
-void [recalculated, genericRecalculated];
+const unknownCalculation: CalculationObservation = { status: "unknown", summary: null };
+const observedCalculation: CalculationObservation = { status: "observed", summary: {
+  computedCells: 1, unchangedCells: 0, unsupportedCells: 0, reasons: [],
+} };
+// @ts-expect-error Unknown state cannot claim a formula calculation summary.
+const inventedCalculation: CalculationObservation = { status: "unknown", summary: observedCalculation.summary };
+// @ts-expect-error Stale state retains a real previous observation.
+const missingCalculation: CalculationObservation = { status: "stale", summary: null };
+void [recalculated, genericRecalculated, unknownCalculation, observedCalculation, inventedCalculation, missingCalculation];
 const rangeRecalculated: RenderRequest<RecalculatedEditResult> = client.setRangeAndRecalculate(
   "document-1", 0, 0, 0, [[automatic, { kind: "number", value: 7 }]], requestOptions,
 );
