@@ -5,9 +5,9 @@ Scope:
 - Manifest: bindings/wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: 83206d813c387692576c2e187e2bf99154eeabbd50a314f9dfddf8991ca64ec0
-- Third-party packages: 44
-- Unique legal texts: 39
+- Cargo lock SHA-256: 6c67459c0a8c14ed2fdf1431e99bb90fd849d96b52f4d86802e88ab968c2d899
+- Third-party packages: 46
+- Unique legal texts: 41
 
 The npm package has no npm runtime dependencies. This notice conservatively
 covers every third-party crate reachable through normal Cargo edges used to
@@ -79,10 +79,10 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: encoding_rs 0.8.35
+PACKAGE: encoding_rs 0.8.42
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: (Apache-2.0 OR MIT) AND BSD-3-Clause
-Registry archive SHA-256: 75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3
+Registry archive SHA-256: 8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679
 Legal files:
 - COPYRIGHT: 11789f45bb180841cd362a5eee6789c68ddb573a11105e30768c308a6add0190
 - LICENSE-APACHE: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
@@ -201,6 +201,16 @@ Legal files:
 - LICENSE-ZLIB.md: 0a54e647fe54104658b5e563c04c6f9edf251710e47bce692e0bd990a4ddaa39
 
 ===============================================================================
+PACKAGE: multiversion_no_op 1.0.0
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: Apache-2.0 OR MIT
+Registry archive SHA-256: 743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d
+Legal files:
+- COPYRIGHT: d2a809eafabba137f508bea16a1b93d8ff24df7da6f38129d830db9bc118bdfe
+- LICENSE-APACHE: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+- LICENSE-MIT: 3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c
+
+===============================================================================
 PACKAGE: num-traits 0.2.19
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
@@ -252,6 +262,15 @@ Registry archive SHA-256: dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
+
+===============================================================================
+PACKAGE: scopeguard 1.2.0
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: MIT OR Apache-2.0
+Registry archive SHA-256: 94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49
+Legal files:
+- LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
+- LICENSE-MIT: fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7
 
 ===============================================================================
 PACKAGE: serde 1.0.229
@@ -933,7 +952,7 @@ THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 11789f45bb180841cd362a5eee6789c68ddb573a11105e30768c308a6add0190
 Referenced by:
-- encoding_rs 0.8.35/COPYRIGHT
+- encoding_rs 0.8.42/COPYRIGHT
 ----- BEGIN LEGAL TEXT -----
 encoding_rs is copyright Mozilla Foundation.
 
@@ -1248,7 +1267,8 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 3fa4ca83dcc9237839b1bdeb2e6d16bdfb5ec0c5ce42b24694d8bbf0dcbef72c
 Referenced by:
-- encoding_rs 0.8.35/LICENSE-MIT
+- encoding_rs 0.8.42/LICENSE-MIT
+- multiversion_no_op 1.0.0/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright Mozilla Foundation
 
@@ -2057,7 +2077,7 @@ For more information, please refer to <http://unlicense.org/>
 ===============================================================================
 LEGAL TEXT SHA-256: 838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50
 Referenced by:
-- encoding_rs 0.8.35/LICENSE-WHATWG
+- encoding_rs 0.8.42/LICENSE-WHATWG
 ----- BEGIN LEGAL TEXT -----
 Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
 
@@ -2607,6 +2627,7 @@ Referenced by:
 - log 0.4.33/LICENSE-APACHE
 - num-traits 0.2.19/LICENSE-APACHE
 - once_cell 1.21.4/LICENSE-APACHE
+- scopeguard 1.2.0/LICENSE-APACHE
 - uuid 1.23.4/LICENSE-APACHE
 - wasm-bindgen 0.2.126/LICENSE-APACHE
 - wasm-bindgen-macro 0.2.126/LICENSE-APACHE
@@ -3027,7 +3048,8 @@ Referenced by:
 ===============================================================================
 LEGAL TEXT SHA-256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
 Referenced by:
-- encoding_rs 0.8.35/LICENSE-APACHE
+- encoding_rs 0.8.42/LICENSE-APACHE
+- multiversion_no_op 1.0.0/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
 
                                  Apache License
@@ -3234,6 +3256,28 @@ Referenced by:
 ----- END LEGAL TEXT -----
 
 ===============================================================================
+LEGAL TEXT SHA-256: d2a809eafabba137f508bea16a1b93d8ff24df7da6f38129d830db9bc118bdfe
+Referenced by:
+- multiversion_no_op 1.0.0/COPYRIGHT
+----- BEGIN LEGAL TEXT -----
+Copyright Mozilla Foundation
+
+Licensed under the Apache License (Version 2.0), or the MIT license,
+(the "Licenses") at your option. You may not use this file except in
+compliance with one of the Licenses. You may obtain copies of the
+Licenses at:
+
+   https://www.apache.org/licenses/LICENSE-2.0
+   https://opensource.org/licenses/MIT
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the Licenses is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the Licenses for the specific language governing permissions and
+limitations under the Licenses.
+----- END LEGAL TEXT -----
+
+===============================================================================
 LEGAL TEXT SHA-256: ebaac853b53fec0ed475796f533ce676912a4df9ad9d8a621fa76d5060591e10
 Referenced by:
 - cfb 0.15.0/LICENSE
@@ -3365,6 +3409,38 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
+----- END LEGAL TEXT -----
+
+===============================================================================
+LEGAL TEXT SHA-256: fb77f0a9c53e473abe5103c8632ef9f0f2874d4fb3f17cb2d8c661aab9cee9d7
+Referenced by:
+- scopeguard 1.2.0/LICENSE-MIT
+----- BEGIN LEGAL TEXT -----
+Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================

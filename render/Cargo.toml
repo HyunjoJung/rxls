@@ -2,7 +2,7 @@
 name = "rxls-render"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Deterministic, bounded worksheet rendering for rxls"
 publish = false
