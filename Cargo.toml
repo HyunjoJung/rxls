@@ -23,6 +23,7 @@ exclude = [
     "oss-fuzz/",
     "render/",
     "scripts/check_cargo_publish_dry_run.py",
+    "scripts/check_fresh_consumers.py",
     "scripts/check_npm_registry_evidence.py",
     "scripts/check-authored-print-parity.py",
     "scripts/check-ooxml-row-oracle.py",
