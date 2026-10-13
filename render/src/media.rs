@@ -111,7 +111,7 @@ fn decode_png(data: &[u8], max_decoded_bytes: u64) -> Option<DecodedImage> {
     decoder.set_ignore_text_chunk(true);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
-    let mut buffer = vec![0_u8; reader.output_buffer_size()];
+    let mut buffer = vec![0_u8; reader.output_buffer_size()?];
     let output = reader.next_frame(&mut buffer).ok()?;
     buffer.truncate(output.buffer_size());
     let rgba = expand_png_rgba(&buffer, output.color_type)?;

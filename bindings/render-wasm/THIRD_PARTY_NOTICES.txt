@@ -5,9 +5,9 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: e2bcc801f46bc2c5ea4fce9cd86fc4990d05e00f08d64341e1254018d13c31e4
+- Cargo lock SHA-256: 4ee18055fb1dea4fa6b4bd257397abf74309f9d0731dc3c9e941584b318a059e
 - Third-party packages: 87
-- Unique legal texts: 80
+- Unique legal texts: 81
 
 The npm package has no npm runtime dependencies. This notice conservatively
 covers every third-party crate reachable through normal Cargo edges used to
@@ -44,15 +44,6 @@ Legal files:
 - LICENSE-MIT: 4da95ec4ecb65b738d470b7d762894ad9c97da93e6cbfb18b570fc2c96f4b871
 
 ===============================================================================
-PACKAGE: bitflags 1.3.2
-Cargo source: registry+https://github.com/rust-lang/crates.io-index
-Declared license expression: MIT/Apache-2.0
-Registry archive SHA-256: bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a
-Legal files:
-- LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
-- LICENSE-MIT: 6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb
-
-===============================================================================
 PACKAGE: bitflags 2.13.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
@@ -62,13 +53,13 @@ Legal files:
 - LICENSE-MIT: 6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb
 
 ===============================================================================
-PACKAGE: block-buffer 0.10.4
+PACKAGE: block-buffer 0.12.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71
+Registry archive SHA-256: d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa
 Legal files:
 - LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
-- LICENSE-MIT: d5c22aa3118d240e877ad41c5d9fa232f9c77d757d4aac0c2f943afc0a95e0ef
+- LICENSE-MIT: 98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01
 
 ===============================================================================
 PACKAGE: bumpalo 3.20.3
@@ -115,6 +106,15 @@ Legal files:
 - LICENSE.txt: 946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831
 
 ===============================================================================
+PACKAGE: const-oid 0.10.2
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: Apache-2.0 OR MIT
+Registry archive SHA-256: a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c
+Legal files:
+- LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
+- LICENSE-MIT: 73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa
+
+===============================================================================
 PACKAGE: core_maths 0.1.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
@@ -159,22 +159,22 @@ Legal files:
 - LICENSE-MIT: 5734ed989dfca1f625b40281ee9f4530f91b2411ec01cb748223e7eb87e201ab
 
 ===============================================================================
-PACKAGE: crypto-common 0.1.7
+PACKAGE: crypto-common 0.2.2
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a
+Registry archive SHA-256: ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453
 Legal files:
 - LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
-- LICENSE-MIT: 3521672491a3479422d5fe1aca6645dd2984090f85da6e5205abfb18fb7a6897
+- LICENSE-MIT: d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963
 
 ===============================================================================
-PACKAGE: digest 0.10.7
+PACKAGE: digest 0.11.3
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292
+Registry archive SHA-256: f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2
 Legal files:
 - LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
-- LICENSE-MIT: 9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba
+- LICENSE-MIT: af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad
 
 ===============================================================================
 PACKAGE: either 1.16.0
@@ -260,14 +260,6 @@ Legal files:
 - LICENSE-MIT: 6652c868f35dfe5e8ef636810a4e576b9d663f3a17fb0f5613ad73583e1b88fd
 
 ===============================================================================
-PACKAGE: generic-array 0.14.7
-Cargo source: registry+https://github.com/rust-lang/crates.io-index
-Declared license expression: MIT
-Registry archive SHA-256: 85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a
-Legal files:
-- LICENSE: c09aae9d3c77b531f56351a9947bc7446511d6b025b3255312d3e3442a9a7583
-
-===============================================================================
 PACKAGE: hashbrown 0.17.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
@@ -275,6 +267,15 @@ Registry archive SHA-256: ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc50
 Legal files:
 - LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 - LICENSE-MIT: ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2
+
+===============================================================================
+PACKAGE: hybrid-array 0.4.15
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: MIT OR Apache-2.0
+Registry archive SHA-256: 27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17
+Legal files:
+- LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
+- LICENSE-MIT: 70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9
 
 ===============================================================================
 PACKAGE: indexmap 2.14.0
@@ -399,10 +400,10 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: png 0.17.16
+PACKAGE: png 0.18.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526
+Registry archive SHA-256: 60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61
 Legal files:
 - LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 - LICENSE-MIT: eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652
@@ -514,13 +515,13 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: sha2 0.10.9
+PACKAGE: sha2 0.11.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283
+Registry archive SHA-256: 47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19
 Legal files:
 - LICENSE-APACHE: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
-- LICENSE-MIT: b4eb00df6e2a4d22518fcaa6a2b4646f249b3a3c9814509b22bd2091f1392ff1
+- LICENSE-MIT: 831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25
 
 ===============================================================================
 PACKAGE: simd-adler32 0.3.10
@@ -593,18 +594,18 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: tiny-skia 0.11.4
+PACKAGE: tiny-skia 0.12.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: BSD-3-Clause
-Registry archive SHA-256: 83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab
+Registry archive SHA-256: 47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea
 Legal files:
 - LICENSE: 6d41e05f1d54fe726997cb0334ec539f1dff50600b1d5d90462ec2b392770ced
 
 ===============================================================================
-PACKAGE: tiny-skia-path 0.11.4
+PACKAGE: tiny-skia-path 0.12.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: BSD-3-Clause
-Registry archive SHA-256: 9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93
+Registry archive SHA-256: edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9
 Legal files:
 - LICENSE: 6d41e05f1d54fe726997cb0334ec539f1dff50600b1d5d90462ec2b392770ced
 
@@ -1739,38 +1740,6 @@ LEGAL TEXT SHA-256: 30fefc3a7d6a0041541858293bcbea2dde4caa4c0a5802f996a7f7e8c008
 Referenced by:
 - rustc-hash 2.1.3/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
------ END LEGAL TEXT -----
-
-===============================================================================
-LEGAL TEXT SHA-256: 3521672491a3479422d5fe1aca6645dd2984090f85da6e5205abfb18fb7a6897
-Referenced by:
-- crypto-common 0.1.7/LICENSE-MIT
------ BEGIN LEGAL TEXT -----
-Copyright (c) 2021 RustCrypto Developers
-
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
 documentation files (the "Software"), to deal in the
@@ -3047,7 +3016,6 @@ END OF TERMS AND CONDITIONS
 ===============================================================================
 LEGAL TEXT SHA-256: 6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb
 Referenced by:
-- bitflags 1.3.2/LICENSE-MIT
 - bitflags 2.13.1/LICENSE-MIT
 - log 0.4.33/LICENSE-MIT
 - num-traits 0.2.19/LICENSE-MIT
@@ -3181,8 +3149,8 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 6d41e05f1d54fe726997cb0334ec539f1dff50600b1d5d90462ec2b392770ced
 Referenced by:
-- tiny-skia 0.11.4/LICENSE
-- tiny-skia-path 0.11.4/LICENSE
+- tiny-skia 0.12.0/LICENSE
+- tiny-skia-path 0.12.0/LICENSE
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2011 Google Inc. All rights reserved.
 Copyright (c) 2020 Yevhenii Reizner All rights reserved.
@@ -3217,11 +3185,75 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
+LEGAL TEXT SHA-256: 70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9
+Referenced by:
+- hybrid-array 0.4.15/LICENSE-MIT
+----- BEGIN LEGAL TEXT -----
+Copyright (c) 2022-2026 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
 LEGAL TEXT SHA-256: 7365cc8878a1d7ce155a58c4ca09c3d7a6be413efa5334a80ea842912b669349
 Referenced by:
 - equivalent 1.0.2/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2016--2023
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
+LEGAL TEXT SHA-256: 73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa
+Referenced by:
+- const-oid 0.10.2/LICENSE-MIT
+----- BEGIN LEGAL TEXT -----
+Copyright (c) 2020-2026 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4159,6 +4191,41 @@ For more information, please refer to <http://unlicense.org/>
 ----- END LEGAL TEXT -----
 
 ===============================================================================
+LEGAL TEXT SHA-256: 831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25
+Referenced by:
+- sha2 0.11.1/LICENSE-MIT
+----- BEGIN LEGAL TEXT -----
+Copyright (c) 2016-2026 The RustCrypto Project Developers
+Copyright (c) 2016 Artyom Pavlov
+Copyright (c) 2009-2013 Mozilla Foundation
+Copyright (c) 2006-2009 Graydon Hoare
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
 LEGAL TEXT SHA-256: 838118388fe5c2e7f1dbbaeed13e1c7f3ebf88be91319c7c1d77c18e987d1a50
 Referenced by:
 - encoding_rs 0.8.42/LICENSE-WHATWG
@@ -4898,27 +4965,11 @@ END OF TERMS AND CONDITIONS
 ----- END LEGAL TEXT -----
 
 ===============================================================================
-LEGAL TEXT SHA-256: 9df9ba60a11af705f2e451b53762686e615d86f76b169cf075c3237730dbd7e2
+LEGAL TEXT SHA-256: 98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01
 Referenced by:
-- bytemuck 1.25.1/LICENSE-MIT
+- block-buffer 0.12.1/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
-MIT License
-
-Copyright (c) 2019 Daniel "Lokathor" Gee.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice (including the next paragraph) shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
------ END LEGAL TEXT -----
-
-===============================================================================
-LEGAL TEXT SHA-256: 9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba
-Referenced by:
-- digest 0.10.7/LICENSE-MIT
------ BEGIN LEGAL TEXT -----
-Copyright (c) 2017 Artyom Pavlov
+Copyright (c) 2018-2025 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4943,6 +4994,22 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+----- END LEGAL TEXT -----
+
+===============================================================================
+LEGAL TEXT SHA-256: 9df9ba60a11af705f2e451b53762686e615d86f76b169cf075c3237730dbd7e2
+Referenced by:
+- bytemuck 1.25.1/LICENSE-MIT
+----- BEGIN LEGAL TEXT -----
+MIT License
+
+Copyright (c) 2019 Daniel "Lokathor" Gee.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next paragraph) shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
@@ -4977,7 +5044,6 @@ SOFTWARE.
 LEGAL TEXT SHA-256: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
 Referenced by:
 - arrayvec 0.7.8/LICENSE-APACHE
-- bitflags 1.3.2/LICENSE-APACHE
 - bitflags 2.13.1/LICENSE-APACHE
 - bumpalo 3.20.3/LICENSE-APACHE
 - cfg-if 1.0.4/LICENSE-APACHE
@@ -4995,7 +5061,7 @@ Referenced by:
 - log 0.4.33/LICENSE-APACHE
 - num-traits 0.2.19/LICENSE-APACHE
 - once_cell 1.21.4/LICENSE-APACHE
-- png 0.17.16/LICENSE-APACHE
+- png 0.18.1/LICENSE-APACHE
 - rayon 1.12.0/LICENSE-APACHE
 - rayon-core 1.13.0/LICENSE-APACHE
 - scopeguard 1.2.0/LICENSE-APACHE
@@ -5246,10 +5312,12 @@ SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5
 Referenced by:
-- block-buffer 0.10.4/LICENSE-APACHE
-- crypto-common 0.1.7/LICENSE-APACHE
-- digest 0.10.7/LICENSE-APACHE
-- sha2 0.10.9/LICENSE-APACHE
+- block-buffer 0.12.1/LICENSE-APACHE
+- const-oid 0.10.2/LICENSE-APACHE
+- crypto-common 0.2.2/LICENSE-APACHE
+- digest 0.11.3/LICENSE-APACHE
+- hybrid-array 0.4.15/LICENSE-APACHE
+- sha2 0.11.1/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
                               Apache License
                         Version 2.0, January 2004
@@ -5455,13 +5523,12 @@ limitations under the License.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
-LEGAL TEXT SHA-256: b4eb00df6e2a4d22518fcaa6a2b4646f249b3a3c9814509b22bd2091f1392ff1
+LEGAL TEXT SHA-256: af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad
 Referenced by:
-- sha2 0.10.9/LICENSE-MIT
+- digest 0.11.3/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
-Copyright (c) 2006-2009 Graydon Hoare
-Copyright (c) 2009-2013 Mozilla Foundation
-Copyright (c) 2016 Artyom Pavlov
+Copyright (c) 2017-2025 RustCrypto Developers
+Copyright (c) 2017 Artyom Pavlov
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -5486,34 +5553,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
------ END LEGAL TEXT -----
-
-===============================================================================
-LEGAL TEXT SHA-256: c09aae9d3c77b531f56351a9947bc7446511d6b025b3255312d3e3442a9a7583
-Referenced by:
-- generic-array 0.14.7/LICENSE
------ BEGIN LEGAL TEXT -----
-The MIT License (MIT)
-
-Copyright (c) 2015 Bartłomiej Kamiński
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
@@ -6197,11 +6236,11 @@ limitations under the Licenses.
 ----- END LEGAL TEXT -----
 
 ===============================================================================
-LEGAL TEXT SHA-256: d5c22aa3118d240e877ad41c5d9fa232f9c77d757d4aac0c2f943afc0a95e0ef
+LEGAL TEXT SHA-256: d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963
 Referenced by:
-- block-buffer 0.10.4/LICENSE-MIT
+- crypto-common 0.2.2/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
-Copyright (c) 2018-2019 The RustCrypto Project Developers
+Copyright (c) 2021-2026 RustCrypto Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -6333,7 +6372,7 @@ freely, subject to the following restrictions:
 ===============================================================================
 LEGAL TEXT SHA-256: eaf40297c75da471f7cda1f3458e8d91b4b2ec866e609527a13acfa93b638652
 Referenced by:
-- png 0.17.16/LICENSE-MIT
+- png 0.18.1/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2015 nwin
 
