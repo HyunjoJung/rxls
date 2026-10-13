@@ -905,7 +905,7 @@ fn replace_zip_member(bytes: &[u8], name: &str, replacement: &[u8]) -> Vec<u8> {
     let mut output = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for index in 0..input.len() {
         let mut part = input.by_index(index).expect("read input zip member");
-        let part_name = part.name().to_string();
+        let part_name = part.name().unwrap().into_owned();
         output
             .start_file(&part_name, SimpleFileOptions::default())
             .expect("start replacement zip member");

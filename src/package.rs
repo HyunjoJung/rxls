@@ -2516,7 +2516,7 @@ mod tests {
         let names: Vec<String> = {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
             (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
                 .collect()
         };
         let a_pos = names.iter().position(|n| n == "xl/a.xml").unwrap();
