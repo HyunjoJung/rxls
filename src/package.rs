@@ -300,7 +300,10 @@ impl Package {
                     continue;
                 }
             };
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|_| Error::Zip("invalid ZIP entry name"))?
+                .into_owned();
             if name.len() > MAX_NAME_LEN {
                 return Err(Error::Zip("OOXML package entry name is too long"));
             }

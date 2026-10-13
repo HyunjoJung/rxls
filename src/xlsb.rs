@@ -241,7 +241,10 @@ fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> 
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
-        if canonical_part_name(file.name()).eq_ignore_ascii_case(&wanted) {
+        let Ok(name) = file.name() else {
+            continue;
+        };
+        if canonical_part_name(&name).eq_ignore_ascii_case(&wanted) {
             return Some(idx);
         }
     }

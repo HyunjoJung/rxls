@@ -488,7 +488,10 @@ fn unique_part_index(
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
-        if matches(file.name()) {
+        let Ok(name) = file.name() else {
+            continue;
+        };
+        if matches(&name) {
             if found.is_some() {
                 return None;
             }

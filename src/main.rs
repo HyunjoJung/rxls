@@ -3670,7 +3670,13 @@ fn inspect_package_bytes(
                 return Err(ExitCode::from(65));
             }
         };
-        let name = file.name().to_string();
+        let name = match file.name() {
+            Ok(name) => name.into_owned(),
+            Err(err) => {
+                eprintln!("{command} {label}: invalid ZIP entry name {index}: {err}");
+                return Err(ExitCode::from(65));
+            }
+        };
         let compressed_bytes = file.compressed_size();
         let uncompressed_bytes = file.size();
         if name.ends_with(".rels") {

@@ -35,9 +35,9 @@ fn seed(columns: &str) -> Vec<u8> {
         let mut contents = Vec::new();
         entry.read_to_end(&mut contents).unwrap();
         output
-            .start_file(entry.name(), SimpleFileOptions::default())
+            .start_file(entry.name().unwrap(), SimpleFileOptions::default())
             .unwrap();
-        if entry.name() == SHEET {
+        if entry.name().unwrap() == SHEET {
             let xml = String::from_utf8(contents).unwrap();
             assert!(!xml.contains("<cols>"));
             let xml = xml.replace("<sheetData>", &format!("<cols>{columns}</cols><sheetData>"));
@@ -273,7 +273,12 @@ fn retained_package_edits_do_not_rewrite_original_column_intervals() {
     assert!(xml.contains(r#"<col min="1" max="16384" style="1" width="9.140625" bestFit="1"/>"#));
     let mut archive = ZipArchive::new(Cursor::new(&original)).unwrap();
     for index in 0..archive.len() {
-        let name = archive.by_index(index).unwrap().name().to_owned();
+        let name = archive
+            .by_index(index)
+            .unwrap()
+            .name()
+            .unwrap()
+            .into_owned();
         if name != SHEET {
             assert_eq!(part(&saved, &name), part(&original, &name), "{name}");
         }

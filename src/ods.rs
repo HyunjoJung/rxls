@@ -163,7 +163,10 @@ fn read_image_parts_with_limits(
         if size > remaining {
             continue;
         }
-        let Some(path) = normalize_package_path(file.name()) else {
+        let Ok(name) = file.name() else {
+            continue;
+        };
+        let Some(path) = normalize_package_path(&name) else {
             continue;
         };
         let Some(format) = image_format(&path) else {
