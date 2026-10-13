@@ -667,8 +667,76 @@ async function runBrowserJourney() {
     });
   }
 
-  await page.setViewportSize({ width: 390, height: 844 });
+  // Escape is a mobile drawer shortcut; the desktop panel stays usable.
+  await page.locator("#sidebar-toggle").focus();
+  await page.keyboard.press("Enter");
+  // Keyboard dispatch can finish before the sidebar visibility transition.
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  await page.locator("#panel-open").focus();
+  assert.equal(
+    await page.locator("#panel-open").evaluate((element) => document.activeElement === element),
+    true,
+  );
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await page.locator("#sidebar-toggle").getAttribute("aria-expanded"),
+    "true",
+  );
+  assert.equal(await page.locator("#sidebar").isVisible(), true);
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    false,
+  );
   await page.locator("#sidebar-toggle").click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const panelToggle = page.locator("#sidebar-toggle");
+  assert.equal(await panelToggle.getAttribute("aria-controls"), "sidebar");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  await panelToggle.focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    false,
+  );
+  await page.locator("#panel-open").focus();
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await panelToggle.getAttribute("aria-expanded"),
+    "false",
+    "Escape closes the mobile workbook panel",
+  );
+  assert.equal(
+    await panelToggle.evaluate((element) => document.activeElement === element),
+    true,
+    "Escape restores focus to the mobile panel toggle",
+  );
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    true,
+  );
+
+  await page.keyboard.press("Space");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  // The panel can remain open behind a modal; the modal owns the first Escape.
+  await page.keyboard.press("Control+e");
+  await page.locator("#cell-dialog").waitFor({ state: "visible" });
+  await page.keyboard.press("Escape");
+  await page.locator("#cell-dialog").waitFor({ state: "hidden" });
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator(".brand").focus();
+  await page.keyboard.press("Escape");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  assert.equal(
+    await panelToggle.evaluate((element) => document.activeElement === element),
+    true,
+    "Escape restores toggle focus even when focus was outside the panel",
+  );
+
+  await panelToggle.click();
   await page
     .locator("body.sidebar-open #sidebar")
     .waitFor({ state: "visible" });
@@ -701,6 +769,11 @@ async function runBrowserJourney() {
         .locator("body")
         .evaluate((body) => body.classList.contains("sidebar-open"))),
     "mobile sidebar close",
+  );
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    true,
   );
   await page.locator("#edit-cell").click();
   await page.locator("#cell-dialog").waitFor({ state: "visible" });

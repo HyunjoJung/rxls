@@ -182,3 +182,11 @@ required-features = ["xlsx"]
 [[example]]
 name = "edit_save_benchmark"
 required-features = ["xlsx"]
+
+[[example]]
+name = "typed_rows"
+required-features = ["serde", "xlsx"]
+
+[[example]]
+name = "csv_export"
+required-features = ["xlsx"]

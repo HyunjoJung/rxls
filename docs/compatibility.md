@@ -2,9 +2,31 @@
 
 [Back to README](../README.md)
 
-This document defines the format and feature boundaries of the published
-`rxls` core crate. Reading, authoring, and preservation editing are separate
-capabilities; support for one does not imply support for the others.
+This document distinguishes the published `rxls` core **0.1.4**, source
+checkouts, and separately versioned adapters. Reading,
+authoring, and preservation editing are separate capabilities; support for one
+does not imply support for the others.
+
+## Release and source boundaries
+
+The registry snapshot below was checked on 2026-10-13. Source changes after a
+release require their own revision-specific verification; installing a released
+package does not select later source changes.
+
+| Surface | Published version | Installation boundary |
+|---|---|---|
+| Native core and CLI | [0.1.4](https://crates.io/crates/rxls/0.1.4) | `cargo install rxls --version =0.1.4 --locked`; released MSRV 1.85 |
+| General WASM adapter | [0.1.4](https://www.npmjs.com/package/rxls-wasm/v/0.1.4) | `npm install rxls-wasm@0.1.4`; read-only synchronous Node/browser API |
+| Render worker | [0.3.0](https://www.npmjs.com/package/@rxls/render-worker/v/0.3.0) | `npm install @rxls/render-worker@0.3.0`; protocol `rxls.render-worker.v2` |
+| Local MCP server | Unpublished | Build `bindings/mcp` from a reviewed source revision; see the [walkthrough](../bindings/mcp/README.md#open-read-edit-and-save-a-copy) |
+| VS Code preview | [0.1.0](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0) | Marketplace, Open VSX, or the checksum-verified release VSIX |
+
+The general WASM API and rendering worker are separate packages. Their
+JavaScript entry points do not automatically expose every native Rust method.
+Worker clients, runtime modules, and generated WASM must come from the same
+package version. See the [installed-consumer checks](validation.md#installed-distribution-snapshot)
+for the scope of the registry audit. Historical `0.1.3` evidence retains its
+original version and Rust 1.85 baseline.
 
 ## Format matrix
 
@@ -74,6 +96,23 @@ separately from authoring merges so reading never changes write output.
 - The `chrono` feature converts Excel date/time and duration serials to
   `chrono` types while retaining raw serial access.
 
+Run the self-contained [typed-row example](../examples/typed_rows.rs) from a
+source checkout:
+
+```sh
+cargo +1.85.0 run --locked --features serde --example typed_rows
+```
+
+It writes and reopens an XLSX in memory, maps the header to a named Serde
+struct, and propagates both header and row conversion errors. `serde` is
+opt-in; `xlsx` is enabled by default. With defaults disabled, use
+`--no-default-features --features xlsx,serde`. Expected stdout:
+
+```text
+Road: price=125.5, awarded=true
+Bridge: price=88, awarded=false
+```
+
 Formula re-evaluation is a bounded deterministic subset, not a full Excel
 calculation engine. See [Formula support](formulas.md).
 
@@ -107,6 +146,78 @@ A sheet or workbook can be exported to CSV, HTML, or Markdown. CSV export has
 an explicit formula-text policy for callers that will open output in
 spreadsheet software.
 
+### Matching CLI and Rust CSV output
+
+The [runnable CSV example](../examples/csv_export.rs) creates a synthetic XLSX
+with worksheet `Data`, text containing a delimiter, quotes and an embedded
+newline, and the literal text `=1+1`. Run these commands from the checkout root
+with the default `xlsx,cli` features:
+
+```sh
+cargo +1.85.0 run --locked --example csv_export
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --formula-injection preserve --max-output-bytes 1024 > target/csv-recipe/preserve.cli.csv
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --formula-injection escape --max-output-bytes 1024 > target/csv-recipe/escape.cli.csv
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --delimiter ';' --newline crlf --bom --formula-injection escape \
+  --max-output-bytes 1024 > target/csv-recipe/excel.cli.csv
+cmp target/csv-recipe/preserve.rust.csv target/csv-recipe/preserve.cli.csv
+cmp target/csv-recipe/escape.rust.csv target/csv-recipe/escape.cli.csv
+cmp target/csv-recipe/excel.rust.csv target/csv-recipe/excel.cli.csv
+```
+
+`cmp` succeeds silently for each byte-identical pair. The example uses
+`export_csv` with these `CsvOptions`; it requires `xlsx` only to generate/read
+the sample. With defaults disabled, run it with `--features xlsx`.
+
+| Output | `delimiter` | `newline` | `bom` | `formula_policy` |
+| --- | --- | --- | --- | --- |
+| `preserve` | `','` | `CsvNewline::Lf` | `false` | `CsvFormulaPolicy::Preserve` |
+| `escape` | `','` | `CsvNewline::Lf` | `false` | `CsvFormulaPolicy::Escape` |
+| `excel` | `';'` | `CsvNewline::CrLf` | `true` | `CsvFormulaPolicy::Escape` |
+
+All three use `max_output_bytes: 1024`. `CsvOptions::default()` uses comma,
+LF, no BOM, `Preserve`, and a 256 MiB output limit. Fields containing the
+delimiter, quotes, CR or LF are quoted; embedded quotes are doubled and embedded
+newlines are retained. The preserved CLI output is:
+
+```csv
+name,note,input
+"a,""b""","line1
+line2",=1+1
+```
+
+`escape` prefixes the last field with an apostrophe, producing `'=1+1`
+(serialized as the quoted CSV field `"'=1+1"`).
+It also prefixes text beginning with `+`, `-`, `@`, tab, CR or LF. This changes
+the exported field text; it is not a universal guarantee about spreadsheet
+applications. Preserve is the default. The `excel` variant starts with the
+UTF-8 BOM bytes `EF BB BF` and uses CRLF between records; the newline inside
+`line1\nline2` remains LF.
+
+The Rust library returns a string **without** a final record separator. The
+example explicitly adds the CLI's final LF/CRLF and checks its bytes against
+the limit before writing, so the files above match exactly.
+
+To reproduce a byte-limit error:
+
+```sh
+if cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --max-output-bytes 8 > target/csv-recipe/limited.csv; then
+  echo 'unexpected export success' >&2
+  exit 1
+fi
+test ! -s target/csv-recipe/limited.csv
+```
+
+The CLI reports `CSV output exceeds the configured 8-byte limit` on stderr
+and exits with code 65 without partial CSV on stdout. Shell redirection may
+still create an empty file. The Rust example checks the corresponding
+`CsvExportError::OutputTooLarge { limit: 8 }`; no partial string is returned.
+
+### Other interfaces
+
 `WorkbookReport` provides machine-readable sheet, cell, formula, document
 property, feature inventory, and parse-provenance data. The CLI exposes this as
 `rxls diagnose` and also provides `info`, `csv`, `compare`, and
@@ -116,8 +227,8 @@ are compatibility-controlled behavior.
 
 The isolated `bindings/wasm` crate exposes the core model through generated Node
 and browser entry points, TypeScript declarations, structured `RxlsError`
-objects, and a synchronous 32 MiB input limit. It is built and distributed
-separately from the native CLI.
+objects, and a synchronous 32 MiB input limit. It is published as
+`rxls-wasm 0.1.4`, separately from the native CLI.
 
 The isolated `bindings/mcp` crate exposes nine local stdio tools for opening,
 inspecting, reading, exporting, preservation-editing, save-copying, and closing
@@ -130,8 +241,8 @@ XLSX/XLSM sessions with `EditCapability::ReadWrite` can mutate or save. The MCP
 crate is currently built from the source workspace and is not independently
 published.
 
-The source workspace also contains an experimental renderer,
-`@rxls/render-worker`, and the local MCP server. They are not included in the
+The renderer, published `@rxls/render-worker` package, and local MCP server are
+separately versioned surfaces. They are not included in the
 published core crate and do not extend the read, write, edit, CLI, or core WASM
 compatibility claims.
 The worker keeps retained workbook bytes inside its dedicated session. For
@@ -176,8 +287,8 @@ Features are additive. Use `default-features = false` for an XLS-only library
 build or `features = ["full"]` for every reader and typed-data helper. The
 minimum supported Rust version is 1.85.
 
-Version 0.1.3 defines the current published API and semantics; this checkout
-prepares the compatible 0.1.4 update. CI and release verification compare all,
+Version 0.1.4 defines the current published API and semantics. CI and release
+verification compare all,
 default, and no-default feature APIs against the published 0.1.3 baseline.
 Compatible updates may add APIs and `#[non_exhaustive]` variants under the
 crate's SemVer policy. Pin an exact version when the dependency graph or
