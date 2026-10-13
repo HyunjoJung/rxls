@@ -120,3 +120,21 @@ These boundaries prevent an apparently successful save from becoming a lossy
 rewrite. Open a feature request with a representative public fixture when an
 additional operation can be implemented with a bounded dependency update and a
 testable preservation contract.
+
+## Raw XML parser compatibility
+
+String-based XLSX, XLSB, and ODS readers use `quick-xml` 0.42. The two package
+preservation byte-reader paths, `XmlTree` and `[Content_Types].xml`, retain an
+exact `quick-xml-raw` alias at 0.41.0. This is a deliberate compatibility
+exception: 0.42 requires every event to be valid UTF-8 before dispatch, whereas
+these paths preserve uninterpreted comments, CDATA, processing instructions,
+declarations, doctypes, and prolog/epilog bytes without rewriting their payloads.
+Replacing invalid bytes or silently making previously editable packages
+read-only would break the existing preservation contract.
+
+The alias is enabled only by the `xlsx` feature (including `xlsb` and `full`),
+not ODS-only or dependency-light XLS builds. Interpreted cell text and attribute
+values still reject invalid UTF-8, malformed entities, and forbidden XML 1.0
+characters; existing depth, node, attribute, general-reference, and package
+budgets remain enforced. Remove the compatibility alias only when a supported
+raw-event API preserves this behavior and the retention regressions pass.

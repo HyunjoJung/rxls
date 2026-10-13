@@ -114,6 +114,10 @@ thiserror = "2.0"
 # .xls-only build (`default-features = false`).
 zip = { version = "9.0.2", default-features = false, features = ["deflate"], optional = true }
 quick-xml = { version = "0.42", optional = true }
+# Raw package preservation requires byte events; quick-xml 0.42 decodes every
+# event as UTF-8. Keep this exact compatibility dependency isolated to XmlTree
+# and [Content_Types].xml while string-based readers use the current release.
+quick-xml-raw = { package = "quick-xml", version = "=0.41.0", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 chrono = { version = "0.4.45", default-features = false, optional = true }
 
@@ -124,7 +128,7 @@ default = ["xlsx", "cli"]
 # unaffected; disable it (via `--no-default-features`) for a library-only
 # build.
 cli = []
-xlsx = ["dep:zip", "dep:quick-xml"]
+xlsx = ["dep:zip", "dep:quick-xml", "dep:quick-xml-raw"]
 # .xlsb (BIFF12 binary) reader — reuses the xlsx ZIP plumbing + rels parser.
 xlsb = ["xlsx"]
 # .ods (OpenDocument Spreadsheet) reader — ZIP + content.xml.
