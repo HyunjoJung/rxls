@@ -2454,7 +2454,7 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Upload path-neutral aggregate identities only
         if: ${{ success() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: render-oracle-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-full' && 'full' || github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-pilot' && 'pilot' || (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.campaign || 'pilot' }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.baseline_mode || 'verify' }}
           path: |
@@ -2509,7 +2509,7 @@ jobs:
       - name: Upload sanitized Render Oracle failure summary
         id: render_oracle_failure_upload
         if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: render-oracle-failure-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/render-oracle-failure/render-oracle-failure-summary.json
