@@ -2,9 +2,31 @@
 
 [Back to README](../README.md)
 
-This document defines the format and feature boundaries of the published
-`rxls` core crate. Reading, authoring, and preservation editing are separate
-capabilities; support for one does not imply support for the others.
+This document distinguishes the published `rxls` core **0.1.4**, source
+checkouts, and separately versioned adapters. Reading,
+authoring, and preservation editing are separate capabilities; support for one
+does not imply support for the others.
+
+## Release and source boundaries
+
+The registry snapshot below was checked on 2026-10-13. Source changes after a
+release require their own revision-specific verification; installing a released
+package does not select later source changes.
+
+| Surface | Published version | Installation boundary |
+|---|---|---|
+| Native core and CLI | [0.1.4](https://crates.io/crates/rxls/0.1.4) | `cargo install rxls --version =0.1.4 --locked`; released MSRV 1.85 |
+| General WASM adapter | [0.1.4](https://www.npmjs.com/package/rxls-wasm/v/0.1.4) | `npm install rxls-wasm@0.1.4`; read-only synchronous Node/browser API |
+| Render worker | [0.3.0](https://www.npmjs.com/package/@rxls/render-worker/v/0.3.0) | `npm install @rxls/render-worker@0.3.0`; protocol `rxls.render-worker.v2` |
+| Local MCP server | Unpublished | Build `bindings/mcp` from a reviewed source revision; see the [walkthrough](../bindings/mcp/README.md#open-read-edit-and-save-a-copy) |
+| VS Code preview | [0.1.0](https://github.com/HyunjoJung/rxls/releases/tag/vscode-v0.1.0) | Marketplace, Open VSX, or the checksum-verified release VSIX |
+
+The general WASM API and rendering worker are separate packages. Their
+JavaScript entry points do not automatically expose every native Rust method.
+Worker clients, runtime modules, and generated WASM must come from the same
+package version. See the [installed-consumer checks](validation.md#installed-distribution-snapshot)
+for the scope of the registry audit. Historical `0.1.3` evidence retains its
+original version and Rust 1.85 baseline.
 
 ## Format matrix
 
@@ -205,8 +227,8 @@ are compatibility-controlled behavior.
 
 The isolated `bindings/wasm` crate exposes the core model through generated Node
 and browser entry points, TypeScript declarations, structured `RxlsError`
-objects, and a synchronous 32 MiB input limit. It is built and distributed
-separately from the native CLI.
+objects, and a synchronous 32 MiB input limit. It is published as
+`rxls-wasm 0.1.4`, separately from the native CLI.
 
 The isolated `bindings/mcp` crate exposes nine local stdio tools for opening,
 inspecting, reading, exporting, preservation-editing, save-copying, and closing
@@ -219,8 +241,8 @@ XLSX/XLSM sessions with `EditCapability::ReadWrite` can mutate or save. The MCP
 crate is currently built from the source workspace and is not independently
 published.
 
-The source workspace also contains an experimental renderer,
-`@rxls/render-worker`, and the local MCP server. They are not included in the
+The renderer, published `@rxls/render-worker` package, and local MCP server are
+separately versioned surfaces. They are not included in the
 published core crate and do not extend the read, write, edit, CLI, or core WASM
 compatibility claims.
 The worker keeps retained workbook bytes inside its dedicated session. For
@@ -265,8 +287,8 @@ Features are additive. Use `default-features = false` for an XLS-only library
 build or `features = ["full"]` for every reader and typed-data helper. The
 minimum supported Rust version is 1.85.
 
-Version 0.1.3 defines the current published API and semantics; this checkout
-prepares the compatible 0.1.4 update. CI and release verification compare all,
+Version 0.1.4 defines the current published API and semantics. CI and release
+verification compare all,
 default, and no-default feature APIs against the published 0.1.3 baseline.
 Compatible updates may add APIs and `#[non_exhaustive]` variants under the
 crate's SemVer policy. Pin an exact version when the dependency graph or

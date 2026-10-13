@@ -10,7 +10,7 @@ exports are `extractText`, `toCsv`, `toHtml`, `toMarkdown`, `reportJson`,
 `maxInputBytes`, and `maxExportOutputBytes`.
 
 ```sh
-npm install rxls-wasm
+npm install rxls-wasm@0.1.4
 ```
 
 ## Node.js
