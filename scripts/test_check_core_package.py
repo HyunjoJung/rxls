@@ -27,10 +27,12 @@ full = ["xlsx", "xlsb", "ods", "serde", "chrono"]
 ods = ["dep:zip", "dep:quick-xml"]
 serde = ["dep:serde"]
 xlsb = ["xlsx"]
-xlsx = ["dep:zip", "dep:quick-xml"]
+xlsx = ["dep:zip", "dep:quick-xml", "dep:quick-xml-raw"]
 """
 DEPENDENCIES = "\n".join(
-    f'[dependencies.{name}]\nversion = "1"'
+    ('[dependencies.quick-xml-raw]\nversion = "=0.41.0"\n'
+     'package = "quick-xml"\noptional = true'
+     if name == "quick-xml-raw" else f'[dependencies.{name}]\nversion = "1"')
     for name in sorted(MODULE.ALLOWED_DEPENDENCIES)
 )
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))[
@@ -174,6 +176,34 @@ class CorePackageGateTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(report["passed"])
         self.assertEqual(report["dependencies"], sorted(MODULE.ALLOWED_DEPENDENCIES))
+
+    def test_rejects_raw_xml_alias_drift(self) -> None:
+        for old, new in (
+            ('package = "quick-xml"', 'package = "other-parser"'),
+            ('version = "=0.41.0"', 'version = "0.41"'),
+            ('optional = true', 'optional = false'),
+        ):
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                crate = Path(directory) / "rxls.crate"
+                write_crate(crate, {"Cargo.toml": MANIFEST.replace(old, new).encode()})
+                errors, _ = MODULE.validate(crate)
+                self.assertIn("raw XML alias must remain pinned and XLSX-optional", errors)
+
+    def test_rejects_optional_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            manifest = MANIFEST.replace('[dependencies.uuid]', '[dependencies.uuid]\noptional = true')
+            write_crate(crate, {"Cargo.toml": manifest.encode()})
+            errors, _ = MODULE.validate(crate)
+        self.assertIn("UUID dependency must remain nonoptional", errors)
+
+    def test_rejects_missing_xlsx_raw_xml_feature(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            crate = Path(directory) / "rxls.crate"
+            manifest = MANIFEST.replace(', "dep:quick-xml-raw"', '')
+            write_crate(crate, {"Cargo.toml": manifest.encode()})
+            errors, _ = MODULE.validate(crate)
+        self.assertIn("core feature semantics changed", errors)
 
     def test_rejects_render_tree_and_internal_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

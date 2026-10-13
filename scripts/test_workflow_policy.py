@@ -148,15 +148,15 @@ class WorkflowPolicyTests(unittest.TestCase):
         valid = (
             "steps:\n"
             "  - uses: actions/setup-node@"
-            "820762786026740c76f36085b0efc47a31fe5020 # v7.0.0\n"
+            "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0\n"
         )
         self.assertEqual(self.policy.audit_action_pins(path, valid), [])
 
         mutations = {
             "commit": valid.replace(
-                "820762786026740c76f36085b0efc47a31fe5020", "a" * 40
+                "949feb2413d6458794dcd2491c4babbbce0c15c1", "a" * 40
             ),
-            "comment": valid.replace("# v7.0.0", "# v6.5.0"),
+            "comment": valid.replace("# v7.1.0", "# v6.5.0"),
         }
         for name, workflow in mutations.items():
             with self.subTest(name=name):
@@ -182,8 +182,8 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_codeql_rejects_updating_only_one_action(self) -> None:
         original = CODEQL_WORKFLOW.read_text(encoding="utf-8")
-        updated = "1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1"
-        previous = "db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8"
+        updated = "24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3"
+        previous = "1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1"
         for action in ("init", "analyze"):
             modified = original.replace(
                 f"github/codeql-action/{action}@{updated}",

@@ -58,7 +58,7 @@ The source format changes the parser, not the application-facing model:
 
 | Need | API |
 |---|---|
-| Searchable text | `extract_text`, `Workbook::to_text` |
+| Searchable text | `extract_text`, `Workbook::text` |
 | Typed coordinates | `Sheet::cell`, `cells`, `dimensions` |
 | Rectangular data | `worksheet_range`, row views, relative and absolute used cells |
 | Workbook structure | sheet visibility, names, properties, tables, panes, print setup |

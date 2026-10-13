@@ -6,7 +6,7 @@
   },
   "wasmBindgen": {
     "buildRust": "1.88.0",
-    "version": "0.2.126"
+    "version": "0.2.129"
   },
   "chromium": {
     "product": "Google Chrome",

@@ -25,8 +25,10 @@ ALLOWED_DEPENDENCIES = {
     "chrono",
     "encoding_rs",
     "quick-xml",
+    "quick-xml-raw",
     "serde",
     "thiserror",
+    "uuid",
     "zip",
 }
 EXPECTED_FEATURES = {
@@ -37,7 +39,7 @@ EXPECTED_FEATURES = {
     "ods": ["dep:zip", "dep:quick-xml"],
     "serde": ["dep:serde"],
     "xlsb": ["xlsx"],
-    "xlsx": ["dep:zip", "dep:quick-xml"],
+    "xlsx": ["dep:zip", "dep:quick-xml", "dep:quick-xml-raw"],
 }
 FORBIDDEN_TOP_LEVEL = {
     ".github",
@@ -300,6 +302,20 @@ def validate(
                                 ):
                                     errors.append("package contains a git or path dependency")
                                     break
+                            dependency_tables = manifest.get("dependencies", {})
+                            raw_xml = dependency_tables.get("quick-xml-raw", {})
+                            if not isinstance(raw_xml, dict) or any(
+                                raw_xml.get(key) != expected
+                                for key, expected in {
+                                    "package": "quick-xml",
+                                    "version": "=0.41.0",
+                                    "optional": True,
+                                }.items()
+                            ):
+                                errors.append("raw XML alias must remain pinned and XLSX-optional")
+                            uuid = dependency_tables.get("uuid", {})
+                            if not isinstance(uuid, dict) or uuid.get("optional", False) is not False:
+                                errors.append("UUID dependency must remain nonoptional")
                             raw_features = manifest.get("features", {})
                             features = {
                                 str(name): [str(value) for value in values]

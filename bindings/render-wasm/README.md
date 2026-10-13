@@ -130,11 +130,11 @@ PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
   "$RUST_188_BIN/cargo" doc --locked --no-deps
 npm test
 rustup toolchain install 1.88.0 --profile minimal
-WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.126.XXXXXX")"
+WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.129.XXXXXX")"
 RUST_188_BIN="$(dirname "$(rustup which cargo --toolchain 1.88.0)")"
 PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
   RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" install wasm-bindgen-cli \
-  --version 0.2.126 --locked --root "$WASM_BINDGEN_TOOL_ROOT"
+  --version 0.2.129 --locked --root "$WASM_BINDGEN_TOOL_ROOT"
 PATH="$WASM_BINDGEN_TOOL_ROOT/bin:$PATH" npm run build:wasm
 npm run test:browser
 ```

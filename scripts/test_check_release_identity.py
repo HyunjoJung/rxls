@@ -42,6 +42,15 @@ class PackageIdentityTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         copy_metadata(self.root)
+        # Graph tests use an explicitly released fixture, independently of the
+        # checkout's current development/release phase.
+        version = tomllib.loads((self.root / "Cargo.toml").read_text())["package"]["version"]
+        (self.root / "CHANGELOG.md").write_text(
+            f"## [{version}] - 2026-09-28\n"
+            f"[{version}]: https://github.com/HyunjoJung/rxls/releases/tag/v{version}\n"
+            f"[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v{version}...HEAD\n",
+            encoding="utf-8",
+        )
 
     def replace(self, relative: str, old: str, new: str) -> None:
         path = self.root / relative
@@ -199,6 +208,55 @@ class PackageIdentityTests(unittest.TestCase):
         self.replace(IDENTITY.POLICY, "rxls.package-identities.v1", "rxls.package-identities.v99")
         with self.assertRaisesRegex(ValueError, "unsupported schema"):
             IDENTITY.validate(self.root)
+
+
+class DevelopmentIdentityTests(unittest.TestCase):
+    CHANGELOG = """## [Unreleased]
+## [0.2.0] - Unreleased
+## [0.1.4] - 2026-09-28
+[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
+[0.2.0]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4
+"""
+
+    def test_source_checkout_identity_passes_development_validation(self) -> None:
+        self.assertEqual(IDENTITY.validate(ROOT, allow_unreleased=True), [])
+
+    def test_publication_rejects_unreleased_version_by_default(self) -> None:
+        errors = IDENTITY._validate_changelog(self.CHANGELOG, "0.2.0", False)
+        self.assertTrue(any("publication requires a dated release entry" in error for error in errors))
+
+    def test_development_validation_keeps_actual_released_baseline(self) -> None:
+        self.assertEqual(IDENTITY._validate_changelog(self.CHANGELOG, "0.2.0", True), [])
+
+    def test_development_validation_rejects_false_or_missing_baseline(self) -> None:
+        for old, new in (
+            ("## [0.1.4] - 2026-09-28", "## [0.1.4] - Unreleased"),
+            ("## [0.1.4] - 2026-09-28", "## [0.1.4] - 2026-02-30"),
+            ("releases/tag/v0.1.4", "releases/tag/v0.1.3"),
+            ("[0.2.0]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD",
+             "[0.2.0]: https://github.com/HyunjoJung/rxls/releases/tag/v0.2.0"),
+            ("[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD",
+             "[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.2.0...HEAD"),
+            ("compare/v0.1.4...HEAD", "compare/v0.2.0...HEAD"),
+            ("## [0.2.0] - Unreleased", "## [0.2.0] - Unreleased\n## [0.2.0] - 2026-10-13"),
+        ):
+            with self.subTest(new=new):
+                self.assertTrue(IDENTITY._validate_changelog(
+                    self.CHANGELOG.replace(old, new), "0.2.0", True,
+                ))
+
+    def test_dated_release_requires_matching_tag_and_comparison(self) -> None:
+        released = self.CHANGELOG.replace("## [0.2.0] - Unreleased", "## [0.2.0] - 2026-10-13")
+        self.assertTrue(IDENTITY._validate_changelog(released, "0.2.0", False))
+        released = released.replace(
+            "[0.2.0]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD",
+            "[0.2.0]: https://github.com/HyunjoJung/rxls/releases/tag/v0.2.0",
+        ).replace(
+            "[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD",
+            "[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.2.0...HEAD",
+        )
+        self.assertEqual(IDENTITY._validate_changelog(released, "0.2.0", False), [])
 
 
 if __name__ == "__main__":
