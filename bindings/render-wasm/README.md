@@ -5,7 +5,11 @@ It keeps parsing, pagination, shaping, SVG serialization, and PNG rasterization
 inside a dedicated module worker and exposes one sheet, tile, or print page at a
 time.
 
-The worker protocol is `rxls.render-worker.v2`. An `open` request creates one
+This checkout prepares worker 0.4.0; it is not a registry availability claim.
+The published worker 0.3.0 uses protocol v2. Keep each client's Worker and WASM
+from the same package; the development v3 contract rejects mixed versions.
+
+The worker protocol is `rxls.render-worker.v3`. An `open` request creates one
 `RenderSession`, so later virtual tile/page requests reuse the parsed workbook
 and a verified in-memory font pack. Input, font members, embedded images,
 layout work, scene nodes, page count, raster pixels, and output bytes all have
@@ -40,7 +44,7 @@ await client.redoEdit(opened.documentId);
 const saved = await client.saveDocument(opened.documentId);
 ```
 
-The `rxls.render-worker.v2` edit surface also supports typed cell
+The `rxls.render-worker.v3` edit surface also supports typed cell
 inspection and complete document-property replacement. XLS, XLSB, ODS, and
 OOXML packages that cannot retain metadata report a stable read-only reason.
 Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
@@ -199,3 +203,15 @@ LibreOffice campaign whose absolute, repeatability, authored-print, and
 reviewed-baseline ratchets all pass. Publication then passes through the
 protected `npm-render-worker` environment before npm receives the verified
 tarball and provenance identity.
+
+### Calculation observation and v3 compatibility
+
+Use the client, Worker, and WASM from the same package version. Protocol v3
+intentionally rejects v2 mixtures; v2 responses have not acquired optional keys.
+`EditState` schema 2 includes `calculation: { status, summary }`. `unknown` has a
+null summary on opening/reopening. `observed` records the latest successful
+supported-evaluator pass; `stale` retains its counts/reasons after a cell change
+without recalculation. Property edits preserve the observation, and Rust
+undo/redo restores it with the workbook. Operation `recalculation` remains a
+separate summary of that operation. Observation metadata is session-local,
+bounded by the history budget, and never saved into the XLSX/XLSM package.

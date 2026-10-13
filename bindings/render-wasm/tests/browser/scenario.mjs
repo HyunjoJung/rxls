@@ -186,6 +186,8 @@ export async function runBrowserScenario({
 
     result.textContent = "STEP atomic dependent recalculation";
     const editDocument = await timed(client.open(fixture.workbook, { documentId: "browser-recalculation" }), "open recalculation fixture");
+    if (editDocument.editState.schemaVersion !== 2 || editDocument.editState.calculation.status !== "unknown" ||
+        editDocument.editState.calculation.summary !== null) throw new Error("new session claimed an unobserved calculation result");
     await timed(client.setCell(editDocument.documentId, 0, 0, 0, { kind: "number", value: 2 }), "seed numeric reference");
     await timed(client.setCellAndRecalculate(editDocument.documentId, 0, 0, 1,
       { kind: "formula-auto", formula: "=A1*2" }), "seed automatic formula");
@@ -204,10 +206,41 @@ export async function runBrowserScenario({
         throw new Error(`${step} did not preserve the atomic dependent formula cache`);
       }
     }
+    await timed(client.setCell(editDocument.documentId, 0, 0, 2,
+      { kind: "formula", formula: "NOW()", cached: { kind: "number", value: 42 } }), "seed unsupported cached formula");
+    const warningObserved = await timed(client.setCellAndRecalculate(editDocument.documentId, 0, 0, 0,
+      { kind: "number", value: 3 }), "observe unsupported formula warning");
+    const observed = warningObserved.editState.calculation;
+    if (observed.status !== "observed" || observed.summary.unsupportedCells !== 1 ||
+        JSON.stringify(observed.summary) !== JSON.stringify(warningObserved.recalculation)) {
+      throw new Error("worker did not expose the Rust calculation observation");
+    }
+    for (const mutation of [
+      () => client.setDocumentProperties(editDocument.documentId, warningObserved.workbook.properties),
+      () => client.undoEdit(editDocument.documentId),
+      () => client.redoEdit(editDocument.documentId),
+    ]) {
+      const response = await timed(mutation(), "restore calculation observation with metadata history");
+      if (JSON.stringify(response.editState.calculation) !== JSON.stringify(observed) || "recalculation" in response) {
+        throw new Error("metadata history changed the observation or invented an operation report");
+      }
+    }
+    const stale = await timed(client.setCell(editDocument.documentId, 0, 0, 0,
+      { kind: "number", value: 3 }), "mark formula cache observation stale");
+    if (stale.editState.calculation.status !== "stale" ||
+        JSON.stringify(stale.editState.calculation.summary) !== JSON.stringify(observed.summary)) {
+      throw new Error("non-recalculating edit cleared a known warning");
+    }
+    const restoredObservation = await timed(client.undoEdit(editDocument.documentId), "restore observed calculation state");
+    if (JSON.stringify(restoredObservation.editState.calculation) !== JSON.stringify(observed)) {
+      throw new Error("undo did not restore the calculation state");
+    }
     const savedRecalculation = await timed(client.saveDocument(editDocument.documentId), "save recalculated workbook");
     await client.closeDocument(editDocument.documentId);
     const reopenedRecalculation = await timed(client.open(savedRecalculation.bytes,
       { documentId: "browser-recalculation-saved" }), "reopen recalculated workbook");
+    if (reopenedRecalculation.editState.calculation.status !== "unknown" ||
+        reopenedRecalculation.editState.calculation.summary !== null) throw new Error("reopened workbook inherited session calculation metadata");
     const savedFormula = await timed(client.readCell(reopenedRecalculation.documentId, 0, 0, 1), "read saved formula cache");
     if (savedFormula.value.kind !== "formula" || savedFormula.value.cached.kind !== "number" ||
         savedFormula.value.cached.value !== 6) throw new Error("saved dependent cache was stale");

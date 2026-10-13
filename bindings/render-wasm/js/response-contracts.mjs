@@ -1,4 +1,5 @@
 /** Internal response contracts shared by the client and WASM boundary. */
+import { validateRecalculationSummary } from "./protocol.mjs";
 
 const DOCUMENT_PROPERTY_KEYS = [
   "title",
@@ -21,7 +22,8 @@ const EDIT_STATE_KEYS = [
   "undoDepth",
   "redoDepth",
   "historyBytes",
-  "editedParts"
+  "editedParts",
+  "calculation"
 ];
 
 const EDIT_REASONS = new Set([
@@ -59,6 +61,7 @@ export function createResponseValidators({
     validateWorkbookInspection,
     validateDocumentProperties,
     validateEditState,
+    validateRecalculationMatch,
     validateInspectedCell
   });
 
@@ -124,11 +127,41 @@ export function createResponseValidators({
     return value;
   }
 
+  // Called after both independently bounded contracts have been validated.
+  function validateRecalculationMatch(editState, summary) {
+    assertPlainRecord(editState, "edit state");
+    assertPlainRecord(summary, "recalculation summary");
+    assertPlainRecord(editState.calculation, "calculation observation");
+    const observation = editState.calculation;
+    const actual = observation.summary;
+    if (observation.status !== "observed" ||
+        actual.computedCells !== summary.computedCells ||
+        actual.unchangedCells !== summary.unchangedCells ||
+        actual.unsupportedCells !== summary.unsupportedCells ||
+        actual.reasons.length !== summary.reasons.length ||
+        actual.reasons.some((reason, index) => reason !== summary.reasons[index])) {
+      throw invalid("recalculating edit must report its current calculation observation");
+    }
+  }
+
+  function validateCalculationObservation(value) {
+    assertPlainRecord(value, "calculation observation");
+    assertExactKeys(value, ["status", "summary"], "calculation observation");
+    if (value.status === "unknown") {
+      if (value.summary !== null) throw invalid("unknown calculation state must not claim an observation");
+    } else if (value.status === "observed" || value.status === "stale") {
+      try { validateRecalculationSummary(value.summary); }
+      catch { throw invalid("calculation observation summary is invalid"); }
+    } else {
+      throw invalid("calculation observation status is invalid");
+    }
+  }
+
   function validateEditState(value) {
     assertPlainRecord(value, "edit state");
     assertExactKeys(value, EDIT_STATE_KEYS, "edit state");
     if (
-      value.schemaVersion !== 1 ||
+      value.schemaVersion !== 2 ||
       !["read-write", "read-only"].includes(value.capability) ||
       (value.reason !== null && !EDIT_REASONS.has(value.reason)) ||
       typeof value.dirty !== "boolean" ||
@@ -145,6 +178,7 @@ export function createResponseValidators({
     ) {
       throw invalid("edit state is invalid");
     }
+    validateCalculationObservation(value.calculation);
     if (
       (value.capability === "read-write" && value.reason !== null) ||
       (value.capability === "read-only" && !EDIT_REASONS.has(value.reason)) ||

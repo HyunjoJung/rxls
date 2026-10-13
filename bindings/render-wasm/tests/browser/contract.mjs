@@ -3,7 +3,7 @@ export const CSP_NEGATIVE_URL =
 
 export const EXPECTED_CAPABILITIES = Object.freeze({
   schemaVersion: 1,
-  protocol: "rxls.render-worker.v2",
+  protocol: "rxls.render-worker.v3",
   outputs: ["sheet-svg", "tile-svg", "page-svg", "page-png"],
   limits: {
     maxInputBytes: 32 * 1024 * 1024,

@@ -1,4 +1,4 @@
-export declare const PROTOCOL: "rxls.render-worker.v2";
+export declare const PROTOCOL: "rxls.render-worker.v3";
 export declare const MAX_INPUT_BYTES: 33554432;
 export declare const MAX_FONT_BYTES: 67108864;
 export declare const MAX_FONT_MANIFEST_BYTES: 4194304;
@@ -253,8 +253,14 @@ export type InspectedCell =
       readonly cached: InspectedCell;
     };
 
+/** Session-local evaluator observation; not persisted into the saved workbook. */
+export type CalculationObservation =
+  | { readonly status: "unknown"; readonly summary: null }
+  | { readonly status: "observed" | "stale"; readonly summary: RecalculationSummary };
+
 export interface EditState {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
+  readonly calculation: CalculationObservation;
   readonly capability: "read-write" | "read-only";
   readonly reason:
     | "legacy-biff"
