@@ -66,22 +66,22 @@ MAX_LEGAL_FILE_BYTES = 512 * 1024
 MAX_NOTICE_BYTES = 512 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 LEGAL_URL_OVERRIDES = {
-    # rmcp 3.1.4 declares Apache-2.0 but its crates.io archive omits the
+    # rmcp 3.5.1 declares Apache-2.0 but its crates.io archive omits the
     # workspace-root legal file. Pin the exact upstream release commit and
     # content hash so a registry packaging omission cannot drop the notice.
-    ("rmcp", "3.1.4"): {
-        "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+    ("rmcp", "3.5.1"): {
+        "name": "UPSTREAM-LICENSE-rust-sdk-79437f29",
         "url": (
             "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
-            "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+            "79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE"
         ),
         "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
     },
-    ("rmcp-macros", "3.1.4"): {
-        "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+    ("rmcp-macros", "3.5.1"): {
+        "name": "UPSTREAM-LICENSE-rust-sdk-79437f29",
         "url": (
             "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
-            "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+            "79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE"
         ),
         "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
     },
