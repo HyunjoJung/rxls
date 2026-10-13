@@ -884,8 +884,8 @@ fn element_node(e: &quick_xml_raw::events::BytesStart<'_>, self_closing: bool) -
 /// `XmlTree` at all rather than becoming silently corruptible once promoted.
 fn unescape_bytes(raw: &[u8]) -> Result<Vec<u8>> {
     let s = std::str::from_utf8(raw).map_err(|_| Error::Xml("xml text is not valid utf-8"))?;
-    let c =
-        quick_xml_raw::escape::unescape(s).map_err(|_| Error::Xml("malformed xml entity reference"))?;
+    let c = quick_xml_raw::escape::unescape(s)
+        .map_err(|_| Error::Xml("malformed xml entity reference"))?;
     if has_xml_illegal_char(&c) {
         return Err(Error::Xml("xml text contains an xml 1.0 illegal character"));
     }
