@@ -165,3 +165,7 @@ required-features = ["xlsx"]
 [[example]]
 name = "typed_rows"
 required-features = ["serde", "xlsx"]
+
+[[example]]
+name = "csv_export"
+required-features = ["xlsx"]

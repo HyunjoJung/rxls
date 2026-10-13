@@ -124,6 +124,78 @@ A sheet or workbook can be exported to CSV, HTML, or Markdown. CSV export has
 an explicit formula-text policy for callers that will open output in
 spreadsheet software.
 
+### Matching CLI and Rust CSV output
+
+The [runnable CSV example](../examples/csv_export.rs) creates a synthetic XLSX
+with worksheet `Data`, text containing a delimiter, quotes and an embedded
+newline, and the literal text `=1+1`. Run these commands from the checkout root
+with the default `xlsx,cli` features:
+
+```sh
+cargo +1.85.0 run --locked --example csv_export
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --formula-injection preserve --max-output-bytes 1024 > target/csv-recipe/preserve.cli.csv
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --formula-injection escape --max-output-bytes 1024 > target/csv-recipe/escape.cli.csv
+cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --sheet 0 --delimiter ';' --newline crlf --bom --formula-injection escape \
+  --max-output-bytes 1024 > target/csv-recipe/excel.cli.csv
+cmp target/csv-recipe/preserve.rust.csv target/csv-recipe/preserve.cli.csv
+cmp target/csv-recipe/escape.rust.csv target/csv-recipe/escape.cli.csv
+cmp target/csv-recipe/excel.rust.csv target/csv-recipe/excel.cli.csv
+```
+
+`cmp` succeeds silently for each byte-identical pair. The example uses
+`export_csv` with these `CsvOptions`; it requires `xlsx` only to generate/read
+the sample. With defaults disabled, run it with `--features xlsx`.
+
+| Output | `delimiter` | `newline` | `bom` | `formula_policy` |
+| --- | --- | --- | --- | --- |
+| `preserve` | `','` | `CsvNewline::Lf` | `false` | `CsvFormulaPolicy::Preserve` |
+| `escape` | `','` | `CsvNewline::Lf` | `false` | `CsvFormulaPolicy::Escape` |
+| `excel` | `';'` | `CsvNewline::CrLf` | `true` | `CsvFormulaPolicy::Escape` |
+
+All three use `max_output_bytes: 1024`. `CsvOptions::default()` uses comma,
+LF, no BOM, `Preserve`, and a 256 MiB output limit. Fields containing the
+delimiter, quotes, CR or LF are quoted; embedded quotes are doubled and embedded
+newlines are retained. The preserved CLI output is:
+
+```csv
+name,note,input
+"a,""b""","line1
+line2",=1+1
+```
+
+`escape` prefixes the last field with an apostrophe, producing `'=1+1`
+(serialized as the quoted CSV field `"'=1+1"`).
+It also prefixes text beginning with `+`, `-`, `@`, tab, CR or LF. This changes
+the exported field text; it is not a universal guarantee about spreadsheet
+applications. Preserve is the default. The `excel` variant starts with the
+UTF-8 BOM bytes `EF BB BF` and uses CRLF between records; the newline inside
+`line1\nline2` remains LF.
+
+The Rust library returns a string **without** a final record separator. The
+example explicitly adds the CLI's final LF/CRLF and checks its bytes against
+the limit before writing, so the files above match exactly.
+
+To reproduce a byte-limit error:
+
+```sh
+if cargo +1.85.0 run --locked --bin rxls -- csv target/csv-recipe/source.xlsx \
+  --max-output-bytes 8 > target/csv-recipe/limited.csv; then
+  echo 'unexpected export success' >&2
+  exit 1
+fi
+test ! -s target/csv-recipe/limited.csv
+```
+
+The CLI reports `CSV output exceeds the configured 8-byte limit` on stderr
+and exits with code 65 without partial CSV on stdout. Shell redirection may
+still create an empty file. The Rust example checks the corresponding
+`CsvExportError::OutputTooLarge { limit: 8 }`; no partial string is returned.
+
+### Other interfaces
+
 `WorkbookReport` provides machine-readable sheet, cell, formula, document
 property, feature inventory, and parse-provenance data. The CLI exposes this as
 `rxls diagnose` and also provides `info`, `csv`, `compare`, and
