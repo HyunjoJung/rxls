@@ -233,19 +233,21 @@ fn part(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
-    if let Some(idx) = zip.index_for_name(name) {
-        return Some(idx);
-    }
-    let wanted = canonical_part_name(name);
-    for idx in 0..zip.len() {
-        let Ok(file) = zip.by_index(idx) else {
-            continue;
-        };
-        if canonical_part_name(file.name()).eq_ignore_ascii_case(&wanted) {
-            return Some(idx);
+    if name.is_ascii() {
+        if let Some(index) = zip.index_for_name(name) {
+            return Some(index);
         }
     }
-    None
+    let entries = crate::ziputil::decoded_entry_indices(zip).ok()?;
+    if let Some((_, index)) = entries.iter().find(|(candidate, _)| candidate == name) {
+        return Some(*index);
+    }
+    let wanted = canonical_part_name(name);
+    entries.into_iter().find_map(|(name, index)| {
+        canonical_part_name(&name)
+            .eq_ignore_ascii_case(&wanted)
+            .then_some(index)
+    })
 }
 
 fn canonical_part_name(name: &str) -> String {
@@ -255,6 +257,7 @@ fn canonical_part_name(name: &str) -> String {
 pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| Error::Zip("not a valid .xlsb ZIP container"))?;
+    crate::ziputil::validate_unicode_paths(bytes, zip.central_directory_start())?;
     crate::ziputil::validate_compression(&mut zip)?;
 
     let shared = part(&mut zip, "xl/sharedStrings.bin")

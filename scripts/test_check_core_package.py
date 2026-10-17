@@ -24,10 +24,10 @@ chrono = ["dep:chrono"]
 cli = []
 default = ["xlsx", "cli"]
 full = ["xlsx", "xlsb", "ods", "serde", "chrono"]
-ods = ["dep:zip", "dep:quick-xml"]
+ods = ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"]
 serde = ["dep:serde"]
 xlsb = ["xlsx"]
-xlsx = ["dep:zip", "dep:quick-xml"]
+xlsx = ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"]
 """
 DEPENDENCIES = "\n".join(
     f'[dependencies.{name}]\nversion = "1"'
@@ -40,7 +40,7 @@ MANIFEST = f"""
 [package]
 name = "rxls"
 version = "{VERSION}"
-rust-version = "1.85"
+rust-version = "1.88"
 {FEATURES}
 {DEPENDENCIES}
 """

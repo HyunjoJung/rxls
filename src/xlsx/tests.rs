@@ -4716,3 +4716,22 @@ fn zero_print_title_rows_are_rejected_without_panicking() {
     assert_eq!(parse_repeat_rows("$0:$1"), None);
     assert_eq!(parse_repeat_rows("1:1048577"), None);
 }
+
+#[test]
+fn decoded_zip_aliases_read_the_last_payload_in_both_orders() {
+    for legacy_first in [false, true] {
+        for repeated_raw in [false, true] {
+            let bytes = crate::ziputil::decoded_alias_fixture(legacy_first, repeated_raw);
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+            assert_eq!(
+                part_raw(&mut archive, "café.bin").as_deref(),
+                Some("latest")
+            );
+            assert_eq!(part_raw(&mut archive, "/CAFÉ.BIN").as_deref(), None);
+            assert_eq!(
+                part_raw(&mut archive, "/café.bin").as_deref(),
+                Some("latest")
+            );
+        }
+    }
+}

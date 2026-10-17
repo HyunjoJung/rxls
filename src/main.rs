@@ -13,6 +13,10 @@ use rxls::{
     SheetView, SheetVisible, Workbook, WorkbookReport,
 };
 
+#[cfg(any(feature = "xlsx", feature = "ods"))]
+#[path = "ziputil/unicode_paths.rs"]
+mod zip_unicode_paths;
+
 fn main() -> ExitCode {
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "rxls".to_string());
@@ -3660,9 +3664,37 @@ fn inspect_package_bytes(
         }
     };
 
-    let mut parts = Vec::with_capacity(archive.len());
+    if let Err(error) = zip_unicode_paths::validate(bytes, archive.central_directory_start()) {
+        eprintln!("{command} {label}: invalid ZIP Unicode path metadata: {error}");
+        return Err(ExitCode::from(65));
+    }
+    let selected = (|| -> zip::result::ZipResult<BTreeMap<String, (u64, usize)>> {
+        let mut entries = BTreeMap::<String, (u64, usize)>::new();
+        for index in 0..archive.len() {
+            let file = archive.by_index_data(index)?;
+            let name = file.name()?.into_owned();
+            let candidate = (file.central_header_start(), index);
+            entries
+                .entry(name)
+                .and_modify(|previous| {
+                    if candidate.0 > previous.0 {
+                        *previous = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        Ok(entries)
+    })();
+    let selected = match selected {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("{command} {label}: invalid ZIP entry metadata: {error}");
+            return Err(ExitCode::from(65));
+        }
+    };
+    let mut parts = Vec::with_capacity(selected.len());
     let mut relationships = 0usize;
-    for index in 0..archive.len() {
+    for (_, index) in selected.into_values() {
         let mut file = match archive.by_index(index) {
             Ok(file) => file,
             Err(err) => {
@@ -3670,7 +3702,13 @@ fn inspect_package_bytes(
                 return Err(ExitCode::from(65));
             }
         };
-        let name = file.name().to_string();
+        let name = match file.name() {
+            Ok(name) => name.into_owned(),
+            Err(err) => {
+                eprintln!("{command} {label}: invalid ZIP entry {index} name: {err}");
+                return Err(ExitCode::from(65));
+            }
+        };
         let compressed_bytes = file.compressed_size();
         let uncompressed_bytes = file.size();
         if name.ends_with(".rels") {

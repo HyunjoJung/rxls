@@ -1257,7 +1257,7 @@ fn exact_integral_xlsx_font_size(value: &str) -> Option<u16> {
     let decimal_scale = fractional_digits.checked_sub(exponent)?;
     let integral = if decimal_scale >= 0 {
         let divisor = 10_u128.checked_pow(decimal_scale as u32)?;
-        if digits % divisor != 0 {
+        if !digits.is_multiple_of(divisor) {
             return None;
         }
         digits / divisor

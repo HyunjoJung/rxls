@@ -212,8 +212,7 @@ fn parse_ooxml_relationships_with_policy(
                 relationships.push(relationship);
             }
             Ok(Event::Text(text))
-                if open_relationship.is_some()
-                    && text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+                if open_relationship.is_some() && text.iter().all(u8::is_ascii_whitespace) => {}
             Ok(Event::PI(_) | Event::Comment(_)) if open_relationship.is_some() => {}
             Ok(_) if open_relationship.is_some() => return None,
             Ok(Event::Start(element)) if root.is_none() && !root_closed => {
@@ -262,7 +261,7 @@ fn parse_ooxml_relationships_with_policy(
                 root_open = false;
                 root_closed = true;
             }
-            Ok(Event::Text(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
             Ok(Event::Decl(_) | Event::PI(_) | Event::Comment(_)) => {}
             Ok(Event::Eof) => break,
             Err(_) | Ok(_) => return None,

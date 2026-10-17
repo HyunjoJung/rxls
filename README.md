@@ -12,7 +12,7 @@ XLSX/XLSM while preserving untouched package parts.
 [![Live viewer](https://img.shields.io/badge/live-viewer-176b3a.svg)](https://hyunjojung.github.io/rxls/)
 [![CI](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml/badge.svg)](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
 `rxls` is built for applications that encounter spreadsheet files from
 different eras and tools. The core library requires no JVM or Apache POI,

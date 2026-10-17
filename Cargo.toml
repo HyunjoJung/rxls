@@ -2,8 +2,8 @@
 name = "rxls"
 version = "0.1.4"
 edition = "2021"
-# The resolved dependency graph supports Rust 1.85; CI enforces this floor.
-rust-version = "1.85"
+# ZIP 9 security fixes require Rust 1.88.
+rust-version = "1.88"
 license = "MIT"
 description = "Native Rust spreadsheet toolkit: reads .xls (BIFF8/5/7), .xlsx, .xlsb, .ods and writes .xlsx. Typed cells, formulas, panic-free, no JVM/POI."
 repository = "https://github.com/HyunjoJung/rxls"
@@ -109,7 +109,10 @@ encoding_rs = "=0.8.35"
 thiserror = "2.0"
 # .xlsx (OOXML) support — on by default; disable for the dependency-light
 # .xls-only build (`default-features = false`).
-zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"], optional = true }
+# ZIP 9 separates DEFLATE support from its backend. Retain ZIP 2's Rust backend.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true }
+crc32fast = { version = "1", optional = true }
 quick-xml = { version = "0.41", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 chrono = { version = "0.4.45", default-features = false, optional = true }
@@ -121,11 +124,11 @@ default = ["xlsx", "cli"]
 # unaffected; disable it (via `--no-default-features`) for a library-only
 # build.
 cli = []
-xlsx = ["dep:zip", "dep:quick-xml"]
+xlsx = ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"]
 # .xlsb (BIFF12 binary) reader — reuses the xlsx ZIP plumbing + rels parser.
 xlsb = ["xlsx"]
 # .ods (OpenDocument Spreadsheet) reader — ZIP + content.xml.
-ods = ["dep:zip", "dep:quick-xml"]
+ods = ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"]
 # Optional typed row deserialization from a worksheet Range.
 serde = ["dep:serde"]
 # Optional conversions from Excel serial dates to chrono's NaiveDateTime.

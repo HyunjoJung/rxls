@@ -149,7 +149,10 @@ fn read_image_parts_with_limits(
 ) -> ImageParts {
     let mut images = HashMap::new();
     let mut remaining = max_total;
-    for idx in 0..zip.len() {
+    let Ok(entries) = crate::ziputil::decoded_entry_indices(zip) else {
+        return images;
+    };
+    for (name, idx) in entries {
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
@@ -163,7 +166,7 @@ fn read_image_parts_with_limits(
         if size > remaining {
             continue;
         }
-        let Some(path) = normalize_package_path(file.name()) else {
+        let Some(path) = normalize_package_path(&name) else {
             continue;
         };
         let Some(format) = image_format(&path) else {
@@ -181,6 +184,7 @@ fn read_image_parts_with_limits(
 pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| Error::Zip("not a valid .ods ZIP container"))?;
+    crate::ziputil::validate_unicode_paths(bytes, zip.central_directory_start())?;
     crate::ziputil::validate_compression(&mut zip)?;
     if has_encrypted_manifest(&mut zip) {
         return Err(Error::EncryptedOpenDocument);

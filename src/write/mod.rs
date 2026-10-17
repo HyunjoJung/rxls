@@ -354,7 +354,8 @@ fn content_type_default_cost(extension: &str, content_type: &str) -> usize {
 fn zip_parts(parts: Vec<(String, Vec<u8>)>) -> Vec<u8> {
     fn build(parts: &[(String, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
         let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opt = SimpleFileOptions::default();
+        // ZIP 2 always wrote Unix host metadata; keep output platform-independent.
+        let opt = SimpleFileOptions::default().system(zip::System::Unix);
         for (path, bytes) in parts {
             zw.start_file(path.as_str(), opt)?;
             zw.write_all(bytes)?;

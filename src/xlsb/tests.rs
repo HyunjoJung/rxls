@@ -3408,3 +3408,22 @@ fn parses_date1904_flag() {
     let off = rec(BRT_WB_PROP, &[0x00, 0, 0, 0]);
     assert!(!parse_workbook(&off, &[]).1, "bit 0 clear => 1900");
 }
+
+#[test]
+fn decoded_zip_aliases_read_the_last_payload_in_both_orders() {
+    use std::io::Read;
+    for legacy_first in [false, true] {
+        for repeated_raw in [false, true] {
+            let bytes = crate::ziputil::decoded_alias_fixture(legacy_first, repeated_raw);
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+            let index = super::part_index(&mut archive, "café.bin").unwrap();
+            let mut value = Vec::new();
+            archive
+                .by_index(index)
+                .unwrap()
+                .read_to_end(&mut value)
+                .unwrap();
+            assert_eq!(value, b"latest");
+        }
+    }
+}

@@ -268,6 +268,7 @@ impl Package {
 
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
             .map_err(|_| Error::Zip("not a valid spreadsheet ZIP container"))?;
+        crate::ziputil::validate_unicode_paths(bytes, zip.central_directory_start())?;
         crate::ziputil::validate_compression(&mut zip)?;
         if zip.len() > max_entries() {
             return Err(Error::Zip("OOXML package has too many entries"));
@@ -292,7 +293,9 @@ impl Package {
         let mut meta_lossy = false;
         let mut total: usize = 0;
 
-        for idx in 0..zip.len() {
+        let entries = crate::ziputil::decoded_entry_indices(&zip)
+            .map_err(|_| Error::Zip("invalid ZIP entry name"))?;
+        for (name, idx) in entries {
             let mut file = match zip.by_index(idx) {
                 Ok(f) => f,
                 Err(_) => {
@@ -300,7 +303,6 @@ impl Package {
                     continue;
                 }
             };
-            let name = file.name().to_string();
             if name.len() > MAX_NAME_LEN {
                 return Err(Error::Zip("OOXML package entry name is too long"));
             }
@@ -493,7 +495,8 @@ impl Package {
         }
 
         let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opt = SimpleFileOptions::default();
+        // ZIP 2 always wrote Unix host metadata; keep output platform-independent.
+        let opt = SimpleFileOptions::default().system(zip::System::Unix);
         let mut total: usize = 0;
 
         for name in &self.order {
@@ -1582,6 +1585,45 @@ mod tests {
     }
 
     #[test]
+    fn cp437_part_payload_survives_package_roundtrip() {
+        let mut input = zip_bytes(&[("caf_.bin", b"original payload")]);
+        let local = input.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        let central = input.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        input[local + 30 + 3] = 0x82;
+        input[central + 46 + 3] = 0x82;
+        let package = Package::from_bytes(&input).unwrap();
+        assert_eq!(
+            package.part_bytes("café.bin"),
+            Some(&b"original payload"[..])
+        );
+        let output = package.to_bytes().unwrap();
+        let reread = Package::from_bytes(&output).unwrap();
+        assert_eq!(
+            reread.part_bytes("café.bin"),
+            Some(&b"original payload"[..])
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(output)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().system(), zip::System::Unix);
+    }
+
+    #[test]
+    fn decoded_aliases_keep_last_payload_in_both_encoding_orders() {
+        for legacy_first in [false, true] {
+            for repeated_raw in [false, true] {
+                let input = crate::ziputil::decoded_alias_fixture(legacy_first, repeated_raw);
+                let package = Package::from_bytes(&input).unwrap();
+                assert_eq!(package.part_bytes("café.bin"), Some(&b"latest"[..]));
+                let output = package.to_bytes().unwrap();
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(output)).unwrap();
+                assert_eq!(archive.len(), 1);
+                let mut data = Vec::new();
+                archive.by_index(0).unwrap().read_to_end(&mut data).unwrap();
+                assert_eq!(data, b"latest");
+            }
+        }
+    }
+
+    #[test]
     fn raw_package_rejects_oversized_part_names() {
         let name = format!("{}.xml", "x".repeat(4096));
         let input = zip_bytes(&[(&name, b"x")]);
@@ -2513,7 +2555,7 @@ mod tests {
         let names: Vec<String> = {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
             (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
                 .collect()
         };
         let a_pos = names.iter().position(|n| n == "xl/a.xml").unwrap();

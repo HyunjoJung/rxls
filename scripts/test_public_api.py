@@ -79,7 +79,7 @@ class PublicApiTests(unittest.TestCase):
         }
         generator = {
             "script": "scripts/check_public_api.py",
-            "rust_toolchain": "1.85.0",
+            "rust_toolchain": "1.88.0",
             "surface": "all-features rustdoc public module indexes",
         }
         expected = {

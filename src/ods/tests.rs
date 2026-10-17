@@ -2528,3 +2528,25 @@ fn ods_unsupported_shape_retains_cell_anchor_sidecar() {
     assert_eq!(metadata.to_cell, Some((2, 3)));
     assert_eq!(metadata.absolute_size_emu, Some((720_000, 360_000)));
 }
+
+#[test]
+fn decoded_image_aliases_charge_only_the_selected_last_payload() {
+    for legacy_first in [false, true] {
+        for repeated_raw in [false, true] {
+            let mut bytes = crate::ziputil::decoded_alias_fixture(legacy_first, repeated_raw);
+            let offsets: Vec<_> = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(index, suffix)| (suffix == b".bin").then_some(index))
+                .collect();
+            assert_eq!(offsets.len(), if repeated_raw { 6 } else { 4 });
+            for offset in offsets {
+                bytes[offset..offset + 4].copy_from_slice(b".png");
+            }
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+            let images = read_image_parts_with_limits(&mut archive, 6, 6);
+            assert_eq!(images.len(), 1);
+            assert_eq!(images.get("café.png").unwrap().1, b"latest");
+        }
+    }
+}

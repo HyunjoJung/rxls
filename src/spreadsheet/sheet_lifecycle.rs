@@ -397,7 +397,9 @@ fn plan_app_sheet_title_repair(
     let heading_vector = heading_vectors[0];
     let titles_vector = title_vectors[0];
     let variants = direct_elements_by_local_name(tree, heading_vector, b"variant");
-    if variants.len() % 2 != 0 || parse_vector_size(tree, heading_vector)? != variants.len() {
+    if !variants.len().is_multiple_of(2)
+        || parse_vector_size(tree, heading_vector)? != variants.len()
+    {
         return Err(Error::Zip("docProps/app.xml heading pairs are malformed"));
     }
 

@@ -24,6 +24,7 @@ ALLOWED_DEPENDENCIES = {
     "cfb",
     "chrono",
     "encoding_rs",
+    "flate2", "crc32fast",
     "quick-xml",
     "serde",
     "thiserror",
@@ -34,10 +35,10 @@ EXPECTED_FEATURES = {
     "cli": [],
     "default": ["xlsx", "cli"],
     "full": ["xlsx", "xlsb", "ods", "serde", "chrono"],
-    "ods": ["dep:zip", "dep:quick-xml"],
+    "ods": ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"],
     "serde": ["dep:serde"],
     "xlsb": ["xlsx"],
-    "xlsx": ["dep:zip", "dep:quick-xml"],
+    "xlsx": ["dep:zip", "dep:quick-xml", "dep:flate2", "dep:crc32fast"],
 }
 FORBIDDEN_TOP_LEVEL = {
     ".github",
@@ -270,8 +271,8 @@ def validate(
                                 errors.append(
                                     "package identity does not match source manifest"
                                 )
-                            if metadata.get("rust-version") != "1.85":
-                                errors.append("packaged core MSRV is not 1.85")
+                            if metadata.get("rust-version") != "1.88":
+                                errors.append("packaged core MSRV is not 1.88")
                             dependencies = sorted(manifest.get("dependencies", {}))
                             if set(dependencies) != ALLOWED_DEPENDENCIES:
                                 errors.append("core dependency profile changed")

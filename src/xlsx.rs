@@ -94,6 +94,7 @@ pub(crate) fn is_xlsx(bytes: &[u8]) -> bool {
 pub(crate) fn open(bytes: &[u8]) -> Result<Workbook> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| Error::Zip("not a valid spreadsheet ZIP container"))?;
+    crate::ziputil::validate_unicode_paths(bytes, zip.central_directory_start())?;
     crate::ziputil::validate_compression(&mut zip)?;
 
     let discovered_workbook_path = office_document_path(&mut zip)?;
@@ -463,36 +464,38 @@ fn part_raw(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Op
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
-    if let Some(idx) = zip.index_for_name(name) {
-        return Some(idx);
+    if name.is_ascii() {
+        if let Some(index) = zip.index_for_name(name) {
+            return Some(index);
+        }
+    }
+    let entries = crate::ziputil::decoded_entry_indices(zip).ok()?;
+    if let Some((_, index)) = entries.iter().find(|(candidate, _)| candidate == name) {
+        return Some(*index);
     }
     let wanted = canonical_part_name(name);
-    if let Some(idx) = unique_part_index(zip, |candidate| canonical_part_name(candidate) == wanted)
-    {
-        return Some(idx);
+    if let Some(index) = unique_part_index(&entries, |candidate| {
+        canonical_part_name(candidate) == wanted
+    }) {
+        return Some(index);
     }
-
-    // Real-world producers sometimes vary ASCII case despite OPC part names
-    // being case-sensitive. Accept that extension only when it is unambiguous.
-    unique_part_index(zip, |candidate| {
+    // Noncanonical producers are accepted only when the decoded name is unambiguous.
+    unique_part_index(&entries, |candidate| {
         canonical_part_name(candidate).eq_ignore_ascii_case(&wanted)
     })
 }
 
 fn unique_part_index(
-    zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    entries: &[(String, usize)],
     mut matches: impl FnMut(&str) -> bool,
 ) -> Option<usize> {
     let mut found = None;
-    for idx in 0..zip.len() {
-        let Ok(file) = zip.by_index(idx) else {
-            continue;
-        };
-        if matches(file.name()) {
+    for (name, index) in entries {
+        if matches(name) {
             if found.is_some() {
                 return None;
             }
-            found = Some(idx);
+            found = Some(*index);
         }
     }
     found

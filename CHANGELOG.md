@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Backport ZIP 9.0.4 fixes for RUSTSEC-2026-0367, RUSTSEC-2026-0368,
+  and RUSTSEC-2026-0369 onto the published 0.1.4 source. Preserve decoded CP437
+  lookups, the last aliased payload, package ordering and Unix writer metadata.
+  The DEFLATE backend remains pure Rust. ZIP 9 requires Rust 1.88.
+
 ## [0.1.4] - 2026-09-28
 
 ### Added

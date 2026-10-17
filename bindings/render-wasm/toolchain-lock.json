@@ -1,6 +1,6 @@
 {
   "schema": "rxls.render-browser-toolchain.v2",
-  "rust": "1.85.0",
+  "rust": "1.88.0",
   "wasmPack": {
     "version": "0.13.1"
   },

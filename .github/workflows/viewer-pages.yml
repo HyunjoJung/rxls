@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RENDER_MSRV: "1.85.0"
+  RENDER_MSRV: "1.88.0"
   WASM_BINDGEN_BUILD_RUST: "1.88.0"
   WASM_BINDGEN_VERSION: "0.2.126"
   NODE_VERSION: "24.18.0"

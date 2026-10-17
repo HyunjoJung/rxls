@@ -2,7 +2,7 @@
 name = "rxls-render"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Deterministic, bounded worksheet rendering for rxls"
 publish = false
@@ -33,4 +33,4 @@ subsetter = { version = "0.2.6", default-features = false }
 
 [dev-dependencies]
 cfb = "0.15"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"] }

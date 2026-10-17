@@ -1746,7 +1746,7 @@ fn parse_chart_text_styles_unified(
             }
             Ok(Event::CData(text)) => {
                 if let Some(body) = body.as_mut().filter(|body| body.in_text) {
-                    if !text.as_ref().is_empty() {
+                    if !text.is_empty() {
                         let role = body.role;
                         let fact = body.current_fact();
                         push_chart_text_style_fact(
