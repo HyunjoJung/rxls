@@ -1102,17 +1102,16 @@ fn apply_ods_style_properties(
             }
         }
         b"paragraph-properties" => {
-            if let Some(alignment) = attr(e, b"text-align") {
-                props.horizontal = match alignment.as_str() {
-                    "left" | "start" => Some(HAlign::Left),
-                    "center" => Some(HAlign::Center),
-                    "right" | "end" => Some(HAlign::Right),
-                    "justify" => {
-                        add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
-                        Some(HAlign::Left)
+            if let Some(align) = attr(e, b"text-align") {
+                if align == "justify" {
+                    add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
+                    props.horizontal = Some(HAlign::Left);
+                } else {
+                    match HAlign::try_from(align) {
+                        Ok(value) => props.horizontal = Some(value),
+                        Err(_) => add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1),
                     }
-                    _ => props.horizontal,
-                };
+                }
             }
             if let Some(indent) =
                 attr(e, b"margin-left").and_then(|value| parse_ods_length_points(&value))
@@ -1148,12 +1147,10 @@ fn apply_ods_style_properties(
                     }
                 }
             }
-            if let Some(value) = attr(e, b"vertical-align") {
-                match value.as_str() {
-                    "top" => props.vertical = Some(VAlign::Top),
-                    "middle" | "center" => props.vertical = Some(VAlign::Center),
-                    "bottom" => props.vertical = Some(VAlign::Bottom),
-                    _ => add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1),
+            if let Some(align) = attr(e, b"vertical-align") {
+                match VAlign::try_from(align) {
+                    Ok(v) => props.vertical = Some(v),
+                    Err(_) => add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1),
                 }
             }
             if let Some(wrap) = attr(e, b"wrap-option") {
