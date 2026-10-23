@@ -19,7 +19,7 @@ pub(super) fn halign_str(h: HAlign) -> &'static str {
 pub(super) fn valign_str(v: VAlign) -> &'static str {
     match v {
         VAlign::Top => "top",
-        VAlign::Middle => "center",
+        VAlign::Center => "center",
         VAlign::Bottom => "bottom",
     }
 }

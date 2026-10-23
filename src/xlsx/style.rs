@@ -1878,7 +1878,7 @@ fn parse_alignment(e: &quick_xml::events::BytesStart<'_>) -> Alignment {
     };
     let vertical = match attr(e, b"vertical").as_deref() {
         Some("top") => Some(VAlign::Top),
-        Some("center" | "distributed" | "justify") => Some(VAlign::Middle),
+        Some("center" | "distributed" | "justify") => Some(VAlign::Center),
         Some("bottom") => Some(VAlign::Bottom),
         _ => None,
     };

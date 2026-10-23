@@ -1151,7 +1151,7 @@ fn apply_ods_style_properties(
             if let Some(value) = attr(e, b"vertical-align") {
                 match value.as_str() {
                     "top" => props.vertical = Some(VAlign::Top),
-                    "middle" | "center" => props.vertical = Some(VAlign::Middle),
+                    "middle" | "center" => props.vertical = Some(VAlign::Center),
                     "bottom" => props.vertical = Some(VAlign::Bottom),
                     _ => add_ods_style_loss(losses, StyleLossKind::UnsupportedProperty, 1),
                 }

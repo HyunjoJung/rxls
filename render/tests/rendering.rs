@@ -22,7 +22,7 @@ fn styled_workbook() -> Workbook {
         .bold()
         .fill(Color::rgb(31, 78, 121))
         .align(HAlign::Center)
-        .valign(VAlign::Middle)
+        .valign(VAlign::Center)
         .border(
             Border::new()
                 .with_all(BorderStyle::Thin)

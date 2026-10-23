@@ -808,7 +808,7 @@ pub(super) fn text_style(region: &Region, options: &RenderOptions) -> TextStyle 
     };
     let baseline = match alignment.and_then(|alignment| alignment.vertical) {
         Some(VAlign::Top) => TextBaseline::Top,
-        Some(VAlign::Middle) => TextBaseline::Middle,
+        Some(VAlign::Center) => TextBaseline::Middle,
         // ECMA-376 Part 1 section 18.8.1 gives `vertical` a default of
         // `bottom`, which is what Excel and Calc both render for a cell that
         // declares no vertical alignment.

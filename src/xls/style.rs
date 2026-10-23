@@ -393,7 +393,7 @@ fn biff_horizontal_alignment(value: u8) -> Option<HAlign> {
 fn biff_vertical_alignment(value: u8) -> Option<VAlign> {
     match value {
         0 => Some(VAlign::Top),
-        1 => Some(VAlign::Middle),
+        1 => Some(VAlign::Center),
         2 => Some(VAlign::Bottom),
         _ => None,
     }

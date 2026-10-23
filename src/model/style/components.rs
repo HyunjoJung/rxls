@@ -142,8 +142,8 @@ pub enum HAlign {
 pub enum VAlign {
     /// Top.
     Top,
-    /// Middle.
-    Middle,
+    /// Center.
+    Center,
     /// Bottom.
     Bottom,
 }

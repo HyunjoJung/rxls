@@ -369,7 +369,7 @@ fn parse_xlsb_xf(p: &[u8], losses: &mut Vec<StyleLoss>) -> Option<RawXf> {
     let vertical_code = (alignment_bits >> 3) & 0x07;
     let vertical = match vertical_code {
         0 => Some(VAlign::Top),
-        1 | 3 | 4 => Some(VAlign::Middle),
+        1 | 3 | 4 => Some(VAlign::Center),
         2 => Some(VAlign::Bottom),
         _ => None,
     };
