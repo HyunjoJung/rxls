@@ -209,7 +209,7 @@ impl TryFrom<&str> for VAlign {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
             "top" => Ok(VAlign::Top),
-            "center" | "distributed" | "justify" => Ok(VAlign::Center),
+            "center" | "distributed" | "justify" | "middle" => Ok(VAlign::Center),
             "bottom" => Ok(VAlign::Bottom),
             _ => Err(format!("invalid vertical alignment '{s}'")),
         }
