@@ -6,23 +6,9 @@ use std::collections::HashMap;
 use crate::write::xml::{esc_attr, hex, NS_MAIN, XML_DECL};
 use crate::{
     Alignment, Border, BorderStyle, CellProtection, CellStyle, Color, Fill, Font, FormatPattern,
-    FormatScript, HAlign, VAlign,
+    FormatScript,
 };
 
-pub(super) fn halign_str(h: HAlign) -> &'static str {
-    match h {
-        HAlign::Left => "left",
-        HAlign::Center => "center",
-        HAlign::Right => "right",
-    }
-}
-pub(super) fn valign_str(v: VAlign) -> &'static str {
-    match v {
-        VAlign::Top => "top",
-        VAlign::Middle => "center",
-        VAlign::Bottom => "bottom",
-    }
-}
 fn text_rotation_value(degrees: i16) -> i16 {
     let degrees = degrees.clamp(-90, 90);
     if degrees < 0 {
@@ -432,10 +418,10 @@ impl StyleTable {
             if let Some(a) = &xf.align {
                 body.push_str("<alignment");
                 if let Some(h) = a.horizontal {
-                    body.push_str(&format!(r#" horizontal="{}""#, halign_str(h)));
+                    body.push_str(&format!(r#" horizontal="{h}""#));
                 }
                 if let Some(v) = a.vertical {
-                    body.push_str(&format!(r#" vertical="{}""#, valign_str(v)));
+                    body.push_str(&format!(r#" vertical="{v}""#));
                 }
                 if a.wrap {
                     body.push_str(r#" wrapText="1""#);

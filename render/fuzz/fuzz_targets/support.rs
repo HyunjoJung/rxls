@@ -69,7 +69,7 @@ pub fn workbook(u: &mut Unstructured<'_>) -> Workbook {
                     })
                     .valign(match u.int_in_range(0u8..=2).unwrap_or(0) {
                         0 => VAlign::Top,
-                        1 => VAlign::Middle,
+                        1 => VAlign::Center,
                         _ => VAlign::Bottom,
                     })
                     .border(

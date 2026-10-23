@@ -2899,7 +2899,7 @@ fn biff8_retains_cell_font_fill_border_alignment_number_format_and_protection() 
         style.align,
         Some(Alignment {
             horizontal: Some(HAlign::Center),
-            vertical: Some(VAlign::Middle),
+            vertical: Some(VAlign::Center),
             wrap: true,
             rotation: -45,
             indent: 3,

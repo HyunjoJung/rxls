@@ -617,7 +617,7 @@ fn calc_vertical_cell_margin_is_shared_by_scene_text_and_outlined_glyphs() {
     sheet.write(0, 0, "default");
     sheet.write_styled(1, 0, "bottom", &CellStyle::new().valign(VAlign::Bottom));
     sheet.write_styled(2, 0, "top", &CellStyle::new().valign(VAlign::Top));
-    sheet.write_styled(3, 0, "middle", &CellStyle::new().valign(VAlign::Middle));
+    sheet.write_styled(3, 0, "middle", &CellStyle::new().valign(VAlign::Center));
     let range = RenderRange::new(0, 0, 3, 0);
     let approximate = build_scene(
         &workbook,
@@ -735,7 +735,7 @@ fn calc_vertical_cell_margin_keeps_too_short_row_clips_bounded() {
     sheet.set_row_height(0, 0.5);
     sheet.write_styled(0, 0, "top", &CellStyle::new().valign(VAlign::Top));
     sheet.write_styled(0, 1, "bottom", &CellStyle::new().valign(VAlign::Bottom));
-    sheet.write_styled(0, 2, "middle", &CellStyle::new().valign(VAlign::Middle));
+    sheet.write_styled(0, 2, "middle", &CellStyle::new().valign(VAlign::Center));
     let build = build_scene(
         &workbook,
         0,

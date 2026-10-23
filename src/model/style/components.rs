@@ -137,15 +137,91 @@ pub enum HAlign {
     Right,
 }
 
+impl HAlign {
+    /// Return the string representation of horizontal alignment enum member
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+impl std::fmt::Display for HAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for HAlign {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "left" | "start" | "justify" => Ok(HAlign::Left),
+            "center" | "centerContinuous" | "distributed" => Ok(HAlign::Center),
+            "right" | "end" => Ok(HAlign::Right),
+            _ => Err(format!("invalid horizontal alignment '{s}'")),
+        }
+    }
+}
+
+impl TryFrom<String> for HAlign {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.as_str().try_into()
+    }
+}
+
 /// Vertical cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VAlign {
     /// Top.
     Top,
-    /// Middle.
-    Middle,
+    /// Center.
+    Center,
     /// Bottom.
     Bottom,
+}
+
+impl VAlign {
+    /// Return the string representation of vertical alignment enum member
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+impl std::fmt::Display for VAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for VAlign {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "top" => Ok(VAlign::Top),
+            "center" | "distributed" | "justify" | "middle" => Ok(VAlign::Center),
+            "bottom" => Ok(VAlign::Bottom),
+            _ => Err(format!("invalid vertical alignment '{s}'")),
+        }
+    }
+}
+
+impl TryFrom<String> for VAlign {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.as_str().try_into()
+    }
 }
 
 /// Cell text alignment.

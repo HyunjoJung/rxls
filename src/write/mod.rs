@@ -2141,7 +2141,7 @@ mod tests {
             .color([0x11, 0x22, 0x33])
             .fill([0xDD, 0xEE, 0xFF])
             .align(HAlign::Center)
-            .valign(VAlign::Middle)
+            .valign(VAlign::Center)
             .wrap()
             .border(Border {
                 left: BorderStyle::Thin,
@@ -3416,7 +3416,7 @@ print('READ_DV_OK')
         let s = wb.add_sheet("fmt");
         let fmt = crate::Format::new()
             .set_text_wrap()
-            .set_valign(crate::VAlign::Middle)
+            .set_valign(crate::VAlign::Center)
             .set_indent(2)
             .set_shrink_to_fit()
             .set_text_rotation(-45);
