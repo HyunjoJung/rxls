@@ -137,6 +137,23 @@ pub enum HAlign {
     Right,
 }
 
+impl HAlign {
+    /// Return the string representation of vertical alignment enum member
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+impl std::fmt::Display for HAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Vertical cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VAlign {
@@ -146,6 +163,23 @@ pub enum VAlign {
     Center,
     /// Bottom.
     Bottom,
+}
+
+impl VAlign {
+    /// Return the string representation of vertical alignment enum member
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
+
+impl std::fmt::Display for VAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Cell text alignment.
