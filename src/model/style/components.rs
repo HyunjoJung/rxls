@@ -154,6 +154,27 @@ impl std::fmt::Display for HAlign {
     }
 }
 
+impl TryFrom<&str> for HAlign {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "left" | "start" | "justify" => Ok(HAlign::Left),
+            "center" | "centerContinuous" | "distributed" => Ok(HAlign::Center),
+            "right" | "end" => Ok(HAlign::Right),
+            _ => Err(format!("invalid horizontal alignment '{s}'")),
+        }
+    }
+}
+
+impl TryFrom<String> for HAlign {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.as_str().try_into()
+    }
+}
+
 /// Vertical cell alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VAlign {
@@ -179,6 +200,27 @@ impl VAlign {
 impl std::fmt::Display for VAlign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for VAlign {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "top" => Ok(VAlign::Top),
+            "center" | "distributed" | "justify" => Ok(VAlign::Center),
+            "bottom" => Ok(VAlign::Bottom),
+            _ => Err(format!("invalid vertical alignment '{s}'")),
+        }
+    }
+}
+
+impl TryFrom<String> for VAlign {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.as_str().try_into()
     }
 }
 
