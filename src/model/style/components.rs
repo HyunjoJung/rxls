@@ -138,7 +138,7 @@ pub enum HAlign {
 }
 
 impl HAlign {
-    /// Return the string representation of vertical alignment enum member
+    /// Return the string representation of horizontal alignment enum member
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Center => "center",
