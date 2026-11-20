@@ -5,8 +5,8 @@ Scope:
 - Manifest: bindings/mcp/Cargo.toml
 - Target: Linux, macOS, and Windows (x86_64/aarch64)
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: d86062cf79a835945244f34f1d673d90f5c596eeeeb8f818a51c4618ccc7c398
-- Third-party packages: 93
+- Cargo lock SHA-256: af89b042b48e3fabf5802581ec6f883b4b789c58b61ecc10c97490a9964f56eb
+- Third-party packages: 94
 - Unique legal texts: 73
 
 This notice conservatively covers every third-party crate reachable through
@@ -504,36 +504,34 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: rmcp 3.5.1
+PACKAGE: rmcp 3.9.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: Apache-2.0
-Registry archive SHA-256: ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350
+Registry archive SHA-256: d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909
 Legal files:
-Pinned legal source: https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE
-- UPSTREAM-LICENSE-rust-sdk-79437f29: 0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a
+- LICENSE: 0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a
 
 ===============================================================================
-PACKAGE: rmcp-macros 3.5.1
+PACKAGE: rmcp-macros 3.9.0
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: Apache-2.0
-Registry archive SHA-256: a1da498700030856ba63114bceefa30ba21f5e278cb975e5b9de3529fe842b40
+Registry archive SHA-256: b3140f24a766f80f9ec1607bde85680959a69b83d46fa9ce87dadab7e67ab029
 Legal files:
-Pinned legal source: https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE
-- UPSTREAM-LICENSE-rust-sdk-79437f29: 0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a
+- LICENSE: 0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a
 
 ===============================================================================
-PACKAGE: schemars 1.2.2
+PACKAGE: schemars 1.2.3
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: 687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a
+Registry archive SHA-256: ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e
 Legal files:
 - LICENSE: 1954992a2b32e8a2af24a4c11b726902e344c1934b947a77f04d404908f8db30
 
 ===============================================================================
-PACKAGE: schemars_derive 1.2.2
+PACKAGE: schemars_derive 1.2.3
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba
+Registry archive SHA-256: e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69
 Legal files:
 - LICENSE: 1954992a2b32e8a2af24a4c11b726902e344c1934b947a77f04d404908f8db30
 
@@ -583,10 +581,10 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: serde_json 1.0.151
+PACKAGE: serde_json 1.0.154
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14
+Registry archive SHA-256: e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
@@ -635,6 +633,15 @@ Legal files:
 - LICENSE: 8ce0830173fdac609dfb4ea603fdc002c2f4af0dc9b1a005653f5da9cf534b18
 
 ===============================================================================
+PACKAGE: socket2 0.6.5
+Cargo source: registry+https://github.com/rust-lang/crates.io-index
+Declared license expression: MIT OR Apache-2.0
+Registry archive SHA-256: c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4
+Legal files:
+- LICENSE-APACHE: a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
+- LICENSE-MIT: 378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397
+
+===============================================================================
 PACKAGE: strsim 0.11.1
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
@@ -679,10 +686,10 @@ Legal files:
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
 
 ===============================================================================
-PACKAGE: tokio 1.53.2
+PACKAGE: tokio 1.53.3
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044
+Registry archive SHA-256: ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e
 Legal files:
 - LICENSE: 253cd04c6714889df2d32f3f64d669179a1c95c76ac43c40882c52eb06bc3552
 
@@ -800,10 +807,10 @@ Legal files:
 - license-mit: c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383
 
 ===============================================================================
-PACKAGE: zip 9.0.2
+PACKAGE: zip 9.0.5
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: 9e2fc56a6707efb066c40aead2409ebb1224e6dde24a074e9fbc78ced500507b
+Registry archive SHA-256: 6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e
 Legal files:
 - LICENSE: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79
 
@@ -1087,8 +1094,8 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a
 Referenced by:
-- rmcp 3.5.1/UPSTREAM-LICENSE-rust-sdk-79437f29
-- rmcp-macros 3.5.1/UPSTREAM-LICENSE-rust-sdk-79437f29
+- rmcp 3.9.0/LICENSE
+- rmcp-macros 3.9.0/LICENSE
 ----- BEGIN LEGAL TEXT -----
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
 
@@ -1844,8 +1851,8 @@ SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 1954992a2b32e8a2af24a4c11b726902e344c1934b947a77f04d404908f8db30
 Referenced by:
-- schemars 1.2.2/LICENSE
-- schemars_derive 1.2.2/LICENSE
+- schemars 1.2.3/LICENSE
+- schemars_derive 1.2.3/LICENSE
 ----- BEGIN LEGAL TEXT -----
 MIT License
 
@@ -1916,7 +1923,7 @@ Referenced by:
 - serde_core 1.0.229/LICENSE-MIT
 - serde_derive 1.0.229/LICENSE-MIT
 - serde_derive_internals 0.30.0/LICENSE-MIT
-- serde_json 1.0.151/LICENSE-MIT
+- serde_json 1.0.154/LICENSE-MIT
 - syn 2.0.119/LICENSE-MIT
 - syn 3.0.4/LICENSE-MIT
 - thiserror 2.0.21/LICENSE-MIT
@@ -1953,7 +1960,7 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 253cd04c6714889df2d32f3f64d669179a1c95c76ac43c40882c52eb06bc3552
 Referenced by:
-- tokio 1.53.2/LICENSE
+- tokio 1.53.3/LICENSE
 - tokio-stream 0.1.19/LICENSE
 - tokio-util 0.7.19/LICENSE
 ----- BEGIN LEGAL TEXT -----
@@ -2201,6 +2208,7 @@ limitations under the License.
 LEGAL TEXT SHA-256: 378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397
 Referenced by:
 - cfg-if 1.0.4/LICENSE-MIT
+- socket2 0.6.5/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
 Copyright (c) 2014 Alex Crichton
 
@@ -2865,7 +2873,7 @@ Referenced by:
 ===============================================================================
 LEGAL TEXT SHA-256: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79
 Referenced by:
-- zip 9.0.2/LICENSE
+- zip 9.0.5/LICENSE
 ----- BEGIN LEGAL TEXT -----
 The MIT License (MIT)
 
@@ -2995,7 +3003,7 @@ Referenced by:
 - serde_core 1.0.229/LICENSE-APACHE
 - serde_derive 1.0.229/LICENSE-APACHE
 - serde_derive_internals 0.30.0/LICENSE-APACHE
-- serde_json 1.0.151/LICENSE-APACHE
+- serde_json 1.0.154/LICENSE-APACHE
 - syn 2.0.119/LICENSE-APACHE
 - syn 3.0.4/LICENSE-APACHE
 - thiserror 2.0.21/LICENSE-APACHE
@@ -4416,6 +4424,7 @@ Referenced by:
 - once_cell 1.21.4/LICENSE-APACHE
 - scopeguard 1.2.0/LICENSE-APACHE
 - signal-hook-registry 1.4.8/LICENSE-APACHE
+- socket2 0.6.5/LICENSE-APACHE
 - uuid 1.26.1/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
                               Apache License
