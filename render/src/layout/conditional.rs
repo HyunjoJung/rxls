@@ -60,10 +60,7 @@ pub(super) fn conditional_style_is_geometry_safe_color_only(
         return false;
     };
     let mut font_without_color = font.clone();
-    if font_without_color.color.take().is_none() || font_without_color != Font::default() {
-        return false;
-    }
-    true
+    font_without_color.color.take().is_some() && font_without_color == Font::default()
 }
 
 pub(super) fn conditional_style_affects_text_layout(
