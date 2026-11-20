@@ -517,8 +517,11 @@ pub(super) fn parse_txo_text(chunks: &[&[u8]], budget: &mut usize) -> Option<Str
             let available = chunk.len().saturating_sub(1) / 2;
             let take = remaining.min(available);
             let units = chunk[1..1 + take * 2]
-                .chunks_exact(2)
-                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect::<Vec<_>>();
             text.push_str(&String::from_utf16_lossy(&units));
             remaining -= take;
@@ -1626,8 +1629,8 @@ fn hlink_url(data: &[u8]) -> Option<String> {
 
 fn decode_hlink_url_units(bytes: &[u8]) -> Option<String> {
     let mut units = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for &chunk in bytes.as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes(chunk);
         if unit == 0 {
             break;
         }
@@ -1639,8 +1642,8 @@ fn decode_hlink_url_units(bytes: &[u8]) -> Option<String> {
 
 fn decode_hlink_zero_terminated(bytes: &[u8]) -> Option<String> {
     let mut units = Vec::new();
-    for chunk in bytes.chunks_exact(2).take(2048) {
-        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for &chunk in bytes.as_chunks::<2>().0.iter().take(2048) {
+        let unit = u16::from_le_bytes(chunk);
         if unit == 0 {
             return decode_hlink_url_units(&units_to_bytes(&units));
         }
