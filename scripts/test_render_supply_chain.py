@@ -484,10 +484,15 @@ class RenderSupplyChainTests(unittest.TestCase):
         )
 
         self.assertIn("BSD-2-Clause", deny["licenses"]["allow"])
+        exceptions = deny["advisories"]["ignore"]
         self.assertEqual(
-            deny["advisories"]["ignore"],
-            ["RUSTSEC-2026-0192", "RUSTSEC-2026-0206"],
+            [
+                entry["id"] if isinstance(entry, dict) else entry
+                for entry in exceptions
+            ],
+            ["RUSTSEC-2026-0192", "RUSTSEC-2026-0206", "RUSTSEC-2026-0543"],
         )
+        self.assertIn("publicly", exceptions[2]["reason"])
         core = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
         self.assertEqual(
             binding["dependencies"]["rxls"]["version"], core["package"]["version"]
