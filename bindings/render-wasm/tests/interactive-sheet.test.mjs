@@ -170,7 +170,8 @@ test("formula-auto accepts a bounded nonempty expression only as a set-cell inpu
 });
 
 async function runtimeHarness({ render = () => JSON.stringify(output()), limits = {}, legacy = false,
-  recalculation = () => ({ computedCells: 2, unchangedCells: 1, unsupportedCells: 1, reasons: ["volatile"] }) } = {}) {
+  recalculation = () => ({ computedCells: 2, unchangedCells: 1, unsupportedCells: 1, reasons: ["volatile"] }),
+  observation = { status: "observed", summary: { computedCells: 2, unchangedCells: 1, unsupportedCells: 1, reasons: ["volatile"] } } } = {}) {
   const messages = [];
   const calls = [];
   const workbook = {
@@ -180,7 +181,7 @@ async function runtimeHarness({ render = () => JSON.stringify(output()), limits 
       "lastModifiedBy", "company", "created"].map((key) => [key, null]))
   };
   const editState = {
-    schemaVersion: 1, capability: "read-write", reason: null, dirty: false,
+    schemaVersion: 2, calculation: { status: "unknown", summary: null }, capability: "read-write", reason: null, dirty: false,
     canUndo: false, canRedo: false, undoDepth: 0, redoDepth: 0, historyBytes: 0, editedParts: []
   };
   class Session {
@@ -199,11 +200,11 @@ async function runtimeHarness({ render = () => JSON.stringify(output()), limits 
   };
   if (!legacy) Session.prototype.setCellRecalculateJson = function (json) {
     calls.push(["set-cell-recalculate", JSON.parse(json)]);
-    return JSON.stringify({ workbook, editState, recalculation: recalculation() });
+    return JSON.stringify({ workbook, editState: { ...editState, calculation: observation }, recalculation: recalculation() });
   };
   if (!legacy) Session.prototype.setRangeRecalculateJson = function (json) {
     calls.push(["set-range-recalculate", JSON.parse(json)]);
-    return JSON.stringify({ workbook, editState, recalculation: recalculation() });
+    return JSON.stringify({ workbook, editState: { ...editState, calculation: observation }, recalculation: recalculation() });
   };
   const capabilities = structuredClone(EXPECTED_CAPABILITIES);
   Object.assign(capabilities.limits, limits);
@@ -512,5 +513,27 @@ test("range editing is optional for legacy adapters and malformed requests never
   assert.equal(h.result("invalid").ok, false);
   assert.equal(h.result("plain").ok, true);
   assert.equal(h.calls.filter(([op]) => op === "set-range-recalculate").length, 0);
+  h.runtime.closeAll();
+});
+
+test("recalculating results cannot contradict their current session observation at either boundary", async () => {
+  const observation = { status: "stale", summary: { computedCells: 2, unchangedCells: 1, unsupportedCells: 1, reasons: ["volatile"] } };
+  const invalid = await runtimeHarness({ observation });
+  invalid.request("mismatch", "set-cell-recalculate", { documentId: "doc", sheetIndex: 0, row: 0, col: 0, value: { kind: "number", value: 1 } });
+  await invalid.settle();
+  assert.equal(invalid.result("mismatch").error.code, "wasm_api_mismatch");
+  invalid.runtime.closeAll();
+
+  const h = await runtimeHarness();
+  const worker = new FakeWorker();
+  const client = new RenderWorkerClient(worker);
+  worker.emit({ protocol: protocol.PROTOCOL, type: "ready", capabilities: structuredClone(EXPECTED_CAPABILITIES) });
+  const pending = client.setCellAndRecalculate("doc", 0, 0, 0, { kind: "number", value: 1 });
+  h.runtime.receive(worker.sent[0]);
+  await h.settle();
+  const reply = structuredClone(h.result(pending.requestId));
+  reply.result.editState.calculation.summary.computedCells += 1;
+  worker.emit(reply);
+  await assert.rejects(pending, { code: "worker_message_error" });
   h.runtime.closeAll();
 });

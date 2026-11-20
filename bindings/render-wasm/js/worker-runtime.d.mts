@@ -7,6 +7,7 @@ export type RenderMaybePromise<Value> = Value | PromiseLike<Value>;
 
 export interface RenderWasmSession {
   inspectionJson(): RenderMaybePromise<string>;
+  /** Protocol v3 requires EditState schema 2, including the session observation. */
   editStateJson(): RenderMaybePromise<string>;
   readCellJson(
     sheetIndex: number,

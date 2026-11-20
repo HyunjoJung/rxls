@@ -64,6 +64,7 @@ function setup({
     client,
     workbook,
     editState: {
+      calculation: { status: "unknown", summary: null },
       capability: "read-write",
       dirty: false,
       canUndo: true,
@@ -571,7 +572,7 @@ test("a loaded cell submits a typed edit and refreshes the rendered workbook", a
   assert.equal(state.manifests.size, 0);
   assert.equal(state.pageIndex, 3);
   assert.deepEqual(calls.renders, [{ fit: false }]);
-  assert.equal(elements["status-message"].textContent, "A1 updated");
+  assert.equal(elements["status-message"].textContent, "A1 updated. Formula caches have not been checked in this session.");
 });
 
 test("a failed read reports the error and never permits an edit", async () => {
@@ -757,7 +758,7 @@ test("shared commit uses the existing render path and does not recursively invok
   assert.equal(fixture.state.busy, false);
   assert.equal(fixture.state.editState.dirty, true);
   assert.deepEqual(fixture.calls.renders, [{ fit: false }]);
-  assert.equal(fixture.elements["status-message"].textContent, "C4 updated");
+  assert.equal(fixture.elements["status-message"].textContent, "C4 updated. Formula caches have not been checked in this session.");
 });
 
 test("shared commit ignores late results after client, document, or sheet changes", async () => {
@@ -905,11 +906,18 @@ test("a fully recalculated later edit clears its previous unsupported warning", 
   );
 });
 
+function observedWarning(unsupportedCells = 1, status = "observed") {
+  return { status, summary: {
+    computedCells: 4, unchangedCells: 2, unsupportedCells,
+    reasons: unsupportedCells ? ["unsupported_function"] : [],
+  } };
+}
+
 function warningFixture() {
   const fixture = setup();
   fixture.state.client.setCellAndRecalculate = async () => ({
     workbook: fixture.workbook,
-    editState: { ...fixture.state.editState, dirty: true },
+    editState: { ...fixture.state.editState, dirty: true, calculation: observedWarning() },
     recalculation: {
       computedCells: 4,
       unchangedCells: 2,
@@ -974,6 +982,10 @@ test("undo and redo restore cached-formula warning state without changing pages"
     ["redo", true],
   ]) {
     fixture.state.pageIndex = 3;
+    fixture.state.client[direction === "undo" ? "undoEdit" : "redoEdit"] = async () => ({
+      workbook: fixture.workbook,
+      editState: { ...fixture.state.editState, calculation: warning ? observedWarning() : { status: "unknown", summary: null } },
+    });
     await fixture.controller.applyHistoryEdit(direction);
     assert.equal(fixture.state.pageIndex, 3);
     assert.equal(fixture.elements["error-banner"].hidden, !warning, direction);
@@ -989,7 +1001,7 @@ test("undo restores a prior warning after a fully recalculated edit and redo cle
   await fixture.commit();
   fixture.state.client.setCellAndRecalculate = async () => ({
     workbook: fixture.workbook,
-    editState: fixture.state.editState,
+    editState: { ...fixture.state.editState, calculation: observedWarning(0) },
     recalculation: {
       computedCells: 2,
       unchangedCells: 0,
@@ -999,13 +1011,15 @@ test("undo restores a prior warning after a fully recalculated edit and redo cle
   });
   await fixture.commit();
   assert.equal(fixture.elements["error-banner"].hidden, true);
+  fixture.state.client.undoEdit = async () => ({ workbook: fixture.workbook, editState: { ...fixture.state.editState, calculation: observedWarning() } });
+  fixture.state.client.redoEdit = async () => ({ workbook: fixture.workbook, editState: { ...fixture.state.editState, calculation: observedWarning(0) } });
   await fixture.controller.applyHistoryEdit("undo");
   assert.equal(fixture.elements["error-banner"].hidden, false);
   await fixture.controller.applyHistoryEdit("redo");
   assert.equal(fixture.elements["error-banner"].hidden, true);
 });
 
-test("warning history follows worker snapshot eviction and new edit branches", async () => {
+test("worker observations remain authoritative after snapshot eviction and new edit branches", async () => {
   const fixture = warningFixture();
   await fixture.commit();
   fixture.state.client.setDocumentProperties = async () => ({
@@ -1015,13 +1029,13 @@ test("warning history follows worker snapshot eviction and new edit branches", a
   await fixture.properties();
   fixture.state.client.undoEdit = async () => ({
     workbook: fixture.workbook,
-    editState: { ...fixture.state.editState, undoDepth: 0, redoDepth: 1 },
+    editState: { ...fixture.state.editState, undoDepth: 0, redoDepth: 1, calculation: observedWarning() },
   });
   await fixture.controller.applyHistoryEdit("undo");
   assert.equal(fixture.elements["error-banner"].hidden, false);
   fixture.state.client.setCellAndRecalculate = async () => ({
     workbook: fixture.workbook,
-    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0 },
+    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0, calculation: observedWarning(0) },
     recalculation: {
       computedCells: 1,
       unchangedCells: 0,
@@ -1035,7 +1049,7 @@ test("warning history follows worker snapshot eviction and new edit branches", a
   assert.equal(fixture.elements["error-banner"].hidden, false);
   fixture.state.client.redoEdit = async () => ({
     workbook: fixture.workbook,
-    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0 },
+    editState: { ...fixture.state.editState, undoDepth: 1, redoDepth: 0, calculation: observedWarning(0) },
   });
   await fixture.controller.applyHistoryEdit("redo");
   assert.equal(fixture.elements["error-banner"].hidden, true);
@@ -1227,4 +1241,24 @@ test("a stale recalculation result cannot overwrite a new document or its visibl
     "Current document rendered",
   );
   assert.deepEqual(fixture.calls.renders, []);
+});
+
+for (const unsupported of [0, 1]) {
+  test(`stale worker observation preserves uncertainty and prior warning count ${unsupported}`, async () => {
+    const fixture = setup();
+    fixture.state.client.undoEdit = async () => ({
+      workbook: fixture.workbook,
+      editState: { ...fixture.state.editState, calculation: observedWarning(unsupported, "stale") },
+    });
+    await fixture.controller.applyHistoryEdit("undo");
+    assert.equal(fixture.elements["error-banner"].hidden, false);
+    assert.match(fixture.elements["error-message"].textContent, /out of date/);
+    assert.match(fixture.elements["error-message"].textContent, unsupported ? /1 unsupported formula cell.*last check/ : /current caches have not been checked/);
+  });
+}
+
+test("opening a session labels cache observation as unknown without claiming correctness", () => {
+  const fixture = setup();
+  fixture.controller.updateEditUi();
+  assert.match(fixture.elements["meta-editing"].title, /not been checked in this session/);
 });

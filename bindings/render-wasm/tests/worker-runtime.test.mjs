@@ -105,7 +105,8 @@ class FakeSession {
   constructor(bytes, fontBundle) {
     FakeSession.calls.push(["open", bytes.byteLength, fontBundle.byteLength]);
     this.editState = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      calculation: { status: "unknown", summary: null },
       capability: FakeSession.editCapability,
       reason: FakeSession.editCapability === "read-write" ? null : "legacy-biff",
       dirty: false,
@@ -258,6 +259,7 @@ const fakeWasm = {
   RenderSession: FakeSession,
   capabilitiesJson() {
     return JSON.stringify({
+      schemaVersion: 1, protocol: PROTOCOL,
       limits: { maxOutputBytes: 1024 * 1024, maxPngBytes: 1024 * 1024 },
       editing: { maxHistoryEntries: 20, maxHistoryBytes: 32 * 1024 * 1024 }
     });
@@ -1134,4 +1136,24 @@ test("worker rejects unbounded payload fields and caps queued transferable bytes
     FakeSession.calls.filter(([kind]) => kind === "open").length,
     2
   );
+});
+
+test("v3 worker rejects a v2 or unversioned WASM module before opening a session", () => {
+  for (const protocol of ["rxls.render-worker.v2", undefined]) {
+    const capabilities = JSON.parse(fakeWasm.capabilitiesJson());
+    capabilities.protocol = protocol;
+    assert.throws(() => new RenderWorkerRuntime({
+      wasm: { ...fakeWasm, capabilitiesJson: () => JSON.stringify(capabilities) },
+      send() {},
+    }), { code: "wasm_api_mismatch", location: "wasm" });
+  }
+});
+
+test("v3 worker explicitly rejects a v2 client request without opening its workbook", async () => {
+  const { runtime, messages } = harness();
+  const before = FakeSession.calls.length;
+  runtime.receive({ ...request("old-client", "open", { documentId: "old", bytes: new Uint8Array([1]) }), protocol: "rxls.render-worker.v2" });
+  await settle();
+  assert.equal(result(messages, "old-client").error.code, "protocol_mismatch");
+  assert.equal(FakeSession.calls.length, before);
 });

@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are reserved for the next releases; this entry does not record publication.
 - Updated the XML reader while retaining the pinned raw-XML parser used by
   package-preserving XLSX edits.
+- Moved calculation observations into Rust session snapshots. Undo and redo
+  restore unknown, observed or stale observations with the workbook. The viewer
+  displays the returned state, and the protocol rejects mixed v2/v3 components.
 
 ### Fixed
 

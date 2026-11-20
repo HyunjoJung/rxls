@@ -290,6 +290,7 @@ struct EditSnapshot {
     bytes: Vec<u8>,
     dirty: bool,
     edited_parts: Vec<String>,
+    calculation: CalculationObservation,
 }
 
 struct EditStateView<'a> {
@@ -298,6 +299,58 @@ struct EditStateView<'a> {
     redo_depth: usize,
     history_bytes: usize,
     edited_parts: &'a [String],
+    calculation: &'a CalculationObservation,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct CalculationObservation {
+    status: CalculationStatus,
+    summary: Option<recalculation::Summary>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CalculationStatus {
+    #[default]
+    Unknown,
+    Observed,
+    Stale,
+}
+
+impl CalculationObservation {
+    fn observed(summary: recalculation::Summary) -> Self {
+        Self {
+            status: CalculationStatus::Observed,
+            summary: Some(summary),
+        }
+    }
+
+    fn after_cell_edit(&self) -> Self {
+        Self {
+            status: if self.summary.is_some() {
+                CalculationStatus::Stale
+            } else {
+                CalculationStatus::Unknown
+            },
+            summary: self.summary.clone(),
+        }
+    }
+
+    fn metadata_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .summary
+                .as_ref()
+                .map_or(0, recalculation::Summary::allocated_bytes)
+    }
+}
+
+impl EditSnapshot {
+    fn budget_bytes(&self) -> usize {
+        self.bytes
+            .len()
+            .saturating_add(self.calculation.metadata_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -477,7 +530,7 @@ pub fn max_input_bytes() -> usize {
 pub fn capabilities_json() -> String {
     serde_json::json!({
         "schemaVersion": 1,
-        "protocol": "rxls.render-worker.v2",
+        "protocol": "rxls.render-worker.v3",
         "outputs": ["sheet-svg", "tile-svg", "page-svg", "page-png"],
         "limits": {
             "maxInputBytes": MAX_INPUT_BYTES,
@@ -555,6 +608,7 @@ pub struct RenderSession {
     redo: Vec<EditSnapshot>,
     dirty: bool,
     edited_parts: Vec<String>,
+    calculation: CalculationObservation,
 }
 
 #[wasm_bindgen]
@@ -870,6 +924,7 @@ impl RenderSession {
             redo: Vec::new(),
             dirty: false,
             edited_parts: Vec::new(),
+            calculation: CalculationObservation::default(),
         })
     }
 
@@ -933,6 +988,7 @@ impl RenderSession {
                 redo_depth: self.redo.len(),
                 history_bytes: history_bytes(&self.undo) + history_bytes(&self.redo),
                 edited_parts: &self.edited_parts,
+                calculation: &self.calculation,
             },
         )
     }
@@ -946,7 +1002,7 @@ impl RenderSession {
             EditCapability::ReadOnly(reason) => ("read-only", Some(edit_reason(reason))),
         };
         serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "capability": capability,
             "reason": reason,
             "dirty": state.dirty,
@@ -956,6 +1012,7 @@ impl RenderSession {
             "redoDepth": state.redo_depth,
             "historyBytes": state.history_bytes,
             "editedParts": state.edited_parts,
+            "calculation": state.calculation,
         })
     }
 
@@ -1152,7 +1209,7 @@ impl RenderSession {
         &mut self,
         edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
     ) -> Result<String, FacadeError> {
-        self.apply_edit_with_recalculation(edit, false)
+        self.apply_edit_checked(edit, false, false, &std::collections::BTreeSet::new())
     }
 
     fn apply_edit_with_recalculation(
@@ -1160,13 +1217,14 @@ impl RenderSession {
         edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
         recalculate: bool,
     ) -> Result<String, FacadeError> {
-        self.apply_edit_checked(edit, recalculate, &std::collections::BTreeSet::new())
+        self.apply_edit_checked(edit, recalculate, true, &std::collections::BTreeSet::new())
     }
 
     fn apply_edit_checked(
         &mut self,
         edit: impl FnOnce(&mut Spreadsheet) -> rxls::Result<()>,
         recalculate: bool,
+        changes_cells: bool,
         required_formulas: &std::collections::BTreeSet<(usize, u32, u16)>,
     ) -> Result<String, FacadeError> {
         ensure_editable(&self.spreadsheet)?;
@@ -1191,6 +1249,13 @@ impl RenderSession {
             None
         };
 
+        let calculation = if let Some(summary) = &recalculation {
+            CalculationObservation::observed(summary.clone())
+        } else if changes_cells {
+            self.calculation.after_cell_edit()
+        } else {
+            self.calculation.clone()
+        };
         let mut edited_parts = self.edited_parts.clone();
         for part in candidate.edited_parts() {
             if !edited_parts.iter().any(|existing| existing == part) {
@@ -1202,8 +1267,8 @@ impl RenderSession {
         let projection = project_history(
             self.undo
                 .iter()
-                .map(|snapshot| snapshot.bytes.len())
-                .chain(std::iter::once(previous.bytes.len()))
+                .map(|snapshot| snapshot.budget_bytes())
+                .chain(std::iter::once(previous.budget_bytes()))
                 .collect(),
             Vec::new(),
             HistorySide::Undo,
@@ -1217,6 +1282,7 @@ impl RenderSession {
                 redo_depth: projection.redo_depth,
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
+                calculation: &calculation,
             },
             recalculation.as_ref(),
         )?;
@@ -1227,6 +1293,7 @@ impl RenderSession {
         self.workbook = workbook;
         self.dirty = true;
         self.edited_parts = edited_parts;
+        self.calculation = calculation;
         Ok(output)
     }
 
@@ -1241,15 +1308,16 @@ impl RenderSession {
         validate_session_workbook(&workbook)?;
         let dirty = target.dirty;
         let edited_parts = target.edited_parts.clone();
+        let calculation = target.calculation.clone();
         let projection = project_history(
             self.undo[..self.undo.len() - 1]
                 .iter()
-                .map(|snapshot| snapshot.bytes.len())
+                .map(|snapshot| snapshot.budget_bytes())
                 .collect(),
             self.redo
                 .iter()
-                .map(|snapshot| snapshot.bytes.len())
-                .chain(std::iter::once(current.bytes.len()))
+                .map(|snapshot| snapshot.budget_bytes())
+                .chain(std::iter::once(current.budget_bytes()))
                 .collect(),
             HistorySide::Undo,
         );
@@ -1262,6 +1330,7 @@ impl RenderSession {
                 redo_depth: projection.redo_depth,
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
+                calculation: &calculation,
             },
             None,
         )?;
@@ -1272,6 +1341,7 @@ impl RenderSession {
         self.workbook = workbook;
         self.dirty = dirty;
         self.edited_parts = edited_parts;
+        self.calculation = calculation;
         Ok(output)
     }
 
@@ -1286,15 +1356,16 @@ impl RenderSession {
         validate_session_workbook(&workbook)?;
         let dirty = target.dirty;
         let edited_parts = target.edited_parts.clone();
+        let calculation = target.calculation.clone();
         let projection = project_history(
             self.undo
                 .iter()
-                .map(|snapshot| snapshot.bytes.len())
-                .chain(std::iter::once(current.bytes.len()))
+                .map(|snapshot| snapshot.budget_bytes())
+                .chain(std::iter::once(current.budget_bytes()))
                 .collect(),
             self.redo[..self.redo.len() - 1]
                 .iter()
-                .map(|snapshot| snapshot.bytes.len())
+                .map(|snapshot| snapshot.budget_bytes())
                 .collect(),
             HistorySide::Redo,
         );
@@ -1307,6 +1378,7 @@ impl RenderSession {
                 redo_depth: projection.redo_depth,
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
+                calculation: &calculation,
             },
             None,
         )?;
@@ -1317,6 +1389,7 @@ impl RenderSession {
         self.workbook = workbook;
         self.dirty = dirty;
         self.edited_parts = edited_parts;
+        self.calculation = calculation;
         Ok(output)
     }
 
@@ -1327,6 +1400,7 @@ impl RenderSession {
             bytes,
             dirty: self.dirty,
             edited_parts: self.edited_parts.clone(),
+            calculation: self.calculation.clone(),
         })
     }
 
@@ -1946,7 +2020,7 @@ fn map_edit_error(_error: rxls::Error) -> FacadeError {
 
 fn history_bytes(history: &[EditSnapshot]) -> usize {
     history.iter().fold(0usize, |total, snapshot| {
-        total.saturating_add(snapshot.bytes.len())
+        total.saturating_add(snapshot.budget_bytes())
     })
 }
 
@@ -2484,7 +2558,7 @@ mod tests {
         let capabilities: serde_json::Value =
             serde_json::from_str(&capabilities_json()).expect("capabilities JSON");
         assert_eq!(capabilities["schemaVersion"], 1);
-        assert_eq!(capabilities["protocol"], "rxls.render-worker.v2");
+        assert_eq!(capabilities["protocol"], "rxls.render-worker.v3");
         assert_eq!(capabilities["limits"]["maxInputBytes"], MAX_INPUT_BYTES);
         assert_eq!(capabilities["limits"]["maxSheets"], MAX_SHEETS);
         assert_eq!(capabilities["fontUploads"]["supported"], true);
@@ -2866,6 +2940,168 @@ mod tests {
             check_font_bytes(2, 1).unwrap_err().resource,
             Some("fontBytes")
         );
+    }
+
+    #[test]
+    fn calculation_observation_tracks_snapshot_state_and_never_claims_reopen_is_clean() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write_number(0, 0, 1.0);
+        sheet.write_formula(0, 1, "NOW()", 42.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let unknown = serde_json::json!({"status":"unknown","summary":null});
+        assert_eq!(session.edit_state_value()["calculation"], unknown);
+        let edit = r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":2}}"#;
+        let response: serde_json::Value =
+            serde_json::from_str(&session.set_cell_recalculate_json_core(edit).unwrap()).unwrap();
+        let observed = serde_json::json!({"status":"observed","summary":response["recalculation"]});
+        assert_eq!(response["editState"]["calculation"], observed);
+        assert_eq!(observed["summary"]["unsupportedCells"], 1);
+        let properties = r#"{"title":"Title","subject":null,"creator":null,"keywords":null,"description":null,"lastModifiedBy":null,"company":null,"created":null}"#;
+        let response: serde_json::Value = serde_json::from_str(
+            &session
+                .set_document_properties_json_core(properties)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.get("recalculation").is_none());
+        assert_eq!(response["editState"]["calculation"], observed);
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["calculation"], observed);
+        session.redo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["calculation"], observed);
+        session.set_cell_json_core(edit).unwrap();
+        let stale = session.edit_state_value()["calculation"].clone();
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["summary"], observed["summary"]);
+        let saved = session.save_document_bytes_core().unwrap();
+        let before = session.edit_state_value();
+        assert!(session.set_cell_recalculate_json_core(r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"formula-auto","formula":"=NOTSUPPORTED(1)"}}"#).is_err());
+        assert_eq!(session.edit_state_value(), before);
+        assert_eq!(session.save_document_bytes_core().unwrap(), saved);
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["calculation"], observed);
+        session.redo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["calculation"], stale);
+        let reopened = RenderSession::new_core(&saved, &[]).unwrap();
+        assert_eq!(reopened.edit_state_value()["calculation"], unknown);
+        let other = RenderSession::new_core(&authored_workbook(), &[]).unwrap();
+        assert_eq!(other.edit_state_value()["calculation"], unknown);
+    }
+
+    #[test]
+    fn recalculation_failure_preserves_stale_observation_and_saved_package() {
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_sheet("Data");
+        sheet.write(0, 0, "");
+        for row in 1..=21 {
+            sheet.write_formula(row, 0, format!("A{row}&A{row}"), 0.0);
+        }
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"number","value":1}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            session.edit_state_value()["calculation"]["status"],
+            "observed"
+        );
+        session
+            .set_cell_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"text","value":"x"}}"#,
+            )
+            .unwrap();
+        let before = session.edit_state_value();
+        assert_eq!(before["calculation"]["status"], "stale");
+        let bytes = session.save_document_bytes_core().unwrap();
+        let error = session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":1,"value":{"kind":"number","value":2}}"#,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "recalculation_failed");
+        assert_eq!(session.edit_state_value(), before);
+        assert_eq!(session.save_document_bytes_core().unwrap(), bytes);
+    }
+
+    #[test]
+    fn response_budget_failure_does_not_commit_calculation_or_history() {
+        let mut workbook = Workbook::new();
+        workbook
+            .add_sheet("Data")
+            .write_formula(0, 1, "NOW()", 42.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":1}}"#,
+            )
+            .unwrap();
+        let state = session.edit_state_value();
+        let bytes = session.save_document_bytes_core().unwrap();
+        // The inspection itself fits exactly; the surrounding mutation envelope
+        // must still fail before the candidate, observation, or history is committed.
+        let inspection_bytes = session
+            .inspection_json_core(&RequestOptions::default())
+            .unwrap()
+            .len();
+        let mut properties = DocProperties::new();
+        properties.title = Some("x".repeat(MAX_OUTPUT_BYTES as usize - inspection_bytes + 2));
+        let error = session
+            .apply_edit(move |candidate| candidate.set_document_properties(properties))
+            .unwrap_err();
+        assert_eq!(error.resource, Some("outputBytes"));
+        assert!(error.actual.unwrap() > MAX_OUTPUT_BYTES);
+        assert_eq!(session.edit_state_value(), state);
+        assert_eq!(session.save_document_bytes_core().unwrap(), bytes);
+    }
+
+    #[test]
+    fn calculation_metadata_is_included_when_projecting_the_history_byte_limit() {
+        let session = RenderSession::new_core(&authored_workbook(), &[]).unwrap();
+        let mut snapshot = session.snapshot().unwrap();
+        snapshot.bytes.resize(MAX_EDIT_HISTORY_BYTES, 0);
+        let projection =
+            project_history(vec![snapshot.budget_bytes()], Vec::new(), HistorySide::Undo);
+        assert_eq!(projection.undo_depth, 0);
+        assert_eq!(projection.undo_drop, 1);
+        assert_eq!(projection.bytes, 0);
+    }
+
+    #[test]
+    fn calculation_history_eviction_and_branching_restore_matching_observations() {
+        let mut workbook = Workbook::new();
+        workbook
+            .add_sheet("Data")
+            .write_formula(0, 1, "NOW()", 42.0);
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let edit = r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":2}}"#;
+        session.set_cell_recalculate_json_core(edit).unwrap();
+        let observed = session.edit_state_value()["calculation"].clone();
+        for _ in 0..MAX_EDIT_HISTORY_ENTRIES {
+            session.set_cell_json_core(edit).unwrap();
+        }
+        for _ in 0..MAX_EDIT_HISTORY_ENTRIES - 1 {
+            session.undo_edit_core().unwrap();
+            assert_eq!(session.edit_state_value()["calculation"]["status"], "stale");
+        }
+        session.undo_edit_core().unwrap();
+        assert_eq!(session.edit_state_value()["calculation"], observed);
+        assert!(session.undo_edit_core().is_err());
+        session.set_cell_recalculate_json_core(edit).unwrap();
+        assert_eq!(session.edit_state_value()["redoDepth"], 0);
+        assert_eq!(
+            session.edit_state_value()["calculation"]["status"],
+            "observed"
+        );
+        // The history reservation also covers the added fixed state and reason allocation.
+        let package_bytes: usize = session
+            .undo
+            .iter()
+            .map(|snapshot| snapshot.bytes.len())
+            .sum();
+        assert!(history_bytes(&session.undo) > package_bytes);
+        assert!(history_bytes(&session.undo) <= MAX_EDIT_HISTORY_BYTES);
     }
 
     #[test]

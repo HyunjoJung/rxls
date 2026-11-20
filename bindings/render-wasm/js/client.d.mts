@@ -26,6 +26,7 @@ import type {
 } from "./protocol.mjs";
 
 export type {
+  CalculationObservation,
   CloseDocumentResult,
   DocumentPropertiesInspection,
   EditableCachedCell,

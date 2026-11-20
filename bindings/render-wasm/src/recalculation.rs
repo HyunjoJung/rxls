@@ -7,7 +7,7 @@ use super::{map_edit_error, FacadeError};
 
 const MAX_FORMULA_CELLS: usize = 10_000;
 
-#[derive(Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Summary {
     computed_cells: usize,
@@ -17,6 +17,10 @@ pub(super) struct Summary {
 }
 
 impl Summary {
+    pub(super) fn allocated_bytes(&self) -> usize {
+        self.reasons.capacity() * std::mem::size_of::<&'static str>()
+    }
+
     pub(super) fn changed_cells(&self) -> usize {
         self.computed_cells - self.unchanged_cells
     }
@@ -84,6 +88,9 @@ pub(super) fn apply(
                 }
                 summary.unsupported_cells += 1;
                 if !summary.reasons.contains(&reason.code()) {
+                    if summary.reasons.len() == 8 {
+                        return Err(failure("unsupported_reason_limit"));
+                    }
                     summary.reasons.push(reason.code());
                 }
             }
