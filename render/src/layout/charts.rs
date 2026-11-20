@@ -2170,7 +2170,7 @@ pub(super) fn chart_x_data_bounds(series: &[ResolvedChartSeries]) -> Option<(f64
 }
 
 pub(super) fn chart_category_label_is_retained(index: usize, count: usize, stride: usize) -> bool {
-    index < count && (index % stride.max(1) == 0 || index + 1 == count)
+    index < count && (index.is_multiple_of(stride.max(1)) || index + 1 == count)
 }
 
 pub(super) fn chart_category_ratio(index: usize, count: usize, shifted: bool) -> f64 {

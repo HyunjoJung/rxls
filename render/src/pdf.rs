@@ -2220,7 +2220,7 @@ fn build_pdf_page(
     let height_points = fixed_to_pdf_points(scene.height)?;
     let mut content = BoundedContent::new(max_bytes);
     content.push("q\n")?;
-    content.push(&format!("0.75 0 0 -0.75 0 {} cm\n", height_points))?;
+    content.push(&format!("0.75 0 0 -0.75 0 {height_points} cm\n"))?;
     let page_bounds = Rect {
         x: Fixed::ZERO,
         y: Fixed::ZERO,
@@ -2630,7 +2630,7 @@ fn pdf_image(node: &ImageNode) -> Result<PdfImage, RenderError> {
     let mut rgb = Vec::with_capacity(pixels.saturating_mul(3));
     let mut alpha = Vec::with_capacity(pixels);
     let mut opaque = true;
-    for rgba in node.rgba.chunks_exact(4) {
+    for rgba in node.rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&rgba[..3]);
         alpha.push(rgba[3]);
         opaque &= rgba[3] == 255;

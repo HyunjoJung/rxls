@@ -8,6 +8,7 @@ all-features = true
 ignore = [
   "RUSTSEC-2026-0192",
   "RUSTSEC-2026-0206",
+  { id = "RUSTSEC-2026-0543", reason = "The optional chrono feature exposes its date and duration types publicly. This maintenance advisory has no patched release. Keep the API compatible while a replacement is evaluated." },
 ]
 
 [licenses]

@@ -380,7 +380,7 @@ fn draw_image_node(
         });
     }
     let mut premultiplied = Vec::with_capacity(node.rgba.len());
-    for rgba in node.rgba.chunks_exact(4) {
+    for rgba in node.rgba.as_chunks::<4>().0 {
         let alpha = u16::from(rgba[3]);
         for channel in &rgba[..3] {
             premultiplied.push(((u16::from(*channel) * alpha + 127) / 255) as u8);

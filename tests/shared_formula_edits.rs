@@ -17,10 +17,10 @@ fn replace_part(bytes: &[u8], name: &str, xml: &str) -> Vec<u8> {
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part.name().unwrap().as_ref(), SimpleFileOptions::default())
             .unwrap();
         output
-            .write_all(if part.name() == name {
+            .write_all(if part.name().unwrap().as_ref() == name {
                 xml.as_bytes()
             } else {
                 &contents
@@ -146,18 +146,18 @@ fn complete_formula_groups_can_be_replaced_and_cleared() {
             let mut result = ZipArchive::new(Cursor::new(&saved)).unwrap();
             for index in 0..source.len() {
                 let mut part = source.by_index(index).unwrap();
-                if part.name() == "xl/worksheets/sheet1.xml" {
+                if part.name().unwrap().as_ref() == "xl/worksheets/sheet1.xml" {
                     continue;
                 }
                 let mut expected = Vec::new();
                 part.read_to_end(&mut expected).unwrap();
                 let mut actual = Vec::new();
                 result
-                    .by_name(part.name())
+                    .by_name(part.name().unwrap().as_ref())
                     .unwrap()
                     .read_to_end(&mut actual)
                     .unwrap();
-                assert_eq!(actual, expected, "{}", part.name());
+                assert_eq!(actual, expected, "{}", part.name().unwrap().as_ref());
             }
         }
     }
@@ -480,7 +480,7 @@ fn rejected_shared_anchor_edit_keeps_calculation_chain_wiring() {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
-        let contents = match part.name() {
+        let contents = match part.name().unwrap().as_ref() {
             "[Content_Types].xml" => String::from_utf8(contents).unwrap().replace(
                 "</Types>",
                 r#"<Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/></Types>"#,
@@ -492,7 +492,7 @@ fn rejected_shared_anchor_edit_keeps_calculation_chain_wiring() {
             _ => contents,
         };
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part.name().unwrap().as_ref(), SimpleFileOptions::default())
             .unwrap();
         output.write_all(&contents).unwrap();
     }

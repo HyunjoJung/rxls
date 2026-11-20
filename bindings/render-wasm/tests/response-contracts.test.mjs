@@ -43,7 +43,7 @@ function workbook() {
 
 function editState(overrides = {}) {
   return {
-    schemaVersion: 1, capability: "read-write", reason: null,
+    schemaVersion: 2, calculation: { status: "unknown", summary: null }, capability: "read-write", reason: null,
     dirty: false, canUndo: false, canRedo: false,
     undoDepth: 0, redoDepth: 0, historyBytes: 0, editedParts: [],
     ...overrides
@@ -76,7 +76,7 @@ const invalidWorkbooks = [
 const invalidEdits = [
   ["missing field", (v) => { delete v.dirty; }],
   ["extra field", (v) => { v.extra = true; }],
-  ["schema", (v) => { v.schemaVersion = 2; }],
+  ["schema", (v) => { v.schemaVersion = 1; }],
   ["unknown capability", (v) => { v.capability = "editable"; }],
   ["unknown reason", (v) => { v.reason = "unknown"; }],
   ["read-write reason", (v) => { v.reason = "legacy-biff"; }],
@@ -231,3 +231,31 @@ test("factory rejects invalid limit configuration and missing error factories", 
   }
   assert.throws(() => createResponseValidators({ ...LIMITS }), TypeError);
 });
+for (const [name, code, location] of boundaries) {
+  test(`${name}: calculation observation has an exact bounded versioned contract`, () => {
+    const validator = boundary(code, location);
+    const summary = { computedCells: 2, unchangedCells: 1, unsupportedCells: 1, reasons: ["volatile"] };
+    for (const status of ["observed", "stale"]) {
+      assert.equal(validator.validateEditState(editState({ schemaVersion: 2, calculation: { status, summary } })).calculation.status, status);
+    }
+    for (const calculation of [
+      { status: "unknown", summary },
+      { status: "observed", summary: null },
+      { status: "stale", summary: null },
+      { status: "clean", summary: null },
+      { status: "unknown", summary: null, extra: true },
+      { status: "observed", summary: { ...summary, computedCells: Infinity } },
+      { status: "stale", summary: { ...summary, reasons: ["volatile", "volatile"] } },
+    ]) {
+      assert.throws(() => validator.validateEditState(editState({ schemaVersion: 2, calculation })), { code, location });
+    }
+    const observed = editState({ calculation: { status: "observed", summary } });
+    validator.validateRecalculationMatch(observed, summary);
+    assert.throws(() => validator.validateRecalculationMatch(editState(), summary), { code, location });
+    assert.throws(() => validator.validateRecalculationMatch(editState({ calculation: { status: "stale", summary } }), summary), { code, location });
+    assert.throws(() => validator.validateRecalculationMatch(observed, { ...summary, computedCells: 3 }), { code, location });
+    const legacy = editState({ schemaVersion: 1 });
+    delete legacy.calculation;
+    assert.throws(() => validator.validateEditState(legacy), { code, location });
+  });
+}

@@ -13,8 +13,8 @@ import {
 } from "./browser/fixture.mjs";
 
 const EXPECTED = Object.freeze({
-  workbookSha256: "0ebe6fbebffa0edcb9492d0a970f4b962af619d0123448451c90ca427a0a09f6",
-  workbookBytes: 555_126,
+  workbookSha256: "aa0fb4758a0bb4e5fbe07beceb80903d66b713712d070cb99e4218e09d9ac393",
+  workbookBytes: 555_836,
   imageSha256: "13147132a9fe28f4f854077ff5ef7d469015c732b88aff421b4f5103dbd196ff",
   imageBytes: 16_516,
   imageWidth: 64,
@@ -23,8 +23,8 @@ const EXPECTED = Object.freeze({
     "82cb3eaa0d7317f95945a978587f7e5b0aa790f5c9d3a2c777323d7ef70a0975",
   decodedImageBytes: 16_384,
   renderedImageSha256:
-    "b848eb79a6b54cefd9772661737bed9d9273a48df8ee3082cb70023f1b7c8530",
-  renderedImageBytes: 13_029,
+    "6871bb384ed9d763a690db19559644469b34a620b64afd82fc988783480b7325",
+  renderedImageBytes: 645,
   fontSha256: "66611ec933da0c18c6558ba71991f3273aa45bbd27fffaa56caea0b8b095f4cc",
   fontBytes: 500,
   fontPackSha256: "87d155e63c124554a065145a45eb7b1c617d0dff468749da9c3f97d93402f12a"

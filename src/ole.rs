@@ -269,7 +269,7 @@ mod tolerant {
             return false;
         };
         let mut seen = vec![false; names.len()];
-        for entry in parsed.dir.chunks_exact(128) {
+        for entry in parsed.dir.as_chunks::<128>().0 {
             if entry.get(66).copied().unwrap_or(0) != 2 {
                 continue;
             }
@@ -293,7 +293,7 @@ mod tolerant {
         let mut root: Option<u32> = None; // root entry's starting sector
         let mut wb: Option<(u32, u64)> = None; // (start sector, byte size)
         let mut wb_is_book = true; // prefer "Workbook" (BIFF8) over "Book" (BIFF5/7)
-        for entry in parsed.dir.chunks_exact(128) {
+        for entry in parsed.dir.as_chunks::<128>().0 {
             let obj_type = entry.get(66).copied().unwrap_or(0);
             if obj_type != 2 && obj_type != 5 {
                 continue;
@@ -346,8 +346,11 @@ mod tolerant {
                 parsed.sector_size,
             );
             let minifat: Vec<u32> = minifat_bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
                 .collect();
             if minifat.is_empty() {
                 return None;

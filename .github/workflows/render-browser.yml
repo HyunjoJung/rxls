@@ -25,9 +25,9 @@ permissions:
   contents: read
 
 env:
-  RENDER_MSRV: "1.85.0"
+  RENDER_MSRV: "1.88.0"
   WASM_BINDGEN_BUILD_RUST: "1.88.0"
-  WASM_BINDGEN_VERSION: "0.2.126"
+  WASM_BINDGEN_VERSION: "0.2.129"
   NODE_VERSION: "24.18.0"
   NPM_VERSION: "11.16.0"
   CHROMIUM_VERSION: "150.0.7871.115"
@@ -62,7 +62,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: bindings/render-wasm
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -193,7 +193,7 @@ jobs:
           npm init --yes
           npm install --ignore-scripts --no-audit --no-fund \
             "$archive"
-          node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v2") process.exit(1)'
+          node --input-type=module -e 'const root=await import("@rxls/render-worker"); const protocol=await import("@rxls/render-worker/protocol"); const workerUrl=root.getRenderWorkerUrl?.(); if (typeof root.RenderWorkerClient !== "function" || !(workerUrl instanceof URL) || !workerUrl.pathname.endsWith("/node_modules/@rxls/render-worker/js/worker.mjs") || protocol.PROTOCOL !== "rxls.render-worker.v3") process.exit(1)'
           RXLS_RENDER_INSTALLED_PACKAGE_ROOT="$PWD/node_modules/@rxls/render-worker" \
             node --experimental-websocket \
             "$GITHUB_WORKSPACE/bindings/render-wasm/tests/browser/run.mjs" \
@@ -239,7 +239,7 @@ jobs:
           git diff --cached --exit-code
       - name: Upload browser-rendering evidence
         if: ${{ success() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: render-browser-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/render-browser-evidence/browser-summary.json

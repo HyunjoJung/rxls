@@ -8,6 +8,9 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[cfg(any(feature = "xlsx", feature = "ods"))]
+mod zipname;
+
 use rxls::{
     export_csv, Cell, CsvFormulaPolicy, CsvNewline, CsvOptions, DocProperties, Error, SheetType,
     SheetView, SheetVisible, Workbook, WorkbookReport,
@@ -3326,12 +3329,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let bit_len = (bytes.len() as u64) * 8;
     let mut padded = bytes.to_vec();
     padded.push(0x80);
-    while (padded.len() + 8) % 64 != 0 {
+    while !(padded.len() + 8).is_multiple_of(64) {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut words = [0u32; 64];
         for (index, word) in words.iter_mut().take(16).enumerate() {
             let start = index * 4;
@@ -3670,7 +3673,7 @@ fn inspect_package_bytes(
                 return Err(ExitCode::from(65));
             }
         };
-        let name = file.name().to_string();
+        let name = zipname::entry_name(file.name_raw(), file.flags().as_u16()).into_owned();
         let compressed_bytes = file.compressed_size();
         let uncompressed_bytes = file.size();
         if name.ends_with(".rels") {

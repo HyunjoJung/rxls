@@ -28,10 +28,11 @@ fn fixture(app: &str) -> Vec<u8> {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
+        let part_name = part.name().unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part_name.as_ref(), SimpleFileOptions::default())
             .unwrap();
-        if part.name() == APP {
+        if part_name == APP {
             found = true;
             output.write_all(app.as_bytes()).unwrap();
         } else {
@@ -54,11 +55,12 @@ fn replace_part(bytes: &[u8], name: &str, replacement: &[u8]) -> Vec<u8> {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
+        let part_name = part.name().unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part_name.as_ref(), SimpleFileOptions::default())
             .unwrap();
         output
-            .write_all(if part.name() == name {
+            .write_all(if part_name == name {
                 replacement
             } else {
                 &contents

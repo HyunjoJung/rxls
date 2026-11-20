@@ -5,7 +5,11 @@ It keeps parsing, pagination, shaping, SVG serialization, and PNG rasterization
 inside a dedicated module worker and exposes one sheet, tile, or print page at a
 time.
 
-The worker protocol is `rxls.render-worker.v2`. An `open` request creates one
+This checkout prepares worker 0.4.0; it is not a registry availability claim.
+The published worker 0.3.0 uses protocol v2. Keep each client's Worker and WASM
+from the same package; the development v3 contract rejects mixed versions.
+
+The worker protocol is `rxls.render-worker.v3`. An `open` request creates one
 `RenderSession`, so later virtual tile/page requests reuse the parsed workbook
 and a verified in-memory font pack. Input, font members, embedded images,
 layout work, scene nodes, page count, raster pixels, and output bytes all have
@@ -40,7 +44,7 @@ await client.redoEdit(opened.documentId);
 const saved = await client.saveDocument(opened.documentId);
 ```
 
-The `rxls.render-worker.v2` edit surface also supports typed cell
+The `rxls.render-worker.v3` edit surface also supports typed cell
 inspection and complete document-property replacement. XLS, XLSB, ODS, and
 OOXML packages that cannot retain metadata report a stable read-only reason.
 Undo/redo history is bounded to 20 entries and 32 MiB, and every candidate is
@@ -117,30 +121,29 @@ handlers, external paint resources, or non-embedded image data.
 Run focused gates from this directory:
 
 ```sh
-RUST_185_BIN="$(dirname "$(rustup which cargo --toolchain 1.85.0)")"
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" test --locked
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" clippy --locked --all-targets -- -D warnings
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 "$RUST_185_BIN/cargo" check \
+RUST_188_BIN="$(dirname "$(rustup which cargo --toolchain 1.88.0)")"
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" test --locked
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" clippy --locked --all-targets -- -D warnings
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" check \
   --target wasm32-unknown-unknown --locked
-PATH="$RUST_185_BIN:$PATH" RUSTC="$RUST_185_BIN/rustc" \
-  RUSTUP_TOOLCHAIN=1.85.0 RUSTDOCFLAGS="-D warnings" \
-  "$RUST_185_BIN/cargo" doc --locked --no-deps
+PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
+  RUSTUP_TOOLCHAIN=1.88.0 RUSTDOCFLAGS="-D warnings" \
+  "$RUST_188_BIN/cargo" doc --locked --no-deps
 npm test
 rustup toolchain install 1.88.0 --profile minimal
-WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.126.XXXXXX")"
+WASM_BINDGEN_TOOL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rxls-wasm-bindgen-cli-0.2.129.XXXXXX")"
 RUST_188_BIN="$(dirname "$(rustup which cargo --toolchain 1.88.0)")"
 PATH="$RUST_188_BIN:$PATH" RUSTC="$RUST_188_BIN/rustc" \
   RUSTUP_TOOLCHAIN=1.88.0 "$RUST_188_BIN/cargo" install wasm-bindgen-cli \
-  --version 0.2.126 --locked --root "$WASM_BINDGEN_TOOL_ROOT"
+  --version 0.2.129 --locked --root "$WASM_BINDGEN_TOOL_ROOT"
 PATH="$WASM_BINDGEN_TOOL_ROOT/bin:$PATH" npm run build:wasm
 npm run test:browser
 ```
 
-`toolchain-lock.json` pins the Rust 1.85 source MSRV, the separate Rust 1.88
-host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
+`toolchain-lock.json` pins the Rust 1.88 source MSRV and host toolchain needed to compile the exact wasm-bindgen CLI into a fresh,
 isolated tool root, wasm-pack/wasm-bindgen, the exact Chrome for Testing archive
 identity, and browser heap/retention ceilings. The release-runner Linux
 process-tree RSS ceiling remains 1 GiB. macOS uses a separate 2 GiB absolute
@@ -199,3 +202,15 @@ LibreOffice campaign whose absolute, repeatability, authored-print, and
 reviewed-baseline ratchets all pass. Publication then passes through the
 protected `npm-render-worker` environment before npm receives the verified
 tarball and provenance identity.
+
+### Calculation observation and v3 compatibility
+
+Use the client, Worker, and WASM from the same package version. Protocol v3
+intentionally rejects v2 mixtures; v2 responses have not acquired optional keys.
+`EditState` schema 2 includes `calculation: { status, summary }`. `unknown` has a
+null summary on opening/reopening. `observed` records the latest successful
+supported-evaluator pass; `stale` retains its counts/reasons after a cell change
+without recalculation. Property edits preserve the observation, and Rust
+undo/redo restores it with the workbook. Operation `recalculation` remains a
+separate summary of that operation. Observation metadata is session-local,
+bounded by the history budget, and never saved into the XLSX/XLSM package.

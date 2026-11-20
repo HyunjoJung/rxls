@@ -32,11 +32,6 @@ export function createEditingController({
   let propertiesDialogGeneration = 0;
   let recalculationWarning = "";
   let warningContext = null;
-  let warningSummary = null;
-  const warningUndo = [];
-  const warningRedo = [];
-  // Match the worker's bounded edit history; retain counts, never workbook text.
-  const maxWarningHistory = 20;
   const editing = {
     cellReadTarget: null,
     cellReadPending: false,
@@ -140,7 +135,7 @@ export function createEditingController({
     elements["meta-editing"].textContent = state.workbook ? status : "-";
     elements["meta-editing"].title = hostReadOnly
       ? "VS Code previews do not modify source workbooks."
-      : (reason ?? status);
+      : (reason ?? `${status}. ${calculationLabel()}`);
     elements["meta-editing"].classList.toggle(
       "dirty",
       Boolean(editState?.dirty && !hostReadOnly),
@@ -507,7 +502,6 @@ export function createEditingController({
         result,
         direction === "undo" ? "Edit undone" : "Edit redone",
         target,
-        direction,
       );
     } catch (error) {
       if (isCurrentTarget(target)) {
@@ -523,11 +517,10 @@ export function createEditingController({
     result,
     message,
     target,
-    history = "edit",
   ) {
     if (!isCurrentTarget(target)) return false;
     syncWarningContext();
-    const report = updateWarningHistory(result, history);
+    const report = result.recalculation;
     state.workbook = result.workbook;
     state.editState = result.editState;
     state.manifests.clear();
@@ -573,64 +566,39 @@ export function createEditingController({
     )
       return;
     clearWarning();
-    warningSummary = null;
-    warningUndo.length = warningRedo.length = 0;
     warningContext = state.workbook ? currentTarget() : null;
   }
 
-  function updateWarningHistory(result, direction) {
-    if (direction === "undo" || direction === "redo") {
-      const source = direction === "undo" ? warningUndo : warningRedo;
-      const destination = direction === "undo" ? warningRedo : warningUndo;
-      destination.push(warningSummary);
-      // If an older snapshot was evicted, retain uncertainty rather than claiming clean caches.
-      if (source.length) warningSummary = source.pop();
-    } else {
-      warningUndo.push(warningSummary);
-      warningRedo.length = 0;
+  function calculationLabel() {
+    const observation = state.editState?.calculation;
+    if (!observation || observation.status === "unknown") {
+      return "Formula caches have not been checked in this session.";
     }
-    for (const [entries, depth] of [
-      [warningUndo, result.editState?.undoDepth],
-      [warningRedo, result.editState?.redoDepth],
-    ]) {
-      const limit =
-        Number.isSafeInteger(depth) && depth >= 0
-          ? Math.min(depth, maxWarningHistory)
-          : maxWarningHistory;
-      entries.splice(0, Math.max(0, entries.length - limit));
+    if (observation.status === "stale") {
+      return "Formula cache observation is out of date after a cell edit.";
     }
-    const report = result.recalculation;
-    if (
-      !report ||
-      !Number.isSafeInteger(report.computedCells) ||
-      report.computedCells < 0 ||
-      !Number.isSafeInteger(report.unsupportedCells) ||
-      report.unsupportedCells < 0
-    )
-      return null;
-    const summary = {
-      computedCells: report.computedCells,
-      unsupportedCells: report.unsupportedCells,
-    };
-    warningSummary = summary.unsupportedCells > 0 ? summary : null;
-    return summary;
+    return "Formula caches were checked within the supported evaluator's scope.";
   }
 
   function summarizeRecalculation(report, message) {
-    // Metadata/history do not recalculate; an absent report must not claim clean caches.
     clearWarning();
-    if (!report && !warningSummary) return message;
-    if (!report) {
-      const count = warningSummary.unsupportedCells;
-      recalculationWarning = `${message}. ${count} unsupported formula cell${count === 1 ? " still uses" : "s still use"} cached values.`;
-      elements["error-message"].textContent = recalculationWarning;
-      elements["error-banner"].hidden = false;
-      return recalculationWarning;
+    const observation = state.editState?.calculation;
+    if (report) {
+      const computed = `${report.computedCells} formula cell${report.computedCells === 1 ? "" : "s"} recalculated`;
+      if (report.unsupportedCells === 0) return `${message}. ${computed}.`;
+      const unsupported = `${report.unsupportedCells} unsupported formula cell${report.unsupportedCells === 1 ? "" : "s"}`;
+      recalculationWarning = `${message}. ${computed}; ${unsupported} kept their cached values.`;
+    } else if (!observation || observation.status === "unknown") {
+      return `${message}. ${calculationLabel()}`;
+    } else {
+      const count = observation.summary.unsupportedCells;
+      const stale = observation.status === "stale";
+      if (!stale && count === 0) return message;
+      const warning = count > 0
+        ? `${count} unsupported formula cell${count === 1 ? " still uses" : "s still use"} cached values${stale ? " according to the last check" : ""}.`
+        : "The previous check found no unsupported formulas; current caches have not been checked.";
+      recalculationWarning = `${message}. ${stale ? `${calculationLabel()} ` : ""}${warning}`;
     }
-    const computed = `${report.computedCells} formula cell${report.computedCells === 1 ? "" : "s"} recalculated`;
-    if (report.unsupportedCells === 0) return `${message}. ${computed}.`;
-    const unsupported = `${report.unsupportedCells} unsupported formula cell${report.unsupportedCells === 1 ? "" : "s"}`;
-    recalculationWarning = `${message}. ${computed}; ${unsupported} kept their cached values.`;
     elements["error-message"].textContent = recalculationWarning;
     elements["error-banner"].hidden = false;
     return recalculationWarning;

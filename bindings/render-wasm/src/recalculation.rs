@@ -3,11 +3,11 @@
 use rxls::{Cell, FormulaEvaluation, Spreadsheet, Workbook};
 use serde::Serialize;
 
-use super::{enforce_output, map_edit_error, FacadeError, MAX_OUTPUT_BYTES};
+use super::{map_edit_error, FacadeError};
 
 const MAX_FORMULA_CELLS: usize = 10_000;
 
-#[derive(Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Summary {
     computed_cells: usize,
@@ -17,18 +17,12 @@ pub(super) struct Summary {
 }
 
 impl Summary {
-    pub(super) fn changed_cells(&self) -> usize {
-        self.computed_cells - self.unchanged_cells
+    pub(super) fn allocated_bytes(&self) -> usize {
+        self.reasons.capacity() * std::mem::size_of::<&'static str>()
     }
 
-    pub(super) fn append_to_result(self, output: String) -> Result<String, FacadeError> {
-        let mut result: serde_json::Value =
-            serde_json::from_str(&output).map_err(|_| failure("serialization_failed"))?;
-        result["recalculation"] =
-            serde_json::to_value(self).map_err(|_| failure("serialization_failed"))?;
-        let result = result.to_string();
-        enforce_output(result.len(), MAX_OUTPUT_BYTES)?;
-        Ok(result)
+    pub(super) fn changed_cells(&self) -> usize {
+        self.computed_cells - self.unchanged_cells
     }
 }
 
@@ -94,6 +88,9 @@ pub(super) fn apply(
                 }
                 summary.unsupported_cells += 1;
                 if !summary.reasons.contains(&reason.code()) {
+                    if summary.reasons.len() == 8 {
+                        return Err(failure("unsupported_reason_limit"));
+                    }
                     summary.reasons.push(reason.code());
                 }
             }

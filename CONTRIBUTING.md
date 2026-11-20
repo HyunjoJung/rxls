@@ -37,8 +37,8 @@ For core Rust changes, install [Rust through rustup], then run from the
 repository root:
 
 ```sh
-rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
-cargo +1.85.0 test --lib --all-features --locked
+rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+cargo +1.88.0 test --lib --all-features --locked
 ```
 
 This uses the committed lockfile and does not need Excel, Java, LibreOffice,
@@ -55,8 +55,8 @@ hosted tooling. Install only the package you are changing with
 `npm ci --prefix viewer --ignore-scripts` or
 `npm ci --prefix extensions/vscode --ignore-scripts`.
 
-The core and renderer support Rust 1.85. For the separate MCP adapter, install
-its Rust 1.88 toolchain and use `cargo +1.88.0` for that package:
+The core, renderer, and separate MCP adapter support Rust 1.88. Use the same
+pinned compiler for source checks in each package:
 
 ```sh
 rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
@@ -68,15 +68,15 @@ their package guides.
 ## Choose a focused check
 
 All commands below run from the repository root. For Rust changes, also run
-`cargo +1.85.0 fmt --all -- --check` (or the changed package's `cargo fmt`).
+`cargo +1.88.0 fmt --all -- --check` (or the changed package's `cargo fmt`).
 
 | Changed area | Start here | More context |
 | --- | --- | --- |
 | Prose and links | `git diff --check`; check links and any changed example | [README](README.md), [public docs](docs/compatibility.md) |
-| Core readers, writer, editor, or formulas | `cargo +1.85.0 test --lib --all-features --locked` | `src/`, [format internals](docs/format-internals.md) |
-| CLI | `cargo +1.85.0 test --test cli --all-features --locked` | `src/main.rs`, `tests/cli.rs` |
-| Public API or fixture regressions | `cargo +1.85.0 test --test integration --test api_contract --all-features --locked` | `tests/`, [fixture provenance](tests/fixtures/README.md) |
-| Renderer | `cargo +1.85.0 test --manifest-path render/Cargo.toml --all-targets --locked` | [Renderer guide](render/README.md) |
+| Core readers, writer, editor, or formulas | `cargo +1.88.0 test --lib --all-features --locked` | `src/`, [format internals](docs/format-internals.md) |
+| CLI | `cargo +1.88.0 test --test cli --all-features --locked` | `src/main.rs`, `tests/cli.rs` |
+| Public API or fixture regressions | `cargo +1.88.0 test --test integration --test api_contract --all-features --locked` | `tests/`, [fixture provenance](tests/fixtures/README.md) |
+| Renderer | `cargo +1.88.0 test --manifest-path render/Cargo.toml --all-targets --locked` | [Renderer guide](render/README.md) |
 | Viewer application logic | `npm --prefix viewer test` | [Viewer setup and browser tests](viewer/README.md) |
 | Render worker JavaScript | `npm --prefix bindings/render-wasm test` | [Worker setup and WASM tests](bindings/render-wasm/README.md) |
 | MCP adapter | `cargo +1.88.0 test --manifest-path bindings/mcp/Cargo.toml --locked` | [MCP guide](bindings/mcp/README.md) |
@@ -145,11 +145,11 @@ dependencies described in [Validation and reproducibility](docs/validation.md).
 Run the full local gate; all applicable checks must pass clean:
 
 On macOS, put rustup's cargo proxy before any Homebrew Rust installation so
-`cargo +1.85.0`, `cargo +nightly`, and the API checker use the pinned toolchain:
+`cargo +1.88.0`, `cargo +nightly`, and the API checker use the pinned toolchain:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo +1.85.0 -V
+cargo +1.88.0 -V
 ```
 
 ```sh

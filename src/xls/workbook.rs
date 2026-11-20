@@ -147,8 +147,11 @@ fn read_property_lpwstr(data: &[u8], value_offset: usize) -> Option<String> {
     let end = start.checked_add(byte_len)?;
     let words = data
         .get(start..end)?
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .take_while(|word| *word != 0)
         .collect::<Vec<_>>();
     String::from_utf16(&words).ok()
@@ -219,7 +222,9 @@ pub(super) fn parse_extern_sheets(data: &[u8]) -> Vec<crate::ptg::ExternSheet> {
     let count = usize::from(u16le(data, 0).unwrap_or(0));
     data.get(2..)
         .unwrap_or_default()
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .take(count)
         .filter_map(|xti| {
             Some(crate::ptg::ExternSheet {
@@ -494,8 +499,11 @@ pub(super) fn decode_chars(data: &[u8], off: usize, cch: usize, grbit: u8) -> Op
     if grbit & 0x01 != 0 {
         let units: Vec<u16> = data
             .get(off..off + cch.checked_mul(2)?)?
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(u16::from_le_bytes)
             .collect();
         Some(String::from_utf16_lossy(&units))
     } else {

@@ -100,7 +100,7 @@ GITHUB_BOOTSTRAP_EVIDENCE_MEMBER = "render-oracle-image-build.json"
 BUILDX_VERSION = "v0.35.0"
 BUILDX_COMMIT = "a319e5b15052cf6557ceb666eb8ff6e32380b782"
 BUILDX_SETUP_ACTION = (
-    "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
+    "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
 )
 BUILDKIT_VERSION = "v0.31.2"
 BUILDKIT_COMMIT = "e42e1bfd389af7203238cce77b1f7dad447285e9"

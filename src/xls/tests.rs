@@ -137,7 +137,7 @@ fn property_set_stream_values(
                 section.extend_from_slice(&value.to_le_bytes());
             }
         }
-        while section.len() % 4 != 0 {
+        while !section.len().is_multiple_of(4) {
             section.push(0);
         }
     }

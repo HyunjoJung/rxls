@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- Raised the source checkout's minimum Rust version to 1.88. Published 0.1.3
+  and 0.1.4 artifacts retain their historical Rust 1.85 requirement.
+- Updated the core and general WASM development versions to 0.2.0 and the
+  render worker to 0.4.0 for its breaking response contract. These versions
+  are reserved for the next releases; this entry does not record publication.
+- Updated the XML reader while retaining the pinned raw-XML parser used by
+  package-preserving XLSX edits.
+- Moved calculation observations into Rust session snapshots. Undo and redo
+  restore unknown, observed or stale observations with the workbook. The viewer
+  displays the returned state, and the protocol rejects mixed v2/v3 components.
+
 ### Fixed
 
 - Preserved punctuation and doubled quotes inside formula text literals (#135),
@@ -484,6 +499,7 @@ Apache POI, or runtime subprocess dependency.
   `quick-xml` migration.
 
 [Unreleased]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
+[0.2.0]: https://github.com/HyunjoJung/rxls/compare/v0.1.4...HEAD
 [0.1.4]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4
 [0.1.3]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.3
 [0.1.2]: https://github.com/HyunjoJung/rxls/releases/tag/v0.1.2

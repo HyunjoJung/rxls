@@ -13,7 +13,7 @@ XLS, XLSX, XLSB, ODS를 하나의 타입 모델로 읽습니다. XLSX를 새로 
 [![Live viewer](https://img.shields.io/badge/live-viewer-176b3a.svg)](https://hyunjojung.github.io/rxls/)
 [![CI](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml/badge.svg)](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
 업무에서는 서로 다른 시기와 프로그램에서 만들어진 엑셀 문서를 한꺼번에
 마주하게 됩니다. `rxls`는 JVM이나 Apache POI, Office 설치, 별도 프로세스 없이

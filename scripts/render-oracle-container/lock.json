@@ -20,7 +20,7 @@
     },
     "buildx": {
       "commit": "a319e5b15052cf6557ceb666eb8ff6e32380b782",
-      "setup_action": "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
+      "setup_action": "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069",
       "version": "v0.35.0"
     },
     "driver": "docker-container",
@@ -45,22 +45,22 @@
   "built_image": {
     "bootstrap_receipt": {
       "artifact": {
-        "digest": "sha256:045f1cceef091d77ec474def8e8c90b40d1e3a34b041c08e00a76305f0cc54a4",
-        "id": 10035514696,
-        "name": "render-oracle-image-59f267be5dd389fae90aefa9fc6e6f3a9bc750a4-34170106943-1",
-        "size_in_bytes": 1753
+        "digest": "sha256:dcceb56628b9cb8efe378ce2b200eecfeceadd5632c7e40ebdd2fdf6ac98bc30",
+        "id": 14606010709,
+        "name": "render-oracle-image-0a064565aec008de194ff86bb36eee244bb158b8-44683573605-1",
+        "size_in_bytes": 1755
       },
       "evidence": {
         "bytes": 6945,
         "member": "render-oracle-image-build.json",
-        "sha256": "51692a377fcae8d3368e29e57cf98117ac389c6e6fb77148e743b16f4459604c"
+        "sha256": "126911229e6fcb55b4209d1ef4429745dacdc9f67fd4d9865e7da85ad02ba858"
       },
       "job": {
         "conclusion": "failure",
-        "id": 101888641335,
+        "id": 136112470341,
         "name": "locked LibreOffice oracle image",
         "run_attempt": 1,
-        "run_id": 34170106943
+        "run_id": 44683573605
       },
       "repository": {
         "full_name": "HyunjoJung/rxls",
@@ -69,15 +69,15 @@
       "run": {
         "conclusion": "failure",
         "event": "pull_request",
-        "head_sha": "59f267be5dd389fae90aefa9fc6e6f3a9bc750a4",
-        "id": 34170106943,
+        "head_sha": "0a064565aec008de194ff86bb36eee244bb158b8",
+        "id": 44683573605,
         "run_attempt": 1,
         "workflow": ".github/workflows/render-hardening.yml"
       },
       "schema": "rxls.render-oracle-bootstrap-receipt.v1"
     },
-    "expected_id": "sha256:33089771ad133e37992d9023e7106ee2a4b05d544eeeb3ba7efe16e6f1d9bedf",
-    "expected_manifest_digest": "sha256:cb9c761be58f29caffab0eb73a0d60b3ad3a349bc00fb12dad3cec761e2a606a",
+    "expected_id": "sha256:cd2ba2fffb92f9410c58cb7870d5a68908e64c594c679a7807e08cd481eaac02",
+    "expected_manifest_digest": "sha256:dd48f00ff734dc317c41a45f7ad2afd21f06bb23b75b580e2618c70c1616dca9",
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
@@ -128,6 +128,6 @@
   "wrapper": {
     "bytes": 128589,
     "path": "scripts/run-render-oracle-container.py",
-    "sha256": "19ccfb9241821aa151dda3851fbd0a9d4156c7d748e44b8d7de58f7de6335c87"
+    "sha256": "e89fd82eeedb7de10e4d653dcf5d519c5abf9a597bbcd6834d150d03a8935ed9"
   }
 }

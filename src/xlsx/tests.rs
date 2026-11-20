@@ -15,6 +15,14 @@ use crate::{
     DrawingCrop, DrawingObjectKind,
 };
 
+#[test]
+fn part_lookup_uses_decoded_cp437_names_before_raw_utf8_bytes() {
+    let bytes = crate::zipname::tests::cp437_collision_archive();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    assert_eq!(part(&mut archive, "xl/é.xml").as_deref(), Some("second"));
+    assert_eq!(part(&mut archive, "xl/├⌐.xml").as_deref(), Some("first"));
+}
+
 fn complete_theme_xml(
     major_latin: &str,
     minor_latin: &str,

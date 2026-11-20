@@ -25,7 +25,7 @@ fn chart_text_attributes_are_subset(
         let Ok(attribute) = attribute else {
             return false;
         };
-        let qualified_name = attribute.key.as_ref();
+        let qualified_name = attribute.key.as_ref().as_bytes();
         qualified_name == b"xmlns"
             || qualified_name.starts_with(b"xmlns:")
             || allowed.contains(&qualified_name)

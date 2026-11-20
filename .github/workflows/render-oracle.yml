@@ -187,7 +187,7 @@ jobs:
             bash scripts/render-oracle-build-storage.sh prepare
           printf '%s\n' 'active=true' >> "$GITHUB_OUTPUT"
       - name: Set up the pinned Buildx client
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           name: rxls-oracle-client
           version: v0.35.0
@@ -410,8 +410,8 @@ jobs:
       - name: Build the exact renderer binary
         if: ${{ env.RXLS_IDENTITY_BOOTSTRAP != '1' }}
         run: |
-          rustup toolchain install 1.85.0 --profile minimal
-          cargo +1.85.0 build --locked --release --manifest-path render/Cargo.toml
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 build --locked --release --manifest-path render/Cargo.toml
           python3 - <<'PY'
           import hashlib, json, pathlib
           path = pathlib.Path("render/target/release/rxls-render")
@@ -438,39 +438,39 @@ jobs:
           command -v pdfinfo
           command -v pdftoppm
           command -v pdftotext
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \
             -- --exact --list \
             | grep -Fqx 'pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \
             -- --exact
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \
             -- --exact --list \
             | grep -Fqx 'embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \
             -- --exact
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \
             -- --exact --list \
             | grep -Fqx 'pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \
             -- --exact
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \
             -- --exact --list \
             | grep -Fqx 'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \
             -- --exact
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
             -- --exact --list \
             | grep -Fqx 'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \
             -- --exact
       - name: Run the pinned-font SinglePageSheets CLI geometry regression
@@ -484,18 +484,18 @@ jobs:
           set -euo pipefail
           [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]
           test -f "$RXLS_TEST_FONT_PACK_MANIFEST"
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \
             -- --exact --list \
             | grep -Fqx 'layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --lib layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \
             -- --exact
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
             -- --exact --list \
             | grep -Fqx 'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'
-          cargo +1.85.0 test --locked --release --manifest-path render/Cargo.toml \
+          cargo +1.88.0 test --locked --release --manifest-path render/Cargo.toml \
             --test printing cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \
             -- --exact
       - name: Build and inspect the locked oracle image
@@ -2454,7 +2454,7 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Upload path-neutral aggregate identities only
         if: ${{ success() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: render-oracle-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-full' && 'full' || github.event_name == 'pull_request' && github.event.label.name == 'rxls-render-oracle-pilot' && 'pilot' || (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.campaign || 'pilot' }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.baseline_mode || 'verify' }}
           path: |
@@ -2509,7 +2509,7 @@ jobs:
       - name: Upload sanitized Render Oracle failure summary
         id: render_oracle_failure_upload
         if: ${{ failure() && env.RXLS_IDENTITY_BOOTSTRAP != '1' && steps.render_oracle_failure_evidence.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: render-oracle-failure-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/render-oracle-failure/render-oracle-failure-summary.json

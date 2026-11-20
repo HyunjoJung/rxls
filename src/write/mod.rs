@@ -354,7 +354,8 @@ fn content_type_default_cost(extension: &str, content_type: &str) -> usize {
 fn zip_parts(parts: Vec<(String, Vec<u8>)>) -> Vec<u8> {
     fn build(parts: &[(String, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
         let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opt = SimpleFileOptions::default();
+        // Keep the ZIP creator metadata identical across host platforms.
+        let opt = SimpleFileOptions::default().system(zip::System::Unix);
         for (path, bytes) in parts {
             zw.start_file(path.as_str(), opt)?;
             zw.write_all(bytes)?;
@@ -403,6 +404,14 @@ mod tests {
         let first = workbook.to_xlsx();
         let second = workbook.to_xlsx();
         assert_eq!(first, second);
+        use zip::read::HasZipMetadata;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(first)).unwrap();
+        for index in 0..archive.len() {
+            assert_eq!(
+                archive.by_index(index).unwrap().get_metadata().system,
+                zip::System::Unix
+            );
+        }
     }
 
     #[test]
@@ -2713,7 +2722,7 @@ print('READ_DV_OK')
             match reader.read_event().unwrap() {
                 quick_xml::events::Event::Empty(element)
                 | quick_xml::events::Event::Start(element)
-                    if element.name().as_ref() == b"col" =>
+                    if element.name().as_ref() == "col" =>
                 {
                     columns.push(
                         element
@@ -2721,8 +2730,8 @@ print('READ_DV_OK')
                             .map(|attribute| {
                                 let attribute = attribute.unwrap();
                                 (
-                                    String::from_utf8(attribute.key.as_ref().to_vec()).unwrap(),
-                                    String::from_utf8(attribute.value.to_vec()).unwrap(),
+                                    attribute.key.as_ref().to_owned(),
+                                    attribute.value.into_owned(),
                                 )
                             })
                             .collect(),

@@ -74,7 +74,8 @@ function fakeWorkbook() {
 
 function fakeEditState(overrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    calculation: { status: "unknown", summary: null },
     capability: "read-write",
     reason: null,
     dirty: false,
@@ -649,4 +650,17 @@ test("generic requests are validated before postMessage and cannot declare accou
     (error) => error.code === "invalid_client_options"
   );
   assert.equal(worker.sent.length, 0);
+});
+
+test("v3 client explicitly rejects old worker and old WASM capability identities", async () => {
+  for (const oldWorker of [true, false]) {
+    const worker = new FakeWorker();
+    const client = new RenderWorkerClient(worker);
+    const pending = client.capabilities();
+    const capabilities = structuredClone(EXPECTED_CAPABILITIES);
+    capabilities.protocol = "rxls.render-worker.v2";
+    worker.emit({ protocol: oldWorker ? "rxls.render-worker.v2" : PROTOCOL, type: "ready", capabilities });
+    await assert.rejects(pending, { code: "worker_message_error", location: "worker" });
+    assert.equal(worker.terminated, true);
+  }
 });

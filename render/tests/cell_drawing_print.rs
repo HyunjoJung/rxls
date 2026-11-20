@@ -135,7 +135,7 @@ fn partial_area_image_workbook(
 fn decoded_png_rgba(png_bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let mut reader = decoder.read_info().unwrap();
-    let mut bytes = vec![0; reader.output_buffer_size()];
+    let mut bytes = vec![0; reader.output_buffer_size().expect("bounded PNG fixture")];
     let info = reader.next_frame(&mut bytes).unwrap();
     assert_eq!(info.color_type, png::ColorType::Rgba);
     bytes.truncate(info.buffer_size());

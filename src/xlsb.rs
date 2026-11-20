@@ -210,8 +210,11 @@ fn wide_string(b: &[u8], o: usize) -> Option<(String, usize)> {
     let bytes = cch.checked_mul(2)?;
     let chars = b.get(o + 4..o + 4 + bytes)?;
     let units: Vec<u16> = chars
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     Some((String::from_utf16_lossy(&units), 4 + bytes))
 }
@@ -233,15 +236,29 @@ fn part(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
-    if let Some(idx) = zip.index_for_name(name) {
-        return Some(idx);
+    if name.is_ascii() {
+        if let Some(idx) = zip.index_for_name(name) {
+            return Some(idx);
+        }
+    } else {
+        // ZIP 9 indexes raw bytes. Non-ASCII names must be compared after
+        // decoding, with the previous last-entry-wins exact-match behavior.
+        for idx in (0..zip.len()).rev() {
+            let Ok(file) = zip.by_index_data(idx) else {
+                continue;
+            };
+            if crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()) == name {
+                return Some(idx);
+            }
+        }
     }
     let wanted = canonical_part_name(name);
     for idx in 0..zip.len() {
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
-        if canonical_part_name(file.name()).eq_ignore_ascii_case(&wanted) {
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
+        if canonical_part_name(&name).eq_ignore_ascii_case(&wanted) {
             return Some(idx);
         }
     }

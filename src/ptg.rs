@@ -374,8 +374,11 @@ fn decompile_impl(rgce: &[u8], rgb_extra: &[u8], context: &Context<'_>) -> Strin
                     let units: Vec<u16> = rgce
                         .get(i + 2..i + 2 + bytes)
                         .unwrap_or(&[])
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u16::from_le_bytes)
                         .collect();
                     (String::from_utf16_lossy(&units), 2 + bytes)
                 } else {
@@ -744,8 +747,11 @@ fn parse_ser_ar_biff8(extra: &[u8], offset: &mut usize) -> Option<String> {
                 let bytes = cch.checked_mul(2)?;
                 let units = extra
                     .get(chars_at..chars_at.checked_add(bytes)?)?
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u16::from_le_bytes)
                     .collect::<Vec<_>>();
                 (String::from_utf16_lossy(&units), bytes)
             } else {
@@ -788,8 +794,11 @@ fn parse_ser_ar_biff12(extra: &[u8], offset: &mut usize) -> Option<String> {
             let bytes = cch.checked_mul(2)?;
             let units = extra
                 .get(chars_at..chars_at.checked_add(bytes)?)?
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect::<Vec<_>>();
             *offset = chars_at.checked_add(bytes)?;
             let text = String::from_utf16_lossy(&units);
@@ -841,7 +850,9 @@ mod tests {
         assert_eq!(value.len() % 2, 0, "hex fixture must have byte pairs");
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text = std::str::from_utf8(pair).unwrap();
                 u8::from_str_radix(text, 16).unwrap()
