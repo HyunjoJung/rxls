@@ -1870,18 +1870,8 @@ fn built_in_num_fmt(id: u16) -> Option<&'static str> {
 }
 
 fn parse_alignment(e: &quick_xml::events::BytesStart<'_>) -> Alignment {
-    let horizontal = match attr(e, b"horizontal").as_deref() {
-        Some("left") => Some(HAlign::Left),
-        Some("center" | "centerContinuous" | "distributed") => Some(HAlign::Center),
-        Some("right") => Some(HAlign::Right),
-        _ => None,
-    };
-    let vertical = match attr(e, b"vertical").as_deref() {
-        Some("top") => Some(VAlign::Top),
-        Some("center" | "distributed" | "justify") => Some(VAlign::Middle),
-        Some("bottom") => Some(VAlign::Bottom),
-        _ => None,
-    };
+    let horizontal = attr(e, b"horizontal").and_then(|v| HAlign::try_from(v).ok());
+    let vertical = attr(e, b"vertical").and_then(|v| VAlign::try_from(v).ok());
     let raw_rotation = attr(e, b"textRotation")
         .and_then(|value| value.parse::<i16>().ok())
         .unwrap_or(0);

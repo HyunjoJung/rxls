@@ -5927,7 +5927,7 @@ fn format_subobject_helpers_feed_object_model() {
         .with_top_color(Color::rgb(0x77, 0x88, 0x99));
     let alignment = Alignment::new()
         .with_horizontal(FormatAlign::Center)
-        .with_vertical(VAlign::Middle)
+        .with_vertical(VAlign::Center)
         .wrapped()
         .with_indent(2)
         .with_rotation(45)
