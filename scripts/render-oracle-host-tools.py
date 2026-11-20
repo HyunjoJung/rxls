@@ -59,7 +59,7 @@ APT_COMPANION_SOURCES = {
 }
 APT_RESTORATION_TIMEOUT_SECONDS = 30
 APT_RESTORATION_DEADLINE_SECONDS = 60
-MAX_APT_RESTORATION_BYTES = 1024 * 1024
+MAX_APT_RESTORATION_BYTES = 4 * 1024 * 1024
 # These archive hashes and sizes were authenticated against Ubuntu's signed
 # 20260909T000000Z noble-updates/main/binary-amd64/Packages.xz index:
 # SHA256 3720dbb6f08b7a99bb77874fb0cd41d3180ec2187f558f264f6e612698df01a7.
@@ -89,6 +89,109 @@ APT_RESTORATIONS = tuple(
          "63ab8110daea359f55d8135d395de198257acb1f948500c561745addddfece4c"),
         ("libkrb5support0", 34688,
          "cee1efc93d4ce4a97db756269824b5a2b90d2cb993cd76102432db60890819fc"),
+    )
+)
+# Exact packages in the captured closure missing from the August snapshot.
+# Their SHA256 and size fields come from 20261119T000000Z signed amd64
+# main indices. The common Ubuntu archive key protects both InRelease files:
+# noble-security InRelease: 92fde223e2612e7d5d715bdac5abb4af07543899af1b919048811c5ffdb450d9
+# main/binary-amd64/Packages.xz: 42f18dd99fd49a29c0c9c834ef2853f6c370e46da86eae5b7290558ded68a597
+# noble-updates InRelease: dc5bcae8f20f2430cdcbfb712573ada0914bd457096eeea5daf7ffdb6d273356
+# main/binary-amd64/Packages.xz: 255b8cf4b02fa3849a757351f4ed707c48c5b7db4f2dc0d2137dac7c9e834c60
+APT_RESTORATIONS += tuple(
+    {
+        "name": name,
+        "version": version,
+        "architecture": "amd64",
+        "bytes": size,
+        "sha256": digest,
+        "url": f"https://snapshot.ubuntu.com/ubuntu/20261119T000000Z/{filename}",
+    }
+    for name, version, size, filename, digest in (
+        ("bzip2", "1.0.8-5.1ubuntu0.1", 34560,
+         "pool/main/b/bzip2/bzip2_1.0.8-5.1ubuntu0.1_amd64.deb",
+         "60fb79214dd8366fa39d7e69911294e72b9f1a4425a3d22f211359c8626e4b9e"),
+        ("libbrotli1", "1.1.0-2ubuntu0.1", 330968,
+         "pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_amd64.deb",
+         "70b188a86d81f30d7510aab30e25d638ed5037dded6691af1533952b71ac61de"),
+        ("libbz2-1.0", "1.0.8-5.1ubuntu0.1", 34562,
+         "pool/main/b/bzip2/libbz2-1.0_1.0.8-5.1ubuntu0.1_amd64.deb",
+         "36ee08b00b1ee5018b2fce02881b7d2d73c9b4e32990bde3388400d86c48126a"),
+        ("libc-bin", "2.39-0ubuntu8.12", 681714,
+         "pool/main/g/glibc/libc-bin_2.39-0ubuntu8.12_amd64.deb",
+         "22f0393621e72ed1b53d228ee332180269182b5445761c7d7b74f5cba75a1dd6"),
+        ("libc-dev-bin", "2.39-0ubuntu8.12", 20450,
+         "pool/main/g/glibc/libc-dev-bin_2.39-0ubuntu8.12_amd64.deb",
+         "74ac21dab2a0a6524a2cf9de623adf1bb1f7d9b672e6b0f70adec0c40452bae3"),
+        ("libc6", "2.39-0ubuntu8.12", 3264258,
+         "pool/main/g/glibc/libc6_2.39-0ubuntu8.12_amd64.deb",
+         "d821b41fc59cb4978ecd53bc83e5c964ac15d305c8d2ac4c8a35aebe55010fb9"),
+        ("libc6-dev", "2.39-0ubuntu8.12", 2124506,
+         "pool/main/g/glibc/libc6-dev_2.39-0ubuntu8.12_amd64.deb",
+         "d81dd6dc9d515762cc93f338efa6219252acf3e2e87b5b89dd7dc517741e6eed"),
+        ("libc6-i386", "2.39-0ubuntu8.12", 2786812,
+         "pool/main/g/glibc/libc6-i386_2.39-0ubuntu8.12_amd64.deb",
+         "f3357fcee4a907404f5231381834cf31647326496d5bb4259338a717b3544c89"),
+        ("libcurl3t64-gnutls", "8.5.0-2ubuntu10.16", 336534,
+         "pool/main/c/curl/libcurl3t64-gnutls_8.5.0-2ubuntu10.16_amd64.deb",
+         "f3993897876cd03ea10941c9b364965ff95d0226459f31f6c5f5b93562c80798"),
+        ("libexpat1", "2.6.1-2ubuntu0.6", 98940,
+         "pool/main/e/expat/libexpat1_2.6.1-2ubuntu0.6_amd64.deb",
+         "494b8e672f722130c6bca6a7bc4cc31a43ca891a31d60d868bfdd699a3c20b13"),
+        ("libexpat1-dev", "2.6.1-2ubuntu0.6", 146542,
+         "pool/main/e/expat/libexpat1-dev_2.6.1-2ubuntu0.6_amd64.deb",
+         "87281ce46d74f261caff4ac404fe5af7b07f185d305246fef81797ddc20fa9f8"),
+        ("libfreetype6", "2.13.2+dfsg-1ubuntu0.2", 402610,
+         "pool/main/f/freetype/libfreetype6_2.13.2+dfsg-1ubuntu0.2_amd64.deb",
+         "8c6d3bac5a6197fa2f48b2d56f04f3ffecaa7082eeab91b0939f97a40adc88a6"),
+        ("libgssapi-krb5-2", "1.20.1-6ubuntu2.10", 142830,
+         "pool/main/k/krb5/libgssapi-krb5-2_1.20.1-6ubuntu2.10_amd64.deb",
+         "0d4a0187bcdbbe3e6a10bfa574100087d12052d0d0ef28614fd6210021c587b2"),
+        ("libk5crypto3", "1.20.1-6ubuntu2.10", 81944,
+         "pool/main/k/krb5/libk5crypto3_1.20.1-6ubuntu2.10_amd64.deb",
+         "273f7cc95a68d927d7f71c3e78b7717a16a8d86e646a206bae7bf797150ae9db"),
+        ("libkrb5-3", "1.20.1-6ubuntu2.10", 347568,
+         "pool/main/k/krb5/libkrb5-3_1.20.1-6ubuntu2.10_amd64.deb",
+         "60b48c5a3233f1d8caba30d6573edc8e131911ab6d63adcd664f7cbe62708362"),
+        ("libkrb5support0", "1.20.1-6ubuntu2.10", 34942,
+         "pool/main/k/krb5/libkrb5support0_1.20.1-6ubuntu2.10_amd64.deb",
+         "9224ede3246a82a845ea97652ecfae57f88e8d8f520d8a186f9157167574fb34"),
+        ("liblzma5", "5.6.1+really5.4.5-1ubuntu0.4", 127704,
+         "pool/main/x/xz-utils/liblzma5_5.6.1+really5.4.5-1ubuntu0.4_amd64.deb",
+         "5bcf5da2339331e21d3f42a831e82c61c54c6b2f29804010e8d59abd0ae52167"),
+        ("libnss3", "2:3.98-1ubuntu0.3", 1444912,
+         "pool/main/n/nss/libnss3_3.98-1ubuntu0.3_amd64.deb",
+         "e11fdf8c09a068d0f0c3fd90ed971253dfed7227cc20d3d487fd615d4771f1bb"),
+        ("libp11-kit0", "0.25.3-4ubuntu2.2", 297270,
+         "pool/main/p/p11-kit/libp11-kit0_0.25.3-4ubuntu2.2_amd64.deb",
+         "e7c58aeac19d89f5f1492dfaa52b8623bcd56edc40983f5243ad56d94f477bf2"),
+        ("libpng16-16t64", "1.6.43-5ubuntu0.7", 188998,
+         "pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5ubuntu0.7_amd64.deb",
+         "863d6abb089b2820ceba98e6b18f06eaacc55f9b05827001e7b4021a9a7b246c"),
+        ("libssh-4", "0.10.6-2ubuntu0.5", 191284,
+         "pool/main/libs/libssh/libssh-4_0.10.6-2ubuntu0.5_amd64.deb",
+         "2448ce5f99e49721d12f8b227f2472dd08ed7a78184dd819fd03a42693024a16"),
+        ("libssl-dev", "3.0.13-0ubuntu3.16", 2408684,
+         "pool/main/o/openssl/libssl-dev_3.0.13-0ubuntu3.16_amd64.deb",
+         "2b4734df0475e305ac03abb0a2cc5659651ed37ef02d967a1c4033a154cf714b"),
+        ("libssl3t64", "3.0.13-0ubuntu3.16", 1945300,
+         "pool/main/o/openssl/libssl3t64_3.0.13-0ubuntu3.16_amd64.deb",
+         "219f43b1cd836a4da550938db5fda93160d269d39a4edcf1f1ce698a470db797"),
+        ("libx11-6", "2:1.8.7-1ubuntu0.1", 653072,
+         "pool/main/libx/libx11/libx11-6_1.8.7-1ubuntu0.1_amd64.deb",
+         "9102f73477081a9a57994c80587ca9760341f644ed51bdfa46f2248083d418b3"),
+        ("p11-kit", "0.25.3-4ubuntu2.2", 141392,
+         "pool/main/p/p11-kit/p11-kit_0.25.3-4ubuntu2.2_amd64.deb",
+         "78f36f206d13cc5846e573e0036145ffa5288d90d77097749849811d9df8cfdc"),
+        ("p11-kit-modules", "0.25.3-4ubuntu2.2", 328846,
+         "pool/main/p/p11-kit/p11-kit-modules_0.25.3-4ubuntu2.2_amd64.deb",
+         "02a6d3b652fdfdc2b003464121e29027b2459cb4131c72d85de1d97582d5aaa7"),
+        ("zlib1g", "1:1.3.dfsg-3.1ubuntu2.3", 63158,
+         "pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.3_amd64.deb",
+         "376249c8de139568221dbb242318cc8cb8f02299e3a62b7432948e1754fbddf9"),
+        ("zlib1g-dev", "1:1.3.dfsg-3.1ubuntu2.3", 894134,
+         "pool/main/z/zlib/zlib1g-dev_1.3.dfsg-3.1ubuntu2.3_amd64.deb",
+         "419902a649e1078f24596cdf31ced9c839519828790f59888056fcdcd58e8a28"),
     )
 )
 EXPECTED_LOCK_KEYS = {
@@ -1069,6 +1172,19 @@ def relevant_apt_restorations(lock: dict[str, Any]) -> list[dict[str, Any]]:
     if lock["expected_identity"] is None:
         return []
     specs = set(default_apt_specs(lock, "all"))
+    specs.update(exact_libc_specs(lock))
+    # Cache matching companions in advance. apt_specs selects only the
+    # companions already installed on the runner.
+    versions = {}
+    for spec in specs:
+        name, separator, version = spec.partition("=")
+        if separator:
+            versions[name.split(":", 1)[0]] = version
+    specs.update(
+        f"{companion}:amd64={versions[source]}"
+        for companion, source in APT_COMPANION_SOURCES.items()
+        if source in versions
+    )
     return [row for row in APT_RESTORATIONS if specs & restoration_specs(row)]
 
 
@@ -1260,29 +1376,38 @@ def fetch_apt_restorations(lock: dict[str, Any], output_dir: Path) -> list[Path]
     return paths
 
 
+LIBC_APT_FAMILY = frozenset({"libc6", "libc6-dev", "libc-dev-bin", "libc-bin"})
+
+
+def captured_libc_version(identity: dict[str, Any]) -> str:
+    versions: set[str] = set()
+    for section in ("poppler", "cairo", "python"):
+        for row in identity[section]["native_libraries"]:
+            name = row.get("package_name", row.get("provider", ""))
+            base, _, architecture = name.partition(":")
+            if base not in LIBC_APT_FAMILY:
+                continue
+            version = row.get("package_version", row.get("provider_version", ""))
+            if architecture not in ("", "amd64") or DEBIAN_VERSION_RE.fullmatch(version) is None:
+                raise HostToolError("apt_restoration_libc_identity")
+            versions.add(version)
+    if len(versions) != 1:
+        raise HostToolError("apt_restoration_libc_identity")
+    return next(iter(versions))
+
+
 def exact_libc_specs(lock: dict[str, Any]) -> list[str]:
     expected = lock["expected_identity"]
     if expected is None:
         raise HostToolError("host_identity_pin_required")
-    family = {"libc6", "libc6-dev", "libc-dev-bin", "libc-bin"}
-    versions: set[str] = set()
-    for section in ("poppler", "cairo", "python"):
-        for row in expected[section]["native_libraries"]:
-            name = row.get("package_name", row.get("provider", ""))
-            if name.split(":", 1)[0] not in family:
-                continue
-            version = row.get("package_version", row.get("provider_version", ""))
-            if (
-                name not in family and name not in {f"{item}:amd64" for item in family}
-                or DEBIAN_VERSION_RE.fullmatch(version) is None
-            ):
-                raise HostToolError("apt_restoration_libc_identity")
-            versions.add(version)
-    bootstrap = [row["version"] for row in lock["ubuntu_apt"]["bootstrap_packages"]
-                 if row["name"] == "libc6-dev:amd64"]
-    if len(versions) != 1 or len(bootstrap) != 1 or bootstrap[0] not in versions:
+    version = captured_libc_version(expected)
+    bootstrap = [
+        row["version"] for row in lock["ubuntu_apt"]["bootstrap_packages"]
+        if row["name"] == "libc6-dev:amd64"
+    ]
+    if bootstrap != [version]:
         raise HostToolError("apt_restoration_libc_identity")
-    return [f"{name}:amd64={bootstrap[0]}" for name in sorted(family)]
+    return [f"{name}:amd64={version}" for name in sorted(LIBC_APT_FAMILY)]
 
 
 def installed_apt_companions() -> set[str]:
@@ -1357,17 +1482,18 @@ def apt_specs(
         return specs
     libc_specs = exact_libc_specs(lock)
     directory = restoration_directory(restoration_dir)
+    requested = set(libc_specs) | set(companion_apt_specs(lock))
+    requested.update(
+        spec for spec in specs
+        if spec.split("=", 1)[0].split(":", 1)[0] not in LIBC_APT_FAMILY
+    )
     replacements: dict[str, str] = {}
     for record in relevant_apt_restorations(lock):
-        matches = set(specs) & restoration_specs(record)
+        matches = requested & restoration_specs(record)
         if matches:
             path = verify_apt_restoration(directory / record["url"].rsplit("/", 1)[1], record)
             replacements.update({spec: str(path) for spec in matches})
-    family = {row.split(":", 1)[0] for row in libc_specs}
-    return sorted(set(libc_specs) | set(companion_apt_specs(lock)) | {
-        replacements.get(spec, spec) for spec in specs
-        if spec.split("=", 1)[0].split(":", 1)[0] not in family
-    })
+    return sorted({replacements.get(spec, spec) for spec in requested})
 
 
 def apt_sources(lock: dict[str, Any]) -> str:
@@ -1490,6 +1616,12 @@ def pin_from_evidence(lock_path: Path, evidence_path: Path) -> dict[str, Any]:
         raise HostToolError("bootstrap_evidence_identity")
     pinned = json.loads(json.dumps(lock))
     pinned["expected_identity"] = identity
+    # libc6-dev is installed by name during bootstrap. Bind its provenance
+    # to the same captured runtime used by Poppler, Cairo and Python.
+    version = captured_libc_version(identity)
+    for package in pinned["ubuntu_apt"]["bootstrap_packages"]:
+        if package["name"] == "libc6-dev:amd64":
+            package["version"] = version
     validate_lock(pinned, read_bounded(REQUIREMENTS, MAX_JSON_BYTES, "requirements_unreadable"))
     return pinned
 

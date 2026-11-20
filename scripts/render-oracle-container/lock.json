@@ -43,9 +43,41 @@
     "snapshotter": "native"
   },
   "built_image": {
-    "bootstrap_receipt": null,
-    "expected_id": null,
-    "expected_manifest_digest": null,
+    "bootstrap_receipt": {
+      "artifact": {
+        "digest": "sha256:dcceb56628b9cb8efe378ce2b200eecfeceadd5632c7e40ebdd2fdf6ac98bc30",
+        "id": 14606010709,
+        "name": "render-oracle-image-0a064565aec008de194ff86bb36eee244bb158b8-44683573605-1",
+        "size_in_bytes": 1755
+      },
+      "evidence": {
+        "bytes": 6945,
+        "member": "render-oracle-image-build.json",
+        "sha256": "126911229e6fcb55b4209d1ef4429745dacdc9f67fd4d9865e7da85ad02ba858"
+      },
+      "job": {
+        "conclusion": "failure",
+        "id": 136112470341,
+        "name": "locked LibreOffice oracle image",
+        "run_attempt": 1,
+        "run_id": 44683573605
+      },
+      "repository": {
+        "full_name": "HyunjoJung/rxls",
+        "id": 1297467060
+      },
+      "run": {
+        "conclusion": "failure",
+        "event": "pull_request",
+        "head_sha": "0a064565aec008de194ff86bb36eee244bb158b8",
+        "id": 44683573605,
+        "run_attempt": 1,
+        "workflow": ".github/workflows/render-hardening.yml"
+      },
+      "schema": "rxls.render-oracle-bootstrap-receipt.v1"
+    },
+    "expected_id": "sha256:cd2ba2fffb92f9410c58cb7870d5a68908e64c594c679a7807e08cd481eaac02",
+    "expected_manifest_digest": "sha256:dd48f00ff734dc317c41a45f7ad2afd21f06bb23b75b580e2618c70c1616dca9",
     "identity_kind": "docker_schema2_manifest_digest_plus_oci_image_config_digest",
     "source_date_epoch": 1783900800,
     "unpinned_verification": "bootstrap_only_two_isolated_no_cache_builds_plus_exact_config_manifest_descriptor_rootfs_contract_and_labels"
