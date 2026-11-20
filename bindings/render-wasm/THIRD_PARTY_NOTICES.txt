@@ -5,7 +5,7 @@ Scope:
 - Manifest: bindings/render-wasm/Cargo.toml
 - Target: wasm32-unknown-unknown
 - Dependency edges: Cargo normal edges for the production target
-- Cargo lock SHA-256: f9ce02d9ccb0d99ac42b7bc1da61ed02b2478c9b785f8ef48abc6e32b88eafad
+- Cargo lock SHA-256: 7bae29a9d8f8cf40e5028f6df718f591539e7cfc1a1cf30b42d2d9e4e39de17a
 - Third-party packages: 88
 - Unique legal texts: 82
 
@@ -627,10 +627,10 @@ Legal files:
 - LICENSE-MIT: f3c9fe731c701ed77fd5fbaac573872af04dc5869385eb9bd5e3c73c42713814
 
 ===============================================================================
-PACKAGE: typed-path 0.12.3
+PACKAGE: typed-path 0.12.4
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT OR Apache-2.0
-Registry archive SHA-256: 8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e
+Registry archive SHA-256: 54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c
 Legal files:
 - LICENSE-APACHE: 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
 - LICENSE-MIT: 23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3
@@ -775,10 +775,10 @@ Legal files:
 - LICENSE-MIT: f428305bbf2e70fbd807af0f3c7ac1b7acfb95311640f451e9d2e48db6d7e96b
 
 ===============================================================================
-PACKAGE: zip 9.0.2
+PACKAGE: zip 9.0.5
 Cargo source: registry+https://github.com/rust-lang/crates.io-index
 Declared license expression: MIT
-Registry archive SHA-256: 9e2fc56a6707efb066c40aead2409ebb1224e6dde24a074e9fbc78ced500507b
+Registry archive SHA-256: 6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e
 Legal files:
 - LICENSE: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79
 
@@ -1477,7 +1477,7 @@ Referenced by:
 - syn 3.0.3/LICENSE-MIT
 - thiserror 2.0.21/LICENSE-MIT
 - thiserror-impl 2.0.21/LICENSE-MIT
-- typed-path 0.12.3/LICENSE-MIT
+- typed-path 0.12.4/LICENSE-MIT
 - unicode-ident 1.0.24/LICENSE-MIT
 - zmij 1.0.23/LICENSE-MIT
 ----- BEGIN LEGAL TEXT -----
@@ -2744,7 +2744,7 @@ DEALINGS IN THE SOFTWARE.
 ===============================================================================
 LEGAL TEXT SHA-256: 58545fed1565e42d687aecec6897d35c6d37ccb71479a137c0deb2203e125c79
 Referenced by:
-- zip 9.0.2/LICENSE
+- zip 9.0.5/LICENSE
 ----- BEGIN LEGAL TEXT -----
 The MIT License (MIT)
 
@@ -2870,7 +2870,7 @@ Referenced by:
 - syn 3.0.3/LICENSE-APACHE
 - thiserror 2.0.21/LICENSE-APACHE
 - thiserror-impl 2.0.21/LICENSE-APACHE
-- typed-path 0.12.3/LICENSE-APACHE
+- typed-path 0.12.4/LICENSE-APACHE
 - unicode-ident 1.0.24/LICENSE-APACHE
 ----- BEGIN LEGAL TEXT -----
                               Apache License
