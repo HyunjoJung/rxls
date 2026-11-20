@@ -21,7 +21,8 @@ fn validate_limits<R: Read + Seek>(
         let file = zip
             .by_index_raw(index)
             .map_err(|_| Error::Zip("invalid ZIP central-directory entry"))?;
-        if file.name().len() > 4096 {
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
+        if name.len() > 4096 {
             return Err(Error::Zip("ZIP package entry name is too long"));
         }
         if file.size() > max_part {
@@ -42,7 +43,8 @@ fn validate_methods<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<()> 
         let file = zip
             .by_index_raw(index)
             .map_err(|_| Error::Zip("invalid ZIP central-directory entry"))?;
-        if file.name().ends_with('/') {
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
+        if name.ends_with('/') {
             continue;
         }
         let method = file.compression();
@@ -51,7 +53,7 @@ fn validate_methods<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> Result<()> 
             zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
         ) {
             return Err(Error::UnsupportedCompression {
-                part: file.name().to_string(),
+                part: name.into_owned(),
                 method: compression_method_id(method),
             });
         }
@@ -104,6 +106,42 @@ mod tests {
             Err(Error::UnsupportedCompression { part, method })
                 if part == "xl/workbook.xml" && method == 12
         ));
+    }
+
+    #[test]
+    fn malformed_utf8_entry_names_keep_lossy_compatibility() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("a", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"value").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let local = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x03\x04")
+            .unwrap();
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        // Set the UTF-8 flag and invalidate both copies of the one-byte name.
+        for (header, flag_offset, name_offset) in [(local, 6, 30), (central, 8, 46)] {
+            let flags = u16::from_le_bytes(
+                bytes[header + flag_offset..header + flag_offset + 2]
+                    .try_into()
+                    .unwrap(),
+            ) | (1 << 11);
+            bytes[header + flag_offset..header + flag_offset + 2]
+                .copy_from_slice(&flags.to_le_bytes());
+            bytes[header + name_offset] = 0xff;
+        }
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        validate_compression(&mut archive).unwrap();
+        let file = archive.by_index_raw(0).unwrap();
+        assert_eq!(
+            crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()),
+            "�"
+        );
     }
 
     #[test]

@@ -561,7 +561,7 @@ fn parse_chart_text_color_map(xml: &str) -> (ChartTextColorMap, bool) {
         for attribute in element.attributes() {
             match attribute {
                 Ok(attribute) => {
-                    let qualified_name = attribute.key.as_ref();
+                    let qualified_name = attribute.key.as_ref().as_bytes();
                     let name = local(qualified_name);
                     if !SOURCE_SLOTS.iter().any(|slot| slot.as_bytes() == name)
                         && qualified_name != b"xmlns"
@@ -794,7 +794,7 @@ pub(super) fn chart_text_attributes_are_subset(
         let Ok(attribute) = attribute else {
             return false;
         };
-        let qualified_name = attribute.key.as_ref();
+        let qualified_name = attribute.key.as_ref().as_bytes();
         qualified_name == b"xmlns"
             || qualified_name.starts_with(b"xmlns:")
             || allowed.contains(&qualified_name)
@@ -4284,7 +4284,7 @@ pub(crate) fn parse_chart_with_theme(
                 });
             }
             Ok(Event::CData(t)) => {
-                let text = String::from_utf8_lossy(t.into_inner().as_ref()).into_owned();
+                let text = t.into_inner().into_owned();
                 append_chart_text(
                     &mut current_series,
                     capture_series_field,

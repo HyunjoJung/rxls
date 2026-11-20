@@ -60,16 +60,16 @@ class RenderSupplyChainTests(unittest.TestCase):
 
     def test_mcp_legal_overrides_are_exactly_pinned(self) -> None:
         expected = {
-            "name": "UPSTREAM-LICENSE-rust-sdk-4a738b9d",
+            "name": "UPSTREAM-LICENSE-rust-sdk-79437f29",
             "url": (
                 "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/"
-                "4a738b9dd99eaca418b614afa433a0cbdaf8d056/LICENSE"
+                "79437f291b2c44053d00dcd5db969fd0cca7c887/LICENSE"
             ),
             "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
         }
-        self.assertEqual(self.supply.LEGAL_URL_OVERRIDES[("rmcp", "3.1.4")], expected)
+        self.assertEqual(self.supply.LEGAL_URL_OVERRIDES[("rmcp", "3.5.1")], expected)
         self.assertEqual(
-            self.supply.LEGAL_URL_OVERRIDES[("rmcp-macros", "3.1.4")], expected
+            self.supply.LEGAL_URL_OVERRIDES[("rmcp-macros", "3.5.1")], expected
         )
 
     def test_native_metadata_merge_unions_target_filtered_edges(self) -> None:
@@ -468,7 +468,7 @@ class RenderSupplyChainTests(unittest.TestCase):
         checked_bytes = checked.read_bytes()
         self.assertNotIn(b"\r", checked_bytes)
         self.assertEqual(checked_bytes, rendered.encode("utf-8"))
-        self.assertIn("PACKAGE: wasm-bindgen 0.2.126", rendered)
+        self.assertIn("PACKAGE: wasm-bindgen 0.2.129", rendered)
         self.assertGreater(summary["packages"], 0)
         self.assertGreater(summary["legal_texts"], 0)
 

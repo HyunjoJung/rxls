@@ -37,13 +37,13 @@ jobs:
       - name: Install pinned SemVer checker
         run: cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked
       - name: Validate native/WASM release identity
-        run: python3 scripts/check_release_identity.py
+        run: python3 scripts/check_release_identity.py --allow-unreleased
       - name: Enforce hosted workflow policy
         run: python3 scripts/check_workflow_policy.py
       - name: Install public reference readers and render-harness libraries
         run: |
           python3 -m pip install \
-            "CairoSVG==2.9.0" \
+            "CairoSVG==2.9.1" \
             "numpy==2.4.4" \
             "openpyxl==3.1.5" \
             "Pillow==12.3.0" \
@@ -54,7 +54,7 @@ jobs:
       - name: Dependency security, license, and source policy
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          rust-version: "1.85.0"
+          rust-version: "1.88.0"
           command: check
           arguments: --locked --all-features
       - name: Format
@@ -124,13 +124,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/check_release_identity.py
+          python3 scripts/check_release_identity.py --allow-unreleased
           version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
           cargo package --locked
           python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"
 
   msrv:
-    name: MSRV 1.85
+    name: MSRV 1.88
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -142,10 +142,10 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Validate native/WASM release identity
-        run: python3 scripts/check_release_identity.py
+        run: python3 scripts/check_release_identity.py --allow-unreleased
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
-          toolchain: 1.85.0
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build (.xls-only)
@@ -154,6 +154,8 @@ jobs:
         run: cargo build --locked
       - name: Build (all features)
         run: cargo build --all-features --locked
+      - name: Verify fresh MSRV consumers
+        run: python3 scripts/check_fresh_consumers.py --output target/fresh-consumers/report.json
       - name: Check standalone renderer
         run: cargo check --manifest-path render/Cargo.toml --all-targets --locked
       - name: Build WebAssembly binding
@@ -217,7 +219,7 @@ jobs:
           python3 -m unittest discover -s bindings/mcp/scripts -p 'test_*.py'
           python3 bindings/mcp/scripts/package_candidate.py --expected-sha "$EXPECTED_SHA"
       - name: Upload independently verified MCP package evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-package-candidate-${{ github.run_attempt }}
           path: bindings/mcp/target/package-candidate/*
@@ -251,7 +253,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
-          toolchain: 1.85.0
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -267,7 +269,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/check_release_identity.py
+          python3 scripts/check_release_identity.py --allow-unreleased
           version=$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])")
           cargo package --locked
           python3 scripts/check_core_package.py "target/package/rxls-${version}.crate"
@@ -293,7 +295,8 @@ jobs:
 
   wasm:
     name: wasm32 binding
-    runs-on: ubuntu-latest
+    # The pinned Playwright smoke runtime supports Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -304,14 +307,14 @@ jobs:
           EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Validate native/WASM release identity
-        run: python3 scripts/check_release_identity.py
+        run: python3 scripts/check_release_identity.py --allow-unreleased
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
       - name: Install locked wasm-bindgen CLI
@@ -345,7 +348,7 @@ jobs:
             --write-report target/wasm-package/wasm-size-report.json
           sha256sum "target/wasm-dist/$archive" > "target/wasm-dist/$archive.sha256"
       - name: Upload WASM release candidates
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rxls-wasm-${{ github.run_attempt }}
           path: |
@@ -405,7 +408,7 @@ jobs:
           python3 scripts/ods-odfpy-parity.py --corpus local/ods --bin target/debug/examples/extract --min 0.99 --show-skips 20 | tee target/ci-ods-parity.txt
       - name: Upload parity diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: public-parity-diagnostics-${{ github.run_attempt }}
           path: target/ci-*.txt

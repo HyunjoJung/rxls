@@ -77,6 +77,8 @@ mod xmltree;
 #[cfg(feature = "xlsx")]
 mod xstring;
 #[cfg(any(feature = "xlsx", feature = "ods"))]
+mod zipname;
+#[cfg(any(feature = "xlsx", feature = "ods"))]
 mod ziputil;
 
 pub use error::{Error, Result};

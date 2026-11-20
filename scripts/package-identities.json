@@ -1,7 +1,7 @@
 {
   "schema": "rxls.package-identities.v1",
   "rust_floors": {
-    "core": "1.85",
+    "core": "1.88",
     "mcp": "1.88"
   },
   "cargo": {

@@ -2,7 +2,7 @@
 """Check rxls's deterministic public-API snapshot using pinned stable rustdoc.
 
 The checker deliberately uses rustdoc HTML instead of unstable rustdoc JSON, so
-it runs on the project's Rust 1.85 MSRV. It records public item declarations,
+it runs on the project's Rust 1.88 MSRV. It records public item declarations,
 inherent callable items, and explicit trait implementations reachable from the
 crate's public module indexes. Compiler-generated auto/blanket implementations
 and documentation prose are excluded from the compatibility snapshot.
@@ -28,7 +28,7 @@ SCHEMA = "rxls.public-api.v1"
 # rolling snapshot freezes the reviewed additive surface on the main branch.
 DEFAULT_BASELINE = ROOT / "tests" / "oracles" / "public-api-main.json"
 DEFAULT_TARGET_DIR = ROOT / "target" / "public-api-doc"
-DEFAULT_TOOLCHAIN = "1.85.0"
+DEFAULT_TOOLCHAIN = "1.88.0"
 ITEM_KINDS = {
     "constant",
     "enum",

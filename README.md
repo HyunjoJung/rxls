@@ -12,7 +12,7 @@ XLSX/XLSM while preserving untouched package parts.
 [![Live viewer](https://img.shields.io/badge/live-viewer-176b3a.svg)](https://hyunjojung.github.io/rxls/)
 [![CI](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml/badge.svg)](https://github.com/HyunjoJung/rxls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)
+![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)
 
 `rxls` is built for applications that encounter spreadsheet files from
 different eras and tools. The core library requires no JVM or Apache POI,
@@ -20,7 +20,7 @@ performs no Office automation, and spawns no subprocesses. Its parsers use
 bounded inputs and typed failures for malformed or unsupported documents.
 
 ```sh
-cargo add rxls@0.1.3 --features full
+cargo add rxls@0.1.4 --features full
 ```
 
 Want to help? Start with a [good first issue](https://github.com/HyunjoJung/rxls/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22)
@@ -58,7 +58,7 @@ The source format changes the parser, not the application-facing model:
 
 | Need | API |
 |---|---|
-| Searchable text | `extract_text`, `Workbook::to_text` |
+| Searchable text | `extract_text`, `Workbook::text` |
 | Typed coordinates | `Sheet::cell`, `cells`, `dimensions` |
 | Rectangular data | `worksheet_range`, row views, relative and absolute used cells |
 | Workbook structure | sheet visibility, names, properties, tables, panes, print setup |
@@ -267,7 +267,7 @@ API documentation is published on [docs.rs](https://docs.rs/rxls). The
   workbook bytes never enter protocol messages or a network listener.
 
 ```sh
-cargo install rxls --version =0.1.3 --locked
+cargo install rxls --version =0.1.4 --locked
 rxls info book.xlsx
 rxls diagnose book.xlsx
 rxls csv book.xlsx --sheet 0 --max-output-bytes 1048576
@@ -283,10 +283,11 @@ bindings/mcp/target/release/rxls-mcp --root /path/to/spreadsheets
 See the [MCP server guide](bindings/mcp/README.md) for its nine tools, client
 configuration, filesystem boundary, and resource limits.
 
-This checkout prepares core `0.1.4`; `0.1.3` remains the current published
-release until the hosted publication and installed-consumer checks succeed.
-The installation examples and validation evidence above refer to `0.1.3`.
-Changes for `0.1.4` are recorded in the [changelog](CHANGELOG.md#014---2026-09-28).
+The current published core is [0.1.4](https://crates.io/crates/rxls/0.1.4); the
+commands above select that version. The video demos and historical corpus/release
+evidence retain their original `0.1.3` identities. Current source changes require
+their own revision-specific checks. See [compatibility boundaries](docs/compatibility.md#release-and-source-boundaries)
+and the [0.1.4 changelog](CHANGELOG.md#014---2026-09-28).
 The renderer,
 `@rxls/render-worker`, local MCP server, and VS Code preview are separately
 gated workspace surfaces and are not part of the published core crate contract.

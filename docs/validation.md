@@ -39,8 +39,10 @@ pinned manifest and a valid SHA-256.
 
 Every core release is accepted only when the crate, tagged source, GitHub
 Release bundle, SBOM, checksums, and provenance are bound by the release
-manifest to one revision. This checkout prepares `0.1.4`; its hosted candidates
-and publication must establish fresh evidence for the final release revision.
+manifest to one revision. The [published 0.1.4 release](https://github.com/HyunjoJung/rxls/releases/tag/v0.1.4)
+and [version-specific API documentation](https://docs.rs/rxls/0.1.4/rxls/) identify
+the current registry core. Subsequent source changes require fresh evidence
+for their exact candidate revision.
 
 The existing `0.1.3` evidence below remains bound to its published source.
 The immutable `v0.1.3` tag identifies source commit
@@ -138,10 +140,47 @@ and chart in Excel 16, and reopen it with `openpyxl 3.1.5`.
 This media release is intentionally separate from the immutable `v0.1.3` core
 release-evidence bundle.
 
+## Installed distribution snapshot
+
+The 2026-10-13 registry audit checked the published versions listed in
+[compatibility boundaries](compatibility.md#release-and-source-boundaries)
+against crates.io, npm, Marketplace, and Open VSX, then exercised the installed
+artifacts:
+
+- `cargo +1.85.0 install rxls --version =0.1.4 --locked` into an isolated prefix
+  succeeded. The installed CLI reported `rxls 0.1.4`, read a generated XLSX,
+  emitted CSV matching the recipe's expected bytes, and returned diagnose
+  schema version 2. The released crate declares Rust 1.85; this check does not
+  set the minimum Rust version for later source revisions.
+- npm-installed `rxls-wasm@0.1.4` passed CommonJS, ESM, and browser-condition
+  entry-point checks on Node 24.18.0 with the packaged WASM. Text, CSV, HTML,
+  Markdown, and diagnostic exports passed. The browser condition ran on a
+  Node host; it is not a browser execution receipt.
+- npm-installed `@rxls/render-worker@0.3.0` reported protocol
+  `rxls.render-worker.v2`. Its installed client and runtime, using the real
+  packaged WASM and an in-process transport, passed open, read, edit, save,
+  close, and reopen checks. Browser Worker, CSP, and rendering fidelity remain
+  separate gates.
+- The canonical `vscode-v0.1.0` VSIX matched its published SHA-256
+  `3d1307502220c65d2755d7c1ef214a8117127b475fdae0c6da514f6ab3eecfd8`.
+  VS Code 1.134.0 installed it into fresh directories and listed
+  `hyunjojung.rxls-spreadsheet-preview@0.1.0`; all 32 non-manifest payload files
+  matched the archive. This checks CLI installation and package identity;
+  GUI activation and rendering were not exercised by this audit.
+
+npm's published provenance records associate
+[`rxls-wasm@0.1.4`](https://registry.npmjs.org/-/npm/v1/attestations/rxls-wasm@0.1.4)
+with source `c708e80d9b79fcfa0d172ec4ca8786885cdfc202` and
+[`@rxls/render-worker@0.3.0`](https://registry.npmjs.org/-/npm/v1/attestations/@rxls%2frender-worker@0.3.0)
+with source `883a1fe0cdeff219509d879100740ba668256bad`. These identities refer to
+the released artifacts, not the current checkout. MCP remains an unpublished
+source build; its [save-copy walkthrough](../bindings/mcp/README.md#open-read-edit-and-save-a-copy)
+uses the actual stdio server and documents the allowed-root boundary.
+
 ## Rendering evidence
 
-Rendering is a separate source-only track and is not part of the published
-`rxls 0.1.3` reader, writer, editor, CLI, or core WASM contract. The renderer
+Rendering has its own published `@rxls/render-worker` package and is not part
+of the core `rxls` reader, writer, editor, CLI, or general WASM contract. The renderer
 uses locked LibreOffice and font inputs, deterministic SVG/PDF/PNG outputs,
 bounded campaigns, and a reviewed full-campaign parity baseline. Its workflow
 and package have independent supply-chain, browser, fidelity, performance, and

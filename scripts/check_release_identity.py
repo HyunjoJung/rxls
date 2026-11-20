@@ -8,6 +8,8 @@ Artifact provenance and packed-file checks remain separate release gates.
 
 from __future__ import annotations
 
+import argparse
+from datetime import date
 import json
 from pathlib import Path
 import posixpath
@@ -158,7 +160,49 @@ def _validate_package_graph(root: Path) -> list[str]:
     return errors
 
 
-def validate(root: Path = ROOT) -> list[str]:
+def _validate_changelog(changelog: str, version: str, allow_unreleased: bool) -> list[str]:
+    """Keep source development identities distinct from publishable releases."""
+    headings = re.findall(rf"^## \[{re.escape(version)}\] - (.+)$", changelog, re.MULTILINE)
+    if len(headings) != 1:
+        return [f"CHANGELOG must contain exactly one dated or Unreleased heading for {version}"]
+    status = headings[0]
+    base_url = "https://github.com/HyunjoJung/rxls"
+    lines = changelog.splitlines()
+    if status == "Unreleased":
+        if not allow_unreleased:
+            return [f"CHANGELOG {version} is unreleased; publication requires a dated release entry"]
+        comparisons = re.findall(
+            rf"^\[{re.escape(version)}\]: {re.escape(base_url)}/compare/"
+            r"v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\.\.\.HEAD$",
+            changelog, re.MULTILINE,
+        )
+        if len(comparisons) != 1:
+            return [f"CHANGELOG unreleased {version} must compare against its released baseline"]
+        baseline = comparisons[0]
+        match = SEMVER.fullmatch(version)
+        if match is None or tuple(map(int, baseline.split("."))) >= tuple(map(int, match.groups())):
+            return [f"CHANGELOG unreleased {version} must advance its released baseline"]
+        # The comparison baseline must itself have a dated entry and a release
+        # tag link. Its Unreleased comparison continues to track source changes.
+        return _validate_changelog(changelog, baseline, False)
+
+    errors = []
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", status) is None:
+            raise ValueError("not an ISO date")
+        date.fromisoformat(status)
+    except ValueError:
+        errors.append(f"CHANGELOG {version} release heading must contain an ISO date")
+    for label, expected in {
+        "release link": f"[{version}]: {base_url}/releases/tag/v{version}",
+        "Unreleased comparison": f"[Unreleased]: {base_url}/compare/v{version}...HEAD",
+    }.items():
+        if lines.count(expected) != 1:
+            errors.append(f"CHANGELOG {label}: expected exactly one {expected!r}")
+    return errors
+
+
+def validate(root: Path = ROOT, *, allow_unreleased: bool = False) -> list[str]:
     errors = _validate_package_graph(root)
     root_manifest = _load(root / "Cargo.toml")
     wasm_manifest = _load(root / "bindings" / "wasm" / "Cargo.toml")
@@ -187,23 +231,20 @@ def validate(root: Path = ROOT) -> list[str]:
     if not required_files.issubset(set(npm_manifest.get("files", []))):
         errors.append("WASM npm files must include runtime, demo, docs, and license")
 
-    changelog_checks = {
-        "release heading": f"## [{version}]",
-        "release link": f"[{version}]: https://github.com/HyunjoJung/rxls/releases/tag/v{version}",
-        "Unreleased comparison": (
-            f"[Unreleased]: https://github.com/HyunjoJung/rxls/compare/v{version}...HEAD"
-        ),
-    }
-    for label, expected in changelog_checks.items():
-        if expected not in changelog:
-            errors.append(f"CHANGELOG {label}: expected {expected!r}")
+    errors.extend(_validate_changelog(changelog, version, allow_unreleased))
 
     return errors
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-unreleased", action="store_true",
+        help="validate a development version without marking it publishable (source CI only)",
+    )
+    args = parser.parse_args()
     try:
-        errors = validate()
+        errors = validate(allow_unreleased=args.allow_unreleased)
         root_manifest = _load(ROOT / "Cargo.toml")
     except (OSError, KeyError, ValueError, TypeError) as error:
         print(f"release identity: {error}", file=sys.stderr)
