@@ -65,19 +65,19 @@ RENDER_ORACLE_MAX_PARALLEL_SHARDS = "2"
 RENDER_PACKAGE_NODE_VERSION = "24.18.0"
 RENDER_PACKAGE_NPM_VERSION = "11.16.0"
 RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST = "1.88.0"
-RENDER_PACKAGE_WASM_BINDGEN_VERSION = "0.2.126"
+RENDER_PACKAGE_WASM_BINDGEN_VERSION = "0.2.129"
 REVIEWED_ACTION_ALLOWLIST = {
     "actions/setup-node": (
-        "820762786026740c76f36085b0efc47a31fe5020",
-        "v7.0.0",
+        "949feb2413d6458794dcd2491c4babbbce0c15c1",
+        "v7.1.0",
     ),
     "github/codeql-action/init": (
-        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
-        "v4.38.1",
+        "24c54180a607b1449ed407dd24f251e4e9147c8d",
+        "v4.38.3",
     ),
     "github/codeql-action/analyze": (
-        "1c5b675653bb5c22dbe9b12b556ec555138e09fd",
-        "v4.38.1",
+        "24c54180a607b1449ed407dd24f251e4e9147c8d",
+        "v4.38.3",
     ),
     "actions/deploy-pages": (
         "368f82528645a54fb793d4d04e342629a3f51346",
@@ -132,14 +132,14 @@ ORACLE_TIMEOUT_EXPRESSION = (
     "&& 330 || 120 }}"
 )
 ORACLE_BUILDX_ACTION = (
-    "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c"
+    "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
 )
 ORACLE_CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 ORACLE_SETUP_PYTHON_ACTION = (
     "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
 )
 ORACLE_UPLOAD_ARTIFACT_ACTION = (
-    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 )
 ORACLE_BUILD_STORAGE_HELPER_SHA256 = (
     "cdea6bf846ecd4be1829ecd70afa789c198a70f23b2e54eb3791d6689798bf48"
@@ -156,13 +156,13 @@ ORACLE_RENDER_STEP_SHA256 = (
     "1266e4280f579884aef9895f70988b7a58ac80f791e5b1dae6d63bfa1b001ede",
     "f14b7dfb812098fb6d42a40b09a3eeae8fc9f8be29182170c2ae3db46477c6bb",
     "99f88a9fbc95afee85f30034fee7787fc9330d942ffdffaae37e481342cf1f81",
-    "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
+    "d15ad995dbb356fe982c9053f55d1c266a4ead68448d375dcffbab876d3834fa",
     "d7309145407cf422dfc95d5fce782e01278fd42a8a878c31f14405033fdd833f",
     "450afbeb424f03bb000719f015ac895f147f98bad6f4f00c76dc019f0297bf99",
     "3d924376e08eb1ecbe1718d01de461fb6d6e652d8760ead1d941bb66d785aba2",
-    "0308865d11b5e8e1a6d43e19a0b5f0b942799aef63ba811d05fb0eaaec5687bc",
-    "91555206ce7c99be03b1c37f9f8e174b1aec49fbf5e9f920cda7cfe5e14dbce4",
-    "dc1c0348112f956e76f4efb6c9181277c6f2a155064281ef8bf08f111da4d61b",
+    "d2493f20353947df340238b2261ee4a0651b5555a46e31a534b64e33a786a986",
+    "dd2704b751336e12caf395f7faeb6109b63b264051a296169a9bd0a693874129",
+    "429eda5bacd6487fae364911fa9147d2573ec36b55abf8e13b94eca23699fb15",
     "054c41f51299ec5331abca90af10c81e7538c3588255d358461e23dc26825b48",
     "8cccee4bac68dd280966abd02de29d9c09dea1dff1bc433b1d197768bc2c50c7",
     "012583aec1469514a63a3616e1f8a4dd35483a2c8284831392db789c8eeaefb0",
@@ -172,32 +172,32 @@ ORACLE_RENDER_STEP_SHA256 = (
     "fc38b091078736b27ab95d43d5ceb8a91477e68a7a6e0b8c0261817882c68dec",
     "940f6c80f0324bc5969d03134a1d1e5448c7c8c9f455cb5979a23a81cc9b2ce0",
     "8e5d8438decff5f4995ff3a6a7681a5f709b2be9c4752f38c68fcef59adc0c24",
-    "9acefc9320cb53ab9c51a58ec9b556dadfec1a4545615b2644392cee13e7582c",
+    "3486885cfd022ed55c567d93dcc002b70f3a002062bb430b2189021e6143c300",
     "0277dad1011ca57308140daf2434fa5dd9e2ef4a9936ed041193347904838eb4",
-    "bdd84b925ad854145d404645230fb7fc341be69b76481a8fc6453b829d284bb6",
+    "c5032904b9e263ae17059b4dee85a683c4ad0ec87bf01703f481c8ccdf6b68e7",
     "5f4113d9afc22d73ccc488156e0f3abcea689b74a2b261c7e8522b338029a4e6",
 )
 ORACLE_HARDENING_IMAGE_STEP_SHA256 = (
     "1474c388488c7cc317f8dc2b1948415ebbc06415499cde15213b8e7369b6b2d9",
     "974a8f3bf55df0faabfb0d3bbbf0bd87a9692941a3c7f2d619bd9916694bcda5",
     "99f88a9fbc95afee85f30034fee7787fc9330d942ffdffaae37e481342cf1f81",
-    "244969ec54f80c9359028bdb8fd31aabe28df43f31ce5f2ef84ec54e1a8aa129",
+    "d15ad995dbb356fe982c9053f55d1c266a4ead68448d375dcffbab876d3834fa",
     "1ab03670dc5df291c6ba673e8ab8590a0670cc67952adde980d3e11a87be41f5",
     "5a0bee8f4f21bda04cd5f69c10d0e9504293a691b4bd112b27ab7d5ebdfc432f",
     "8cccee4bac68dd280966abd02de29d9c09dea1dff1bc433b1d197768bc2c50c7",
-    "43d6bfd32a185411e10497a570623fec6e09413f8be78adcae671f8516b43b79",
+    "0eb9eed39fa3ee4cf36536dd1c16a0ac1f0cc33b7c9c3c894445a294a5578138",
 )
 ORACLE_RENDER_WORKFLOW_SHA256 = (
-    "802ea7d98349d84fb02478e9b97d284563e396e997c7a58fec999dc33f6c8816"
+    "9dbbadd175ad28608cfa19b138ac4eaec95ede8f223ecb980e83ee7ee8d45578"
 )
 ORACLE_HARDENING_WORKFLOW_SHA256 = (
-    "d7a82aae13ec0231abefd30a3d954c2fbd2034083f04872c60da6af153510c7f"
+    "c550d17a5313fe7eece6c46d668c25fcd7f6fa4a2ebbaabaa7d672db681ac953"
 )
 RENDER_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "c5a5820b6050784c4af5a2e12e796c3fcc13058dc4e8c7d88f76386f56d1407e"
+    "d942304a23f0de67fb5ddcd142cff5af7ed07f133b05b9357f43e95d624e31f8"
 )
 WASM_PACKAGE_RELEASE_WORKFLOW_SHA256 = (
-    "39a36f584d18859cb9ddcdbf0ee45cc2ef5712acb0448bfde575818b7ebfeac8"
+    "4ca1fbb3754edc2d5d41434a6a20ecfb2d0899170893836427194ca44b033c8d"
 )
 ORACLE_BUILDKIT_IMAGE = (
     "docker.io/moby/buildkit:v0.31.2@sha256:"
@@ -1227,7 +1227,7 @@ def _audit_oracle_buildx_setup(path: Path, text: str, errors: list[str]) -> None
         errors,
     )
     required = (
-        f"uses: {ORACLE_BUILDX_ACTION} # v4.2.0",
+        f"uses: {ORACLE_BUILDX_ACTION} # v4.4.1",
         "name: rxls-oracle-client",
         f"version: {ORACLE_BUILDX_VERSION}",
         "driver: docker-container",
@@ -2177,7 +2177,7 @@ def audit_ci_package_versions(path: Path, text: str) -> list[str]:
         step = _single_yaml_block(path, active, header, 6, header, errors)
         required = (
             "shell: bash", "set -euo pipefail",
-            "python3 scripts/check_release_identity.py", version_read,
+            "python3 scripts/check_release_identity.py --allow-unreleased", version_read,
             "cargo package --locked", package_check,
         )
         positions = [step.find(command) for command in required]
@@ -2190,6 +2190,19 @@ def audit_ci_package_versions(path: Path, text: str) -> list[str]:
             or 'echo "version=$version" >> "$GITHUB_OUTPUT"' not in step
         ):
             errors.append(f"{path}: installed product must export its validated package version")
+    msrv = _single_yaml_block(path, active, "msrv:", 2, "MSRV job", errors)
+    fresh = _single_yaml_block(
+        path, msrv, "- name: Verify fresh MSRV consumers", 6, "fresh MSRV consumer step", errors,
+    )
+    fresh_command = "python3 scripts/check_fresh_consumers.py --output target/fresh-consumers/report.json"
+    if _yaml_mapping_entries_at_indent(fresh, 8) != [("run", fresh_command)]:
+        errors.append(f"{path}: fresh MSRV consumers must run unconditionally with retained evidence")
+    positions = [msrv.find(command) for command in (
+        "cargo build --no-default-features --locked", "cargo build --locked",
+        "cargo build --all-features --locked", fresh_command,
+    )]
+    if not all(left >= 0 and left < right for left, right in zip(positions, positions[1:])):
+        errors.append(f"{path}: fresh MSRV consumers must follow all three locked core builds")
     install = _single_yaml_block(
         path, active, "- name: Install CLI from the exact packaged crate contents",
         6, "installed package consumer", errors,
@@ -2212,6 +2225,14 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
 
     active = _without_commented_lines(text)
     errors: list[str] = []
+    source_identity = _single_yaml_block(
+        path, active, "- name: Validate native/WASM release identity", 6,
+        "publishable source identity", errors,
+    )
+    if _yaml_mapping_entries_at_indent(source_identity, 8) != [
+        ("run", "python3 scripts/check_release_identity.py")
+    ]:
+        errors.append(f"{path}: publication must retain strict dated source identity validation")
     jobs = _single_yaml_block(path, active, "jobs:", 0, "core release jobs", errors)
     if _yaml_mapping_entries_at_indent(jobs, 2) != [("verify", ""), ("rehearse", ""), ("publish", "")]:
         errors.append(f"{path}: core release must separate verify and publish jobs")
@@ -2395,7 +2416,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
             errors.append(f"{path}: {message}")
 
     for name, value in (
-        ("WASM_MSRV", "1.85.0"),
+        ("WASM_MSRV", "1.88.0"),
         ("WASM_BINDGEN_BUILD_RUST", RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST),
         ("WASM_BINDGEN_VERSION", RENDER_PACKAGE_WASM_BINDGEN_VERSION),
         ("NODE_VERSION", RENDER_PACKAGE_NODE_VERSION),
@@ -2410,7 +2431,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
 
     setup_node_header = (
         "- uses: actions/setup-node@"
-        "820762786026740c76f36085b0efc47a31fe5020 # v7.0.0"
+        "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0"
     )
     setup_node_step = _single_yaml_block(
         path,
@@ -2551,7 +2572,7 @@ def audit_core_release_evidence(path: Path, text: str) -> list[str]:
     if python_dependencies_step.count("python3 -m pip install") != 1:
         errors.append(f"{path}: release must install Python dependencies exactly once")
     for requirement in (
-        "CairoSVG==2.9.0",
+        "CairoSVG==2.9.1",
         "numpy==2.4.4",
         "openpyxl==3.1.5",
         "Pillow==12.3.0",
@@ -3359,62 +3380,62 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "          command -v pdfinfo\n"
         "          command -v pdftoppm\n"
         "          command -v pdftotext\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::project_font_pack_type0_pdf_exposes_exact_poppler_word_tokens \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "embed::tests::pinned_arimo_and_noto_faces_match_libreoffice_descriptor_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_arimo_and_noto_descriptors_match_libreoffice_pdf_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "pdf::tests::pinned_type0_poppler_boxes_follow_libreoffice_descriptor_metrics \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'deterministic_pdf_reopens_has_exact_page_count_and_extractable_text: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "deterministic_pdf_reopens_has_exact_page_count_and_extractable_text \\\n"
@@ -3447,26 +3468,26 @@ def audit_render_oracle_workflow(path: Path, text: str) -> list[str]:
         "          set -euo pipefail\n"
         '          [[ "$RXLS_TEST_FONT_PACK_MANIFEST" = "$GITHUB_WORKSPACE/"* ]]\n'
         '          test -f "$RXLS_TEST_FONT_PACK_MANIFEST"\n'
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --lib "
         "layout::tests::pinned_calc_ctl_base_face_produces_the_verified_mixed_rtl_row_height \\\n"
         "            -- --exact\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
         "            -- --exact --list \\\n"
         "            | grep -Fqx "
         "'cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync: test'\n"
-        "          cargo +1.85.0 test --locked --release --manifest-path "
+        "          cargo +1.88.0 test --locked --release --manifest-path "
         "render/Cargo.toml \\\n"
         "            --test printing "
         "cli_single_page_terminal_drawing_keeps_every_geometry_contract_in_sync \\\n"
@@ -6460,7 +6481,7 @@ def audit_wasm_package_release_workflow(path: Path, text: str) -> list[str]:
         "CARGO_DENY_SHA256": (
             "3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f"
         ),
-        "WASM_MSRV": "1.85.0",
+        "WASM_MSRV": "1.88.0",
         "WASM_BINDGEN_BUILD_RUST": RENDER_PACKAGE_WASM_BINDGEN_BUILD_RUST,
         "WASM_BINDGEN_VERSION": RENDER_PACKAGE_WASM_BINDGEN_VERSION,
         "NODE_VERSION": RENDER_PACKAGE_NODE_VERSION,

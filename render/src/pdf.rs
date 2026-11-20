@@ -2220,7 +2220,7 @@ fn build_pdf_page(
     let height_points = fixed_to_pdf_points(scene.height)?;
     let mut content = BoundedContent::new(max_bytes);
     content.push("q\n")?;
-    content.push(&format!("0.75 0 0 -0.75 0 {} cm\n", height_points))?;
+    content.push(&format!("0.75 0 0 -0.75 0 {height_points} cm\n"))?;
     let page_bounds = Rect {
         x: Fixed::ZERO,
         y: Fixed::ZERO,

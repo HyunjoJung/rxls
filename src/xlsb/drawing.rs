@@ -13,7 +13,8 @@ use super::{
     normalize_part_target, part_index, sheet_rels_path, MAX_XLSB_DRAWINGS, MAX_XLSB_DRAWING_TEXT,
 };
 
-fn xml_local(name: &[u8]) -> &[u8] {
+fn xml_local<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     name.iter()
         .rposition(|byte| *byte == b':')
         .map_or(name, |index| &name[index + 1..])
@@ -24,9 +25,8 @@ fn xml_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String>
         (xml_local(attribute.key.as_ref()) == key)
             .then(|| {
                 attribute
-                    .decoded_and_normalized_value_with(
+                    .normalized_value_with(
                         XmlVersion::Implicit1_0,
-                        e.decoder(),
                         1,
                         quick_xml::escape::resolve_xml_entity,
                     )
@@ -72,7 +72,7 @@ pub(super) fn drawing_relationship_target(xml: &str) -> crate::xlsx::Relationshi
 }
 
 fn drawing_text(e: &quick_xml::events::BytesText<'_>) -> String {
-    e.decode().map(|text| text.into_owned()).unwrap_or_default()
+    e.as_ref().to_owned()
 }
 
 fn truncate_drawing_text(value: &mut String) {
@@ -93,10 +93,8 @@ fn append_drawing_ref(out: &mut String, reference: &BytesRef<'_>) {
     match reference.resolve_char_ref() {
         Ok(Some(ch)) => out.push(ch),
         Ok(None) => {
-            if let Ok(name) = reference.decode() {
-                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
-                    out.push_str(value);
-                }
+            if let Some(value) = quick_xml::escape::resolve_xml_entity(reference.as_ref()) {
+                out.push_str(value);
             }
         }
         Err(_) => {}

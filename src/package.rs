@@ -38,8 +38,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
-use quick_xml::events::Event;
-use quick_xml::{Reader, XmlVersion};
+// Only [Content_Types].xml uses these byte events. Relationship readers below
+// delegate to the strict UTF-8 reader; retained metadata must keep raw payloads.
+use quick_xml_raw::events::Event;
+use quick_xml_raw::{Reader, XmlVersion};
 use zip::write::SimpleFileOptions;
 
 use crate::write::xml::esc_attr;
@@ -300,7 +302,8 @@ impl Package {
                     continue;
                 }
             };
-            let name = file.name().to_string();
+            let name =
+                crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()).into_owned();
             if name.len() > MAX_NAME_LEN {
                 return Err(Error::Zip("OOXML package entry name is too long"));
             }
@@ -343,9 +346,9 @@ impl Package {
             }
 
             if !seen.insert(name.clone()) {
-                // Exact duplicate name: keep the *last* entry's data (matching
-                // the `zip` crate's own last-entry-wins `by_name` lookup
-                // semantics) but don't add a second `order`/`parts` slot.
+                // Exact decoded-name duplicate: keep the *last* entry's data,
+                // matching the pre-migration decoded-name lookup semantics,
+                // but don't add a second `order`/`parts` slot.
                 parts.insert(name, Part::Raw(data));
                 continue;
             }
@@ -1366,18 +1369,19 @@ fn source_part_of_rels_path(rels_path: &str) -> Option<String> {
 }
 
 /// Local (namespace-prefix-stripped) name of a qualified XML name.
-fn local_name(name: &[u8]) -> &[u8] {
+fn local_name<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     name.rsplit(|&b| b == b':').next().unwrap_or(name)
 }
 
-fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn attr_value(e: &quick_xml_raw::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local_name(a.key.as_ref()) == key {
             a.decoded_and_normalized_value_with(
                 XmlVersion::Implicit1_0,
                 e.decoder(),
                 1,
-                quick_xml::escape::resolve_xml_entity,
+                quick_xml_raw::escape::resolve_xml_entity,
             )
             .ok()
             .map(|v| v.into_owned())
@@ -1557,7 +1561,60 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn content_types_raw_comment_does_not_downgrade_or_rewrite_retained_metadata() {
+        let baseline = Package::from_bytes(&minimal_xlsx()).unwrap();
+        let original = baseline.part_bytes(CONTENT_TYPES).unwrap();
+        let mut content_types = original.to_vec();
+        content_types.extend_from_slice(b"<!--uninterpreted \xff\xfe-->");
+        let parts = baseline
+            .part_names()
+            .map(|name| {
+                (
+                    name,
+                    if name == CONTENT_TYPES {
+                        content_types.as_slice()
+                    } else {
+                        baseline.part_bytes(name).unwrap()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = zip_bytes(&parts);
+        let package = Package::from_bytes(&input).unwrap();
+        assert!(!package.is_meta_lossy());
+        let saved = package.to_bytes().unwrap();
+        let reopened = Package::from_bytes(&saved).unwrap();
+        assert!(!reopened.is_meta_lossy());
+        assert_eq!(
+            reopened.part_bytes(CONTENT_TYPES),
+            Some(content_types.as_slice())
+        );
+    }
+
     // --- Preserved public surface (spreadsheet.rs / report.rs call sites) ---
+
+    #[test]
+    fn editing_preserves_distinct_cp437_passthrough_parts() {
+        let input = crate::zipname::tests::cp437_collision_archive();
+        let mut package = Package::from_bytes(&input).unwrap();
+        assert!(package.is_complete());
+        assert!(!package.is_meta_lossy());
+        assert_eq!(package.part_bytes("xl/├⌐.xml"), Some(&b"first"[..]));
+        assert_eq!(package.part_bytes("xl/é.xml"), Some(&b"second"[..]));
+
+        let edited = b"<workbook><sheets/></workbook>";
+        package
+            .replace_part("xl/workbook.xml", edited.to_vec())
+            .unwrap();
+        let saved = package.to_bytes().unwrap();
+        let reopened = Package::from_bytes(&saved).unwrap();
+        assert!(reopened.is_complete());
+        assert!(!reopened.is_meta_lossy());
+        assert_eq!(reopened.part_bytes("xl/workbook.xml"), Some(&edited[..]));
+        assert_eq!(reopened.part_bytes("xl/├⌐.xml"), Some(&b"first"[..]));
+        assert_eq!(reopened.part_bytes("xl/é.xml"), Some(&b"second"[..]));
+    }
 
     #[test]
     fn raw_package_roundtrip_preserves_part_payloads() {
@@ -2513,7 +2570,7 @@ mod tests {
         let names: Vec<String> = {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
             (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
                 .collect()
         };
         let a_pos = names.iter().position(|n| n == "xl/a.xml").unwrap();

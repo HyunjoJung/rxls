@@ -54,7 +54,7 @@ pub(super) fn parse_comments(xml: &str) -> Vec<Comment> {
                 append_general_ref(&mut cur_text, &reference);
             }
             Ok(Event::CData(t)) if in_t => {
-                cur_text.push_str(&String::from_utf8_lossy(t.into_inner().as_ref()));
+                cur_text.push_str(t.as_ref());
             }
             Ok(Event::End(e)) => match local(e.name().as_ref()) {
                 b"authors" => in_authors = false,

@@ -45,7 +45,7 @@
       "svg_rasterizer": {
         "distribution": "CairoSVG",
         "kind": "cairosvg",
-        "version": "2.9.0"
+        "version": "2.9.1"
       }
     }
   ],

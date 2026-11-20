@@ -463,8 +463,21 @@ fn part_raw(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Op
 }
 
 fn part_index(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> Option<usize> {
-    if let Some(idx) = zip.index_for_name(name) {
-        return Some(idx);
+    if name.is_ascii() {
+        if let Some(idx) = zip.index_for_name(name) {
+            return Some(idx);
+        }
+    } else {
+        // ZIP 9 indexes raw bytes. Non-ASCII names must be compared after
+        // decoding, with the previous last-entry-wins exact-match behavior.
+        for idx in (0..zip.len()).rev() {
+            let Ok(file) = zip.by_index_data(idx) else {
+                continue;
+            };
+            if crate::zipname::entry_name(file.name_raw(), file.flags().as_u16()) == name {
+                return Some(idx);
+            }
+        }
     }
     let wanted = canonical_part_name(name);
     if let Some(idx) = unique_part_index(zip, |candidate| canonical_part_name(candidate) == wanted)
@@ -488,7 +501,8 @@ fn unique_part_index(
         let Ok(file) = zip.by_index(idx) else {
             continue;
         };
-        if matches(file.name()) {
+        let name = crate::zipname::entry_name(file.name_raw(), file.flags().as_u16());
+        if matches(&name) {
             if found.is_some() {
                 return None;
             }
@@ -554,7 +568,8 @@ fn sheet_rels_path(path: &str) -> String {
 
 const MAX_XLSX_COLUMN_INDEX: u16 = 16_383;
 const MAX_XLSX_ROW_INDEX: u32 = 1_048_575;
-fn local(name: &[u8]) -> &[u8] {
+fn local<N: AsRef<[u8]> + ?Sized>(name: &N) -> &[u8] {
+    let name = name.as_ref();
     match name.iter().rposition(|&b| b == b':') {
         Some(i) => &name[i + 1..],
         None => name,
@@ -604,13 +619,11 @@ enum MarkupNamespacePolicy {
 
 fn markup_is_supported(xml: &str, policy: MarkupNamespacePolicy) -> bool {
     fn decoded_attribute_value(
-        element: &quick_xml::events::BytesStart<'_>,
         attribute: &quick_xml::events::attributes::Attribute<'_>,
     ) -> Option<String> {
         attribute
-            .decoded_and_normalized_value_with(
+            .normalized_value_with(
                 XmlVersion::Implicit1_0,
-                element.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -630,7 +643,7 @@ fn markup_is_supported(xml: &str, policy: MarkupNamespacePolicy) -> bool {
             .collect::<std::result::Result<Vec<_>, _>>()
             .ok()?;
         for attribute in &attributes {
-            let name = attribute.key.as_ref();
+            let name = attribute.key.as_ref().as_bytes();
             let prefix = if name == b"xmlns" {
                 Some(Vec::new())
             } else {
@@ -642,13 +655,13 @@ fn markup_is_supported(xml: &str, policy: MarkupNamespacePolicy) -> bool {
             if !declared.insert(prefix.clone()) {
                 return None;
             }
-            let value = decoded_attribute_value(element, attribute)?;
+            let value = decoded_attribute_value(attribute)?;
             let previous = namespaces.insert(prefix.clone(), value);
             changes.push((prefix, previous));
         }
 
         let element_name = element.name();
-        let element_name = element_name.as_ref();
+        let element_name = element_name.as_ref().as_bytes();
         let element_prefix = qualified_prefix(element_name).unwrap_or_default();
         let element_namespace = namespaces.get(element_prefix).map(String::as_str);
         match policy {
@@ -670,7 +683,7 @@ fn markup_is_supported(xml: &str, policy: MarkupNamespacePolicy) -> bool {
         }
 
         for attribute in &attributes {
-            let name = attribute.key.as_ref();
+            let name = attribute.key.as_ref().as_bytes();
             if name == b"xmlns" || name.starts_with(b"xmlns:") {
                 continue;
             }
@@ -745,9 +758,8 @@ fn theme_markup_is_supported(xml: &str) -> bool {
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local(a.key.as_ref()) == key {
-            a.decoded_and_normalized_value_with(
+            a.normalized_value_with(
                 XmlVersion::Implicit1_0,
-                e.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -774,9 +786,8 @@ fn unique_attr(
         }
         value = Some(
             attribute
-                .decoded_and_normalized_value_with(
+                .normalized_value_with(
                     XmlVersion::Implicit1_0,
-                    e.decoder(),
                     1,
                     quick_xml::escape::resolve_xml_entity,
                 )
@@ -797,7 +808,7 @@ fn unique_parsed_attr<T: std::str::FromStr>(
 }
 
 fn text_of(e: &quick_xml::events::BytesText<'_>) -> String {
-    e.decode().map(|c| c.into_owned()).unwrap_or_default()
+    e.as_ref().to_owned()
 }
 
 fn with_general_ref_text(reference: &BytesRef<'_>, mut append: impl FnMut(&str)) {
@@ -807,11 +818,9 @@ fn with_general_ref_text(reference: &BytesRef<'_>, mut append: impl FnMut(&str))
             append(ch.encode_utf8(&mut encoded));
         }
         Ok(None) => {
-            if let Ok(name) = reference.decode() {
-                if let Some(value) = quick_xml::escape::resolve_xml_entity(&name) {
-                    append(value);
-                    return;
-                }
+            if let Some(value) = quick_xml::escape::resolve_xml_entity(reference.as_ref()) {
+                append(value);
+                return;
             }
             append_raw_general_ref(reference, append);
         }
@@ -820,11 +829,9 @@ fn with_general_ref_text(reference: &BytesRef<'_>, mut append: impl FnMut(&str))
 }
 
 fn append_raw_general_ref(reference: &BytesRef<'_>, mut append: impl FnMut(&str)) {
-    if let Ok(raw) = std::str::from_utf8(reference.as_ref()) {
-        append("&");
-        append(raw);
-        append(";");
-    }
+    append("&");
+    append(reference.as_ref());
+    append(";");
 }
 
 fn append_general_ref(out: &mut String, reference: &BytesRef<'_>) {
@@ -1002,13 +1009,13 @@ fn parse_shared_strings(xml: &str, theme: &ThemeColors, indexed: &[Color]) -> Ve
             Ok(Event::Text(t)) if in_si && in_t && !in_rph => {
                 // XML 1.0 normalizes raw CR/CRLF before ST_Xstring decoding.
                 // Numeric character references are appended separately below.
-                text_element.push_str(&t.xml10_content().unwrap_or_default());
+                text_element.push_str(&t.xml10_content());
             }
             Ok(Event::GeneralRef(reference)) if in_si && in_t && !in_rph => {
                 append_general_ref(&mut text_element, &reference);
             }
             Ok(Event::CData(t)) if in_si && in_t && !in_rph => {
-                text_element.push_str(&t.xml10_content().unwrap_or_default());
+                text_element.push_str(&t.xml10_content());
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}

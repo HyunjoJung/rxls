@@ -495,7 +495,7 @@ class ReleaseToolTests(unittest.TestCase):
     def test_release_identity_matches_native_wasm_and_locks(self) -> None:
         module = _load("check_release_identity", IDENTITY)
 
-        self.assertEqual(module.validate(ROOT), [])
+        self.assertEqual(module.validate(ROOT, allow_unreleased=True), [])
 
     def test_wasm_release_profile_keeps_original_budget_and_native_isolation(self) -> None:
         root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
@@ -542,7 +542,7 @@ class ReleaseToolTests(unittest.TestCase):
             text = re.sub(r'rust-version = "[^"]+"', 'rust-version = "1.84"', text, count=1)
             wasm.write_text(text, encoding="utf-8")
 
-            errors = module.validate(root)
+            errors = module.validate(root, allow_unreleased=True)
 
         self.assertEqual(len(errors), 5)
         self.assertTrue(any("Cargo.lock rxls" in error for error in errors))

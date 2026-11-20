@@ -119,7 +119,7 @@ fn relationship_root_context(
     let mut namespaces = HashMap::<Vec<u8>, String>::new();
     for attribute in element.attributes() {
         let attribute = attribute.ok()?;
-        let qualified_name = attribute.key.as_ref();
+        let qualified_name = attribute.key.as_ref().as_bytes();
         let prefix = if qualified_name == b"xmlns" {
             Vec::new()
         } else if let Some(prefix) = qualified_name.strip_prefix(b"xmlns:") {
@@ -130,9 +130,8 @@ fn relationship_root_context(
             return None;
         };
         let value = attribute
-            .decoded_and_normalized_value_with(
+            .normalized_value_with(
                 XmlVersion::Implicit1_0,
-                element.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
@@ -142,7 +141,7 @@ fn relationship_root_context(
             return None;
         }
     }
-    let root_name = element.name().as_ref().to_vec();
+    let root_name = element.name().as_ref().as_bytes().to_vec();
     let prefix = qualified_prefix(&root_name).unwrap_or_default();
     let namespace = namespaces.get(prefix).cloned();
     if (!prefix.is_empty() && namespace.is_none())
@@ -202,7 +201,7 @@ fn parse_ooxml_relationships_with_policy(
         match reader.read_event() {
             Ok(Event::End(element)) if open_relationship.is_some() => {
                 let (qualified_name, relationship) = open_relationship.take()?;
-                if element.name().as_ref() != qualified_name.as_slice() {
+                if element.name().as_ref().as_bytes() != qualified_name.as_slice() {
                     return None;
                 }
                 if relationships.len() >= MAX_RELATIONSHIPS || !ids.insert(relationship.id.clone())
@@ -213,7 +212,7 @@ fn parse_ooxml_relationships_with_policy(
             }
             Ok(Event::Text(text))
                 if open_relationship.is_some()
-                    && text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+                    && text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(Event::PI(_) | Event::Comment(_)) if open_relationship.is_some() => {}
             Ok(_) if open_relationship.is_some() => return None,
             Ok(Event::Start(element)) if root.is_none() && !root_closed => {
@@ -252,17 +251,19 @@ fn parse_ooxml_relationships_with_policy(
                     allow_extension_attributes,
                     MAX_RELATIONSHIP_FIELD_BYTES,
                 )?;
-                open_relationship = Some((element.name().as_ref().to_vec(), relationship));
+                open_relationship =
+                    Some((element.name().as_ref().as_bytes().to_vec(), relationship));
             }
             Ok(Event::End(element)) if root_open => {
                 let root = root.as_ref()?;
-                if element.name().as_ref() != root.qualified_name.as_slice() {
+                if element.name().as_ref().as_bytes() != root.qualified_name.as_slice() {
                     return None;
                 }
                 root_open = false;
                 root_closed = true;
             }
-            Ok(Event::Text(text)) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Text(text))
+                if text.as_ref().as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(Event::Decl(_) | Event::PI(_) | Event::Comment(_)) => {}
             Ok(Event::Eof) => break,
             Err(_) | Ok(_) => return None,
@@ -285,7 +286,7 @@ fn parse_ooxml_relationship_element(
         return None;
     }
     let element_name = element.name();
-    let prefix = qualified_prefix(element_name.as_ref()).unwrap_or_default();
+    let prefix = qualified_prefix(element_name.as_ref().as_bytes()).unwrap_or_default();
     let namespace = root.namespaces.get(prefix).map(String::as_str);
     if (!prefix.is_empty() && namespace.is_none()) || namespace != root.namespace.as_deref() {
         return None;
@@ -297,7 +298,7 @@ fn parse_ooxml_relationship_element(
     let mut target_mode = None;
     for attribute in element.attributes() {
         let attribute = attribute.ok()?;
-        let slot = match attribute.key.as_ref() {
+        let slot = match attribute.key.as_ref().as_bytes() {
             b"Id" => Some(&mut id),
             b"Type" => Some(&mut rel_type),
             b"Target" => Some(&mut target),
@@ -312,9 +313,8 @@ fn parse_ooxml_relationship_element(
             return None;
         }
         let value = attribute
-            .decoded_and_normalized_value_with(
+            .normalized_value_with(
                 XmlVersion::Implicit1_0,
-                element.decoder(),
                 1,
                 quick_xml::escape::resolve_xml_entity,
             )
