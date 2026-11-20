@@ -12,8 +12,12 @@ import {
 import { createStoredZip, readZipEntries } from "../scripts/zip.mjs";
 import { exerciseRangePaste, exerciseLargeRangePaste } from "./range-paste.mjs";
 import { exerciseEditingGuards } from "./editing-guards.mjs";
+import { recordJourney } from "./journey-evidence.mjs";
+import { exerciseKeyboardRedo } from "./keyboard-redo.mjs";
 
 const execFileAsync = promisify(execFile);
+const selectedJourney = process.env.RXLS_VIEWER_JOURNEY || "production";
+assert.ok(["production", "keyboard-redo"].includes(selectedJourney), "unknown viewer journey");
 const port = Number(process.env.RXLS_VIEWER_PORT || 4173);
 const basePath = await builtBasePath();
 const server = await preview({
@@ -29,7 +33,12 @@ if (process.env.RXLS_CHROMIUM_EXECUTABLE) {
 }
 
 const browser = await chromium.launch(launchOptions);
-try {
+async function runBrowserJourney() {
+  await recordJourney("browser-runtime", {
+    browserVersion: browser.version(), nodeVersion: process.version,
+    basePath, headless: launchOptions.headless,
+    executable: launchOptions.executablePath ?? launchOptions.channel,
+  });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 900 },
   });
@@ -66,6 +75,16 @@ try {
     throw new Error(`viewer did not render: ${JSON.stringify(diagnostics)}`, {
       cause: error,
     });
+  }
+
+  await exerciseKeyboardRedo(page, { waitForCondition, waitForViewerState });
+  if (selectedJourney === "keyboard-redo") {
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(consoleErrors, []);
+    assert.deepEqual(failedResponses, []);
+    await recordJourney("keyboard-redo-browser", { status: "passed", selectedJourney });
+    console.log("viewer keyboard redo journey passed");
+    return;
   }
 
   // The workbench uses real controls and external CSS under the strict CSP.
@@ -648,8 +667,76 @@ try {
     });
   }
 
-  await page.setViewportSize({ width: 390, height: 844 });
+  // Escape is a mobile drawer shortcut; the desktop panel stays usable.
+  await page.locator("#sidebar-toggle").focus();
+  await page.keyboard.press("Enter");
+  // Keyboard dispatch can finish before the sidebar visibility transition.
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  await page.locator("#panel-open").focus();
+  assert.equal(
+    await page.locator("#panel-open").evaluate((element) => document.activeElement === element),
+    true,
+  );
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await page.locator("#sidebar-toggle").getAttribute("aria-expanded"),
+    "true",
+  );
+  assert.equal(await page.locator("#sidebar").isVisible(), true);
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    false,
+  );
   await page.locator("#sidebar-toggle").click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const panelToggle = page.locator("#sidebar-toggle");
+  assert.equal(await panelToggle.getAttribute("aria-controls"), "sidebar");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  await panelToggle.focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    false,
+  );
+  await page.locator("#panel-open").focus();
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await panelToggle.getAttribute("aria-expanded"),
+    "false",
+    "Escape closes the mobile workbook panel",
+  );
+  assert.equal(
+    await panelToggle.evaluate((element) => document.activeElement === element),
+    true,
+    "Escape restores focus to the mobile panel toggle",
+  );
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    true,
+  );
+
+  await page.keyboard.press("Space");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator("body.sidebar-open #sidebar").waitFor({ state: "visible" });
+  // The panel can remain open behind a modal; the modal owns the first Escape.
+  await page.keyboard.press("Control+e");
+  await page.locator("#cell-dialog").waitFor({ state: "visible" });
+  await page.keyboard.press("Escape");
+  await page.locator("#cell-dialog").waitFor({ state: "hidden" });
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "true");
+  await page.locator(".brand").focus();
+  await page.keyboard.press("Escape");
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  assert.equal(
+    await panelToggle.evaluate((element) => document.activeElement === element),
+    true,
+    "Escape restores toggle focus even when focus was outside the panel",
+  );
+
+  await panelToggle.click();
   await page
     .locator("body.sidebar-open #sidebar")
     .waitFor({ state: "visible" });
@@ -682,6 +769,11 @@ try {
         .locator("body")
         .evaluate((body) => body.classList.contains("sidebar-open"))),
     "mobile sidebar close",
+  );
+  assert.equal(await panelToggle.getAttribute("aria-expanded"), "false");
+  assert.equal(
+    await page.locator("#sidebar").evaluate((element) => element.inert),
+    true,
   );
   await page.locator("#edit-cell").click();
   await page.locator("#cell-dialog").waitFor({ state: "visible" });
@@ -728,6 +820,12 @@ try {
     );
   }
   console.log("viewer browser smoke passed");
+}
+try {
+  await runBrowserJourney();
+} catch (error) {
+  await recordJourney(selectedJourney === "keyboard-redo" ? "keyboard-redo-browser" : "production-browser", { status: "failed", error: String(error) });
+  throw error;
 } finally {
   await browser.close();
   await new Promise((resolve) => server.httpServer.close(resolve));

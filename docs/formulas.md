@@ -56,6 +56,46 @@ AND OR NOT ISNA ISERROR ISNUMBER ISTEXT ISBLANK
 Invalid argument counts produce Excel-compatible value errors where the
 supported function contract defines them.
 
+The source checkout preserves punctuation inside double-quoted formula text:
+`LEN("a@b.com")` returns 7 and `LEN("[x]")` returns 3. Embedded double quotes
+use doubled quotes. OpenFormula semicolon separators and bracket references
+normalize only outside quoted text; quoted sheet names keep their punctuation
+and doubled apostrophes. Actual external references and array syntax retain
+their typed fallbacks. Stored source and caches are unchanged by evaluation.
+
+The next-release source accepts the exact case-insensitive `_xlfn.IFNA(...)`
+storage spelling as an IFNA call. This alias applies only to function calls;
+text, defined names and sheet names retain their original meaning. Other
+qualified future functions remain outside the supported subset.
+
+The source checkout includes aggregate coercion fixes for the next core
+release. `SUM`, `AVERAGE`, `MIN`, `MAX` and `PRODUCT` ignore referenced text,
+booleans and blanks, including single-cell ranges and defined references.
+Direct numeric text and booleans contribute; invalid direct text returns
+`#VALUE!`. `COUNT` ignores errors, and `COUNTA` distinguishes a missing cell
+from empty text. `IF` retains a selected reference's origin; `IFERROR`, `IFNA`
+and unary `+` produce values, converting a selected missing cell to zero.
+`AND`/`OR` ignore referenced text and accept direct `TRUE`/`FALSE` strings,
+omitting other text. They return `#VALUE!` when no logical/numeric input remains.
+A formula returning a missing reference produces zero; directly evaluating a
+missing target retains the empty-text result described below.
+These scalar conditional and unary paths accept actual one-cell ranges;
+selected multi-cell or whole-axis arrays return `ArraySemantics`, even when
+only one value is stored. Direct bounded range aggregates remain supported.
+
+The next-release source also rounds `ROUND`, `ROUNDUP`, `ROUNDDOWN` and `TRUNC`
+using a bounded 15-significant-digit decimal coefficient before applying the
+requested decimal step. Nearest ties round away from zero; `ROUNDUP` moves away
+and `ROUNDDOWN`/`TRUNC` move toward zero. This removes binary scaling noise while
+retaining genuine 15-digit offsets. Fractional precision truncates toward zero;
+`TRUNC` defaults to zero digits. Precisions whose binary `10^digits` is infinite
+or zero (including `+/-400`) return `#NUM!`, retaining the existing engine bound.
+Decimal normalization or final-result overflow also returns `#NUM!` (including
+rounding `f64::MAX` at zero digits); no nonfinite result is emitted.
+This policy applies to rounding functions; general arithmetic and literal
+parsing still use binary64, and full Excel arithmetic compensation is outside
+the subset.
+
 ## Typed fallback reasons
 
 `FormulaUnsupportedReason::code()` provides a stable machine-readable code:

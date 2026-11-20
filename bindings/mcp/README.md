@@ -69,6 +69,94 @@ With no `--root`, the current directory is the only allowed root.
 | `workbook_save_copy` | Publish a new same-format XLSX/XLSM copy without overwrite |
 | `workbook_close` | Close a session and release retained bytes |
 
+## Open, read, edit, and save a copy
+
+From the repository root, generate a project-owned XLSX in a fresh temporary
+directory and build the server. The core example uses Rust 1.85; the MCP
+adapter requires Rust 1.88.
+
+```sh
+walkthrough_root=$(mktemp -d)
+cargo +1.85.0 run --locked --example api_journeys -- "$walkthrough_root/source.xlsx"
+cargo +1.88.0 build --manifest-path bindings/mcp/Cargo.toml --locked
+printf 'Allowed root: %s\n' "$walkthrough_root"
+bindings/mcp/target/debug/rxls-mcp --root "$walkthrough_root"
+```
+
+The last command starts the stdio server; configure your existing MCP client
+to launch that binary with the same `--root` argument. Do not paste the objects
+below directly into its stdin: they are **tool arguments**, not complete
+JSON-RPC transport messages. Replace `/absolute/allowed/root` with the directory
+printed above. Replace every `<SESSION_ID>` with the opaque `session_id`
+returned by `workbook_open`.
+
+1. Call `workbook_open`:
+
+   ```json
+   { "path": "/absolute/allowed/root/source.xlsx" }
+   ```
+
+   Check that the result reports format `xlsx`, worksheet `Data`, and
+   `edit_capability: "read_write_preserving"` before editing.
+
+2. Call `workbook_read_range`:
+
+   ```json
+   { "session_id": "<SESSION_ID>", "sheet": "Data", "range": "A1:B2" }
+   ```
+
+   The generated sample has `amount` in A1 and the number `84` in A2. B2 is
+   `A2*2` with a retained cached value of `42`: the generating example edits A2
+   without recalculating. Reading a cache does not establish a current result.
+
+3. Call `workbook_set_cells` with an atomic pair of edits:
+
+   ```json
+   {
+     "session_id": "<SESSION_ID>",
+     "sheet": "Data",
+     "edits": [
+       { "kind": "set", "cell": "A2", "value": { "type": "number", "value": 126 } },
+       { "kind": "formula", "cell": "B2", "formula": "=A2*2", "cached": { "type": "number", "value": 252 } }
+     ]
+   }
+   ```
+
+   Check `applied_edits: 2`. The formula cache here is explicitly supplied by
+   the caller; this call does not claim that the server recalculated it.
+
+4. Read the edited cells **before saving**, using `workbook_read_range`:
+
+   ```json
+   { "session_id": "<SESSION_ID>", "sheet": "Data", "range": "A2:B2" }
+   ```
+
+   In `rows[0]`, A2 has `value: { "type": "number", "value": 126 }`.
+   B2 has `value.type: "formula"`, `formula: "A2*2"`, and the numeric cached
+   value `252`.
+
+5. Call `workbook_save_copy`:
+
+   ```json
+   { "session_id": "<SESSION_ID>", "path": "/absolute/allowed/root/edited.xlsx" }
+   ```
+
+   The destination must not exist, must stay below an allowed root, and must
+   retain the source format (`.xlsx` here; `.xlsm` for an XLSM source). An
+   existing destination is rejected; choose a new filename on a later run.
+   The source remains unchanged. For an independent read-back, open
+   `edited.xlsx` in a new session and read `Data!A2:B2` with that new ID.
+
+6. Call `workbook_close` for each session you opened:
+
+   ```json
+   { "session_id": "<SESSION_ID>" }
+   ```
+
+Check each tool result for an error before using its structured output or
+continuing to the next step. Closing an unsaved session discards its edits;
+save-copy is the explicit persistence operation.
+
 ## Security boundaries
 
 - Existing paths and allowed roots are canonicalized before comparison.

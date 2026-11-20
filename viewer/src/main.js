@@ -1129,6 +1129,17 @@ function onDrop(event) {
 function onKeyDown(event) {
   if (event.defaultPrevented || event.isComposing || event.keyCode === 229)
     return;
+  if (
+    event.key === "Escape" &&
+    window.matchMedia("(max-width: 760px)").matches &&
+    document.body.classList.contains("sidebar-open") &&
+    !document.querySelector("dialog[open]")
+  ) {
+    event.preventDefault();
+    closeSidebar();
+    elements["sidebar-toggle"].focus();
+    return;
+  }
   if (event.key === "Escape" && grid.hasDraft()) {
     event.preventDefault();
     if (grid.cancel()) elements["grid-input"].focus();
@@ -1165,7 +1176,11 @@ function onKeyDown(event) {
     void openCellEditor();
     return;
   }
-  if (!editingText && key === "z" && state.editState?.canUndo) {
+  if (
+    !editingText &&
+    key === "z" &&
+    (event.shiftKey ? state.editState?.canRedo : state.editState?.canUndo)
+  ) {
     event.preventDefault();
     void applyHistoryEdit(event.shiftKey ? "redo" : "undo");
     return;

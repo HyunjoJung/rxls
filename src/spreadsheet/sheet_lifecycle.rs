@@ -8,9 +8,9 @@ use crate::xmltree::{NodeId, XmlTree};
 use crate::{Color, Error, Result, SheetVisible};
 
 use super::{
-    canonical_part_key, canonical_part_name, direct_elements_by_local_name, invalidate_calc_chain,
-    local, newly_touched, peek_part_tree, remember_edited_part, workbook_path,
-    workbook_sheet_index, worksheet_path, Spreadsheet,
+    canonical_part_key, canonical_part_name, invalidate_calc_chain, local, newly_touched,
+    peek_part_tree, remember_edited_part, workbook_path, workbook_sheet_index, worksheet_path,
+    Spreadsheet,
 };
 
 impl Spreadsheet {
@@ -49,6 +49,15 @@ impl Spreadsheet {
             return Ok(());
         }
 
+        let app_repair = plan_package_app_sheet_titles(
+            package,
+            &workbook_path,
+            AppSheetTitleChange::Rename {
+                old: old_name,
+                new: new_name,
+            },
+        )?;
+
         let formula_parts = formula_bearing_parts(package, &workbook_path);
         for path in formula_parts {
             let rewrites = peek_part_tree(
@@ -69,6 +78,10 @@ impl Spreadsheet {
         }
 
         let before = package.touched_parts();
+        if let Some(repair) = app_repair {
+            let tree = package.part_tree_mut("docProps/app.xml")?;
+            apply_app_sheet_title_repair(tree, repair)?;
+        }
         let tree = package.part_tree_mut(&workbook_path)?;
         let sheet = sml_find_sheet_by_name(tree, old_name).ok_or(Error::MissingWorkbook)?;
         tree.set_attr(sheet, b"name", new_name.as_bytes())?;
@@ -104,6 +117,8 @@ impl Spreadsheet {
                 }
                 Ok((next_sheet_id(tree)?, workbook_sheet_count(tree) == 0))
             })?;
+        let app_repair =
+            plan_package_app_sheet_titles(package, &workbook_path, AppSheetTitleChange::Add(name))?;
         let worksheet_path = next_worksheet_part_name(package)?;
         let relationship_target = Package::rel_target(&workbook_path, &worksheet_path);
         let before = package.touched_parts();
@@ -115,6 +130,10 @@ impl Spreadsheet {
         sml_append_sheet(tree, name, sheet_id, &rid)?;
         if was_empty {
             sml_set_active_tab(tree, 0)?;
+        }
+        if let Some(repair) = app_repair {
+            let tree = package.part_tree_mut("docProps/app.xml")?;
+            apply_app_sheet_title_repair(tree, repair)?;
         }
         for touched in newly_touched(&before, package) {
             remember_edited_part(&mut self.edited_parts, touched);
@@ -147,21 +166,11 @@ impl Spreadsheet {
             delete_sheet_plan(tree, name)
         })?;
         let workbook_relationships = package.relationships_of(&workbook_path);
-        let mut worksheet_count = 0usize;
-        for sheet_rid in &plan.sheet_rids {
-            let matches: Vec<_> = workbook_relationships
-                .iter()
-                .filter(|relationship| relationship.id == *sheet_rid)
-                .collect();
-            if matches.len() != 1 || matches[0].external {
-                return Err(Error::Zip(
-                    "workbook sheet relationships are missing or ambiguous",
-                ));
-            }
-            if crate::xlsx::relationship_type_matches(&matches[0].rel_type, "worksheet") {
-                worksheet_count += 1;
-            }
-        }
+        let worksheet_names =
+            peek_part_tree(package, &workbook_path, Error::MissingWorkbook, |tree| {
+                workbook_worksheet_names(tree, workbook_relationships)
+            })?;
+        let worksheet_count = worksheet_names.len();
         if worksheet_count <= 1 {
             return Err(Error::Zip("cannot delete the last worksheet"));
         }
@@ -210,7 +219,13 @@ impl Spreadsheet {
                 package,
                 "docProps/app.xml",
                 Error::Zip("docProps/app.xml is missing"),
-                |tree| plan_app_sheet_title_repair(tree, name, worksheet_count),
+                |tree| {
+                    plan_app_sheet_title_repair(
+                        tree,
+                        &worksheet_names,
+                        AppSheetTitleChange::Delete(name),
+                    )
+                },
             )?
         } else {
             None
@@ -343,42 +358,313 @@ impl Spreadsheet {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
+enum AppSheetTitleChange<'a> {
+    Add(&'a str),
+    Rename { old: &'a str, new: &'a str },
+    Delete(&'a str),
+}
+
+#[derive(Debug)]
+enum AppSheetTitleAction {
+    Add { index: usize, xml: Vec<u8> },
+    Rename { node: NodeId, name: String },
+    Delete(NodeId),
+}
+
+#[derive(Debug)]
 struct AppSheetTitleRepair {
     worksheet_count_node: NodeId,
     titles_vector: NodeId,
-    title_node: NodeId,
-    new_worksheet_count: usize,
-    new_titles_size: usize,
+    action: AppSheetTitleAction,
+    new_sizes: Option<(usize, usize)>,
+}
+
+type AppNamespaceBindings<'a> = BTreeMap<&'a [u8], &'a [u8]>;
+
+fn app_namespace_bindings(tree: &XmlTree, node: NodeId) -> AppNamespaceBindings<'_> {
+    let mut bindings = BTreeMap::new();
+    if let Some(attributes) = tree.attributes(node) {
+        for (name, value) in attributes {
+            let prefix = if name == b"xmlns" {
+                b"".as_slice()
+            } else if let Some(prefix) = name.strip_prefix(b"xmlns:") {
+                prefix
+            } else {
+                continue;
+            };
+            bindings.entry(prefix).or_insert(value.as_slice());
+        }
+    }
+    bindings
+}
+
+fn app_namespace<'a>(
+    tree: &'a XmlTree,
+    node: NodeId,
+    ancestors: &[&AppNamespaceBindings<'a>],
+) -> Option<&'a [u8]> {
+    let name = tree.element_name(node)?;
+    let prefix = app_qname_prefix(name)?;
+    tree.attributes(node)
+        .and_then(|attributes| {
+            attributes.iter().find_map(|(key, value)| {
+                let matches = if prefix.is_empty() {
+                    key == b"xmlns"
+                } else {
+                    key.strip_prefix(b"xmlns:") == Some(prefix)
+                };
+                matches.then_some(value.as_slice())
+            })
+        })
+        .or_else(|| {
+            ancestors
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(prefix).copied())
+        })
+}
+
+fn app_qname_prefix(name: &[u8]) -> Option<&[u8]> {
+    let mut parts = name.split(|&byte| byte == b':');
+    let first = parts.next()?;
+    match parts.next() {
+        Some(local) if !first.is_empty() && !local.is_empty() && parts.next().is_none() => {
+            Some(first)
+        }
+        None if !first.is_empty() => Some(b"".as_slice()),
+        _ => None,
+    }
+}
+
+fn app_children(
+    tree: &XmlTree,
+    parent: NodeId,
+    ancestors: &[&AppNamespaceBindings<'_>],
+    namespace: &[u8],
+    name: &[u8],
+) -> Vec<NodeId> {
+    tree.children_of(parent)
+        .iter()
+        .copied()
+        .filter(|&node| {
+            tree.element_name(node)
+                .is_some_and(|qualified| local(qualified) == name)
+                && app_namespace(tree, node, ancestors) == Some(namespace)
+        })
+        .collect()
 }
 
 fn only_element_child(tree: &XmlTree, parent: NodeId) -> Option<NodeId> {
-    let children: Vec<_> = tree
+    let mut elements = tree
         .children_of(parent)
         .iter()
         .copied()
-        .filter(|&node| tree.element_name(node).is_some())
-        .collect();
-    (children.len() == 1).then_some(children[0])
+        .filter(|&node| tree.element_name(node).is_some());
+    let child = elements.next()?;
+    elements.next().is_none().then_some(child)
 }
 
 fn parse_vector_size(tree: &XmlTree, vector: NodeId) -> Result<usize> {
     tree.attr_value(vector, b"size")
         .and_then(|value| std::str::from_utf8(value).ok())
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|value| value as usize)
         .ok_or(Error::Zip("docProps/app.xml vector size is malformed"))
+}
+
+fn app_scalar_is(
+    tree: &XmlTree,
+    node: NodeId,
+    ancestors: &[&AppNamespaceBindings<'_>],
+    namespace: &[u8],
+    name: &[u8],
+) -> bool {
+    tree.element_name(node)
+        .is_some_and(|qualified| local(qualified) == name)
+        && app_namespace(tree, node, ancestors) == Some(namespace)
+        && !tree
+            .children_of(node)
+            .iter()
+            .any(|&child| tree.element_name(child).is_some())
+}
+
+fn app_title_name(ancestors: &[&AppNamespaceBindings<'_>], namespace: &[u8]) -> Result<String> {
+    let mut shadowed = BTreeSet::new();
+    for scope in ancestors.iter().rev() {
+        for (&prefix, &uri) in *scope {
+            if shadowed.insert(prefix) && uri == namespace {
+                let prefix = std::str::from_utf8(prefix)
+                    .map_err(|_| Error::Zip("docProps/app.xml namespace prefix is malformed"))?;
+                return Ok(if prefix.is_empty() {
+                    "lpstr".to_string()
+                } else {
+                    format!("{prefix}:lpstr")
+                });
+            }
+        }
+    }
+    Err(Error::Zip("docProps/app.xml title namespace is missing"))
+}
+
+/// Count names through exact worksheet relationships, excluding chart/dialog tabs.
+fn workbook_worksheet_names(
+    tree: &XmlTree,
+    relationships: &[crate::package::Rel],
+) -> Result<Vec<String>> {
+    let root = tree.root_element().ok_or(Error::MissingWorkbook)?;
+    let sheets = tree
+        .child_by_name(root, b"sheets")
+        .ok_or(Error::MissingWorkbook)?;
+    let root_bindings = app_namespace_bindings(tree, root);
+    let sheets_bindings = app_namespace_bindings(tree, sheets);
+    let mut by_id = BTreeMap::new();
+    for relationship in relationships {
+        by_id
+            .entry(relationship.id.as_str())
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(relationship));
+    }
+    let mut names = Vec::new();
+    for &sheet in tree.children_of(sheets) {
+        if tree.element_name(sheet) != Some(b"sheet") {
+            continue;
+        }
+        let sheet_bindings = app_namespace_bindings(tree, sheet);
+        let rid = workbook_sheet_rid(
+            tree,
+            sheet,
+            &[&root_bindings, &sheets_bindings, &sheet_bindings],
+        )?;
+        let relationship = by_id
+            .get(rid)
+            .copied()
+            .flatten()
+            .filter(|relationship| !relationship.external)
+            .ok_or(Error::Zip(
+                "workbook sheet relationships are missing or ambiguous",
+            ))?;
+        if crate::xlsx::relationship_type_matches(&relationship.rel_type, "worksheet") {
+            let name = tree
+                .attr_value(sheet, b"name")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .ok_or(Error::MissingWorkbook)?;
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn workbook_sheet_rid<'a>(
+    tree: &'a XmlTree,
+    sheet: NodeId,
+    scopes: &[&AppNamespaceBindings<'a>],
+) -> Result<&'a str> {
+    let mut ids = tree
+        .attributes(sheet)
+        .ok_or(Error::MissingWorkbook)?
+        .iter()
+        .filter_map(|(name, value)| {
+            let prefix = app_qname_prefix(name)?;
+            if prefix.is_empty() || local(name) != b"id" {
+                return None;
+            }
+            let namespace = scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(prefix).copied())?;
+            if namespace != NS_R.as_bytes()
+                && namespace != b"http://purl.oclc.org/ooxml/officeDocument/relationships"
+            {
+                return None;
+            }
+            Some(value.as_slice())
+        });
+    let value = ids.next().ok_or(Error::MissingWorkbook)?;
+    if ids.next().is_some() {
+        return Err(Error::Zip("workbook sheet relationship id is ambiguous"));
+    }
+    std::str::from_utf8(value).map_err(|_| Error::MissingWorkbook)
+}
+
+fn app_property_namespaces(
+    tree: &XmlTree,
+    root: NodeId,
+) -> Result<Option<(&'static [u8], &'static [u8])>> {
+    const EP: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+    const EP_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/officeDocument/extendedProperties";
+    const VT: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes";
+    const VT_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/officeDocument/docPropsVTypes";
+    let namespaces = match app_namespace(tree, root, &[]) {
+        Some(EP) => (EP, VT),
+        Some(EP_STRICT) => (EP_STRICT, VT_STRICT),
+        _ => return Ok(None),
+    };
+    if tree
+        .element_name(root)
+        .is_none_or(|name| local(name) != b"Properties")
+    {
+        return Err(Error::Zip("docProps/app.xml is malformed"));
+    }
+    Ok(Some(namespaces))
+}
+
+fn plan_package_app_sheet_titles(
+    package: &Package,
+    workbook: &str,
+    change: AppSheetTitleChange<'_>,
+) -> Result<Option<AppSheetTitleRepair>> {
+    if !package.has_part("docProps/app.xml") {
+        return Ok(None);
+    }
+    peek_part_tree(
+        package,
+        "docProps/app.xml",
+        Error::Zip("docProps/app.xml is missing"),
+        |tree| {
+            let root = tree
+                .root_element()
+                .ok_or(Error::Zip("docProps/app.xml is malformed"))?;
+            let Some((ep, _)) = app_property_namespaces(tree, root)? else {
+                return Ok(None);
+            };
+            let bindings = app_namespace_bindings(tree, root);
+            if app_children(tree, root, &[&bindings], ep, b"HeadingPairs").is_empty()
+                && app_children(tree, root, &[&bindings], ep, b"TitlesOfParts").is_empty()
+            {
+                return Ok(None);
+            }
+            let names =
+                peek_part_tree(package, workbook, Error::MissingWorkbook, |workbook_tree| {
+                    workbook_worksheet_names(workbook_tree, package.relationships_of(workbook))
+                })?;
+            if matches!(change, AppSheetTitleChange::Rename { old, .. } if !names.iter().any(|name| name == old))
+            {
+                return Ok(None);
+            }
+            plan_app_sheet_title_repair(tree, &names, change)
+        },
+    )
 }
 
 fn plan_app_sheet_title_repair(
     tree: &XmlTree,
-    deleted_name: &str,
-    worksheet_count: usize,
+    worksheet_names: &[String],
+    change: AppSheetTitleChange<'_>,
 ) -> Result<Option<AppSheetTitleRepair>> {
+    // ECMA-376 22.2.2.12 / 22.2.2.27: paired group counts and ordered titles.
+    // Strict spellings verified against the primary Microsoft Open XML SDK:
+    // src/DocumentFormat.OpenXml.Framework/Features/OpenXmlNamespaceResolver.cs.
     let root = tree
         .root_element()
         .ok_or(Error::Zip("docProps/app.xml is malformed"))?;
-    let heading_pairs = direct_elements_by_local_name(tree, root, b"HeadingPairs");
-    let titles = direct_elements_by_local_name(tree, root, b"TitlesOfParts");
+    let root_bindings = app_namespace_bindings(tree, root);
+    let root_scopes = [&root_bindings];
+    let Some((ep, vt)) = app_property_namespaces(tree, root)? else {
+        return Ok(None);
+    };
+    let heading_pairs = app_children(tree, root, &root_scopes, ep, b"HeadingPairs");
+    let titles = app_children(tree, root, &root_scopes, ep, b"TitlesOfParts");
     if heading_pairs.is_empty() && titles.is_empty() {
         return Ok(None);
     }
@@ -387,8 +673,12 @@ fn plan_app_sheet_title_repair(
             "docProps/app.xml sheet-title metadata is missing or ambiguous",
         ));
     }
-    let heading_vectors = direct_elements_by_local_name(tree, heading_pairs[0], b"vector");
-    let title_vectors = direct_elements_by_local_name(tree, titles[0], b"vector");
+    let heading_bindings = app_namespace_bindings(tree, heading_pairs[0]);
+    let title_bindings = app_namespace_bindings(tree, titles[0]);
+    let heading_scopes = [&root_bindings, &heading_bindings];
+    let title_scopes = [&root_bindings, &title_bindings];
+    let heading_vectors = app_children(tree, heading_pairs[0], &heading_scopes, vt, b"vector");
+    let title_vectors = app_children(tree, titles[0], &title_scopes, vt, b"vector");
     if heading_vectors.len() != 1 || title_vectors.len() != 1 {
         return Err(Error::Zip(
             "docProps/app.xml title vectors are missing or ambiguous",
@@ -396,81 +686,186 @@ fn plan_app_sheet_title_repair(
     }
     let heading_vector = heading_vectors[0];
     let titles_vector = title_vectors[0];
-    let variants = direct_elements_by_local_name(tree, heading_vector, b"variant");
+    if tree.attr_value(heading_vector, b"baseType") != Some(b"variant")
+        || tree.attr_value(titles_vector, b"baseType") != Some(b"lpstr")
+    {
+        return Err(Error::Zip("docProps/app.xml vector types are malformed"));
+    }
+    let heading_vector_bindings = app_namespace_bindings(tree, heading_vector);
+    let titles_vector_bindings = app_namespace_bindings(tree, titles_vector);
+    let heading_scopes = [&root_bindings, &heading_bindings, &heading_vector_bindings];
+    let title_scopes = [&root_bindings, &title_bindings, &titles_vector_bindings];
+    let variants = app_children(tree, heading_vector, &heading_scopes, vt, b"variant");
+    for &node in tree.children_of(heading_vector) {
+        if app_namespace(tree, node, &heading_scopes) == Some(vt)
+            && tree
+                .element_name(node)
+                .is_none_or(|name| local(name) != b"variant")
+        {
+            return Err(Error::Zip("docProps/app.xml heading types are malformed"));
+        }
+    }
     if variants.len() % 2 != 0 || parse_vector_size(tree, heading_vector)? != variants.len() {
         return Err(Error::Zip("docProps/app.xml heading pairs are malformed"));
     }
-
-    let mut worksheet_counts = Vec::new();
+    let mut worksheet_group = None;
     let mut titles_accounted_for = 0usize;
     for pair in variants.chunks_exact(2) {
+        let label_bindings = app_namespace_bindings(tree, pair[0]);
+        let count_bindings = app_namespace_bindings(tree, pair[1]);
+        let label_scopes = [
+            &root_bindings,
+            &heading_bindings,
+            &heading_vector_bindings,
+            &label_bindings,
+        ];
+        let count_scopes = [
+            &root_bindings,
+            &heading_bindings,
+            &heading_vector_bindings,
+            &count_bindings,
+        ];
         let label = only_element_child(tree, pair[0])
             .ok_or(Error::Zip("docProps/app.xml heading label is malformed"))?;
         let count = only_element_child(tree, pair[1])
             .ok_or(Error::Zip("docProps/app.xml heading count is malformed"))?;
+        if !app_scalar_is(tree, label, &label_scopes, vt, b"lpstr")
+            || !app_scalar_is(tree, count, &count_scopes, vt, b"i4")
+        {
+            return Err(Error::Zip(
+                "docProps/app.xml heading value types are malformed",
+            ));
+        }
         let value = tree
             .text_of(count)
-            .parse::<usize>()
-            .map_err(|_| Error::Zip("docProps/app.xml heading count is malformed"))?;
-        if tree.text_of(label).eq_ignore_ascii_case("Worksheets") {
-            worksheet_counts.push((count, value, titles_accounted_for));
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(Error::Zip("docProps/app.xml heading count is malformed"))?;
+        if tree.text_of(label).eq_ignore_ascii_case("Worksheets")
+            && worksheet_group
+                .replace((count, value, titles_accounted_for))
+                .is_some()
+        {
+            return Err(Error::Zip("docProps/app.xml worksheet group is ambiguous"));
         }
         titles_accounted_for = titles_accounted_for
             .checked_add(value)
             .ok_or(Error::Zip("docProps/app.xml heading counts overflow"))?;
     }
-    if worksheet_counts.len() != 1 || worksheet_counts[0].1 != worksheet_count {
-        return Err(Error::Zip(
+    let (count_node, worksheet_count, title_start) = worksheet_group
+        .filter(|(_, count, _)| *count == worksheet_names.len())
+        .ok_or(Error::Zip(
             "docProps/app.xml worksheet count does not match the workbook",
-        ));
+        ))?;
+    let title_nodes = app_children(tree, titles_vector, &title_scopes, vt, b"lpstr");
+    for &node in tree.children_of(titles_vector) {
+        if app_namespace(tree, node, &title_scopes) == Some(vt)
+            && !app_scalar_is(tree, node, &title_scopes, vt, b"lpstr")
+        {
+            return Err(Error::Zip("docProps/app.xml title types are malformed"));
+        }
     }
-
-    let title_nodes: Vec<_> = tree
-        .children_of(titles_vector)
-        .iter()
-        .copied()
-        .filter(|&node| tree.element_name(node).is_some())
-        .collect();
     if parse_vector_size(tree, titles_vector)? != title_nodes.len()
         || titles_accounted_for != title_nodes.len()
     {
         return Err(Error::Zip("docProps/app.xml sheet titles are malformed"));
     }
-    let title_start = worksheet_counts[0].2;
     let title_end = title_start
         .checked_add(worksheet_count)
         .filter(|&end| end <= title_nodes.len())
         .ok_or(Error::Zip("docProps/app.xml sheet titles are malformed"))?;
-    let matches: Vec<_> = title_nodes[title_start..title_end]
+    let worksheet_titles = &title_nodes[title_start..title_end];
+    let actual_names: BTreeSet<_> = worksheet_titles
         .iter()
-        .copied()
-        .filter(|&node| tree.text_of(node) == deleted_name)
+        .map(|&node| tree.text_of(node))
         .collect();
-    if matches.len() != 1 {
+    let expected_names: BTreeSet<_> = worksheet_names.iter().cloned().collect();
+    if actual_names.len() != worksheet_count
+        || expected_names.len() != worksheet_count
+        || actual_names != expected_names
+    {
         return Err(Error::Zip(
-            "docProps/app.xml deleted sheet title is missing or ambiguous",
+            "docProps/app.xml worksheet titles do not match the workbook",
         ));
     }
+    let find_title = |name: &str| {
+        worksheet_titles
+            .iter()
+            .copied()
+            .find(|&node| tree.text_of(node) == name)
+            .ok_or(Error::Zip("docProps/app.xml sheet title is missing"))
+    };
+    let (action, new_sizes) = match change {
+        AppSheetTitleChange::Add(name) => {
+            let count = worksheet_count
+                .checked_add(1)
+                .filter(|&count| count <= i32::MAX as usize)
+                .ok_or(Error::Zip("docProps/app.xml worksheet count overflows"))?;
+            let size = title_nodes
+                .len()
+                .checked_add(1)
+                .ok_or(Error::Zip("docProps/app.xml title count overflows"))?;
+            let children = tree.children_of(titles_vector);
+            let index = if let Some(&next) = title_nodes.get(title_end) {
+                children.iter().position(|&node| node == next)
+            } else if let Some(&last) = title_nodes.last() {
+                children
+                    .iter()
+                    .position(|&node| node == last)
+                    .map(|index| index + 1)
+            } else {
+                Some(0)
+            }
+            .ok_or(Error::Zip("docProps/app.xml title layout is malformed"))?;
+            let qualified = app_title_name(&title_scopes, vt)?;
+            let xml = format!(
+                "<{qualified}>{}</{qualified}>",
+                crate::write::xml::esc_text(name)
+            )
+            .into_bytes();
+            (AppSheetTitleAction::Add { index, xml }, Some((count, size)))
+        }
+        AppSheetTitleChange::Rename { old, new } => (
+            AppSheetTitleAction::Rename {
+                node: find_title(old)?,
+                name: new.to_string(),
+            },
+            None,
+        ),
+        AppSheetTitleChange::Delete(name) => (
+            AppSheetTitleAction::Delete(find_title(name)?),
+            Some((
+                worksheet_count
+                    .checked_sub(1)
+                    .ok_or(Error::MissingWorkbook)?,
+                title_nodes.len() - 1,
+            )),
+        ),
+    };
     Ok(Some(AppSheetTitleRepair {
-        worksheet_count_node: worksheet_counts[0].0,
+        worksheet_count_node: count_node,
         titles_vector,
-        title_node: matches[0],
-        new_worksheet_count: worksheet_count - 1,
-        new_titles_size: title_nodes.len() - 1,
+        action,
+        new_sizes,
     }))
 }
 
 fn apply_app_sheet_title_repair(tree: &mut XmlTree, repair: AppSheetTitleRepair) -> Result<()> {
-    tree.set_element_text(
-        repair.worksheet_count_node,
-        &repair.new_worksheet_count.to_string(),
-    )?;
-    tree.remove_child(repair.titles_vector, repair.title_node)?;
-    tree.set_attr(
-        repair.titles_vector,
-        b"size",
-        repair.new_titles_size.to_string().as_bytes(),
-    )?;
+    match repair.action {
+        AppSheetTitleAction::Add { index, xml } => {
+            tree.insert_fragment_at(repair.titles_vector, index, &xml)?;
+        }
+        AppSheetTitleAction::Rename { node, name } => {
+            tree.set_scalar_text_preserving_markup(node, &name)?
+        }
+        AppSheetTitleAction::Delete(node) => tree.remove_child(repair.titles_vector, node)?,
+    }
+    if let Some((count, size)) = repair.new_sizes {
+        tree.set_scalar_text_preserving_markup(repair.worksheet_count_node, &count.to_string())?;
+        tree.set_attr(repair.titles_vector, b"size", size.to_string().as_bytes())?;
+    }
     Ok(())
 }
 
@@ -1202,11 +1597,21 @@ fn sml_append_sheet(tree: &mut XmlTree, name: &str, sheet_id: u32, rid: &str) ->
     let sheets = tree
         .child_by_name(workbook, b"sheets")
         .ok_or(Error::MissingWorkbook)?;
-    if tree.attr_value(workbook, b"xmlns:r").is_none() {
-        tree.set_attr(workbook, b"xmlns:r", NS_R.as_bytes())?;
-    }
+    let root_bindings = app_namespace_bindings(tree, workbook);
+    let sheets_bindings = app_namespace_bindings(tree, sheets);
+    let inherited_r = sheets_bindings
+        .get(b"r".as_slice())
+        .or_else(|| root_bindings.get(b"r".as_slice()))
+        .copied();
+    // Bind the new attribute locally when an ancestor uses a different alias
+    // or shadows r; changing that ancestor could reinterpret retained content.
+    let relationship_binding = if inherited_r == Some(NS_R.as_bytes()) {
+        String::new()
+    } else {
+        format!(r#" xmlns:r="{NS_R}""#)
+    };
     let fragment = format!(
-        r#"<sheet name="{}" sheetId="{sheet_id}" r:id="{}"/>"#,
+        r#"<sheet{relationship_binding} name="{}" sheetId="{sheet_id}" r:id="{}"/>"#,
         esc_attr(name),
         esc_attr(rid)
     );
@@ -1232,7 +1637,6 @@ struct SheetDeletePlan {
     sheet_index: usize,
     new_active_tab: usize,
     rid: String,
-    sheet_rids: Vec<String>,
 }
 
 fn delete_sheet_plan(tree: &XmlTree, name: &str) -> Result<SheetDeletePlan> {
@@ -1261,14 +1665,21 @@ fn delete_sheet_plan(tree: &XmlTree, name: &str) -> Result<SheetDeletePlan> {
         return Err(Error::MissingWorkbook);
     }
     let sheet_index = matching_indices[0];
+    let root_bindings = app_namespace_bindings(tree, workbook);
+    let sheets_bindings = app_namespace_bindings(tree, sheets);
     let sheet_rids: Vec<String> = sheet_nodes
         .iter()
         .map(|&sheet| {
-            tree.attr_value(sheet, b"r:id")
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .ok_or(Error::Zip("workbook sheet relationship id is malformed"))
+            let sheet_bindings = app_namespace_bindings(tree, sheet);
+            let rid = workbook_sheet_rid(
+                tree,
+                sheet,
+                &[&root_bindings, &sheets_bindings, &sheet_bindings],
+            )?;
+            if rid.is_empty() {
+                return Err(Error::Zip("workbook sheet relationship id is malformed"));
+            }
+            Ok(rid.to_string())
         })
         .collect::<Result<_>>()?;
     let unique_rids: BTreeSet<_> = sheet_rids.iter().collect();
@@ -1317,7 +1728,6 @@ fn delete_sheet_plan(tree: &XmlTree, name: &str) -> Result<SheetDeletePlan> {
         sheet_index,
         new_active_tab: new_active,
         rid,
-        sheet_rids,
     })
 }
 

@@ -675,7 +675,7 @@ fn estimated_output_size(wb: &Workbook) -> usize {
         for runs in sheet.rich.values() {
             bytes = bytes.saturating_add(runs.len().saturating_mul(2 << 10));
             for run in runs {
-                bytes = add_escaped_string(bytes, &run.text);
+                bytes = add_cell_string(bytes, &run.text);
                 bytes = add_font_payload(bytes, &run.font);
             }
         }
@@ -775,7 +775,8 @@ fn estimated_output_size(wb: &Workbook) -> usize {
 
 fn add_cell_payload(bytes: usize, cell: &Cell) -> usize {
     match cell {
-        Cell::Text(text) | Cell::Error(text) => add_escaped_string(bytes, text),
+        Cell::Text(text) => add_cell_string(bytes, text),
+        Cell::Error(text) => add_escaped_string(bytes, text),
         Cell::Formula { formula, cached } => {
             add_cell_payload(add_escaped_string(bytes, formula), cached)
         }
@@ -808,6 +809,12 @@ fn add_escaped_string(bytes: usize, value: &str) -> usize {
     // XML entity escaping expands one UTF-8 byte by at most six bytes; this is
     // deliberately conservative for both text and attribute contexts.
     bytes.saturating_add(value.len().saturating_mul(6))
+}
+
+fn add_cell_string(bytes: usize, value: &str) -> usize {
+    // ST_Xstring encodes a one-byte control as seven ASCII bytes. Literal
+    // escape protection and XML entities grow by less than this bound.
+    bytes.saturating_add(value.len().saturating_mul(7))
 }
 
 fn validate_defined_names(wb: &Workbook) -> Result<(), WriteError> {
@@ -957,10 +964,7 @@ fn cell_number_is_finite(cell: &Cell) -> bool {
 
 fn validate_cell_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(), WriteError> {
     match cell {
-        Cell::Text(value) => {
-            validate_cell_text_length(row, col, value.encode_utf16().count())?;
-            validate_xml_text("cell text", value)
-        }
+        Cell::Text(value) => validate_cell_text_length(row, col, value.encode_utf16().count()),
         Cell::Error(value) => validate_xml_text("cell error", value),
         Cell::Formula { formula, cached } => {
             validate_xml_text("formula", formula)?;
@@ -972,10 +976,7 @@ fn validate_cell_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(), WriteEr
 
 fn validate_formula_cached_xml_text(cell: &Cell, row: u32, col: u16) -> Result<(), WriteError> {
     match cell {
-        Cell::Text(value) => {
-            validate_cell_text_length(row, col, value.encode_utf16().count())?;
-            validate_xml_text("formula cached text", value)
-        }
+        Cell::Text(value) => validate_cell_text_length(row, col, value.encode_utf16().count()),
         Cell::Error(value) => validate_xml_text("formula cached error", value),
         Cell::Formula { .. } => Err(WriteError::InvalidFormulaCachedValue { row, col }),
         Cell::Number(_) | Cell::Date(_) | Cell::Bool(_) => Ok(()),
@@ -1005,7 +1006,6 @@ fn validate_rich_text_runs(runs: &[crate::TextRun], row: u32, col: u16) -> Resul
     });
     validate_cell_text_length(row, col, length)?;
     for run in runs {
-        validate_xml_text("rich string text", &run.text)?;
         validate_font_xml_text(&run.font)?;
     }
     Ok(())
@@ -1688,12 +1688,17 @@ mod tests {
     }
 
     #[test]
-    fn cell_text_that_would_be_dropped_is_rejected() {
+    fn cell_text_controls_are_preserved() {
         let mut wb = Workbook::new();
         let sheet = wb.add_sheet("S");
         sheet.write(0, 0, "keep\u{1f}all");
 
-        assert_invalid_xml_text(wb, "cell text", "keep\u{1f}all");
+        let bytes = wb.to_xlsx_checked().unwrap();
+        let reopened = Workbook::open(&bytes).unwrap();
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Text("keep\u{1f}all".into()))
+        );
     }
 
     #[test]
@@ -1722,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_cached_text_that_would_be_dropped_is_rejected() {
+    fn formula_cached_text_controls_are_preserved() {
         let mut wb = Workbook::new();
         let sheet = wb.add_sheet("S");
         sheet.write(
@@ -1734,7 +1739,15 @@ mod tests {
             },
         );
 
-        assert_invalid_xml_text(wb, "formula cached text", "cached\u{1f}value");
+        let bytes = wb.to_xlsx_checked().unwrap();
+        let reopened = Workbook::open(&bytes).unwrap();
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Formula {
+                formula: "A1".into(),
+                cached: Box::new(Cell::Text("cached\u{1f}value".into()))
+            })
+        );
     }
 
     #[test]
@@ -1783,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_text_run_text_that_would_be_dropped_is_rejected() {
+    fn rich_text_run_controls_are_preserved() {
         let mut wb = Workbook::new();
         let sheet = wb.add_sheet("S");
         sheet.write_rich(
@@ -1792,7 +1805,12 @@ mod tests {
             vec![crate::TextRun::new("bad\u{1f}run", crate::Font::default())],
         );
 
-        assert_invalid_xml_text(wb, "rich string text", "bad\u{1f}run");
+        let bytes = wb.to_xlsx_checked().unwrap();
+        let reopened = Workbook::open(&bytes).unwrap();
+        assert_eq!(
+            reopened.sheets[0].cell(0, 0),
+            Some(&Cell::Text("bad\u{1f}run".into()))
+        );
     }
 
     #[test]
@@ -1870,6 +1888,35 @@ mod tests {
             })
         );
         assert_eq!(validate_output_size_with_limit(&workbook, estimate), Ok(()));
+    }
+
+    #[test]
+    fn checked_output_limit_accounts_for_cell_control_escape_growth() {
+        for cached in [false, true] {
+            let cell = |text: String| {
+                if cached {
+                    Cell::Formula {
+                        formula: "A1".into(),
+                        cached: Box::new(Cell::Text(text)),
+                    }
+                } else {
+                    Cell::Text(text)
+                }
+            };
+            let mut baseline = Workbook::new();
+            baseline.add_sheet("Data").write(0, 0, cell(String::new()));
+            let mut controls = baseline.clone();
+            controls.sheets[0].write(0, 0, cell("\u{1}".repeat(10_000)));
+
+            // The escaped payload alone occupies 70,000 XML bytes. A 65,000
+            // byte allowance must reject before either plain or cached text
+            // reaches the emitter; the previous six-byte estimate accepted it.
+            let limit = estimated_output_size(&baseline) + 65_000;
+            assert!(matches!(
+                validate_output_size_with_limit(&controls, limit),
+                Err(WriteError::OutputTooLarge { .. })
+            ));
+        }
     }
 
     #[test]
