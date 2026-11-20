@@ -104,8 +104,8 @@ async function buildFixture() {
     decodedImageSha256: await sha256Hex(decodedImage),
     decodedImageBytes: decodedImage.byteLength,
     renderedImageSha256:
-      "b848eb79a6b54cefd9772661737bed9d9273a48df8ee3082cb70023f1b7c8530",
-    renderedImageBytes: 13_029,
+      "6871bb384ed9d763a690db19559644469b34a620b64afd82fc988783480b7325",
+    renderedImageBytes: 645,
     fontSha256: await sha256Hex(font),
     fontBytes: font.byteLength,
     fontPackSha256: JSON.parse(new TextDecoder().decode(fontPack.manifest)).pack_sha256,

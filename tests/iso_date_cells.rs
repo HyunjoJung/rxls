@@ -23,11 +23,12 @@ fn fixture(epoch1904: bool, cells: &str) -> Vec<u8> {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
+        let part_name = part.name().unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part_name.as_ref(), SimpleFileOptions::default())
             .unwrap();
         output
-            .write_all(match part.name() {
+            .write_all(match part_name.as_ref() {
                 "xl/styles.xml" => STYLES.as_bytes(),
                 "xl/worksheets/sheet1.xml" => sheet.as_bytes(),
                 _ => &contents,

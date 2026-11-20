@@ -869,7 +869,7 @@ fn cli_inspect_output_reports_readback_metadata_counts() {
         sheet.write(0, 0, "status");
         sheet.write(0, 1, "score");
         for row in 1..=3u32 {
-            sheet.write(row, 0, if row % 2 == 0 { "Yes" } else { "No" });
+            sheet.write(row, 0, if row.is_multiple_of(2) { "Yes" } else { "No" });
             sheet.write(row, 1, f64::from(row) * 10.0);
         }
         sheet.add_data_validation(DataValidation::list((1, 0, 3, 0), "\"Yes,No\""));
@@ -2655,7 +2655,7 @@ fn cli_sheet_reports_detailed_r3_metadata_values() {
         sheet.write(0, 0, "status");
         sheet.write(0, 1, "score");
         for row in 1..=3u32 {
-            sheet.write(row, 0, if row % 2 == 0 { "Yes" } else { "No" });
+            sheet.write(row, 0, if row.is_multiple_of(2) { "Yes" } else { "No" });
             sheet.write(row, 1, f64::from(row) * 10.0);
         }
         sheet.add_table(Table {

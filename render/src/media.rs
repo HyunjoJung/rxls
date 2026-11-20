@@ -130,7 +130,7 @@ fn expand_png_rgba(bytes: &[u8], color: png::ColorType) -> Option<Vec<u8>> {
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgba => 4,
     };
-    if bytes.len() % channels != 0 {
+    if !bytes.len().is_multiple_of(channels) {
         return None;
     }
     let pixels = bytes.len() / channels;
@@ -171,7 +171,7 @@ fn decode_jpeg(data: &[u8], max_decoded_bytes: u64) -> Option<DecodedImage> {
             if decoded.len() != pixels.checked_mul(2)? {
                 return None;
             }
-            for value in decoded.chunks_exact(2) {
+            for value in decoded.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[value[0], value[0], value[0], 255]);
             }
         }
@@ -179,7 +179,7 @@ fn decode_jpeg(data: &[u8], max_decoded_bytes: u64) -> Option<DecodedImage> {
             if decoded.len() != pixels.checked_mul(3)? {
                 return None;
             }
-            for value in decoded.chunks_exact(3) {
+            for value in decoded.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[value[0], value[1], value[2], 255]);
             }
         }
@@ -187,7 +187,7 @@ fn decode_jpeg(data: &[u8], max_decoded_bytes: u64) -> Option<DecodedImage> {
             if decoded.len() != pixels.checked_mul(4)? {
                 return None;
             }
-            for value in decoded.chunks_exact(4) {
+            for value in decoded.as_chunks::<4>().0 {
                 let convert = |channel: u8| {
                     let inverted = u16::from(255 - channel);
                     let black = u16::from(255 - value[3]);

@@ -13,11 +13,12 @@ fn replace_part(bytes: &[u8], name: &str, xml: &str) -> Vec<u8> {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
+        let part_name = part.name().unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part_name.as_ref(), SimpleFileOptions::default())
             .unwrap();
         output
-            .write_all(if part.name() == name {
+            .write_all(if part_name == name {
                 xml.as_bytes()
             } else {
                 &contents
@@ -323,18 +324,19 @@ fn cell_edits_and_cache_batches_preserve_xstring_text_and_unrelated_parts() {
         let mut result = ZipArchive::new(Cursor::new(&saved)).unwrap();
         for index in 0..source.len() {
             let mut part = source.by_index(index).unwrap();
-            if part.name() == "xl/worksheets/sheet1.xml" {
+            let part_name = part.name().unwrap().into_owned();
+            if part_name == "xl/worksheets/sheet1.xml" {
                 continue;
             }
             let mut original = Vec::new();
             let mut actual = Vec::new();
             part.read_to_end(&mut original).unwrap();
             result
-                .by_name(part.name())
+                .by_name(&part_name)
                 .unwrap()
                 .read_to_end(&mut actual)
                 .unwrap();
-            assert_eq!(actual, original, "{}", part.name());
+            assert_eq!(actual, original, "{part_name}");
         }
     }
 }

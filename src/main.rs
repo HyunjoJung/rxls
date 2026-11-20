@@ -3329,12 +3329,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let bit_len = (bytes.len() as u64) * 8;
     let mut padded = bytes.to_vec();
     padded.push(0x80);
-    while (padded.len() + 8) % 64 != 0 {
+    while !(padded.len() + 8).is_multiple_of(64) {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut words = [0u32; 64];
         for (index, word) in words.iter_mut().take(16).enumerate() {
             let start = index * 4;

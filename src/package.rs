@@ -496,7 +496,7 @@ impl Package {
         }
 
         let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opt = SimpleFileOptions::default();
+        let opt = SimpleFileOptions::default().system(zip::System::Unix);
         let mut total: usize = 0;
 
         for name in &self.order {

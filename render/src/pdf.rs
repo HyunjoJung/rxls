@@ -2630,7 +2630,7 @@ fn pdf_image(node: &ImageNode) -> Result<PdfImage, RenderError> {
     let mut rgb = Vec::with_capacity(pixels.saturating_mul(3));
     let mut alpha = Vec::with_capacity(pixels);
     let mut opaque = true;
-    for rgba in node.rgba.chunks_exact(4) {
+    for rgba in node.rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&rgba[..3]);
         alpha.push(rgba[3]);
         opaque &= rgba[3] == 255;

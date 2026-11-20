@@ -129,7 +129,9 @@ pub(super) fn parse_brt_extern_sheets(p: &[u8]) -> Vec<crate::ptg::ExternSheet> 
     let count = usize::try_from(u32le(p, 0).unwrap_or(0)).unwrap_or(0);
     p.get(4..)
         .unwrap_or_default()
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .take(count)
         .filter_map(|xti| {
             Some(crate::ptg::ExternSheet {

@@ -399,7 +399,10 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                         MODULE.companion_apt_specs(lock)
 
     def test_restoration_records_are_the_four_authenticated_exact_archives(self) -> None:
-        records = MODULE.APT_RESTORATIONS
+        records = tuple(
+            row for row in MODULE.APT_RESTORATIONS
+            if row["version"] == "1.20.1-6ubuntu2.8"
+        )
         self.assertEqual(len(records), 4)
         self.assertEqual(
             {row["name"] for row in records},
@@ -447,7 +450,7 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                             self.assertEqual(
                                 len([s for s in specs if s.split("=", 1)[0].split(":", 1)[0] == name]), 1
                             )
-                        for record in MODULE.APT_RESTORATIONS:
+                        for record in MODULE.relevant_apt_restorations(lock):
                             self.assertIn(str(root / record["url"].rsplit("/", 1)[1]), specs)
                             self.assertNotIn(f"{record['name']}:amd64={record['version']}", specs)
         self.assertEqual(MODULE.canonical_json_bytes(lock), before)
@@ -750,7 +753,8 @@ class RenderOracleHostToolsTests(unittest.TestCase):
     def test_restoration_selection_is_exact_and_does_not_fetch_unrelated_versions(self) -> None:
         lock = pinned_dependency_lock()
         records = MODULE.relevant_apt_restorations(lock)
-        self.assertEqual(records, list(MODULE.APT_RESTORATIONS))
+        self.assertEqual(records, [row for row in MODULE.APT_RESTORATIONS
+                                   if row["version"] == "1.20.1-6ubuntu2.8"])
         for row in lock["expected_identity"]["poppler"]["native_libraries"]:
             if row["package_name"].split(":")[0] == "libkrb5-3":
                 row["package_version"] = "1.20.1-6ubuntu2.99"
@@ -980,6 +984,51 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             )
             pinned = MODULE.pin_from_evidence(lock_path, evidence_path)
             self.assertEqual(pinned["expected_identity"], identity)
+
+    def test_bootstrap_pins_drifted_libc_and_restores_only_exact_archives(self) -> None:
+        lock = pinned_dependency_lock()
+        identity = lock.pop("expected_identity")
+        lock["expected_identity"] = None
+        version = "2.39-0ubuntu8.12"
+        for section in ("poppler", "cairo", "python"):
+            for row in identity[section]["native_libraries"]:
+                package = row.get("package_name", row.get("provider"))
+                if package == "libc6:amd64":
+                    field = "package_version" if "package_name" in row else "provider_version"
+                    row[field] = version
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            lock_path = root / "lock.json"
+            evidence_path = root / "evidence.json"
+            lock_path.write_bytes(MODULE.canonical_json_bytes(lock))
+            MODULE.verify_host(lock_path, evidence_path, scope="all", bootstrap_identities=True,
+                               capture=lambda *_: identity)
+            pinned = MODULE.pin_from_evidence(lock_path, evidence_path)
+            self.assertEqual(pinned["expected_identity"], identity)
+            self.assertEqual(pinned["ubuntu_apt"]["snapshot"], lock["ubuntu_apt"]["snapshot"])
+            self.assertEqual(MODULE.exact_libc_specs(pinned),
+                             [f"{name}:amd64={version}" for name in
+                              ("libc-bin", "libc-dev-bin", "libc6", "libc6-dev")])
+            relevant = MODULE.relevant_apt_restorations(pinned)
+            archives = {row["name"]: row for row in relevant if row["version"] == version}
+            self.assertEqual(set(archives),
+                             {"libc-bin", "libc-dev-bin", "libc6", "libc6-dev", "libc6-i386"})
+            with (
+                mock.patch.object(MODULE, "restoration_directory", return_value=root),
+                mock.patch.object(MODULE, "verify_apt_restoration", side_effect=lambda path, _: path),
+                mock.patch.object(MODULE, "installed_apt_companions", return_value=set()) as installed,
+            ):
+                specs = MODULE.apt_specs(pinned, "all", restoration_dir=root)
+                for name, row in archives.items():
+                    expected = str(root / row["url"].rsplit("/", 1)[1])
+                    if name == "libc6-i386":
+                        self.assertNotIn(expected, specs)
+                    else:
+                        self.assertIn(expected, specs)
+                    self.assertNotIn(f"{name}:amd64={version}", specs)
+                installed.return_value = {"libc6-i386"}
+                self.assertIn(str(root / archives["libc6-i386"]["url"].rsplit("/", 1)[1]),
+                              MODULE.apt_specs(pinned, "all", restoration_dir=root))
 
     def test_identity_mismatch_names_the_drifted_entry_without_digests(self) -> None:
         # A bare error code cannot be acted on: it does not distinguish an

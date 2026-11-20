@@ -229,8 +229,8 @@ fn absent_column_gaps_remain_absent_and_equal_autofit_widths_can_merge() {
 fn alternating_columns_remain_bounded_and_nonoverlapping_at_the_grid_limit() {
     let mut workbook = Workbook::new();
     let sheet = workbook.add_sheet("Alternating");
-    for column in 0..=16383 {
-        sheet.set_col_width(column, if column % 2 == 0 { 10.0 } else { 20.0 });
+    for column in 0..=16383u16 {
+        sheet.set_col_width(column, if column.is_multiple_of(2) { 10.0 } else { 20.0 });
     }
     let saved = workbook.to_xlsx_checked().unwrap();
     let records = columns(&saved);

@@ -705,12 +705,14 @@ fn plan_app_sheet_title_repair(
             return Err(Error::Zip("docProps/app.xml heading types are malformed"));
         }
     }
-    if variants.len() % 2 != 0 || parse_vector_size(tree, heading_vector)? != variants.len() {
+    if !variants.len().is_multiple_of(2)
+        || parse_vector_size(tree, heading_vector)? != variants.len()
+    {
         return Err(Error::Zip("docProps/app.xml heading pairs are malformed"));
     }
     let mut worksheet_group = None;
     let mut titles_accounted_for = 0usize;
-    for pair in variants.chunks_exact(2) {
+    for pair in variants.as_chunks::<2>().0 {
         let label_bindings = app_namespace_bindings(tree, pair[0]);
         let count_bindings = app_namespace_bindings(tree, pair[1]);
         let label_scopes = [

@@ -548,7 +548,7 @@ impl HeaderFooterPolicy {
                 header: self.first_header.as_deref(),
                 footer: self.first_footer.as_deref(),
             }
-        } else if displayed_page_number % 2 == 0 && self.different_odd_even {
+        } else if displayed_page_number.is_multiple_of(2) && self.different_odd_even {
             RunningText {
                 header: self.even_header.as_deref(),
                 footer: self.even_footer.as_deref(),
