@@ -188,6 +188,7 @@ function syntheticWorkbook(image) {
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
     '<Default Extension="xml" ContentType="application/xml"/>' +
     '<Default Extension="png" ContentType="image/png"/>' +
+    '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>' +
     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
     '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
     '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
@@ -197,7 +198,16 @@ function syntheticWorkbook(image) {
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>' +
     "</Relationships>";
+  const coreProperties =
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ' +
+    'xmlns:dc="http://purl.org/dc/elements/1.1/" ' +
+    'xmlns:dcterms="http://purl.org/dc/terms/" ' +
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
+    '<dc:title>RXLS browser fixture</dc:title>' +
+    '</cp:coreProperties>';
   const workbook =
     '<?xml version="1.0" encoding="UTF-8"?>' +
     '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
@@ -265,6 +275,7 @@ function syntheticWorkbook(image) {
   return storedZip([
     ["[Content_Types].xml", encoder.encode(contentTypes)],
     ["_rels/.rels", encoder.encode(packageRelationships)],
+    ["docProps/core.xml", encoder.encode(coreProperties)],
     ["xl/workbook.xml", encoder.encode(workbook)],
     ["xl/_rels/workbook.xml.rels", encoder.encode(workbookRelationships)],
     ["xl/styles.xml", encoder.encode(styles)],

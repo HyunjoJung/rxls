@@ -215,14 +215,18 @@ export async function runBrowserScenario({
         JSON.stringify(observed.summary) !== JSON.stringify(warningObserved.recalculation)) {
       throw new Error("worker did not expose the Rust calculation observation");
     }
-    for (const mutation of [
-      () => client.setDocumentProperties(editDocument.documentId, warningObserved.workbook.properties),
-      () => client.undoEdit(editDocument.documentId),
-      () => client.redoEdit(editDocument.documentId),
+    const originalProperties = warningObserved.workbook.properties;
+    const updatedProperties = { ...originalProperties, title: "Calculation observation history" };
+    for (const [stage, expectedTitle, mutate] of [
+      ["edit workbook title", updatedProperties.title,
+        () => client.setDocumentProperties(editDocument.documentId, updatedProperties)],
+      ["undo workbook title edit", originalProperties.title, () => client.undoEdit(editDocument.documentId)],
+      ["redo workbook title edit", updatedProperties.title, () => client.redoEdit(editDocument.documentId)],
     ]) {
-      const response = await timed(mutation(), "restore calculation observation with metadata history");
-      if (JSON.stringify(response.editState.calculation) !== JSON.stringify(observed) || "recalculation" in response) {
-        throw new Error("metadata history changed the observation or invented an operation report");
+      const response = await timed(mutate(), stage);
+      if (response.workbook.properties.title !== expectedTitle ||
+          JSON.stringify(response.editState.calculation) !== JSON.stringify(observed) || "recalculation" in response) {
+        throw new Error(`${stage} did not preserve the expected title and calculation observation`);
       }
     }
     const stale = await timed(client.setCell(editDocument.documentId, 0, 0, 0,

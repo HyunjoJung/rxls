@@ -13,8 +13,8 @@ import {
 } from "./browser/fixture.mjs";
 
 const EXPECTED = Object.freeze({
-  workbookSha256: "0ebe6fbebffa0edcb9492d0a970f4b962af619d0123448451c90ca427a0a09f6",
-  workbookBytes: 555_126,
+  workbookSha256: "aa0fb4758a0bb4e5fbe07beceb80903d66b713712d070cb99e4218e09d9ac393",
+  workbookBytes: 555_836,
   imageSha256: "13147132a9fe28f4f854077ff5ef7d469015c732b88aff421b4f5103dbd196ff",
   imageBytes: 16_516,
   imageWidth: 64,
