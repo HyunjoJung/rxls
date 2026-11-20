@@ -210,8 +210,11 @@ fn wide_string(b: &[u8], o: usize) -> Option<(String, usize)> {
     let bytes = cch.checked_mul(2)?;
     let chars = b.get(o + 4..o + 4 + bytes)?;
     let units: Vec<u16> = chars
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
         .collect();
     Some((String::from_utf16_lossy(&units), 4 + bytes))
 }

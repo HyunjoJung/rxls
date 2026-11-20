@@ -2258,7 +2258,7 @@ fn synthetic_font_with_optional_kerning(
     }
     for (_, bytes) in tables {
         font.extend_from_slice(&bytes);
-        while font.len() % 4 != 0 {
+        while !font.len().is_multiple_of(4) {
             font.push(0);
         }
     }
@@ -2329,7 +2329,7 @@ pub(crate) fn synthetic_cff_test_font() -> Vec<u8> {
     }
     for (_, bytes) in tables {
         font.extend_from_slice(&bytes);
-        while font.len() % 4 != 0 {
+        while !font.len().is_multiple_of(4) {
             font.push(0);
         }
     }

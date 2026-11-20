@@ -24,11 +24,12 @@ fn fixture(namespaces: &str, metadata: &str, rows: &str) -> Vec<u8> {
         let mut part = source.by_index(index).unwrap();
         let mut contents = Vec::new();
         part.read_to_end(&mut contents).unwrap();
+        let part_name = part.name().unwrap();
         output
-            .start_file(part.name(), SimpleFileOptions::default())
+            .start_file(part_name.as_ref(), SimpleFileOptions::default())
             .unwrap();
         output
-            .write_all(if part.name() == PART {
+            .write_all(if part_name == PART {
                 xml.as_bytes()
             } else {
                 &contents
@@ -62,7 +63,12 @@ fn assert_untouched_parts(source: &[u8], saved: &[u8]) {
     let result = ZipArchive::new(Cursor::new(saved)).unwrap();
     assert_eq!(original.len(), result.len());
     for index in 0..original.len() {
-        let name = original.by_index(index).unwrap().name().to_string();
+        let name = original
+            .by_index(index)
+            .unwrap()
+            .name()
+            .unwrap()
+            .into_owned();
         if name != PART {
             assert_eq!(part(saved, &name), part(source, &name), "{name}");
         }

@@ -220,7 +220,7 @@ fn parse_style_color(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -
 
 fn parse_xlsb_font(p: &[u8], theme: &XlsbTheme, losses: &mut Vec<StyleLoss>) -> Font {
     let height_twips = u16le(p, 0).unwrap_or(220);
-    if height_twips % 20 != 0 {
+    if !height_twips.is_multiple_of(20) {
         add_style_loss(losses, StyleLossKind::UnsupportedProperty, 1);
     }
     let flags = u16le(p, 2).unwrap_or_default();
@@ -581,7 +581,10 @@ struct VerifiedXlsbStyleProvenance {
 fn exact_integral_xlsb_font_size(payload: &[u8]) -> Option<u16> {
     let height_twips = u16le(payload, 0)?;
     let (name, used) = bounded_wide_string(payload, 21, 1_024)?;
-    if name.is_empty() || 21_usize.checked_add(used)? != payload.len() || height_twips % 20 != 0 {
+    if name.is_empty()
+        || 21_usize.checked_add(used)? != payload.len()
+        || !height_twips.is_multiple_of(20)
+    {
         return None;
     }
     let points = height_twips / 20;
