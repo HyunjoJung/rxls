@@ -209,6 +209,46 @@ struct WorkbookInspection<'a> {
     properties: DocumentPropertiesInspection<'a>,
 }
 
+// Assemble typed response components before the one JSON encoding. Converting
+// to Value only at the outer boundary preserves the existing canonical key order.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationResult<'a> {
+    workbook: WorkbookInspection<'a>,
+    edit_state: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recalculation: Option<&'a recalculation::Summary>,
+}
+
+#[derive(Default)]
+struct JsonByteCount(usize);
+
+impl std::io::Write for JsonByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON byte count overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes(value: &impl Serialize) -> Result<usize, FacadeError> {
+    let mut count = JsonByteCount::default();
+    serde_json::to_writer(&mut count, value).map_err(|_| {
+        FacadeError::simple(
+            "serialization_failed",
+            "JSON output could not be measured",
+            "output",
+        )
+    })?;
+    Ok(count.0)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SheetInspection<'a> {
@@ -842,6 +882,23 @@ impl RenderSession {
         workbook: &Workbook,
         options: &RequestOptions,
     ) -> Result<String, FacadeError> {
+        let (inspection, output_limit) = self.inspection_for(workbook, options)?;
+        let output = serde_json::to_string(&inspection).map_err(|_| {
+            FacadeError::simple(
+                "serialization_failed",
+                "workbook inspection could not be serialized",
+                "output",
+            )
+        })?;
+        enforce_output(output.len(), output_limit)?;
+        Ok(output)
+    }
+
+    fn inspection_for<'a>(
+        &'a self,
+        workbook: &'a Workbook,
+        options: &RequestOptions,
+    ) -> Result<(WorkbookInspection<'a>, u64), FacadeError> {
         let effective = effective_options(options, self.font_pack.as_ref())?;
         check_font_bytes(self.font_pack_bytes, effective.resources.font_bytes)?;
         let (image_count, image_bytes) = check_embedded_images(workbook, effective.resources)?;
@@ -864,15 +921,7 @@ impl RenderSession {
             font_faces: self.font_pack.as_ref().map_or(0, FontPack::font_count),
             properties: DocumentPropertiesInspection::from(&workbook.properties),
         };
-        let output = serde_json::to_string(&inspection).map_err(|_| {
-            FacadeError::simple(
-                "serialization_failed",
-                "workbook inspection could not be serialized",
-                "output",
-            )
-        })?;
-        enforce_output(output.len(), effective.render.limits.max_output_bytes)?;
-        Ok(output)
+        Ok((inspection, effective.render.limits.max_output_bytes))
     }
 
     fn edit_state_value(&self) -> serde_json::Value {
@@ -915,21 +964,25 @@ impl RenderSession {
         spreadsheet: &Spreadsheet,
         workbook: &Workbook,
         edit_state: EditStateView<'_>,
+        recalculation: Option<&recalculation::Summary>,
     ) -> Result<String, FacadeError> {
-        let workbook: serde_json::Value =
-            serde_json::from_str(&self.inspection_json_for(workbook, &RequestOptions::default())?)
-                .map_err(|_| {
-                    FacadeError::simple(
-                        "serialization_failed",
-                        "workbook inspection could not be assembled",
-                        "output",
-                    )
-                })?;
-        let output = serde_json::json!({
-            "workbook": workbook,
-            "editState": Self::edit_state_value_for(spreadsheet, edit_state),
-        })
-        .to_string();
+        let (inspection, output_limit) =
+            self.inspection_for(workbook, &RequestOptions::default())?;
+        enforce_output(serialized_json_bytes(&inspection)?, output_limit)?;
+        let result = MutationResult {
+            workbook: inspection,
+            edit_state: Self::edit_state_value_for(spreadsheet, edit_state),
+            recalculation,
+        };
+        let output = serde_json::to_value(result)
+            .map_err(|_| {
+                FacadeError::simple(
+                    "serialization_failed",
+                    "edit result could not be assembled",
+                    "output",
+                )
+            })?
+            .to_string();
         enforce_output(output.len(), MAX_OUTPUT_BYTES)?;
         Ok(output)
     }
@@ -1165,12 +1218,8 @@ impl RenderSession {
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
             },
+            recalculation.as_ref(),
         )?;
-        let output = if let Some(summary) = recalculation {
-            summary.append_to_result(output)?
-        } else {
-            output
-        };
         self.undo.push(previous);
         self.redo.clear();
         apply_history_projection(&mut self.undo, &mut self.redo, &projection);
@@ -1214,6 +1263,7 @@ impl RenderSession {
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
             },
+            None,
         )?;
         self.undo.pop();
         self.redo.push(current);
@@ -1258,6 +1308,7 @@ impl RenderSession {
                 history_bytes: projection.bytes,
                 edited_parts: &edited_parts,
             },
+            None,
         )?;
         self.redo.pop();
         self.undo.push(current);
@@ -2815,6 +2866,50 @@ mod tests {
             check_font_bytes(2, 1).unwrap_err().resource,
             Some("fontBytes")
         );
+    }
+
+    #[test]
+    fn typed_mutation_assembly_preserves_canonical_json_and_utf8_limits() {
+        let mut workbook = Workbook::new();
+        workbook.add_sheet("한글 \"Sheet\"").write_number(0, 0, 1.0);
+        workbook.properties.title = Some("문서\n\"title\"".into());
+        let mut session = RenderSession::new_core(&workbook.to_xlsx(), &[]).unwrap();
+        let mutation = session
+            .set_cell_recalculate_json_core(
+                r#"{"sheetIndex":0,"row":0,"col":0,"value":{"kind":"number","value":2}}"#,
+            )
+            .unwrap();
+        let inspection = session
+            .inspection_json_core(&RequestOptions::default())
+            .unwrap();
+        let legacy: serde_json::Value = serde_json::from_str(&inspection).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&mutation).unwrap();
+        let expected = serde_json::json!({
+            "workbook": legacy,
+            "editState": session.edit_state_value(),
+            "recalculation": parsed["recalculation"],
+        })
+        .to_string();
+        assert_eq!(mutation, expected);
+        let (typed, _) = session
+            .inspection_for(&session.workbook, &RequestOptions::default())
+            .unwrap();
+        assert_eq!(serialized_json_bytes(&typed).unwrap(), inspection.len());
+        assert!(inspection.len() > inspection.chars().count());
+        let options = parse_options(&format!(
+            r#"{{"limits":{{"maxOutputBytes":{}}}}}"#,
+            inspection.len()
+        ))
+        .unwrap();
+        assert_eq!(session.inspection_json_core(&options).unwrap(), inspection);
+        let options = parse_options(&format!(
+            r#"{{"limits":{{"maxOutputBytes":{}}}}}"#,
+            inspection.len() - 1
+        ))
+        .unwrap();
+        let error = session.inspection_json_core(&options).unwrap_err();
+        assert_eq!(error.resource, Some("outputBytes"));
+        assert_eq!(error.actual, Some(inspection.len() as u64));
     }
 
     #[test]
