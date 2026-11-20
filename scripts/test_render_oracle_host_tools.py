@@ -691,11 +691,21 @@ class RenderOracleHostToolsTests(unittest.TestCase):
     def test_restoration_fetch_publishes_verified_cache_and_rechecks_reuse(self) -> None:
         lock = pinned_dependency_lock()
         record, payload = restoration_fixture()
+        installed = ""
+
+        def run_package_tool(command, error):
+            if error == "apt_companion_query":
+                self.assertEqual(command[0], "dpkg-query")
+                return installed
+            self.assertEqual(error, "apt_restoration_metadata")
+            self.assertEqual(command[0], "dpkg-deb")
+            return restoration_metadata(record)
+
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve() / "new"
             with mock.patch.object(MODULE, "APT_RESTORATIONS", (record,)):
                 with mock.patch.object(MODULE, "download_apt_restoration", return_value=payload) as download:
-                    with mock.patch.object(MODULE, "run_text", return_value=restoration_metadata(record)) as inspect:
+                    with mock.patch.object(MODULE, "run_text", side_effect=run_package_tool) as inspect:
                         paths = MODULE.fetch_apt_restorations(lock, root)
                         self.assertEqual(paths, [root / record["url"].rsplit("/", 1)[1]])
                         self.assertEqual(paths[0].read_bytes(), payload)
@@ -707,8 +717,14 @@ class RenderOracleHostToolsTests(unittest.TestCase):
                         with self.assertRaisesRegex(MODULE.HostToolError, "apt_restoration_sha256"):
                             MODULE.fetch_apt_restorations(lock, root)
                         self.assertEqual(download.call_count, 1)
-                        with self.assertRaisesRegex(MODULE.HostToolError, "apt_restoration_sha256"):
-                            MODULE.apt_specs(lock, "all", restoration_dir=root)
+                        for status in ("not-installed", "installed"):
+                            with self.subTest(companion_status=status):
+                                installed = f"bzip2\tamd64\t{status}\n"
+                                prior_calls = inspect.call_count
+                                with self.assertRaisesRegex(MODULE.HostToolError, "apt_restoration_sha256"):
+                                    MODULE.apt_specs(lock, "all", restoration_dir=root)
+                                self.assertEqual(inspect.call_count, prior_calls + 1)
+                                self.assertEqual(inspect.call_args.args[1], "apt_companion_query")
 
     def test_restoration_fetch_failure_never_publishes_unverified_archive(self) -> None:
         lock = pinned_dependency_lock()
