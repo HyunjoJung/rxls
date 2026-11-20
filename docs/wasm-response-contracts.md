@@ -59,12 +59,11 @@ module registration and declaration matching, not a built npm artifact.
 The existing browser and installed-package checks must still pass before
 merging. This PR does not claim parsing, rendering or edit-latency improvements.
 
-## Remaining issue scope
+## Issue #153
 
-Parts A, B, and C are implemented here: shared response rules, Rust-owned
-calculation observations under protocol v3, and internal JSON assembly as
-described below. Part D requires separately recorded before/after native and
-browser measurements; contract tests alone do not establish performance gains.
+The Worker shares response rules, tracks calculation observations with the
+Rust workbook history, and assembles JSON from typed results. The edit-path
+measurements below compare the internal JSON change on native and browser builds.
 
 ## Internal JSON assembly
 
@@ -112,3 +111,52 @@ are added to this metadata, and no observation is persisted into OOXML.
 The viewer formats the current Rust observation and each operation report. It
 has no warning undo/redo stacks, and labels both initial uncertainty and stale
 observations rather than treating missing recalculation as successful checking.
+
+## Edit-path measurements
+
+The Stage D comparison used parent
+`04f9f004cc6098655f333f9cec231e6481872c6c` and Part C
+`48bf8a21c77dead9605d5db5407beb6ef35a38a4`. Both used the same locked
+dependencies and Rust 1.85.0 release profile on Windows 10 (Ryzen 5 3600).
+Browser runs used Chrome for Testing 150.0.7871.115, Node 24.18.0 and the
+same viewer bundle. Each pair alternated the order across repetitions.
+
+The `editing_benchmark` example used a 211,074-byte XLSX with
+64,000 numeric cells and 200 formulas. In 18 measured samples per revision,
+the median moved from 6,478 to 6,375 ms for eight sequential edits,
+1,235 to 1,163 ms for one 1×8 paste, 1,399 to 1,428 ms for a 10,000×1
+paste, and 1,349 to 1,308 ms for a 1×10,000 paste. A separate test with
+20 samples per revision on the same input measured 1,112 to 1,118 ms
+for one recalculating edit, 269 to 264 ms for Undo, and 228 to 233 ms
+for Redo. Read-only inspection took about 0.010 ms and returned 313
+bytes. This last measurement covers public inspection alone.
+
+In three fresh browser contexts per revision, Worker initialization
+took a median 66.6 to 53.7 ms and workbook open took 244.2 to 240.7 ms.
+Across 18 warm Worker samples the medians went from 1,146.6 to 1,135.5 ms
+for one edit, 1,051.4 to 1,058.6 ms for a 1×8 paste, 301.2 to 296.6 ms
+for Undo, and 260.6 to 263.6 ms for Redo. These include the full Client
+request and validated Worker response.
+
+The viewer used a separate 4,724-byte XLSX with 360 populated cells and
+40 formulas. Across 30 successful SVG replacements in five fresh
+contexts per revision, the median click-to-ready frame went from 63.5
+to 67.7 ms. The mutation Worker round trip went from 13.7 to 14.0 ms
+and the interactive render Worker round trip from 16.3 to 17.4 ms.
+The larger fixture was rejected by the full-sheet renderer on both
+revisions and was excluded from this comparison.
+
+Native peak working set in the original benchmark was 334.1 to 334.5
+MiB. Warm Worker V8 used heap was about 1.22 MB on both revisions.
+WASM linear memory capacity went from 184.8 to 176.6 MiB, and compressed
+edit history used 3,388,242 bytes on each revision. Linear memory capacity
+and the 128 MiB Worker resource budgets measure different quantities.
+Browser process RSS was not measured in this Windows comparison.
+
+The latency ranges overlapped on this host. Save/reparse, recalculation,
+and response assembly were measured together. The data supports keeping
+Part C scoped to code simplification. Re-run the native
+baseline with `cargo +1.85.0 run --release --locked --manifest-path
+bindings/render-wasm/Cargo.toml --example editing_benchmark` at both
+revisions. Browser timings require a real WASM build and separate fresh
+and warm measurements.
