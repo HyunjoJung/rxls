@@ -310,7 +310,8 @@ jobs:
         run: python3 scripts/check_release_identity.py --allow-unreleased
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-07-15)
         with:
-          toolchain: stable
+          # Match the compiler used to build the release WASM package.
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
